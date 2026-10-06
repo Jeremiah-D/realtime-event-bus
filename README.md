@@ -43,6 +43,16 @@ library.
   precedence over the legacy `baseDelayMs`/`maxDelayMs`/`jitterMs` options.
   Supports `onGiveUp` after `maxAttempts` failures. The connect function is
   injectable for testing.
+- **`src/heartbeat.ts` — `HeartbeatMonitor`**: keep-alive for a
+  `ReconnectController`. While the controller reports `connected`, it sends a
+  ping every `intervalMs` through an injected `pingFn` (resolved on pong);
+  a pong that does not arrive within `timeoutMs` counts as a missed
+  heartbeat — `onTimeout(missed)` fires and the connection is handed back to
+  the reconnect state machine via `controller.notifyDisconnected()`, driving
+  the normal backoff/reconnect flow. Pings are skipped whenever the
+  controller is not `connected`, an in-flight ping blocks the next tick so a
+  hung peer cannot stack pings, and `onPong(latencyMs)` reports each
+  round-trip.
 
 ## Run
 
@@ -72,3 +82,8 @@ npm test
   precedence over the legacy numeric knobs), a linear strategy receives
   1-based attempt numbers, and the default exponential backoff grows/caps
   deterministically with injected randomness.
+- `test/heartbeat.test.ts` — successful pongs report latency and keep the
+  connection up, a hung peer times out exactly once and hands the connection
+  back to reconnect (no stacked pings), pings stay silent while the
+  controller is not connected, consecutive timeouts grow the miss counter
+  until a pong resets it, and `stop()` halts the interval.
