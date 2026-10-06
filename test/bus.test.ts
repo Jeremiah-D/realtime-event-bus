@@ -288,3 +288,74 @@ test('publishBatch of an empty array is a no-op', async () => {
   await flush();
   assert.equal(calls, 0); // no flush was scheduled
 });
+
+test('getStats reports subscribers grouped by pattern', () => {
+  const bus = new EventBus();
+  bus.subscribe('market.btc', () => {});
+  bus.subscribe('market.btc', () => {});
+  bus.subscribe('market.*', () => {});
+  const stats = bus.getStats();
+  assert.equal(stats.totalSubscribers, 3);
+  assert.deepEqual(stats.subscribersByPattern, { 'market.btc': 2, 'market.*': 1 });
+  assert.equal(stats.totalPublished, 0);
+  assert.deepEqual(stats.topics, []);
+});
+
+test('getStats updates pattern counts on unsubscribe', () => {
+  const bus = new EventBus();
+  const a = bus.subscribe('market.btc', () => {});
+  bus.subscribe('market.btc', () => {});
+  a.unsubscribe();
+  assert.deepEqual(bus.getStats().subscribersByPattern, { 'market.btc': 1 });
+});
+
+test('getStats drops the pattern entry when its last subscriber leaves', () => {
+  const bus = new EventBus();
+  const a = bus.subscribe('market.btc', () => {});
+  a.unsubscribe();
+  a.unsubscribe(); // double unsubscribe is a no-op, must not go negative
+  const stats = bus.getStats();
+  assert.deepEqual(stats.subscribersByPattern, {});
+  assert.equal(stats.totalSubscribers, 0);
+});
+
+test('getStats tracks per-topic fan-out width and publish counts', () => {
+  const bus = new EventBus();
+  bus.subscribe('market.**', () => {});
+  bus.subscribe('market.btc', () => {});
+  bus.publish('market.btc', 1);
+  bus.publish('market.btc', 2);
+  bus.publish('market.eth', 3);
+  const stats = bus.getStats();
+  assert.equal(stats.totalPublished, 3);
+  assert.deepEqual(stats.topics, [
+    { topic: 'market.btc', subscriberCount: 2, publishedMessages: 2 },
+    { topic: 'market.eth', subscriberCount: 1, publishedMessages: 1 },
+  ]);
+});
+
+test('getStats refreshes fan-out width when subscriptions change', () => {
+  const bus = new EventBus();
+  bus.subscribe('market.btc', () => {});
+  bus.publish('market.btc', 1);
+  assert.equal(bus.getStats().topics[0].subscriberCount, 1);
+  const sub = bus.subscribe('market.btc', () => {});
+  bus.publish('market.btc', 2);
+  assert.equal(bus.getStats().topics[0].subscriberCount, 2);
+  sub.unsubscribe();
+  bus.publish('market.btc', 3);
+  const stats = bus.getStats();
+  assert.equal(stats.topics[0].subscriberCount, 1);
+  assert.equal(stats.topics[0].publishedMessages, 3);
+});
+
+test('getStats snapshot is a copy, not live bus state', () => {
+  const bus = new EventBus();
+  bus.subscribe('market.btc', () => {});
+  bus.publish('market.btc', 1);
+  const stats = bus.getStats();
+  stats.subscribersByPattern['market.btc'] = 999;
+  stats.topics[0].subscriberCount = 999;
+  assert.equal(bus.getStats().subscribersByPattern['market.btc'], 1);
+  assert.equal(bus.getStats().topics[0].subscriberCount, 1);
+});

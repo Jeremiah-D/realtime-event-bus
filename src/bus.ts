@@ -40,6 +40,34 @@ export interface Subscription {
   unsubscribe(): void;
 }
 
+/** Per-topic stats kept live by the bus. */
+export interface TopicStats {
+  /** The concrete topic name (as published, never a pattern). */
+  topic: string;
+  /**
+   * Subscribers matched by the most recent publish to this topic — the
+   * current fan-out width, so operators can see hot topics at a glance.
+   */
+  subscriberCount: number;
+  /** Total messages published to this topic since the bus was created. */
+  publishedMessages: number;
+}
+
+/** Point-in-time snapshot returned by `EventBus.getStats()`. */
+export interface BusStats {
+  /** Currently active subscriptions. */
+  totalSubscribers: number;
+  /** Subscriptions grouped by the exact pattern string that was registered. */
+  subscribersByPattern: Record<string, number>;
+  /** Total messages accepted via `publish`/`publishBatch`. */
+  totalPublished: number;
+  /**
+   * Stats for every concrete topic that has seen at least one publish,
+   * in order of first publish.
+   */
+  topics: TopicStats[];
+}
+
 interface Subscriber {
   id: string;
   pattern: string;
@@ -77,6 +105,9 @@ function matchSegments(pattern: string[], topic: string[]): boolean {
 
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
+  private subscribersByPattern = new Map<string, number>();
+  private topicStats = new Map<string, { subscriberCount: number; publishedMessages: number }>();
+  private totalPublished = 0;
   private nextId = 0;
   private flushScheduled = false;
 
@@ -113,11 +144,15 @@ export class EventBus {
     });
     const subscriber: Subscriber = { id, pattern: topicPattern, handler, queue };
     this.subscribers.set(id, subscriber);
+    this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
 
     return {
       id,
       unsubscribe: () => {
-        this.subscribers.delete(id);
+        if (!this.subscribers.delete(id)) return;
+        const remaining = (this.subscribersByPattern.get(topicPattern) ?? 1) - 1;
+        if (remaining <= 0) this.subscribersByPattern.delete(topicPattern);
+        else this.subscribersByPattern.set(topicPattern, remaining);
       },
     };
   }
@@ -130,14 +165,9 @@ export class EventBus {
    * microtask so slow consumers exert real backpressure.
    */
   publish(topic: string, payload: unknown): number {
-    let delivered = 0;
-    const msg: BusMessage = { topic, payload };
-    for (const subscriber of this.subscribers.values()) {
-      if (!matches(subscriber.pattern, topic)) continue;
-      if (subscriber.queue.push(msg) === 'accepted') delivered += 1;
-    }
+    const { accepted } = this.fanOut({ topic, payload });
     this.scheduleFlush();
-    return delivered;
+    return accepted;
   }
 
   /**
@@ -150,17 +180,56 @@ export class EventBus {
    */
   publishBatch(messages: BusMessage[]): number {
     if (messages.length === 0) return 0;
-    let delivered = 0;
+    let accepted = 0;
     for (const msg of messages) {
-      for (const subscriber of this.subscribers.values()) {
-        if (!matches(subscriber.pattern, msg.topic)) continue;
-        if (subscriber.queue.push({ topic: msg.topic, payload: msg.payload }) === 'accepted') {
-          delivered += 1;
-        }
-      }
+      accepted += this.fanOut({ topic: msg.topic, payload: msg.payload }).accepted;
     }
     this.scheduleFlush();
-    return delivered;
+    return accepted;
+  }
+
+  /**
+   * Pushes one message into every matching subscriber's queue and records
+   * per-topic stats. Returns how many subscribers matched and how many
+   * queues accepted the message (they differ when backpressure drops kick
+   * in). Does not schedule a flush — callers do that once per batch.
+   */
+  private fanOut(msg: BusMessage): { matched: number; accepted: number } {
+    let matched = 0;
+    let accepted = 0;
+    for (const subscriber of this.subscribers.values()) {
+      if (!matches(subscriber.pattern, msg.topic)) continue;
+      matched += 1;
+      if (subscriber.queue.push(msg) === 'accepted') accepted += 1;
+    }
+    let stats = this.topicStats.get(msg.topic);
+    if (stats == null) {
+      stats = { subscriberCount: 0, publishedMessages: 0 };
+      this.topicStats.set(msg.topic, stats);
+    }
+    stats.subscriberCount = matched;
+    stats.publishedMessages += 1;
+    this.totalPublished += 1;
+    return { matched, accepted };
+  }
+
+  /**
+   * Returns a point-in-time snapshot of live bus metrics: active
+   * subscriptions (total and per pattern) plus per-topic fan-out widths and
+   * publish counts. The snapshot is a plain-data copy — mutating it does
+   * not affect the bus.
+   */
+  getStats(): BusStats {
+    return {
+      totalSubscribers: this.subscribers.size,
+      subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
+      totalPublished: this.totalPublished,
+      topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
+        topic,
+        subscriberCount: stats.subscriberCount,
+        publishedMessages: stats.publishedMessages,
+      })),
+    };
   }
 
   /** Number of active subscriptions. */
