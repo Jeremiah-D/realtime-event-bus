@@ -62,6 +62,11 @@ export interface BusStats {
   /** Total messages accepted via `publish`/`publishBatch`. */
   totalPublished: number;
   /**
+   * Number of compiled topic patterns currently held in the pattern cache —
+   * one entry per distinct pattern with at least one active subscriber.
+   */
+  patternCacheSize: number;
+  /**
    * Stats for every concrete topic that has seen at least one publish,
    * in order of first publish.
    */
@@ -71,41 +76,73 @@ export interface BusStats {
 interface Subscriber {
   id: string;
   pattern: string;
+  /** Compiled form of `pattern`, shared with every subscriber on the pattern. */
+  matcher: RegExp;
   handler: MessageHandler;
   queue: BoundedQueue<BusMessage>;
 }
 
-function matches(pattern: string, topic: string): boolean {
-  // A lone `*` or `**` matches every topic.
-  if (pattern === '*' || pattern === '**') return true;
-  const patternParts = pattern.split('.');
-  const topicParts = topic.split('.');
-  return matchSegments(patternParts, topicParts);
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
- * Segment matcher where `*` matches exactly one topic segment and `**`
- * matches zero or more segments (AMQP/MQTT-style multi-level wildcard, e.g.
- * `market.**` matches `market`, `market.btc` and `market.btc.trades`).
+ * Compiles a topic pattern into an anchored RegExp with exactly the same
+ * matching semantics as the documented wildcard rules: `*` matches a single
+ * topic segment, `**` matches zero or more segments (in leading, middle, or
+ * trailing position), and every other segment matches literally. A bare `*`
+ * or `**` matches every topic.
+ *
+ * The bus compiles each distinct pattern once and shares the RegExp across
+ * all subscribers on that pattern (see `EventBus`), so hot paths pay for
+ * pattern parsing a single time instead of on every publish.
  */
-function matchSegments(pattern: string[], topic: string[]): boolean {
-  if (pattern.length === 0) return topic.length === 0;
-  const [head, ...rest] = pattern;
-  if (head === '**') {
-    // Try consuming 0..topic.length segments for the wildcard.
-    for (let i = 0; i <= topic.length; i += 1) {
-      if (matchSegments(rest, topic.slice(i))) return true;
-    }
-    return false;
+export function compilePattern(pattern: string): RegExp {
+  // A lone `*` or `**` matches every topic.
+  if (pattern === '*' || pattern === '**') return /^.*$/;
+  // Consecutive `**` segments are equivalent to a single one (zero-or-more
+  // followed by zero-or-more segments is still zero-or-more), so collapse
+  // runs first — this keeps the separator bookkeeping below unambiguous.
+  const segments: string[] = [];
+  for (const seg of pattern.split('.')) {
+    if (seg === '**' && segments[segments.length - 1] === '**') continue;
+    segments.push(seg);
   }
-  if (topic.length === 0) return false;
-  if (head !== '*' && head !== topic[0]) return false;
-  return matchSegments(rest, topic.slice(1));
+  let source = '^';
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i];
+    if (seg === '**') {
+      // Zero or more segments. Leading `**` absorbs the separator that
+      // *follows* it (`(?:.*\.)?`); anywhere else it absorbs the separator
+      // that *precedes* it (`(?:\..*)?`). Either way, zero segments means
+      // no separator is consumed.
+      source += i === 0 ? '(?:.*\\.)?' : '(?:\\..*)?';
+      continue;
+    }
+    const atom = seg === '*' ? '[^.]+' : escapeRegExp(seg);
+    if (i === 0) {
+      source += atom;
+    } else if (segments[i - 1] === '**' && i - 1 === 0) {
+      // Separator already inside the leading `**` group.
+      source += atom;
+    } else {
+      source += `\\.${atom}`;
+    }
+  }
+  source += '$';
+  return new RegExp(source);
 }
 
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
+  /**
+   * Compiled topic patterns, keyed by the exact pattern string. Each distinct
+   * pattern is compiled once and the RegExp is shared by every subscriber on
+   * it; the entry is evicted when its last subscriber unsubscribes so the
+   * cache cannot grow without bound.
+   */
+  private patternCache = new Map<string, RegExp>();
   private topicStats = new Map<string, { subscriberCount: number; publishedMessages: number }>();
   private totalPublished = 0;
   private nextId = 0;
@@ -142,7 +179,13 @@ export class EventBus {
               }),
           }),
     });
-    const subscriber: Subscriber = { id, pattern: topicPattern, handler, queue };
+    const subscriber: Subscriber = {
+      id,
+      pattern: topicPattern,
+      matcher: this.compiledMatcher(topicPattern),
+      handler,
+      queue,
+    };
     this.subscribers.set(id, subscriber);
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
 
@@ -151,10 +194,27 @@ export class EventBus {
       unsubscribe: () => {
         if (!this.subscribers.delete(id)) return;
         const remaining = (this.subscribersByPattern.get(topicPattern) ?? 1) - 1;
-        if (remaining <= 0) this.subscribersByPattern.delete(topicPattern);
-        else this.subscribersByPattern.set(topicPattern, remaining);
+        if (remaining <= 0) {
+          this.subscribersByPattern.delete(topicPattern);
+          this.patternCache.delete(topicPattern);
+        } else {
+          this.subscribersByPattern.set(topicPattern, remaining);
+        }
       },
     };
+  }
+
+  /**
+   * Returns the cached compiled RegExp for `pattern`, compiling it on first
+   * use. Subscribers on the same pattern share one RegExp instance.
+   */
+  private compiledMatcher(pattern: string): RegExp {
+    let matcher = this.patternCache.get(pattern);
+    if (matcher == null) {
+      matcher = compilePattern(pattern);
+      this.patternCache.set(pattern, matcher);
+    }
+    return matcher;
   }
 
   /**
@@ -198,7 +258,7 @@ export class EventBus {
     let matched = 0;
     let accepted = 0;
     for (const subscriber of this.subscribers.values()) {
-      if (!matches(subscriber.pattern, msg.topic)) continue;
+      if (!subscriber.matcher.test(msg.topic)) continue;
       matched += 1;
       if (subscriber.queue.push(msg) === 'accepted') accepted += 1;
     }
@@ -224,6 +284,7 @@ export class EventBus {
       totalSubscribers: this.subscribers.size,
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
       totalPublished: this.totalPublished,
+      patternCacheSize: this.patternCache.size,
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,

@@ -19,7 +19,10 @@ library.
 - **`src/bus.ts` — `EventBus`**: in-process publish/subscribe with wildcard
   topic patterns (`market.*` matches `market.btc`; `**` matches zero or more
   segments, so `market.**` matches `market`, `market.btc` and
-  `market.btc.trades`; a bare `*` or `**` matches every topic). `publish()` fans out to all matching subscribers and returns how
+  `market.btc.trades`; a bare `*` or `**` matches every topic). Each distinct
+  pattern is compiled to a `RegExp` once and shared by all subscribers on
+  that pattern (evicted when its last subscriber leaves), so the hot publish
+  path never re-parses patterns. `publish()` fans out to all matching subscribers and returns how
   many accepted the message. Each subscriber gets an independent bounded
   queue; delivery is batched on a microtask so slow consumers exert real
   backpressure instead of blocking publishers. `publishBatch(messages)` fans

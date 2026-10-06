@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventBus, type BackpressureEvent } from '../src/bus.ts';
+import { EventBus, compilePattern, type BackpressureEvent } from '../src/bus.ts';
 
 /** Yields until the bus's scheduled microtask flush has run. */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -358,4 +358,86 @@ test('getStats snapshot is a copy, not live bus state', () => {
   stats.topics[0].subscriberCount = 999;
   assert.equal(bus.getStats().subscribersByPattern['market.btc'], 1);
   assert.equal(bus.getStats().topics[0].subscriberCount, 1);
+});
+
+test('compilePattern preserves wildcard semantics across edge cases', () => {
+  const cases: Array<[pattern: string, topic: string, expected: boolean]> = [
+    // exact + single-level wildcard
+    ['market.btc', 'market.btc', true],
+    ['market.btc', 'market.eth', false],
+    ['market.*', 'market.btc', true],
+    ['market.*', 'market', false],
+    ['market.*', 'market.btc.trades', false],
+    // trailing ** (zero or more)
+    ['market.**', 'market', true],
+    ['market.**', 'market.btc', true],
+    ['market.**', 'market.btc.trades', true],
+    ['market.**', 'news.btc', false],
+    ['market.**', 'marketplace.btc', false], // prefix must end at a segment boundary
+    // leading **
+    ['**.trades', 'trades', true],
+    ['**.trades', 'market.trades', true],
+    ['**.trades', 'market.btc.trades', true],
+    ['**.trades', 'market.btc.quotes', false],
+    ['**.trades', 'tradesx', false],
+    // middle **
+    ['market.**.trades', 'market.trades', true],
+    ['market.**.trades', 'market.btc.trades', true],
+    ['market.**.trades', 'market.btc.quotes', false],
+    ['market.**.trades', 'market.btc.trades.x', false],
+    // consecutive ** collapses to one
+    ['**.**.trades', 'trades', true],
+    ['**.**.trades', 'a.b.trades', true],
+    ['market.**.**', 'market', true],
+    ['market.**.**', 'market.a.b', true],
+    // bare wildcards match everything
+    ['*', 'a', true],
+    ['*', 'a.b.c', true],
+    ['**', 'a', true],
+    ['**', 'a.b.c', true],
+    // literal segments containing regex metacharacters match literally
+    ['price.usd+', 'price.usd+', true],
+    ['price.usd+', 'price.usd', false],
+    ['a+b', 'aab', false],
+    ['a(b)', 'a(b)', true],
+    ['a.b', 'a+b', false],
+  ];
+  for (const [pattern, topic, expected] of cases) {
+    assert.equal(
+      compilePattern(pattern).test(topic),
+      expected,
+      `pattern ${JSON.stringify(pattern)} vs topic ${JSON.stringify(topic)}`,
+    );
+  }
+});
+
+test('subscribers on the same pattern share one cached RegExp', () => {
+  const bus = new EventBus();
+  bus.subscribe('market.*', () => {});
+  bus.subscribe('market.*', () => {});
+  assert.equal(bus.getStats().patternCacheSize, 1);
+  bus.subscribe('market.**', () => {});
+  assert.equal(bus.getStats().patternCacheSize, 2);
+});
+
+test('pattern cache entry is evicted when its last subscriber leaves', () => {
+  const bus = new EventBus();
+  const a = bus.subscribe('market.*', () => {});
+  const b = bus.subscribe('market.*', () => {});
+  assert.equal(bus.getStats().patternCacheSize, 1);
+  a.unsubscribe();
+  assert.equal(bus.getStats().patternCacheSize, 1); // still one subscriber left
+  b.unsubscribe();
+  assert.equal(bus.getStats().patternCacheSize, 0);
+  // re-subscribing recompiles and still matches
+  const received: string[] = [];
+  bus.subscribe('market.*', (msg) => received.push(msg.topic));
+  assert.equal(bus.getStats().patternCacheSize, 1);
+  bus.publish('market.btc', 1);
+  return new Promise<void>((resolve) =>
+    setImmediate(() => {
+      assert.deepEqual(received, ['market.btc']);
+      resolve();
+    }),
+  );
 });
