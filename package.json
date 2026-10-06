@@ -1,0 +1,1 @@
+{"description":"Zero-dependency in-process realtime event bus with wildcard subscriptions, bounded backpressure queues and reconnect control.","engines":{"node":">=22"},"license":"MIT","name":"realtime-event-bus","scripts":{"test":"node --test test/*.test.ts"},"type":"module","version":"0.1.0"}
