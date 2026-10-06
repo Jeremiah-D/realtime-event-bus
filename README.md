@@ -35,9 +35,14 @@ library.
   high-water-mark callback that fires once at 80% capacity and re-arms after
   the queue recedes.
 - **`src/reconnect.ts` — `ReconnectController`**: connection state machine
-  (`idle → connecting → connected → backoff → connecting …`) with exponential
-  backoff plus jitter, a configurable delay cap, and `onGiveUp` after
-  `maxAttempts` failures. The connect function is injectable for testing.
+  (`idle → connecting → connected → backoff → connecting …`) with an
+  injectable `BackoffStrategy` (`ReconnectOptions.strategy`). The default is
+  `ExponentialBackoff` (exponential backoff plus jitter with a configurable
+  delay cap and injectable randomness for deterministic tests); pass a custom
+  strategy for fixed, linear or decorrelated-jitter policies — it takes
+  precedence over the legacy `baseDelayMs`/`maxDelayMs`/`jitterMs` options.
+  Supports `onGiveUp` after `maxAttempts` failures. The connect function is
+  injectable for testing.
 
 ## Run
 
@@ -62,4 +67,8 @@ npm test
   behavior, drain ordering.
 - `test/reconnect.test.ts` — exponentially increasing backoff delays within
   the jitter window, give-up after `maxAttempts`, attempt-counter reset on
-  successful connect, and the disconnect → backoff transition.
+  successful connect, the disconnect → backoff transition, plus custom
+  strategy injection: a fixed-delay strategy is honored verbatim (taking
+  precedence over the legacy numeric knobs), a linear strategy receives
+  1-based attempt numbers, and the default exponential backoff grows/caps
+  deterministically with injected randomness.

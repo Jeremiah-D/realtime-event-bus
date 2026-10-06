@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ReconnectController } from '../src/reconnect.ts';
+import {
+  ExponentialBackoff,
+  ReconnectController,
+} from '../src/reconnect.ts';
 
 function waitFor(cond: () => boolean, timeoutMs = 10000): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -118,4 +121,107 @@ test('notifyDisconnected moves from connected into backoff', async () => {
   assert.equal(controller.getState(), 'backoff');
   controller.stop();
   assert.equal(controller.getState(), 'idle');
+});
+
+test('custom BackoffStrategy is honored verbatim (constant-delay strategy)', async () => {
+  // A trivial strategy every realtime client eventually wants: fixed delay.
+  class FixedDelay {
+    private readonly ms: number;
+    constructor(ms: number) {
+      this.ms = ms;
+    }
+    delayMs(_attempt: number): number {
+      return this.ms;
+    }
+  }
+
+  const recorded: number[] = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  let armed = false;
+  (globalThis as unknown as { setTimeout: unknown }).setTimeout = (
+    fn: (...args: unknown[]) => void,
+    ms: number,
+    ...rest: unknown[]
+  ) => {
+    if (armed) recorded.push(ms);
+    return (originalSetTimeout as (...a: unknown[]) => unknown)(fn, ms, ...rest);
+  };
+
+  let gaveUp = 0;
+  const controller = new ReconnectController({
+    connectFn: async () => {
+      throw new Error('network down');
+    },
+    strategy: new FixedDelay(25),
+    // These legacy knobs must be ignored once a strategy is injected.
+    baseDelayMs: 10_000,
+    maxDelayMs: 60_000,
+    jitterMs: 5_000,
+    maxAttempts: 4,
+    onGiveUp: () => {
+      gaveUp += 1;
+      armed = false;
+    },
+  });
+  try {
+    armed = true;
+    controller.start();
+    await waitFor(() => gaveUp === 1);
+  } finally {
+    (globalThis as unknown as { setTimeout: unknown }).setTimeout = originalSetTimeout;
+    controller.stop();
+  }
+
+  assert.equal(recorded.length, 3);
+  assert.deepEqual(recorded, [25, 25, 25]);
+});
+
+test('strategy receives 1-based attempt numbers (linear strategy)', () => {
+  const seen: number[] = [];
+  const linear = {
+    delayMs: (attempt: number): number => {
+      seen.push(attempt);
+      return attempt * 100;
+    },
+  };
+  const controller = new ReconnectController({
+    connectFn: async () => {},
+    strategy: linear,
+  });
+  assert.equal(controller.computeDelayMs(1), 100);
+  assert.equal(controller.computeDelayMs(2), 200);
+  assert.equal(controller.computeDelayMs(3), 300);
+  assert.deepEqual(seen, [1, 2, 3]);
+  controller.stop();
+});
+
+test('default ExponentialBackoff grows and caps with injected randomness', () => {
+  const strategy = new ExponentialBackoff({
+    baseDelayMs: 100,
+    maxDelayMs: 250,
+    jitterMs: 100,
+    random: () => 0.5, // deterministic: jitter contributes exactly half
+  });
+  assert.equal(strategy.delayMs(1), 100 + 50);
+  assert.equal(strategy.delayMs(2), 200 + 50);
+  // 100 * 2^2 = 400 would exceed the cap; capped to 250 before jitter.
+  assert.equal(strategy.delayMs(3), 250 + 50);
+  assert.equal(strategy.delayMs(10), 250 + 50);
+  // Non-positive attempt numbers clamp to the first retry's delay.
+  assert.equal(strategy.delayMs(0), strategy.delayMs(1));
+});
+
+test('without a strategy the controller still uses exponential backoff', async () => {
+  const controller = new ReconnectController({
+    connectFn: async () => {},
+    baseDelayMs: 100,
+    maxDelayMs: 800,
+    jitterMs: 0,
+  });
+  assert.equal(controller.computeDelayMs(1), 100);
+  assert.equal(controller.computeDelayMs(2), 200);
+  assert.equal(controller.computeDelayMs(3), 400);
+  assert.equal(controller.computeDelayMs(4), 800);
+  assert.equal(controller.computeDelayMs(5), 800); // capped
+  controller.stop();
 });
