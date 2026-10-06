@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventBus } from '../src/bus.ts';
+import { EventBus, type BackpressureEvent } from '../src/bus.ts';
 
 /** Yields until the bus's scheduled microtask flush has run. */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -138,4 +138,75 @@ test('drop-newest sheds the incoming message instead', async () => {
   assert.equal(bus.droppedCount(sub.id), 1);
   await flush();
   assert.deepEqual(received, ['m1', 'm2']);
+});
+
+test('onBackpressure fires once when the queue hits its high-water mark', () => {
+  const bus = new EventBus();
+  const events: BackpressureEvent[] = [];
+  const sub = bus.subscribe('t', () => {}, {
+    queueSize: 10,
+    onBackpressure: (e) => events.push(e),
+  });
+  for (let i = 0; i < 7; i++) bus.publish('t', i);
+  assert.equal(events.length, 0); // below 80%
+  bus.publish('t', 7); // size hits 8 = 80% of capacity
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0], {
+    subscriberId: sub.id,
+    pattern: 't',
+    queueSize: 8,
+    capacity: 10,
+    dropped: 0,
+  });
+  for (let i = 0; i < 5; i++) bus.publish('t', i);
+  assert.equal(events.length, 1); // fires only once while above the mark
+});
+
+test('onBackpressure re-arms after the queue drains', async () => {
+  const bus = new EventBus();
+  const events: BackpressureEvent[] = [];
+  bus.subscribe('t', () => {}, { queueSize: 10, onBackpressure: (e) => events.push(e) });
+  for (let i = 0; i < 8; i++) bus.publish('t', i);
+  assert.equal(events.length, 1);
+  await flush();
+  for (let i = 0; i < 8; i++) bus.publish('t', i);
+  assert.equal(events.length, 2);
+});
+
+test('slow consumer drops are recorded and visible via droppedCount', () => {
+  const bus = new EventBus();
+  const events: BackpressureEvent[] = [];
+  const sub = bus.subscribe('t', () => {}, {
+    queueSize: 2,
+    onBackpressure: (e) => events.push(e),
+  });
+  bus.publish('t', 'm1');
+  bus.publish('t', 'm2'); // size 2 >= 80%: high-water mark fires
+  bus.publish('t', 'm3'); // queue full, drop-oldest sheds 'm1'
+  assert.equal(events.length, 1);
+  assert.equal(events[0].dropped, 0); // no drop had happened yet when the mark fired
+  assert.equal(bus.droppedCount(sub.id), 1);
+});
+
+test('backpressure event carries the cumulative dropped count', async () => {
+  const bus = new EventBus();
+  const events: BackpressureEvent[] = [];
+  bus.subscribe('t', () => {}, { queueSize: 2, onBackpressure: (e) => events.push(e) });
+  bus.publish('t', 'm1');
+  bus.publish('t', 'm2'); // fires: nothing dropped yet
+  bus.publish('t', 'm3'); // drop-oldest sheds one
+  await flush(); // drain: re-arms the callback
+  bus.publish('t', 'm4');
+  bus.publish('t', 'm5'); // fires again: one message was shed earlier
+  assert.equal(events.length, 2);
+  assert.equal(events[1].dropped, 1);
+});
+
+test('onBackpressure stays silent when the consumer keeps up', async () => {
+  const bus = new EventBus();
+  let calls = 0;
+  bus.subscribe('t', () => {}, { onBackpressure: () => (calls += 1) });
+  bus.publish('t', 'm1');
+  await flush();
+  assert.equal(calls, 0);
 });

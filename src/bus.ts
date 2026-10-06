@@ -12,6 +12,27 @@ export interface SubscribeOptions {
   queueSize?: number;
   /** Drop policy when the queue is full (default 'drop-oldest'). */
   dropPolicy?: DropPolicy;
+  /**
+   * Called when the subscriber falls behind: its queue reached the high-water
+   * mark (80% of capacity). Fires once per excursion and re-arms after the
+   * queue drains below the mark — use it to shed load upstream, alert an
+   * operator, or degrade gracefully instead of silently dropping messages.
+   */
+  onBackpressure?: (event: BackpressureEvent) => void;
+}
+
+/** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
+export interface BackpressureEvent {
+  /** The subscriber whose queue is filling up. */
+  subscriberId: string;
+  /** The topic pattern the lagging subscriber registered. */
+  pattern: string;
+  /** Queue size when the event fired. */
+  queueSize: number;
+  /** Configured per-subscriber queue capacity. */
+  capacity: number;
+  /** Total messages dropped for this subscriber so far (same as `droppedCount`). */
+  dropped: number;
 }
 
 export interface Subscription {
@@ -65,12 +86,30 @@ export class EventBus {
    * `**` matches zero or more segments (`market.**` matches `market`,
    * `market.btc` and `market.btc.trades`); a bare `*` or `**` matches every
    * topic.
+   *
+   * Pass `onBackpressure` in `opts` to be notified when this subscriber falls
+   * behind (its queue reaches the high-water mark); `droppedCount` reports how
+   * many of its messages were shed.
    */
   subscribe(topicPattern: string, handler: MessageHandler, opts?: SubscribeOptions): Subscription {
     const id = `sub-${++this.nextId}`;
+    const capacity = opts?.queueSize ?? 100;
+    const onBackpressure = opts?.onBackpressure;
     const queue = new BoundedQueue<BusMessage>({
-      capacity: opts?.queueSize ?? 100,
+      capacity,
       policy: opts?.dropPolicy ?? 'drop-oldest',
+      ...(onBackpressure == null
+        ? {}
+        : {
+            onHighWaterMark: (size: number) =>
+              onBackpressure({
+                subscriberId: id,
+                pattern: topicPattern,
+                queueSize: size,
+                capacity,
+                dropped: queue.droppedCount,
+              }),
+          }),
     });
     const subscriber: Subscriber = { id, pattern: topicPattern, handler, queue };
     this.subscribers.set(id, subscriber);

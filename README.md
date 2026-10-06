@@ -22,7 +22,10 @@ library.
   `market.btc.trades`; a bare `*` or `**` matches every topic). `publish()` fans out to all matching subscribers and returns how
   many accepted the message. Each subscriber gets an independent bounded
   queue; delivery is batched on a microtask so slow consumers exert real
-  backpressure instead of blocking publishers.
+  backpressure instead of blocking publishers. `subscribe()` accepts an
+  `onBackpressure` callback that fires — once per excursion, re-armed after the
+  queue drains — when a subscriber's queue reaches its 80% high-water mark,
+  reporting queue size, capacity, and the cumulative `droppedCount`.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
@@ -46,8 +49,10 @@ npm test
 `npm test` runs `node --test test/`. Coverage includes:
 
 - `test/bus.test.ts` — exact, single-segment (`*`) and multi-level (`**`)
-  wildcard delivery, non-matching topics, fan-out counts, unsubscribe, and
-  queue-full drop semantics.
+  wildcard delivery, non-matching topics, fan-out counts, unsubscribe,
+  queue-full drop semantics, and the per-subscriber `onBackpressure` callback
+  (one-shot high-water-mark firing, re-arm after drain, dropped-count
+  reporting).
 - `test/backpressure.test.ts` — both drop policies, one-shot high-water-mark
   behavior, drain ordering.
 - `test/reconnect.test.ts` — exponentially increasing backoff delays within
