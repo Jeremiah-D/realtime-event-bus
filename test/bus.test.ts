@@ -1,0 +1,103 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { EventBus } from '../src/bus.ts';
+
+/** Yields until the bus's scheduled microtask flush has run. */
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test('exact topic match delivers the payload', async () => {
+  const bus = new EventBus();
+  const received: unknown[] = [];
+  bus.subscribe('market.btc', (msg) => received.push(msg.payload));
+  const delivered = bus.publish('market.btc', { price: 50000 });
+  assert.equal(delivered, 1);
+  await flush();
+  assert.deepEqual(received, [{ price: 50000 }]);
+});
+
+test('wildcard segment matches one topic level', async () => {
+  const bus = new EventBus();
+  const received: string[] = [];
+  bus.subscribe('market.*', (msg) => received.push(msg.topic));
+  bus.publish('market.btc', 1);
+  bus.publish('market.eth', 2);
+  bus.publish('market', 3); // different segment count: no match
+  bus.publish('news.btc', 4); // different first segment: no match
+  await flush();
+  assert.deepEqual(received, ['market.btc', 'market.eth']);
+});
+
+test('bare * matches every topic', async () => {
+  const bus = new EventBus();
+  const received: string[] = [];
+  bus.subscribe('*', (msg) => received.push(msg.topic));
+  bus.publish('a', 1);
+  bus.publish('a.b.c', 2);
+  await flush();
+  assert.deepEqual(received, ['a', 'a.b.c']);
+});
+
+test('non-matching topics are not delivered', async () => {
+  const bus = new EventBus();
+  const received: string[] = [];
+  bus.subscribe('orders.*', (msg) => received.push(msg.topic));
+  bus.publish('market.btc', 1);
+  bus.publish('orders', 2); // segment count differs
+  await flush();
+  assert.deepEqual(received, []);
+});
+
+test('publish fans out to all matching subscribers and returns the count', async () => {
+  const bus = new EventBus();
+  const hits: string[] = [];
+  bus.subscribe('market.*', () => hits.push('wildcard'));
+  bus.subscribe('market.btc', () => hits.push('exact'));
+  bus.subscribe('news.*', () => hits.push('other'));
+  const delivered = bus.publish('market.btc', 1);
+  assert.equal(delivered, 2);
+  await flush();
+  assert.deepEqual(hits.sort(), ['exact', 'wildcard']);
+});
+
+test('unsubscribe stops delivery', async () => {
+  const bus = new EventBus();
+  let count = 0;
+  const sub = bus.subscribe('t', () => {
+    count += 1;
+  });
+  assert.equal(bus.subscriberCount(), 1);
+  sub.unsubscribe();
+  assert.equal(bus.subscriberCount(), 0);
+  bus.publish('t', 1);
+  await flush();
+  assert.equal(count, 0);
+});
+
+test('full queue drops the oldest message and counts it', async () => {
+  const bus = new EventBus();
+  const received: unknown[] = [];
+  const sub = bus.subscribe('t', (msg) => received.push(msg.payload), { queueSize: 2 });
+  bus.publish('t', 'm1');
+  bus.publish('t', 'm2');
+  bus.publish('t', 'm3');
+  assert.equal(bus.pendingCount(sub.id), 2);
+  assert.equal(bus.droppedCount(sub.id), 1);
+  await flush();
+  assert.deepEqual(received, ['m2', 'm3']); // 'm1' was shed
+  assert.equal(bus.pendingCount(sub.id), 0);
+});
+
+test('drop-newest sheds the incoming message instead', async () => {
+  const bus = new EventBus();
+  const received: unknown[] = [];
+  const sub = bus.subscribe('t', (msg) => received.push(msg.payload), {
+    queueSize: 2,
+    dropPolicy: 'drop-newest',
+  });
+  assert.equal(bus.publish('t', 'm1'), 1);
+  assert.equal(bus.publish('t', 'm2'), 1);
+  assert.equal(bus.publish('t', 'm3'), 0); // rejected at enqueue time
+  assert.equal(bus.droppedCount(sub.id), 1);
+  await flush();
+  assert.deepEqual(received, ['m1', 'm2']);
+});
