@@ -37,6 +37,44 @@ test('bare * matches every topic', async () => {
   assert.deepEqual(received, ['a', 'a.b.c']);
 });
 
+test('** matches zero or more trailing segments', async () => {
+  const bus = new EventBus();
+  const received: string[] = [];
+  bus.subscribe('market.**', (msg) => received.push(msg.topic));
+  bus.publish('market', 1); // zero segments after the prefix
+  bus.publish('market.btc', 2); // one segment
+  bus.publish('market.btc.trades', 3); // two segments
+  bus.publish('news.btc.trades', 4); // different prefix: no match
+  await flush();
+  assert.deepEqual(received, ['market', 'market.btc', 'market.btc.trades']);
+});
+
+test('** works in leading and middle positions', async () => {
+  const bus = new EventBus();
+  const leading: string[] = [];
+  const middle: string[] = [];
+  bus.subscribe('**.trades', (msg) => leading.push(msg.topic));
+  bus.subscribe('market.**.trades', (msg) => middle.push(msg.topic));
+  bus.publish('trades', 1);
+  bus.publish('market.trades', 2);
+  bus.publish('market.btc.trades', 3);
+  bus.publish('market.btc.quotes', 4); // suffix differs: no match
+  bus.publish('news.trades', 5); // first segment differs for middle: no match
+  await flush();
+  assert.deepEqual(leading, ['trades', 'market.trades', 'market.btc.trades', 'news.trades']);
+  assert.deepEqual(middle, ['market.trades', 'market.btc.trades']);
+});
+
+test('bare ** matches every topic', async () => {
+  const bus = new EventBus();
+  const received: string[] = [];
+  bus.subscribe('**', (msg) => received.push(msg.topic));
+  bus.publish('a', 1);
+  bus.publish('a.b.c.d', 2);
+  await flush();
+  assert.deepEqual(received, ['a', 'a.b.c.d']);
+});
+
 test('non-matching topics are not delivered', async () => {
   const bus = new EventBus();
   const received: string[] = [];

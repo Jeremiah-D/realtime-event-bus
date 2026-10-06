@@ -27,12 +27,31 @@ interface Subscriber {
 }
 
 function matches(pattern: string, topic: string): boolean {
-  // A lone `*` matches every topic.
-  if (pattern === '*') return true;
+  // A lone `*` or `**` matches every topic.
+  if (pattern === '*' || pattern === '**') return true;
   const patternParts = pattern.split('.');
   const topicParts = topic.split('.');
-  if (patternParts.length !== topicParts.length) return false;
-  return patternParts.every((part, i) => part === '*' || part === topicParts[i]);
+  return matchSegments(patternParts, topicParts);
+}
+
+/**
+ * Segment matcher where `*` matches exactly one topic segment and `**`
+ * matches zero or more segments (AMQP/MQTT-style multi-level wildcard, e.g.
+ * `market.**` matches `market`, `market.btc` and `market.btc.trades`).
+ */
+function matchSegments(pattern: string[], topic: string[]): boolean {
+  if (pattern.length === 0) return topic.length === 0;
+  const [head, ...rest] = pattern;
+  if (head === '**') {
+    // Try consuming 0..topic.length segments for the wildcard.
+    for (let i = 0; i <= topic.length; i += 1) {
+      if (matchSegments(rest, topic.slice(i))) return true;
+    }
+    return false;
+  }
+  if (topic.length === 0) return false;
+  if (head !== '*' && head !== topic[0]) return false;
+  return matchSegments(rest, topic.slice(1));
 }
 
 export class EventBus {
@@ -43,7 +62,9 @@ export class EventBus {
   /**
    * Registers a handler for topics matching `topicPattern`.
    * `*` matches a single topic segment (`market.*` matches `market.btc`);
-   * a bare `*` pattern matches every topic.
+   * `**` matches zero or more segments (`market.**` matches `market`,
+   * `market.btc` and `market.btc.trades`); a bare `*` or `**` matches every
+   * topic.
    */
   subscribe(topicPattern: string, handler: MessageHandler, opts?: SubscribeOptions): Subscription {
     const id = `sub-${++this.nextId}`;

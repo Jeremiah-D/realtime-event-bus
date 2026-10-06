@@ -17,8 +17,9 @@ library.
 ## What it implements
 
 - **`src/bus.ts` — `EventBus`**: in-process publish/subscribe with wildcard
-  topic patterns (`market.*` matches `market.btc`; a bare `*` matches every
-  topic). `publish()` fans out to all matching subscribers and returns how
+  topic patterns (`market.*` matches `market.btc`; `**` matches zero or more
+  segments, so `market.**` matches `market`, `market.btc` and
+  `market.btc.trades`; a bare `*` or `**` matches every topic). `publish()` fans out to all matching subscribers and returns how
   many accepted the message. Each subscriber gets an independent bounded
   queue; delivery is batched on a microtask so slow consumers exert real
   backpressure instead of blocking publishers.
@@ -44,8 +45,9 @@ npm test
 
 `npm test` runs `node --test test/`. Coverage includes:
 
-- `test/bus.test.ts` — exact and wildcard delivery, non-matching topics,
-  fan-out counts, unsubscribe, and queue-full drop semantics.
+- `test/bus.test.ts` — exact, single-segment (`*`) and multi-level (`**`)
+  wildcard delivery, non-matching topics, fan-out counts, unsubscribe, and
+  queue-full drop semantics.
 - `test/backpressure.test.ts` — both drop policies, one-shot high-water-mark
   behavior, drain ordering.
 - `test/reconnect.test.ts` — exponentially increasing backoff delays within
