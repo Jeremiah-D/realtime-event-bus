@@ -91,3 +91,32 @@ npm test
   back to reconnect (no stacked pings), pings stay silent while the
   controller is not connected, consecutive timeouts grow the miss counter
   until a pong resets it, and `stop()` halts the interval.
+
+## Benchmark
+
+`bench/fanout.bench.ts` measures the synchronous cost of one `publish()` —
+matching the topic against the subscription patterns and enqueuing the
+message into every matching subscriber's bounded queue — with **10,000**
+subscribers on a single process (6,000 exact `market.btc.trades`, 2,500
+`market.btc.*`, 1,500 `market.**`). Each sample drains the queues on a
+microtask before the next publish, so the numbers are pure fan-out latency
+with no backpressure drops.
+
+```bash
+node bench/fanout.bench.ts
+```
+
+Results measured 2026-10-06 on Node v24.20.0 (linux/x64, V8 13.6),
+2-vCPU AMD EPYC 9D25 VM — 2,000 samples after 1,000 warmup publishes:
+
+| metric | latency |
+| ------ | ------- |
+| mean   | 2.93 ms |
+| p50    | 2.67 ms |
+| p95    | 4.02 ms |
+| p99    | 5.43 ms |
+| min / max | 2.60 ms / 27.47 ms |
+
+Throughput: ~342 publishes/s → **~3.42M deliveries/s** (in-process,
+single thread). A second run gave similar numbers (p50 2.70 ms, p99
+4.83 ms). Numbers depend on hardware — rerun the script to reproduce.
