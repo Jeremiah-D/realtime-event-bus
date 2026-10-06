@@ -1,5 +1,12 @@
 export type DropPolicy = 'drop-oldest' | 'drop-newest';
 
+/**
+ * Message priority for shed decisions. Higher values are shed later:
+ * when the queue is full under `drop-oldest`, the oldest entry with the
+ * lowest priority is dropped first. The default priority is 0.
+ */
+export type Priority = number;
+
 export interface BoundedQueueOptions<T> {
   capacity: number;
   policy?: DropPolicy;
@@ -7,13 +14,19 @@ export interface BoundedQueueOptions<T> {
   onHighWaterMark?: (size: number) => void;
 }
 
+interface QueueEntry<T> {
+  item: T;
+  priority: Priority;
+}
+
 export class BoundedQueue<T> {
-  private items: T[] = [];
+  private entries: QueueEntry<T>[] = [];
   private readonly capacity: number;
   private readonly policy: DropPolicy;
   private readonly onHighWaterMark?: (size: number) => void;
   private highWaterMarkReached = false;
   private dropped = 0;
+  private readonly droppedByPriorityCount = new Map<Priority, number>();
 
   constructor(options: BoundedQueueOptions<T>) {
     if (!Number.isInteger(options.capacity) || options.capacity <= 0) {
@@ -25,48 +38,93 @@ export class BoundedQueue<T> {
   }
 
   get size(): number {
-    return this.items.length;
+    return this.entries.length;
   }
 
   get droppedCount(): number {
     return this.dropped;
   }
 
+  /** Per-priority drop counts, useful for backpressure observability. */
+  get droppedByPriority(): ReadonlyMap<Priority, number> {
+    return this.droppedByPriorityCount;
+  }
+
   private get highWaterMark(): number {
     return this.capacity * 0.8;
   }
 
-  push(item: T): 'accepted' | 'dropped' {
-    if (this.items.length < this.capacity) {
-      this.items.push(item);
+  /**
+   * Enqueues an item. When the queue is full:
+   * - `drop-newest`: the incoming item is discarded.
+   * - `drop-oldest`: the oldest entry with the lowest priority is shed to make
+   *   room — unless the incoming item itself is the strictly lowest-priority
+   *   one, in which case the incoming item is discarded instead. High-priority
+   *   messages are therefore dropped last.
+   */
+  push(item: T, priority: Priority = 0): 'accepted' | 'dropped' {
+    if (!Number.isFinite(priority)) {
+      throw new RangeError('priority must be a finite number');
+    }
+    if (this.entries.length < this.capacity) {
+      this.entries.push({ item, priority });
       this.checkHighWaterMark();
       return 'accepted';
     }
-    // Queue is full: apply the drop policy and count the loss.
-    this.dropped += 1;
-    if (this.policy === 'drop-oldest') {
-      this.items.shift();
-      this.items.push(item);
-      this.checkHighWaterMark();
-      return 'accepted';
+    if (this.policy === 'drop-newest') {
+      this.recordDrop(priority);
+      return 'dropped';
     }
-    // 'drop-newest': the incoming item is discarded.
-    return 'dropped';
+    // 'drop-oldest' with priority-aware shedding.
+    const victimIndex = this.findShedVictimIndex(priority);
+    if (victimIndex === -1) {
+      // The incoming item is strictly lower priority than everything queued:
+      // dropping it protects the higher-priority backlog.
+      this.recordDrop(priority);
+      return 'dropped';
+    }
+    this.recordDrop(this.entries[victimIndex].priority);
+    this.entries.splice(victimIndex, 1);
+    this.entries.push({ item, priority });
+    this.checkHighWaterMark();
+    return 'accepted';
   }
 
   /** Removes and returns every queued item in FIFO order. */
   drain(): T[] {
-    const items = this.items;
-    this.items = [];
+    const items = this.entries.map((entry) => entry.item);
+    this.entries = [];
     this.highWaterMarkReached = false;
     return items;
   }
 
+  /**
+   * Index of the shed victim among the queued entries: the oldest entry whose
+   * priority is minimal. Returns -1 when the incoming item is strictly lower
+   * priority than every queued entry (so the incoming item should be dropped).
+   */
+  private findShedVictimIndex(incomingPriority: Priority): number {
+    let minPriority = Infinity;
+    for (const entry of this.entries) {
+      if (entry.priority < minPriority) minPriority = entry.priority;
+    }
+    if (incomingPriority < minPriority) return -1;
+    return this.entries.findIndex((entry) => entry.priority === minPriority);
+  }
+
+  private recordDrop(priority: Priority): void {
+    this.dropped += 1;
+    this.droppedByPriorityCount.set(
+      priority,
+      (this.droppedByPriorityCount.get(priority) ?? 0) + 1,
+    );
+  }
+
   private checkHighWaterMark(): void {
     if (this.onHighWaterMark == null) return;
-    if (!this.highWaterMarkReached && this.items.length >= this.highWaterMark) {
+    if (!this.highWaterMarkReached && this.entries.length >= this.highWaterMark) {
       this.highWaterMarkReached = true;
-      this.onHighWaterMark(this.items.length);
+      this.onHighWaterMark(this.entries.length);
     }
   }
 }

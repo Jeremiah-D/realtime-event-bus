@@ -33,7 +33,11 @@ library.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
-  the queue recedes.
+  the queue recedes. `push(item, priority = 0)` is priority-aware: under
+  `drop-oldest` the oldest lowest-priority entry is shed first, so
+  high-priority messages are dropped last; an incoming item that is strictly
+  lower priority than the whole backlog is discarded instead of evicting it.
+  `droppedByPriority` exposes per-priority drop counts.
 - **`src/reconnect.ts` — `ReconnectController`**: connection state machine
   (`idle → connecting → connected → backoff → connecting …`) with an
   injectable `BackoffStrategy` (`ReconnectOptions.strategy`). The default is

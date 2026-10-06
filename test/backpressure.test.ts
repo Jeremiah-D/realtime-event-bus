@@ -50,3 +50,62 @@ test('drain empties the queue and preserves FIFO order', () => {
 test('non-positive capacity throws', () => {
   assert.throws(() => new BoundedQueue<never>({ capacity: 0 }), RangeError);
 });
+
+test('priority: high-priority message survives drop-oldest shedding', () => {
+  const q = new BoundedQueue<string>({ capacity: 2, policy: 'drop-oldest' });
+  q.push('a', 0);
+  q.push('b', 0);
+  assert.equal(q.push('c', 10), 'accepted'); // oldest low-priority 'a' is shed
+  assert.deepEqual(q.drain(), ['b', 'c']);
+  assert.equal(q.droppedCount, 1);
+});
+
+test('priority: lowest-priority entry is shed first, oldest among ties', () => {
+  const q = new BoundedQueue<string>({ capacity: 3, policy: 'drop-oldest' });
+  q.push('a', 0);
+  q.push('b', 9);
+  q.push('c', 0);
+  assert.equal(q.push('d', 5), 'accepted'); // sheds 'a' (oldest of the priority-0 pair)
+  assert.deepEqual(q.drain(), ['b', 'c', 'd']);
+});
+
+test('priority: incoming strictly-lowest-priority item is dropped', () => {
+  const q = new BoundedQueue<string>({ capacity: 2, policy: 'drop-oldest' });
+  q.push('a', 5);
+  q.push('b', 5);
+  assert.equal(q.push('c', 0), 'dropped'); // would evict a higher-priority message
+  assert.deepEqual(q.drain(), ['a', 'b']);
+  assert.equal(q.droppedCount, 1);
+});
+
+test('priority: equal priorities keep the classic oldest-first behavior', () => {
+  const q = new BoundedQueue<string>({ capacity: 2, policy: 'drop-oldest' });
+  q.push('a', 3);
+  q.push('b', 3);
+  assert.equal(q.push('c', 3), 'accepted'); // ties: incoming is newest, so 'a' is shed
+  assert.deepEqual(q.drain(), ['b', 'c']);
+});
+
+test('priority: drop-newest ignores priority and drops the incoming item', () => {
+  const q = new BoundedQueue<string>({ capacity: 2, policy: 'drop-newest' });
+  q.push('a', 0);
+  q.push('b', 0);
+  assert.equal(q.push('c', 99), 'dropped');
+  assert.deepEqual(q.drain(), ['a', 'b']);
+});
+
+test('priority: droppedByPriority tracks per-priority drop counts', () => {
+  const q = new BoundedQueue<string>({ capacity: 1, policy: 'drop-oldest' });
+  q.push('a', 1);
+  q.push('b', 2); // sheds 'a' (priority 1)
+  q.push('c', 0); // dropped: incoming is the lowest priority
+  assert.equal(q.droppedCount, 2);
+  assert.deepEqual(Object.fromEntries(q.droppedByPriority), { 1: 1, 0: 1 });
+  assert.deepEqual(q.drain(), ['b']);
+});
+
+test('priority: non-finite priority throws', () => {
+  const q = new BoundedQueue<never>({ capacity: 2 });
+  assert.throws(() => q.push('x' as never, NaN), RangeError);
+  assert.throws(() => q.push('x' as never, Infinity), RangeError);
+});
