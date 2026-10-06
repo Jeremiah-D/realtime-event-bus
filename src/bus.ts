@@ -140,6 +140,29 @@ export class EventBus {
     return delivered;
   }
 
+  /**
+   * Fans out every message in the batch to its matching subscribers' bounded
+   * queues, then schedules a single flush for the whole batch — so N messages
+   * cost one event-loop round instead of N, at the price of one larger drain.
+   * Matching, drop policies, and backpressure callbacks behave exactly as
+   * they do for `publish`; returns the total number of accepted deliveries.
+   * An empty batch is a no-op that schedules no flush.
+   */
+  publishBatch(messages: BusMessage[]): number {
+    if (messages.length === 0) return 0;
+    let delivered = 0;
+    for (const msg of messages) {
+      for (const subscriber of this.subscribers.values()) {
+        if (!matches(subscriber.pattern, msg.topic)) continue;
+        if (subscriber.queue.push({ topic: msg.topic, payload: msg.payload }) === 'accepted') {
+          delivered += 1;
+        }
+      }
+    }
+    this.scheduleFlush();
+    return delivered;
+  }
+
   /** Number of active subscriptions. */
   subscriberCount(): number {
     return this.subscribers.size;

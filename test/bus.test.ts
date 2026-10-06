@@ -210,3 +210,81 @@ test('onBackpressure stays silent when the consumer keeps up', async () => {
   await flush();
   assert.equal(calls, 0);
 });
+
+test('publishBatch delivers every message in order with one flush', async () => {
+  const bus = new EventBus();
+  const received: unknown[] = [];
+  const sub = bus.subscribe('market.*', (msg) => received.push(msg.payload));
+  const delivered = bus.publishBatch([
+    { topic: 'market.btc', payload: 1 },
+    { topic: 'market.eth', payload: 2 },
+    { topic: 'news.btc', payload: 3 }, // no match
+  ]);
+  assert.equal(delivered, 2);
+  assert.equal(bus.pendingCount(sub.id), 2); // nothing delivered yet: still one pending flush
+  await flush();
+  assert.deepEqual(received, [1, 2]);
+});
+
+test('publishBatch counts accepted deliveries across subscribers', async () => {
+  const bus = new EventBus();
+  bus.subscribe('market.*', () => {});
+  bus.subscribe('market.btc', () => {});
+  bus.subscribe('news.*', () => {});
+  const delivered = bus.publishBatch([
+    { topic: 'market.btc', payload: 1 }, // 2 acceptances
+    { topic: 'market.eth', payload: 2 }, // 1 acceptance
+  ]);
+  assert.equal(delivered, 3);
+  await flush();
+});
+
+test('publishBatch applies drop policies like publish does', async () => {
+  const bus = new EventBus();
+  const received: unknown[] = [];
+  const sub = bus.subscribe('t', (msg) => received.push(msg.payload), { queueSize: 2 });
+  const delivered = bus.publishBatch([
+    { topic: 't', payload: 'm1' },
+    { topic: 't', payload: 'm2' },
+    { topic: 't', payload: 'm3' },
+  ]);
+  // drop-oldest always accepts: 'm3' is enqueued, 'm1' is shed and counted.
+  assert.equal(delivered, 3);
+  assert.equal(bus.droppedCount(sub.id), 1);
+  await flush();
+  assert.deepEqual(received, ['m2', 'm3']);
+});
+
+test('publishBatch with drop-newest reports rejected messages', async () => {
+  const bus = new EventBus();
+  const sub = bus.subscribe('t', () => {}, { queueSize: 2, dropPolicy: 'drop-newest' });
+  const delivered = bus.publishBatch([
+    { topic: 't', payload: 'm1' },
+    { topic: 't', payload: 'm2' },
+    { topic: 't', payload: 'm3' }, // rejected at enqueue time
+  ]);
+  assert.equal(delivered, 2);
+  assert.equal(bus.droppedCount(sub.id), 1);
+});
+
+test('publishBatch keeps messages ordered per subscriber', async () => {
+  const bus = new EventBus();
+  const received: unknown[] = [];
+  bus.subscribe('*', (msg) => received.push(msg.payload));
+  bus.publishBatch([
+    { topic: 'a', payload: 'first' },
+    { topic: 'b', payload: 'second' },
+    { topic: 'c', payload: 'third' },
+  ]);
+  await flush();
+  assert.deepEqual(received, ['first', 'second', 'third']);
+});
+
+test('publishBatch of an empty array is a no-op', async () => {
+  const bus = new EventBus();
+  let calls = 0;
+  bus.subscribe('*', () => (calls += 1));
+  assert.equal(bus.publishBatch([]), 0);
+  await flush();
+  assert.equal(calls, 0); // no flush was scheduled
+});
