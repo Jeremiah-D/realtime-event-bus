@@ -40,6 +40,20 @@ export interface Subscription {
   unsubscribe(): void;
 }
 
+/**
+ * Options for the {@link EventBus} constructor. Every field is optional;
+ * a bus created with no options behaves exactly like before.
+ */
+export interface EventBusOptions {
+  /**
+   * Clock source in milliseconds. The bus reads it when a message is
+   * published (to stamp its TTL deadline) and when a flush drains the
+   * queues (to enforce expiries). Defaults to `Date.now`. Inject a fake
+   * clock here for deterministic expiry tests.
+   */
+  now?: () => number;
+}
+
 /** Per-topic stats kept live by the bus. */
 export interface TopicStats {
   /** The concrete topic name (as published, never a pattern). */
@@ -51,6 +65,12 @@ export interface TopicStats {
   subscriberCount: number;
   /** Total messages published to this topic since the bus was created. */
   publishedMessages: number;
+  /**
+   * Messages on this topic discarded because their TTL expired before
+   * delivery. Counts each discarded queue entry once, so a message fanned
+   * out to N subscribers whose queues all expire it contributes N here.
+   */
+  expiredMessages: number;
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -61,6 +81,12 @@ export interface BusStats {
   subscribersByPattern: Record<string, number>;
   /** Total messages accepted via `publish`/`publishBatch`. */
   totalPublished: number;
+  /**
+   * Total messages discarded because their TTL expired before delivery
+   * (sum of the per-topic `expiredMessages` counters, counting each
+   * discarded queue entry once — see `TopicStats.expiredMessages`).
+   */
+  expiredMessages: number;
   /**
    * Number of compiled topic patterns currently held in the pattern cache —
    * one entry per distinct pattern with at least one active subscriber.
@@ -143,10 +169,81 @@ export class EventBus {
    * cache cannot grow without bound.
    */
   private patternCache = new Map<string, RegExp>();
-  private topicStats = new Map<string, { subscriberCount: number; publishedMessages: number }>();
+  private topicStats = new Map<
+    string,
+    { subscriberCount: number; publishedMessages: number; expiredMessages: number }
+  >();
   private totalPublished = 0;
+  private totalExpired = 0;
   private nextId = 0;
   private flushScheduled = false;
+  /**
+   * Per-topic message TTLs in milliseconds, keyed by the exact string passed
+   * to `setTopicTtl` — either a concrete topic name or a wildcard pattern.
+   * Insertion order is the tie-break order when several rules match a topic.
+   */
+  private ttlRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in `ttlRules`, kept apart
+   * from the subscriber pattern cache so TTL configuration never inflates
+   * `patternCacheSize`.
+   */
+  private ttlMatcherCache = new Map<string, RegExp>();
+  private readonly now: () => number;
+
+  constructor(options?: EventBusOptions) {
+    this.now = options?.now ?? Date.now;
+  }
+
+  /**
+   * Configures how long a message lives after being published, in
+   * milliseconds, for one topic or topic pattern. `topicPattern` accepts the
+   * same wildcard syntax as `subscribe` (or an exact topic name); a message
+   * published to a matching topic gets an expiry deadline of
+   * `publishTime + ttlMs`, and is silently dropped — counted as expired —
+   * if it has not been delivered by then. Topics without a matching rule
+   * keep the previous behavior: messages never expire.
+   *
+   * When several rules match a topic, an exact-topic rule wins over any
+   * pattern; between patterns the earliest-registered rule wins. Re-setting
+   * a rule replaces it. Throws when `ttlMs` is negative or not finite.
+   */
+  setTopicTtl(topicPattern: string, ttlMs: number): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+      throw new RangeError('ttlMs must be a non-negative finite number of milliseconds');
+    }
+    this.ttlRules.set(topicPattern, ttlMs);
+  }
+
+  /**
+   * Removes the TTL rule previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed.
+   */
+  clearTopicTtl(topicPattern: string): boolean {
+    return this.ttlRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the TTL in milliseconds that applies to `topic`, or `undefined`
+   * when no rule matches. An exact-topic rule wins over patterns; between
+   * patterns the earliest-registered matching rule wins.
+   */
+  private ttlForTopic(topic: string): number | undefined {
+    const exact = this.ttlRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, ttlMs] of this.ttlRules) {
+      let matcher = this.ttlMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.ttlMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return ttlMs;
+    }
+    return undefined;
+  }
 
   /**
    * Registers a handler for topics matching `topicPattern`.
@@ -253,18 +350,24 @@ export class EventBus {
    * per-topic stats. Returns how many subscribers matched and how many
    * queues accepted the message (they differ when backpressure drops kick
    * in). Does not schedule a flush — callers do that once per batch.
+   *
+   * When a TTL rule matches the topic, every enqueued copy is stamped with
+   * the same expiry deadline (`publishTime + ttlMs`); the queues discard
+   * expired copies at drain time and count them as expired.
    */
   private fanOut(msg: BusMessage): { matched: number; accepted: number } {
     let matched = 0;
     let accepted = 0;
+    const ttlMs = this.ttlForTopic(msg.topic);
+    const expiresAt = ttlMs === undefined ? undefined : this.now() + ttlMs;
     for (const subscriber of this.subscribers.values()) {
       if (!subscriber.matcher.test(msg.topic)) continue;
       matched += 1;
-      if (subscriber.queue.push(msg) === 'accepted') accepted += 1;
+      if (subscriber.queue.push(msg, 0, expiresAt) === 'accepted') accepted += 1;
     }
     let stats = this.topicStats.get(msg.topic);
     if (stats == null) {
-      stats = { subscriberCount: 0, publishedMessages: 0 };
+      stats = { subscriberCount: 0, publishedMessages: 0, expiredMessages: 0 };
       this.topicStats.set(msg.topic, stats);
     }
     stats.subscriberCount = matched;
@@ -284,11 +387,13 @@ export class EventBus {
       totalSubscribers: this.subscribers.size,
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
       totalPublished: this.totalPublished,
+      expiredMessages: this.totalExpired,
       patternCacheSize: this.patternCache.size,
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,
         publishedMessages: stats.publishedMessages,
+        expiredMessages: stats.expiredMessages,
       })),
     };
   }
@@ -317,11 +422,29 @@ export class EventBus {
     this.flushScheduled = true;
     queueMicrotask(() => {
       this.flushScheduled = false;
+      // One clock reading for the whole flush so every queue in this drain
+      // round enforces the same expiry cutoff.
+      const nowMs = this.now();
       for (const subscriber of this.subscribers.values()) {
-        for (const msg of subscriber.queue.drain()) {
+        const { live, expired } = subscriber.queue.drainLive(nowMs);
+        for (const msg of expired) {
+          this.recordExpired(msg.topic);
+        }
+        for (const msg of live) {
           subscriber.handler(msg);
         }
       }
     });
+  }
+
+  /**
+   * Counts one message discarded for TTL expiry against its concrete topic
+   * and the global total. Each discarded queue entry counts once (see
+   * `TopicStats.expiredMessages`).
+   */
+  private recordExpired(topic: string): void {
+    this.totalExpired += 1;
+    const stats = this.topicStats.get(topic);
+    if (stats != null) stats.expiredMessages += 1;
   }
 }

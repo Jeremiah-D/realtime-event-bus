@@ -17,6 +17,11 @@ export interface BoundedQueueOptions<T> {
 interface QueueEntry<T> {
   item: T;
   priority: Priority;
+  /**
+   * Absolute expiry timestamp in milliseconds (same clock as the caller's
+   * `nowMs` argument to `drainLive`). Entries without one never expire.
+   */
+  expiresAt?: number;
 }
 
 export class BoundedQueue<T> {
@@ -27,6 +32,7 @@ export class BoundedQueue<T> {
   private highWaterMarkReached = false;
   private dropped = 0;
   private readonly droppedByPriorityCount = new Map<Priority, number>();
+  private expired = 0;
 
   constructor(options: BoundedQueueOptions<T>) {
     if (!Number.isInteger(options.capacity) || options.capacity <= 0) {
@@ -45,6 +51,11 @@ export class BoundedQueue<T> {
     return this.dropped;
   }
 
+  /** Total entries discarded by `drainLive` because their TTL expired. */
+  get expiredCount(): number {
+    return this.expired;
+  }
+
   /** Per-priority drop counts, useful for backpressure observability. */
   get droppedByPriority(): ReadonlyMap<Priority, number> {
     return this.droppedByPriorityCount;
@@ -61,13 +72,21 @@ export class BoundedQueue<T> {
    *   room — unless the incoming item itself is the strictly lowest-priority
    *   one, in which case the incoming item is discarded instead. High-priority
    *   messages are therefore dropped last.
+   *
+   * `expiresAt` is an absolute timestamp (milliseconds, same clock the caller
+   * passes to `drainLive`); entries without one never expire. Expiry is only
+   * enforced when the queue drains — an entry keeps its slot until then, so
+   * publishing with a TTL does not change backpressure drop behavior.
    */
-  push(item: T, priority: Priority = 0): 'accepted' | 'dropped' {
+  push(item: T, priority: Priority = 0, expiresAt?: number): 'accepted' | 'dropped' {
     if (!Number.isFinite(priority)) {
       throw new RangeError('priority must be a finite number');
     }
+    if (expiresAt !== undefined && (!Number.isFinite(expiresAt) || expiresAt < 0)) {
+      throw new RangeError('expiresAt must be a non-negative finite timestamp');
+    }
     if (this.entries.length < this.capacity) {
-      this.entries.push({ item, priority });
+      this.entries.push({ item, priority, expiresAt });
       this.checkHighWaterMark();
       return 'accepted';
     }
@@ -85,7 +104,7 @@ export class BoundedQueue<T> {
     }
     this.recordDrop(this.entries[victimIndex].priority);
     this.entries.splice(victimIndex, 1);
-    this.entries.push({ item, priority });
+    this.entries.push({ item, priority, expiresAt });
     this.checkHighWaterMark();
     return 'accepted';
   }
@@ -96,6 +115,32 @@ export class BoundedQueue<T> {
     this.entries = [];
     this.highWaterMarkReached = false;
     return items;
+  }
+
+  /**
+   * Removes and returns every non-expired queued item in FIFO order.
+   * Entries whose expiry timestamp is at or before `nowMs` are discarded and
+   * counted (see `expiredCount`) instead of being delivered; entries without
+   * an expiry timestamp are always live.
+   *
+   * Expiry boundary semantics: the deadline is inclusive — an entry is
+   * expired exactly when `nowMs >= expiresAt`, i.e. a message that has been
+   * alive for exactly its TTL is dropped, not delivered.
+   */
+  drainLive(nowMs: number): { live: T[]; expired: T[] } {
+    const live: T[] = [];
+    const expired: T[] = [];
+    for (const entry of this.entries) {
+      if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) {
+        expired.push(entry.item);
+      } else {
+        live.push(entry.item);
+      }
+    }
+    this.entries = [];
+    this.highWaterMarkReached = false;
+    this.expired += expired.length;
+    return { live, expired };
   }
 
   /**
