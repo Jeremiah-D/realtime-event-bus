@@ -109,3 +109,114 @@ test('priority: non-finite priority throws', () => {
   assert.throws(() => q.push('x' as never, NaN), RangeError);
   assert.throws(() => q.push('x' as never, Infinity), RangeError);
 });
+
+test('setHighWaterMarkRatio adjusts the mark at runtime', () => {
+  const seen: number[] = [];
+  const q = new BoundedQueue<number>({ capacity: 10, onHighWaterMark: (s) => seen.push(s) });
+  assert.equal(q.highWaterMark, 8);
+  assert.equal(q.highWaterMarkRatio, 0.8);
+  for (let i = 0; i < 5; i++) q.push(i);
+  assert.deepEqual(seen, []); // below the default mark
+  q.setHighWaterMarkRatio(0.5);
+  assert.equal(q.highWaterMark, 5);
+  assert.equal(q.highWaterMarkRatio, 0.5);
+  q.push(5); // size 6 >= 5: excursion under the new mark
+  assert.deepEqual(seen, [6]);
+});
+
+test('onDrained fires once when the queue recedes below the mark', () => {
+  const events: string[] = [];
+  const q = new BoundedQueue<number>({
+    capacity: 10,
+    onHighWaterMark: () => events.push('high'),
+    onDrained: (size) => events.push(`drained:${size}`),
+  });
+  for (let i = 0; i < 8; i++) q.push(i);
+  assert.deepEqual(events, ['high']);
+  q.drain();
+  assert.deepEqual(events, ['high', 'drained:0']);
+  // Re-arms: a new excursion fires both callbacks again.
+  for (let i = 0; i < 8; i++) q.push(i);
+  q.drain();
+  assert.deepEqual(events, ['high', 'drained:0', 'high', 'drained:0']);
+});
+
+test('onDrained does not fire without a preceding high-water excursion', () => {
+  let drained = 0;
+  const q = new BoundedQueue<number>({ capacity: 10, onDrained: () => drained++ });
+  for (let i = 0; i < 3; i++) q.push(i);
+  q.drain();
+  assert.equal(drained, 0);
+});
+
+test('lowering the mark below the current size mid-excursion fires onDrained immediately', () => {
+  const events: string[] = [];
+  const q = new BoundedQueue<number>({
+    capacity: 10,
+    onHighWaterMark: () => events.push('high'),
+    onDrained: (size) => events.push(`drained:${size}`),
+  });
+  for (let i = 0; i < 8; i++) q.push(i); // excursion at mark 8
+  q.setHighWaterMarkRatio(0.95); // mark 9.5 > size 8: excursion ends now
+  assert.deepEqual(events, ['high', 'drained:8']);
+  assert.equal(q.highWaterMark, 9.5);
+});
+
+test('lowering the mark but staying above the current size keeps the excursion', () => {
+  let drained = 0;
+  const q = new BoundedQueue<number>({ capacity: 10, onDrained: () => drained++ });
+  for (let i = 0; i < 8; i++) q.push(i);
+  q.setHighWaterMarkRatio(0.5); // mark 5 <= size 8: still in excursion
+  assert.equal(drained, 0);
+  q.drain();
+  assert.equal(drained, 1);
+});
+
+test('raising the mark above the current size mid-excursion ends it immediately', () => {
+  const events: string[] = [];
+  const q = new BoundedQueue<number>({
+    capacity: 10,
+    onHighWaterMark: () => events.push('high'),
+    onDrained: (size) => events.push(`drained:${size}`),
+  });
+  for (let i = 0; i < 8; i++) q.push(i); // excursion at mark 8
+  q.setHighWaterMarkRatio(0.9); // mark 9 > size 8: below the new mark, excursion ends
+  assert.deepEqual(events, ['high', 'drained:8']);
+  // The latch re-armed: filling past the new mark fires again.
+  q.push(9); // size 9 >= 9
+  assert.deepEqual(events, ['high', 'drained:8', 'high']);
+});
+
+test('raising the mark but staying at or below the current size keeps the excursion', () => {
+  let drained = 0;
+  const q = new BoundedQueue<number>({ capacity: 10, onDrained: () => drained++ });
+  for (let i = 0; i < 8; i++) q.push(i);
+  q.setHighWaterMarkRatio(0.8); // mark 8 <= size 8: still in excursion
+  assert.equal(drained, 0);
+  q.drain();
+  assert.equal(drained, 1);
+});
+
+test('setHighWaterMarkRatio rejects out-of-range values', () => {
+  const q = new BoundedQueue<number>({ capacity: 10 });
+  for (const bad of [0, -0.5, 1.5, NaN, Infinity]) {
+    assert.throws(() => q.setHighWaterMarkRatio(bad), RangeError);
+  }
+});
+
+test('constructor accepts an initial highWaterMarkRatio', () => {
+  const seen: number[] = [];
+  const q = new BoundedQueue<number>({
+    capacity: 10,
+    highWaterMarkRatio: 0.5,
+    onHighWaterMark: (s) => seen.push(s),
+  });
+  assert.equal(q.highWaterMarkRatio, 0.5);
+  for (let i = 0; i < 5; i++) q.push(i);
+  assert.deepEqual(seen, [5]);
+  assert.throws(() => new BoundedQueue<number>({ capacity: 10, highWaterMarkRatio: 0 }), RangeError);
+  assert.throws(
+    () => new BoundedQueue<number>({ capacity: 10, highWaterMarkRatio: 1.1 }),
+    RangeError,
+  );
+});

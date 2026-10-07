@@ -28,6 +28,21 @@ export interface SubscribeOptions {
    * operator, or degrade gracefully instead of silently dropping messages.
    */
   onBackpressure?: (event: BackpressureEvent) => void;
+  /**
+   * Called when the subscriber's queue recedes below the high-water mark
+   * after a backpressure excursion — the signal that a throttled consumer
+   * may resume full speed. Fires once per excursion, mirroring
+   * `onBackpressure`, and re-arms together with it. Also fires synchronously
+   * if `setHighWaterMarkRatio` moves the mark above the current queue size
+   * mid-excursion.
+   */
+  onDrained?: (event: DrainedEvent) => void;
+  /**
+   * High-water-mark ratio for this subscriber's queue (fraction of
+   * `queueSize`, default 0.8). Must be in (0, 1]. Adjustable at runtime via
+   * `EventBus.setHighWaterMarkRatio`.
+   */
+  highWaterMarkRatio?: number;
 }
 
 export interface ReliableSubscribeOptions extends SubscribeOptions {
@@ -51,6 +66,22 @@ export interface BackpressureEvent {
   capacity: number;
   /** Total messages dropped for this subscriber so far (same as `droppedCount`). */
   dropped: number;
+}
+
+/** Snapshot delivered to `onDrained` when a subscriber's queue recovers. */
+export interface DrainedEvent {
+  /** The subscriber whose queue recovered. */
+  subscriberId: string;
+  /** The topic pattern the subscriber registered. */
+  pattern: string;
+  /** Queue size when the event fired (below the high-water mark). */
+  queueSize: number;
+  /** Configured per-subscriber queue capacity. */
+  capacity: number;
+  /** Total messages dropped for this subscriber so far (same as `droppedCount`). */
+  dropped: number;
+  /** Absolute high-water mark (in items) in effect when the event fired. */
+  highWaterMark: number;
 }
 
 export interface Subscription {
@@ -300,9 +331,11 @@ export class EventBus {
     const id = `sub-${++this.nextId}`;
     const capacity = opts?.queueSize ?? 100;
     const onBackpressure = opts?.onBackpressure;
+    const onDrained = opts?.onDrained;
     const queue = new BoundedQueue<BusMessage>({
       capacity,
       policy: opts?.dropPolicy ?? 'drop-oldest',
+      highWaterMarkRatio: opts?.highWaterMarkRatio,
       ...(onBackpressure == null
         ? {}
         : {
@@ -313,6 +346,19 @@ export class EventBus {
                 queueSize: size,
                 capacity,
                 dropped: queue.droppedCount,
+              }),
+          }),
+      ...(onDrained == null
+        ? {}
+        : {
+            onDrained: (size: number) =>
+              onDrained({
+                subscriberId: id,
+                pattern: topicPattern,
+                queueSize: size,
+                capacity,
+                dropped: queue.droppedCount,
+                highWaterMark: queue.highWaterMark,
               }),
           }),
     });
@@ -513,6 +559,18 @@ export class EventBus {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     return subscriber.queue.droppedCount;
+  }
+
+  /**
+   * Adjusts a subscriber's high-water-mark ratio at runtime (fraction of its
+   * queue capacity, in (0, 1]). If the subscriber is mid-excursion and its
+   * queue is already below the new mark, the excursion ends immediately and
+   * `onDrained` fires synchronously.
+   */
+  setHighWaterMarkRatio(subId: string, ratio: number): void {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    subscriber.queue.setHighWaterMarkRatio(ratio);
   }
 
   /**

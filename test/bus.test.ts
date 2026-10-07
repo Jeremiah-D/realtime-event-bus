@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventBus, compilePattern, type BackpressureEvent } from '../src/bus.ts';
+import {
+  EventBus,
+  compilePattern,
+  type BackpressureEvent,
+  type DrainedEvent,
+} from '../src/bus.ts';
 
 /** Yields until the bus's scheduled microtask flush has run. */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -440,4 +445,54 @@ test('pattern cache entry is evicted when its last subscriber leaves', () => {
       resolve();
     }),
   );
+});
+
+test('onDrained fires when a subscriber recovers from backpressure', async () => {
+  const bus = new EventBus();
+  const drained: DrainedEvent[] = [];
+  const pressured: BackpressureEvent[] = [];
+  const sub = bus.subscribe('t', () => {}, {
+    queueSize: 10,
+    onBackpressure: (e) => pressured.push(e),
+    onDrained: (e) => drained.push(e),
+  });
+  for (let i = 0; i < 8; i++) bus.publish('t', i); // mark 8: excursion
+  assert.equal(pressured.length, 1);
+  await flush(); // drains the queue: recovery
+  assert.equal(drained.length, 1);
+  assert.equal(drained[0].subscriberId, sub.id);
+  assert.equal(drained[0].pattern, 't');
+  assert.equal(drained[0].queueSize, 0);
+  assert.equal(drained[0].capacity, 10);
+  assert.equal(drained[0].highWaterMark, 8);
+});
+
+test('setHighWaterMarkRatio adjusts a subscriber watermark at runtime', async () => {
+  const bus = new EventBus();
+  const drained: DrainedEvent[] = [];
+  const sub = bus.subscribe('t', () => {}, {
+    queueSize: 10,
+    onDrained: (e) => drained.push(e),
+  });
+  for (let i = 0; i < 8; i++) bus.publish('t', i); // excursion at mark 8
+  bus.setHighWaterMarkRatio(sub.id, 0.95); // mark 9.5 > size 8: drained now
+  assert.equal(drained.length, 1);
+  assert.equal(drained[0].queueSize, 8);
+  assert.equal(drained[0].highWaterMark, 9.5);
+  assert.throws(() => bus.setHighWaterMarkRatio('nope', 0.5), /unknown subscriber/);
+  assert.throws(() => bus.setHighWaterMarkRatio(sub.id, 2), RangeError);
+  await flush();
+});
+
+test('subscribe accepts an initial highWaterMarkRatio', () => {
+  const bus = new EventBus();
+  const pressured: BackpressureEvent[] = [];
+  bus.subscribe('t', () => {}, {
+    queueSize: 10,
+    highWaterMarkRatio: 0.5,
+    onBackpressure: (e) => pressured.push(e),
+  });
+  for (let i = 0; i < 5; i++) bus.publish('t', i);
+  assert.equal(pressured.length, 1);
+  assert.equal(pressured[0].queueSize, 5);
 });

@@ -32,7 +32,16 @@ library.
   `subscribe()` accepts an
   `onBackpressure` callback that fires — once per excursion, re-armed after the
   queue drains — when a subscriber's queue reaches its 80% high-water mark,
-  reporting queue size, capacity, and the cumulative `droppedCount`.
+  reporting queue size, capacity, and the cumulative `droppedCount`. A
+  mirrored `onDrained` callback fires when the queue recedes below the mark,
+  signalling the consumer may resume full speed. `subscribeReliable()` opts a
+  subscriber into at-least-once delivery: the handler receives a `Delivery`
+  envelope (`msg`, per-subscriber `seq`, `redeliveries` count) with `ack()` /
+  `nack()` — `nack()` requeues immediately at the tail (FIFO order kept),
+  and deliveries still outstanding after `ackTimeoutMs` (default 5 s) are
+  requeued automatically. Redelivered messages keep their original TTL
+  deadline. `unackedCount(subId)` and `getStats().unackedDeliveries` expose
+  the outstanding-delivery backlog.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
@@ -40,7 +49,12 @@ library.
   `drop-oldest` the oldest lowest-priority entry is shed first, so
   high-priority messages are dropped last; an incoming item that is strictly
   lower priority than the whole backlog is discarded instead of evicting it.
-  `droppedByPriority` exposes per-priority drop counts.
+  `droppedByPriority` exposes per-priority drop counts. The high-water mark is
+  a runtime-tunable ratio of capacity (`setHighWaterMarkRatio`, in (0, 1],
+  also settable per subscriber via `EventBus.setHighWaterMarkRatio`); an
+  `onDrained` callback fires once when the queue recedes below the mark after
+  an excursion — or immediately if the mark is lowered below the current size
+  mid-excursion.
 - **`src/reconnect.ts` — `ReconnectController`**: connection state machine
   (`idle → connecting → connected → backoff → connecting …`) with an
   injectable `BackoffStrategy` (`ReconnectOptions.strategy`). The default is
@@ -81,7 +95,14 @@ npm test
   reporting), and `publishBatch` (single-flush batch fan-out, per-message
   ordering, both drop policies, empty-batch no-op).
 - `test/backpressure.test.ts` — both drop policies, one-shot high-water-mark
-  behavior, drain ordering.
+  behavior, drain ordering, runtime watermark adjustment (`setHighWaterMarkRatio`,
+  validation, mid-excursion lowering/raising semantics) and the `onDrained`
+  recovery callback.
+- `test/ack.test.ts` — at-least-once delivery: ack suppresses redelivery,
+  nack redelivers immediately with a bumped `redeliveries` count, ack timeout
+  auto-requeues, double/late settles are no-ops, unsubscribe cancels pending
+  timers, redelivered messages keep their original TTL deadline, and
+  `ackTimeoutMs` validation.
 - `test/reconnect.test.ts` — exponentially increasing backoff delays within
   the jitter window, give-up after `maxAttempts`, attempt-counter reset on
   successful connect, the disconnect → backoff transition, plus custom

@@ -10,8 +10,19 @@ export type Priority = number;
 export interface BoundedQueueOptions<T> {
   capacity: number;
   policy?: DropPolicy;
-  /** Fired once when size >= capacity * 0.8; re-arms after the size recedes below the watermark. */
+  /** Fired once when size >= the high-water mark; re-arms after the size recedes below the mark. */
   onHighWaterMark?: (size: number) => void;
+  /**
+   * Fired once when the queue recedes below the high-water mark after an
+   * excursion — the consumer-may-resume signal. Never fires without a
+   * preceding `onHighWaterMark`; re-arms together with it.
+   */
+  onDrained?: (size: number) => void;
+  /**
+   * High-water mark as a fraction of capacity (default 0.8). Must be in
+   * (0, 1]. Adjustable at runtime via `setHighWaterMarkRatio`.
+   */
+  highWaterMarkRatio?: number;
 }
 
 interface QueueEntry<T> {
@@ -29,6 +40,8 @@ export class BoundedQueue<T> {
   private readonly capacity: number;
   private readonly policy: DropPolicy;
   private readonly onHighWaterMark?: (size: number) => void;
+  private readonly onDrained?: (size: number) => void;
+  private highWaterMarkFraction: number;
   private highWaterMarkReached = false;
   private dropped = 0;
   private readonly droppedByPriorityCount = new Map<Priority, number>();
@@ -41,6 +54,15 @@ export class BoundedQueue<T> {
     this.capacity = options.capacity;
     this.policy = options.policy ?? 'drop-oldest';
     this.onHighWaterMark = options.onHighWaterMark;
+    this.onDrained = options.onDrained;
+    this.highWaterMarkFraction = options.highWaterMarkRatio ?? 0.8;
+    BoundedQueue.checkRatio(this.highWaterMarkFraction);
+  }
+
+  private static checkRatio(ratio: number): void {
+    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 1) {
+      throw new RangeError('highWaterMarkRatio must be a finite number in (0, 1]');
+    }
   }
 
   get size(): number {
@@ -61,8 +83,38 @@ export class BoundedQueue<T> {
     return this.droppedByPriorityCount;
   }
 
-  private get highWaterMark(): number {
-    return this.capacity * 0.8;
+  /** High-water mark as a fraction of capacity, in (0, 1]. */
+  get highWaterMarkRatio(): number {
+    return this.highWaterMarkFraction;
+  }
+
+  /** Absolute high-water mark in items: `capacity * highWaterMarkRatio`. */
+  get highWaterMark(): number {
+    return this.capacity * this.highWaterMarkFraction;
+  }
+
+  /**
+   * Adjusts the high-water mark at runtime. If an excursion is in flight
+   * and the queue is already below the new mark, the excursion ends
+   * immediately: the latch clears and `onDrained` fires synchronously with
+   * the current size. Throws `RangeError` for values outside (0, 1].
+   */
+  setHighWaterMarkRatio(ratio: number): void {
+    BoundedQueue.checkRatio(ratio);
+    this.highWaterMarkFraction = ratio;
+    this.maybeFireDrained();
+  }
+
+  /**
+   * Ends a high-water-mark excursion when the queue has receded below the
+   * mark: clears the latch and fires `onDrained` once. No-op when no
+   * excursion is in flight.
+   */
+  private maybeFireDrained(): void {
+    if (this.highWaterMarkReached && this.entries.length < this.highWaterMark) {
+      this.highWaterMarkReached = false;
+      this.onDrained?.(this.entries.length);
+    }
   }
 
   /**
@@ -113,7 +165,7 @@ export class BoundedQueue<T> {
   drain(): T[] {
     const items = this.entries.map((entry) => entry.item);
     this.entries = [];
-    this.highWaterMarkReached = false;
+    this.maybeFireDrained();
     return items;
   }
 
@@ -138,7 +190,7 @@ export class BoundedQueue<T> {
       }
     }
     this.entries = [];
-    this.highWaterMarkReached = false;
+    this.maybeFireDrained();
     this.expired += expired.length;
     return { live, expired };
   }
@@ -166,10 +218,11 @@ export class BoundedQueue<T> {
   }
 
   private checkHighWaterMark(): void {
-    if (this.onHighWaterMark == null) return;
+    // The excursion latch is tracked independently of the callbacks so that
+    // `onDrained` works even when no `onHighWaterMark` is registered.
     if (!this.highWaterMarkReached && this.entries.length >= this.highWaterMark) {
       this.highWaterMarkReached = true;
-      this.onHighWaterMark(this.entries.length);
+      this.onHighWaterMark?.(this.entries.length);
     }
   }
 }
