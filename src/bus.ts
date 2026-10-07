@@ -1,4 +1,7 @@
 import { BoundedQueue, type DropPolicy } from './backpressure.ts';
+import { AckTracker, type Delivery } from './ack.ts';
+
+export type { Delivery } from './ack.ts';
 
 export interface BusMessage {
   topic: string;
@@ -6,6 +9,12 @@ export interface BusMessage {
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
+
+/**
+ * Handler for reliable (at-least-once) subscriptions: receives a `Delivery`
+ * envelope with `ack()`/`nack()` instead of a bare message.
+ */
+export type ReliableMessageHandler = (delivery: Delivery<BusMessage>) => void;
 
 export interface SubscribeOptions {
   /** Per-subscriber bounded queue capacity (default 100). */
@@ -19,6 +28,15 @@ export interface SubscribeOptions {
    * operator, or degrade gracefully instead of silently dropping messages.
    */
   onBackpressure?: (event: BackpressureEvent) => void;
+}
+
+export interface ReliableSubscribeOptions extends SubscribeOptions {
+  /**
+   * Milliseconds an unacked delivery may stay outstanding before the bus
+   * requeues it automatically. Defaults to 5000. Must be a positive finite
+   * number.
+   */
+  ackTimeoutMs?: number;
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -88,6 +106,11 @@ export interface BusStats {
    */
   expiredMessages: number;
   /**
+   * Deliveries currently outstanding — handed to reliable subscribers but
+   * not yet acked or nacked — across all subscriptions.
+   */
+  unackedDeliveries: number;
+  /**
    * Number of compiled topic patterns currently held in the pattern cache —
    * one entry per distinct pattern with at least one active subscriber.
    */
@@ -106,6 +129,15 @@ interface Subscriber {
   matcher: RegExp;
   handler: MessageHandler;
   queue: BoundedQueue<BusMessage>;
+  /**
+   * Present for reliable subscriptions: at-least-once delivery state.
+   * `redeliveries` counts, per message, how many times this subscriber has
+   * requeued it — reported back on each `Delivery` for poison detection.
+   */
+  reliable?: {
+    tracker: AckTracker<BusMessage>;
+    redeliveries: WeakMap<BusMessage, number>;
+  };
 }
 
 function escapeRegExp(literal: string): string {
@@ -189,6 +221,14 @@ export class EventBus {
    * `patternCacheSize`.
    */
   private ttlMatcherCache = new Map<string, RegExp>();
+  /**
+   * Original TTL deadlines by message, for redelivery. `fanOut` stamps the
+   * deadline here when a TTL rule matches; the reliable-subscription
+   * requeue path reads it back so a requeued message keeps its
+   * publish-time deadline instead of being resurrected after expiry.
+   * Entries die with their message (WeakMap).
+   */
+  private messageDeadlines = new WeakMap<BusMessage, number>();
   private readonly now: () => number;
 
   constructor(options?: EventBusOptions) {
@@ -302,6 +342,58 @@ export class EventBus {
   }
 
   /**
+   * Registers a reliable handler for topics matching `topicPattern`:
+   * at-least-once delivery semantics. The handler receives a `Delivery`
+   * envelope instead of a bare message — call `delivery.ack()` to confirm
+   * receipt, or `delivery.nack()` to requeue the message for redelivery. A
+   * delivery that is neither acked nor nacked within `ackTimeoutMs` is
+   * requeued automatically, so a stalled consumer cannot lose messages
+   * silently.
+   *
+   * Redelivery preserves FIFO order (requeued at the tail, so a redelivered
+   * message never jumps ahead of newer ones) and the message's original TTL
+   * deadline — a message that outlived its TTL is dropped as expired on the
+   * next drain, not resurrected. Redelivery is at-least-once, not
+   * exactly-once: `delivery.redeliveries` counts prior requeues so consumers
+   * can spot poison messages. All queue options (`queueSize`, `dropPolicy`,
+   * `onBackpressure`) behave as in `subscribe`.
+   */
+  subscribeReliable(
+    topicPattern: string,
+    handler: ReliableMessageHandler,
+    opts?: ReliableSubscribeOptions,
+  ): Subscription {
+    // The bus flush calls `Subscriber.handler` with bare messages; wrap it
+    // so reliable subscribers transparently get tracked deliveries instead.
+    // Assigned synchronously here, before any flush microtask can run.
+    let deliver!: (msg: BusMessage) => void;
+    const sub = this.subscribe(topicPattern, (msg) => deliver(msg), opts);
+    const subscriber = this.subscribers.get(sub.id);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
+    const redeliveries = new WeakMap<BusMessage, number>();
+    const tracker = new AckTracker<BusMessage>({
+      ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
+      onRedeliver: (msg) => {
+        redeliveries.set(msg, (redeliveries.get(msg) ?? 0) + 1);
+        subscriber.queue.push(msg, 0, this.messageDeadlines.get(msg));
+        this.scheduleFlush();
+      },
+    });
+    subscriber.reliable = { tracker, redeliveries };
+    deliver = (msg) => {
+      handler(tracker.track(msg, redeliveries.get(msg) ?? 0));
+    };
+    return {
+      id: sub.id,
+      unsubscribe: () => {
+        // Cancel pending ack timers first: no phantom redeliveries after unsubscribe.
+        tracker.clear();
+        sub.unsubscribe();
+      },
+    };
+  }
+
+  /**
    * Returns the cached compiled RegExp for `pattern`, compiling it on first
    * use. Subscribers on the same pattern share one RegExp instance.
    */
@@ -360,6 +452,7 @@ export class EventBus {
     let accepted = 0;
     const ttlMs = this.ttlForTopic(msg.topic);
     const expiresAt = ttlMs === undefined ? undefined : this.now() + ttlMs;
+    if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
     for (const subscriber of this.subscribers.values()) {
       if (!subscriber.matcher.test(msg.topic)) continue;
       matched += 1;
@@ -383,11 +476,16 @@ export class EventBus {
    * not affect the bus.
    */
   getStats(): BusStats {
+    let unackedDeliveries = 0;
+    for (const subscriber of this.subscribers.values()) {
+      unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
+    }
     return {
       totalSubscribers: this.subscribers.size,
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
       totalPublished: this.totalPublished,
       expiredMessages: this.totalExpired,
+      unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
@@ -415,6 +513,17 @@ export class EventBus {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     return subscriber.queue.droppedCount;
+  }
+
+  /**
+   * Deliveries currently outstanding — handed to this reliable subscriber
+   * but not yet acked or nacked. Always 0 for plain `subscribe`
+   * subscriptions.
+   */
+  unackedCount(subId: string): number {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    return subscriber.reliable?.tracker.unackedCount ?? 0;
   }
 
   private scheduleFlush(): void {
