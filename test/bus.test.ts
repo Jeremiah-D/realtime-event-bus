@@ -334,8 +334,22 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
   const stats = bus.getStats();
   assert.equal(stats.totalPublished, 3);
   assert.deepEqual(stats.topics, [
-    { topic: 'market.btc', subscriberCount: 2, publishedMessages: 2, expiredMessages: 0 },
-    { topic: 'market.eth', subscriberCount: 1, publishedMessages: 1, expiredMessages: 0 },
+    {
+      topic: 'market.btc',
+      subscriberCount: 2,
+      publishedMessages: 2,
+      expiredMessages: 0,
+      lastSeq: 2,
+      sequenceGaps: 0,
+    },
+    {
+      topic: 'market.eth',
+      subscriberCount: 1,
+      publishedMessages: 1,
+      expiredMessages: 0,
+      lastSeq: 1,
+      sequenceGaps: 0,
+    },
   ]);
 });
 

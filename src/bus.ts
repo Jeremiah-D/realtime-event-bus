@@ -6,6 +6,18 @@ export type { Delivery } from './ack.ts';
 export interface BusMessage {
   topic: string;
   payload: unknown;
+  /**
+   * Per-topic sequence number assigned by the bus at publish time. Starts
+   * at 1 and increases by 1 for every message published to the same topic,
+   * no matter how many subscribers receive it. Handlers can compare it with
+   * the previously seen number to detect loss (a jump means messages were
+   * dropped by backpressure or expired by TTL before delivery) and
+   * duplicates / redeliveries (same or lower number than the last seen —
+   * expected under at-least-once semantics, never a gap). This is the
+   * topic-level message order; `Delivery.seq` on reliable subscriptions is
+   * a separate per-subscriber delivery counter.
+   */
+  seq: number;
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
@@ -120,6 +132,23 @@ export interface TopicStats {
    * out to N subscribers whose queues all expire it contributes N here.
    */
   expiredMessages: number;
+  /**
+   * Highest sequence number published on this topic so far (0 when nothing
+   * has been published yet). Compare with the last `seq` a subscriber
+   * received to spot a lost tail the gap detector cannot see.
+   */
+  lastSeq: number;
+  /**
+   * Sequence numbers observed missing by subscribers of this topic. Every
+   * time a delivery arrives with a `seq` more than one above the previously
+   * delivered number for the same subscriber and topic, the count of skipped
+   * numbers is added here (summed across subscribers). Redeliveries — same
+   * or lower `seq` than the last delivered, expected under at-least-once
+   * semantics — never count. Messages shed by backpressure or expired by
+   * TTL surface here as gaps: from the subscriber's point of view they were
+   * lost.
+   */
+  sequenceGaps: number;
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -147,6 +176,12 @@ export interface BusStats {
    */
   patternCacheSize: number;
   /**
+   * Total missing sequence numbers detected across all topics — the sum of
+   * every topic's `sequenceGaps`. See `TopicStats.sequenceGaps` for the
+   * exact counting rules.
+   */
+  sequenceGaps: number;
+  /**
    * Stats for every concrete topic that has seen at least one publish,
    * in order of first publish.
    */
@@ -169,6 +204,17 @@ interface Subscriber {
     tracker: AckTracker<BusMessage>;
     redeliveries: WeakMap<BusMessage, number>;
   };
+  /**
+   * Last per-topic sequence number delivered to this subscriber's handler,
+   * for gap detection. A delivery with `seq` more than one above the stored
+   * number means messages were lost in between (dropped by backpressure or
+   * expired by TTL); the count of missing numbers feeds the topic's
+   * `sequenceGaps` stat. Redeliveries (`seq` at or below the stored number)
+   * are ignored, never counted as gaps. The first delivery on a topic only
+   * establishes the baseline — a subscriber that joins late must not count
+   * pre-subscription messages as lost.
+   */
+  lastDeliveredSeq: Map<string, number>;
 }
 
 function escapeRegExp(literal: string): string {
@@ -234,10 +280,24 @@ export class EventBus {
   private patternCache = new Map<string, RegExp>();
   private topicStats = new Map<
     string,
-    { subscriberCount: number; publishedMessages: number; expiredMessages: number }
+    {
+      subscriberCount: number;
+      publishedMessages: number;
+      expiredMessages: number;
+      lastSeq: number;
+      sequenceGaps: number;
+    }
   >();
   private totalPublished = 0;
   private totalExpired = 0;
+  private totalSequenceGaps = 0;
+  /**
+   * Per-topic sequence counters. Each message published to a topic takes
+   * the next number, so every message carries a topic-scoped monotonic
+   * `seq` starting at 1. Grows with the distinct topics ever published to —
+   * the same bound as `topicStats`.
+   */
+  private topicSeq = new Map<string, number>();
   private nextId = 0;
   private flushScheduled = false;
   /**
@@ -368,6 +428,7 @@ export class EventBus {
       matcher: this.compiledMatcher(topicPattern),
       handler,
       queue,
+      lastDeliveredSeq: new Map(),
     };
     this.subscribers.set(id, subscriber);
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
@@ -460,7 +521,7 @@ export class EventBus {
    * microtask so slow consumers exert real backpressure.
    */
   publish(topic: string, payload: unknown): number {
-    const { accepted } = this.fanOut({ topic, payload });
+    const { accepted } = this.fanOut(topic, payload);
     this.scheduleFlush();
     return accepted;
   }
@@ -472,15 +533,31 @@ export class EventBus {
    * Matching, drop policies, and backpressure callbacks behave exactly as
    * they do for `publish`; returns the total number of accepted deliveries.
    * An empty batch is a no-op that schedules no flush.
+   *
+   * Callers do not supply `seq`: the bus assigns each message its per-topic
+   * sequence number at fan-out time, in batch order.
    */
-  publishBatch(messages: BusMessage[]): number {
+  publishBatch(messages: Array<Omit<BusMessage, 'seq'>>): number {
     if (messages.length === 0) return 0;
     let accepted = 0;
     for (const msg of messages) {
-      accepted += this.fanOut({ topic: msg.topic, payload: msg.payload }).accepted;
+      accepted += this.fanOut(msg.topic, msg.payload).accepted;
     }
     this.scheduleFlush();
     return accepted;
+  }
+
+  /**
+   * Hands out the next per-topic sequence number, starting at 1. The
+   * counter is per concrete topic and never resets, so every message ever
+   * published to a topic carries a unique, gap-free number at publish
+   * time — gaps only ever appear downstream, when a subscriber's queue
+   * drops or expires a message.
+   */
+  private nextSeq(topic: string): number {
+    const seq = (this.topicSeq.get(topic) ?? 0) + 1;
+    this.topicSeq.set(topic, seq);
+    return seq;
   }
 
   /**
@@ -489,28 +566,40 @@ export class EventBus {
    * queues accepted the message (they differ when backpressure drops kick
    * in). Does not schedule a flush — callers do that once per batch.
    *
+   * The message is stamped with its per-topic sequence number here, so all
+   * subscribers see the same `seq` for the same publish regardless of queue
+   * state. `TopicStats.lastSeq` tracks the highest number handed out.
+   *
    * When a TTL rule matches the topic, every enqueued copy is stamped with
    * the same expiry deadline (`publishTime + ttlMs`); the queues discard
    * expired copies at drain time and count them as expired.
    */
-  private fanOut(msg: BusMessage): { matched: number; accepted: number } {
+  private fanOut(topic: string, payload: unknown): { matched: number; accepted: number } {
+    const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
     let matched = 0;
     let accepted = 0;
-    const ttlMs = this.ttlForTopic(msg.topic);
+    const ttlMs = this.ttlForTopic(topic);
     const expiresAt = ttlMs === undefined ? undefined : this.now() + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
     for (const subscriber of this.subscribers.values()) {
-      if (!subscriber.matcher.test(msg.topic)) continue;
+      if (!subscriber.matcher.test(topic)) continue;
       matched += 1;
       if (subscriber.queue.push(msg, 0, expiresAt) === 'accepted') accepted += 1;
     }
-    let stats = this.topicStats.get(msg.topic);
+    let stats = this.topicStats.get(topic);
     if (stats == null) {
-      stats = { subscriberCount: 0, publishedMessages: 0, expiredMessages: 0 };
-      this.topicStats.set(msg.topic, stats);
+      stats = {
+        subscriberCount: 0,
+        publishedMessages: 0,
+        expiredMessages: 0,
+        lastSeq: 0,
+        sequenceGaps: 0,
+      };
+      this.topicStats.set(topic, stats);
     }
     stats.subscriberCount = matched;
     stats.publishedMessages += 1;
+    stats.lastSeq = msg.seq;
     this.totalPublished += 1;
     return { matched, accepted };
   }
@@ -533,11 +622,14 @@ export class EventBus {
       expiredMessages: this.totalExpired,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
+      sequenceGaps: this.totalSequenceGaps,
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,
         publishedMessages: stats.publishedMessages,
         expiredMessages: stats.expiredMessages,
+        lastSeq: stats.lastSeq,
+        sequenceGaps: stats.sequenceGaps,
       })),
     };
   }
@@ -598,6 +690,7 @@ export class EventBus {
           this.recordExpired(msg.topic);
         }
         for (const msg of live) {
+          this.detectGap(subscriber, msg);
           subscriber.handler(msg);
         }
       }
@@ -613,5 +706,31 @@ export class EventBus {
     this.totalExpired += 1;
     const stats = this.topicStats.get(topic);
     if (stats != null) stats.expiredMessages += 1;
+  }
+
+  /**
+   * Compares a delivered message's topic sequence number against the last
+   * number delivered to the same subscriber on the same topic, and counts
+   * any skipped numbers into the topic's `sequenceGaps` stat (and the global
+   * total). The first delivery on a topic only establishes the baseline —
+   * a subscriber that joined after earlier publishes must not count
+   * pre-subscription messages as lost. A delivery at or below the last
+   * delivered number is a redelivery (at-least-once `nack()` / ack-timeout
+   * requeue): expected, never a gap, and it does not move the baseline
+   * backwards.
+   */
+  private detectGap(subscriber: Subscriber, msg: BusMessage): void {
+    const last = subscriber.lastDeliveredSeq.get(msg.topic);
+    if (last === undefined) {
+      subscriber.lastDeliveredSeq.set(msg.topic, msg.seq);
+      return;
+    }
+    if (msg.seq > last + 1) {
+      const missing = msg.seq - last - 1;
+      this.totalSequenceGaps += missing;
+      const stats = this.topicStats.get(msg.topic);
+      if (stats != null) stats.sequenceGaps += missing;
+    }
+    if (msg.seq > last) subscriber.lastDeliveredSeq.set(msg.topic, msg.seq);
   }
 }

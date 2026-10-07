@@ -41,7 +41,12 @@ library.
   and deliveries still outstanding after `ackTimeoutMs` (default 5 s) are
   requeued automatically. Redelivered messages keep their original TTL
   deadline. `unackedCount(subId)` and `getStats().unackedDeliveries` expose
-  the outstanding-delivery backlog.
+  the outstanding-delivery backlog. Every message carries a per-topic `seq`
+  (monotonic from 1, assigned at publish time); the bus watches each
+  subscriber's deliveries and counts skipped numbers into `getStats()`
+  `sequenceGaps` (per topic and global, with `lastSeq` per topic) —
+  backpressure drops and TTL expiries surface as gaps, while at-least-once
+  redeliveries never do.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
@@ -115,6 +120,11 @@ npm test
   back to reconnect (no stacked pings), pings stay silent while the
   controller is not connected, consecutive timeouts grow the miss counter
   until a pong resets it, and `stop()` halts the interval.
+- `test/sequence.test.ts` — per-topic sequence numbers (starting at 1,
+  independent per topic, consecutive across `publishBatch`), `lastSeq` in
+  `getStats`, and gap detection: backpressure drops and TTL expiries count
+  as gaps, redeliveries and late-joining subscribers don't, and gaps
+  aggregate per topic across subscribers.
 
 ## Benchmark
 
