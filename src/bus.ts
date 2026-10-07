@@ -1,6 +1,7 @@
 import { BoundedQueue, type DropPolicy } from './backpressure.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
+import { DurableTopicLog } from './durablelog.ts';
 
 export type { Delivery } from './ack.ts';
 
@@ -81,6 +82,27 @@ export interface SubscribeOptions {
    * `onDrained` already signals the return to full speed.
    */
   onThrottled?: (event: ThrottleEvent) => void;
+  /**
+   * Resume-from offset for durable-log replay. When the bus has a durable
+   * log (`EventBusOptions.durableLogDir`), the subscriber's queue is
+   * pre-filled at subscribe time with every logged message on topics
+   * matching its pattern whose per-topic `seq` is greater than
+   * `resumeFromSeq` — so a consumer that disconnected (or a process that
+   * restarted) picks up where it left off. `0` replays everything logged.
+   * Messages keep their original `seq` and TTL deadline; ones whose TTL
+   * already expired are dropped as expired at drain time, not resurrected.
+   * Cross-topic order follows publish time (`at`), per-topic order follows
+   * `seq` — the same per-topic ordering live delivery gives; there is no
+   * global total order across topics.
+   *
+   * Requires `durableLogDir`: passing `resumeFromSeq` without it throws
+   * `RangeError` instead of silently replaying nothing. Must be a
+   * non-negative integer. For consumer-group members the replay is per
+   * member — each member replays into its own queue from its own offset,
+   * so seed it from that member's own committed offset (see
+   * `commitOffset`), not the group's assignment watermark.
+   */
+  resumeFromSeq?: number;
 }
 
 /**
@@ -214,6 +236,22 @@ export interface EventBusOptions {
    * clock here for deterministic expiry tests.
    */
   now?: () => number;
+  /**
+   * Enables the durable topic log: every published message is appended to
+   * an append-only per-topic JSONL log under this directory (created when
+   * missing), so a restarted process — a new `EventBus` pointed at the same
+   * directory — recovers per-topic sequence counters and can replay missed
+   * messages to resubscribing consumers via
+   * `SubscribeOptions.resumeFromSeq`. Disabled by default; when enabled,
+   * every `publish` pays one synchronous file append.
+   */
+  durableLogDir?: string;
+  /**
+   * Maximum retained log entries per topic before the log compacts away the
+   * oldest entries (default 10000). Only meaningful with `durableLogDir`.
+   * Must be a positive integer.
+   */
+  durableLogMaxEntriesPerTopic?: number;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -310,6 +348,20 @@ export interface BusStats {
    * group subscription is active.
    */
   consumerGroups: Array<{ groupId: string; pattern: string; members: number }>;
+  /**
+   * Durable topic log state (`EventBusOptions.durableLogDir`). Absent when
+   * the durable log is disabled.
+   */
+  durableLog?: {
+    /** The log directory, as configured. */
+    dir: string;
+    /** Topics with at least one logged entry. */
+    topics: number;
+    /** Total logged entries across all topics. */
+    entries: number;
+    /** Malformed log lines skipped during recovery/reads. */
+    corruptLines: number;
+  };
 }
 
 interface Subscriber {
@@ -573,9 +625,36 @@ export class EventBus {
    */
   private committedOffsets = new Map<string, Map<string, number>>();
   private readonly now: () => number;
+  /**
+   * Durable topic log, present only when `EventBusOptions.durableLogDir`
+   * was given. Every `fanOut` appends the stamped message here; the
+   * per-topic sequence counters are seeded from it at construction so a
+   * restart never reuses a sequence number.
+   */
+  private readonly durableLog?: DurableTopicLog;
 
   constructor(options?: EventBusOptions) {
     this.now = options?.now ?? Date.now;
+    if (options?.durableLogDir != null) {
+      this.durableLog = DurableTopicLog.open({
+        dir: options.durableLogDir,
+        maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
+      });
+      // Recover numbering continuity: the next publish on a logged topic
+      // continues the on-disk sequence, and stats reflect the recovered
+      // history instead of pretending the bus is brand new.
+      for (const topic of this.durableLog.topics()) {
+        const lastSeq = this.durableLog.lastSeq(topic);
+        this.topicSeq.set(topic, lastSeq);
+        this.topicStats.set(topic, {
+          subscriberCount: 0,
+          publishedMessages: this.durableLog.entryCount(topic),
+          expiredMessages: 0,
+          lastSeq,
+          sequenceGaps: 0,
+        });
+      }
+    }
   }
 
   /**
@@ -640,6 +719,17 @@ export class EventBus {
    * many of its messages were shed.
    */
   subscribe(topicPattern: string, handler: MessageHandler, opts?: SubscribeOptions): Subscription {
+    // Validate the durable-log resume options before registering anything:
+    // a throw must not leave a half-registered subscriber behind.
+    const resumeFromSeq = opts?.resumeFromSeq;
+    if (resumeFromSeq !== undefined) {
+      if (this.durableLog == null) {
+        throw new RangeError('resumeFromSeq requires EventBusOptions.durableLogDir to be set');
+      }
+      if (!Number.isInteger(resumeFromSeq) || resumeFromSeq < 0) {
+        throw new RangeError('resumeFromSeq must be a non-negative integer');
+      }
+    }
     const id = `sub-${++this.nextId}`;
     const capacity = opts?.queueSize ?? 100;
     const onBackpressure = opts?.onBackpressure;
@@ -709,6 +799,15 @@ export class EventBus {
       this.prefixIndex.set(indexKey, indexBucket);
     }
     indexBucket.add(id);
+
+    // Durable-log resume: pre-fill the queue with logged messages the
+    // subscriber missed (seq > resumeFromSeq on matching topics), in
+    // publish-time order per topic, before any live message. Queue push
+    // applies the subscriber's normal backpressure policy to replayed
+    // messages too; a flush is scheduled so they are delivered promptly.
+    if (resumeFromSeq !== undefined) {
+      this.replayLog(subscriber, resumeFromSeq);
+    }
 
     return {
       id,
@@ -1050,6 +1149,38 @@ export class EventBus {
   }
 
   /**
+   * Replays durable-log records into a resubscribing subscriber's queue:
+   * every logged message on a topic matching the subscriber's pattern with
+   * `seq` greater than `fromSeq` is re-enqueued with its original `seq` and
+   * TTL deadline. Cross-topic order follows publish time (`at`), then seq,
+   * then topic name — deterministic; per-topic order follows `seq`, the
+   * same order live delivery gives. Expired deadlines are kept on the
+   * message so the drain drops them as expired instead of resurrecting
+   * stale data.
+   *
+   * Replayed messages go through the subscriber's normal queue (and its
+   * backpressure policy) but bypass consumer-group assignment: group replay
+   * is per member, from each member's own offset.
+   */
+  private replayLog(subscriber: Subscriber, fromSeq: number): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const matcher = subscriber.matcher;
+    const records: Array<{ seq: number; topic: string; at: number; expiresAt?: number; payload: unknown }> = [];
+    for (const topic of log.topics()) {
+      if (!matcher.test(topic)) continue;
+      for (const rec of log.readSince(topic, fromSeq)) records.push(rec);
+    }
+    records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    for (const rec of records) {
+      const msg: BusMessage = { topic: rec.topic, payload: rec.payload, seq: rec.seq };
+      if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
+      subscriber.queue.push(msg, 0, rec.expiresAt);
+    }
+    this.scheduleFlush();
+  }
+
+  /**
    * Fans the message out to every matching subscriber's bounded queue and
    * returns the number of subscribers whose queue accepted the message.
    * When a queue is full, the subscriber's drop policy sheds a message and
@@ -1141,9 +1272,16 @@ export class EventBus {
     const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
     let matched = 0;
     let accepted = 0;
+    // One clock reading for the publish: TTL deadline and log timestamp stay
+    // consistent even if the injected clock moves between the two.
+    const nowMs = this.now();
     const ttlMs = this.ttlForTopic(topic);
-    const expiresAt = ttlMs === undefined ? undefined : this.now() + ttlMs;
+    const expiresAt = ttlMs === undefined ? undefined : nowMs + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
+    // Durable log (opt-in): persist the stamped message before fan-out, so a
+    // crash between publish and delivery still leaves it replayable. Logging
+    // never throws into the publish path — see `DurableTopicLog.append`.
+    this.durableLog?.append({ seq: msg.seq, topic, at: nowMs, expiresAt, payload });
     // The prefix index prunes the regex tests down to subscribers whose
     // pattern's literal prefix can plausibly match the topic; the compiled
     // regex stays the final authority, and the no-miss invariant in
@@ -1236,6 +1374,14 @@ export class EventBus {
         lastSeq: stats.lastSeq,
         sequenceGaps: stats.sequenceGaps,
       })),
+      ...(this.durableLog == null
+        ? {}
+        : {
+            durableLog: {
+              dir: this.durableLog.dir,
+              ...this.durableLog.stats(),
+            },
+          }),
     };
   }
 

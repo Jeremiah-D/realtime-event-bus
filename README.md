@@ -70,6 +70,28 @@ library.
   per-topic `seq` handed to any member) and consumer checkpoints
   (`commitOffset` / `getCommittedOffsets`); `getStats().consumerGroups`
   lists live groups.
+- **`src/durablelog.ts` — `DurableTopicLog`**: opt-in append-only per-topic
+  JSONL log (`new EventBus({ durableLogDir })`). Every published message is
+  appended as one line (`{v, seq, topic, at, expiresAt?, payload}`, one file
+  per URL-encoded topic) before fan-out, so a restarted process pointed at
+  the same directory recovers per-topic sequence counters — numbering
+  continues gap-free, never reused — and `getStats()` reflects the recovered
+  history. A resubscribing consumer passes
+  `subscribe(pattern, handler, { resumeFromSeq })` to pre-fill its queue with
+  every logged message on matching topics with `seq` greater than
+  `resumeFromSeq` (`0` = everything): per-topic order follows `seq`,
+  cross-topic order follows publish time, original TTL deadlines are kept
+  (already-expired replays are dropped as expired at drain, not resurrected),
+  and replay goes through the normal queue backpressure policy. For
+  consumer-group members replay is per member from each member's own offset
+  (seed from that member's `commitOffset`). `resumeFromSeq` without
+  `durableLogDir` throws instead of silently replaying nothing. Hot topics
+  compact automatically (`durableLogMaxEntriesPerTopic`, default 10000,
+  amortized rewrite at 2x). Corrupt log lines are skipped and counted
+  (`getStats().durableLog.corruptLines`), never fatal; payloads
+  `JSON.stringify` cannot represent are delivered live but skipped by the
+  log. Durability is process-restart grade (synchronous appends, no
+  per-message `fsync`) — a crash log for recovery, not a write-ahead log.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
@@ -145,6 +167,14 @@ npm test
   isolation (own drop policy), `getGroupOffsets` watermark,
   `commitOffset`/`getCommittedOffsets` round-trip and validation,
   `getStats().consumerGroups`, and `**` patterns.
+- `test/durablelog.test.ts` — durable topic log: append/readSince round-trip,
+  reopen recovery of topics/seqs/counts, corrupt-line tolerance, amortized
+  compaction, option validation; bus integration: per-publish logging with
+  seq and TTL deadline, seq continuity across restart, `resumeFromSeq`
+  replay (missed-only, pattern-scoped, `0` = everything), loud failure when
+  `durableLogDir` is missing, TTL-expired replays counted as expired, no
+  phantom sequence gaps after replay, per-member group replay, unserializable
+  payloads delivered live but not logged, and the on-disk JSONL line format.
 - `test/backpressure.test.ts` — both drop policies, one-shot high-water-mark
   behavior, drain ordering, runtime watermark adjustment (`setHighWaterMarkRatio`,
   validation, mid-excursion lowering/raising semantics) and the `onDrained`
