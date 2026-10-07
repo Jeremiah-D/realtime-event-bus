@@ -1,5 +1,6 @@
 import { BoundedQueue, type DropPolicy } from './backpressure.ts';
 import { AckTracker, type Delivery } from './ack.ts';
+import { TokenBucket } from './throttle.ts';
 
 export type { Delivery } from './ack.ts';
 
@@ -55,6 +56,77 @@ export interface SubscribeOptions {
    * `EventBus.setHighWaterMarkRatio`.
    */
   highWaterMarkRatio?: number;
+  /**
+   * Opt-in adaptive publish-side throttling for a slow subscriber. When the
+   * subscriber's queue crosses the high-water mark, the bus rate-limits how
+   * many freshly published messages are fanned out to it (per-subscriber
+   * token bucket) instead of letting every publish churn through the queue's
+   * drop policy. Messages shed by the throttle never reach the queue and are
+   * counted separately (see `throttledCount`); they surface as sequence gaps
+   * like any other loss. When the queue drains below the mark, throttling
+   * disengages and the subscriber resumes full speed — and the drain rate
+   * measured during the excursion seeds the next engagement, so the throttle
+   * converges on the consumer's real speed. Disabled by default.
+   *
+   * Pass `true` for the defaults, or a `ThrottleOptions` object to tune the
+   * rate bounds. Invalid rates throw `RangeError` from `subscribe`.
+   */
+  throttle?: boolean | ThrottleOptions;
+  /**
+   * Called when adaptive throttling engages for this subscriber (see
+   * `throttle`): its queue crossed the high-water mark and the bus is now
+   * rate-limiting fan-out to it. Fires once per engagement; the enforced
+   * rate and whether it was adapted from the subscriber's measured drain
+   * rate arrive in the event. Disengagement needs no event: the existing
+   * `onDrained` already signals the return to full speed.
+   */
+  onThrottled?: (event: ThrottleEvent) => void;
+}
+
+/**
+ * Tuning for adaptive publish-side throttling (`SubscribeOptions.throttle`).
+ * All rates are messages per second. Bounds are validated at `subscribe`
+ * time; violations throw `RangeError`.
+ */
+export interface ThrottleOptions {
+  /**
+   * Floor of the enforced publish rate while throttled. Must be a positive
+   * finite number. Default 1 — a throttled subscriber is slowed, never
+   * fully stalled.
+   */
+  minRatePerSec?: number;
+  /**
+   * Ceiling of the enforced publish rate while throttled. Must be positive;
+   * `Infinity` (the default) means no ceiling.
+   */
+  maxRatePerSec?: number;
+  /**
+   * Rate enforced on the first backpressure excursion, before any drain rate
+   * has been observed for this subscriber. Must be a positive finite number.
+   * Defaults to one high-water-mark worth of messages per second
+   * (`queueSize * highWaterMarkRatio`, at least 1).
+   */
+  initialRatePerSec?: number;
+}
+
+/** Snapshot delivered to `onThrottled` when adaptive throttling engages. */
+export interface ThrottleEvent {
+  /** The subscriber whose fan-out is now rate-limited. */
+  subscriberId: string;
+  /** The topic pattern the throttled subscriber registered. */
+  pattern: string;
+  /** Publish-side rate now enforced for this subscriber, messages/sec. */
+  ratePerSec: number;
+  /** Queue size when throttling engaged (at or above the high-water mark). */
+  queueSize: number;
+  /** Configured per-subscriber queue capacity. */
+  capacity: number;
+  /**
+   * True when the rate was adapted from this subscriber's measured drain
+   * rate during its previous excursion; false on the first excursion, when
+   * the configured initial rate applies.
+   */
+  adapted: boolean;
 }
 
 export interface ReliableSubscribeOptions extends SubscribeOptions {
@@ -182,6 +254,12 @@ export interface BusStats {
    */
   sequenceGaps: number;
   /**
+   * Subscriptions currently under adaptive publish-side throttling (see
+   * `SubscribeOptions.throttle`): their queues crossed the high-water mark
+   * and the bus is rate-limiting fan-out to them until their queues drain.
+   */
+  throttledSubscribers: number;
+  /**
    * Stats for every concrete topic that has seen at least one publish,
    * in order of first publish.
    */
@@ -215,6 +293,38 @@ interface Subscriber {
    * pre-subscription messages as lost.
    */
   lastDeliveredSeq: Map<string, number>;
+  /**
+   * Adaptive publish-side throttling state (see `SubscribeOptions.throttle`).
+   * Absent when throttling is disabled for this subscriber.
+   */
+  throttle?: ThrottleState;
+  /** Fired once when adaptive throttling engages for this subscriber. */
+  onThrottled?: (event: ThrottleEvent) => void;
+}
+
+/**
+ * Per-subscriber adaptive throttling state. The token bucket is (re)created
+ * on every engagement with one second's worth of burst; `observedDrainRatePerSec`
+ * survives across excursions so re-engagement starts at the consumer's
+ * measured speed.
+ */
+interface ThrottleState {
+  bucket: TokenBucket;
+  /** Whether fan-out to this subscriber is currently rate-limited. */
+  throttled: boolean;
+  /** Rate currently (or last) enforced, messages/sec. */
+  ratePerSec: number;
+  /** Messages shed at the publish side by the throttle. */
+  throttledDrops: number;
+  /** Drain rate measured during the previous excursion, messages/sec. */
+  observedDrainRatePerSec?: number;
+  /** `now()` reading when the current excursion started. */
+  backpressureAtMs: number;
+  /** Queue size when the current excursion started. */
+  sizeAtBackpressure: number;
+  minRatePerSec: number;
+  maxRatePerSec: number;
+  initialRatePerSec: number;
 }
 
 function escapeRegExp(literal: string): string {
@@ -266,6 +376,59 @@ export function compilePattern(pattern: string): RegExp {
   }
   source += '$';
   return new RegExp(source);
+}
+
+/**
+ * Validates `SubscribeOptions.throttle` and builds the initial per-subscriber
+ * throttle state. Returns `undefined` when throttling is disabled. Throws
+ * `RangeError` for invalid rates.
+ */
+function resolveThrottleOptions(
+  opt: boolean | ThrottleOptions | undefined,
+  capacity: number,
+  hwmRatio: number,
+  now: () => number,
+): ThrottleState | undefined {
+  if (opt == null || opt === false) return undefined;
+  const o: ThrottleOptions = opt === true ? {} : opt;
+  const checkRate = (name: string, value: number | undefined, fallback: number): number => {
+    if (value === undefined) return fallback;
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new RangeError(`throttle.${name} must be a positive finite number of messages/sec`);
+    }
+    return value;
+  };
+  const minRatePerSec = checkRate('minRatePerSec', o.minRatePerSec, 1);
+  let maxRatePerSec: number;
+  if (o.maxRatePerSec === undefined) {
+    maxRatePerSec = Infinity;
+  } else if (o.maxRatePerSec === Infinity || (Number.isFinite(o.maxRatePerSec) && o.maxRatePerSec > 0)) {
+    maxRatePerSec = o.maxRatePerSec;
+  } else {
+    throw new RangeError('throttle.maxRatePerSec must be a positive number of messages/sec');
+  }
+  if (minRatePerSec > maxRatePerSec) {
+    throw new RangeError('throttle.minRatePerSec must not exceed throttle.maxRatePerSec');
+  }
+  const initialRatePerSec = checkRate(
+    'initialRatePerSec',
+    o.initialRatePerSec,
+    Math.max(1, Math.floor(capacity * hwmRatio)),
+  );
+  const clampedInitial = Math.min(Math.max(initialRatePerSec, minRatePerSec), maxRatePerSec);
+  return {
+    // Created for real on first engagement; the placeholder keeps the
+    // state shape uniform until then.
+    bucket: new TokenBucket(Math.max(1, Math.ceil(clampedInitial)), clampedInitial, now),
+    throttled: false,
+    ratePerSec: clampedInitial,
+    throttledDrops: 0,
+    backpressureAtMs: 0,
+    sizeAtBackpressure: 0,
+    minRatePerSec,
+    maxRatePerSec,
+    initialRatePerSec: clampedInitial,
+  };
 }
 
 export class EventBus {
@@ -392,34 +555,48 @@ export class EventBus {
     const capacity = opts?.queueSize ?? 100;
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
+    const onThrottled = opts?.onThrottled;
+    const hwmRatio = opts?.highWaterMarkRatio ?? 0.8;
+    const throttle = resolveThrottleOptions(opts?.throttle, capacity, hwmRatio, this.now);
     const queue = new BoundedQueue<BusMessage>({
       capacity,
       policy: opts?.dropPolicy ?? 'drop-oldest',
       highWaterMarkRatio: opts?.highWaterMarkRatio,
-      ...(onBackpressure == null
+      // The internal wrappers are registered whenever throttling is enabled,
+      // even without user callbacks: the bus needs the excursion signals to
+      // engage/disengage the throttle.
+      ...(onBackpressure == null && throttle == null
         ? {}
         : {
-            onHighWaterMark: (size: number) =>
-              onBackpressure({
+            onHighWaterMark: (size: number) => {
+              if (throttle != null) {
+                this.engageThrottle(subscriber, size, capacity);
+              }
+              onBackpressure?.({
                 subscriberId: id,
                 pattern: topicPattern,
                 queueSize: size,
                 capacity,
                 dropped: queue.droppedCount,
-              }),
+              });
+            },
           }),
-      ...(onDrained == null
+      ...(onDrained == null && throttle == null
         ? {}
         : {
-            onDrained: (size: number) =>
-              onDrained({
+            onDrained: (size: number) => {
+              if (throttle != null) {
+                this.releaseThrottle(subscriber, size);
+              }
+              onDrained?.({
                 subscriberId: id,
                 pattern: topicPattern,
                 queueSize: size,
                 capacity,
                 dropped: queue.droppedCount,
                 highWaterMark: queue.highWaterMark,
-              }),
+              });
+            },
           }),
     });
     const subscriber: Subscriber = {
@@ -429,6 +606,8 @@ export class EventBus {
       handler,
       queue,
       lastDeliveredSeq: new Map(),
+      throttle,
+      onThrottled,
     };
     this.subscribers.set(id, subscriber);
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
@@ -584,6 +763,14 @@ export class EventBus {
     for (const subscriber of this.subscribers.values()) {
       if (!subscriber.matcher.test(topic)) continue;
       matched += 1;
+      const throttle = subscriber.throttle;
+      if (throttle != null && throttle.throttled && !throttle.bucket.take()) {
+        // Publish-side shed: the message never reaches the queue, so the
+        // drop policy never churns on it. Counted separately from queue
+        // drops; sequence-gap detection surfaces the loss downstream.
+        throttle.throttledDrops += 1;
+        continue;
+      }
       if (subscriber.queue.push(msg, 0, expiresAt) === 'accepted') accepted += 1;
     }
     let stats = this.topicStats.get(topic);
@@ -612,8 +799,10 @@ export class EventBus {
    */
   getStats(): BusStats {
     let unackedDeliveries = 0;
+    let throttledSubscribers = 0;
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
+      if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
     }
     return {
       totalSubscribers: this.subscribers.size,
@@ -623,6 +812,7 @@ export class EventBus {
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       sequenceGaps: this.totalSequenceGaps,
+      throttledSubscribers,
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,
@@ -654,6 +844,17 @@ export class EventBus {
   }
 
   /**
+   * Messages shed at the publish side for a subscriber by adaptive
+   * throttling (see `SubscribeOptions.throttle`). Always 0 when throttling
+   * is disabled for the subscriber.
+   */
+  throttledCount(subId: string): number {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    return subscriber.throttle?.throttledDrops ?? 0;
+  }
+
+  /**
    * Adjusts a subscriber's high-water-mark ratio at runtime (fraction of its
    * queue capacity, in (0, 1]). If the subscriber is mid-excursion and its
    * queue is already below the new mark, the excursion ends immediately and
@@ -674,6 +875,62 @@ export class EventBus {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     return subscriber.reliable?.tracker.unackedCount ?? 0;
+  }
+
+  /**
+   * Engages adaptive publish-side throttling for a subscriber whose queue
+   * crossed the high-water mark. The enforced rate is the drain rate measured
+   * during the previous excursion when one exists (adapted to the consumer's
+   * real speed), otherwise the configured initial rate. A fresh token bucket
+   * with one second's worth of burst starts full, so the engagement itself
+   * never sheds the messages already in flight.
+   */
+  private engageThrottle(subscriber: Subscriber, size: number, capacity: number): void {
+    const throttle = subscriber.throttle;
+    if (throttle == null || throttle.throttled) return;
+    const adapted = throttle.observedDrainRatePerSec !== undefined;
+    const target = adapted ? throttle.observedDrainRatePerSec! : throttle.initialRatePerSec;
+    throttle.ratePerSec = Math.min(Math.max(target, throttle.minRatePerSec), throttle.maxRatePerSec);
+    throttle.bucket = new TokenBucket(
+      Math.max(1, Math.ceil(throttle.ratePerSec)),
+      throttle.ratePerSec,
+      this.now,
+    );
+    throttle.throttled = true;
+    throttle.backpressureAtMs = this.now();
+    throttle.sizeAtBackpressure = size;
+    subscriber.onThrottled?.({
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      ratePerSec: throttle.ratePerSec,
+      queueSize: size,
+      capacity,
+      adapted,
+    });
+  }
+
+  /**
+   * Disengages throttling when the subscriber's queue drains below the
+   * high-water mark: full speed resumes immediately, and the drain rate
+   * measured over this excursion seeds the next engagement. A zero or
+   * negative elapsed time (e.g. the excursion ended via
+   * `setHighWaterMarkRatio` in the same millisecond) keeps the previous
+   * observation instead of recording a bogus rate.
+   */
+  private releaseThrottle(subscriber: Subscriber, size: number): void {
+    const throttle = subscriber.throttle;
+    if (throttle == null || !throttle.throttled) return;
+    const elapsedMs = this.now() - throttle.backpressureAtMs;
+    if (elapsedMs > 0) {
+      const observedPerSec = ((throttle.sizeAtBackpressure - size) / elapsedMs) * 1000;
+      if (observedPerSec >= 0) {
+        throttle.observedDrainRatePerSec = Math.min(
+          Math.max(observedPerSec, throttle.minRatePerSec),
+          throttle.maxRatePerSec,
+        );
+      }
+    }
+    throttle.throttled = false;
   }
 
   private scheduleFlush(): void {

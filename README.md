@@ -60,6 +60,23 @@ library.
   `onDrained` callback fires once when the queue recedes below the mark after
   an excursion — or immediately if the mark is lowered below the current size
   mid-excursion.
+- **`src/throttle.ts` — `TokenBucket` + adaptive publish-side throttling**:
+  opt-in per subscriber via `subscribe(..., { throttle: true })`. When the
+  subscriber's queue crosses the high-water mark, the bus rate-limits how many
+  freshly published messages are fanned out to it (per-subscriber token
+  bucket, one second of burst) instead of letting every publish churn through
+  the queue's drop policy. Messages shed by the throttle never reach the
+  queue — `throttledCount(subId)` counts them separately and they surface as
+  sequence gaps like any other loss. When the queue drains below the mark,
+  throttling disengages and full speed resumes; the drain rate measured over
+  the excursion seeds the next engagement, so the throttle converges on the
+  consumer's real speed. `onThrottled` fires once per engagement with the
+  enforced rate and whether it was adapted from a measured drain rate;
+  `getStats().throttledSubscribers` reports how many subscribers are
+  currently throttled. Rate bounds are tunable
+  (`{ minRatePerSec, maxRatePerSec, initialRatePerSec }`); invalid rates
+  throw `RangeError` from `subscribe`. Disabled by default — existing
+  backpressure behavior is unchanged unless a subscriber opts in.
 - **`src/reconnect.ts` — `ReconnectController`**: connection state machine
   (`idle → connecting → connected → backoff → connecting …`) with an
   injectable `BackoffStrategy` (`ReconnectOptions.strategy`). The default is
