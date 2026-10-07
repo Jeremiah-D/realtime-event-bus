@@ -248,6 +248,15 @@ export interface BusStats {
    */
   patternCacheSize: number;
   /**
+   * Number of distinct literal-prefix keys currently held in the
+   * publish-side prefix index — one entry per prefix with at least one
+   * active subscriber. Patterns that share a literal prefix (e.g. several
+   * `market.btc.*` subscribers) share one key, and patterns starting with
+   * a wildcard file under the empty key, so this stays small relative to
+   * the subscriber count unless patterns are all prefix-distinct.
+   */
+  indexSize: number;
+  /**
    * Total missing sequence numbers detected across all topics — the sum of
    * every topic's `sequenceGaps`. See `TopicStats.sequenceGaps` for the
    * exact counting rules.
@@ -441,6 +450,15 @@ export class EventBus {
    * cache cannot grow without bound.
    */
   private patternCache = new Map<string, RegExp>();
+  /**
+   * Publish-side prefix inverted index: maps a pattern's literal-segment
+   * prefix to the ids of the subscribers registered on patterns with that
+   * prefix (see `patternPrefixKey`). `fanOut` consults it to prune the
+   * compiled-regex tests down to plausible candidates instead of scanning
+   * every subscriber. Keys are evicted when their last subscriber leaves,
+   * so the index cannot grow without bound.
+   */
+  private prefixIndex = new Map<string, Set<string>>();
   private topicStats = new Map<
     string,
     {
@@ -611,11 +629,27 @@ export class EventBus {
     };
     this.subscribers.set(id, subscriber);
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
+    // File the subscriber in the publish-side prefix index under its
+    // pattern's literal prefix (see `patternPrefixKey`).
+    const indexKey = EventBus.patternPrefixKey(topicPattern);
+    let indexBucket = this.prefixIndex.get(indexKey);
+    if (indexBucket == null) {
+      indexBucket = new Set<string>();
+      this.prefixIndex.set(indexKey, indexBucket);
+    }
+    indexBucket.add(id);
 
     return {
       id,
       unsubscribe: () => {
         if (!this.subscribers.delete(id)) return;
+        const bucket = this.prefixIndex.get(indexKey);
+        if (bucket != null) {
+          bucket.delete(id);
+          // Evict emptied keys so a churn of short-lived patterns cannot
+          // grow the index without bound.
+          if (bucket.size === 0) this.prefixIndex.delete(indexKey);
+        }
         const remaining = (this.subscribersByPattern.get(topicPattern) ?? 1) - 1;
         if (remaining <= 0) {
           this.subscribersByPattern.delete(topicPattern);
@@ -677,6 +711,59 @@ export class EventBus {
         sub.unsubscribe();
       },
     };
+  }
+
+  /**
+   * Returns the inverted-index key for a topic pattern: the dot-joined
+   * literal segments before the pattern's first wildcard (`*` / `**`)
+   * segment, or the empty string when the pattern starts with a wildcard.
+   * Examples: `market.btc.*` → `market.btc`; `market.**` → `market`;
+   * `**`, `*`, `*.foo`, `**.foo` → `''`; exact `a.b` → `a.b`.
+   */
+  private static patternPrefixKey(pattern: string): string {
+    const segments = pattern.split('.');
+    let end = 0;
+    while (end < segments.length && segments[end] !== '*' && segments[end] !== '**') {
+      end += 1;
+    }
+    return segments.slice(0, end).join('.');
+  }
+
+  /**
+   * Collects the candidate subscriber ids for a publish to `topic` from the
+   * prefix index. Candidate keys are the full topic, every progressively
+   * shorter segment prefix, and finally the empty key (patterns whose first
+   * segment is a wildcard).
+   *
+   * No-miss invariant (why the candidates are a safe over-approximation):
+   * if a pattern's compiled matcher accepts `topic`, then every literal
+   * segment before the pattern's first wildcard must equal the
+   * corresponding leading topic segment — the matcher is anchored and
+   * consumes the literal segments verbatim before any wildcard can absorb
+   * separators. So the pattern's literal prefix is exactly the first j
+   * topic segments for some j (j = 0 when the pattern starts with a
+   * wildcard), and the pattern's index key is always one of the candidate
+   * keys above. `fanOut` therefore tests every true match and never skips
+   * one. Non-matching patterns may still appear as candidates (e.g. an
+   * exact `a.b` pattern when publishing `a.b.c`); their compiled regex —
+   * still the final authority in `fanOut` — rejects them.
+   */
+  private candidateIds(topic: string): Set<string> {
+    const candidates = new Set<string>();
+    const segments = topic.split('.');
+    let prefix = '';
+    for (const segment of segments) {
+      prefix = prefix === '' ? segment : `${prefix}.${segment}`;
+      const bucket = this.prefixIndex.get(prefix);
+      if (bucket != null) {
+        for (const id of bucket) candidates.add(id);
+      }
+    }
+    const wildcards = this.prefixIndex.get('');
+    if (wildcards != null) {
+      for (const id of wildcards) candidates.add(id);
+    }
+    return candidates;
   }
 
   /**
@@ -760,7 +847,18 @@ export class EventBus {
     const ttlMs = this.ttlForTopic(topic);
     const expiresAt = ttlMs === undefined ? undefined : this.now() + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
+    // The prefix index prunes the regex tests down to subscribers whose
+    // pattern's literal prefix can plausibly match the topic; the compiled
+    // regex stays the final authority, and the no-miss invariant in
+    // `candidateIds` keeps matching semantics identical to the old full
+    // scan. Iteration order (insertion order) is unchanged.
+    const candidates = this.candidateIds(topic);
+    // Degenerate case: when every subscriber is a candidate (e.g. all on
+    // `**`), the membership check would pass for all of them, so skip it.
+    // Semantically identical, avoids a Set lookup per subscriber.
+    const prune = candidates.size < this.subscribers.size;
     for (const subscriber of this.subscribers.values()) {
+      if (prune && !candidates.has(subscriber.id)) continue;
       if (!subscriber.matcher.test(topic)) continue;
       matched += 1;
       const throttle = subscriber.throttle;
@@ -811,6 +909,7 @@ export class EventBus {
       expiredMessages: this.totalExpired,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
+      indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       throttledSubscribers,
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({

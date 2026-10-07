@@ -22,7 +22,18 @@ library.
   `market.btc.trades`; a bare `*` or `**` matches every topic). Each distinct
   pattern is compiled to a `RegExp` once and shared by all subscribers on
   that pattern (evicted when its last subscriber leaves), so the hot publish
-  path never re-parses patterns. `publish()` fans out to all matching subscribers and returns how
+  path never re-parses patterns. A publish-side prefix inverted index
+  (`Map<prefix, Set<subscriberId>>`) prunes the per-publish regex tests:
+  each pattern files under its literal segment prefix (the segments before
+  its first `*`/`**` — e.g. `market.btc.*` files under `market.btc`,
+  patterns starting with a wildcard file under the empty key), and each
+  publish looks up only the full topic, its progressively shorter segment
+  prefixes, and the empty key. A pattern that matches is guaranteed to be
+  among the candidates, so the compiled regex — still the final authority —
+  confirms with identical matching semantics. The index is maintained
+  incrementally (keys are evicted when their last subscriber leaves) and
+  `getStats().indexSize` reports how many distinct prefix keys are live.
+  `publish()` fans out to all matching subscribers and returns how
   many accepted the message. Each subscriber gets an independent bounded
   queue; delivery is batched on a microtask so slow consumers exert real
   backpressure instead of blocking publishers. `publishBatch(messages)` fans
@@ -142,6 +153,13 @@ npm test
   `getStats`, and gap detection: backpressure drops and TTL expiries count
   as gaps, redeliveries and late-joining subscribers don't, and gaps
   aggregate per topic across subscribers.
+- `test/index.test.ts` — the publish-side prefix index: an oracle-based
+  equivalence test (delivery sets under the index match `compilePattern`
+  exactly, across exact/`*`/`**`/leading/middle/trailing/consecutive-`**`
+  patterns), incremental subscribe/unsubscribe maintenance (`indexSize`
+  bookkeeping, key eviction, idempotent unsubscribe), and boundary cases
+  (`a.**` matching the bare topic `a`, leading-wildcard patterns under the
+  empty key, `subscribeReliable` routing through the same index).
 
 ## Benchmark
 
@@ -171,3 +189,49 @@ Results measured 2026-10-06 on Node v24.20.0 (linux/x64, V8 13.6),
 Throughput: ~342 publishes/s → **~3.42M deliveries/s** (in-process,
 single thread). A second run gave similar numbers (p50 2.70 ms, p99
 4.83 ms). Numbers depend on hardware — rerun the script to reproduce.
+
+## Prefix index
+
+`bench/index.bench.ts` isolates the publish-side matching cost with 5,000
+subscribers, measuring the synchronous `publish()` latency distribution
+(mean / p50 / p95 / p99 over 2,000 samples after 1,000 warmups, µs):
+
+- **Scenario A** — 5,000 subscribers with mutually distinct literal prefixes
+  (`t0.*` … `t4999.*`), publishing `t42.price`, which matches exactly one
+  of them. The index turns 5,000 regex tests into a few map lookups plus
+  one confirmation.
+- **Scenario B (degenerate control)** — 5,000 subscribers all on `**`, so
+  every pattern files under the empty key and the index degrades to the
+  full candidate set; this measures the index's own overhead.
+
+Before/after protocol: run the bench on the new code, then
+`git stash push -- src/bus.ts` to restore the old linear-scan `fanOut`,
+run the bench again, and `git stash pop` to restore. The script uses only
+the public API, so it runs unchanged against both versions.
+
+Results measured 2026-10-07 on Node v24.20.0 (linux/x64, V8 13.6), same
+2-vCPU AMD EPYC 9D25 VM as above:
+
+| scenario | before (linear scan) | after (prefix index) |
+| -------- | -------------------- | -------------------- |
+| A · mean | 1028.07 µs | 104.31 µs |
+| A · p50  | 993.95 µs  | 57.23 µs |
+| A · p95  | 1207.69 µs | 155.39 µs |
+| A · p99  | 1591.97 µs | 1166.46 µs |
+| B · mean | 595.46 µs  | 2712.40 µs |
+| B · p50  | 462.52 µs  | 1275.23 µs |
+| B · p95  | 1132.57 µs | 7847.96 µs |
+| B · p99  | 3484.05 µs | 24128.15 µs |
+
+Scenario A is ~17× faster at p50 (993.95 µs → 57.23 µs): the index skips
+~4,999 wasted regex tests per publish. Scenario B is ~2.8× slower at p50
+(462.52 µs → 1275.23 µs) — the honest price of the degenerate case, where
+building the candidate set buys nothing because every subscriber is a
+candidate. Note the shared VM shows run-to-run tail jitter (occasional
+multi-ms outliers); the p50 band was stable across repeated runs (~55–90 µs
+for A-after, ~1150–1450 µs for B-after, ~990 µs for A-before, ~460 µs for
+B-before). Rerun the script to reproduce.
+
+```bash
+node bench/index.bench.ts
+```
