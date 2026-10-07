@@ -379,6 +379,15 @@ export interface TopicStats {
    * lost.
    */
   sequenceGaps: number;
+  /**
+   * Messages on this topic shed by publish-side rate limiting (see
+   * `setTopicRateLimit`): the topic's token bucket was empty when the
+   * message was published, so it was never fanned out to any subscriber.
+   * The shed consumes a sequence number, so subscribers observe the loss
+   * as a sequence gap — the same visibility backpressure drops and TTL
+   * expirations get.
+   */
+  rateLimitedMessages: number;
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -420,6 +429,12 @@ export interface BusStats {
    * exact counting rules.
    */
   sequenceGaps: number;
+  /**
+   * Total messages shed by publish-side per-topic rate limiting — the sum
+   * of every topic's `rateLimitedMessages`. See
+   * `TopicStats.rateLimitedMessages` for the exact counting rules.
+   */
+  rateLimitedMessages: number;
   /**
    * Subscriptions currently under adaptive publish-side throttling (see
    * `SubscribeOptions.throttle`): their queues crossed the high-water mark
@@ -741,6 +756,29 @@ export class EventBus {
    */
   private ttlMatcherCache = new Map<string, RegExp>();
   /**
+   * Per-topic publish rate limits, keyed by the exact string passed to
+   * `setTopicRateLimit` — either a concrete topic name or a wildcard
+   * pattern. Match resolution is identical to the TTL rules: an exact-topic
+   * rule wins over any pattern; between patterns the earliest-registered
+   * rule wins.
+   */
+  private rateLimitRules = new Map<string, { messagesPerSec: number; burst: number }>();
+  /**
+   * Compiled matchers for the wildcard entries in `rateLimitRules`, kept
+   * apart from the subscriber pattern cache and the TTL cache so rate-limit
+   * configuration never inflates `patternCacheSize`.
+   */
+  private rateLimitMatcherCache = new Map<string, RegExp>();
+  /**
+   * Token buckets per concrete topic, created lazily on the first publish
+   * that falls under a rule and refilled from the injected clock
+   * (`EventBusOptions.now`), so rate limiting is deterministic in tests.
+   * Setting or clearing any rule drops every bucket: a changed rule starts
+   * from a fresh budget rather than inheriting a half-spent one.
+   */
+  private rateLimitBuckets = new Map<string, TokenBucket>();
+  private totalRateLimited = 0;
+  /**
    * Original TTL deadlines by message, for redelivery. `fanOut` stamps the
    * deadline here when a TTL rule matches; the reliable-subscription
    * requeue path reads it back so a requeued message keeps its
@@ -802,6 +840,7 @@ export class EventBus {
           expiredMessages: 0,
           lastSeq,
           sequenceGaps: 0,
+          rateLimitedMessages: 0,
         });
       }
     }
@@ -853,6 +892,70 @@ export class EventBus {
         this.ttlMatcherCache.set(pattern, matcher);
       }
       if (matcher.test(topic)) return ttlMs;
+    }
+    return undefined;
+  }
+
+  /**
+   * Caps how many messages per second may be published to topics matching
+   * `topicPattern`, enforced by a per-topic token bucket at the publish
+   * side. `topicPattern` accepts the same wildcard syntax as `subscribe`
+   * (or an exact topic name). The first `burst` messages publish instantly;
+   * afterwards the bucket refills at `messagesPerSec` per second.
+   *
+   * A publish that finds the bucket empty is shed at the publish side: it
+   * is never fanned out to any subscriber, never written to the durable
+   * log, and never reaches a queue — so subscriber backpressure policies
+   * do not churn on it. The shed consumes a sequence number and is counted
+   * in `TopicStats.rateLimitedMessages` (and the global total); subscribers
+   * observe the loss as a sequence gap, the same visibility backpressure
+   * drops and TTL expirations get. `publish` returns 0 for a shed message.
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * patterns, the earliest-registered matching pattern wins. Re-setting a
+   * rule replaces it and resets that topic's budget. Throws when
+   * `topicPattern` is empty, when `messagesPerSec` is not a positive finite
+   * number, or when `burst` is not a positive finite number.
+   */
+  setTopicRateLimit(topicPattern: string, messagesPerSec: number, opts?: { burst?: number }): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isFinite(messagesPerSec) || messagesPerSec <= 0) {
+      throw new RangeError('messagesPerSec must be a positive finite number of messages per second');
+    }
+    const burst = opts?.burst ?? Math.max(1, Math.ceil(messagesPerSec));
+    if (!Number.isFinite(burst) || burst <= 0) {
+      throw new RangeError('burst must be a positive finite number of messages');
+    }
+    this.rateLimitRules.set(topicPattern, { messagesPerSec, burst });
+    this.rateLimitBuckets.clear();
+  }
+
+  /**
+   * Removes the rate-limit rule previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed.
+   */
+  clearTopicRateLimit(topicPattern: string): boolean {
+    const removed = this.rateLimitRules.delete(topicPattern);
+    if (removed) this.rateLimitBuckets.clear();
+    return removed;
+  }
+
+  /**
+   * Returns the rate limit that applies to `topic`, or `undefined` when no
+   * rule matches. Same precedence as `ttlForTopic`.
+   */
+  private rateLimitForTopic(topic: string): { messagesPerSec: number; burst: number } | undefined {
+    const exact = this.rateLimitRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, limit] of this.rateLimitRules) {
+      let matcher = this.rateLimitMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.rateLimitMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return limit;
     }
     return undefined;
   }
@@ -1436,6 +1539,40 @@ export class EventBus {
    */
   private fanOut(topic: string, payload: unknown): { matched: number; accepted: number } {
     const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
+    let stats = this.topicStats.get(topic);
+    if (stats == null) {
+      stats = {
+        subscriberCount: 0,
+        publishedMessages: 0,
+        expiredMessages: 0,
+        lastSeq: 0,
+        sequenceGaps: 0,
+        rateLimitedMessages: 0,
+      };
+      this.topicStats.set(topic, stats);
+    }
+    stats.publishedMessages += 1;
+    stats.lastSeq = msg.seq;
+    this.totalPublished += 1;
+    // Publish-side per-topic rate limiting: when the topic's token bucket
+    // is empty the message is shed here — never fanned out, never logged,
+    // never queued. The shed consumes the sequence number stamped above so
+    // subscribers observe the loss as a sequence gap. The per-topic stats
+    // entry is updated above the shed so `publishedMessages` and `lastSeq`
+    // stay consistent with what `getStats` reports for accepted traffic.
+    const limit = this.rateLimitForTopic(topic);
+    if (limit !== undefined) {
+      let bucket = this.rateLimitBuckets.get(topic);
+      if (bucket == null) {
+        bucket = new TokenBucket(limit.burst, limit.messagesPerSec, this.now);
+        this.rateLimitBuckets.set(topic, bucket);
+      }
+      if (!bucket.take()) {
+        stats.rateLimitedMessages += 1;
+        this.totalRateLimited += 1;
+        return { matched: 0, accepted: 0 };
+      }
+    }
     let matched = 0;
     let accepted = 0;
     // One clock reading for the publish: TTL deadline and log timestamp stay
@@ -1483,21 +1620,7 @@ export class EventBus {
       if (this.deliverToSubscriber(assignee, msg, expiresAt)) accepted += 1;
       this.recordGroupOffset(hit.groupId, topic, msg.seq);
     }
-    let stats = this.topicStats.get(topic);
-    if (stats == null) {
-      stats = {
-        subscriberCount: 0,
-        publishedMessages: 0,
-        expiredMessages: 0,
-        lastSeq: 0,
-        sequenceGaps: 0,
-      };
-      this.topicStats.set(topic, stats);
-    }
     stats.subscriberCount = matched;
-    stats.publishedMessages += 1;
-    stats.lastSeq = msg.seq;
-    this.totalPublished += 1;
     return { matched, accepted };
   }
 
@@ -1525,6 +1648,7 @@ export class EventBus {
       patternCacheSize: this.patternCache.size,
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
+      rateLimitedMessages: this.totalRateLimited,
       throttledSubscribers,
       degradedSubscribers,
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
@@ -1542,6 +1666,7 @@ export class EventBus {
         expiredMessages: stats.expiredMessages,
         lastSeq: stats.lastSeq,
         sequenceGaps: stats.sequenceGaps,
+        rateLimitedMessages: stats.rateLimitedMessages,
       })),
       ...(this.durableLog == null
         ? {}

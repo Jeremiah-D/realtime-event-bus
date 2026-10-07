@@ -158,6 +158,21 @@ library.
   per-subscriber state. Invalid probe options throw `RangeError` from
   `subscribe`. Disabled by default — a throwing handler behaves exactly as
   before unless a subscriber opts in.
+- **Per-topic publish rate limiting** (in `src/bus.ts`, via
+  `setTopicRateLimit(pattern, messagesPerSec, { burst })`): a token bucket
+  per concrete topic (refilled from the bus clock, so tests stay
+  deterministic) caps how many messages per second a hot topic may publish;
+  the first `burst` messages (default: one second of budget) publish
+  instantly. A publish that finds the bucket empty is shed at the publish
+  side — never fanned out, never written to the durable log, never queued —
+  so subscriber backpressure policies do not churn on it; `publish` returns 0
+  for a shed message. The shed consumes a sequence number and is counted in
+  `TopicStats.rateLimitedMessages` (and the global total), so subscribers
+  observe the loss as a sequence gap — the same visibility backpressure drops
+  and TTL expiries get. Rule matching mirrors `setTopicTtl`: an exact-topic
+  rule wins over patterns, the earliest-registered matching pattern wins, and
+  re-setting a rule resets the topic's budget. `clearTopicRateLimit` removes
+  a rule. Invalid configurations throw `RangeError`.
 
 ## Run
 
