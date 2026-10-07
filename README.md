@@ -141,6 +141,23 @@ library.
   controller is not `connected`, an in-flight ping blocks the next tick so a
   hung peer cannot stack pings, and `onPong(latencyMs)` reports each
   round-trip.
+- **Subscriber health probing** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { healthProbe: true })`): the bus watches every delivery to
+  the subscriber — a handler that throws, or one that overruns its
+  `processingTimeoutMs` budget (measured with the bus clock), counts as one
+  failure, and every success resets the consecutive-failure counter to 0.
+  When the failures reach `maxConsecutiveFailures` (default 5), delivery
+  auto-pauses: the backlog stays queued under the normal backpressure policy
+  (preserved in FIFO order, never dropped — even a degradation that trips
+  mid-drain requeues the messages it did not attempt) until the subscriber
+  is resumed manually with `EventBus.resume(subId)` or automatically after
+  the `autoResumeAfterMs` cooldown. `onDegraded` fires once per degradation
+  with the failure count, the reason (`'error'` / `'timeout'`), and the
+  preserved backlog size; `getStats().degradedSubscribers` reports how many
+  subscribers are currently paused, and `subscriberHealth(subId)` reads the
+  per-subscriber state. Invalid probe options throw `RangeError` from
+  `subscribe`. Disabled by default — a throwing handler behaves exactly as
+  before unless a subscriber opts in.
 
 ## Run
 
@@ -184,6 +201,13 @@ npm test
   auto-requeues, double/late settles are no-ops, unsubscribe cancels pending
   timers, redelivered messages keep their original TTL deadline, and
   `ackTimeoutMs` validation.
+- `test/health.test.ts` — subscriber health probing: consecutive-error and
+  processing-timeout thresholds auto-pause delivery, success resets the
+  counter, a mid-drain degradation requeues unattempted messages in order,
+  manual `resume` and cooldown auto-resume redeliver the preserved backlog
+  FIFO, `onDegraded` fires once per excursion, stats/per-subscriber health
+  exposure, option validation, failure isolation across subscribers, reliable
+  (ack) coexistence, and auto-resume timer cleanup on unsubscribe.
 - `test/reconnect.test.ts` — exponentially increasing backoff delays within
   the jitter window, give-up after `maxAttempts`, attempt-counter reset on
   successful connect, the disconnect → backoff transition, plus custom

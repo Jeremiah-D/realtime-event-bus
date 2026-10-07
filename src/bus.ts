@@ -83,6 +83,33 @@ export interface SubscribeOptions {
    */
   onThrottled?: (event: ThrottleEvent) => void;
   /**
+   * Opt-in subscriber health probing. When enabled, the bus watches every
+   * delivery to this subscriber: a handler that throws, or one that takes
+   * longer than `processingTimeoutMs` to run, counts as one failure.
+   * Successful deliveries reset the consecutive-failure counter to 0.
+   *
+   * When the consecutive failures reach `maxConsecutiveFailures`, delivery
+   * to this subscriber auto-pauses: its messages stay queued under the
+   * normal backpressure policy (preserved, not dropped) until delivery
+   * resumes, and `onDegraded` fires once per degradation. Recovery is
+   * manual via `EventBus.resume(subId)`, or automatic after a cooldown when
+   * `autoResumeAfterMs` is set.
+   *
+   * Pass `true` for the defaults, or a `HealthProbeOptions` object to tune
+   * the threshold, the processing budget, and the auto-resume cooldown.
+   * Invalid values throw `RangeError` from `subscribe`. Disabled by default —
+   * without it, a throwing handler behaves exactly as before.
+   */
+  healthProbe?: boolean | HealthProbeOptions;
+  /**
+   * Called once when health probing auto-pauses delivery to this
+   * subscriber (see `healthProbe`): its handler failed too many times in a
+   * row. The event carries the failure count, what tripped the pause, and
+   * how many messages are preserved in its queue. Requires `healthProbe`;
+   * without it, this callback never fires.
+   */
+  onDegraded?: (event: DegradedEvent) => void;
+  /**
    * Resume-from offset for durable-log replay. When the bus has a durable
    * log (`EventBusOptions.durableLogDir`), the subscriber's queue is
    * pre-filled at subscribe time with every logged message on topics
@@ -149,6 +176,68 @@ export interface ThrottleEvent {
    * the configured initial rate applies.
    */
   adapted: boolean;
+}
+
+/**
+ * Tuning for subscriber health probing (`SubscribeOptions.healthProbe`).
+ * Validation happens at `subscribe` time; violations throw `RangeError`.
+ */
+export interface HealthProbeOptions {
+  /**
+   * Consecutive handler failures (thrown errors and/or processing timeouts)
+   * that auto-pause delivery to the subscriber. Must be a positive integer.
+   * Default 5.
+   */
+  maxConsecutiveFailures?: number;
+  /**
+   * Per-message handler budget in milliseconds, measured with the bus clock
+   * (`EventBusOptions.now`). A handler whose execution exceeds the budget
+   * counts as one failure (a processing timeout). Opt-in: absent means slow
+   * handlers are not counted, only thrown errors. Must be a positive finite
+   * number.
+   */
+  processingTimeoutMs?: number;
+  /**
+   * Cooldown in milliseconds after which a degraded subscriber auto-resumes
+   * delivery. Opt-in: absent means recovery is manual via
+   * `EventBus.resume(subId)` only. Must be a positive finite number.
+   */
+  autoResumeAfterMs?: number;
+}
+
+/** Snapshot delivered to `onDegraded` when health probing auto-pauses a subscriber. */
+export interface DegradedEvent {
+  /** The subscriber whose delivery was paused. */
+  subscriberId: string;
+  /** The topic pattern the paused subscriber registered. */
+  pattern: string;
+  /** Consecutive failures that tripped the pause. */
+  consecutiveFailures: number;
+  /**
+   * What tripped the pause: the last delivery threw (`'error'`), or its
+   * handler exceeded the processing budget (`'timeout'`).
+   */
+  reason: 'error' | 'timeout';
+  /**
+   * Messages preserved in the subscriber's queue at pause time — nothing
+   * was dropped, and resuming redelivers them in order.
+   */
+  pendingMessages: number;
+}
+
+/** Point-in-time health snapshot for one subscriber (see `EventBus.subscriberHealth`). */
+export interface SubscriberHealth {
+  /** The subscriber this snapshot describes. */
+  subscriberId: string;
+  /** Whether the health probe is enabled for this subscriber. */
+  enabled: boolean;
+  /** True while delivery is auto-paused after hitting the failure threshold. */
+  degraded: boolean;
+  /**
+   * Current consecutive-failure count. Resets to 0 on every successful
+   * delivery and on every resume; always 0 when the probe is disabled.
+   */
+  consecutiveFailures: number;
 }
 
 export interface ReliableSubscribeOptions extends SubscribeOptions {
@@ -338,6 +427,13 @@ export interface BusStats {
    */
   throttledSubscribers: number;
   /**
+   * Subscriptions currently auto-paused by subscriber health probing (see
+   * `SubscribeOptions.healthProbe`): their handlers failed too many times
+   * in a row and delivery is paused until they are resumed manually via
+   * `EventBus.resume` or automatically after their configured cooldown.
+   */
+  degradedSubscribers: number;
+  /**
    * Stats for every concrete topic that has seen at least one publish,
    * in order of first publish.
    */
@@ -399,6 +495,13 @@ interface Subscriber {
   /** Fired once when adaptive throttling engages for this subscriber. */
   onThrottled?: (event: ThrottleEvent) => void;
   /**
+   * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
+   * Absent when the probe is disabled for this subscriber.
+   */
+  health?: HealthProbeState;
+  /** Fired once per degradation when health probing auto-pauses delivery. */
+  onDegraded?: (event: DegradedEvent) => void;
+  /**
    * Present for consumer-group members: the group this subscription
    * belongs to. Members of the same (groupId, pattern) compete — each
    * message is delivered to exactly one of them (see `subscribeToGroup`).
@@ -431,6 +534,25 @@ interface ThrottleState {
   minRatePerSec: number;
   maxRatePerSec: number;
   initialRatePerSec: number;
+}
+
+/**
+ * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
+ * Only `consecutiveFailures`, `degraded`, and `autoResumeTimer` change over
+ * the subscription's lifetime; the rest is the validated configuration.
+ */
+interface HealthProbeState {
+  /** Consecutive handler failures; resets to 0 on every success and resume. */
+  consecutiveFailures: number;
+  /** True while delivery is auto-paused after hitting the failure threshold. */
+  degraded: boolean;
+  /** What tripped the current (or most recent) pause. */
+  degradedReason?: 'error' | 'timeout';
+  maxConsecutiveFailures: number;
+  processingTimeoutMs?: number;
+  autoResumeAfterMs?: number;
+  /** Pending auto-resume timer, if the subscriber degraded with a cooldown. */
+  autoResumeTimer?: ReturnType<typeof setTimeout>;
 }
 
 function escapeRegExp(literal: string): string {
@@ -534,6 +656,34 @@ function resolveThrottleOptions(
     minRatePerSec,
     maxRatePerSec,
     initialRatePerSec: clampedInitial,
+  };
+}
+
+/**
+ * Validates `SubscribeOptions.healthProbe` and builds the initial
+ * per-subscriber probe state. Returns `undefined` when the probe is
+ * disabled. Throws `RangeError` for invalid values.
+ */
+function resolveHealthProbeOptions(
+  opt: boolean | HealthProbeOptions | undefined,
+): Omit<HealthProbeState, 'consecutiveFailures' | 'degraded' | 'autoResumeTimer'> | undefined {
+  if (opt == null || opt === false) return undefined;
+  const o: HealthProbeOptions = opt === true ? {} : opt;
+  const maxConsecutiveFailures = o.maxConsecutiveFailures ?? 5;
+  if (!Number.isInteger(maxConsecutiveFailures) || maxConsecutiveFailures < 1) {
+    throw new RangeError('healthProbe.maxConsecutiveFailures must be a positive integer');
+  }
+  const checkPositiveMs = (name: string, value: number | undefined): number | undefined => {
+    if (value === undefined) return undefined;
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new RangeError(`healthProbe.${name} must be a positive finite number of milliseconds`);
+    }
+    return value;
+  };
+  return {
+    maxConsecutiveFailures,
+    processingTimeoutMs: checkPositiveMs('processingTimeoutMs', o.processingTimeoutMs),
+    autoResumeAfterMs: checkPositiveMs('autoResumeAfterMs', o.autoResumeAfterMs),
   };
 }
 
@@ -737,6 +887,10 @@ export class EventBus {
     const onThrottled = opts?.onThrottled;
     const hwmRatio = opts?.highWaterMarkRatio ?? 0.8;
     const throttle = resolveThrottleOptions(opts?.throttle, capacity, hwmRatio, this.now);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
+    const onDegraded = opts?.onDegraded;
     const queue = new BoundedQueue<BusMessage>({
       capacity,
       policy: opts?.dropPolicy ?? 'drop-oldest',
@@ -787,6 +941,11 @@ export class EventBus {
       lastDeliveredSeq: new Map(),
       throttle,
       onThrottled,
+      health:
+        healthProbe == null
+          ? undefined
+          : { consecutiveFailures: 0, degraded: false, ...healthProbe },
+      onDegraded,
     };
     this.subscribers.set(id, subscriber);
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
@@ -813,6 +972,13 @@ export class EventBus {
       id,
       unsubscribe: () => {
         if (!this.subscribers.delete(id)) return;
+        // A pending auto-resume must not outlive the subscriber: no phantom
+        // resume (and no rescheduled flush) after unsubscribe.
+        const health = subscriber.health;
+        if (health?.autoResumeTimer !== undefined) {
+          clearTimeout(health.autoResumeTimer);
+          health.autoResumeTimer = undefined;
+        }
         const bucket = this.prefixIndex.get(indexKey);
         if (bucket != null) {
           bucket.delete(id);
@@ -1344,9 +1510,11 @@ export class EventBus {
   getStats(): BusStats {
     let unackedDeliveries = 0;
     let throttledSubscribers = 0;
+    let degradedSubscribers = 0;
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
+      if (subscriber.health?.degraded === true) degradedSubscribers += 1;
     }
     return {
       totalSubscribers: this.subscribers.size,
@@ -1358,6 +1526,7 @@ export class EventBus {
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       throttledSubscribers,
+      degradedSubscribers,
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
         return {
@@ -1413,6 +1582,62 @@ export class EventBus {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     return subscriber.throttle?.throttledDrops ?? 0;
+  }
+
+  /**
+   * Resumes delivery to a subscriber that health probing auto-paused (see
+   * `SubscribeOptions.healthProbe`). The messages preserved in its queue
+   * are redelivered in order on the next flush, and its consecutive-failure
+   * counter restarts at 0. Returns true when the subscriber was degraded
+   * and is now resumed, false when it was not paused (or the probe is
+   * disabled for it). Throws on an unknown subscriber id.
+   */
+  resume(subId: string): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    if (subscriber.health == null || !subscriber.health.degraded) return false;
+    this.resumeDelivery(subscriber);
+    return true;
+  }
+
+  /**
+   * Point-in-time health snapshot for one subscriber (see
+   * `SubscribeOptions.healthProbe`). `enabled` is false and the counters
+   * are 0 when the probe is not enabled for the subscriber. Throws on an
+   * unknown subscriber id.
+   */
+  subscriberHealth(subId: string): SubscriberHealth {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const health = subscriber.health;
+    if (health == null) {
+      return { subscriberId: subId, enabled: false, degraded: false, consecutiveFailures: 0 };
+    }
+    return {
+      subscriberId: subId,
+      enabled: true,
+      degraded: health.degraded,
+      consecutiveFailures: health.consecutiveFailures,
+    };
+  }
+
+  /**
+   * Clears a degraded state — manual (`resume`) or automatic (cooldown
+   * timer): the consecutive-failure counter restarts at 0, any pending
+   * auto-resume timer is cancelled (it already fired, or is superseded),
+   * and a flush is scheduled so the preserved backlog is delivered
+   * promptly.
+   */
+  private resumeDelivery(subscriber: Subscriber): void {
+    const health = subscriber.health;
+    if (health == null) return;
+    health.degraded = false;
+    health.consecutiveFailures = 0;
+    if (health.autoResumeTimer !== undefined) {
+      clearTimeout(health.autoResumeTimer);
+      health.autoResumeTimer = undefined;
+    }
+    this.scheduleFlush();
   }
 
   /**
@@ -1503,16 +1728,131 @@ export class EventBus {
       // round enforces the same expiry cutoff.
       const nowMs = this.now();
       for (const subscriber of this.subscribers.values()) {
+        // A degraded subscriber's deliveries are paused: its backlog stays
+        // queued under the normal backpressure policy, untouched by the
+        // drain, so resuming picks up exactly where delivery paused.
+        if (subscriber.health?.degraded === true) continue;
         const { live, expired } = subscriber.queue.drainLive(nowMs);
         for (const msg of expired) {
           this.recordExpired(msg.topic);
         }
-        for (const msg of live) {
-          this.detectGap(subscriber, msg);
-          subscriber.handler(msg);
+        const health = subscriber.health;
+        if (health == null) {
+          for (const msg of live) {
+            this.detectGap(subscriber, msg);
+            subscriber.handler(msg);
+          }
+          continue;
+        }
+        for (let i = 0; i < live.length; i += 1) {
+          this.deliverWithHealth(subscriber, live[i]);
+          if (!health.degraded) continue;
+          // The threshold tripped mid-drain: everything not yet attempted
+          // goes back to the queue, in order, with its original TTL
+          // deadline restored from the bus registry — FIFO is preserved and
+          // resuming redelivers exactly what was paused. (The queue is empty
+          // here — it was just drained — so the requeue cannot drop.)
+          for (let j = i + 1; j < live.length; j += 1) {
+            subscriber.queue.push(live[j], 0, this.messageDeadlines.get(live[j]));
+          }
+          this.reportDegraded(subscriber);
+          break;
         }
       }
     });
+  }
+
+  /**
+   * Delivers one message to a health-probed subscriber, counting handler
+   * failures: a thrown error counts as one failure, and — when
+   * `processingTimeoutMs` is configured — a handler that takes longer than
+   * the budget to run counts as one failure (a processing timeout). A throw
+   * that also overruns the budget still counts once. A successful delivery
+   * resets the consecutive-failure counter to 0; reaching the threshold
+   * auto-pauses the subscriber via `pauseForHealth`.
+   *
+   * The failed message itself is consumed (plain subscriptions have no
+   * redelivery — use `subscribeReliable` when a failed message must be
+   * requeued); the pause protects everything that follows it.
+   */
+  private deliverWithHealth(subscriber: Subscriber, msg: BusMessage): void {
+    const health = subscriber.health;
+    if (health == null) return;
+    this.detectGap(subscriber, msg);
+    const budgetMs = health.processingTimeoutMs;
+    const startedAtMs = budgetMs !== undefined ? this.now() : 0;
+    let failed = false;
+    let reason: 'error' | 'timeout' = 'error';
+    try {
+      subscriber.handler(msg);
+    } catch {
+      failed = true;
+    }
+    if (!failed && budgetMs !== undefined && this.now() - startedAtMs > budgetMs) {
+      failed = true;
+      reason = 'timeout';
+    }
+    if (!failed) {
+      health.consecutiveFailures = 0;
+      return;
+    }
+    health.consecutiveFailures += 1;
+    if (!health.degraded && health.consecutiveFailures >= health.maxConsecutiveFailures) {
+      this.pauseForHealth(subscriber, reason);
+    }
+  }
+
+  /**
+   * Auto-pauses a subscriber whose consecutive failures hit the threshold.
+   * Starts the auto-resume cooldown timer when one is configured; the
+   * `onDegraded` callback fires separately in `reportDegraded`, after the
+   * drain loop has requeued the messages it did not attempt.
+   */
+  private pauseForHealth(subscriber: Subscriber, reason: 'error' | 'timeout'): void {
+    const health = subscriber.health;
+    if (health == null || health.degraded) return;
+    health.degraded = true;
+    health.degradedReason = reason;
+    if (health.autoResumeAfterMs !== undefined) {
+      this.scheduleAutoResume(subscriber, health.autoResumeAfterMs);
+    }
+  }
+
+  /**
+   * Fires the subscriber's `onDegraded` callback once per degradation with
+   * the failure count, the reason, and the preserved backlog size.
+   */
+  private reportDegraded(subscriber: Subscriber): void {
+    const health = subscriber.health;
+    if (health == null) return;
+    subscriber.onDegraded?.({
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      consecutiveFailures: health.consecutiveFailures,
+      reason: health.degradedReason ?? 'error',
+      pendingMessages: subscriber.queue.size,
+    });
+  }
+
+  /**
+   * Arms the auto-resume cooldown: after `afterMs` the subscriber resumes
+   * automatically if it is still degraded and still subscribed. The timer
+   * never keeps the process alive on its own, and unsubscribe clears it.
+   */
+  private scheduleAutoResume(subscriber: Subscriber, afterMs: number): void {
+    const health = subscriber.health;
+    if (health == null) return;
+    const timer = setTimeout(() => {
+      health.autoResumeTimer = undefined;
+      // The subscriber may have unsubscribed or been manually resumed since
+      // the timer was armed — only a still-degraded member resumes here.
+      if (!this.subscribers.has(subscriber.id) || !health.degraded) return;
+      this.resumeDelivery(subscriber);
+    }, afterMs);
+    // A paused subscriber must not keep the process alive on its own.
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    health.autoResumeTimer = timer;
   }
 
   /**
