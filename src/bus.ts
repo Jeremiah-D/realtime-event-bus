@@ -138,6 +138,35 @@ export interface ReliableSubscribeOptions extends SubscribeOptions {
   ackTimeoutMs?: number;
 }
 
+/** Snapshot delivered to `onRebalance` when a consumer group's membership changes. */
+export interface GroupRebalanceEvent {
+  /** The group whose membership changed. */
+  groupId: string;
+  /** The topic pattern this competing set is scoped to. */
+  pattern: string;
+  /**
+   * Member subscription ids in the group after the change, in join order.
+   * A snapshot — mutating it does not affect the bus.
+   */
+  members: string[];
+  /** What triggered the rebalance. */
+  trigger: 'join' | 'leave';
+  /** The subscription id of the member that joined or left. */
+  memberId: string;
+}
+
+export interface GroupSubscribeOptions extends SubscribeOptions {
+  /**
+   * Called on every member of the group when its membership changes — a
+   * member joins (`trigger: 'join'`, fired on existing members and the
+   * newcomer) or unsubscribes (`trigger: 'leave'`, fired on the members
+   * that remain). The bus rebalances implicitly (round-robin over the
+   * current roster), so this is purely informational: use it to re-derive
+   * any local assignment state.
+   */
+  onRebalance?: (event: GroupRebalanceEvent) => void;
+}
+
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
 export interface BackpressureEvent {
   /** The subscriber whose queue is filling up. */
@@ -194,6 +223,8 @@ export interface TopicStats {
   /**
    * Subscribers matched by the most recent publish to this topic — the
    * current fan-out width, so operators can see hot topics at a glance.
+   * A matching consumer group counts once (its copy goes to a single
+   * assigned member), however many members it has.
    */
   subscriberCount: number;
   /** Total messages published to this topic since the bus was created. */
@@ -273,6 +304,12 @@ export interface BusStats {
    * in order of first publish.
    */
   topics: TopicStats[];
+  /**
+   * Live consumer groups: one entry per (groupId, pattern) competing set
+   * with at least one member, in first-registration order. Empty when no
+   * group subscription is active.
+   */
+  consumerGroups: Array<{ groupId: string; pattern: string; members: number }>;
 }
 
 interface Subscriber {
@@ -309,6 +346,14 @@ interface Subscriber {
   throttle?: ThrottleState;
   /** Fired once when adaptive throttling engages for this subscriber. */
   onThrottled?: (event: ThrottleEvent) => void;
+  /**
+   * Present for consumer-group members: the group this subscription
+   * belongs to. Members of the same (groupId, pattern) compete — each
+   * message is delivered to exactly one of them (see `subscribeToGroup`).
+   */
+  groupId?: string;
+  /** Fired on group membership changes (see `GroupSubscribeOptions`). */
+  onRebalance?: (event: GroupRebalanceEvent) => void;
 }
 
 /**
@@ -501,6 +546,32 @@ export class EventBus {
    * Entries die with their message (WeakMap).
    */
   private messageDeadlines = new WeakMap<BusMessage, number>();
+  /**
+   * Consumer-group membership: `groupKey(groupId, pattern)` -> member
+   * subscription ids in join order. A group is scoped to one pattern the
+   * same way a Kafka consumer group is scoped to its subscription: the same
+   * groupId on two patterns is two independent competing sets.
+   */
+  private groupMembers = new Map<string, string[]>();
+  /**
+   * Round-robin cursor per group key. Monotonic — the modulo is applied at
+   * use — so join/leave churn never repeats or skips an assignment
+   * position. Deleted when the group's last member leaves.
+   */
+  private groupCursors = new Map<string, number>();
+  /**
+   * Per-group assignment watermark: groupId -> concrete topic -> highest
+   * per-topic `seq` assigned to any member of the group. Bounded by
+   * (groups x topics), the same order as `topicStats`.
+   */
+  private groupOffsets = new Map<string, Map<string, number>>();
+  /**
+   * Consumer-checkpointed offsets: groupId -> concrete topic -> last
+   * processed `seq` as reported by the consumer via `commitOffset`. Pure
+   * bookkeeping for operators and resume-after-restart; the bus never acts
+   * on it by itself.
+   */
+  private committedOffsets = new Map<string, Map<string, number>>();
   private readonly now: () => number;
 
   constructor(options?: EventBusOptions) {
@@ -714,6 +785,205 @@ export class EventBus {
   }
 
   /**
+   * Registers a consumer-group member for topics matching `topicPattern` —
+   * Kafka-style competing consumers inside one process.
+   *
+   * Semantics:
+   * - Members of the same `(groupId, topicPattern)` form one competing
+   *   set: each published message matching the pattern is delivered to
+   *   exactly one member, picked round-robin in join order. Assignment
+   *   does not skip slow members — a member whose queue is full sheds via
+   *   its own drop policy, exactly as a plain subscriber would.
+   * - Different groups on the same pattern each receive a copy (broadcast
+   *   across groups); the same groupId on different patterns is an
+   *   independent competing set per pattern.
+   * - Membership changes rebalance implicitly: a joining member is
+   *   appended to the rotation, a leaving member is removed, and every
+   *   affected member's `onRebalance` fires with the new roster. No
+   *   partition ownership is tracked — the bus assigns per message, so
+   *   there is nothing to revoke.
+   * - The bus tracks the assignment watermark per group and topic
+   *   (`getGroupOffsets`): the highest per-topic `seq` handed to any
+   *   member. Consumers checkpoint their own progress with
+   *   `commitOffset`; combined with a durable topic log
+   *   (`EventBusOptions.durableLogDir` + `SubscribeOptions.resumeFromSeq`)
+   *   a rejoining member can resume where it left off.
+   *
+   * All queue options (`queueSize`, `dropPolicy`, `onBackpressure`,
+   * `throttle`, ...) behave per member exactly as in `subscribe`. Throws
+   * `RangeError` when `groupId` is empty.
+   */
+  subscribeToGroup(
+    groupId: string,
+    topicPattern: string,
+    handler: MessageHandler,
+    opts?: GroupSubscribeOptions,
+  ): Subscription {
+    if (groupId.length === 0) {
+      throw new RangeError('groupId must be a non-empty string');
+    }
+    const sub = this.subscribe(topicPattern, handler, opts);
+    const subscriber = this.subscribers.get(sub.id);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
+    subscriber.groupId = groupId;
+    subscriber.onRebalance = opts?.onRebalance;
+    const key = EventBus.groupKey(groupId, topicPattern);
+    let members = this.groupMembers.get(key);
+    if (members == null) {
+      members = [];
+      this.groupMembers.set(key, members);
+    }
+    members.push(sub.id);
+    this.fireRebalance(groupId, topicPattern, key, 'join', sub.id);
+    return {
+      id: sub.id,
+      unsubscribe: () => {
+        // Second call is a no-op: no double leave-event, no roster churn.
+        if (!this.subscribers.has(sub.id)) return;
+        this.removeGroupMember(key, sub.id);
+        sub.unsubscribe();
+        this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id);
+      },
+    };
+  }
+
+  /**
+   * Map key for one competing set: groupId and pattern joined by NUL.
+   * Neither may contain NUL in practice, so the pairing is unambiguous and
+   * reversible (see `getStats`).
+   */
+  private static groupKey(groupId: string, pattern: string): string {
+    return `${groupId}\0${pattern}`;
+  }
+
+  /**
+   * Removes a member from its competing set. Emptied sets (and their
+   * round-robin cursors) are deleted so churn of short-lived groups cannot
+   * grow the maps without bound; assignment watermarks and committed
+   * offsets are history and are kept.
+   */
+  private removeGroupMember(key: string, memberId: string): void {
+    const members = this.groupMembers.get(key);
+    if (members == null) return;
+    const idx = members.indexOf(memberId);
+    if (idx >= 0) members.splice(idx, 1);
+    if (members.length === 0) {
+      this.groupMembers.delete(key);
+      this.groupCursors.delete(key);
+    }
+  }
+
+  /**
+   * Notifies every current member of a group about a membership change.
+   * Each member receives its own snapshot of the post-change roster.
+   */
+  private fireRebalance(
+    groupId: string,
+    pattern: string,
+    key: string,
+    trigger: 'join' | 'leave',
+    memberId: string,
+  ): void {
+    const members = this.groupMembers.get(key);
+    if (members == null) return;
+    for (const id of members) {
+      const subscriber = this.subscribers.get(id);
+      subscriber?.onRebalance?.({
+        groupId,
+        pattern,
+        members: [...members],
+        trigger,
+        memberId,
+      });
+    }
+  }
+
+  /**
+   * Picks the next assignee for a group: round-robin over the members that
+   * matched this publish, in join order. The cursor is monotonic and the
+   * modulo is applied at use, so members joining or leaving mid-stream
+   * never cause a repeated or skipped position.
+   */
+  private assignGroupMember(key: string, members: Subscriber[]): Subscriber {
+    const cursor = this.groupCursors.get(key) ?? 0;
+    const assignee = members[cursor % members.length];
+    this.groupCursors.set(key, cursor + 1);
+    return assignee;
+  }
+
+  /**
+   * Advances a group's assignment watermark for a topic. Assignment order
+   * follows publish order, which follows `seq` order, so the newest
+   * assignment is always the maximum.
+   */
+  private recordGroupOffset(groupId: string, topic: string, seq: number): void {
+    let offsets = this.groupOffsets.get(groupId);
+    if (offsets == null) {
+      offsets = new Map<string, number>();
+      this.groupOffsets.set(groupId, offsets);
+    }
+    offsets.set(topic, seq);
+  }
+
+  /**
+   * Assignment watermark per concrete topic for a group: the highest
+   * per-topic `seq` handed to any member of the group so far. Empty when
+   * the group has received nothing (or does not exist). This is what a
+   * rejoining member resumes from.
+   */
+  getGroupOffsets(groupId: string): Record<string, number> {
+    const offsets = this.groupOffsets.get(groupId);
+    return offsets == null ? {} : Object.fromEntries(offsets);
+  }
+
+  /**
+   * Records a consumer-side checkpoint: the last per-topic `seq` the
+   * caller has durably processed for a group. The bus never acts on
+   * committed offsets by itself — they exist so operators can observe lag
+   * (`getGroupOffsets` minus `getCommittedOffsets`) and so a restarted
+   * consumer can resubscribe with `SubscribeOptions.resumeFromSeq` seeded
+   * from here. Committing for a group with no live members is allowed:
+   * that is exactly the restore-before-rejoin case.
+   *
+   * Throws `RangeError` on an empty groupId/topic or a non-positive
+   * non-integer seq.
+   */
+  commitOffset(groupId: string, topic: string, seq: number): void {
+    if (groupId.length === 0) {
+      throw new RangeError('groupId must be a non-empty string');
+    }
+    if (topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    if (!Number.isInteger(seq) || seq < 1) {
+      throw new RangeError('seq must be a positive integer sequence number');
+    }
+    let committed = this.committedOffsets.get(groupId);
+    if (committed == null) {
+      committed = new Map<string, number>();
+      this.committedOffsets.set(groupId, committed);
+    }
+    committed.set(topic, seq);
+  }
+
+  /**
+   * Consumer-checkpointed offsets per concrete topic for a group (see
+   * `commitOffset`). Empty when nothing has been committed.
+   */
+  getCommittedOffsets(groupId: string): Record<string, number> {
+    const committed = this.committedOffsets.get(groupId);
+    return committed == null ? {} : Object.fromEntries(committed);
+  }
+
+  /**
+   * Subscription ids of the current members of one competing set, in join
+   * order. Empty when the group/pattern has no live members.
+   */
+  getGroupMembers(groupId: string, pattern: string): string[] {
+    return [...(this.groupMembers.get(EventBus.groupKey(groupId, pattern)) ?? [])];
+  }
+
+  /**
    * Returns the inverted-index key for a topic pattern: the dot-joined
    * literal segments before the pattern's first wildcard (`*` / `**`)
    * segment, or the empty string when the pattern starts with a wildcard.
@@ -827,6 +1097,28 @@ export class EventBus {
   }
 
   /**
+   * Pushes one message into a subscriber's queue, honoring adaptive
+   * publish-side throttling. Returns true when the queue accepted the
+   * message. Shared by the plain fan-out path and the consumer-group
+   * assignment path so both get identical backpressure semantics.
+   */
+  private deliverToSubscriber(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    expiresAt: number | undefined,
+  ): boolean {
+    const throttle = subscriber.throttle;
+    if (throttle != null && throttle.throttled && !throttle.bucket.take()) {
+      // Publish-side shed: the message never reaches the queue, so the
+      // drop policy never churns on it. Counted separately from queue
+      // drops; sequence-gap detection surfaces the loss downstream.
+      throttle.throttledDrops += 1;
+      return false;
+    }
+    return subscriber.queue.push(msg, 0, expiresAt) === 'accepted';
+  }
+
+  /**
    * Pushes one message into every matching subscriber's queue and records
    * per-topic stats. Returns how many subscribers matched and how many
    * queues accepted the message (they differ when backpressure drops kick
@@ -835,6 +1127,11 @@ export class EventBus {
    * The message is stamped with its per-topic sequence number here, so all
    * subscribers see the same `seq` for the same publish regardless of queue
    * state. `TopicStats.lastSeq` tracks the highest number handed out.
+   *
+   * Consumer-group members compete: all members of one (groupId, pattern)
+   * that match the topic are collected first, then a single member is
+   * picked round-robin and receives the group's one copy. `matched` counts
+   * one per matching group — the actual fan-out width.
    *
    * When a TTL rule matches the topic, every enqueued copy is stamped with
    * the same expiry deadline (`publishTime + ttlMs`); the queues discard
@@ -857,19 +1154,30 @@ export class EventBus {
     // `**`), the membership check would pass for all of them, so skip it.
     // Semantically identical, avoids a Set lookup per subscriber.
     const prune = candidates.size < this.subscribers.size;
+    // Group members are collected per competing set first; the group's
+    // single copy is assigned round-robin after the scan.
+    const groupHits = new Map<string, { groupId: string; members: Subscriber[] }>();
     for (const subscriber of this.subscribers.values()) {
       if (prune && !candidates.has(subscriber.id)) continue;
       if (!subscriber.matcher.test(topic)) continue;
-      matched += 1;
-      const throttle = subscriber.throttle;
-      if (throttle != null && throttle.throttled && !throttle.bucket.take()) {
-        // Publish-side shed: the message never reaches the queue, so the
-        // drop policy never churns on it. Counted separately from queue
-        // drops; sequence-gap detection surfaces the loss downstream.
-        throttle.throttledDrops += 1;
+      if (subscriber.groupId == null) {
+        matched += 1;
+        if (this.deliverToSubscriber(subscriber, msg, expiresAt)) accepted += 1;
         continue;
       }
-      if (subscriber.queue.push(msg, 0, expiresAt) === 'accepted') accepted += 1;
+      const key = EventBus.groupKey(subscriber.groupId, subscriber.pattern);
+      let hit = groupHits.get(key);
+      if (hit == null) {
+        hit = { groupId: subscriber.groupId, members: [] };
+        groupHits.set(key, hit);
+      }
+      hit.members.push(subscriber);
+    }
+    for (const [key, hit] of groupHits) {
+      matched += 1;
+      const assignee = this.assignGroupMember(key, hit.members);
+      if (this.deliverToSubscriber(assignee, msg, expiresAt)) accepted += 1;
+      this.recordGroupOffset(hit.groupId, topic, msg.seq);
     }
     let stats = this.topicStats.get(topic);
     if (stats == null) {
@@ -912,6 +1220,14 @@ export class EventBus {
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       throttledSubscribers,
+      consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
+        const sep = key.indexOf('\0');
+        return {
+          groupId: key.slice(0, sep),
+          pattern: key.slice(sep + 1),
+          members: members.length,
+        };
+      }),
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,

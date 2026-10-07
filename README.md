@@ -58,6 +58,18 @@ library.
   `sequenceGaps` (per topic and global, with `lastSeq` per topic) —
   backpressure drops and TTL expiries surface as gaps, while at-least-once
   redeliveries never do.
+  `subscribeToGroup(groupId, pattern, handler, opts)` registers a
+  Kafka-style consumer-group member: members of the same
+  `(groupId, pattern)` compete — each matching message is delivered to
+  exactly one member, picked round-robin in join order — while different
+  groups on the same pattern each receive a copy. A slow member never
+  blocks the group: assignment does not skip full queues, the member's own
+  drop policy applies. Membership changes rebalance implicitly
+  (`onRebalance` fires on affected members with the new roster). The bus
+  tracks the per-group assignment watermark (`getGroupOffsets`: highest
+  per-topic `seq` handed to any member) and consumer checkpoints
+  (`commitOffset` / `getCommittedOffsets`); `getStats().consumerGroups`
+  lists live groups.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
@@ -127,6 +139,12 @@ npm test
   (one-shot high-water-mark firing, re-arm after drain, dropped-count
   reporting), and `publishBatch` (single-flush batch fan-out, per-message
   ordering, both drop policies, empty-batch no-op).
+- `test/groups.test.ts` — consumer groups: exactly-once-per-group delivery
+  with round-robin order, cross-group broadcast, per-pattern independence,
+  leave/join rebalance events, double-unsubscribe no-op, slow-member
+  isolation (own drop policy), `getGroupOffsets` watermark,
+  `commitOffset`/`getCommittedOffsets` round-trip and validation,
+  `getStats().consumerGroups`, and `**` patterns.
 - `test/backpressure.test.ts` — both drop policies, one-shot high-water-mark
   behavior, drain ordering, runtime watermark adjustment (`setHighWaterMarkRatio`,
   validation, mid-excursion lowering/raising semantics) and the `onDrained`
