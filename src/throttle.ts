@@ -44,6 +44,19 @@ export class TokenBucket {
   }
 
   /**
+   * Milliseconds until one more whole token is available at the current
+   * refill rate. Returns 0 when at least one token is available now. Used
+   * to schedule the next delivery round for a rate-shaped subscriber
+   * without polling.
+   */
+  msUntilNextToken(): number {
+    const nowMs = this.now();
+    const tokens = this.refilledTokens(nowMs);
+    if (tokens >= 1) return 0;
+    return (1 - tokens) / this.refillTokensPerMs;
+  }
+
+  /**
    * Consumes one token when available. Returns true when the caller may
    * proceed, false when the caller is over budget. Never consumes a token
    * on a false return. Refills are capped at the bucket capacity, so idle

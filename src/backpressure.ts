@@ -180,16 +180,34 @@ export class BoundedQueue<T> {
    * alive for exactly its TTL is dropped, not delivered.
    */
   drainLive(nowMs: number): { live: T[]; expired: T[] } {
+    return this.drainLiveUpTo(nowMs, Infinity);
+  }
+
+  /**
+   * Like `drainLive`, but returns at most `maxLive` non-expired entries —
+   * the remaining entries stay queued in FIFO order with their expiry
+   * timestamps intact, so a later drain picks up exactly where this one
+   * stopped. Entries past the live window are not inspected for expiry in
+   * this pass; they are evaluated when a later drain reaches them. Used by
+   * delivery-side rate shaping to dequeue only what the subscriber's token
+   * budget allows in one round.
+   */
+  drainLiveUpTo(nowMs: number, maxLive: number): { live: T[]; expired: T[] } {
     const live: T[] = [];
     const expired: T[] = [];
+    const rest: QueueEntry<T>[] = [];
     for (const entry of this.entries) {
       if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) {
         expired.push(entry.item);
-      } else {
+        continue;
+      }
+      if (live.length < maxLive) {
         live.push(entry.item);
+      } else {
+        rest.push(entry);
       }
     }
-    this.entries = [];
+    this.entries = rest;
     this.maybeFireDrained();
     this.expired += expired.length;
     return { live, expired };

@@ -220,3 +220,48 @@ test('constructor accepts an initial highWaterMarkRatio', () => {
     RangeError,
   );
 });
+
+test('drainLiveUpTo returns at most maxLive items and keeps the rest queued', () => {
+  const q = new BoundedQueue<string>({ capacity: 10 });
+  for (const item of ['a', 'b', 'c', 'd']) q.push(item);
+  const first = q.drainLiveUpTo(0, 2);
+  assert.deepEqual(first, { live: ['a', 'b'], expired: [] });
+  assert.equal(q.size, 2);
+  const second = q.drainLiveUpTo(0, 10);
+  assert.deepEqual(second, { live: ['c', 'd'], expired: [] });
+  assert.equal(q.size, 0);
+});
+
+test('drainLiveUpTo still enforces expiry within the window', () => {
+  const q = new BoundedQueue<string>({ capacity: 10 });
+  q.push('old', 0, 100); // expires at t=100
+  q.push('fresh', 0, 1000);
+  q.push('kept');
+  const { live, expired } = q.drainLiveUpTo(100, 1);
+  assert.deepEqual(live, ['fresh']);
+  assert.deepEqual(expired, ['old']);
+  assert.equal(q.expiredCount, 1);
+  // 'kept' was past the live window: still queued, evaluated on a later drain.
+  assert.equal(q.size, 1);
+  assert.deepEqual(q.drainLiveUpTo(0, 10).live, ['kept']);
+});
+
+test('drainLiveUpTo with maxLive 0 only collects expired entries', () => {
+  const q = new BoundedQueue<string>({ capacity: 10 });
+  q.push('old', 0, 100);
+  q.push('fresh');
+  const { live, expired } = q.drainLiveUpTo(100, 0);
+  assert.deepEqual(live, []);
+  assert.deepEqual(expired, ['old']);
+  assert.equal(q.size, 1);
+});
+
+test('drainLive drains everything, like drainLiveUpTo with no bound', () => {
+  const q = new BoundedQueue<string>({ capacity: 10 });
+  q.push('a', 0, 50);
+  q.push('b');
+  const { live, expired } = q.drainLive(100);
+  assert.deepEqual(live, ['b']);
+  assert.deepEqual(expired, ['a']);
+  assert.equal(q.size, 0);
+});

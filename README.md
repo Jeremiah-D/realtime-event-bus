@@ -186,6 +186,22 @@ library.
   publish caller — validation runs before any state is mutated for that
   message. `clearTopicSchema` removes a rule. Empty patterns and
   non-function validators throw `RangeError`.
+- **Subscriber output rate shaping** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { deliveryShaping: true })`): delivery-side pacing for a
+  slow downstream consumer. A per-subscriber token bucket caps deliveries at
+  `messagesPerSec` (default 100, `burst` defaulting to one second of budget);
+  messages over budget stay queued — in FIFO order, never dropped — and are
+  delivered on later flush rounds as the bucket refills, so delivery is
+  smoothed to the downstream's pace instead of arriving in bursts. Unlike
+  adaptive publish-side `throttle` (which sheds), shaping never drops: the
+  backlog accumulates under the subscriber's normal backpressure policy, so
+  size the queue for the expected backlog — a full queue still applies its
+  drop policy. Shaping does not extend TTL: a message whose deadline passes
+  while it waits is dropped as expired, and paced delivery produces no
+  sequence gaps. A re-flush timer (unref'd, derived from the bus clock) keeps
+  draining the backlog when no new publishes arrive; `getStats()` reports
+  actively-shaped subscribers via `shapedSubscribers`. Invalid options throw
+  `RangeError` from `subscribe`. Disabled by default.
 
 ## Run
 

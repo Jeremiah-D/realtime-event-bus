@@ -83,6 +83,26 @@ export interface SubscribeOptions {
    */
   onThrottled?: (event: ThrottleEvent) => void;
   /**
+   * Opt-in delivery-side rate shaping for a slow downstream consumer. When
+   * enabled, the bus delivers at most `messagesPerSec` messages per second
+   * to this subscriber (token bucket, first `burst` messages go at once);
+   * messages over budget stay queued — in FIFO order, never dropped — and
+   * are delivered on later flush rounds as the bucket refills, so delivery
+   * is smoothed to the downstream's pace instead of arriving in bursts.
+   *
+   * Unlike adaptive publish-side `throttle` (which sheds), shaping never
+   * drops: the backlog accumulates under the subscriber's normal
+   * backpressure policy, so size the queue for the expected backlog — a
+   * full queue still applies its drop policy. Shaping does not extend TTL:
+   * a message whose deadline passes while it waits is dropped as expired.
+   * Disabled by default.
+   *
+   * Pass `true` for the defaults (100 messages/sec, one second of burst),
+   * or a `DeliveryShapingOptions` object to tune the rate. Invalid values
+   * throw `RangeError` from `subscribe`.
+   */
+  deliveryShaping?: boolean | DeliveryShapingOptions;
+  /**
    * Opt-in subscriber health probing. When enabled, the bus watches every
    * delivery to this subscriber: a handler that throws, or one that takes
    * longer than `processingTimeoutMs` to run, counts as one failure.
@@ -156,6 +176,26 @@ export interface ThrottleOptions {
    * (`queueSize * highWaterMarkRatio`, at least 1).
    */
   initialRatePerSec?: number;
+}
+
+/**
+ * Tuning for delivery-side rate shaping (`SubscribeOptions.deliveryShaping`).
+ * Bounds are validated at `subscribe` time; violations throw `RangeError`.
+ */
+export interface DeliveryShapingOptions {
+  /**
+   * Maximum deliveries per second to the subscriber. Must be a positive
+   * finite number. Default 100.
+   */
+  messagesPerSec?: number;
+  /**
+   * How many messages may be delivered in one flush round once budget has
+   * accumulated — the token bucket capacity. Must be a positive finite
+   * number. Defaults to one second's worth of budget
+   * (`max(1, ceil(messagesPerSec))`), the same convention as
+   * `setTopicRateLimit`.
+   */
+  burst?: number;
 }
 
 /** Snapshot delivered to `onThrottled` when adaptive throttling engages. */
@@ -463,8 +503,14 @@ export interface BusStats {
    */
   degradedSubscribers: number;
   /**
-   * Stats for every concrete topic that has seen at least one publish,
-   * in order of first publish.
+   * Subscriptions currently having messages held back by delivery-side
+   * rate shaping (see `SubscribeOptions.deliveryShaping`): their queues
+   * still hold messages the token budget did not allow this round.
+   */
+  shapedSubscribers: number;
+  /**
+   * Stats for every concrete topic that has seen at least one publish or
+   * schema rejection, in order of first publish.
    */
   topics: TopicStats[];
   /**
@@ -523,6 +569,11 @@ interface Subscriber {
   throttle?: ThrottleState;
   /** Fired once when adaptive throttling engages for this subscriber. */
   onThrottled?: (event: ThrottleEvent) => void;
+  /**
+   * Delivery-side rate shaping state (see `SubscribeOptions.deliveryShaping`).
+   * Absent when shaping is disabled for this subscriber.
+   */
+  deliveryShaping?: DeliveryShapingState;
   /**
    * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
    * Absent when the probe is disabled for this subscriber.
@@ -685,6 +736,51 @@ function resolveThrottleOptions(
     minRatePerSec,
     maxRatePerSec,
     initialRatePerSec: clampedInitial,
+  };
+}
+
+/**
+ * Per-subscriber delivery-side rate shaping state (see
+ * `SubscribeOptions.deliveryShaping`). The token bucket paces how many
+ * queued messages one flush round may deliver; `shaping` is true while the
+ * subscriber holds messages back for lack of budget, and `timer` is the
+ * pending re-flush scheduled for when the bucket refills.
+ */
+interface DeliveryShapingState {
+  bucket: TokenBucket;
+  /** True while queued messages are held back for lack of budget. */
+  shaping: boolean;
+  messagesPerSec: number;
+  burst: number;
+  /** Pending re-flush timer, armed while `shaping` is true. */
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Validates `SubscribeOptions.deliveryShaping` and builds the initial
+ * per-subscriber shaping state. Returns `undefined` when shaping is
+ * disabled. Throws `RangeError` for invalid rates.
+ */
+function resolveDeliveryShapingOptions(
+  opt: boolean | DeliveryShapingOptions | undefined,
+  now: () => number,
+): DeliveryShapingState | undefined {
+  if (opt == null || opt === false) return undefined;
+  const o: DeliveryShapingOptions = opt === true ? {} : opt;
+  const messagesPerSec = o.messagesPerSec ?? 100;
+  if (!Number.isFinite(messagesPerSec) || messagesPerSec <= 0) {
+    throw new RangeError('deliveryShaping.messagesPerSec must be a positive finite number of messages/sec');
+  }
+  const burst = o.burst ?? Math.max(1, Math.ceil(messagesPerSec));
+  if (!Number.isFinite(burst) || burst <= 0) {
+    throw new RangeError('deliveryShaping.burst must be a positive finite number of messages');
+  }
+  return {
+    bucket: new TokenBucket(burst, messagesPerSec, now),
+    shaping: false,
+    messagesPerSec,
+    burst,
+    timer: undefined,
   };
 }
 
@@ -1097,6 +1193,7 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
+    const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
     const onDegraded = opts?.onDegraded;
     const queue = new BoundedQueue<BusMessage>({
       capacity,
@@ -1148,6 +1245,7 @@ export class EventBus {
       lastDeliveredSeq: new Map(),
       throttle,
       onThrottled,
+      deliveryShaping,
       health:
         healthProbe == null
           ? undefined
@@ -1179,13 +1277,14 @@ export class EventBus {
       id,
       unsubscribe: () => {
         if (!this.subscribers.delete(id)) return;
-        // A pending auto-resume must not outlive the subscriber: no phantom
-        // resume (and no rescheduled flush) after unsubscribe.
+        // Pending timers must not outlive the subscriber: no phantom
+        // resume or re-flush after unsubscribe.
         const health = subscriber.health;
         if (health?.autoResumeTimer !== undefined) {
           clearTimeout(health.autoResumeTimer);
           health.autoResumeTimer = undefined;
         }
+        this.clearShapingTimer(subscriber);
         const bucket = this.prefixIndex.get(indexKey);
         if (bucket != null) {
           bucket.delete(id);
@@ -1766,10 +1865,12 @@ export class EventBus {
     let unackedDeliveries = 0;
     let throttledSubscribers = 0;
     let degradedSubscribers = 0;
+    let shapedSubscribers = 0;
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
+      if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
     }
     return {
       totalSubscribers: this.subscribers.size,
@@ -1784,6 +1885,7 @@ export class EventBus {
       rejectedMessages: this.totalRejected,
       throttledSubscribers,
       degradedSubscribers,
+      shapedSubscribers,
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
         return {
@@ -1987,38 +2089,124 @@ export class EventBus {
       // round enforces the same expiry cutoff.
       const nowMs = this.now();
       for (const subscriber of this.subscribers.values()) {
-        // A degraded subscriber's deliveries are paused: its backlog stays
-        // queued under the normal backpressure policy, untouched by the
-        // drain, so resuming picks up exactly where delivery paused.
-        if (subscriber.health?.degraded === true) continue;
-        const { live, expired } = subscriber.queue.drainLive(nowMs);
-        for (const msg of expired) {
-          this.recordExpired(msg.topic);
-        }
-        const health = subscriber.health;
-        if (health == null) {
-          for (const msg of live) {
-            this.detectGap(subscriber, msg);
-            subscriber.handler(msg);
-          }
-          continue;
-        }
-        for (let i = 0; i < live.length; i += 1) {
-          this.deliverWithHealth(subscriber, live[i]);
-          if (!health.degraded) continue;
-          // The threshold tripped mid-drain: everything not yet attempted
-          // goes back to the queue, in order, with its original TTL
-          // deadline restored from the bus registry — FIFO is preserved and
-          // resuming redelivers exactly what was paused. (The queue is empty
-          // here — it was just drained — so the requeue cannot drop.)
-          for (let j = i + 1; j < live.length; j += 1) {
-            subscriber.queue.push(live[j], 0, this.messageDeadlines.get(live[j]));
-          }
-          this.reportDegraded(subscriber);
-          break;
-        }
+        this.drainSubscriber(subscriber, nowMs);
       }
     });
+  }
+
+  /**
+   * Drains one subscriber's queue and delivers the dequeued messages,
+   * honoring delivery-side rate shaping when enabled. A shaped subscriber
+   * dequeues at most what its token budget allows this round (whole tokens
+   * only — a fractional token delivers nothing); the remainder stays queued
+   * in FIFO order for a later flush, and a re-flush timer is armed so the
+   * backlog drains even when no new publishes arrive.
+   */
+  private drainSubscriber(subscriber: Subscriber, nowMs: number): void {
+    // A degraded subscriber's deliveries are paused: its backlog stays
+    // queued under the normal backpressure policy, untouched by the
+    // drain, so resuming picks up exactly where delivery paused.
+    if (subscriber.health?.degraded === true) return;
+    const shaping = subscriber.deliveryShaping;
+    const maxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
+    const { live, expired } = subscriber.queue.drainLiveUpTo(nowMs, maxLive);
+    for (const msg of expired) {
+      this.recordExpired(msg.topic);
+    }
+    const health = subscriber.health;
+    if (health == null) {
+      for (const msg of live) {
+        // Guaranteed to succeed: the drain above dequeued at most
+        // floor(availableTokens), and nothing else consumes this
+        // subscriber's bucket in between.
+        shaping?.bucket.take();
+        this.detectGap(subscriber, msg);
+        subscriber.handler(msg);
+      }
+    } else {
+      for (let i = 0; i < live.length; i += 1) {
+        shaping?.bucket.take();
+        this.deliverWithHealth(subscriber, live[i]);
+        if (!health.degraded) continue;
+        // The threshold tripped mid-drain: everything not yet attempted
+        // goes back to the queue, in FIFO order (see requeueUndelivered).
+        this.requeueUndelivered(subscriber, live.slice(i + 1));
+        this.reportDegraded(subscriber);
+        break;
+      }
+    }
+    if (shaping != null) {
+      // Expired entries were discarded above, so a non-empty queue means
+      // shaping is actively holding this subscriber back for lack of
+      // budget — never because of TTL.
+      shaping.shaping = subscriber.queue.size > 0;
+      if (shaping.shaping) {
+        this.armShapingTimer(subscriber);
+      } else {
+        this.clearShapingTimer(subscriber);
+      }
+    }
+  }
+
+  /**
+   * Returns messages a drain dequeued but never delivered (health probing
+   * tripped mid-drain) to the subscriber's queue, preserving FIFO order.
+   * When the drain emptied the queue the messages are simply appended back;
+   * when a bounded (shaped) drain left entries queued, the queue is rebuilt
+   * as [undelivered..., still-queued...] — the total never exceeds the
+   * pre-drain size, so the requeue cannot drop.
+   */
+  private requeueUndelivered(subscriber: Subscriber, undelivered: BusMessage[]): void {
+    if (undelivered.length === 0) return;
+    const queue = subscriber.queue;
+    if (queue.size === 0) {
+      for (const msg of undelivered) queue.push(msg, 0, this.messageDeadlines.get(msg));
+      return;
+    }
+    const rest = queue.drain();
+    for (const msg of undelivered) queue.push(msg, 0, this.messageDeadlines.get(msg));
+    for (const msg of rest) queue.push(msg, 0, this.messageDeadlines.get(msg));
+  }
+
+  /**
+   * Arms the re-flush timer for a shaped subscriber that is holding
+   * messages back: when the token bucket refills, the timer triggers
+   * another flush so the backlog drains even when no new publishes arrive.
+   * The delay is derived from the bus clock (consistent with the bucket);
+   * the timer itself is a real wall-clock timeout — like the health
+   * probe's auto-resume timer — and never keeps the process alive on its
+   * own. Firing only schedules a flush when the subscriber is still shaping
+   * and the bucket actually has budget; otherwise it re-arms, so a clock
+   * that has not advanced cannot spin the flush loop.
+   */
+  private armShapingTimer(subscriber: Subscriber): void {
+    const shaping = subscriber.deliveryShaping;
+    if (shaping == null || shaping.timer !== undefined) return;
+    const delayMs = Math.max(0, Math.ceil(shaping.bucket.msUntilNextToken()));
+    const timer = setTimeout(() => {
+      shaping.timer = undefined;
+      if (!shaping.shaping || this.subscribers.get(subscriber.id) !== subscriber) return;
+      if (shaping.bucket.availableTokens < 1) {
+        this.armShapingTimer(subscriber);
+        return;
+      }
+      this.scheduleFlush();
+    }, delayMs);
+    // A shaped backlog must not keep the process alive on its own.
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    shaping.timer = timer;
+  }
+
+  /**
+   * Cancels a shaped subscriber's pending re-flush timer, if any.
+   */
+  private clearShapingTimer(subscriber: Subscriber): void {
+    const shaping = subscriber.deliveryShaping;
+    if (shaping?.timer !== undefined) {
+      clearTimeout(shaping.timer);
+      shaping.timer = undefined;
+    }
   }
 
   /**
