@@ -455,6 +455,40 @@ export interface GroupRebalanceEvent {
   trigger: 'join' | 'leave';
   /** The subscription id of the member that joined or left. */
   memberId: string;
+  /**
+   * Present on `leave` events when the leaving member configured
+   * `GroupSubscribeOptions.handoffLingerMs` and had assigned-but-
+   * uncommitted work: the bus-clock time (ms) until which that backlog is
+   * treated as still in flight — a member that (re)joins and replays from
+   * the durable log skips it instead of delivering it a second time.
+   */
+  lingerUntil?: number;
+  /**
+   * Present alongside `lingerUntil`: the per-topic backlog ranges held in
+   * the linger window — `(fromSeq, toSeq]`, committed-exclusive to
+   * assigned-inclusive — that replay skips until `lingerUntil`.
+   */
+  lingering?: Array<{ topic: string; fromSeq: number; toSeq: number }>;
+}
+
+/**
+ * One active handoff-linger window for a group (see
+ * `GroupSubscribeOptions.handoffLingerMs`): seqs the group assigned to a
+ * departed member but nobody committed yet. While `until` is in the
+ * future, durable-log replay skips these seqs for members of the group —
+ * the leaver is presumed still processing them — so they are never
+ * delivered twice. After `until`, the backlog becomes replayable again
+ * (the leaver is presumed dead; at-least-once resumes).
+ */
+interface LingerWindow {
+  /** Concrete topic the backlog range covers. */
+  topic: string;
+  /** Committed seq at leave time (exclusive bound). */
+  fromSeq: number;
+  /** Assigned seq at leave time (inclusive bound). */
+  toSeq: number;
+  /** Bus-clock ms; the window is live while this is in the future. */
+  until: number;
 }
 
 export interface GroupSubscribeOptions extends SubscribeOptions {
@@ -467,6 +501,26 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * any local assignment state.
    */
   onRebalance?: (event: GroupRebalanceEvent) => void;
+  /**
+   * Graceful-handoff window in milliseconds, applied when this member
+   * leaves the group. While the window is open, messages the group
+   * assigned to the leaving member but that were never committed are
+   * treated as still in flight: a member that (re)joins and replays from
+   * the durable log (`resumeFromSeq`) skips them instead of delivering
+   * them a second time. After the window expires the backlog becomes
+   * replayable again — the leaver is presumed dead and at-least-once
+   * delivery resumes.
+   *
+   * `0` (default) disables the window. Only meaningful with
+   * `EventBusOptions.durableLogDir`: without a durable log there is
+   * nothing to replay, so the linger is inert. Must be a finite number
+   * `>= 0`; anything else throws `RangeError`.
+   *
+   * Operational recipe: `commitOffset` before leaving — committed work
+   * needs no handoff window. The linger only covers what the leaver did
+   * not commit (the crash case), exactly like a Kafka rebalance revoke.
+   */
+  handoffLingerMs?: number;
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -920,6 +974,12 @@ interface Subscriber {
   groupId?: string;
   /** Fired on group membership changes (see `GroupSubscribeOptions`). */
   onRebalance?: (event: GroupRebalanceEvent) => void;
+  /**
+   * Graceful-handoff linger in ms for consumer-group members (see
+   * `GroupSubscribeOptions.handoffLingerMs`). Absent (or 0) for plain
+   * subscribers and members without a linger.
+   */
+  handoffLingerMs?: number;
   /**
    * Subscriber-side content filter (see `SubscribeOptions.filter`).
    * Absent when the subscriber has no filter.
@@ -1854,9 +1914,19 @@ export class EventBus {
    * Consumer-checkpointed offsets: groupId -> concrete topic -> last
    * processed `seq` as reported by the consumer via `commitOffset`. Pure
    * bookkeeping for operators and resume-after-restart; the bus never acts
-   * on it by itself.
+   * on it by itself. When a durable log is configured the checkpoints are
+   * additionally journaled to disk (see `DurableTopicLog.appendOffset`)
+   * and reseeded from the journal at construction.
    */
   private committedOffsets = new Map<string, Map<string, number>>();
+  /**
+   * Active handoff-linger windows: groupId -> windows (see
+   * `GroupSubscribeOptions.handoffLingerMs`). While a window is live,
+   * durable-log replay skips the covered seqs for members of the group,
+   * so a leaving member's in-flight work is never delivered twice.
+   * Bounded: windows are pruned on every read and capped per group.
+   */
+  private lingerWindows = new Map<string, LingerWindow[]>();
   private readonly now: () => number;
   /**
    * Durable topic log, present only when `EventBusOptions.durableLogDir`
@@ -1940,6 +2010,22 @@ export class EventBus {
       // that never fanned out (and were not cancelled) survive the
       // restart. Already-due entries fan out immediately.
       this.recoverDelayed();
+      // Reseed consumer-group checkpoints from the offset journal: the
+      // highest committed seq per (group, topic) wins, so a restarted bus
+      // resumes committed offsets instead of forgetting them — a rejoining
+      // member that seeds `resumeFromSeq` from `getCommittedOffsets` picks
+      // up exactly where its predecessor committed.
+      for (const [key, seq] of this.durableLog.recoveredCommittedOffsets()) {
+        const sep = key.indexOf('\0');
+        const groupId = key.slice(0, sep);
+        const topic = key.slice(sep + 1);
+        let committed = this.committedOffsets.get(groupId);
+        if (committed == null) {
+          committed = new Map<string, number>();
+          this.committedOffsets.set(groupId, committed);
+        }
+        committed.set(topic, seq);
+      }
     }
   }
 
@@ -2329,17 +2415,10 @@ export class EventBus {
    * many of its messages were shed.
    */
   subscribe(topicPattern: string, handler: MessageHandler, opts?: SubscribeOptions): Subscription {
-    // Validate the durable-log resume options before registering anything:
-    // a throw must not leave a half-registered subscriber behind.
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const resumeFromSeq = opts?.resumeFromSeq;
-    if (resumeFromSeq !== undefined) {
-      if (this.durableLog == null) {
-        throw new RangeError('resumeFromSeq requires EventBusOptions.durableLogDir to be set');
-      }
-      if (!Number.isInteger(resumeFromSeq) || resumeFromSeq < 0) {
-        throw new RangeError('resumeFromSeq must be a non-negative integer');
-      }
-    }
+    this.validateResumeFromSeq(resumeFromSeq);
     const id = `sub-${++this.nextId}`;
     const capacity = opts?.queueSize ?? 100;
     const onBackpressure = opts?.onBackpressure;
@@ -2578,13 +2657,22 @@ export class EventBus {
    * - The bus tracks the assignment watermark per group and topic
    *   (`getGroupOffsets`): the highest per-topic `seq` handed to any
    *   member. Consumers checkpoint their own progress with
-   *   `commitOffset`; combined with a durable topic log
-   *   (`EventBusOptions.durableLogDir` + `SubscribeOptions.resumeFromSeq`)
-   *   a rejoining member can resume where it left off.
+   *   `commitOffset`; with a durable topic log
+   *   (`EventBusOptions.durableLogDir`) checkpoints are additionally
+   *   journaled to disk and reseeded on restart, so combined with
+   *   `SubscribeOptions.resumeFromSeq` a rejoining member resumes where
+   *   it committed — even across process restarts.
+   * - A leaving member may open a graceful-handoff linger window
+   *   (`GroupSubscribeOptions.handoffLingerMs`): while the window is
+   *   open, durable-log replay skips the group's assigned-but-uncommitted
+   *   backlog for that member's in-flight work, so it is never delivered
+   *   twice. Operational recipe: `commitOffset` before leaving — the
+   *   linger only covers what the leaver did not commit.
    *
    * All queue options (`queueSize`, `dropPolicy`, `onBackpressure`,
    * `throttle`, ...) behave per member exactly as in `subscribe`. Throws
-   * `RangeError` when `groupId` is empty.
+   * `RangeError` when `groupId` is empty or `handoffLingerMs` is not a
+   * finite number `>= 0`.
    */
   subscribeToGroup(
     groupId: string,
@@ -2595,11 +2683,23 @@ export class EventBus {
     if (groupId.length === 0) {
       throw new RangeError('groupId must be a non-empty string');
     }
-    const sub = this.subscribe(topicPattern, handler, opts);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const handoffLingerMs = opts?.handoffLingerMs ?? 0;
+    if (!Number.isFinite(handoffLingerMs) || handoffLingerMs < 0) {
+      throw new RangeError('handoffLingerMs must be a finite number of milliseconds >= 0');
+    }
+    // The durable-log replay is deferred until after the group assignment
+    // is recorded below: `replayLog` skips seqs inside the group's live
+    // handoff-linger windows, which needs `subscriber.groupId` to be set.
+    const { resumeFromSeq, ...restOpts } = opts ?? {};
+    this.validateResumeFromSeq(resumeFromSeq);
+    const sub = this.subscribe(topicPattern, handler, restOpts);
     const subscriber = this.subscribers.get(sub.id);
     if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
     subscriber.groupId = groupId;
     subscriber.onRebalance = opts?.onRebalance;
+    subscriber.handoffLingerMs = handoffLingerMs;
     const key = EventBus.groupKey(groupId, topicPattern);
     let members = this.groupMembers.get(key);
     if (members == null) {
@@ -2607,6 +2707,9 @@ export class EventBus {
       this.groupMembers.set(key, members);
     }
     members.push(sub.id);
+    if (resumeFromSeq !== undefined) {
+      this.replayLog(subscriber, resumeFromSeq);
+    }
     this.fireRebalance(groupId, topicPattern, key, 'join', sub.id);
     return {
       id: sub.id,
@@ -2614,8 +2717,9 @@ export class EventBus {
         // Second call is a no-op: no double leave-event, no roster churn.
         if (!this.subscribers.has(sub.id)) return;
         this.removeGroupMember(key, sub.id);
+        const linger = this.beginLingerHandoff(groupId, subscriber);
         sub.unsubscribe();
-        this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id);
+        this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id, linger);
       },
     };
   }
@@ -2649,6 +2753,8 @@ export class EventBus {
   /**
    * Notifies every current member of a group about a membership change.
    * Each member receives its own snapshot of the post-change roster.
+   * `linger` (leave events only) carries the handoff window opened for
+   * the departed member, so the event observes the no-duplicate handoff.
    */
   private fireRebalance(
     groupId: string,
@@ -2656,6 +2762,7 @@ export class EventBus {
     key: string,
     trigger: 'join' | 'leave',
     memberId: string,
+    linger?: { until: number; windows: LingerWindow[] },
   ): void {
     const members = this.groupMembers.get(key);
     if (members == null) return;
@@ -2667,7 +2774,96 @@ export class EventBus {
         members: [...members],
         trigger,
         memberId,
+        ...(linger == null
+          ? {}
+          : {
+              lingerUntil: linger.until,
+              lingering: linger.windows.map((w) => ({ topic: w.topic, fromSeq: w.fromSeq, toSeq: w.toSeq })),
+            }),
       });
+    }
+  }
+
+  /**
+   * Opens a handoff-linger window for a leaving group member (see
+   * `GroupSubscribeOptions.handoffLingerMs`). Returns the window summary
+   * for the rebalance event, or `undefined` when no window was opened.
+   *
+   * A window covers, per topic, the seqs the group assigned but nobody
+   * committed: `(committed, assigned]`. While any window is live,
+   * `replayLog` skips those seqs for members of the group, so a rejoining
+   * member's resume never delivers the leaver's in-flight work a second
+   * time. After the window expires the backlog is replayable again — the
+   * leaver is presumed dead, at-least-once resumes.
+   *
+   * No window opens when the member configured no linger, when there is
+   * no uncommitted backlog, or when no durable log is configured: without
+   * a log there is no replay to suppress, so a linger would be inert.
+   */
+  private beginLingerHandoff(
+    groupId: string,
+    subscriber: Subscriber,
+  ): { until: number; windows: LingerWindow[] } | undefined {
+    const lingerMs = subscriber.handoffLingerMs ?? 0;
+    if (lingerMs <= 0 || this.durableLog == null) return undefined;
+    const assigned = this.groupOffsets.get(groupId);
+    if (assigned == null) return undefined;
+    const committed = this.committedOffsets.get(groupId);
+    const until = this.now() + lingerMs;
+    const windows: LingerWindow[] = [];
+    for (const [topic, toSeq] of assigned) {
+      const fromSeq = committed?.get(topic) ?? 0;
+      if (toSeq > fromSeq) windows.push({ topic, fromSeq, toSeq, until });
+    }
+    if (windows.length === 0) return undefined;
+    let list = this.lingerWindows.get(groupId);
+    if (list == null) {
+      list = [];
+      this.lingerWindows.set(groupId, list);
+    }
+    list.push(...windows);
+    // Bound memory: linger windows are transient; when a group churns an
+    // absurd number of short-lived members, drop the oldest windows —
+    // their handoffs have long expired anyway.
+    if (list.length > 1024) list.splice(0, list.length - 1024);
+    return { until, windows };
+  }
+
+  /**
+   * Drops expired linger windows for a group; deletes the group's row
+   * when no live window remains. Returns the live windows.
+   */
+  private pruneLingerWindows(groupId: string): LingerWindow[] {
+    const list = this.lingerWindows.get(groupId);
+    if (list == null) return [];
+    const now = this.now();
+    const live = list.filter((w) => w.until > now);
+    if (live.length === 0) this.lingerWindows.delete(groupId);
+    else this.lingerWindows.set(groupId, live);
+    return live;
+  }
+
+  /** True when `seq` on `topic` sits inside one of the group's live linger windows. */
+  private isLingering(groupId: string, topic: string, seq: number): boolean {
+    for (const w of this.pruneLingerWindows(groupId)) {
+      if (w.topic === topic && seq > w.fromSeq && seq <= w.toSeq) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Validates the durable-log resume option before anything registers: a
+   * throw must not leave a half-registered subscriber behind. Shared by
+   * `subscribe` and `subscribeToGroup` (the latter replays after recording
+   * the group assignment — see below).
+   */
+  private validateResumeFromSeq(resumeFromSeq: number | undefined): void {
+    if (resumeFromSeq === undefined) return;
+    if (this.durableLog == null) {
+      throw new RangeError('resumeFromSeq requires EventBusOptions.durableLogDir to be set');
+    }
+    if (!Number.isInteger(resumeFromSeq) || resumeFromSeq < 0) {
+      throw new RangeError('resumeFromSeq must be a non-negative integer');
     }
   }
 
@@ -2718,6 +2914,13 @@ export class EventBus {
    * from here. Committing for a group with no live members is allowed:
    * that is exactly the restore-before-rejoin case.
    *
+   * When a durable log is configured (`EventBusOptions.durableLogDir`)
+   * the checkpoint is additionally appended to the log's group-offset
+   * journal, so committed offsets survive a process restart (the journal
+   * is append-only; the highest seq per (group, topic) wins at recovery).
+   * A journal write failure never fails the in-memory commit — the live
+   * process keeps serving from memory.
+   *
    * Throws `RangeError` on an empty groupId/topic or a non-positive
    * non-integer seq.
    */
@@ -2737,6 +2940,7 @@ export class EventBus {
       this.committedOffsets.set(groupId, committed);
     }
     committed.set(topic, seq);
+    this.durableLog?.appendOffset(groupId, topic, seq, this.now());
   }
 
   /**
@@ -2864,6 +3068,19 @@ export class EventBus {
           this.countFiltered(subscriber, rec.topic, rec.seq);
           continue;
         }
+      }
+      // Handoff linger: a group member that left within its linger window
+      // is presumed still processing these seqs — skip them so the
+      // rejoining member's resume never delivers in-flight work twice.
+      // Like a content filter, the skip must not churn backpressure or
+      // count as a sequence gap: the per-topic baseline advances over it.
+      // After the window expires the same replay delivers them normally
+      // (the leaver is presumed dead; at-least-once resumes).
+      const groupId = subscriber.groupId;
+      if (groupId !== undefined && this.isLingering(groupId, rec.topic, rec.seq)) {
+        const last = subscriber.lastDeliveredSeq.get(rec.topic);
+        if (last === undefined || rec.seq > last) subscriber.lastDeliveredSeq.set(rec.topic, rec.seq);
+        continue;
       }
       const msg: BusMessage = { topic: rec.topic, payload: rec.payload, seq: rec.seq };
       // The log stores the wire payload: a record written while a

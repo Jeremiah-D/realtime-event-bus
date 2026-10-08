@@ -109,6 +109,80 @@ interface LogLine {
 }
 
 /**
+ * One persisted consumer-group offset commit: the last per-topic `seq`
+ * a consumer of `groupId` durably processed on `topic`.
+ */
+export interface DurableOffsetCommit {
+  /** The consumer group that reported the checkpoint. */
+  groupId: string;
+  /** Concrete topic the checkpoint covers. */
+  topic: string;
+  /** Last per-topic `seq` the consumer durably processed. */
+  seq: number;
+  /** Commit timestamp in milliseconds (the bus clock). */
+  at: number;
+}
+
+/** On-disk envelope for one offset-commit line. `v` pins the format. */
+interface OffsetLine {
+  v: 1;
+  group: string;
+  topic: string;
+  seq: number;
+  at: number;
+}
+
+/**
+ * Key for one (group, topic) checkpoint: groupId and topic joined by NUL.
+ * Neither may contain NUL in practice, so the pairing is unambiguous and
+ * reversible (see `recoveredCommittedOffsets`).
+ */
+function offsetKey(groupId: string, topic: string): string {
+  return `${groupId}\0${topic}`;
+}
+
+/** Builds the on-disk envelope for an offset commit. */
+function offsetLineOf(commit: DurableOffsetCommit): OffsetLine {
+  return { v: 1, group: commit.groupId, topic: commit.topic, seq: commit.seq, at: commit.at };
+}
+
+/**
+ * Parses one offset-journal line. Returns `null` for anything malformed —
+ * wrong version, empty group/topic, a non-positive-integer seq, or a
+ * non-finite timestamp. Corrupt lines are skipped, never fatal.
+ */
+function parseOffsetLine(line: string): DurableOffsetCommit | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const o = parsed as Record<string, unknown>;
+  if (o['v'] !== 1) return null;
+  if (typeof o['group'] !== 'string' || (o['group'] as string).length === 0) return null;
+  if (typeof o['topic'] !== 'string' || (o['topic'] as string).length === 0) return null;
+  const seq = o['seq'];
+  if (!Number.isInteger(seq) || (seq as number) < 1) return null;
+  if (typeof o['at'] !== 'number' || !Number.isFinite(o['at'])) return null;
+  return {
+    groupId: o['group'] as string,
+    topic: o['topic'] as string,
+    seq: seq as number,
+    at: o['at'] as number,
+  };
+}
+
+/**
+ * File name of the group-offset journal inside the log directory. A
+ * `.jsonl` name — not `.log` — so topic-file recovery never mistakes it
+ * for a topic file, and it can never collide with a topic file either
+ * (`fileFor` always appends `.log`).
+ */
+const OFFSET_JOURNAL_NAME = '__group_offsets.jsonl';
+
+/**
  * Append-only, per-topic durable log for the event bus.
  *
  * Each concrete topic gets one JSONL file (`<url-encoded topic>.log`) under
@@ -129,6 +203,16 @@ interface LogLine {
  * Superseded records linger on disk until the next compaction pass — reads
  * (`readSince`) and restart recovery dedupe them in memory, so a
  * superseded value is never replayed even before the file is rewritten.
+ *
+ * Besides the per-topic message files, the log maintains one group-offset
+ * journal (`__group_offsets.jsonl`): every consumer-group offset commit
+ * (`EventBus.commitOffset`) is appended as one line, and opening the log
+ * recovers the highest committed seq per (group, topic). A restarted bus
+ * seeded from the same directory therefore resumes its committed offsets —
+ * a rejoining consumer that replays from `getCommittedOffsets` does not
+ * lose its checkpoint across restarts. The journal compacts itself to the
+ * latest commit per (group, topic) when it grows past twice
+ * `maxEntriesPerTopic` lines.
  *
  * Durability note: appends are synchronous (`appendFileSync`), so a record
  * is handed to the OS before `append` returns. A power loss can still lose
@@ -176,13 +260,29 @@ export class DurableTopicLog {
   private readonly supersededCounts = new Map<string, number>();
   /** Lines that failed to parse during recovery/reads. Skipped, never fatal. */
   private corruptLines = 0;
+  /**
+   * Path of the group-offset journal (`__group_offsets.jsonl`) inside the
+   * log directory. One append-only file for every group, separate from the
+   * per-topic message files.
+   */
+  private readonly offsetFile: string;
+  /**
+   * Latest committed offset per (group, topic), keyed by
+   * `offsetKey(groupId, topic)` — the in-memory side of the offset
+   * journal, rebuilt on open and maintained on append.
+   */
+  private readonly offsetCommits = new Map<string, { groupId: string; topic: string; seq: number; at: number }>();
+  /** Lines currently in the offset journal, used for compaction. */
+  private offsetEntries = 0;
 
   private constructor(dir: string, maxEntriesPerTopic: number, keyCompaction: boolean) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
     this.keyCompaction = keyCompaction;
+    this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
     mkdirSync(dir, { recursive: true });
     this.recover();
+    this.recoverOffsets();
   }
 
   /**
@@ -395,6 +495,100 @@ export class DurableTopicLog {
     return [...this.topicsSeen];
   }
 
+  /**
+   * Scans the offset journal and rebuilds the in-memory checkpoint index:
+   * the highest committed seq per (group, topic) wins, so a restarted bus
+   * resumes from where its consumers committed, not from zero. Corrupt
+   * lines are counted and skipped; a corrupt journal never prevents the
+   * log from opening.
+   */
+  private recoverOffsets(): void {
+    let text: string;
+    try {
+      text = readFileSync(this.offsetFile, 'utf8');
+    } catch {
+      return;
+    }
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      this.offsetEntries += 1;
+      const commit = parseOffsetLine(line);
+      if (commit == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const key = offsetKey(commit.groupId, commit.topic);
+      const prev = this.offsetCommits.get(key);
+      if (prev == null || commit.seq > prev.seq) {
+        this.offsetCommits.set(key, { groupId: commit.groupId, topic: commit.topic, seq: commit.seq, at: commit.at });
+      }
+    }
+  }
+
+  /**
+   * Persists one consumer-group offset commit to the append-only offset
+   * journal. Returns `true` when the commit was persisted, `false` when
+   * the commit could not be serialized or the write failed — the caller
+   * keeps the in-memory checkpoint regardless, so a full disk must not
+   * fail the commit path. Never throws.
+   *
+   * When the journal grows past twice `maxEntriesPerTopic` lines it is
+   * compacted down to the latest commit per (group, topic): a group that
+   * commits per message must not grow the journal without bound.
+   */
+  appendOffset(groupId: string, topic: string, seq: number, at: number): boolean {
+    let line: string;
+    try {
+      line = `${JSON.stringify(offsetLineOf({ groupId, topic, seq, at }))}\n`;
+    } catch {
+      return false;
+    }
+    try {
+      appendFileSync(this.offsetFile, line, 'utf8');
+    } catch {
+      return false;
+    }
+    this.offsetEntries += 1;
+    const key = offsetKey(groupId, topic);
+    const prev = this.offsetCommits.get(key);
+    if (prev == null || seq > prev.seq) {
+      this.offsetCommits.set(key, { groupId, topic, seq, at });
+    }
+    if (this.offsetEntries > this.maxEntriesPerTopic * 2) {
+      this.compactOffsets();
+    }
+    return true;
+  }
+
+  /** Rewrites the offset journal keeping only the latest commit per (group, topic). */
+  private compactOffsets(): void {
+    const text = [...this.offsetCommits.values()]
+      .map((c) => `${JSON.stringify(offsetLineOf({ groupId: c.groupId, topic: c.topic, seq: c.seq, at: c.at }))}\n`)
+      .join('');
+    try {
+      writeFileSync(this.offsetFile, text, 'utf8');
+    } catch {
+      return;
+    }
+    this.offsetEntries = this.offsetCommits.size;
+  }
+
+  /**
+   * Committed offsets recovered from the offset journal: the highest
+   * committed seq per (group, topic), keyed `${groupId}\0${topic}` (the
+   * same NUL-joined pairing as `EventBus`'s group key).
+   */
+  recoveredCommittedOffsets(): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const [key, c] of this.offsetCommits) out.set(key, c.seq);
+    return out;
+  }
+
+  /** Lines currently in the offset journal, 0 when no offset was ever committed. */
+  offsetEntryCount(): number {
+    return this.offsetEntries;
+  }
+
   /** Highest seq logged for a topic, 0 when the topic is unknown. */
   lastSeq(topic: string): number {
     return this.lastSeqs.get(topic) ?? 0;
@@ -415,10 +609,23 @@ export class DurableTopicLog {
   }
 
   /** Point-in-time log stats. */
-  stats(): { topics: number; entries: number; corruptLines: number; keyCompaction: boolean } {
+  stats(): {
+    topics: number;
+    entries: number;
+    corruptLines: number;
+    keyCompaction: boolean;
+    /** Lines in the group-offset journal (`__group_offsets.jsonl`). */
+    offsetEntries: number;
+  } {
     let entries = 0;
     for (const count of this.entryCounts.values()) entries += count;
-    return { topics: this.topicsSeen.size, entries, corruptLines: this.corruptLines, keyCompaction: this.keyCompaction };
+    return {
+      topics: this.topicsSeen.size,
+      entries,
+      corruptLines: this.corruptLines,
+      keyCompaction: this.keyCompaction,
+      offsetEntries: this.offsetEntries,
+    };
   }
 }
 

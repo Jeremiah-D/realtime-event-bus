@@ -121,6 +121,23 @@ library.
   schedule records are timer intents and are never compacted away; a keyed
   delayed message keeps its key across restart. Durability is process-restart grade (synchronous appends, no
   per-message `fsync`) — a crash log for recovery, not a write-ahead log.
+  Alongside the per-topic files the log keeps one group-offset journal
+  (`__group_offsets.jsonl`): every `commitOffset(groupId, topic, seq)` is
+  appended as one line, and a bus opened over the same directory reseeds
+  `getCommittedOffsets` from the highest committed seq per (group, topic)
+  — checkpoints survive restarts, so a rejoining consumer that seeds
+  `resumeFromSeq` from `getCommittedOffsets` picks up exactly where its
+  predecessor committed. The journal compacts itself to the latest commit
+  per (group, topic) past twice the entry budget (`getStats().durableLog.offsetEntries`
+  reports its size). A leaving group member may open a graceful-handoff
+  linger window (`subscribeToGroup(..., { handoffLingerMs })`): while the
+  window is open, durable-log replay skips the group's assigned-but-
+  uncommitted backlog for that member's in-flight work — a rejoining
+  member's resume never delivers it twice — and after the window expires
+  the backlog becomes replayable again (at-least-once). The `leave`
+  rebalance event carries `lingerUntil` / `lingering` so operators can see
+  the handoff; the operational recipe is `commitOffset` before leaving —
+  the linger only covers what the leaver did not commit.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
@@ -373,6 +390,13 @@ npm test
   isolation (own drop policy), `getGroupOffsets` watermark,
   `commitOffset`/`getCommittedOffsets` round-trip and validation,
   `getStats().consumerGroups`, and `**` patterns.
+- `test/group-offsets.test.ts` — durable group-offset journal
+  (`__group_offsets.jsonl`): checkpoint reseeding after restart, max-seq
+  wins, corrupt-line tolerance, journal self-compaction; rebalance linger
+  (`handoffLingerMs`): leave-event `lingerUntil`/`lingering`, replay
+  skipping in-flight seqs during the window, live traffic unaffected,
+  backlog replayable after expiry, no window when fully committed, inert
+  without a durable log, option validation.
 - `test/durablelog.test.ts` — durable topic log: append/readSince round-trip,
   reopen recovery of topics/seqs/counts, corrupt-line tolerance, amortized
   compaction, option validation; bus integration: per-publish logging with
