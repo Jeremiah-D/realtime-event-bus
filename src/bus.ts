@@ -2,6 +2,8 @@ import { BoundedQueue, type DropPolicy } from './backpressure.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
 import { DurableTopicLog } from './durablelog.ts';
+import { deflateSync, inflateSync } from 'node:zlib';
+import { Buffer } from 'node:buffer';
 
 export type { Delivery } from './ack.ts';
 
@@ -436,6 +438,35 @@ export interface TopicStats {
    * invisible to gap detection.
    */
   rejectedMessages: number;
+  /**
+   * Messages on this topic delivered with a compressed payload (see
+   * `setTopicCompression`): the payload's serialized size exceeded the
+   * topic's `thresholdBytes` and deflate produced a smaller encoding.
+   * Compression never changes delivery semantics — the subscriber's
+   * handler transparently receives the original payload.
+   */
+  compressedMessages: number;
+  /**
+   * Sum of serialized payload bytes before compression, over this topic's
+   * compressed messages.
+   */
+  compressedBytesBefore: number;
+  /**
+   * Sum of payload bytes after compression (the deflated bytes, before
+   * base64), over this topic's compressed messages.
+   */
+  compressedBytesAfter: number;
+  /**
+   * `compressedBytesAfter / compressedBytesBefore` — below 1 means the
+   * wire shrank. 0 when nothing on this topic has been compressed yet.
+   */
+  compressionRatio: number;
+  /**
+   * Mean deflate time per compressed message in milliseconds, measured
+   * with the bus clock. 0 when nothing on this topic has been compressed
+   * yet.
+   */
+  meanCompressionMs: number;
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -489,6 +520,32 @@ export interface BusStats {
    * exact counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total messages delivered with a compressed payload — the sum of every
+   * topic's `compressedMessages`. See `TopicStats.compressedMessages` for
+   * the exact counting rules.
+   */
+  compressedMessages: number;
+  /**
+   * Sum of serialized payload bytes before compression, across all
+   * compressed messages.
+   */
+  compressedBytesBefore: number;
+  /**
+   * Sum of payload bytes after compression (deflated bytes, before
+   * base64), across all compressed messages.
+   */
+  compressedBytesAfter: number;
+  /**
+   * Global `compressedBytesAfter / compressedBytesBefore` — below 1 means
+   * the wire shrank. 0 when nothing has been compressed yet.
+   */
+  compressionRatio: number;
+  /**
+   * Mean deflate time per compressed message in milliseconds, measured
+   * with the bus clock. 0 when nothing has been compressed yet.
+   */
+  meanCompressionMs: number;
   /**
    * Subscriptions currently under adaptive publish-side throttling (see
    * `SubscribeOptions.throttle`): their queues crossed the high-water mark
@@ -823,6 +880,78 @@ function resolveHealthProbeOptions(
  */
 export type SchemaValidator = (payload: unknown, topic: string) => boolean;
 
+/**
+ * Tuning for opt-in per-topic payload compression (see
+ * `EventBus.setTopicCompression`). Compression uses `node:zlib` deflate —
+ * zero new dependencies — and only kicks in for payloads whose serialized
+ * size exceeds `thresholdBytes`, so small messages never pay deflate CPU.
+ */
+export interface TopicCompressionOptions {
+  /**
+   * Payloads whose serialized (UTF-8 JSON) size is strictly greater than
+   * this many bytes are deflate-compressed; anything at or below the
+   * threshold passes through untouched. Must be a positive finite number
+   * of bytes.
+   */
+  thresholdBytes: number;
+  /**
+   * zlib deflate compression level, 0–9. Default 6. Higher levels trade
+   * CPU for smaller output; level 0 stores without compressing, so its
+   * output is never smaller than the input and the bus always passes
+   * through (useful for testing the never-adopt-a-larger-encoding guard).
+   */
+  level?: number;
+}
+
+/**
+ * Wire form of a compressed payload: what subscriber queues and the
+ * durable log hold between publish and delivery. The `__busCompressed`
+ * marker is reserved by the bus — a user payload that happens to carry the
+ * exact same shape is NOT treated as compressed (see `EventBus`'s
+ * `compressedPayloads` set), but do not hand-craft this envelope: its
+ * layout is internal and may change.
+ */
+interface CompressedPayload {
+  /** Reserved marker: this envelope carries zlib-deflated payload bytes. */
+  __busCompressed: 'deflate';
+  /** Base64 of the raw deflate bytes of the payload's UTF-8 JSON encoding. */
+  data: string;
+}
+
+/**
+ * Shape-check for the compression envelope. Strict on purpose (exact key
+ * count, exact marker, string data) so a user payload that merely
+ * resembles the envelope is never mistaken for one — the bus additionally
+ * gates decompression on its own `compressedPayloads` set, so this check
+ * is the second line of defense, not the first.
+ */
+function isCompressedPayload(value: unknown): value is CompressedPayload {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    Object.keys(record).length === 2 &&
+    record.__busCompressed === 'deflate' &&
+    typeof record.data === 'string'
+  );
+}
+
+/**
+ * Serializes a payload to its canonical byte form for the compression
+ * size check: the UTF-8 JSON encoding. Returns `undefined` for payloads
+ * with no JSON encoding (`undefined`, functions, symbols) or ones
+ * `JSON.stringify` cannot represent (circular structures, BigInt) — those
+ * are uncompressible and pass through untouched, exactly as the durable
+ * log already treats them.
+ */
+function serializeForCompression(payload: unknown): string | undefined {
+  try {
+    const serialized = JSON.stringify(payload);
+    return typeof serialized === 'string' ? serialized : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
@@ -852,6 +981,11 @@ export class EventBus {
       sequenceGaps: number;
       rateLimitedMessages: number;
       rejectedMessages: number;
+      compressedMessages: number;
+      compressedBytesBefore: number;
+      compressedBytesAfter: number;
+      /** Sum of deflate times in milliseconds (bus clock); see `meanCompressionMs`. */
+      compressionTimeMs: number;
     }
   >();
   private totalPublished = 0;
@@ -923,6 +1057,38 @@ export class EventBus {
    */
   private totalRejected = 0;
   /**
+   * Per-topic payload compression rules, keyed by the exact string passed
+   * to `setTopicCompression` — either a concrete topic name or a wildcard
+   * pattern. Match resolution mirrors the TTL, rate-limit, and schema
+   * rules: an exact-topic rule wins over any pattern; between patterns the
+   * earliest-registered rule wins.
+   */
+  private compressionRules = new Map<string, TopicCompressionOptions>();
+  /**
+   * Compiled matchers for the wildcard entries in `compressionRules`, kept
+   * apart from the subscriber pattern cache so compression configuration
+   * never inflates `patternCacheSize`.
+   */
+  private compressionMatcherCache = new Map<string, RegExp>();
+  /** Messages whose payload the bus actually compressed (global total). */
+  private totalCompressed = 0;
+  /** Serialized payload bytes before compression (global total). */
+  private totalCompressedBytesBefore = 0;
+  /** Deflated payload bytes after compression (global total). */
+  private totalCompressedBytesAfter = 0;
+  /** Sum of deflate times in milliseconds, bus clock (global total). */
+  private totalCompressionTimeMs = 0;
+  /**
+   * Messages currently carrying a compressed payload envelope. Live
+   * messages are registered here by the publish path when they are
+   * compressed; replayed messages are registered by `replayLog` when the
+   * log record carries an envelope. Decompression at delivery is gated on
+   * this set — NOT on the envelope marker alone — so a user payload that
+   * happens to share the envelope's shape is never mistaken for a
+   * compressed one. Entries die with their message (WeakSet).
+   */
+  private compressedPayloads = new WeakSet<BusMessage>();
+  /**
    * Original TTL deadlines by message, for redelivery. `fanOut` stamps the
    * deadline here when a TTL rule matches; the reliable-subscription
    * requeue path reads it back so a requeued message keeps its
@@ -986,6 +1152,10 @@ export class EventBus {
           sequenceGaps: 0,
           rateLimitedMessages: 0,
           rejectedMessages: 0,
+          compressedMessages: 0,
+          compressedBytesBefore: 0,
+          compressedBytesAfter: 0,
+          compressionTimeMs: 0,
         });
       }
     }
@@ -1158,6 +1328,149 @@ export class EventBus {
       if (matcher.test(topic)) return validator;
     }
     return undefined;
+  }
+
+  /**
+   * Opts topics matching `topicPattern` into publish-side payload
+   * compression. `topicPattern` accepts the same wildcard syntax as
+   * `subscribe` (or an exact topic name). A publish whose payload
+   * serializes to more than `opts.thresholdBytes` UTF-8 JSON bytes is
+   * deflate-compressed (`node:zlib`, zero new dependencies); smaller
+   * payloads pass through untouched and never pay deflate CPU.
+   *
+   * The compressed bytes — wrapped in a bus-internal envelope — are what
+   * get written to the durable log and fanned out to subscriber queues;
+   * subscribers transparently receive the original payload (inflated just
+   * before delivery), so compression is invisible to handlers. Compression
+   * never changes message semantics: it consumes no sequence numbers,
+   * moves no TTL deadlines, and is orthogonal to ACK redelivery (a
+   * redelivered message is inflated once, on its first delivery).
+   *
+   * Compression is a no-op unless it actually shrinks the payload: when
+   * deflate would not make the bytes smaller (incompressible data, or an
+   * absurd level like 0), the message passes through uncompressed and is
+   * not counted. Payloads with no JSON encoding (`undefined`, functions,
+   * symbols, circular structures, BigInt) are uncompressible and pass
+   * through untouched — like the durable log, compression is designed for
+   * JSON-shaped payloads.
+   *
+   * Rule matching mirrors `setTopicTtl`: an exact-topic rule wins over
+   * patterns, the earliest-registered matching pattern wins. Re-setting a
+   * rule replaces it. Throws when `topicPattern` is empty, when
+   * `thresholdBytes` is not a positive finite number, or when `level` is
+   * not an integer in 0–9.
+   */
+  setTopicCompression(topicPattern: string, opts: TopicCompressionOptions): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (opts == null || !Number.isFinite(opts.thresholdBytes) || opts.thresholdBytes <= 0) {
+      throw new RangeError('thresholdBytes must be a positive finite number of bytes');
+    }
+    const level = opts.level ?? 6;
+    if (!Number.isInteger(level) || level < 0 || level > 9) {
+      throw new RangeError('level must be an integer in 0-9');
+    }
+    this.compressionRules.set(topicPattern, { thresholdBytes: opts.thresholdBytes, level });
+  }
+
+  /**
+   * Removes the compression rule previously registered for `topicPattern`.
+   * Messages already queued keep whatever form they were published with;
+   * only new publishes are affected. Returns true when a rule existed and
+   * was removed.
+   */
+  clearTopicCompression(topicPattern: string): boolean {
+    return this.compressionRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the compression options that apply to `topic`, or `undefined`
+   * when no rule matches. Same precedence as `ttlForTopic`.
+   */
+  private compressionForTopic(topic: string): TopicCompressionOptions | undefined {
+    const exact = this.compressionRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, rule] of this.compressionRules) {
+      let matcher = this.compressionMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.compressionMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return rule;
+    }
+    return undefined;
+  }
+
+  /**
+   * Applies the topic's compression rule to a publish, if any. Returns the
+   * payload as it should travel on the wire: either the original payload
+   * (no rule, below threshold, uncompressible, or deflate did not shrink
+   * it) or the compression envelope. When compression is adopted, the
+   * message is registered in `compressedPayloads` (the delivery-time
+   * decompression gate) and the per-topic + global compression counters
+   * are updated.
+   *
+   * Runs on the admitted message only — after schema validation and after
+   * the rate-limit shed — so rejected/shed publishes never pay deflate
+   * CPU and never touch compression metrics.
+   */
+  private compressPayload(
+    msg: BusMessage,
+    payload: unknown,
+    rule: TopicCompressionOptions,
+    stats: { compressedMessages: number; compressedBytesBefore: number; compressedBytesAfter: number; compressionTimeMs: number },
+  ): unknown {
+    const serialized = serializeForCompression(payload);
+    if (serialized === undefined) return payload;
+    const bytesBefore = Buffer.byteLength(serialized, 'utf8');
+    // Small messages pass through: compression is opt-in per byte saved,
+    // not a tax on every publish.
+    if (bytesBefore <= rule.thresholdBytes) return payload;
+    const startedAtMs = this.now();
+    const deflated = deflateSync(serialized, { level: rule.level ?? 6 });
+    const elapsedMs = Math.max(0, this.now() - startedAtMs);
+    // Never adopt an encoding that does not shrink the payload —
+    // incompressible data (or level 0) would only add envelope overhead.
+    if (deflated.length >= bytesBefore) return payload;
+    const envelope: CompressedPayload = {
+      __busCompressed: 'deflate',
+      data: deflated.toString('base64'),
+    };
+    this.compressedPayloads.add(msg);
+    stats.compressedMessages += 1;
+    stats.compressedBytesBefore += bytesBefore;
+    stats.compressedBytesAfter += deflated.length;
+    stats.compressionTimeMs += elapsedMs;
+    this.totalCompressed += 1;
+    this.totalCompressedBytesBefore += bytesBefore;
+    this.totalCompressedBytesAfter += deflated.length;
+    this.totalCompressionTimeMs += elapsedMs;
+    return envelope;
+  }
+
+  /**
+   * Restores a message's original payload just before delivery. Only acts
+   * on messages the publish path registered in `compressedPayloads` — a
+   * plain payload, even one shaped like the envelope, passes through
+   * untouched. Idempotent: after the first inflation the payload is the
+   * original value, so redeliveries and multi-subscriber fan-out of the
+   * same message never inflate twice.
+   *
+   * A message registered here whose payload is not a well-formed envelope
+   * can only come from a tampered durable log (the bus never produces
+   * one); it throws rather than delivering corrupt data silently.
+   */
+  private inflateMessagePayload(msg: BusMessage): void {
+    if (!this.compressedPayloads.has(msg)) return;
+    this.compressedPayloads.delete(msg);
+    const payload = msg.payload;
+    if (!isCompressedPayload(payload)) {
+      throw new Error(
+        `compressed payload envelope for topic "${msg.topic}" (seq ${msg.seq}) is malformed`,
+      );
+    }
+    msg.payload = JSON.parse(inflateSync(Buffer.from(payload.data, 'base64')).toString('utf8'));
   }
 
   /**
@@ -1646,6 +1959,11 @@ export class EventBus {
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
     for (const rec of records) {
       const msg: BusMessage = { topic: rec.topic, payload: rec.payload, seq: rec.seq };
+      // The log stores the wire payload: a record written while a
+      // compression rule was active carries the deflated envelope, so
+      // re-register it for transparent inflation at delivery — exactly
+      // like a live compressed message.
+      if (isCompressedPayload(rec.payload)) this.compressedPayloads.add(msg);
       if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
       subscriber.queue.push(msg, 0, rec.expiresAt);
     }
@@ -1761,6 +2079,10 @@ export class EventBus {
           sequenceGaps: 0,
           rateLimitedMessages: 0,
           rejectedMessages: 0,
+          compressedMessages: 0,
+          compressedBytesBefore: 0,
+          compressedBytesAfter: 0,
+          compressionTimeMs: 0,
         };
         this.topicStats.set(topic, rejectedStats);
       }
@@ -1779,6 +2101,10 @@ export class EventBus {
         sequenceGaps: 0,
         rateLimitedMessages: 0,
         rejectedMessages: 0,
+        compressedMessages: 0,
+        compressedBytesBefore: 0,
+        compressedBytesAfter: 0,
+        compressionTimeMs: 0,
       };
       this.topicStats.set(topic, stats);
     }
@@ -1804,6 +2130,25 @@ export class EventBus {
         return { matched: 0, accepted: 0 };
       }
     }
+    // Publish-side per-topic payload compression (opt-in via
+    // `setTopicCompression`). Pipeline order, and why:
+    //   1. schema validation ran first and always sees the RAW payload —
+    //      validators are written against the application payload shape,
+    //      so validating the compressed envelope would break every
+    //      existing validator.
+    //   2. rate limiting ran before compression: a shed message is dropped
+    //      without ever paying deflate CPU, and compression metrics only
+    //      count admitted messages.
+    //   3. what is persisted to the durable log and fanned out to queues is
+    //      the COMPRESSED bytes (envelope); subscribers inflate
+    //      transparently just before delivery. Compression consumes no
+    //      sequence number and moves no TTL deadline — seq/TTL semantics
+    //      are unchanged.
+    const compressionRule = this.compressionForTopic(topic);
+    if (compressionRule !== undefined) {
+      const wirePayload = this.compressPayload(msg, payload, compressionRule, stats);
+      if (wirePayload !== payload) msg.payload = wirePayload;
+    }
     let matched = 0;
     let accepted = 0;
     // One clock reading for the publish: TTL deadline and log timestamp stay
@@ -1815,7 +2160,11 @@ export class EventBus {
     // Durable log (opt-in): persist the stamped message before fan-out, so a
     // crash between publish and delivery still leaves it replayable. Logging
     // never throws into the publish path — see `DurableTopicLog.append`.
-    this.durableLog?.append({ seq: msg.seq, topic, at: nowMs, expiresAt, payload });
+    // The log stores the wire payload: when compression is on, the deflated
+    // bytes are what hit the disk, and resume replays the envelope —
+    // `replayLog` re-registers those messages for transparent inflation at
+    // delivery, exactly like live ones.
+    this.durableLog?.append({ seq: msg.seq, topic, at: nowMs, expiresAt, payload: msg.payload });
     // The prefix index prunes the regex tests down to subscribers whose
     // pattern's literal prefix can plausibly match the topic; the compiled
     // regex stays the final authority, and the no-miss invariant in
@@ -1883,6 +2232,15 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       rejectedMessages: this.totalRejected,
+      compressedMessages: this.totalCompressed,
+      compressedBytesBefore: this.totalCompressedBytesBefore,
+      compressedBytesAfter: this.totalCompressedBytesAfter,
+      compressionRatio:
+        this.totalCompressedBytesBefore > 0
+          ? this.totalCompressedBytesAfter / this.totalCompressedBytesBefore
+          : 0,
+      meanCompressionMs:
+        this.totalCompressed > 0 ? this.totalCompressionTimeMs / this.totalCompressed : 0,
       throttledSubscribers,
       degradedSubscribers,
       shapedSubscribers,
@@ -1903,6 +2261,15 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         rejectedMessages: stats.rejectedMessages,
+        compressedMessages: stats.compressedMessages,
+        compressedBytesBefore: stats.compressedBytesBefore,
+        compressedBytesAfter: stats.compressedBytesAfter,
+        compressionRatio:
+          stats.compressedBytesBefore > 0
+            ? stats.compressedBytesAfter / stats.compressedBytesBefore
+            : 0,
+        meanCompressionMs:
+          stats.compressedMessages > 0 ? stats.compressionTimeMs / stats.compressedMessages : 0,
       })),
       ...(this.durableLog == null
         ? {}
@@ -2120,12 +2487,18 @@ export class EventBus {
         // floor(availableTokens), and nothing else consumes this
         // subscriber's bucket in between.
         shaping?.bucket.take();
+        // Compressed payloads are inflated here — once per message, before
+        // any handler sees it — so every subscriber transparently receives
+        // the original payload. See `inflateMessagePayload` for the
+        // idempotency and envelope-collision notes.
+        this.inflateMessagePayload(msg);
         this.detectGap(subscriber, msg);
         subscriber.handler(msg);
       }
     } else {
       for (let i = 0; i < live.length; i += 1) {
         shaping?.bucket.take();
+        this.inflateMessagePayload(live[i]);
         this.deliverWithHealth(subscriber, live[i]);
         if (!health.degraded) continue;
         // The threshold tripped mid-drain: everything not yet attempted

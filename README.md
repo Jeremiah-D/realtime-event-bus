@@ -186,6 +186,35 @@ library.
   publish caller — validation runs before any state is mutated for that
   message. `clearTopicSchema` removes a rule. Empty patterns and
   non-function validators throw `RangeError`.
+- **Per-topic payload compression** (in `src/bus.ts`, via
+  `setTopicCompression(pattern, { thresholdBytes, level })`): opt-in
+  `node:zlib` deflate for large payloads — zero new dependencies. A publish
+  whose payload serializes to more than `thresholdBytes` UTF-8 JSON bytes is
+  deflate-compressed (default level 6, tunable 0–9); smaller payloads pass
+  through untouched and never pay deflate CPU. Pipeline order is deliberate
+  and documented in `fanOut`: schema validation always sees the *raw*
+  payload (validators are written against the application shape), rate-limit
+  sheds happen *before* compression (a shed message never pays deflate CPU
+  and never touches compression metrics), and the compressed bytes are what
+  get written to the durable log and fanned out to subscriber queues. Each
+  compressed message carries a bus-internal envelope marker; subscribers
+  inflate transparently just before delivery, so handlers always receive the
+  original payload. Decompression is gated on a bus-side `WeakSet` of
+  messages the publish path actually compressed — not on the marker alone —
+  so a user payload that happens to share the envelope's shape is never
+  mistaken for a compressed one. Compression is a no-op unless it shrinks
+  the payload (an encoding larger than the input is never adopted), and
+  payloads with no JSON encoding (`undefined`, functions, circular
+  structures, BigInt) pass through untouched. It never changes message
+  semantics: no sequence numbers consumed, no TTL deadlines moved, and ACK
+  redelivery reuses the once-inflated message. `getStats()` exposes
+  per-topic and global `compressedMessages`, `compressedBytesBefore`,
+  `compressedBytesAfter`, `compressionRatio` (after/before, < 1 means the
+  wire shrank), and `meanCompressionMs` (deflate time, bus clock). Rule
+  matching mirrors `setTopicTtl`: an exact-topic rule wins over patterns,
+  the earliest-registered matching pattern wins; `clearTopicCompression`
+  removes a rule (already-queued messages keep the form they were published
+  with). Invalid options throw `RangeError`. Disabled by default.
 - **Subscriber output rate shaping** (in `src/bus.ts`, opt-in via
   `subscribe(..., { deliveryShaping: true })`): delivery-side pacing for a
   slow downstream consumer. A per-subscriber token bucket caps deliveries at
@@ -276,6 +305,18 @@ npm test
   bookkeeping, key eviction, idempotent unsubscribe), and boundary cases
   (`a.**` matching the bare topic `a`, leading-wildcard patterns under the
   empty key, `subscribeReliable` routing through the same index).
+- `test/compress.test.ts` — per-topic opt-in payload compression:
+  below-threshold passthrough, above-threshold deflate with transparent
+  subscriber-side inflation (one inflation per message across subscribers),
+  no sequence-number consumption or reordering, `clearTopicCompression`
+  restoring passthrough, rule matching (exact-topic beats patterns,
+  earliest-registered pattern wins), never adopting an encoding that does
+  not shrink the payload (level 0), unserializable payload passthrough,
+  schema validation seeing the raw payload, rate-limit sheds happening
+  before compression, durable-log round-trip (compressed bytes on disk,
+  resume inflates), ACK redelivery of compressed messages, TTL deadline
+  preservation, envelope-shaped user payloads never mistaken for
+  compressed, and option validation.
 
 ## Benchmark
 

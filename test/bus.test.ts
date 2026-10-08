@@ -343,6 +343,11 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       rejectedMessages: 0,
+      compressedMessages: 0,
+      compressedBytesBefore: 0,
+      compressedBytesAfter: 0,
+      compressionRatio: 0,
+      meanCompressionMs: 0,
     },
     {
       topic: 'market.eth',
@@ -353,6 +358,11 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       rejectedMessages: 0,
+      compressedMessages: 0,
+      compressedBytesBefore: 0,
+      compressedBytesAfter: 0,
+      compressionRatio: 0,
+      meanCompressionMs: 0,
     },
   ]);
 });
