@@ -342,6 +342,7 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       lastSeq: 2,
       sequenceGaps: 0,
       rateLimitedMessages: 0,
+      rejectedMessages: 0,
     },
     {
       topic: 'market.eth',
@@ -351,6 +352,7 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       lastSeq: 1,
       sequenceGaps: 0,
       rateLimitedMessages: 0,
+      rejectedMessages: 0,
     },
   ]);
 });

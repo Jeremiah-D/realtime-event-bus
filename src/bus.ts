@@ -388,6 +388,14 @@ export interface TopicStats {
    * expirations get.
    */
   rateLimitedMessages: number;
+  /**
+   * Publishes to this topic rejected by schema validation (see
+   * `setTopicSchema`): the payload failed the topic's validator. Unlike
+   * rate-limit sheds, a rejection happens before admission — the payload
+   * never became a message, so it consumed no sequence number and is
+   * invisible to gap detection.
+   */
+  rejectedMessages: number;
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -435,6 +443,12 @@ export interface BusStats {
    * `TopicStats.rateLimitedMessages` for the exact counting rules.
    */
   rateLimitedMessages: number;
+  /**
+   * Total publishes rejected by schema validation — the sum of every
+   * topic's `rejectedMessages`. See `TopicStats.rejectedMessages` for the
+   * exact counting rules.
+   */
+  rejectedMessages: number;
   /**
    * Subscriptions currently under adaptive publish-side throttling (see
    * `SubscribeOptions.throttle`): their queues crossed the high-water mark
@@ -702,6 +716,17 @@ function resolveHealthProbeOptions(
   };
 }
 
+/**
+ * Publish-side payload validator for one topic or topic pattern (see
+ * `EventBus.setTopicSchema`). Return `true` to admit the publish, `false`
+ * to reject it. The topic argument is the concrete topic being published
+ * to (never a pattern), so one validator registered for a pattern can
+ * branch on it. A validator that throws propagates the error to the
+ * publish caller — validation runs before any state is mutated for that
+ * message, so a throw never leaves a half-published message behind.
+ */
+export type SchemaValidator = (payload: unknown, topic: string) => boolean;
+
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
@@ -729,6 +754,8 @@ export class EventBus {
       expiredMessages: number;
       lastSeq: number;
       sequenceGaps: number;
+      rateLimitedMessages: number;
+      rejectedMessages: number;
     }
   >();
   private totalPublished = 0;
@@ -778,6 +805,27 @@ export class EventBus {
    */
   private rateLimitBuckets = new Map<string, TokenBucket>();
   private totalRateLimited = 0;
+  /**
+   * Per-topic schema validators, keyed by the exact string passed to
+   * `setTopicSchema` — either a concrete topic name or a wildcard pattern.
+   * Match resolution mirrors the TTL and rate-limit rules: an exact-topic
+   * rule wins over any pattern; between patterns the earliest-registered
+   * rule wins.
+   */
+  private schemaRules = new Map<string, SchemaValidator>();
+  /**
+   * Compiled matchers for the wildcard entries in `schemaRules`, kept apart
+   * from the subscriber pattern cache so schema configuration never inflates
+   * `patternCacheSize`.
+   */
+  private schemaMatcherCache = new Map<string, RegExp>();
+  /**
+   * Messages rejected by schema validation (global total). A rejection
+   * happens before admission: the payload never becomes a message, so it
+   * consumes no sequence number, is never written to the durable log, and
+   * never reaches a subscriber queue.
+   */
+  private totalRejected = 0;
   /**
    * Original TTL deadlines by message, for redelivery. `fanOut` stamps the
    * deadline here when a TTL rule matches; the reliable-subscription
@@ -841,6 +889,7 @@ export class EventBus {
           lastSeq,
           sequenceGaps: 0,
           rateLimitedMessages: 0,
+          rejectedMessages: 0,
         });
       }
     }
@@ -956,6 +1005,61 @@ export class EventBus {
         this.rateLimitMatcherCache.set(pattern, matcher);
       }
       if (matcher.test(topic)) return limit;
+    }
+    return undefined;
+  }
+
+  /**
+   * Registers a publish-side schema validator for one topic or topic
+   * pattern — an admission gate for malformed payloads. `topicPattern`
+   * accepts the same wildcard syntax as `subscribe` (or an exact topic
+   * name); a publish whose payload makes the validator return `false` is
+   * rejected: it is never fanned out, never written to the durable log,
+   * and never reaches a subscriber queue — `publish` returns 0 for it.
+   *
+   * A rejection happens before admission, so it consumes no sequence
+   * number (subscribers see no gap), does not burn rate-limit budget, and
+   * is counted separately in `TopicStats.rejectedMessages` (and the global
+   * total). A validator that throws propagates the error to the publish
+   * caller; validation runs before any state is mutated for that message.
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * patterns, the earliest-registered matching pattern wins. Re-setting a
+   * rule replaces it. Throws when `topicPattern` is empty or `validator`
+   * is not a function.
+   */
+  setTopicSchema(topicPattern: string, validator: SchemaValidator): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (typeof validator !== 'function') {
+      throw new RangeError('validator must be a function');
+    }
+    this.schemaRules.set(topicPattern, validator);
+  }
+
+  /**
+   * Removes the schema validator previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed.
+   */
+  clearTopicSchema(topicPattern: string): boolean {
+    return this.schemaRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the schema validator that applies to `topic`, or `undefined`
+   * when no rule matches. Same precedence as `ttlForTopic`.
+   */
+  private schemaForTopic(topic: string): SchemaValidator | undefined {
+    const exact = this.schemaRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, validator] of this.schemaRules) {
+      let matcher = this.schemaMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.schemaMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return validator;
     }
     return undefined;
   }
@@ -1454,7 +1558,9 @@ export class EventBus {
    * returns the number of subscribers whose queue accepted the message.
    * When a queue is full, the subscriber's drop policy sheds a message and
    * counts the drop (see `droppedCount`); delivery happens on the next
-   * microtask so slow consumers exert real backpressure.
+   * microtask so slow consumers exert real backpressure. A publish rejected
+   * by a schema validator (see `setTopicSchema`) is never fanned out and
+   * returns 0.
    */
   publish(topic: string, payload: unknown): number {
     const { accepted } = this.fanOut(topic, payload);
@@ -1538,6 +1644,31 @@ export class EventBus {
    * expired copies at drain time and count them as expired.
    */
   private fanOut(topic: string, payload: unknown): { matched: number; accepted: number } {
+    // Publish-side schema validation runs before admission: a rejected
+    // payload never becomes a message — no sequence number is consumed
+    // (subscribers see no gap), the durable log never sees it, and it
+    // does not burn rate-limit budget. Rejection is counted on the
+    // topic's stats entry, which is created here when the topic has never
+    // published anything valid yet.
+    const validator = this.schemaForTopic(topic);
+    if (validator !== undefined && !validator(payload, topic)) {
+      let rejectedStats = this.topicStats.get(topic);
+      if (rejectedStats == null) {
+        rejectedStats = {
+          subscriberCount: 0,
+          publishedMessages: 0,
+          expiredMessages: 0,
+          lastSeq: 0,
+          sequenceGaps: 0,
+          rateLimitedMessages: 0,
+          rejectedMessages: 0,
+        };
+        this.topicStats.set(topic, rejectedStats);
+      }
+      rejectedStats.rejectedMessages += 1;
+      this.totalRejected += 1;
+      return { matched: 0, accepted: 0 };
+    }
     const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
     let stats = this.topicStats.get(topic);
     if (stats == null) {
@@ -1548,6 +1679,7 @@ export class EventBus {
         lastSeq: 0,
         sequenceGaps: 0,
         rateLimitedMessages: 0,
+        rejectedMessages: 0,
       };
       this.topicStats.set(topic, stats);
     }
@@ -1649,6 +1781,7 @@ export class EventBus {
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
+      rejectedMessages: this.totalRejected,
       throttledSubscribers,
       degradedSubscribers,
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
@@ -1667,6 +1800,7 @@ export class EventBus {
         lastSeq: stats.lastSeq,
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
+        rejectedMessages: stats.rejectedMessages,
       })),
       ...(this.durableLog == null
         ? {}

@@ -173,6 +173,19 @@ library.
   rule wins over patterns, the earliest-registered matching pattern wins, and
   re-setting a rule resets the topic's budget. `clearTopicRateLimit` removes
   a rule. Invalid configurations throw `RangeError`.
+- **Publish-side schema validation** (in `src/bus.ts`, via
+  `setTopicSchema(pattern, validator)`): an admission gate for malformed
+  payloads. A publish whose payload makes the validator return `false` is
+  rejected before admission — it consumes no sequence number (subscribers
+  see no gap), is never written to the durable log, never reaches a queue,
+  and does not burn rate-limit budget; `publish` returns 0 for it.
+  Rejections are counted in `TopicStats.rejectedMessages` (and the global
+  total). Rule matching mirrors `setTopicTtl`: an exact-topic rule wins over
+  patterns, the earliest-registered matching pattern wins, and re-setting a
+  rule replaces it. A validator that throws propagates the error to the
+  publish caller — validation runs before any state is mutated for that
+  message. `clearTopicSchema` removes a rule. Empty patterns and
+  non-function validators throw `RangeError`.
 
 ## Run
 
