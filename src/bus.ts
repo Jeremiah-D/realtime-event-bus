@@ -28,6 +28,16 @@ export interface BusMessage {
 export type MessageHandler = (msg: BusMessage) => void;
 
 /**
+ * Subscriber content filter (see `SubscribeOptions.filter`): receives the
+ * raw published payload and the concrete topic, returns `true` to accept
+ * the message into the subscriber's queue, `false` to skip it. Filters
+ * always see the application payload — never a compressed wire envelope —
+ * and are expected pure: a throwing filter propagates to the publish call,
+ * exactly like a throwing schema validator.
+ */
+export type MessageFilter = (payload: unknown, topic: string) => boolean;
+
+/**
  * Handler for reliable (at-least-once) subscriptions: receives a `Delivery`
  * envelope with `ack()`/`nack()` instead of a bare message.
  */
@@ -153,6 +163,27 @@ export interface SubscribeOptions {
    * `commitOffset`), not the group's assignment watermark.
    */
   resumeFromSeq?: number;
+  /**
+   * Opt-in subscriber-side content filter. When set, every message fanned
+   * out to this subscriber first passes the predicate at the publish side:
+   * a message the filter rejects never enters the subscriber's queue — it
+   * consumes no backpressure budget, burns no adaptive-throttle token, and
+   * does not surface as a sequence gap (the per-topic baseline advances
+   * over it, exactly as if it had been delivered and deliberately
+   * skipped). The filter sees the raw application payload and the concrete
+   * topic, so one subscription can narrow a broad pattern (e.g. subscribe
+   * `market.**` but only accept `payload.symbol === 'BTC'`).
+   *
+   * The filter also applies to durable-log replay (`resumeFromSeq`): a
+   * replayed message the filter rejects is skipped the same way — never
+   * queued, never a gap. For consumer-group members the filter is
+   * evaluated on the assigned member only: if the assignee rejects the
+   * message, the group's one copy is dropped.
+   *
+   * Must be a function when provided; anything else throws `TypeError`
+   * from `subscribe`. Disabled by default.
+   */
+  filter?: MessageFilter;
 }
 
 /**
@@ -440,6 +471,14 @@ export interface TopicStats {
    */
   rejectedMessages: number;
   /**
+   * Messages fanned out on this topic that a subscriber's content filter
+   * rejected (see `SubscribeOptions.filter`): the message never entered
+   * that subscriber's queue — no backpressure budget consumed — and the
+   * subscriber's per-topic baseline advanced over it, so it is invisible
+   * to sequence-gap detection.
+   */
+  filteredMessages: number;
+  /**
    * Messages on this topic delivered with a compressed payload (see
    * `setTopicCompression`): the payload's serialized size exceeded the
    * topic's `thresholdBytes` and deflate produced a smaller encoding.
@@ -521,6 +560,12 @@ export interface BusStats {
    * exact counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total messages skipped by subscriber content filters — the sum of
+   * every topic's `filteredMessages`. See `TopicStats.filteredMessages`
+   * for the exact counting rules.
+   */
+  filteredMessages: number;
   /**
    * Total messages delivered with a compressed payload — the sum of every
    * topic's `compressedMessages`. See `TopicStats.compressedMessages` for
@@ -653,6 +698,11 @@ interface Subscriber {
   groupId?: string;
   /** Fired on group membership changes (see `GroupSubscribeOptions`). */
   onRebalance?: (event: GroupRebalanceEvent) => void;
+  /**
+   * Subscriber-side content filter (see `SubscribeOptions.filter`).
+   * Absent when the subscriber has no filter.
+   */
+  filter?: MessageFilter;
 }
 
 /**
@@ -716,6 +766,7 @@ function zeroedTopicStats(): {
   sequenceGaps: number;
   rateLimitedMessages: number;
   rejectedMessages: number;
+  filteredMessages: number;
   compressedMessages: number;
   compressedBytesBefore: number;
   compressedBytesAfter: number;
@@ -729,6 +780,7 @@ function zeroedTopicStats(): {
     sequenceGaps: 0,
     rateLimitedMessages: 0,
     rejectedMessages: 0,
+    filteredMessages: 0,
     compressedMessages: 0,
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,
@@ -1031,6 +1083,17 @@ interface CompressedPayload {
 }
 
 /**
+ * Inflates a compression envelope back to the application payload. Used
+ * when a subscriber content filter must judge a durable-log record whose
+ * on-disk bytes are the deflated envelope: the filter always sees the raw
+ * payload, exactly like a live filter evaluation. Throws on a malformed
+ * envelope — a tampered log must not silently deliver corrupt data.
+ */
+function inflateEnvelopePayload(envelope: CompressedPayload): unknown {
+  return JSON.parse(inflateSync(Buffer.from(envelope.data, 'base64')).toString('utf8'));
+}
+
+/**
  * Shape-check for the compression envelope. Strict on purpose (exact key
  * count, exact marker, string data) so a user payload that merely
  * resembles the envelope is never mistaken for one — the bus additionally
@@ -1093,6 +1156,7 @@ export class EventBus {
       sequenceGaps: number;
       rateLimitedMessages: number;
       rejectedMessages: number;
+      filteredMessages: number;
       compressedMessages: number;
       compressedBytesBefore: number;
       compressedBytesAfter: number;
@@ -1168,6 +1232,13 @@ export class EventBus {
    * never reaches a subscriber queue.
    */
   private totalRejected = 0;
+  /**
+   * Messages skipped by subscriber content filters (global total, see
+   * `SubscribeOptions.filter`). A filtered message was fanned out but
+   * never entered the rejecting subscriber's queue — no backpressure
+   * budget consumed, no sequence gap reported.
+   */
+  private totalFiltered = 0;
   /**
    * Per-topic payload compression rules, keyed by the exact string passed
    * to `setTopicCompression` — either a concrete topic name or a wildcard
@@ -1292,6 +1363,7 @@ export class EventBus {
           sequenceGaps: 0,
           rateLimitedMessages: 0,
           rejectedMessages: 0,
+          filteredMessages: 0,
           compressedMessages: 0,
           compressedBytesBefore: 0,
           compressedBytesAfter: 0,
@@ -1614,7 +1686,7 @@ export class EventBus {
         `compressed payload envelope for topic "${msg.topic}" (seq ${msg.seq}) is malformed`,
       );
     }
-    msg.payload = JSON.parse(inflateSync(Buffer.from(payload.data, 'base64')).toString('utf8'));
+    msg.payload = inflateEnvelopePayload(payload);
   }
 
   /**
@@ -1652,6 +1724,10 @@ export class EventBus {
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
     const onDegraded = opts?.onDegraded;
+    const filter = opts?.filter;
+    if (filter !== undefined && typeof filter !== 'function') {
+      throw new TypeError('filter must be a function');
+    }
     const queue = new BoundedQueue<BusMessage>({
       capacity,
       policy: opts?.dropPolicy ?? 'drop-oldest',
@@ -1708,6 +1784,7 @@ export class EventBus {
           ? undefined
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
+      filter,
     };
     this.subscribers.set(id, subscriber);
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
@@ -2101,7 +2178,23 @@ export class EventBus {
       for (const rec of log.readSince(topic, fromSeq)) records.push(rec);
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    const filter = subscriber.filter;
     for (const rec of records) {
+      // A subscriber content filter applies to replay exactly as it does
+      // to live fan-out: a rejected replayed message is never queued (it
+      // must not churn the backpressure budget on reconnect) and advances
+      // the per-topic baseline so it never counts as a gap. The log holds
+      // the wire payload — inflate a compressed envelope first so the
+      // filter judges the raw application payload.
+      if (filter !== undefined) {
+        const rawPayload = isCompressedPayload(rec.payload)
+          ? inflateEnvelopePayload(rec.payload)
+          : rec.payload;
+        if (!filter(rawPayload, rec.topic)) {
+          this.countFiltered(subscriber, rec.topic, rec.seq);
+          continue;
+        }
+      }
       const msg: BusMessage = { topic: rec.topic, payload: rec.payload, seq: rec.seq };
       // The log stores the wire payload: a record written while a
       // compression rule was active carries the deflated envelope, so
@@ -2576,16 +2669,32 @@ export class EventBus {
   }
 
   /**
-   * Pushes one message into a subscriber's queue, honoring adaptive
-   * publish-side throttling. Returns true when the queue accepted the
-   * message. Shared by the plain fan-out path and the consumer-group
-   * assignment path so both get identical backpressure semantics.
+   * Pushes one message into a subscriber's queue, honoring the
+   * subscriber's content filter and adaptive publish-side throttling.
+   * Returns true when the queue accepted the message. Shared by the plain
+   * fan-out path and the consumer-group assignment path so both get
+   * identical backpressure semantics.
+   *
+   * `rawPayload` is the application payload as published — never a
+   * compressed wire envelope — so the content filter always judges the
+   * real payload, exactly like a schema validator does.
    */
   private deliverToSubscriber(
     subscriber: Subscriber,
     msg: BusMessage,
     expiresAt: number | undefined,
+    rawPayload: unknown,
   ): boolean {
+    const filter = subscriber.filter;
+    if (filter !== undefined && !filter(rawPayload, msg.topic)) {
+      // Content-filtered: the message never reaches the queue — no
+      // backpressure budget consumed, no throttle token burned — and it
+      // must not surface as a sequence gap, so the per-topic baseline
+      // advances over it (seen, deliberately skipped). A throwing filter
+      // propagates to the publish call, like a throwing schema validator.
+      this.countFiltered(subscriber, msg.topic, msg.seq);
+      return false;
+    }
     const throttle = subscriber.throttle;
     if (throttle != null && throttle.throttled && !throttle.bucket.take()) {
       // Publish-side shed: the message never reaches the queue, so the
@@ -2595,6 +2704,24 @@ export class EventBus {
       return false;
     }
     return subscriber.queue.push(msg, 0, expiresAt) === 'accepted';
+  }
+
+  /**
+   * Counts one message skipped by a subscriber's content filter (see
+   * `SubscribeOptions.filter`) against the topic and the global total,
+   * and advances the subscriber's per-topic sequence baseline over it so
+   * the deliberately skipped message never counts as a gap.
+   *
+   * Sampling caveat, shared with every sampling-based gap detector: a
+   * message lost (dropped/expired) while every later message on the topic
+   * is filtered stays invisible, because the baseline can only move on
+   * deliveries and filter decisions.
+   */
+  private countFiltered(subscriber: Subscriber, topic: string, seq: number): void {
+    const last = subscriber.lastDeliveredSeq.get(topic);
+    if (last === undefined || seq > last) subscriber.lastDeliveredSeq.set(topic, seq);
+    this.statsFor(topic).filteredMessages += 1;
+    this.totalFiltered += 1;
   }
 
   /**
@@ -2748,7 +2875,7 @@ export class EventBus {
       if (!subscriber.matcher.test(topic)) continue;
       if (subscriber.groupId == null) {
         matched += 1;
-        if (this.deliverToSubscriber(subscriber, msg, expiresAt)) accepted += 1;
+        if (this.deliverToSubscriber(subscriber, msg, expiresAt, payload)) accepted += 1;
         continue;
       }
       const key = EventBus.groupKey(subscriber.groupId, subscriber.pattern);
@@ -2762,7 +2889,7 @@ export class EventBus {
     for (const [key, hit] of groupHits) {
       matched += 1;
       const assignee = this.assignGroupMember(key, hit.members);
-      if (this.deliverToSubscriber(assignee, msg, expiresAt)) accepted += 1;
+      if (this.deliverToSubscriber(assignee, msg, expiresAt, payload)) accepted += 1;
       this.recordGroupOffset(hit.groupId, topic, msg.seq);
     }
     stats.subscriberCount = matched;
@@ -2797,6 +2924,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       rejectedMessages: this.totalRejected,
+      filteredMessages: this.totalFiltered,
       compressedMessages: this.totalCompressed,
       compressedBytesBefore: this.totalCompressedBytesBefore,
       compressedBytesAfter: this.totalCompressedBytesAfter,
@@ -2827,6 +2955,7 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         rejectedMessages: stats.rejectedMessages,
+        filteredMessages: stats.filteredMessages,
         compressedMessages: stats.compressedMessages,
         compressedBytesBefore: stats.compressedBytesBefore,
         compressedBytesAfter: stats.compressedBytesAfter,

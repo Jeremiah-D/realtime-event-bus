@@ -69,7 +69,16 @@ library.
   tracks the per-group assignment watermark (`getGroupOffsets`: highest
   per-topic `seq` handed to any member) and consumer checkpoints
   (`commitOffset` / `getCommittedOffsets`); `getStats().consumerGroups`
-  lists live groups.
+  lists live groups. `subscribe()` also accepts an opt-in content `filter`
+  predicate: a message the filter rejects never enters that subscriber's
+  queue — no backpressure budget consumed, no adaptive-throttle token
+  burned — and the subscriber's per-topic baseline advances over it, so a
+  deliberately skipped message never counts as a sequence gap (a message
+  genuinely dropped while later ones are filtered can still stay invisible
+  — the sampling limit of any gap detector). The filter sees the raw
+  application payload and the concrete topic, applies to durable-log replay
+  too, and for group members is evaluated on the assigned member only;
+  `getStats()` reports `filteredMessages` per topic and globally.
 - **`src/durablelog.ts` — `DurableTopicLog`**: opt-in append-only per-topic
   JSONL log (`new EventBus({ durableLogDir })`). Every published message is
   appended as one line (`{v, seq, topic, at, expiresAt?, payload}`, one file
@@ -383,6 +392,14 @@ npm test
   double delivery, no recount), unserializable payloads throwing with a
   durable log and scheduling in memory without one, timing-option
   validation, and `getStats().pendingDelayed`.
+- `test/filter.test.ts` — subscriber content filtering: reject/accept
+  semantics, filtered messages consuming no backpressure budget, no
+  sequence gaps from skipped messages (while a genuinely dropped message
+  still counts), `TypeError` on a non-function filter, throwing filters
+  propagating to the publish call, group-member filtering on the assigned
+  member, filters seeing the raw payload under compression, durable-log
+  replay honoring the filter (no queue churn, no gaps), and
+  `getStats().filteredMessages`.
 
 ## Benchmark
 
