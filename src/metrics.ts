@@ -44,12 +44,23 @@
  *   recent publish to the topic — the current fan-out width, so hot
  *   topics are visible at a glance. A matching consumer group counts once
  *   (its copy goes to a single assigned member).
+ * - `eventbus_delivery_latency_ms{quantile,subscriber,pattern}`: per-subscriber
+ *   enqueue→delivery queue-dwell distribution for subscriptions with
+ *   `deliveryLatency` enabled — nearest-rank p50/p95/p99 over each
+ *   subscriber's bounded rolling window (`quantile` is "0.5", "0.95" or
+ *   "0.99"). The bus-level slow-consumer view; only tracked subscribers
+ *   appear.
+ * - `eventbus_delivery_latency_samples{subscriber,pattern}`: samples
+ *   currently in each tracked subscriber's latency window.
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
  * bus fanning out over millions of ad-hoc topic names will grow the
  * series count. Topic names come from the publisher, never from subscriber
- * input, so this is bounded by the application's own topic space.
+ * input, so this is bounded by the application's own topic space. The
+ * per-subscriber latency series (four per tracked subscription) are
+ * bounded by the tracked-subscriber count — sampling is opt-in per
+ * subscription, so untracked subscribers add no series.
  *
  * The bus has no HTTP server of its own; wire the returned text into your
  * scrape endpoint with `PROMETHEUS_CONTENT_TYPE`, e.g.:
@@ -170,6 +181,25 @@ export function renderPrometheus(stats: BusStats): string {
     'Delayed messages scheduled but not yet due.',
     stats.pendingDelayed,
   );
+
+  // Per-subscriber delivery-latency series (only subscriptions with
+  // `deliveryLatency` enabled), in subscription order (same as
+  // BusStats.deliveryLatency).
+  lines.push(
+    '# HELP eventbus_delivery_latency_ms Per-subscriber enqueue-to-delivery queue-dwell distribution (nearest-rank quantiles over the rolling sample window).',
+  );
+  lines.push('# TYPE eventbus_delivery_latency_ms gauge');
+  lines.push(
+    '# HELP eventbus_delivery_latency_samples Samples currently in the subscriber latency window.',
+  );
+  lines.push('# TYPE eventbus_delivery_latency_samples gauge');
+  for (const s of stats.deliveryLatency) {
+    const labels = `subscriber="${escapeLabelValue(s.subscriberId)}",pattern="${escapeLabelValue(s.pattern)}"`;
+    lines.push(`eventbus_delivery_latency_ms{quantile="0.5",${labels}} ${s.p50Ms}`);
+    lines.push(`eventbus_delivery_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
+    lines.push(`eventbus_delivery_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
+    lines.push(`eventbus_delivery_latency_samples{${labels}} ${s.samples}`);
+  }
 
   // Per-topic series, in first-publish order (same as BusStats.topics).
   lines.push(

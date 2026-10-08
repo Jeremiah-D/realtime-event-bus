@@ -288,6 +288,23 @@ library.
   draining the backlog when no new publishes arrive; `getStats()` reports
   actively-shaped subscribers via `shapedSubscribers`. Invalid options throw
   `RangeError` from `subscribe`. Disabled by default.
+- **Per-subscriber delivery-latency sampling** (in `src/latency.ts`, opt-in
+  via `subscribe(..., { deliveryLatency: true })`): measures each delivered
+  message's queue dwell — from enqueue into the subscriber's queue to the
+  handler hand-off (handler processing time excluded, so a high p99 means
+  the subscriber is starved behind its own backlog, not that its handler is
+  slow). One sample per delivery (redeliveries sample again); messages that
+  never reach a handler (drops, TTL expiries, throttle sheds, filter skips)
+  are never sampled. The clock is the bus's injected clock, so tests drive
+  deterministic latencies. Each tracked subscriber keeps a bounded rolling
+  window (default 1024 samples, `windowSize` tunable); `getStats()` exposes
+  `deliveryLatency` (per-subscriber p50/p95/p99 nearest-rank + min/max/mean)
+  and `slowestSubscribers` (top 5 by p99 — the first place to look when
+  end-to-end lag grows). `src/metrics.ts` renders
+  `eventbus_delivery_latency_ms{quantile="0.5"|"0.95"|"0.99",subscriber,pattern}`
+  and `eventbus_delivery_latency_samples{subscriber,pattern}` gauges (four
+  series per tracked subscriber; untracked subscribers add none). Invalid
+  options throw `RangeError` from `subscribe`. Disabled by default.
 - **Atomic cross-topic batch publish** (in `src/bus.ts`, via
   `publishAtomic(entries)`): all-or-nothing fan-out for multi-message
   batches — subscribers either see every message or none. Admission runs in
@@ -583,8 +600,13 @@ Exported series:
 | `eventbus_shaped_subscribers` | gauge | `shapedSubscribers` |
 | `eventbus_pending_delayed` | gauge | `pendingDelayed` |
 | `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
+| `eventbus_delivery_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→delivery queue-dwell p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `deliveryLatency`-tracked subscriptions |
+| `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
 
 The per-topic series grow with the distinct topics ever published to — the
 same bound as `BusStats.topics` — so a bus fanning out over millions of
 ad-hoc topic names grows the series count. Topic names come from the
-publisher, so this is bounded by the application's own topic space.
+publisher, so this is bounded by the application's own topic space. The
+per-subscriber latency series (four per tracked subscription) are bounded
+by the tracked-subscriber count — sampling is opt-in, so untracked
+subscribers add no series.

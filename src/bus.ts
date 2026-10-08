@@ -1,6 +1,11 @@
 import { BoundedQueue, type DropPolicy } from './backpressure.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
+import {
+  DeliveryLatencyTracker,
+  type DeliveryLatencyOptions,
+  type DeliveryLatencySummaryStats,
+} from './latency.ts';
 import { DurableTopicLog } from './durablelog.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -8,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 
 export type { Delivery } from './ack.ts';
+export type { DeliveryLatencyOptions, DeliveryLatencySummaryStats } from './latency.ts';
 
 export interface BusMessage {
   topic: string;
@@ -116,6 +122,22 @@ export interface SubscribeOptions {
    * throw `RangeError` from `subscribe`.
    */
   deliveryShaping?: boolean | DeliveryShapingOptions;
+  /**
+   * Opt-in per-subscriber delivery-latency sampling. When enabled, the bus
+   * stamps every message enqueued for this subscriber with the bus clock
+   * and records one sample per handler hand-off: the enqueue→delivery
+   * queue dwell in milliseconds (handler processing time excluded).
+   * `getStats()` exposes the per-subscriber p50/p95/p99 distribution
+   * (`deliveryLatency`) and the slowest tracked subscribers (`slowestSubscribers`),
+   * and `src/metrics.ts` renders them as Prometheus gauges. Useful for
+   * spotting starved consumers before their backpressure queue starts
+   * shedding. Disabled by default.
+   *
+   * Pass `true` for the defaults (1024-sample rolling window per
+   * subscriber), or a `DeliveryLatencyOptions` object to tune the window.
+   * Invalid values throw `RangeError` from `subscribe`.
+   */
+  deliveryLatency?: boolean | DeliveryLatencyOptions;
   /**
    * Opt-in subscriber health probing. When enabled, the bus watches every
    * delivery to this subscriber: a handler that throws, or one that takes
@@ -781,6 +803,28 @@ export interface BusStats {
    */
   pendingDelayed: number;
   /**
+   * Per-subscriber delivery-latency summaries (see
+   * `SubscribeOptions.deliveryLatency`): one entry per subscription with
+   * sampling enabled, in subscription order. Each entry carries the
+   * enqueue→delivery queue-dwell distribution (p50/p95/p99, min/max/mean
+   * over the subscriber's bounded rolling window). Empty when no
+   * subscriber opts in.
+   */
+  deliveryLatency: Array<
+    { subscriberId: string; pattern: string } & DeliveryLatencySummaryStats
+  >;
+  /**
+   * The slowest latency-tracked subscribers by p99 queue dwell (top 5,
+   * descending) — the first place to look when end-to-end lag grows.
+   * Only subscribers with at least one sample appear.
+   */
+  slowestSubscribers: Array<{
+    subscriberId: string;
+    pattern: string;
+    p99Ms: number;
+    samples: number;
+  }>;
+  /**
    * Stats for every concrete topic that has seen at least one publish or
    * schema rejection, in order of first publish.
    */
@@ -856,6 +900,11 @@ interface Subscriber {
    * Absent when shaping is disabled for this subscriber.
    */
   deliveryShaping?: DeliveryShapingState;
+  /**
+   * Delivery-latency sampling state (see `SubscribeOptions.deliveryLatency`).
+   * Absent when sampling is disabled for this subscriber.
+   */
+  latency?: SubscriberLatencyState;
   /**
    * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
    * Absent when the probe is disabled for this subscriber.
@@ -1163,6 +1212,34 @@ function resolveDeliveryShapingOptions(
     burst,
     timer: undefined,
   };
+}
+
+/**
+ * Per-subscriber delivery-latency sampling state (see
+ * `SubscribeOptions.deliveryLatency`). `enqueuedAt` maps a queued message
+ * to the bus-clock reading of its most recent enqueue; entries die with
+ * their messages (WeakMap), so no cleanup is needed on unsubscribe.
+ */
+interface SubscriberLatencyState {
+  tracker: DeliveryLatencyTracker;
+  enqueuedAt: WeakMap<BusMessage, number>;
+}
+
+/**
+ * Validates `SubscribeOptions.deliveryLatency` and builds the initial
+ * per-subscriber sampling state. Returns `undefined` when sampling is
+ * disabled. Throws `RangeError` for an invalid window size.
+ */
+function resolveDeliveryLatencyOptions(
+  opt: boolean | DeliveryLatencyOptions | undefined,
+): SubscriberLatencyState | undefined {
+  if (opt == null || opt === false) return undefined;
+  const o: DeliveryLatencyOptions = opt === true ? {} : opt;
+  const windowSize = o.windowSize ?? 1024;
+  if (!Number.isInteger(windowSize) || windowSize <= 0) {
+    throw new RangeError('deliveryLatency.windowSize must be a positive integer');
+  }
+  return { tracker: new DeliveryLatencyTracker(windowSize), enqueuedAt: new WeakMap() };
 }
 
 /**
@@ -2274,6 +2351,9 @@ export class EventBus {
     // half-registered subscriber behind.
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
     const onDegraded = opts?.onDegraded;
     const filter = opts?.filter;
     if (filter !== undefined && typeof filter !== 'function') {
@@ -2330,6 +2410,7 @@ export class EventBus {
       throttle,
       onThrottled,
       deliveryShaping,
+      latency: deliveryLatency,
       health:
         healthProbe == null
           ? undefined
@@ -3410,7 +3491,32 @@ export class EventBus {
     const droppedBefore = queue.droppedCount;
     const result = queue.push(msg, 0, deadline);
     this.totalDropped += queue.droppedCount - droppedBefore;
+    const latency = subscriber.latency;
+    if (latency != null && result === 'accepted') {
+      // Stamp the enqueue time for the delivery-latency tracker (see
+      // `SubscribeOptions.deliveryLatency`). Only tracked subscribers pay
+      // for the clock read; a dropped message never reaches a handler, so
+      // it is never stamped. Requeues (nack redelivery, health requeue)
+      // re-stamp: each delivery samples its own queue dwell.
+      latency.enqueuedAt.set(msg, this.now());
+    }
     return result;
+  }
+
+  /**
+   * Records one enqueue→delivery latency sample for a tracked subscriber,
+   * at the moment a message is handed to its handler. The sample measures
+   * queue dwell (enqueue to hand-off), never handler processing time.
+   * `nowMs` is the flush's single clock reading, so every delivery in one
+   * flush round shares the same delivery timestamp.
+   */
+  private recordDeliveryLatency(subscriber: Subscriber, msg: BusMessage, nowMs: number): void {
+    const latency = subscriber.latency;
+    if (latency == null) return;
+    const enqueuedAt = latency.enqueuedAt.get(msg);
+    latency.enqueuedAt.delete(msg);
+    if (enqueuedAt === undefined) return;
+    latency.tracker.record(nowMs - enqueuedAt);
   }
 
   /**
@@ -3672,12 +3778,31 @@ export class EventBus {
     let throttledSubscribers = 0;
     let degradedSubscribers = 0;
     let shapedSubscribers = 0;
+    const deliveryLatency: BusStats['deliveryLatency'] = [];
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
+      const latency = subscriber.latency;
+      if (latency != null) {
+        deliveryLatency.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          ...latency.tracker.summary(),
+        });
+      }
     }
+    const slowestSubscribers = deliveryLatency
+      .filter((s) => s.samples > 0)
+      .sort((a, b) => b.p99Ms - a.p99Ms)
+      .slice(0, 5)
+      .map((s) => ({
+        subscriberId: s.subscriberId,
+        pattern: s.pattern,
+        p99Ms: s.p99Ms,
+        samples: s.samples,
+      }));
     return {
       totalSubscribers: this.subscribers.size,
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
@@ -3708,6 +3833,8 @@ export class EventBus {
       degradedSubscribers,
       shapedSubscribers,
       pendingDelayed: this.delayedById.size,
+      deliveryLatency,
+      slowestSubscribers,
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
         return {
@@ -4051,13 +4178,15 @@ export class EventBus {
         this.inflateMessagePayload(msg);
         this.detectGap(subscriber, msg);
         this.totalDelivered += 1;
+        // Sampled before the handler runs: queue dwell, not processing time.
+        this.recordDeliveryLatency(subscriber, msg, nowMs);
         subscriber.handler(msg);
       }
     } else {
       for (let i = 0; i < live.length; i += 1) {
         shaping?.bucket.take();
         this.inflateMessagePayload(live[i]);
-        this.deliverWithHealth(subscriber, live[i]);
+        this.deliverWithHealth(subscriber, live[i], nowMs);
         if (!health.degraded) continue;
         // The threshold tripped mid-drain: everything not yet attempted
         // goes back to the queue, in FIFO order (see requeueUndelivered).
@@ -4153,7 +4282,7 @@ export class EventBus {
    * redelivery — use `subscribeReliable` when a failed message must be
    * requeued); the pause protects everything that follows it.
    */
-  private deliverWithHealth(subscriber: Subscriber, msg: BusMessage): void {
+  private deliverWithHealth(subscriber: Subscriber, msg: BusMessage, nowMs: number): void {
     const health = subscriber.health;
     if (health == null) return;
     this.detectGap(subscriber, msg);
@@ -4162,6 +4291,8 @@ export class EventBus {
     let failed = false;
     let reason: 'error' | 'timeout' = 'error';
     this.totalDelivered += 1;
+    // Sampled before the handler runs: queue dwell, not processing time.
+    this.recordDeliveryLatency(subscriber, msg, nowMs);
     try {
       subscriber.handler(msg);
     } catch {
