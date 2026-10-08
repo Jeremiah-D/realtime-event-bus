@@ -2,6 +2,7 @@ import { BoundedQueue, type DropPolicy } from './backpressure.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
 import { DurableTopicLog } from './durablelog.ts';
+import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { Buffer } from 'node:buffer';
 
@@ -566,6 +567,12 @@ export interface BusStats {
    */
   shapedSubscribers: number;
   /**
+   * Delayed messages currently scheduled (see `publishDelayed`): accepted,
+   * not yet due, fanned out, cancelled, or expired. Each one holds a slot
+   * in the timer heap until its due time.
+   */
+  pendingDelayed: number;
+  /**
    * Stats for every concrete topic that has seen at least one publish or
    * schema rejection, in order of first publish.
    */
@@ -694,6 +701,39 @@ interface HealthProbeState {
 
 function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Fresh per-topic counters, all zero. Shared by the bus's lazy stats
+ * creation and the schema-rejection counter so the shape cannot drift
+ * between call sites.
+ */
+function zeroedTopicStats(): {
+  subscriberCount: number;
+  publishedMessages: number;
+  expiredMessages: number;
+  lastSeq: number;
+  sequenceGaps: number;
+  rateLimitedMessages: number;
+  rejectedMessages: number;
+  compressedMessages: number;
+  compressedBytesBefore: number;
+  compressedBytesAfter: number;
+  compressionTimeMs: number;
+} {
+  return {
+    subscriberCount: 0,
+    publishedMessages: 0,
+    expiredMessages: 0,
+    lastSeq: 0,
+    sequenceGaps: 0,
+    rateLimitedMessages: 0,
+    rejectedMessages: 0,
+    compressedMessages: 0,
+    compressedBytesBefore: 0,
+    compressedBytesAfter: 0,
+    compressionTimeMs: 0,
+  };
 }
 
 /**
@@ -909,6 +949,47 @@ export interface AtomicPublishRejection {
 export interface AtomicPublishResult {
   published: number;
   rejected?: AtomicPublishRejection;
+}
+
+/**
+ * When a `publishDelayed` message becomes due. Exactly one of the two
+ * fields must be set; passing both or neither throws `RangeError`.
+ */
+export interface PublishDelayedOptions {
+  /**
+   * Deliver this many milliseconds after now, measured on the bus clock
+   * (`EventBusOptions.now`). Must be a non-negative finite number. `0`
+   * means the message is due immediately and fans out on the next flush,
+   * exactly like `publish`.
+   */
+  delayMs?: number;
+  /**
+   * Deliver at this absolute bus-clock timestamp in milliseconds. A
+   * timestamp at or before now means the message is already due and fans
+   * out on the next flush. Must be finite.
+   */
+  deliverAt?: number;
+}
+
+/**
+ * Carried from a delayed schedule into its fan-out: at its due time the
+ * message enters the normal publish pipeline — sequence stamping,
+ * rate-limit budget, compression, durable log, fan-out — exactly as if it
+ * had been published at that moment. Schema validation is NOT re-run here:
+ * it already ran once at schedule time (fail-fast), and validators are
+ * expected pure (the same contract `publishAtomic` relies on).
+ */
+interface DelayedFanOut {
+  /** The schedule's id; copied onto the delivery's durable-log record. */
+  delayId: string;
+  /** The due time the message was scheduled for (bus clock). */
+  deliverAt: number;
+  /**
+   * TTL deadline stamped at schedule time, when a TTL rule matched — or
+   * `undefined` when no rule matched then. A rule added between schedule
+   * and fan-out does not retroactively expire the message.
+   */
+  expiresAt?: number;
 }
 
 /**
@@ -1161,6 +1242,31 @@ export class EventBus {
    * restart never reuses a sequence number.
    */
   private readonly durableLog?: DurableTopicLog;
+  /**
+   * Timer heap of scheduled delayed deliveries, ordered by due time (see
+   * `publishDelayed`). Entries wait here — consuming no sequence number,
+   * no durable-log message record, and no rate-limit budget — until the
+   * bus clock reaches their `deliverAt`, when the sweep fans them out
+   * through the normal publish pipeline.
+   */
+  private delayHeap = new DelayHeap();
+  /**
+   * Pending delayed deliveries by their `publishDelayed` id. The heap may
+   * additionally hold lazily-cancelled entries (see `DelayedEntry`), so
+   * this map — not the heap size — is the source of truth for
+   * `pendingDelayed`.
+   */
+  private delayedById = new Map<string, DelayedEntry>();
+  /** Counter for `publishDelayed` ids (`delayed-1`, …). */
+  private nextDelayedId = 0;
+  /**
+   * Wall-clock timer armed for the heap's next due time. Unref'd — a
+   * pending delayed message never keeps the process alive on its own —
+   * and re-armed on every schedule/cancel/sweep. The delay is derived
+   * from the bus clock; the timer itself is real wall time, like the
+   * shaping re-flush timer.
+   */
+  private delayTimer?: ReturnType<typeof setTimeout>;
 
   constructor(options?: EventBusOptions) {
     this.now = options?.now ?? Date.now;
@@ -1177,7 +1283,10 @@ export class EventBus {
         this.topicSeq.set(topic, lastSeq);
         this.topicStats.set(topic, {
           subscriberCount: 0,
-          publishedMessages: this.durableLog.entryCount(topic),
+          // `messageCount` excludes the seq-0 delayed-delivery schedule
+          // records: a scheduled-but-pending message has not fanned out
+          // yet, so it must not count as published.
+          publishedMessages: this.durableLog.messageCount(topic),
           expiredMessages: 0,
           lastSeq,
           sequenceGaps: 0,
@@ -1189,6 +1298,10 @@ export class EventBus {
           compressionTimeMs: 0,
         });
       }
+      // Rebuild pending delayed-delivery timers from the log: schedules
+      // that never fanned out (and were not cancelled) survive the
+      // restart. Already-due entries fan out immediately.
+      this.recoverDelayed();
     }
   }
 
@@ -2131,6 +2244,301 @@ export class EventBus {
   }
 
   /**
+   * Schedules a message for future delivery: it enters the timer heap and
+   * is fanned out — through the normal publish pipeline — once the bus
+   * clock reaches its due time. Returns the delay id (pass it to
+   * `cancelDelayed`), or `undefined` when the payload was rejected by the
+   * topic's schema validator (fail-fast: nothing is scheduled).
+   *
+   * Timing: pass `{ delayMs }` for a relative delay or `{ deliverAt }`
+   * for an absolute bus-clock timestamp; exactly one of the two is
+   * required. A due time at or before now fans out on the next flush,
+   * exactly like `publish`.
+   *
+   * Admission semantics, and why they are this way:
+   * - Schema validation runs NOW, fail-fast: a rejected payload never
+   *   becomes a scheduled delivery. A throwing validator propagates,
+   *   exactly as in `publish`. Validation is not re-run at fan-out
+   *   (validators are expected pure — the same contract `publishAtomic`
+   *   relies on), so a payload accepted here is never rejected at its due
+   *   time.
+   * - Everything else waits for the due time: the message consumes no
+   *   sequence number, is written to no durable-log message record, and
+   *   burns no rate-limit budget until it actually fans out (the EB-20 /
+   *   EB-19 shed semantics applied to the schedule-then-deliver split).
+   *   At fan-out the message goes through the full pipeline — seq
+   *   stamping, rate-limit `take()` (which may shed it like any other
+   *   publish), compression, durable log, fan-out — exactly as if it had
+   *   been published at that moment.
+   * - TTL is stamped at schedule time: the message is "published" now and
+   *   only *delivered* later. A message whose deadline passes before its
+   *   due time is dropped as expired at sweep time — counted in
+   *   `expiredMessages` — never delivered.
+   *
+   * Durability: with `EventBusOptions.durableLogDir` the schedule is
+   * persisted before this method returns (a seq-0 record carrying
+   * `deliverAt`), so a restart rebuilds the pending timer and still
+   * delivers the message. The payload must therefore be JSON-serializable
+   * when the durable log is enabled — otherwise the schedule could not
+   * survive a restart, and this method throws instead of scheduling
+   * something it cannot keep. Without a durable log the schedule lives in
+   * memory only, like everything else on a non-durable bus.
+   *
+   * Throws `RangeError` when neither or both of `delayMs`/`deliverAt` are
+   * given, or when the given value is not a valid timestamp/duration.
+   */
+  publishDelayed(topic: string, payload: unknown, opts: PublishDelayedOptions = {}): string | undefined {
+    const nowMs = this.now();
+    const hasDelayMs = opts.delayMs !== undefined;
+    const hasDeliverAt = opts.deliverAt !== undefined;
+    if (hasDelayMs === hasDeliverAt) {
+      throw new RangeError('publishDelayed requires exactly one of delayMs or deliverAt');
+    }
+    let deliverAt: number;
+    if (hasDelayMs) {
+      const delayMs = opts.delayMs as number;
+      if (!Number.isFinite(delayMs) || delayMs < 0) {
+        throw new RangeError('delayMs must be a non-negative finite number of milliseconds');
+      }
+      deliverAt = nowMs + delayMs;
+    } else {
+      deliverAt = opts.deliverAt as number;
+      if (!Number.isFinite(deliverAt)) {
+        throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
+      }
+    }
+    // Fail fast on schema: a rejected payload never becomes a scheduled
+    // delivery — no id, nothing in the heap, nothing on disk. Counted the
+    // same way a `publish` rejection is.
+    const validator = this.schemaForTopic(topic);
+    if (validator !== undefined && !validator(payload, topic)) {
+      this.countSchemaRejection(topic);
+      return undefined;
+    }
+    const ttlMs = this.ttlForTopic(topic);
+    const expiresAt = ttlMs === undefined ? undefined : nowMs + ttlMs;
+    const id = `delayed-${++this.nextDelayedId}`;
+    const entry: DelayedEntry = { id, topic, payload, deliverAt, expiresAt, cancelled: false };
+    // Persist the schedule before it is visible anywhere: a crash between
+    // here and the due time must still deliver the message after restart.
+    // The schedule record carries no sequence number and burns no
+    // rate-limit budget — those happen at fan-out, via the normal path.
+    if (this.durableLog != null) {
+      const persisted = this.durableLog.append({
+        seq: 0,
+        topic,
+        at: nowMs,
+        deliverAt,
+        expiresAt,
+        delayId: id,
+        payload,
+      });
+      if (!persisted) {
+        throw new Error(
+          `publishDelayed: the schedule for topic "${topic}" could not be persisted to the ` +
+            'durable log (payload is not JSON-serializable or the log write failed); the ' +
+            'delayed delivery was not scheduled',
+        );
+      }
+    }
+    this.delayedById.set(id, entry);
+    this.delayHeap.push(entry);
+    // An already-due entry (`delayMs: 0`, past `deliverAt`) fans out on the
+    // next flush — the sweep below fans it into the queues synchronously
+    // and schedules the flush, exactly like `publish`.
+    this.sweepDelayed(nowMs);
+    return id;
+  }
+
+  /**
+   * Cancels a pending delayed delivery scheduled by `publishDelayed`: the
+   * message will never fan out. Returns `true` when a pending schedule was
+   * cancelled.
+   *
+   * Contract: returns `false` (a no-op, never a throw) for unknown ids —
+   * never scheduled, already fanned out, already cancelled, or already
+   * dropped as expired. Cancellation is recorded in the durable log (when
+   * enabled) so a restart does not resurrect the schedule.
+   */
+  cancelDelayed(delayId: string): boolean {
+    const entry = this.delayedById.get(delayId);
+    if (entry == null) return false;
+    // Lazy heap deletion: the entry stays in the heap, marked, and the
+    // sweep skips it when it surfaces — cancel is O(1).
+    entry.cancelled = true;
+    this.delayedById.delete(delayId);
+    this.appendDelayTombstone(delayId, entry.topic);
+    this.armDelayTimer();
+    return true;
+  }
+
+  /**
+   * Fans out every delayed entry whose due time has arrived (bus clock),
+   * in due-time order. Due entries go through the normal `fanOut` path —
+   * sequence stamping, rate-limit budget, compression, durable log (whose
+   * record carries `deliverAt`/`delayId`), fan-out — so a delayed message
+   * is indistinguishable from a publish made at its due time.
+   *
+   * An entry whose TTL deadline passed while it waited is dropped as
+   * expired — counted in `expiredMessages`, never delivered — mirroring
+   * the drain-time expiry rule for queued messages.
+   *
+   * Every entry that leaves the pending set also gets a tombstone in the
+   * durable log (when enabled): without one, a restart could rebuild —
+   * and recount — a schedule that already resolved. The tombstone is
+   * redundant when the fan-out wrote a delivery record (which also closes
+   * the schedule via its `delayId`), and essential when it did not (rate-
+   * limit shed, expiry drop).
+   *
+   * `trailingFlush` schedules a flush when anything fanned out; pass
+   * `false` when the sweep already runs inside a flush — the drain below
+   * it picks the messages up.
+   */
+  private sweepDelayed(nowMs: number = this.now(), trailingFlush = true): void {
+    let fannedOut = false;
+    for (;;) {
+      const top = this.delayHeap.peek();
+      if (top == null) break;
+      if (top.cancelled) {
+        // Lazy deletion surfacing: already dropped from `delayedById` by
+        // `cancelDelayed`; just discard the heap node.
+        this.delayHeap.pop();
+        continue;
+      }
+      if (top.deliverAt > nowMs) break;
+      this.delayHeap.pop();
+      this.delayedById.delete(top.id);
+      if (top.expiresAt !== undefined && nowMs >= top.expiresAt) {
+        this.recordExpired(top.topic);
+        this.appendDelayTombstone(top.id, top.topic);
+        continue;
+      }
+      // `preAdmitted`: schema already ran once at schedule time
+      // (fail-fast); validators are expected pure.
+      this.fanOut(top.topic, top.payload, true, {
+        delayId: top.id,
+        deliverAt: top.deliverAt,
+        expiresAt: top.expiresAt,
+      });
+      this.appendDelayTombstone(top.id, top.topic);
+      fannedOut = true;
+    }
+    this.armDelayTimer();
+    if (fannedOut && trailingFlush) this.scheduleFlush();
+  }
+
+  /**
+   * Arms the wall-clock timer for the heap's next due time. Cancelled heap
+   * heads are discarded first so the timer tracks the next real deadline.
+   * The timer never keeps the process alive on its own (unref'd). When it
+   * fires, the sweep re-arms it — so a bus clock that has not advanced
+   * (e.g. a frozen injected clock in tests) cannot spin the loop: the
+   * sweep simply finds nothing due and re-arms for the same deadline.
+   */
+  private armDelayTimer(): void {
+    if (this.delayTimer !== undefined) {
+      clearTimeout(this.delayTimer);
+      this.delayTimer = undefined;
+    }
+    for (;;) {
+      const top = this.delayHeap.peek();
+      if (top == null || !top.cancelled) break;
+      this.delayHeap.pop();
+    }
+    const next = this.delayHeap.peek();
+    if (next == null) return;
+    const delayMs = Math.max(0, next.deliverAt - this.now());
+    // `setTimeout` saturates past 2^31-1 ms (~24.8 days); longer delays
+    // re-arm on fire.
+    const timer = setTimeout(() => {
+      this.delayTimer = undefined;
+      this.sweepDelayed();
+    }, Math.min(delayMs, 2_147_483_647));
+    // A pending delayed message must not keep the process alive on its own.
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    this.delayTimer = timer;
+  }
+
+  /**
+   * Writes a tombstone closing a delayed-delivery schedule (cancelled,
+   * expired while delayed, or shed at fan-out) to the durable log, when
+   * one is enabled. Restart recovery treats a tombstoned `delayId` as
+   * resolved and never rebuilds it. Best-effort like all durable-log
+   * writes: a failed append never throws into the caller.
+   */
+  private appendDelayTombstone(delayId: string, topic: string): void {
+    this.durableLog?.append({ seq: 0, topic, at: this.now(), delayId, cancelled: true, payload: null });
+  }
+
+  /**
+   * Rebuilds pending delayed-delivery timers from the durable log after a
+   * restart. A schedule record (seq 0, `delayId` + `deliverAt`) becomes a
+   * live timer unless a later record closed it — a delivery record or a
+   * tombstone carrying the same `delayId`. Rebuilt entries keep their
+   * original id, so `cancelDelayed` handles handed out before the restart
+   * keep working afterwards.
+   *
+   * Entries already due (the process was down past their `deliverAt`) fan
+   * out immediately via the trailing sweep; entries whose TTL expired
+   * while the process was down are dropped as expired (counted once — a
+   * tombstone closes the schedule so a second restart does not recount).
+   */
+  private recoverDelayed(): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const nowMs = this.now();
+    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown }>();
+    const closed = new Set<string>();
+    // `readSince(topic, -1)`: the exclusive bound sits below every real
+    // seq, so seq-0 schedule records and tombstones come along too.
+    for (const topic of log.topics()) {
+      for (const rec of log.readSince(topic, -1)) {
+        if (rec.delayId == null) continue;
+        if (rec.cancelled === true || rec.seq >= 1) {
+          closed.add(rec.delayId);
+          continue;
+        }
+        if (!closed.has(rec.delayId) && !scheduled.has(rec.delayId)) {
+          scheduled.set(rec.delayId, {
+            topic: rec.topic,
+            // A well-formed schedule record always carries `deliverAt`
+            // (the log parser rejects it otherwise).
+            deliverAt: rec.deliverAt as number,
+            expiresAt: rec.expiresAt,
+            payload: rec.payload,
+          });
+        }
+      }
+    }
+    for (const [delayId, rec] of scheduled) {
+      if (closed.has(delayId)) continue;
+      if (rec.expiresAt !== undefined && nowMs >= rec.expiresAt) {
+        this.recordExpired(rec.topic);
+        this.appendDelayTombstone(delayId, rec.topic);
+        continue;
+      }
+      const entry: DelayedEntry = {
+        id: delayId,
+        topic: rec.topic,
+        payload: rec.payload,
+        deliverAt: rec.deliverAt,
+        expiresAt: rec.expiresAt,
+        cancelled: false,
+      };
+      this.delayedById.set(delayId, entry);
+      this.delayHeap.push(entry);
+      // Keep generated ids ahead of recovered ones — `publishDelayed`
+      // must never reuse an id the previous process handed out.
+      const match = /^delayed-(\d+)$/.exec(delayId);
+      if (match != null) {
+        this.nextDelayedId = Math.max(this.nextDelayedId, parseInt(match[1], 10) + 1);
+      }
+    }
+    this.sweepDelayed(nowMs);
+  }
+
+  /**
    * Hands out the next per-topic sequence number, starting at 1. The
    * counter is per concrete topic and never resets, so every message ever
    * published to a topic carries a unique, gap-free number at publish
@@ -2141,6 +2549,30 @@ export class EventBus {
     const seq = (this.topicSeq.get(topic) ?? 0) + 1;
     this.topicSeq.set(topic, seq);
     return seq;
+  }
+
+  /**
+   * Returns the topic's stats entry, creating it zeroed on first use.
+   */
+  private statsFor(topic: string): ReturnType<typeof zeroedTopicStats> {
+    let stats = this.topicStats.get(topic);
+    if (stats == null) {
+      stats = zeroedTopicStats();
+      this.topicStats.set(topic, stats);
+    }
+    return stats;
+  }
+
+  /**
+   * Counts one publish rejected by schema validation against the topic and
+   * the global total. A rejection happens before admission: the payload
+   * never becomes a message — no sequence number is consumed (subscribers
+   * see no gap), the durable log never sees it, and it does not burn
+   * rate-limit budget.
+   */
+  private countSchemaRejection(topic: string): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
   }
 
   /**
@@ -2191,8 +2623,23 @@ export class EventBus {
    * runs and is guaranteed to succeed — the shadow budget ensured every
    * take in this synchronous turn has a token (the bus clock cannot move
    * backwards within the turn, and lazy refill can only add tokens).
+   *
+   * `delayed` is set only by the delayed-delivery sweep (`sweepDelayed`)
+   * for a message whose due time arrived: schema validation already ran
+   * once at schedule time (fail-fast, see `publishDelayed`), so it is
+   * skipped here for the same purity reason — but the per-topic rate-limit
+   * budget IS burned here, at fan-out time, and may shed the message like
+   * any other publish. The TTL deadline is the one stamped at schedule
+   * time (a rule added in between does not retroactively expire the
+   * message), and the durable-log record carries `deliverAt`/`delayId` so
+   * restart recovery can tell it apart from a still-pending schedule.
    */
-  private fanOut(topic: string, payload: unknown, preAdmitted = false): { matched: number; accepted: number } {
+  private fanOut(
+    topic: string,
+    payload: unknown,
+    preAdmitted = false,
+    delayed?: DelayedFanOut,
+  ): { matched: number; accepted: number } {
     // Publish-side schema validation runs before admission: a rejected
     // payload never becomes a message — no sequence number is consumed
     // (subscribers see no gap), the durable log never sees it, and it
@@ -2202,46 +2649,12 @@ export class EventBus {
     if (!preAdmitted) {
       const validator = this.schemaForTopic(topic);
       if (validator !== undefined && !validator(payload, topic)) {
-        let rejectedStats = this.topicStats.get(topic);
-        if (rejectedStats == null) {
-          rejectedStats = {
-            subscriberCount: 0,
-            publishedMessages: 0,
-            expiredMessages: 0,
-            lastSeq: 0,
-            sequenceGaps: 0,
-            rateLimitedMessages: 0,
-            rejectedMessages: 0,
-            compressedMessages: 0,
-            compressedBytesBefore: 0,
-            compressedBytesAfter: 0,
-            compressionTimeMs: 0,
-          };
-          this.topicStats.set(topic, rejectedStats);
-        }
-        rejectedStats.rejectedMessages += 1;
-        this.totalRejected += 1;
+        this.countSchemaRejection(topic);
         return { matched: 0, accepted: 0 };
       }
     }
     const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
-    let stats = this.topicStats.get(topic);
-    if (stats == null) {
-      stats = {
-        subscriberCount: 0,
-        publishedMessages: 0,
-        expiredMessages: 0,
-        lastSeq: 0,
-        sequenceGaps: 0,
-        rateLimitedMessages: 0,
-        rejectedMessages: 0,
-        compressedMessages: 0,
-        compressedBytesBefore: 0,
-        compressedBytesAfter: 0,
-        compressionTimeMs: 0,
-      };
-      this.topicStats.set(topic, stats);
-    }
+    const stats = this.statsFor(topic);
     stats.publishedMessages += 1;
     stats.lastSeq = msg.seq;
     this.totalPublished += 1;
@@ -2289,7 +2702,14 @@ export class EventBus {
     // consistent even if the injected clock moves between the two.
     const nowMs = this.now();
     const ttlMs = this.ttlForTopic(topic);
-    const expiresAt = ttlMs === undefined ? undefined : nowMs + ttlMs;
+    // A delayed fan-out keeps the TTL deadline stamped at schedule time —
+    // it is "published" then and only delivered later. Note the explicit
+    // `delayed !== undefined` check instead of `??`: an explicit "no
+    // deadline" from schedule time must not fall through to the rules in
+    // effect now (a rule added in between does not retroactively expire
+    // the message).
+    const expiresAt =
+      delayed !== undefined ? delayed.expiresAt : ttlMs === undefined ? undefined : nowMs + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
     // Durable log (opt-in): persist the stamped message before fan-out, so a
     // crash between publish and delivery still leaves it replayable. Logging
@@ -2298,7 +2718,18 @@ export class EventBus {
     // bytes are what hit the disk, and resume replays the envelope —
     // `replayLog` re-registers those messages for transparent inflation at
     // delivery, exactly like live ones.
-    this.durableLog?.append({ seq: msg.seq, topic, at: nowMs, expiresAt, payload: msg.payload });
+    // A delayed delivery's record additionally carries its schedule
+    // identity (`deliverAt`/`delayId`): restart recovery tells a fulfilled
+    // schedule (delivery record present) from a still-pending one
+    // (schedule record only).
+    this.durableLog?.append({
+      seq: msg.seq,
+      topic,
+      at: nowMs,
+      expiresAt,
+      payload: msg.payload,
+      ...(delayed == null ? {} : { deliverAt: delayed.deliverAt, delayId: delayed.delayId }),
+    });
     // The prefix index prunes the regex tests down to subscribers whose
     // pattern's literal prefix can plausibly match the topic; the compiled
     // regex stays the final authority, and the no-miss invariant in
@@ -2378,6 +2809,7 @@ export class EventBus {
       throttledSubscribers,
       degradedSubscribers,
       shapedSubscribers,
+      pendingDelayed: this.delayedById.size,
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
         return {
@@ -2589,6 +3021,11 @@ export class EventBus {
       // One clock reading for the whole flush so every queue in this drain
       // round enforces the same expiry cutoff.
       const nowMs = this.now();
+      // Delayed deliveries due by now fan out first, so one flush carries
+      // both — and advancing an injected clock past a `deliverAt` and then
+      // publishing anything delivers deterministically in tests. No
+      // trailing flush: the drain below picks the fanned-out messages up.
+      this.sweepDelayed(nowMs, false);
       for (const subscriber of this.subscribers.values()) {
         this.drainSubscriber(subscriber, nowMs);
       }

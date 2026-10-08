@@ -249,6 +249,30 @@ library.
   message. A throwing validator propagates to the caller, always during
   admission, so a throw can never leave a half-committed batch. An empty
   batch is a no-op.
+- **Delayed delivery** (in `src/bus.ts` + `src/delayed.ts`, via
+  `publishDelayed(topic, payload, { delayMs } | { deliverAt })`): the message
+  waits in a timer min-heap and fans out once the bus clock reaches its due
+  time. Returns a delay id; `cancelDelayed(id)` cancels a pending delivery
+  (`false` for unknown/already-resolved ids — never throws). Admission
+  semantics are deliberate: schema validation fails fast at schedule time
+  (rejection returns no id and is counted like a `publish` rejection), but
+  the message consumes no sequence number, writes no durable-log message
+  record, and burns no rate-limit budget until it actually fans out — at
+  which point it goes through the full publish pipeline exactly as if
+  published at that moment. TTL is stamped at schedule time: a message whose
+  deadline passes before its due time is dropped as expired, never
+  delivered. With `durableLogDir`, the schedule is persisted before
+  `publishDelayed` returns (a seq-0 record carrying `deliverAt`), so a
+  restart rebuilds pending timers; delivery records carry `deliverAt` /
+  `delayId`, and cancellations/expiry-drops write tombstones, so a restart
+  never resurrects or double-counts a resolved schedule. The wall-clock
+  wake-up timer is unref'd (a pending delay never keeps the process alive),
+  and due sweeps also run at the start of every flush, so advancing an
+  injected clock past a `deliverAt` and publishing anything delivers
+  deterministically in tests. `getStats().pendingDelayed` reports the
+  scheduled count. Invalid timing options throw `RangeError`; with a durable
+  log, a non-JSON-serializable payload throws instead of scheduling
+  something that could not survive a restart.
 
 ## Run
 
@@ -345,6 +369,20 @@ npm test
   pattern-vs-exact rule resolution matching `publish`, batch-order delivery
   with independent per-topic seqs, durable-log writes on commit, and
   downstream per-message drop policies still applying.
+- `test/delayed.test.ts` — delayed delivery: not delivered before the due
+  time, due-time ordering across schedules, immediate fan-out for
+  `delayMs: 0` / past `deliverAt`, `cancelDelayed` (pending cancel, double
+  cancel and unknown ids as no-op `false`), injected-clock determinism of
+  `deliverAt` (relative and absolute forms, on-disk JSONL format), TTL
+  expiry while delayed (dropped as expired, never delivered), schema
+  fail-fast at schedule time (no id, counted rejection, throwing validator
+  propagates), no sequence number consumed until fan-out, rate-limit budget
+  burned at fan-out (not at schedule), wall-clock timer liveness with no
+  other activity, durable-log persistence with restart rebuild (pending,
+  already-due, cancelled, and expired-while-down schedules; no id reuse, no
+  double delivery, no recount), unserializable payloads throwing with a
+  durable log and scheduling in memory without one, timing-option
+  validation, and `getStats().pendingDelayed`.
 
 ## Benchmark
 
