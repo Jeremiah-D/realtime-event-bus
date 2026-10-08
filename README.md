@@ -231,6 +231,24 @@ library.
   draining the backlog when no new publishes arrive; `getStats()` reports
   actively-shaped subscribers via `shapedSubscribers`. Invalid options throw
   `RangeError` from `subscribe`. Disabled by default.
+- **Atomic cross-topic batch publish** (in `src/bus.ts`, via
+  `publishAtomic(entries)`): all-or-nothing fan-out for multi-message
+  batches — subscribers either see every message or none. Admission runs in
+  two phases: first every entry is checked against the same publish-time
+  gates `publish` applies (schema validation, then the per-topic rate-limit
+  budget) without mutating any bus state, with rate-limit tokens charged
+  against a per-batch shadow balance so a batch cannot overdraft the bucket
+  with its own entries; then, if all pass, the batch commits through the
+  normal `fanOut` path in one synchronous turn with a single scheduled
+  flush. A rejected batch returns `{ published: 0, rejected: { index, topic,
+  reason } }` and leaves the bus exactly as before — no sequence numbers
+  consumed, no rate-limit tokens taken, no durable-log writes, no stats
+  changes (not even the rejection counters). TTL is drain-time and never
+  rejects a batch; downstream per-message semantics (queue drop policies,
+  adaptive throttling, delivery shaping, ACK) still apply to each committed
+  message. A throwing validator propagates to the caller, always during
+  admission, so a throw can never leave a half-committed batch. An empty
+  batch is a no-op.
 
 ## Run
 
@@ -317,6 +335,16 @@ npm test
   resume inflates), ACK redelivery of compressed messages, TTL deadline
   preservation, envelope-shaped user payloads never mistaken for
   compressed, and option validation.
+- `test/atomic.test.ts` — atomic cross-topic batch publish: all-or-nothing
+  commit across topics, schema rejection rolling back with zero side effects
+  (no seq consumed, no rate-limit budget burned, no durable-log writes, no
+  stats changes), rate-limit rejection restoring the full budget,
+  per-batch shadow budgeting for repeated same-topic entries, first-failure
+  reporting, empty-batch no-op, throwing validators propagating without a
+  partial commit, TTL remaining drain-time (never an admission rejection),
+  pattern-vs-exact rule resolution matching `publish`, batch-order delivery
+  with independent per-topic seqs, durable-log writes on commit, and
+  downstream per-message drop policies still applying.
 
 ## Benchmark
 

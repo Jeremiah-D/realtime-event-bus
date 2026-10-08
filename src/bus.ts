@@ -881,6 +881,37 @@ function resolveHealthProbeOptions(
 export type SchemaValidator = (payload: unknown, topic: string) => boolean;
 
 /**
+ * Why one entry of an atomic batch was rejected: its payload failed the
+ * topic's schema validator (`'schema'`), or the topic's rate-limit bucket
+ * had no token left for it (`'rate-limit'`). TTL expiry is drain-time and
+ * never rejects a publish, so it cannot appear here.
+ */
+export type AtomicRejectReason = 'schema' | 'rate-limit';
+
+/**
+ * Which entry of a `publishAtomic` batch failed admission, and why.
+ */
+export interface AtomicPublishRejection {
+  /** Zero-based position of the rejected entry in the batch. */
+  index: number;
+  /** Concrete topic of the rejected entry. */
+  topic: string;
+  /** The admission gate that rejected it. */
+  reason: AtomicRejectReason;
+}
+
+/**
+ * Outcome of `EventBus.publishAtomic`. On success `published` is the number
+ * of committed messages — always the whole batch — and `rejected` is
+ * absent. On failure `published` is 0, nothing was committed, and
+ * `rejected` identifies the entry that failed admission.
+ */
+export interface AtomicPublishResult {
+  published: number;
+  rejected?: AtomicPublishRejection;
+}
+
+/**
  * Tuning for opt-in per-topic payload compression (see
  * `EventBus.setTopicCompression`). Compression uses `node:zlib` deflate —
  * zero new dependencies — and only kicks in for payloads whose serialized
@@ -2007,6 +2038,99 @@ export class EventBus {
   }
 
   /**
+   * Cross-topic atomic batch publish: either every entry is published or
+   * none is. The batch goes through two phases, both synchronous, so no
+   * subscriber ever observes a partial batch:
+   *
+   * 1. Admission: every entry is checked against the same admission gates
+   *    `publish` applies — schema validation, then the per-topic
+   *    rate-limit budget — without mutating any bus state. Rate-limit
+   *    tokens are charged against a per-batch shadow balance, so a batch
+   *    cannot overdraft the bucket with its own entries. The first entry
+   *    that would be rejected or shed aborts the whole batch.
+   * 2. Commit: the admitted batch runs through the normal `fanOut` path
+   *    (per-topic seq stamping, compression, durable log, fan-out, stats),
+   *    then one flush is scheduled for the whole batch — like
+   *    `publishBatch`, all messages land in subscriber queues before any
+   *    delivery happens.
+   *
+   * On success returns `{ published: entries.length }`. On failure returns
+   * `{ published: 0, rejected: { index, topic, reason } }` and the bus is
+   * exactly as before the call: no sequence numbers consumed, no
+   * rate-limit tokens taken, no durable-log writes, no stats changes — not
+   * even the rejection counters move, because nothing was admitted.
+   *
+   * TTL is drain-time, not an admission gate: a batch containing messages
+   * that expire before the flush is still admitted, and each message
+   * expires independently at drain exactly as a lone `publish` would.
+   * Downstream per-message semantics (queue drop policies, adaptive
+   * publish-side throttling, delivery shaping, ACK) apply to each committed
+   * message exactly as they do for `publish`/`publishBatch` — atomicity
+   * covers admission, not delivery. A throwing validator propagates to the
+   * caller, exactly as in `publish`; it always throws during admission, so
+   * a throw can never leave a half-committed batch behind.
+   *
+   * Validators are expected to be pure: admission runs them once per
+   * entry, and the commit phase skips re-validation. An empty batch is a
+   * no-op returning `{ published: 0 }` without scheduling a flush.
+   */
+  publishAtomic(entries: Array<Omit<BusMessage, 'seq'>>): AtomicPublishResult {
+    if (entries.length === 0) return { published: 0 };
+    // Phase 1: admit the whole batch against shadow state.
+    const shadowBudget = new Map<string, number>();
+    for (let index = 0; index < entries.length; index++) {
+      const { topic, payload } = entries[index];
+      const reason = this.admissionVerdict(topic, payload, shadowBudget);
+      if (reason !== undefined) return { published: 0, rejected: { index, topic, reason } };
+    }
+    // Phase 2: everything was admitted — commit through the normal
+    // publish path in one synchronous turn, then flush once.
+    for (const { topic, payload } of entries) this.fanOut(topic, payload, true);
+    this.scheduleFlush();
+    return { published: entries.length };
+  }
+
+  /**
+   * Runs the admission gate of the publish pipeline — schema validation
+   * first (rejections happen before admission: no seq, no rate-limit
+   * budget), then the per-topic rate-limit budget — WITHOUT mutating any
+   * bus state, so `publishAtomic` can pre-validate a batch before
+   * committing anything. Returns the rejection reason when the publish
+   * would be rejected or shed, `undefined` when it would be admitted.
+   *
+   * `shadowBudget` maps a concrete topic to the tokens this batch has
+   * already reserved: the balance peeked from the live bucket
+   * (`availableTokens` is a read-only lazy-refill view — it never takes a
+   * token) minus those reservations must cover one more message. A topic
+   * with no live bucket yet is checked against a locally constructed full
+   * bucket, mirroring what `fanOut` would create at commit — the shadow
+   * bucket is never stored, so even a rejected batch creates no state.
+   *
+   * Rule resolution is identical to `publish`: the same `schemaForTopic`
+   * / `rateLimitForTopic` resolvers run, so exact-topic rules win over
+   * patterns and the earliest-registered matching pattern wins. A throwing
+   * validator propagates, exactly as in `publish` — nothing has been
+   * mutated at that point.
+   */
+  private admissionVerdict(
+    topic: string,
+    payload: unknown,
+    shadowBudget: Map<string, number>,
+  ): AtomicRejectReason | undefined {
+    const validator = this.schemaForTopic(topic);
+    if (validator !== undefined && !validator(payload, topic)) return 'schema';
+    const limit = this.rateLimitForTopic(topic);
+    if (limit !== undefined) {
+      let bucket = this.rateLimitBuckets.get(topic);
+      if (bucket == null) bucket = new TokenBucket(limit.burst, limit.messagesPerSec, this.now);
+      const reserved = shadowBudget.get(topic) ?? 0;
+      if (bucket.availableTokens - reserved < 1) return 'rate-limit';
+      shadowBudget.set(topic, reserved + 1);
+    }
+    return undefined;
+  }
+
+  /**
    * Hands out the next per-topic sequence number, starting at 1. The
    * counter is per concrete topic and never resets, so every message ever
    * published to a topic carries a unique, gap-free number at publish
@@ -2059,36 +2183,46 @@ export class EventBus {
    * When a TTL rule matches the topic, every enqueued copy is stamped with
    * the same expiry deadline (`publishTime + ttlMs`); the queues discard
    * expired copies at drain time and count them as expired.
+   *
+   * `preAdmitted` is set only by `publishAtomic`, after the batch passed
+   * `admissionVerdict`: the schema gate is skipped because validation
+   * already ran once per message (validators are expected pure), so the
+   * commit phase cannot reject on schema. The rate-limit `take()` still
+   * runs and is guaranteed to succeed — the shadow budget ensured every
+   * take in this synchronous turn has a token (the bus clock cannot move
+   * backwards within the turn, and lazy refill can only add tokens).
    */
-  private fanOut(topic: string, payload: unknown): { matched: number; accepted: number } {
+  private fanOut(topic: string, payload: unknown, preAdmitted = false): { matched: number; accepted: number } {
     // Publish-side schema validation runs before admission: a rejected
     // payload never becomes a message — no sequence number is consumed
     // (subscribers see no gap), the durable log never sees it, and it
     // does not burn rate-limit budget. Rejection is counted on the
     // topic's stats entry, which is created here when the topic has never
     // published anything valid yet.
-    const validator = this.schemaForTopic(topic);
-    if (validator !== undefined && !validator(payload, topic)) {
-      let rejectedStats = this.topicStats.get(topic);
-      if (rejectedStats == null) {
-        rejectedStats = {
-          subscriberCount: 0,
-          publishedMessages: 0,
-          expiredMessages: 0,
-          lastSeq: 0,
-          sequenceGaps: 0,
-          rateLimitedMessages: 0,
-          rejectedMessages: 0,
-          compressedMessages: 0,
-          compressedBytesBefore: 0,
-          compressedBytesAfter: 0,
-          compressionTimeMs: 0,
-        };
-        this.topicStats.set(topic, rejectedStats);
+    if (!preAdmitted) {
+      const validator = this.schemaForTopic(topic);
+      if (validator !== undefined && !validator(payload, topic)) {
+        let rejectedStats = this.topicStats.get(topic);
+        if (rejectedStats == null) {
+          rejectedStats = {
+            subscriberCount: 0,
+            publishedMessages: 0,
+            expiredMessages: 0,
+            lastSeq: 0,
+            sequenceGaps: 0,
+            rateLimitedMessages: 0,
+            rejectedMessages: 0,
+            compressedMessages: 0,
+            compressedBytesBefore: 0,
+            compressedBytesAfter: 0,
+            compressionTimeMs: 0,
+          };
+          this.topicStats.set(topic, rejectedStats);
+        }
+        rejectedStats.rejectedMessages += 1;
+        this.totalRejected += 1;
+        return { matched: 0, accepted: 0 };
       }
-      rejectedStats.rejectedMessages += 1;
-      this.totalRejected += 1;
-      return { matched: 0, accepted: 0 };
     }
     const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
     let stats = this.topicStats.get(topic);
