@@ -4,6 +4,7 @@ import { TokenBucket } from './throttle.ts';
 import { DurableTopicLog } from './durablelog.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 
 export type { Delivery } from './ack.ts';
@@ -1337,6 +1338,87 @@ export interface TopicCompressionOptions {
    * through (useful for testing the never-adopt-a-larger-encoding guard).
    */
   level?: number;
+  /**
+   * Optional preset deflate dictionary (zlib `dictionary` option), zero
+   * new dependencies. Pre-seeding the compressor with the topic's
+   * recurring byte patterns — field names, enum values, venue prefixes —
+   * dramatically improves the compression ratio of SMALL JSON messages
+   * that carry too little redundancy for deflate to find on its own.
+   * Typical use: build it once from a few hundred representative
+   * serialized payloads concatenated together (keep it under the 32 KiB
+   * zlib cap), then share the same bytes across topics with similar
+   * shapes. The bus copies the bytes at registration time, so mutating
+   * the caller's buffer afterwards has no effect.
+   *
+   * The SAME dictionary must be used to inflate: it travels with each
+   * live message and is resolved from the bus's dictionary registry for
+   * durable-log replay (registered automatically by
+   * `setTopicCompression`). A replayed record whose dictionary is no
+   * longer registered fails loudly at replay instead of delivering
+   * garbage — keep the rule (or re-register the identical dictionary)
+   * for as long as you need to replay logs written with it.
+   */
+  dictionary?: Uint8Array | ArrayBuffer | DataView;
+}
+
+/**
+ * A compression rule with every option resolved to its concrete runtime
+ * form: `level` defaulted to 6, and `dictionary` snapshotted into an owned
+ * `Buffer` plus its SHA-256 id (used to resolve the dictionary for
+ * durable-log replay, where no live rule is at hand).
+ */
+interface ResolvedCompressionRule {
+  thresholdBytes: number;
+  level: number;
+  dictionary?: Buffer;
+  dictionaryId?: string;
+}
+
+/**
+ * Maximum zlib preset-dictionary size: 32 KiB, the largest window zlib
+ * can reference (2^15). Anything larger cannot help and `deflateSync`
+ * would reject it.
+ */
+const MAX_COMPRESSION_DICTIONARY_BYTES = 32 * 1024;
+
+/**
+ * Maximum dictionaries the bus retains for durable-log replay. A
+ * dictionary is registered once per distinct byte content; 64 is far above
+ * what a process configures (one or two dictionaries per payload family)
+ * while keeping the retention bounded when rules are churned.
+ */
+const MAX_REGISTERED_COMPRESSION_DICTIONARIES = 64;
+
+/**
+ * Validates and snapshots a `TopicCompressionOptions.dictionary` value.
+ * Returns the owned `Buffer` copy, or `undefined` when no dictionary was
+ * given. Throws `RangeError` for anything that is not a non-empty byte
+ * view of at most 32 KiB. The bytes are COPIED, not referenced: mutating
+ * the caller's buffer after registration cannot silently change what the
+ * bus compresses with — a real hazard when the same `Uint8Array` doubles
+ * as a scratch buffer elsewhere.
+ */
+function coerceCompressionDictionary(
+  dictionary: Uint8Array | ArrayBuffer | DataView | undefined,
+): Buffer | undefined {
+  if (dictionary === undefined) return undefined;
+  let view: { readonly byteLength: number } | null = null;
+  if (dictionary instanceof ArrayBuffer) {
+    view = dictionary;
+  } else if (ArrayBuffer.isView(dictionary)) {
+    view = dictionary as DataView;
+  }
+  if (view === null || view.byteLength === 0) {
+    throw new RangeError('dictionary must be a non-empty byte buffer (Uint8Array, ArrayBuffer or DataView)');
+  }
+  if (view.byteLength > MAX_COMPRESSION_DICTIONARY_BYTES) {
+    throw new RangeError(
+      `dictionary must be at most ${MAX_COMPRESSION_DICTIONARY_BYTES} bytes (zlib preset-dictionary cap)`,
+    );
+  }
+  if (dictionary instanceof ArrayBuffer) return Buffer.from(dictionary.slice(0));
+  const typed = dictionary as unknown as { buffer: ArrayBuffer; byteOffset: number; byteLength: number };
+  return Buffer.from(typed.buffer.slice(typed.byteOffset, typed.byteOffset + typed.byteLength));
 }
 
 /**
@@ -1360,9 +1442,15 @@ interface CompressedPayload {
  * on-disk bytes are the deflated envelope: the filter always sees the raw
  * payload, exactly like a live filter evaluation. Throws on a malformed
  * envelope — a tampered log must not silently deliver corrupt data.
+ * `dictionary` must be the preset dictionary the payload was compressed
+ * with (or `undefined` for dictionary-less compression); a wrong
+ * dictionary makes zlib throw, never silently mis-decode.
  */
-function inflateEnvelopePayload(envelope: CompressedPayload): unknown {
-  return JSON.parse(inflateSync(Buffer.from(envelope.data, 'base64')).toString('utf8'));
+function inflateEnvelopePayload(envelope: CompressedPayload, dictionary?: Buffer): unknown {
+  const raw = Buffer.from(envelope.data, 'base64');
+  const inflated =
+    dictionary === undefined ? inflateSync(raw) : inflateSync(raw, { dictionary });
+  return JSON.parse(inflated.toString('utf8'));
 }
 
 /**
@@ -1616,13 +1704,22 @@ export class EventBus {
    * rules: an exact-topic rule wins over any pattern; between patterns the
    * earliest-registered rule wins.
    */
-  private compressionRules = new Map<string, TopicCompressionOptions>();
+  private compressionRules = new Map<string, ResolvedCompressionRule>();
   /**
    * Compiled matchers for the wildcard entries in `compressionRules`, kept
    * apart from the subscriber pattern cache so compression configuration
    * never inflates `patternCacheSize`.
    */
   private compressionMatcherCache = new Map<string, RegExp>();
+  /**
+   * Preset dictionaries by SHA-256 id, registered by `setTopicCompression`.
+   * Lets durable-log replay inflate dictionary-compressed records after a
+   * restart, where the rule that wrote them may no longer be configured:
+   * the record carries the dictionary id, and the bytes come from here.
+   * Bounded (LRU, 64 entries) so churning rules cannot grow the bus
+   * without bound; dictionaries are tiny (≤32 KiB) and few in practice.
+   */
+  private compressionDictionaryRegistry = new Map<string, Buffer>();
   /** Messages whose payload the bus actually compressed (global total). */
   private totalCompressed = 0;
   /** Serialized payload bytes before compression (global total). */
@@ -1641,6 +1738,14 @@ export class EventBus {
    * compressed one. Entries die with their message (WeakSet).
    */
   private compressedPayloads = new WeakSet<BusMessage>();
+  /**
+   * Preset dictionary used to compress each live message, for the
+   * messages the publish path actually compressed with one. Inflating
+   * requires the EXACT dictionary bytes, so they travel with the message
+   * (entries die with it) rather than being re-read from the rule — a
+   * rule change between publish and delivery must not corrupt inflation.
+   */
+  private compressedDictionaries = new WeakMap<BusMessage, Buffer>();
   /**
    * Original TTL deadlines by message, for redelivery. `fanOut` stamps the
    * deadline here when a TTL rule matches; the reliable-subscription
@@ -1957,8 +2062,9 @@ export class EventBus {
    * Rule matching mirrors `setTopicTtl`: an exact-topic rule wins over
    * patterns, the earliest-registered matching pattern wins. Re-setting a
    * rule replaces it. Throws when `topicPattern` is empty, when
-   * `thresholdBytes` is not a positive finite number, or when `level` is
-   * not an integer in 0–9.
+   * `thresholdBytes` is not a positive finite number, when `level` is
+   * not an integer in 0–9, or when `dictionary` is not a non-empty byte
+   * buffer of at most 32 KiB.
    */
   setTopicCompression(topicPattern: string, opts: TopicCompressionOptions): void {
     if (topicPattern.length === 0) {
@@ -1971,7 +2077,56 @@ export class EventBus {
     if (!Number.isInteger(level) || level < 0 || level > 9) {
       throw new RangeError('level must be an integer in 0-9');
     }
-    this.compressionRules.set(topicPattern, { thresholdBytes: opts.thresholdBytes, level });
+    const dictionary = coerceCompressionDictionary(opts.dictionary);
+    let dictionaryId: string | undefined;
+    if (dictionary !== undefined) {
+      dictionaryId = createHash('sha256').update(dictionary).digest('hex');
+      this.registerCompressionDictionary(dictionaryId, dictionary);
+    }
+    this.compressionRules.set(topicPattern, { thresholdBytes: opts.thresholdBytes, level, dictionary, dictionaryId });
+  }
+
+  /**
+   * Registers a preset dictionary for durable-log replay, keyed by its
+   * SHA-256 id. LRU-capped at 64 entries: replays resolve the bytes by id,
+   * so the registry only needs the dictionaries of rules ever configured
+   * on this bus, and churning rules cannot leak memory.
+   */
+  private registerCompressionDictionary(id: string, dictionary: Buffer): void {
+    this.compressionDictionaryRegistry.delete(id);
+    this.compressionDictionaryRegistry.set(id, dictionary);
+    while (this.compressionDictionaryRegistry.size > MAX_REGISTERED_COMPRESSION_DICTIONARIES) {
+      const oldest = this.compressionDictionaryRegistry.keys().next();
+      if (oldest.done) break;
+      this.compressionDictionaryRegistry.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Resolves the preset dictionary for a durable-log record (by the
+   * `dictId` the record carries), or `undefined` for dictionary-less
+   * records. A record whose dictionary is no longer registered — rule
+   * never configured on this bus, or evicted by registry churn — throws
+   * a clear error naming the topic and sequence: inflating with a wrong
+   * or missing dictionary would corrupt data, so replay fails loudly
+   * instead. Re-registering the rule with the identical dictionary bytes
+   * fixes it.
+   */
+  private dictionaryForRecord(record: { topic: string; seq: number; dictId?: string }): Buffer | undefined {
+    const dictId = record.dictId;
+    if (dictId === undefined) return undefined;
+    const dictionary = this.compressionDictionaryRegistry.get(dictId);
+    if (dictionary !== undefined) {
+      // LRU touch: a replayed dictionary is live again.
+      this.compressionDictionaryRegistry.delete(dictId);
+      this.compressionDictionaryRegistry.set(dictId, dictionary);
+      return dictionary;
+    }
+    throw new Error(
+      `cannot inflate compressed record for topic "${record.topic}" (seq ${record.seq}): ` +
+        'its preset dictionary is not registered on this bus — call setTopicCompression with the ' +
+        'same dictionary bytes before replaying this log',
+    );
   }
 
   /**
@@ -1988,7 +2143,7 @@ export class EventBus {
    * Returns the compression options that apply to `topic`, or `undefined`
    * when no rule matches. Same precedence as `ttlForTopic`.
    */
-  private compressionForTopic(topic: string): TopicCompressionOptions | undefined {
+  private compressionForTopic(topic: string): ResolvedCompressionRule | undefined {
     const exact = this.compressionRules.get(topic);
     if (exact !== undefined) return exact;
     for (const [pattern, rule] of this.compressionRules) {
@@ -2018,7 +2173,7 @@ export class EventBus {
   private compressPayload(
     msg: BusMessage,
     payload: unknown,
-    rule: TopicCompressionOptions,
+    rule: ResolvedCompressionRule,
     stats: { compressedMessages: number; compressedBytesBefore: number; compressedBytesAfter: number; compressionTimeMs: number },
   ): unknown {
     const serialized = serializeForCompression(payload);
@@ -2028,7 +2183,10 @@ export class EventBus {
     // not a tax on every publish.
     if (bytesBefore <= rule.thresholdBytes) return payload;
     const startedAtMs = this.now();
-    const deflated = deflateSync(serialized, { level: rule.level ?? 6 });
+    const deflated =
+      rule.dictionary === undefined
+        ? deflateSync(serialized, { level: rule.level })
+        : deflateSync(serialized, { level: rule.level, dictionary: rule.dictionary });
     const elapsedMs = Math.max(0, this.now() - startedAtMs);
     // Never adopt an encoding that does not shrink the payload —
     // incompressible data (or level 0) would only add envelope overhead.
@@ -2038,6 +2196,10 @@ export class EventBus {
       data: deflated.toString('base64'),
     };
     this.compressedPayloads.add(msg);
+    // The exact dictionary bytes travel with the message: inflating needs
+    // them byte-identical, and a rule change between publish and delivery
+    // must not corrupt inflation.
+    if (rule.dictionary !== undefined) this.compressedDictionaries.set(msg, rule.dictionary);
     stats.compressedMessages += 1;
     stats.compressedBytesBefore += bytesBefore;
     stats.compressedBytesAfter += deflated.length;
@@ -2070,7 +2232,12 @@ export class EventBus {
         `compressed payload envelope for topic "${msg.topic}" (seq ${msg.seq}) is malformed`,
       );
     }
-    msg.payload = inflateEnvelopePayload(payload);
+    // A message compressed with a preset dictionary inflates with the
+    // bytes carried on the message; one compressed without inflates with
+    // `undefined`, exactly like the legacy path.
+    const dictionary = this.compressedDictionaries.get(msg);
+    this.compressedDictionaries.delete(msg);
+    msg.payload = inflateEnvelopePayload(payload, dictionary);
   }
 
   /**
@@ -2605,10 +2772,12 @@ export class EventBus {
       // must not churn the backpressure budget on reconnect) and advances
       // the per-topic baseline so it never counts as a gap. The log holds
       // the wire payload — inflate a compressed envelope first so the
-      // filter judges the raw application payload.
+      // filter judges the raw application payload. A dictionary-compressed
+      // record resolves its bytes from the registry here; an unregistered
+      // dictionary fails loudly rather than judging garbage.
       if (filter !== undefined) {
         const rawPayload = isCompressedPayload(rec.payload)
-          ? inflateEnvelopePayload(rec.payload)
+          ? inflateEnvelopePayload(rec.payload, this.dictionaryForRecord(rec))
           : rec.payload;
         if (!filter(rawPayload, rec.topic)) {
           this.countFiltered(subscriber, rec.topic, rec.seq);
@@ -2619,8 +2788,15 @@ export class EventBus {
       // The log stores the wire payload: a record written while a
       // compression rule was active carries the deflated envelope, so
       // re-register it for transparent inflation at delivery — exactly
-      // like a live compressed message.
-      if (isCompressedPayload(rec.payload)) this.compressedPayloads.add(msg);
+      // like a live compressed message. Dictionary-compressed records
+      // additionally re-register their dictionary from the registry; a
+      // missing dictionary throws here (fail closed at replay) instead of
+      // corrupting data at delivery.
+      if (isCompressedPayload(rec.payload)) {
+        this.compressedPayloads.add(msg);
+        const dictionary = this.dictionaryForRecord(rec);
+        if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
+      }
       if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
       this.enqueueMessage(subscriber, msg, rec.expiresAt);
     }
@@ -3394,9 +3570,16 @@ export class EventBus {
     //      sequence number and moves no TTL deadline — seq/TTL semantics
     //      are unchanged.
     const compressionRule = this.compressionForTopic(topic);
+    // SHA-256 id of the preset dictionary that compressed this message, for
+    // the durable-log record: replay resolves the bytes from the bus's
+    // dictionary registry (set by `setTopicCompression`).
+    let compressedDictId: string | undefined;
     if (compressionRule !== undefined) {
       const wirePayload = this.compressPayload(msg, payload, compressionRule, stats);
-      if (wirePayload !== payload) msg.payload = wirePayload;
+      if (wirePayload !== payload) {
+        msg.payload = wirePayload;
+        if (this.compressedDictionaries.has(msg)) compressedDictId = compressionRule.dictionaryId;
+      }
     }
     let matched = 0;
     let accepted = 0;
@@ -3435,6 +3618,9 @@ export class EventBus {
       payload: msg.payload,
       ...(delayed == null ? {} : { deliverAt: delayed.deliverAt, delayId: delayed.delayId }),
       ...(recordKey === undefined ? {} : { key: recordKey }),
+      // Only present when a preset dictionary compressed this message:
+      // replay needs the same bytes to inflate it.
+      ...(compressedDictId === undefined ? {} : { dictId: compressedDictId }),
     });
     // The prefix index prunes the regex tests down to subscribers whose
     // pattern's literal prefix can plausibly match the topic; the compiled

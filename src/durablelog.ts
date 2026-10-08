@@ -49,6 +49,15 @@ export interface DurableLogRecord {
    * intent itself is never compacted away.
    */
   key?: string;
+  /**
+   * SHA-256 id of the preset dictionary that compressed this record's
+   * payload (see `setTopicCompression`'s `dictionary` option). Present
+   * only on dictionary-compressed records. The bytes themselves live in
+   * the bus's dictionary registry — replay resolves them by id, so the
+   * log stays small while inflation stays byte-exact. A restarted bus
+   * re-registers the same dictionary by re-setting the rule.
+   */
+  dictId?: string;
   /** The published payload, JSON-serialized. */
   payload: unknown;
 }
@@ -90,6 +99,12 @@ interface LogLine {
   delayId?: string;
   cancelled?: boolean;
   key?: string;
+  /**
+   * SHA-256 id of the preset dictionary that compressed `payload`, when
+   * the payload is a dictionary-compressed envelope. The bytes live in
+   * the bus's registry; the id is all replay needs.
+   */
+  dictId?: string;
   payload: unknown;
 }
 
@@ -447,6 +462,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.delayId !== undefined) line.delayId = record.delayId;
   if (record.cancelled !== undefined) line.cancelled = record.cancelled;
   if (record.key !== undefined) line.key = record.key;
+  if (record.dictId !== undefined) line.dictId = record.dictId;
   return line;
 }
 
@@ -510,6 +526,13 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   if (o['key'] !== undefined) {
     if (typeof o['key'] !== 'string' || (o['key'] as string).length === 0) return null;
     record.key = o['key'] as string;
+  }
+  if (o['dictId'] !== undefined) {
+    // A preset-dictionary id is the SHA-256 hex of the dictionary bytes:
+    // 64 lowercase hex chars. Anything else is a corrupt line, not a
+    // dictionary — replay must never resolve a forged id.
+    if (typeof o['dictId'] !== 'string' || !/^[0-9a-f]{64}$/.test(o['dictId'] as string)) return null;
+    record.dictId = o['dictId'] as string;
   }
   // A non-tombstone schedule record must say when it is due.
   if (isScheduleRecord && record.cancelled !== true && record.deliverAt === undefined) return null;

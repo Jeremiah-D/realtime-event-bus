@@ -244,6 +244,34 @@ library.
   the earliest-registered matching pattern wins; `clearTopicCompression`
   removes a rule (already-queued messages keep the form they were published
   with). Invalid options throw `RangeError`. Disabled by default.
+  - **Preset dictionary** (`dictionary` option): a `Uint8Array` /
+    `ArrayBuffer` / `DataView` of up to 32 KiB (zlib's cap) passed as the
+    deflate preset dictionary. Pre-seeding the compressor with the topic's
+    recurring byte patterns — field names, enum values, venue prefixes —
+    makes SMALL JSON messages compressible that deflate alone barely
+    shrinks: build it once by concatenating a few hundred representative
+    serialized payloads. The bus snapshots the bytes at registration, so
+    later caller mutation cannot corrupt inflation; the same bytes inflate,
+    carried per live message and resolved from the bus's dictionary
+    registry for durable-log replay (the log record stores the dictionary's
+    SHA-256 id, not the bytes). Replaying a dictionary-compressed record
+    whose dictionary is not registered fails loudly at `subscribe` time
+    instead of delivering garbage — re-register the rule with identical
+    bytes first. Invalid dictionaries (empty, > 32 KiB, wrong shape) throw
+    `RangeError`. Measured on `bench/compress-dict.bench.ts` (2,000
+    market-tick messages, mean 142 bytes serialized; 300-sample dictionary
+    capped at 32 KiB; Node v24, AMD EPYC 9D25):
+
+    | mode | wire ratio (after/before) | deflate p50 | deflate p99 |
+    | ---- | ------------------------- | ----------- | ----------- |
+    | no dictionary | 0.909 | ~21µs | ~140–290µs |
+    | with dictionary | 0.192 | ~90µs | ~390–940µs |
+
+    The dictionary shrinks the wire ~4.7x further (0.909 → 0.192) and —
+    decisively for small messages — compresses all 2,000 samples while
+    plain deflate fails the never-adopt-a-larger-encoding guard on the
+    least redundant ones. The trade is CPU: dictionary deflate costs ~4x
+    the p50 time, so size the threshold for your payload family.
 - **Subscriber output rate shaping** (in `src/bus.ts`, opt-in via
   `subscribe(..., { deliveryShaping: true })`): delivery-side pacing for a
   slow downstream consumer. A per-subscriber token bucket caps deliveries at
