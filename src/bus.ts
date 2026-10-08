@@ -651,6 +651,23 @@ export interface BusStats {
   /** Total messages accepted via `publish`/`publishBatch`. */
   totalPublished: number;
   /**
+   * Total messages handed to subscriber handlers. Counts each handler
+   * invocation, so at-least-once redeliveries count again; a handler
+   * that throws still received the message, and still counts.
+   */
+  deliveredMessages: number;
+  /**
+   * Total messages shed by subscriber backpressure queues. Matches the
+   * sum of the per-subscriber `droppedCount` values for live subscribers.
+   */
+  droppedMessages: number;
+  /**
+   * Total messages shed at the publish side by adaptive publish-side
+   * throttling (see `SubscribeOptions.throttle`) — the sum of every
+   * subscriber's `throttledCount`. Counted separately from queue drops.
+   */
+  throttledMessages: number;
+  /**
    * Total messages discarded because their TTL expired before delivery
    * (sum of the per-topic `expiredMessages` counters, counting each
    * discarded queue entry once — see `TopicStats.expiredMessages`).
@@ -1462,6 +1479,24 @@ export class EventBus {
   >();
   private totalPublished = 0;
   private totalExpired = 0;
+  /**
+   * Messages handed to subscriber handlers (global total). Counts each
+   * handler invocation, so at-least-once redeliveries count again; a
+   * handler that throws still received the message, and still counts.
+   */
+  private totalDelivered = 0;
+  /**
+   * Messages shed by subscriber backpressure queues (global total). Every
+   * queue insertion funnels through `enqueueMessage`, so this matches the
+   * sum of the per-subscriber `droppedCount` values for live subscribers.
+   */
+  private totalDropped = 0;
+  /**
+   * Messages shed at the publish side by adaptive throttling (global
+   * total). Incremented next to the per-subscriber `throttledDrops` (see
+   * `throttledCount`); counted separately from backpressure queue drops.
+   */
+  private totalThrottled = 0;
   private totalSequenceGaps = 0;
   /**
    * Per-topic sequence counters. Each message published to a topic takes
@@ -2237,7 +2272,7 @@ export class EventBus {
           this.moveToDeadLetter(subscriber, msg, count - 1);
           return;
         }
-        subscriber.queue.push(msg, 0, this.messageDeadlines.get(msg));
+        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
         this.scheduleFlush();
       },
     });
@@ -2587,7 +2622,7 @@ export class EventBus {
       // like a live compressed message.
       if (isCompressedPayload(rec.payload)) this.compressedPayloads.add(msg);
       if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
-      subscriber.queue.push(msg, 0, rec.expiresAt);
+      this.enqueueMessage(subscriber, msg, rec.expiresAt);
     }
     this.scheduleFlush();
   }
@@ -3182,6 +3217,27 @@ export class EventBus {
   }
 
   /**
+   * Pushes one message into a subscriber's queue and counts bus-level
+   * backpressure drops. Every queue insertion in the bus funnels through
+   * here — fan-out, redeliveries, log replays, DLQ replays, and mid-drain
+   * requeues. Drops are counted by diffing the queue's `droppedCount`
+   * rather than by the push result: under `drop-oldest` the incoming item
+   * is accepted while an older entry is shed, so the return value alone
+   * misses those evictions.
+   */
+  private enqueueMessage(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    deadline: number | undefined,
+  ): 'accepted' | 'dropped' {
+    const queue = subscriber.queue;
+    const droppedBefore = queue.droppedCount;
+    const result = queue.push(msg, 0, deadline);
+    this.totalDropped += queue.droppedCount - droppedBefore;
+    return result;
+  }
+
+  /**
    * Pushes one message into a subscriber's queue, honoring the
    * subscriber's content filter and adaptive publish-side throttling.
    * Returns true when the queue accepted the message. Shared by the plain
@@ -3214,9 +3270,10 @@ export class EventBus {
       // drop policy never churns on it. Counted separately from queue
       // drops; sequence-gap detection surfaces the loss downstream.
       throttle.throttledDrops += 1;
+      this.totalThrottled += 1;
       return false;
     }
-    return subscriber.queue.push(msg, 0, expiresAt) === 'accepted';
+    return this.enqueueMessage(subscriber, msg, expiresAt) === 'accepted';
   }
 
   /**
@@ -3439,6 +3496,9 @@ export class EventBus {
       totalSubscribers: this.subscribers.size,
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
       totalPublished: this.totalPublished,
+      deliveredMessages: this.totalDelivered,
+      droppedMessages: this.totalDropped,
+      throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
@@ -3602,7 +3662,7 @@ export class EventBus {
     // Fresh retry budget: the operator's replay is a new chance, not a
     // continuation of the poison run.
     subscriber.reliable?.redeliveries.delete(record.msg);
-    subscriber.queue.push(record.msg, 0, this.messageDeadlines.get(record.msg));
+    this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg));
     this.scheduleFlush();
     return true;
   }
@@ -3804,6 +3864,7 @@ export class EventBus {
         // idempotency and envelope-collision notes.
         this.inflateMessagePayload(msg);
         this.detectGap(subscriber, msg);
+        this.totalDelivered += 1;
         subscriber.handler(msg);
       }
     } else {
@@ -3844,12 +3905,12 @@ export class EventBus {
     if (undelivered.length === 0) return;
     const queue = subscriber.queue;
     if (queue.size === 0) {
-      for (const msg of undelivered) queue.push(msg, 0, this.messageDeadlines.get(msg));
+      for (const msg of undelivered) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
       return;
     }
     const rest = queue.drain();
-    for (const msg of undelivered) queue.push(msg, 0, this.messageDeadlines.get(msg));
-    for (const msg of rest) queue.push(msg, 0, this.messageDeadlines.get(msg));
+    for (const msg of undelivered) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
+    for (const msg of rest) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
   }
 
   /**
@@ -3914,6 +3975,7 @@ export class EventBus {
     const startedAtMs = budgetMs !== undefined ? this.now() : 0;
     let failed = false;
     let reason: 'error' | 'timeout' = 'error';
+    this.totalDelivered += 1;
     try {
       subscriber.handler(msg);
     } catch {

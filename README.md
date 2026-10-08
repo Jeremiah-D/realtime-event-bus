@@ -436,6 +436,11 @@ npm test
   batch/atomic publishes, `RangeError` on invalid keys with zero state
   change, delayed messages carrying their key through restart, and keys
   working without a durable log.
+- `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
+  `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
+  TTL expiry, schema rejection), `renderPrometheus` exposition output
+  (HELP/TYPE lines, per-topic series, label escaping), and the
+  `PROMETHEUS_CONTENT_TYPE` media type.
 
 ## Benchmark
 
@@ -511,3 +516,47 @@ B-before). Rerun the script to reproduce.
 ```bash
 node bench/index.bench.ts
 ```
+
+## Prometheus metrics
+
+`src/metrics.ts` renders a `getStats()` snapshot as Prometheus text
+exposition (0.0.4), hand-written with zero dependencies:
+
+```ts
+import { EventBus } from './src/bus.ts';
+import { renderPrometheus, PROMETHEUS_CONTENT_TYPE } from './src/metrics.ts';
+
+const bus = new EventBus();
+// ... in your HTTP handler:
+res.writeHead(200, { 'content-type': PROMETHEUS_CONTENT_TYPE });
+res.end(renderPrometheus(bus.getStats()));
+```
+
+Exported series:
+
+| Metric | Type | Source |
+|---|---|---|
+| `eventbus_published_messages_total` | counter | `totalPublished` |
+| `eventbus_delivered_messages_total` | counter | `deliveredMessages` — each handler invocation; at-least-once redeliveries count again |
+| `eventbus_dropped_messages_total` | counter | `droppedMessages` — backpressure queue sheds |
+| `eventbus_expired_messages_total` | counter | `expiredMessages` — TTL discards |
+| `eventbus_throttled_messages_total` | counter | `throttledMessages` — publish-side adaptive throttle sheds |
+| `eventbus_rejected_messages_total` | counter | `rejectedMessages` — schema rejections |
+| `eventbus_rate_limited_messages_total` | counter | `rateLimitedMessages` — per-topic rate-limit sheds |
+| `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |
+| `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
+| `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
+| `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
+| `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
+| `eventbus_subscribers` | gauge | `totalSubscribers` |
+| `eventbus_unacked_deliveries` | gauge | `unackedDeliveries` |
+| `eventbus_throttled_subscribers` | gauge | `throttledSubscribers` |
+| `eventbus_degraded_subscribers` | gauge | `degradedSubscribers` |
+| `eventbus_shaped_subscribers` | gauge | `shapedSubscribers` |
+| `eventbus_pending_delayed` | gauge | `pendingDelayed` |
+| `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
+
+The per-topic series grow with the distinct topics ever published to — the
+same bound as `BusStats.topics` — so a bus fanning out over millions of
+ad-hoc topic names grows the series count. Topic names come from the
+publisher, so this is bounded by the application's own topic space.

@@ -1,0 +1,190 @@
+/**
+ * Prometheus text exposition (0.0.4), hand-written, zero dependencies —
+ * the metrics surface for an `EventBus`:
+ *
+ * Counters (bus-level, monotonic):
+ * - `eventbus_published_messages_total`: messages accepted via
+ *   `publish`/`publishBatch`.
+ * - `eventbus_delivered_messages_total`: messages handed to subscriber
+ *   handlers (each handler invocation; at-least-once redeliveries count
+ *   again).
+ * - `eventbus_dropped_messages_total`: messages shed by subscriber
+ *   backpressure queues.
+ * - `eventbus_expired_messages_total`: messages discarded by TTL before
+ *   delivery.
+ * - `eventbus_throttled_messages_total`: messages shed at the publish
+ *   side by adaptive throttling.
+ * - `eventbus_rejected_messages_total`: publishes rejected by schema
+ *   validation.
+ * - `eventbus_rate_limited_messages_total`: messages shed by publish-side
+ *   per-topic rate limiting.
+ * - `eventbus_duplicate_messages_total`: idempotent publishes suppressed
+ *   as duplicates.
+ * - `eventbus_filtered_messages_total`: messages skipped by subscriber
+ *   content filters.
+ * - `eventbus_dead_lettered_messages_total`: reliable messages moved into
+ *   subscriber dead-letter queues.
+ * - `eventbus_sequence_gaps_total`: sequence numbers observed missing by
+ *   subscribers (see `TopicStats.sequenceGaps` for the counting rules).
+ * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
+ *
+ * Gauges (point-in-time):
+ * - `eventbus_subscribers`: currently active subscriptions.
+ * - `eventbus_unacked_deliveries`: reliable deliveries handed out but not
+ *   yet acked or nacked.
+ * - `eventbus_throttled_subscribers`: subscriptions under adaptive
+ *   publish-side throttling.
+ * - `eventbus_degraded_subscribers`: subscriptions auto-paused by health
+ *   probing.
+ * - `eventbus_shaped_subscribers`: subscriptions held back by
+ *   delivery-side rate shaping.
+ * - `eventbus_pending_delayed`: delayed messages scheduled but not yet
+ *   due.
+ * - `eventbus_topic_subscribers{topic}`: subscribers matched by the most
+ *   recent publish to the topic — the current fan-out width, so hot
+ *   topics are visible at a glance. A matching consumer group counts once
+ *   (its copy goes to a single assigned member).
+ *
+ * Cardinality note: the per-topic series grow with the number of distinct
+ * topics ever published to — the same bound as `BusStats.topics` — so a
+ * bus fanning out over millions of ad-hoc topic names will grow the
+ * series count. Topic names come from the publisher, never from subscriber
+ * input, so this is bounded by the application's own topic space.
+ *
+ * The bus has no HTTP server of its own; wire the returned text into your
+ * scrape endpoint with `PROMETHEUS_CONTENT_TYPE`, e.g.:
+ *
+ * ```ts
+ * import { EventBus } from './src/bus.ts';
+ * import { renderPrometheus, PROMETHEUS_CONTENT_TYPE } from './src/metrics.ts';
+ *
+ * const bus = new EventBus();
+ * // ... in your HTTP handler:
+ * res.writeHead(200, { 'content-type': PROMETHEUS_CONTENT_TYPE });
+ * res.end(renderPrometheus(bus.getStats()));
+ * ```
+ */
+import type { BusStats } from './bus.ts';
+
+/** Content-Type for a Prometheus exposition response body. */
+export const PROMETHEUS_CONTENT_TYPE = 'text/plain; version=0.0.4; charset=utf-8';
+
+/** Escape a label value per the Prometheus exposition format. */
+function escapeLabelValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/"/g, '\\"');
+}
+
+/** Render a `BusStats` snapshot as Prometheus text exposition (0.0.4). */
+export function renderPrometheus(stats: BusStats): string {
+  const lines: string[] = [];
+  const counter = (name: string, help: string, value: number): void => {
+    lines.push(`# HELP ${name} ${help}`);
+    lines.push(`# TYPE ${name} counter`);
+    lines.push(`${name} ${value}`);
+  };
+  const gauge = (name: string, help: string, value: number): void => {
+    lines.push(`# HELP ${name} ${help}`);
+    lines.push(`# TYPE ${name} gauge`);
+    lines.push(`${name} ${value}`);
+  };
+
+  counter(
+    'eventbus_published_messages_total',
+    'Total messages accepted via publish/publishBatch.',
+    stats.totalPublished,
+  );
+  counter(
+    'eventbus_delivered_messages_total',
+    'Total messages handed to subscriber handlers (each handler invocation; at-least-once redeliveries count again).',
+    stats.deliveredMessages,
+  );
+  counter(
+    'eventbus_dropped_messages_total',
+    'Total messages shed by subscriber backpressure queues.',
+    stats.droppedMessages,
+  );
+  counter(
+    'eventbus_expired_messages_total',
+    'Total messages discarded because their TTL expired before delivery.',
+    stats.expiredMessages,
+  );
+  counter(
+    'eventbus_throttled_messages_total',
+    'Total messages shed at the publish side by adaptive throttling.',
+    stats.throttledMessages,
+  );
+  counter(
+    'eventbus_rejected_messages_total',
+    'Total publishes rejected by schema validation.',
+    stats.rejectedMessages,
+  );
+  counter(
+    'eventbus_rate_limited_messages_total',
+    'Total messages shed by publish-side per-topic rate limiting.',
+    stats.rateLimitedMessages,
+  );
+  counter(
+    'eventbus_duplicate_messages_total',
+    'Total idempotent publishes suppressed as duplicates.',
+    stats.duplicateMessages,
+  );
+  counter(
+    'eventbus_filtered_messages_total',
+    "Total messages skipped by subscriber content filters.",
+    stats.filteredMessages,
+  );
+  counter(
+    'eventbus_dead_lettered_messages_total',
+    'Total reliable messages moved into subscriber dead-letter queues.',
+    stats.deadLetteredMessages,
+  );
+  counter(
+    'eventbus_sequence_gaps_total',
+    'Total sequence numbers observed missing by subscribers.',
+    stats.sequenceGaps,
+  );
+
+  gauge('eventbus_subscribers', 'Currently active subscriptions.', stats.totalSubscribers);
+  gauge(
+    'eventbus_unacked_deliveries',
+    'Reliable deliveries handed out but not yet acked or nacked.',
+    stats.unackedDeliveries,
+  );
+  gauge(
+    'eventbus_throttled_subscribers',
+    'Subscriptions currently under adaptive publish-side throttling.',
+    stats.throttledSubscribers,
+  );
+  gauge(
+    'eventbus_degraded_subscribers',
+    'Subscriptions currently auto-paused by health probing.',
+    stats.degradedSubscribers,
+  );
+  gauge(
+    'eventbus_shaped_subscribers',
+    'Subscriptions currently held back by delivery-side rate shaping.',
+    stats.shapedSubscribers,
+  );
+  gauge(
+    'eventbus_pending_delayed',
+    'Delayed messages scheduled but not yet due.',
+    stats.pendingDelayed,
+  );
+
+  // Per-topic series, in first-publish order (same as BusStats.topics).
+  lines.push(
+    '# HELP eventbus_topic_published_messages_total Total messages published to the topic.',
+  );
+  lines.push('# TYPE eventbus_topic_published_messages_total counter');
+  lines.push(
+    '# HELP eventbus_topic_subscribers Subscribers matched by the most recent publish to the topic (fan-out width).',
+  );
+  lines.push('# TYPE eventbus_topic_subscribers gauge');
+  for (const t of stats.topics) {
+    const label = `topic="${escapeLabelValue(t.topic)}"`;
+    lines.push(`eventbus_topic_published_messages_total{${label}} ${t.publishedMessages}`);
+    lines.push(`eventbus_topic_subscribers{${label}} ${t.subscriberCount}`);
+  }
+
+  return lines.join('\n') + '\n';
+}
