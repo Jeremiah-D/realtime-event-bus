@@ -423,6 +423,27 @@ export interface EventBusOptions {
    * false.
    */
   durableLogKeyCompaction?: boolean;
+  /**
+   * Enables publish-side idempotent dedup for `publishIdempotent`: within
+   * this many milliseconds of an admitted publish, a retry carrying the
+   * same `messageId` on the same topic is suppressed as a duplicate — it
+   * consumes no sequence number, is never written to the durable log, and
+   * burns no rate-limit budget. The window is measured on the bus clock
+   * (`EventBusOptions.now`), so it is deterministic in tests. Must be a
+   * positive finite number of milliseconds. Default 60000.
+   *
+   * The classic use is payment/fintech retry safety: a client that retries
+   * an order or settlement publish after a timeout passes the same
+   * `messageId`, and the bus guarantees the downstream sees it exactly
+   * once within the window — no double charge, no double settlement.
+   */
+  idempotencyWindowMs?: number;
+  /**
+   * Maximum entries in the idempotency dedup table (`publishIdempotent`).
+   * When the table is full, the oldest (topic, messageId) entry is evicted
+   * to make room. Must be a positive integer. Default 10000.
+   */
+  idempotencyMaxEntries?: number;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -478,6 +499,16 @@ export interface TopicStats {
    * invisible to gap detection.
    */
   rejectedMessages: number;
+  /**
+   * Idempotent publishes to this topic suppressed as duplicates (see
+   * `publishIdempotent`): the retry arrived with a `(topic, messageId)`
+   * pair already published within the idempotency window, so it was
+   * dropped before admission — no sequence number consumed (subscribers
+   * see no gap), nothing written to the durable log, no rate-limit budget
+   * burned. The key retry-safety metric: it tells operators how many
+   * retries the bus absorbed.
+   */
+  duplicateMessages: number;
   /**
    * Messages fanned out on this topic that a subscriber's content filter
    * rejected (see `SubscribeOptions.filter`): the message never entered
@@ -568,6 +599,12 @@ export interface BusStats {
    * exact counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total idempotent publishes suppressed as duplicates — the sum of
+   * every topic's `duplicateMessages`. See `TopicStats.duplicateMessages`
+   * for the exact counting rules.
+   */
+  duplicateMessages: number;
   /**
    * Total messages skipped by subscriber content filters — the sum of
    * every topic's `filteredMessages`. See `TopicStats.filteredMessages`
@@ -776,6 +813,7 @@ function zeroedTopicStats(): {
   sequenceGaps: number;
   rateLimitedMessages: number;
   rejectedMessages: number;
+  duplicateMessages: number;
   filteredMessages: number;
   compressedMessages: number;
   compressedBytesBefore: number;
@@ -790,6 +828,7 @@ function zeroedTopicStats(): {
     sequenceGaps: 0,
     rateLimitedMessages: 0,
     rejectedMessages: 0,
+    duplicateMessages: 0,
     filteredMessages: 0,
     compressedMessages: 0,
     compressedBytesBefore: 0,
@@ -1191,6 +1230,46 @@ function serializeForCompression(payload: unknown): string | undefined {
   }
 }
 
+/**
+ * Options for `EventBus.publishIdempotent`: `PublishOptions` plus the
+ * idempotency key.
+ */
+export interface IdempotentPublishOptions extends PublishOptions {
+  /**
+   * Idempotency key for this publish. The dedup identity is the pair
+   * `(topic, messageId)`: the same `messageId` on different topics is
+   * independent, so one payment id can be reused across unrelated topics
+   * without interference.
+   *
+   * Absent or empty disables dedup — the publish behaves exactly like
+   * `publish`, still returning an `IdempotentPublishResult` with
+   * `duplicate: false`. A non-string value is treated as absent.
+   */
+  messageId?: string;
+}
+
+/**
+ * Outcome of `EventBus.publishIdempotent`.
+ */
+export interface IdempotentPublishResult {
+  /**
+   * True when this publish was suppressed as a duplicate: the same
+   * `(topic, messageId)` was already admitted within the idempotency
+   * window, so nothing was published — no sequence number consumed,
+   * nothing written to the durable log, no rate-limit budget burned — and
+   * `accepted` is 0.
+   */
+  duplicate: boolean;
+  /**
+   * Number of subscriber queues that accepted the message (the same value
+   * `publish` would return). 0 when `duplicate` is true; also 0 for an
+   * admitted publish that the schema validator rejected or the rate
+   * limiter shed — neither is a duplicate, and neither suppresses the
+   * retry.
+   */
+  accepted: number;
+}
+
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
@@ -1220,6 +1299,7 @@ export class EventBus {
       sequenceGaps: number;
       rateLimitedMessages: number;
       rejectedMessages: number;
+      duplicateMessages: number;
       filteredMessages: number;
       compressedMessages: number;
       compressedBytesBefore: number;
@@ -1296,6 +1376,39 @@ export class EventBus {
    * never reaches a subscriber queue.
    */
   private totalRejected = 0;
+  /**
+   * Idempotent publishes suppressed as duplicates (global total). A
+   * duplicate is dropped before admission — no sequence number, no
+   * durable-log write, no rate-limit budget — and counted here and on the
+   * topic's `duplicateMessages` stat only.
+   */
+  private totalDuplicates = 0;
+  /**
+   * Idempotency dedup table for `publishIdempotent`: dedup key ->
+   * bus-clock timestamp of the admitted publish that claimed it. The
+   * dedup key is `${topic}\0${messageId}`, so the same messageId on
+   * different topics is independent. The map is insertion-ordered, which
+   * `pruneDedup` and the bounded eviction rely on: the head is the oldest
+   * entry (approximately — an injected clock may move non-monotonically,
+   * so per-key expiry is always re-checked on lookup).
+   *
+   * Only admitted messages (past schema validation and the rate-limit
+   * budget) occupy slots: a rejected or shed first attempt must not
+   * suppress its retry.
+   */
+  private dedup = new Map<string, number>();
+  /**
+   * Dedup window in milliseconds (`EventBusOptions.idempotencyWindowMs`):
+   * a retry within this long of the admitted publish is a duplicate.
+   * Measured on the injected bus clock.
+   */
+  private readonly idempotencyWindowMs: number;
+  /**
+   * Maximum entries in the dedup table
+   * (`EventBusOptions.idempotencyMaxEntries`): the oldest entry is evicted
+   * when the table is full.
+   */
+  private readonly idempotencyMaxEntries: number;
   /**
    * Messages skipped by subscriber content filters (global total, see
    * `SubscribeOptions.filter`). A filtered message was fanned out but
@@ -1405,6 +1518,18 @@ export class EventBus {
 
   constructor(options?: EventBusOptions) {
     this.now = options?.now ?? Date.now;
+    const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
+    if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
+      throw new RangeError(
+        'idempotencyWindowMs must be a positive finite number of milliseconds',
+      );
+    }
+    this.idempotencyWindowMs = idempotencyWindowMs;
+    const idempotencyMaxEntries = options?.idempotencyMaxEntries ?? 10_000;
+    if (!Number.isInteger(idempotencyMaxEntries) || idempotencyMaxEntries < 1) {
+      throw new RangeError('idempotencyMaxEntries must be a positive integer');
+    }
+    this.idempotencyMaxEntries = idempotencyMaxEntries;
     if (options?.durableLogDir != null) {
       this.durableLog = DurableTopicLog.open({
         dir: options.durableLogDir,
@@ -1428,6 +1553,7 @@ export class EventBus {
           sequenceGaps: 0,
           rateLimitedMessages: 0,
           rejectedMessages: 0,
+          duplicateMessages: 0,
           filteredMessages: 0,
           compressedMessages: 0,
           compressedBytesBefore: 0,
@@ -2292,6 +2418,90 @@ export class EventBus {
   }
 
   /**
+   * Idempotent publish: within the idempotency window
+   * (`EventBusOptions.idempotencyWindowMs`), a `(topic, messageId)` pair is
+   * published at most once. A retry carrying the same `messageId` on the
+   * same topic — the classic payment/fintech pattern where a client retries
+   * after a timeout — returns `{ duplicate: true, accepted: 0 }` instead of
+   * publishing again, so the downstream sees the message exactly once and
+   * a retried order or settlement can never double-execute.
+   *
+   * The dedup gate runs before admission, ahead of everything else: a
+   * duplicate consumes no sequence number (subscribers see no phantom
+   * gap), is never written to the durable log, and burns no rate-limit
+   * budget. Schema validation is not re-run for a duplicate either — the
+   * gate decides on the identity alone.
+   *
+   * Window and lifetime semantics:
+   * - The window starts when a message is ADMITTED (past schema validation
+   *   and the rate-limit budget). A first attempt that the schema
+   *   validator rejected or the rate limiter shed claims no dedup slot —
+   *   its retry is a fresh publish, never suppressed. Suppressing the
+   *   retry of a message that never reached anyone would silently lose it;
+   *   idempotency must not do that.
+   * - When the window expires, the next publish with the same `messageId`
+   *   is admitted again and restarts the window.
+   * - The table is bounded by `EventBusOptions.idempotencyMaxEntries`:
+   *   when full, the oldest entry is evicted. Expired entries are dropped
+   *   from the head on every idempotent publish; an injected clock that
+   *   moves non-monotonically may leave an expired entry off-head, and the
+   *   per-key lookup re-checks expiry so it can never suppress wrongly.
+   * - The window is measured on the bus clock (`EventBusOptions.now`), so
+   *   dedup is deterministic in tests.
+   *
+   * Without a `messageId` (absent or empty) this behaves exactly like
+   * `publish`, returning `{ duplicate: false, accepted }`. Suppressed
+   * duplicates are counted in `TopicStats.duplicateMessages` (and the
+   * global total) — the retry-safety observability metric.
+   *
+   * `opts.key` opts the message into durable-log keyed compaction (see
+   * `PublishOptions.key`); like `publish`, an invalid key throws
+   * `RangeError` before anything is mutated.
+   */
+  publishIdempotent(
+    topic: string,
+    payload: unknown,
+    opts?: IdempotentPublishOptions,
+  ): IdempotentPublishResult {
+    validateMessageKey(opts?.key, 'publishIdempotent');
+    const messageId = opts?.messageId;
+    // No identity, no dedup: a plain publish that still reports the same
+    // result shape.
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      const { accepted } = this.fanOut(topic, payload, false, undefined, opts?.key);
+      this.scheduleFlush();
+      return { duplicate: false, accepted };
+    }
+    const nowMs = this.now();
+    const dedupKey = `${topic}\0${messageId}`;
+    this.pruneDedup(nowMs);
+    const firstAt = this.dedup.get(dedupKey);
+    if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
+      // Suppressed duplicate: dropped before admission — no sequence
+      // number, no durable-log write, no rate-limit budget. Counted for
+      // observability only.
+      this.countDuplicate(topic);
+      return { duplicate: true, accepted: 0 };
+    }
+    const { accepted, admitted } = this.fanOut(topic, payload, false, undefined, opts?.key);
+    this.scheduleFlush();
+    if (admitted) {
+      // Only an admitted message claims a dedup slot: the window starts at
+      // its publish time, and a rejected/shed first attempt leaves the
+      // retry free. Deleting before re-inserting refreshes the entry's
+      // position so the bounded eviction tracks last-publish order.
+      this.dedup.delete(dedupKey);
+      this.dedup.set(dedupKey, nowMs);
+      while (this.dedup.size > this.idempotencyMaxEntries) {
+        const oldest = this.dedup.keys().next();
+        if (oldest.done) break;
+        this.dedup.delete(oldest.value);
+      }
+    }
+    return { duplicate: false, accepted };
+  }
+
+  /**
    * Fans out every message in the batch to its matching subscribers' bounded
    * queues, then schedules a single flush for the whole batch — so N messages
    * cost one event-loop round instead of N, at the price of one larger drain.
@@ -2752,6 +2962,32 @@ export class EventBus {
   }
 
   /**
+   * Counts one publish suppressed as an idempotency duplicate against the
+   * topic and the global total. A duplicate is dropped before admission, so
+   * — like a schema rejection — it creates the topic's stats entry when the
+   * topic has never published anything yet.
+   */
+  private countDuplicate(topic: string): void {
+    this.statsFor(topic).duplicateMessages += 1;
+    this.totalDuplicates += 1;
+  }
+
+  /**
+   * Drops expired dedup entries from the head of the insertion-ordered
+   * table. Entries are inserted in publish order, so with a sane clock the
+   * head is the oldest and the scan stops at the first live entry —
+   * amortized O(1) per idempotent publish. An injected clock that jumps
+   * backwards can leave an expired entry behind the head; the per-key
+   * expiry re-check in `publishIdempotent` keeps that harmless.
+   */
+  private pruneDedup(nowMs: number): void {
+    for (const [key, firstAt] of this.dedup) {
+      if (nowMs - firstAt < this.idempotencyWindowMs) break;
+      this.dedup.delete(key);
+    }
+  }
+
+  /**
    * Pushes one message into a subscriber's queue, honoring the
    * subscriber's content filter and adaptive publish-side throttling.
    * Returns true when the queue accepted the message. Shared by the plain
@@ -2854,7 +3090,7 @@ export class EventBus {
     preAdmitted = false,
     delayed?: DelayedFanOut,
     key?: string,
-  ): { matched: number; accepted: number } {
+  ): { matched: number; accepted: number; admitted: boolean } {
     // Publish-side schema validation runs before admission: a rejected
     // payload never becomes a message — no sequence number is consumed
     // (subscribers see no gap), the durable log never sees it, and it
@@ -2865,7 +3101,7 @@ export class EventBus {
       const validator = this.schemaForTopic(topic);
       if (validator !== undefined && !validator(payload, topic)) {
         this.countSchemaRejection(topic);
-        return { matched: 0, accepted: 0 };
+        return { matched: 0, accepted: 0, admitted: false };
       }
     }
     const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
@@ -2889,7 +3125,7 @@ export class EventBus {
       if (!bucket.take()) {
         stats.rateLimitedMessages += 1;
         this.totalRateLimited += 1;
-        return { matched: 0, accepted: 0 };
+        return { matched: 0, accepted: 0, admitted: false };
       }
     }
     // Publish-side per-topic payload compression (opt-in via
@@ -2985,7 +3221,7 @@ export class EventBus {
       this.recordGroupOffset(hit.groupId, topic, msg.seq);
     }
     stats.subscriberCount = matched;
-    return { matched, accepted };
+    return { matched, accepted, admitted: true };
   }
 
   /**
@@ -3016,6 +3252,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       rejectedMessages: this.totalRejected,
+      duplicateMessages: this.totalDuplicates,
       filteredMessages: this.totalFiltered,
       compressedMessages: this.totalCompressed,
       compressedBytesBefore: this.totalCompressedBytesBefore,
@@ -3047,6 +3284,7 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         rejectedMessages: stats.rejectedMessages,
+        duplicateMessages: stats.duplicateMessages,
         filteredMessages: stats.filteredMessages,
         compressedMessages: stats.compressedMessages,
         compressedBytesBefore: stats.compressedBytesBefore,
