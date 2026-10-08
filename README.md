@@ -52,7 +52,17 @@ library.
   and deliveries still outstanding after `ackTimeoutMs` (default 5 s) are
   requeued automatically. Redelivered messages keep their original TTL
   deadline. `unackedCount(subId)` and `getStats().unackedDeliveries` expose
-  the outstanding-delivery backlog. Every message carries a per-topic `seq`
+  the outstanding-delivery backlog. Opt-in `deadLetter` bounds redelivery:
+  a message requeued more than `maxRedeliveries` times (default 5) moves to
+  the subscriber's dead-letter queue instead of being retried forever —
+  inspect it with `getDeadLetterMessages(subId)` (DLQ-local `seq`, topic,
+  payload, `redeliveries` count, `deadLetteredAt`, original TTL deadline)
+  and hand it back with `replayDeadLetter(subId, seq)` (fresh redelivery
+  budget, original `seq`/deadline preserved — no false sequence gap). The
+  DLQ is bounded (`maxEntries`, default 1000, oldest evicted first) and a
+  synchronously throwing handler counts as an immediate redelivery attempt
+  rather than crashing the flush. `getStats().deadLetteredMessages` counts
+  every dead-lettering. Every message carries a per-topic `seq`
   (monotonic from 1, assigned at publish time); the bus watches each
   subscriber's deliveries and counts skipped numbers into `getStats()`
   `sequenceGaps` (per topic and global, with `lastSeq` per topic) —
@@ -335,6 +345,13 @@ npm test
   auto-requeues, double/late settles are no-ops, unsubscribe cancels pending
   timers, redelivered messages keep their original TTL deadline, and
   `ackTimeoutMs` validation.
+- `test/deadletter.test.ts` — subscriber dead-letter queues: nack/ack-timeout
+  exhaustion and repeatedly throwing handlers move poison messages to the DLQ,
+  DLQ-local seqs and arrival order, snapshot reads, replay with original seq
+  and TTL deadline (no false sequence gap, expired replays dropped as
+  expired), fresh redelivery budget on replay, bounded eviction with
+  `onDeadLetter`, option validation, `deadLetter: true` defaults, and the
+  unchanged retry-forever behavior without the option.
 - `test/health.test.ts` — subscriber health probing: consecutive-error and
   processing-timeout thresholds auto-pause delivery, success resets the
   counter, a mid-drain degradation requeues unattempted messages in order,

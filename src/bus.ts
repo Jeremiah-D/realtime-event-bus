@@ -321,6 +321,100 @@ export interface ReliableSubscribeOptions extends SubscribeOptions {
    * number.
    */
   ackTimeoutMs?: number;
+  /**
+   * Opt-in per-subscriber dead-letter queue for poison messages. Without
+   * it, a reliable subscription retries forever (at-least-once): every
+   * `nack()` and every ack timeout requeues the message with no upper
+   * bound. With it, a message that has been requeued more than
+   * `maxRedeliveries` times moves to the subscriber's DLQ instead of being
+   * requeued again — inspect it with `getDeadLetterMessages(subId)` and
+   * hand it back to the queue with `replayDeadLetter(subId, seq)`.
+   *
+   * Pass `true` for the defaults (5 redeliveries, 1000 DLQ entries), or a
+   * `DeadLetterOptions` object to tune them. Disabled by default.
+   */
+  deadLetter?: boolean | DeadLetterOptions;
+}
+
+/**
+ * Tuning for a reliable subscriber's dead-letter queue (see
+ * `ReliableSubscribeOptions.deadLetter`).
+ */
+export interface DeadLetterOptions {
+  /**
+   * How many times a message may be requeued (via `nack()` or ack timeout)
+   * before it moves to the DLQ. The next requeue attempt beyond this
+   * budget dead-letters the message instead. Defaults to 5. Must be a
+   * non-negative integer — `0` means the first redelivery attempt already
+   * dead-letters.
+   */
+  maxRedeliveries?: number;
+  /**
+   * Maximum DLQ entries kept per subscriber. When the DLQ is full, the
+   * oldest entry is evicted to make room (reported via
+   * `DeadLetterEvent.evictedOldest`). Defaults to 1000. Must be a positive
+   * integer.
+   */
+  maxEntries?: number;
+  /**
+   * Fired when a message enters the subscriber's DLQ — once per
+   * dead-lettering, synchronously with the move.
+   */
+  onDeadLetter?: (event: DeadLetterEvent) => void;
+}
+
+/**
+ * One message sitting in a subscriber's dead-letter queue: the poison
+ * message, preserved in DLQ arrival order with its original TTL deadline.
+ * Returned by `getDeadLetterMessages(subId)`; `seq` identifies the entry
+ * for `replayDeadLetter(subId, seq)`. The returned objects are snapshots —
+ * mutating them does not affect the bus.
+ */
+export interface DeadLetterEntry {
+  /**
+   * DLQ-local sequence, starting at 1 per subscriber and increasing by 1
+   * for every dead-lettered message. The DLQ preserves arrival order, so a
+   * higher `seq` always means "dead-lettered later".
+   */
+  seq: number;
+  /** The concrete topic the message was published to. */
+  topic: string;
+  /**
+   * The published payload. This is the original payload object, shared by
+   * reference — the bus treats payloads as opaque everywhere (see
+   * `BusMessage.payload`), so it is never cloned. Do not mutate it if you
+   * plan to replay the entry.
+   */
+  payload: unknown;
+  /**
+   * How many times the message was requeued before it was dead-lettered.
+   * Poison-message signal: a high count means the consumer failed the
+   * message repeatedly.
+   */
+  redeliveries: number;
+  /** Bus-clock timestamp when the message entered the DLQ. */
+  deadLetteredAt: number;
+  /**
+   * The message's original TTL deadline, preserved so a replayed message
+   * expires on the same schedule instead of being resurrected. Absent when
+   * the message had no TTL.
+   */
+  expiresAt?: number;
+}
+
+/** Snapshot delivered to `DeadLetterOptions.onDeadLetter`. */
+export interface DeadLetterEvent {
+  /** The reliable subscription whose DLQ took the message. */
+  subscriberId: string;
+  /** The subscription's topic pattern. */
+  pattern: string;
+  /** The entry that was added. */
+  entry: DeadLetterEntry;
+  /**
+   * True when the DLQ was full and the oldest entry was evicted to make
+   * room for this one.
+   */
+  evictedOldest: boolean;
 }
 
 /** Snapshot delivered to `onRebalance` when a consumer group's membership changes. */
@@ -612,6 +706,12 @@ export interface BusStats {
    */
   filteredMessages: number;
   /**
+   * Total messages moved into subscriber dead-letter queues — every
+   * reliable-subscription message that exhausted its redelivery budget
+   * (see `ReliableSubscribeOptions.deadLetter`).
+   */
+  deadLetteredMessages: number;
+  /**
    * Total messages delivered with a compressed payload — the sum of every
    * topic's `compressedMessages`. See `TopicStats.compressedMessages` for
    * the exact counting rules.
@@ -708,6 +808,14 @@ interface Subscriber {
     redeliveries: WeakMap<BusMessage, number>;
   };
   /**
+   * Present for reliable subscriptions with `deadLetter` enabled: the
+   * subscriber's poison-message queue. Messages that exhausted their
+   * redelivery budget land here in arrival order instead of being
+   * requeued forever. Bounded by `maxEntries` — the oldest entry is
+   * evicted when full.
+   */
+  deadLetter?: SubscriberDeadLetter;
+  /**
    * Last per-topic sequence number delivered to this subscriber's handler,
    * for gap detection. A delivery with `seq` more than one above the stored
    * number means messages were lost in between (dropped by backpressure or
@@ -775,6 +883,21 @@ interface ThrottleState {
   minRatePerSec: number;
   maxRatePerSec: number;
   initialRatePerSec: number;
+}
+
+/**
+ * Per-subscriber dead-letter queue state (see
+ * `ReliableSubscribeOptions.deadLetter`). `entries` holds the poison
+ * messages in dead-lettering order; each record keeps the original
+ * `BusMessage` so replay requeues the identical object (same per-topic
+ * `seq`, same TTL deadline) instead of a reconstructed copy.
+ */
+interface SubscriberDeadLetter {
+  entries: Array<DeadLetterEntry & { msg: BusMessage }>;
+  maxRedeliveries: number;
+  maxEntries: number;
+  nextSeq: number;
+  onDeadLetter?: (event: DeadLetterEvent) => void;
 }
 
 /**
@@ -848,6 +971,35 @@ function validateMessageKey(key: string | undefined, caller: string): void {
   if (typeof key !== 'string' || key.length === 0) {
     throw new RangeError(`${caller}: key must be a non-empty string`);
   }
+}
+
+/**
+ * Normalizes the `deadLetter` subscribe option into the resolved config,
+ * or `null` when the DLQ is disabled. Throws `RangeError` on invalid
+ * budgets before anything is mutated, matching the other subscribe-option
+ * validations.
+ */
+function normalizeDeadLetterOptions(
+  opt: boolean | DeadLetterOptions | undefined,
+  caller: string,
+): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'onDeadLetter'> | null {
+  if (opt === undefined || opt === false) return null;
+  if (opt !== true && (typeof opt !== 'object' || opt === null)) {
+    throw new TypeError(`${caller}: deadLetter must be true or a DeadLetterOptions object`);
+  }
+  const o: DeadLetterOptions = opt === true ? {} : opt;
+  const maxRedeliveries = o.maxRedeliveries ?? 5;
+  const maxEntries = o.maxEntries ?? 1000;
+  if (!Number.isInteger(maxRedeliveries) || maxRedeliveries < 0) {
+    throw new RangeError(`${caller}: deadLetter.maxRedeliveries must be a non-negative integer`);
+  }
+  if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
+    throw new RangeError(`${caller}: deadLetter.maxEntries must be a positive integer`);
+  }
+  if (o.onDeadLetter !== undefined && typeof o.onDeadLetter !== 'function') {
+    throw new TypeError(`${caller}: deadLetter.onDeadLetter must be a function`);
+  }
+  return { maxRedeliveries, maxEntries, onDeadLetter: o.onDeadLetter };
 }
 
 /**
@@ -1416,6 +1568,12 @@ export class EventBus {
    * budget consumed, no sequence gap reported.
    */
   private totalFiltered = 0;
+  /**
+   * Total messages moved into subscriber dead-letter queues (see
+   * `ReliableSubscribeOptions.deadLetter`). Counts every dead-lettering,
+   * including replays that failed again.
+   */
+  private totalDeadLettered = 0;
   /**
    * Per-topic payload compression rules, keyed by the exact string passed
    * to `setTopicCompression` — either a concrete topic name or a wildcard
@@ -2044,6 +2202,11 @@ export class EventBus {
    * exactly-once: `delivery.redeliveries` counts prior requeues so consumers
    * can spot poison messages. All queue options (`queueSize`, `dropPolicy`,
    * `onBackpressure`) behave as in `subscribe`.
+   *
+   * With `deadLetter` enabled, redelivery is bounded: a message requeued
+   * more than `maxRedeliveries` times moves to the subscriber's
+   * dead-letter queue instead of being requeued forever (see
+   * `getDeadLetterMessages` / `replayDeadLetter`).
    */
   subscribeReliable(
     topicPattern: string,
@@ -2053,6 +2216,9 @@ export class EventBus {
     // The bus flush calls `Subscriber.handler` with bare messages; wrap it
     // so reliable subscribers transparently get tracked deliveries instead.
     // Assigned synchronously here, before any flush microtask can run.
+    // Validate the DLQ options before subscribing: a rejected option must
+    // not leave a half-registered subscription behind.
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable');
     let deliver!: (msg: BusMessage) => void;
     const sub = this.subscribe(topicPattern, (msg) => deliver(msg), opts);
     const subscriber = this.subscribers.get(sub.id);
@@ -2061,14 +2227,42 @@ export class EventBus {
     const tracker = new AckTracker<BusMessage>({
       ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
       onRedeliver: (msg) => {
-        redeliveries.set(msg, (redeliveries.get(msg) ?? 0) + 1);
+        const count = (redeliveries.get(msg) ?? 0) + 1;
+        redeliveries.set(msg, count);
+        // The redelivery budget is exhausted: the message is poison
+        // (repeated nacks, ack timeouts, or a handler that keeps throwing
+        // and never settles). Dead-letter it instead of requeueing
+        // forever.
+        if (dlq != null && count > dlq.maxRedeliveries) {
+          this.moveToDeadLetter(subscriber, msg, count - 1);
+          return;
+        }
         subscriber.queue.push(msg, 0, this.messageDeadlines.get(msg));
         this.scheduleFlush();
       },
     });
     subscriber.reliable = { tracker, redeliveries };
+    if (dlq != null) {
+      subscriber.deadLetter = { entries: [], nextSeq: 0, ...dlq };
+    }
     deliver = (msg) => {
-      handler(tracker.track(msg, redeliveries.get(msg) ?? 0));
+      const delivery = tracker.track(msg, redeliveries.get(msg) ?? 0);
+      if (dlq == null) {
+        handler(delivery);
+        return;
+      }
+      // With a DLQ configured, a synchronously throwing handler is an
+      // immediate redelivery attempt, not a process crash: without this
+      // the throw would escape the flush microtask and kill the process,
+      // while the message would be requeued anyway once the ack timer
+      // fired. Counting it now keeps the failure fast, deterministic,
+      // and inside the redelivery budget — repeated throws land the
+      // message in the DLQ instead of crashing the bus.
+      try {
+        handler(delivery);
+      } catch {
+        delivery.nack();
+      }
     };
     return {
       id: sub.id,
@@ -3254,6 +3448,7 @@ export class EventBus {
       rejectedMessages: this.totalRejected,
       duplicateMessages: this.totalDuplicates,
       filteredMessages: this.totalFiltered,
+      deadLetteredMessages: this.totalDeadLettered,
       compressedMessages: this.totalCompressed,
       compressedBytesBefore: this.totalCompressedBytesBefore,
       compressedBytesAfter: this.totalCompressedBytesAfter,
@@ -3324,6 +3519,92 @@ export class EventBus {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     return subscriber.queue.droppedCount;
+  }
+
+  /**
+   * Moves a message that exhausted its redelivery budget into the
+   * subscriber's dead-letter queue (see
+   * `ReliableSubscribeOptions.deadLetter`). The original message object
+   * is kept — replay requeues the identical object, so its per-topic
+   * `seq` and TTL deadline survive the round trip. The DLQ is bounded by
+   * `maxEntries`: the oldest entry is evicted when full.
+   */
+  private moveToDeadLetter(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    redeliveries: number,
+  ): void {
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) return;
+    let evictedOldest = false;
+    if (dlq.entries.length >= dlq.maxEntries) {
+      dlq.entries.shift();
+      evictedOldest = true;
+    }
+    const entry: DeadLetterEntry = {
+      seq: ++dlq.nextSeq,
+      topic: msg.topic,
+      payload: msg.payload,
+      redeliveries,
+      deadLetteredAt: this.now(),
+      expiresAt: this.messageDeadlines.get(msg),
+    };
+    dlq.entries.push({ ...entry, msg });
+    this.totalDeadLettered += 1;
+    dlq.onDeadLetter?.({
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      entry,
+      evictedOldest,
+    });
+  }
+
+  /**
+   * The messages currently sitting in a reliable subscriber's
+   * dead-letter queue, in dead-lettering order (see
+   * `ReliableSubscribeOptions.deadLetter`). Empty when the subscriber
+   * has no DLQ configured or nothing has been dead-lettered. Throws on
+   * an unknown subscriber id. The returned array and entry envelopes are
+   * snapshots — mutating them does not affect the bus; `payload` is the
+   * original published object, shared by reference (see
+   * `DeadLetterEntry.payload`).
+   */
+  getDeadLetterMessages(subId: string): DeadLetterEntry[] {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    return (subscriber.deadLetter?.entries ?? []).map(
+      ({ msg: _msg, ...entry }) => ({ ...entry }),
+    );
+  }
+
+  /**
+   * Hands one dead-lettered message back to the subscriber's queue for
+   * another delivery attempt (see
+   * `ReliableSubscribeOptions.deadLetter`). The message keeps its
+   * original per-topic `seq` (no false sequence gap) and its original
+   * TTL deadline — a message whose deadline already passed is dropped as
+   * expired on the next drain, not resurrected. The replayed message
+   * gets a fresh redelivery budget: if it fails again it is requeued up
+   * to `maxRedeliveries` times before returning to the DLQ.
+   *
+   * Returns true when the entry was found and requeued, false when the
+   * subscriber has no DLQ or no entry with that `seq`. Throws on an
+   * unknown subscriber id.
+   */
+  replayDeadLetter(subId: string, seq: number): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) return false;
+    const idx = dlq.entries.findIndex((e) => e.seq === seq);
+    if (idx === -1) return false;
+    const [record] = dlq.entries.splice(idx, 1);
+    // Fresh retry budget: the operator's replay is a new chance, not a
+    // continuation of the poison run.
+    subscriber.reliable?.redeliveries.delete(record.msg);
+    subscriber.queue.push(record.msg, 0, this.messageDeadlines.get(record.msg));
+    this.scheduleFlush();
+    return true;
   }
 
   /**
