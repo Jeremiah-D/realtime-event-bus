@@ -99,7 +99,17 @@ library.
   amortized rewrite at 2x). Corrupt log lines are skipped and counted
   (`getStats().durableLog.corruptLines`), never fatal; payloads
   `JSON.stringify` cannot represent are delivered live but skipped by the
-  log. Durability is process-restart grade (synchronous appends, no
+  log. Opt-in Kafka-style keyed compaction (`durableLogKeyCompaction`):
+  `publish(topic, payload, { key })` (also on batch/atomic/delayed
+  publishes) stamps a compaction key on the log record, and the log then
+  retains only the latest record per (topic, key) — older values for the
+  same key are superseded: `readSince` never replays them (even before the
+  file is rewritten), restart recovery rebuilds the key index from disk,
+  and compaction rewrites the file keeping the latest record per key plus
+  the newest `maxEntriesPerTopic` keyless messages (a full budget's worth of
+  superseded records also triggers the rewrite early). Delayed-delivery
+  schedule records are timer intents and are never compacted away; a keyed
+  delayed message keeps its key across restart. Durability is process-restart grade (synchronous appends, no
   per-message `fsync`) — a crash log for recovery, not a write-ahead log.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
@@ -400,6 +410,15 @@ npm test
   member, filters seeing the raw payload under compression, durable-log
   replay honoring the filter (no queue churn, no gaps), and
   `getStats().filteredMessages`.
+- `test/compaction.test.ts` — durable-log keyed compaction: repeated key
+  updates collapsing to the latest on disk, multi-key latest-each plus
+  keyless budget, `readSince` dedupe before any rewrite, restart recovery
+  rebuilding the key index, seq-0 schedule records surviving compaction
+  undeduped, flag-off preserving old behavior, malformed key lines counted
+  corrupt, bus end-to-end keyed publish with replay-only-latest, keys on
+  batch/atomic publishes, `RangeError` on invalid keys with zero state
+  change, delayed messages carrying their key through restart, and keys
+  working without a durable log.
 
 ## Benchmark
 

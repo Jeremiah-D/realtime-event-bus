@@ -415,6 +415,14 @@ export interface EventBusOptions {
    * Must be a positive integer.
    */
   durableLogMaxEntriesPerTopic?: number;
+  /**
+   * Opt-in Kafka-style keyed log compaction for the durable log (see
+   * `DurableTopicLog`). A published message may then carry a `key` (see
+   * `PublishOptions.key`): only the latest record per (topic, key) is
+   * retained and replayed. Only meaningful with `durableLogDir`. Default
+   * false.
+   */
+  durableLogKeyCompaction?: boolean;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -641,6 +649,8 @@ export interface BusStats {
     entries: number;
     /** Malformed log lines skipped during recovery/reads. */
     corruptLines: number;
+    /** Whether keyed log compaction is enabled (`durableLogKeyCompaction`). */
+    keyCompaction: boolean;
   };
 }
 
@@ -786,6 +796,19 @@ function zeroedTopicStats(): {
     compressedBytesAfter: 0,
     compressionTimeMs: 0,
   };
+}
+
+/**
+ * Validates a publish message key (see `PublishOptions.key`): absent is
+ * fine, otherwise it must be a non-empty string. Throws `RangeError`
+ * before anything is mutated, matching the other publish-option
+ * validations.
+ */
+function validateMessageKey(key: string | undefined, caller: string): void {
+  if (key === undefined) return;
+  if (typeof key !== 'string' || key.length === 0) {
+    throw new RangeError(`${caller}: key must be a non-empty string`);
+  }
 }
 
 /**
@@ -1004,6 +1027,33 @@ export interface AtomicPublishResult {
 }
 
 /**
+ * Options for `EventBus.publish`: per-message publish-time controls.
+ */
+export interface PublishOptions {
+  /**
+   * Compaction key for the durable log's keyed compaction (requires
+   * `EventBusOptions.durableLogKeyCompaction`, Kafka-style): only the
+   * latest record per (topic, key) is retained and replayed — publishing a
+   * new message with an existing key supersedes the old value. Use it for
+   * state snapshots (latest price per symbol, latest config per service)
+   * rather than event streams. Keyless messages are ordinary log entries.
+   *
+   * Must be a non-empty string when provided; anything else throws
+   * `RangeError` from `publish`. The key is recorded on the durable-log
+   * record regardless, but without `durableLogKeyCompaction` it has no
+   * behavioral effect.
+   */
+  key?: string;
+}
+
+/**
+ * One message in a `publishBatch` / `publishAtomic` batch: topic and
+ * payload, with the bus assigning `seq` at fan-out. `key` opts the message
+ * into durable-log keyed compaction (see `PublishOptions.key`).
+ */
+export type BatchMessage = Omit<BusMessage, 'seq'> & { key?: string };
+
+/**
  * When a `publishDelayed` message becomes due. Exactly one of the two
  * fields must be set; passing both or neither throws `RangeError`.
  */
@@ -1021,6 +1071,14 @@ export interface PublishDelayedOptions {
    * out on the next flush. Must be finite.
    */
   deliverAt?: number;
+  /**
+   * Compaction key for the durable log's keyed compaction (see
+   * `PublishOptions.key`): persisted on the schedule record so a restart
+   * rebuilds the timer with the key intact, and recorded on the delivery
+   * record when the message fans out. Must be a non-empty string when
+   * provided; anything else throws `RangeError`.
+   */
+  key?: string;
 }
 
 /**
@@ -1042,6 +1100,12 @@ interface DelayedFanOut {
    * and fan-out does not retroactively expire the message.
    */
   expiresAt?: number;
+  /**
+   * Compaction key carried from the delayed schedule into its fan-out
+   * (see `PublishDelayedOptions.key`): stamped onto the delivery's
+   * durable-log record.
+   */
+  key?: string;
 }
 
 /**
@@ -1345,6 +1409,7 @@ export class EventBus {
       this.durableLog = DurableTopicLog.open({
         dir: options.durableLogDir,
         maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
+        keyCompaction: options.durableLogKeyCompaction,
       });
       // Recover numbering continuity: the next publish on a logged topic
       // continues the on-disk sequence, and stats reflect the recovered
@@ -2215,9 +2280,13 @@ export class EventBus {
    * microtask so slow consumers exert real backpressure. A publish rejected
    * by a schema validator (see `setTopicSchema`) is never fanned out and
    * returns 0.
+   *
+   * `opts.key` opts the message into durable-log keyed compaction (see
+   * `PublishOptions.key`).
    */
-  publish(topic: string, payload: unknown): number {
-    const { accepted } = this.fanOut(topic, payload);
+  publish(topic: string, payload: unknown, opts?: PublishOptions): number {
+    validateMessageKey(opts?.key, 'publish');
+    const { accepted } = this.fanOut(topic, payload, false, undefined, opts?.key);
     this.scheduleFlush();
     return accepted;
   }
@@ -2232,12 +2301,16 @@ export class EventBus {
    *
    * Callers do not supply `seq`: the bus assigns each message its per-topic
    * sequence number at fan-out time, in batch order.
+   *
+   * Each entry may carry a `key` opting it into durable-log keyed
+   * compaction (see `BatchMessage`).
    */
-  publishBatch(messages: Array<Omit<BusMessage, 'seq'>>): number {
+  publishBatch(messages: Array<BatchMessage>): number {
     if (messages.length === 0) return 0;
+    for (const msg of messages) validateMessageKey(msg.key, 'publishBatch');
     let accepted = 0;
     for (const msg of messages) {
-      accepted += this.fanOut(msg.topic, msg.payload).accepted;
+      accepted += this.fanOut(msg.topic, msg.payload, false, undefined, msg.key).accepted;
     }
     this.scheduleFlush();
     return accepted;
@@ -2280,8 +2353,11 @@ export class EventBus {
    * entry, and the commit phase skips re-validation. An empty batch is a
    * no-op returning `{ published: 0 }` without scheduling a flush.
    */
-  publishAtomic(entries: Array<Omit<BusMessage, 'seq'>>): AtomicPublishResult {
+  publishAtomic(entries: Array<BatchMessage>): AtomicPublishResult {
     if (entries.length === 0) return { published: 0 };
+    // Key validation first: a throw must leave zero state behind, and
+    // validation mutates nothing.
+    for (const entry of entries) validateMessageKey(entry.key, 'publishAtomic');
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
     for (let index = 0; index < entries.length; index++) {
@@ -2291,7 +2367,7 @@ export class EventBus {
     }
     // Phase 2: everything was admitted — commit through the normal
     // publish path in one synchronous turn, then flush once.
-    for (const { topic, payload } of entries) this.fanOut(topic, payload, true);
+    for (const { topic, payload, key } of entries) this.fanOut(topic, payload, true, undefined, key);
     this.scheduleFlush();
     return { published: entries.length };
   }
@@ -2410,12 +2486,15 @@ export class EventBus {
     }
     const ttlMs = this.ttlForTopic(topic);
     const expiresAt = ttlMs === undefined ? undefined : nowMs + ttlMs;
+    validateMessageKey(opts.key, 'publishDelayed');
     const id = `delayed-${++this.nextDelayedId}`;
-    const entry: DelayedEntry = { id, topic, payload, deliverAt, expiresAt, cancelled: false };
+    const entry: DelayedEntry = { id, topic, payload, deliverAt, expiresAt, cancelled: false, key: opts.key };
     // Persist the schedule before it is visible anywhere: a crash between
     // here and the due time must still deliver the message after restart.
     // The schedule record carries no sequence number and burns no
     // rate-limit budget — those happen at fan-out, via the normal path.
+    // It does carry the compaction key, so a restart rebuilds the timer
+    // with the key intact.
     if (this.durableLog != null) {
       const persisted = this.durableLog.append({
         seq: 0,
@@ -2424,6 +2503,7 @@ export class EventBus {
         deliverAt,
         expiresAt,
         delayId: id,
+        key: opts.key,
         payload,
       });
       if (!persisted) {
@@ -2512,6 +2592,7 @@ export class EventBus {
         delayId: top.id,
         deliverAt: top.deliverAt,
         expiresAt: top.expiresAt,
+        key: top.key,
       });
       this.appendDelayTombstone(top.id, top.topic);
       fannedOut = true;
@@ -2581,7 +2662,7 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const nowMs = this.now();
-    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown }>();
+    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string }>();
     const closed = new Set<string>();
     // `readSince(topic, -1)`: the exclusive bound sits below every real
     // seq, so seq-0 schedule records and tombstones come along too.
@@ -2600,6 +2681,7 @@ export class EventBus {
             deliverAt: rec.deliverAt as number,
             expiresAt: rec.expiresAt,
             payload: rec.payload,
+            key: rec.key,
           });
         }
       }
@@ -2618,6 +2700,7 @@ export class EventBus {
         deliverAt: rec.deliverAt,
         expiresAt: rec.expiresAt,
         cancelled: false,
+        key: rec.key,
       };
       this.delayedById.set(delayId, entry);
       this.delayHeap.push(entry);
@@ -2760,12 +2843,17 @@ export class EventBus {
    * time (a rule added in between does not retroactively expire the
    * message), and the durable-log record carries `deliverAt`/`delayId` so
    * restart recovery can tell it apart from a still-pending schedule.
+   *
+   * `key` is the durable-log compaction key for direct publishes (see
+   * `PublishOptions.key`); delayed messages carry theirs on `delayed`
+   * instead. The key is stamped onto the delivery's durable-log record.
    */
   private fanOut(
     topic: string,
     payload: unknown,
     preAdmitted = false,
     delayed?: DelayedFanOut,
+    key?: string,
   ): { matched: number; accepted: number } {
     // Publish-side schema validation runs before admission: a rejected
     // payload never becomes a message — no sequence number is consumed
@@ -2848,7 +2936,10 @@ export class EventBus {
     // A delayed delivery's record additionally carries its schedule
     // identity (`deliverAt`/`delayId`): restart recovery tells a fulfilled
     // schedule (delivery record present) from a still-pending one
-    // (schedule record only).
+    // (schedule record only). A compaction `key` — from the direct publish
+    // options or carried over from the delayed schedule — rides on the
+    // delivery record.
+    const recordKey = key ?? delayed?.key;
     this.durableLog?.append({
       seq: msg.seq,
       topic,
@@ -2856,6 +2947,7 @@ export class EventBus {
       expiresAt,
       payload: msg.payload,
       ...(delayed == null ? {} : { deliverAt: delayed.deliverAt, delayId: delayed.delayId }),
+      ...(recordKey === undefined ? {} : { key: recordKey }),
     });
     // The prefix index prunes the regex tests down to subscribers whose
     // pattern's literal prefix can plausibly match the topic; the compiled

@@ -28,6 +28,11 @@ export interface DelayedEntry {
   expiresAt?: number;
   /** Set by `cancelDelayed`; the heap skips marked entries lazily. */
   cancelled: boolean;
+  /**
+   * Compaction key (see `PublishDelayedOptions.key`): carried on the
+   * schedule record and stamped onto the delivery record at fan-out.
+   */
+  key?: string;
 }
 
 interface HeapNode {

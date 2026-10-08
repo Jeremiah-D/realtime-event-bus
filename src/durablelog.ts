@@ -39,6 +39,16 @@ export interface DurableLogRecord {
    * while delayed, or shed at fan-out) and must not be rebuilt on restart.
    */
   cancelled?: boolean;
+  /**
+   * Compaction key for keyed log compaction (see
+   * `DurableLogOptions.keyCompaction`): records sharing a (topic, key)
+   * keep only the latest — Kafka-style log compaction for state snapshots
+   * (latest price per symbol, latest config per service). Keyless records
+   * are ordinary log entries. A keyed delayed-delivery schedule record
+   * (seq 0) carries the key of the message it will become; the timer
+   * intent itself is never compacted away.
+   */
+  key?: string;
   /** The published payload, JSON-serialized. */
   payload: unknown;
 }
@@ -56,6 +66,17 @@ export interface DurableLogOptions {
    * without bound. Must be a positive integer. Default 10000.
    */
   maxEntriesPerTopic?: number;
+  /**
+   * Opt-in Kafka-style keyed compaction: when a published message carries
+   * a `key` (see `DurableLogRecord.key`), only the latest record per
+   * (topic, key) is retained and replayed — older values for the same key
+   * are superseded. Compaction rewrites the file keeping the latest record
+   * per key plus the newest `maxEntriesPerTopic` keyless messages;
+   * `readSince` never resurrects a superseded value, and restart recovery
+   * rebuilds the key index from disk. Keyless topics behave exactly as
+   * before. Default false.
+   */
+  keyCompaction?: boolean;
 }
 
 /** On-disk envelope for one log line. `v` pins the format for future readers. */
@@ -68,6 +89,7 @@ interface LogLine {
   deliverAt?: number;
   delayId?: string;
   cancelled?: boolean;
+  key?: string;
   payload: unknown;
 }
 
@@ -86,6 +108,13 @@ interface LogLine {
  * pending timers. Schedule records are timer intents, not messages: they
  * never move the sequence counters and `readSince` never returns them.
  *
+ * Keyed compaction (`DurableLogOptions.keyCompaction`) is Kafka-style log
+ * compaction for state snapshots: a published message may carry a `key`,
+ * and the log then retains only the latest record per (topic, key).
+ * Superseded records linger on disk until the next compaction pass — reads
+ * (`readSince`) and restart recovery dedupe them in memory, so a
+ * superseded value is never replayed even before the file is rewritten.
+ *
  * Durability note: appends are synchronous (`appendFileSync`), so a record
  * is handed to the OS before `append` returns. A power loss can still lose
  * whatever the OS had not flushed to disk — this is crash recovery for
@@ -102,6 +131,7 @@ interface LogLine {
 export class DurableTopicLog {
   private readonly logDir: string;
   private readonly maxEntriesPerTopic: number;
+  private readonly keyCompaction: boolean;
   /** Topics known to the log (recovered from disk + appended since open). */
   private readonly topicsSeen = new Set<string>();
   /** Entry counts per topic, used for compaction and stats. */
@@ -115,12 +145,27 @@ export class DurableTopicLog {
   private readonly messageCounts = new Map<string, number>();
   /** Highest seq observed per topic (recovered + appended). */
   private readonly lastSeqs = new Map<string, number>();
+  /**
+   * Latest message seq per (topic, key), rebuilt on recovery and
+   * maintained on append — the in-memory side of keyed compaction. Only
+   * populated when `keyCompaction` is on; seq-0 schedule records never
+   * enter it (they are timer intents, not messages).
+   */
+  private readonly keyIndex = new Map<string, Map<string, number>>();
+  /**
+   * Per-topic count of keyed records superseded by a newer record for the
+   * same key and still sitting in the file. Drives the compaction trigger
+   * for keyed topics: waiting for the 2x entry-count trigger would let a
+   * hot single key bloat the file with dead records.
+   */
+  private readonly supersededCounts = new Map<string, number>();
   /** Lines that failed to parse during recovery/reads. Skipped, never fatal. */
   private corruptLines = 0;
 
-  private constructor(dir: string, maxEntriesPerTopic: number) {
+  private constructor(dir: string, maxEntriesPerTopic: number, keyCompaction: boolean) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
+    this.keyCompaction = keyCompaction;
     mkdirSync(dir, { recursive: true });
     this.recover();
   }
@@ -138,7 +183,7 @@ export class DurableTopicLog {
     if (!Number.isInteger(maxEntriesPerTopic) || maxEntriesPerTopic < 1) {
       throw new RangeError('durableLogMaxEntriesPerTopic must be a positive integer');
     }
-    return new DurableTopicLog(dir, maxEntriesPerTopic);
+    return new DurableTopicLog(dir, maxEntriesPerTopic, options.keyCompaction ?? false);
   }
 
   /** The log directory, as configured. */
@@ -184,6 +229,7 @@ export class DurableTopicLog {
       }
       this.lastSeqs.set(topic, last);
       this.messageCounts.set(topic, messages);
+      if (this.keyCompaction) this.rebuildKeyIndex(topic, records);
     }
   }
 
@@ -238,10 +284,31 @@ export class DurableTopicLog {
     if (record.seq > (this.lastSeqs.get(record.topic) ?? 0)) {
       this.lastSeqs.set(record.topic, record.seq);
     }
+    if (this.keyCompaction && record.key !== undefined && record.seq >= 1) {
+      let keys = this.keyIndex.get(record.topic);
+      if (keys == null) {
+        keys = new Map();
+        this.keyIndex.set(record.topic, keys);
+      }
+      if (keys.has(record.key)) {
+        // The previous record for this key is now dead weight in the
+        // file — it stays on disk until compaction, but reads and
+        // recovery already ignore it.
+        this.supersededCounts.set(
+          record.topic,
+          (this.supersededCounts.get(record.topic) ?? 0) + 1,
+        );
+      }
+      keys.set(record.key, record.seq);
+    }
     // Amortized compaction: only rewrite when the file has grown to twice
     // the budget, keeping the newest `maxEntriesPerTopic` entries, so a
     // steady stream of appends does not pay a rewrite on every message.
-    if (count > this.maxEntriesPerTopic * 2) {
+    // With keyed compaction a hot single key would otherwise bloat the
+    // file with superseded records long before the 2x trigger, so a full
+    // budget's worth of dead keyed records compacts too.
+    const superseded = this.supersededCounts.get(record.topic) ?? 0;
+    if (count > this.maxEntriesPerTopic * 2 || (this.keyCompaction && superseded >= this.maxEntriesPerTopic)) {
       this.compact(record.topic);
     }
     return true;
@@ -250,7 +317,7 @@ export class DurableTopicLog {
   /** Rewrites a topic's file keeping only the newest entries. */
   private compact(topic: string): void {
     const records = this.readFileRecords(topic);
-    const kept = records.slice(-this.maxEntriesPerTopic);
+    const kept = this.keyCompaction ? compactKeyed(records, this.maxEntriesPerTopic) : records.slice(-this.maxEntriesPerTopic);
     const text = kept.map((rec) => `${JSON.stringify(logLineOf(rec))}\n`).join('');
     try {
       writeFileSync(this.fileFor(topic), text, 'utf8');
@@ -259,15 +326,53 @@ export class DurableTopicLog {
     }
     this.entryCounts.set(topic, kept.length);
     this.messageCounts.set(topic, kept.filter((rec) => rec.seq >= 1).length);
+    if (this.keyCompaction) this.rebuildKeyIndex(topic, kept);
+  }
+
+  /**
+   * Rebuilds the key index and superseded count for a topic from its
+   * records (recovery and post-compaction). Only message records (seq >= 1)
+   * participate: seq-0 schedule records are timer intents, and tombstones
+   * carry no key. Records are in file order, so the last write per key
+   * wins — the same "latest per key" rule `readSince` applies.
+   */
+  private rebuildKeyIndex(topic: string, records: DurableLogRecord[]): void {
+    const keys = new Map<string, number>();
+    let keyed = 0;
+    for (const rec of records) {
+      if (rec.key === undefined || rec.seq < 1) continue;
+      keyed += 1;
+      keys.set(rec.key, rec.seq);
+    }
+    if (keys.size > 0) this.keyIndex.set(topic, keys);
+    else this.keyIndex.delete(topic);
+    // By construction a freshly compacted file has no superseded records;
+    // after recovery this counts the dead weight already on disk.
+    this.supersededCounts.set(topic, keyed - keys.size);
   }
 
   /**
    * Every logged record for `topic` with `seq` strictly greater than
    * `fromSeqExclusive`, in ascending seq order. Used to refill a
    * resubscribing consumer's queue from where it left off.
+   *
+   * With keyed compaction on, only the latest record per key is returned:
+   * a superseded value is never replayed, even before compaction rewrites
+   * the file. Keyless records pass through untouched, and seq-0 schedule
+   * records (timer intents, requested via a negative bound by delayed-
+   * delivery recovery) are never deduped.
    */
   readSince(topic: string, fromSeqExclusive: number): DurableLogRecord[] {
-    return this.readFileRecords(topic).filter((rec) => rec.seq > fromSeqExclusive);
+    const records = this.readFileRecords(topic).filter((rec) => rec.seq > fromSeqExclusive);
+    if (!this.keyCompaction) return records;
+    const latestByKey = new Map<string, DurableLogRecord>();
+    for (const rec of records) {
+      // Records arrive in file (ascending seq) order, so the last write
+      // per key wins.
+      if (rec.key !== undefined && rec.seq >= 1) latestByKey.set(rec.key, rec);
+    }
+    if (latestByKey.size === 0) return records;
+    return records.filter((rec) => rec.key === undefined || rec.seq < 1 || latestByKey.get(rec.key) === rec);
   }
 
   /** Topics with at least one log file, in first-seen order. */
@@ -295,11 +400,43 @@ export class DurableTopicLog {
   }
 
   /** Point-in-time log stats. */
-  stats(): { topics: number; entries: number; corruptLines: number } {
+  stats(): { topics: number; entries: number; corruptLines: number; keyCompaction: boolean } {
     let entries = 0;
     for (const count of this.entryCounts.values()) entries += count;
-    return { topics: this.topicsSeen.size, entries, corruptLines: this.corruptLines };
+    return { topics: this.topicsSeen.size, entries, corruptLines: this.corruptLines, keyCompaction: this.keyCompaction };
   }
+}
+
+/**
+ * Keyed compaction rewrite: keeps the latest record per key, the newest
+ * `maxEntries` keyless messages, and every seq-0 delayed-delivery schedule
+ * record / tombstone (timer intents are never compacted away — dropping a
+ * pending schedule would lose its timer on restart). Keyed survivors are
+ * not capped by `maxEntries`: like Kafka, the key space itself bounds the
+ * retained set. Relative order of the survivors is preserved.
+ */
+function compactKeyed(records: DurableLogRecord[], maxEntries: number): DurableLogRecord[] {
+  const keep = new Set<DurableLogRecord>();
+  const seenKeys = new Set<string>();
+  let keylessKept = 0;
+  // Newest-first: the first record seen for a key is its survivor.
+  for (const rec of [...records].reverse()) {
+    if (rec.seq === 0) {
+      keep.add(rec);
+      continue;
+    }
+    if (rec.key !== undefined) {
+      if (seenKeys.has(rec.key)) continue;
+      seenKeys.add(rec.key);
+      keep.add(rec);
+      continue;
+    }
+    if (keylessKept < maxEntries) {
+      keylessKept += 1;
+      keep.add(rec);
+    }
+  }
+  return records.filter((rec) => keep.has(rec));
 }
 
 /** Builds the on-disk envelope for a record. */
@@ -309,6 +446,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.deliverAt !== undefined) line.deliverAt = record.deliverAt;
   if (record.delayId !== undefined) line.delayId = record.delayId;
   if (record.cancelled !== undefined) line.cancelled = record.cancelled;
+  if (record.key !== undefined) line.key = record.key;
   return line;
 }
 
@@ -322,6 +460,9 @@ function logLineOf(record: DurableLogRecord): LogLine {
  * carry a non-empty `delayId`, and — unless they are a `cancelled`
  * tombstone — a finite `deliverAt`. A tombstone (`cancelled: true`) is only
  * valid with `seq` 0.
+ *
+ * A `key`, when present, must be a non-empty string; anything else makes
+ * the line corrupt.
  */
 function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | null {
   let parsed: unknown;
@@ -365,6 +506,10 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     // real message and rejected there.
     if (o['cancelled'] !== true || !isScheduleRecord) return null;
     record.cancelled = true;
+  }
+  if (o['key'] !== undefined) {
+    if (typeof o['key'] !== 'string' || (o['key'] as string).length === 0) return null;
+    record.key = o['key'] as string;
   }
   // A non-tombstone schedule record must say when it is due.
   if (isScheduleRecord && record.cancelled !== true && record.deliverAt === undefined) return null;
