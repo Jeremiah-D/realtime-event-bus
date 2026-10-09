@@ -45,6 +45,14 @@ export interface DelayedEntry {
    * the fan-out (see `PublishOptions.traceparent`).
    */
   traceparent?: string;
+  /**
+   * Application-level message identity carried from
+   * `PublishDelayedOptions` into the fan-out (see
+   * `PublishOptions.messageId`): stamped onto the envelope when the
+   * schedule fans out, so subscriber-side dedup recognizes the delayed
+   * message like any live publish.
+   */
+  messageId?: string;
 }
 
 interface HeapNode {

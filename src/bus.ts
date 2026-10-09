@@ -79,6 +79,16 @@ export interface BusMessage {
    * counting a phantom gap across the local/cluster sequence spaces.
    */
   epoch?: string;
+  /**
+   * Application-level message identity, set when the publish carried one
+   * (`PublishOptions.messageId`, always set by `publishIdempotent` when
+   * its `messageId` is present). It rides the envelope end to end —
+   * durable log, replay, cluster forwarding, redeliveries — so
+   * subscriber-side dedup (`SubscribeOptions.deduplicateMessages`) can
+   * recognize the same logical message across replays and redeliveries.
+   * Absent for plain publishes without an identity.
+   */
+  messageId?: string;
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
@@ -101,6 +111,39 @@ export type BatchMessageHandler = (messages: BusMessage[]) => void;
  * exactly like a throwing schema validator.
  */
 export type MessageFilter = (payload: unknown, topic: string) => boolean;
+
+/**
+ * Tuning for subscriber-side exactly-once dedup
+ * (`SubscribeOptions.deduplicateMessages`). Bounds are validated at
+ * `subscribe` time; violations throw `RangeError`.
+ */
+export interface DeduplicateMessagesOptions {
+  /**
+   * How long a delivered `messageId` stays in the window, in
+   * milliseconds on the bus clock (`EventBusOptions.now`). A re-arrival
+   * of the same `(topic, messageId)` at or after `windowMs` is "unknown"
+   * — delivered again, no guarantee. Must be a positive finite number.
+   * Defaults to the bus's publish-side idempotency window
+   * (`EventBusOptions.idempotencyWindowMs`, 60s), so the subscribe-side
+   * horizon matches the publisher's retry horizon unless tuned.
+   */
+  windowMs?: number;
+  /**
+   * Maximum `(topic, messageId)` entries held per subscriber; the
+   * oldest entry is evicted when full. Must be a positive integer.
+   * Default 10000.
+   */
+  maxEntries?: number;
+  /**
+   * Stable consumer identity for the durable dedup window. When set,
+   * every recorded `messageId` is journaled to the durable log
+   * directory and rehydrated on subscribe, so a restarted bus does not
+   * double-deliver on resume. Requires `EventBusOptions.durableLogDir`
+   * — passing it without one throws `RangeError`. Must be a non-empty
+   * string when provided. Omit it for a memory-only window.
+   */
+  consumerId?: string;
+}
 
 /**
  * Handler for reliable (at-least-once) subscriptions: receives a `Delivery`
@@ -396,6 +439,45 @@ export interface SubscribeOptions {
    * from `subscribe`. Disabled by default.
    */
   filter?: MessageFilter;
+  /**
+   * Opt-in subscriber-side exactly-once dedup window. When enabled, the
+   * bus remembers the `messageId` of every message that entered this
+   * subscriber's queue within `windowMs`, and suppresses any later
+   * arrival of the same `(topic, messageId)` — across durable-log
+   * replays, ack-timeout/nack redeliveries, and health-probe requeues —
+   * so the handler sees each logical message at most once per window.
+   * Suppressed duplicates never reach the queue (no backpressure budget,
+   * no throttle token, no sequence gap — the original delivery already
+   * advanced the baseline) and are counted in
+   * `getStats().dedupDropped`.
+   *
+   * Only messages carrying a `messageId` (`PublishOptions.messageId`,
+   * always set by `publishIdempotent`) participate: plain publishes
+   * without an identity are unaffected. A message whose `messageId`
+   * aged out of the window is "unknown" again — the bus no longer
+   * guarantees anything about it, and a re-arrival is delivered.
+   *
+   * Composes with at-least-once (`subscribeReliable`): within the
+   * window, dedup wins — a redelivery is suppressed instead of
+   * requeued, so combine with `deadLetter` only for the first-delivery
+   * poison path (a message whose first delivery already poisoned the
+   * handler still dead-letters on redelivery-budget exhaustion when
+   * dedup is off). An operator's `replayDeadLetter` is a deliberate
+   * fresh chance and bypasses the window.
+   *
+   * Durability: pass a stable `consumerId` and run the bus with a
+   * durable log (`EventBusOptions.durableLogDir`) to persist the window
+   * — a restarted bus rehydrates it, so a crash between delivery and
+   * processing cannot double-deliver on resume. Without `consumerId`
+   * the window is memory-only and a restart starts it empty. Sharing
+   * one `consumerId` between two live subscribers is unsupported: each
+   * hydrates its own copy of the persisted window and they diverge.
+   *
+   * Pass `true` for the defaults, or a `DeduplicateMessagesOptions`
+   * object to tune the window. Invalid values throw `RangeError` from
+   * `subscribe`. Disabled by default.
+   */
+  deduplicateMessages?: boolean | DeduplicateMessagesOptions;
   /**
    * Opt-in subscriber-side batch delivery. When enabled, the drain
    * collects up to `maxSize` queued messages and invokes the handler once
@@ -1105,6 +1187,15 @@ export interface TopicStats {
    */
   filteredMessages: number;
   /**
+   * Messages on this topic suppressed by subscriber-side exactly-once
+   * dedup (see `SubscribeOptions.deduplicateMessages`): the same
+   * `(topic, messageId)` arrived again within a subscriber's dedup
+   * window — via replay or redelivery — after the original delivery, so
+   * it never entered the queue again. Counts each suppressed queue
+   * entry once, like `filteredMessages`.
+   */
+  dedupDropped: number;
+  /**
    * Publishes to this topic rejected because its migration alias expired
    * (see `EventBus.setTopicAlias`): the old topic is read-only, so the
    * publish was refused before admission — no sequence number consumed
@@ -1235,6 +1326,12 @@ export interface BusStats {
    * for the exact counting rules.
    */
   duplicateMessages: number;
+  /**
+   * Total messages suppressed by subscriber-side exactly-once dedup —
+   * the sum of every topic's `dedupDropped`. See
+   * `TopicStats.dedupDropped` for the exact counting rules.
+   */
+  dedupDropped: number;
   /**
    * Total publishes rejected because the target topic's migration alias
    * expired (the old topic is read-only) — the sum of every topic's
@@ -1622,6 +1719,28 @@ interface Subscriber {
    * batching is disabled for this subscriber.
    */
   batch?: BatchDeliveryState;
+  /**
+   * Subscriber-side exactly-once dedup window (see
+   * `SubscribeOptions.deduplicateMessages`). Absent when dedup is
+   * disabled for this subscriber.
+   */
+  dedup?: SubscriberDedupState;
+}
+
+/**
+ * Per-subscriber exactly-once dedup window (see
+ * `SubscribeOptions.deduplicateMessages`). `table` maps
+ * `${topic}\0${messageId}` to the bus-clock timestamp of the first
+ * delivery into this subscriber's queue; entries expire after
+ * `windowMs`, and the table is bounded by `maxEntries` (oldest
+ * evicted). `consumerId`, when set, journals every recorded entry to
+ * the durable log so a restarted bus rehydrates the window.
+ */
+interface SubscriberDedupState {
+  table: Map<string, number>;
+  windowMs: number;
+  maxEntries: number;
+  consumerId?: string;
 }
 
 /**
@@ -1702,6 +1821,7 @@ function zeroedTopicStats(): {
   rejectedMessages: number;
   duplicateMessages: number;
   filteredMessages: number;
+  dedupDropped: number;
   aliasRetiredMessages: number;
   compressedMessages: number;
   compressedBytesBefore: number;
@@ -1718,6 +1838,7 @@ function zeroedTopicStats(): {
     rejectedMessages: 0,
     duplicateMessages: 0,
     filteredMessages: 0,
+    dedupDropped: 0,
     aliasRetiredMessages: 0,
     compressedMessages: 0,
     compressedBytesBefore: 0,
@@ -2212,6 +2333,45 @@ function resolveHealthProbeOptions(
 }
 
 /**
+ * Resolves `SubscribeOptions.deduplicateMessages` into per-subscriber
+ * dedup state (see `SubscriberDedupState`). `defaultWindowMs` is the
+ * bus's publish-side idempotency window — the subscribe-side horizon
+ * matches the publisher's retry horizon unless tuned. A `consumerId`
+ * without a durable log throws: without a journal there is nothing to
+ * persist the window to, so accepting the identity would silently
+ * promise crash recovery it cannot deliver.
+ */
+function resolveDeduplicateMessagesOptions(
+  opt: boolean | DeduplicateMessagesOptions | undefined,
+  defaultWindowMs: number,
+  hasDurableLog: boolean,
+): SubscriberDedupState | undefined {
+  if (opt == null || opt === false) return undefined;
+  const o: DeduplicateMessagesOptions = opt === true ? {} : opt;
+  const windowMs = o.windowMs ?? defaultWindowMs;
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new RangeError('deduplicateMessages.windowMs must be a positive finite number of milliseconds');
+  }
+  const maxEntries = o.maxEntries ?? 10_000;
+  if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+    throw new RangeError('deduplicateMessages.maxEntries must be a positive integer');
+  }
+  const consumerId = o.consumerId;
+  if (consumerId !== undefined) {
+    if (typeof consumerId !== 'string' || consumerId.length === 0) {
+      throw new RangeError('deduplicateMessages.consumerId must be a non-empty string');
+    }
+    if (!hasDurableLog) {
+      throw new RangeError(
+        'deduplicateMessages.consumerId requires EventBusOptions.durableLogDir: ' +
+          'the dedup window is persisted to the durable log directory',
+      );
+    }
+  }
+  return { table: new Map(), windowMs, maxEntries, consumerId };
+}
+
+/**
  * Publish-side payload validator for one topic or topic pattern (see
  * `EventBus.setTopicSchema`). Return `true` to admit the publish, `false`
  * to reject it. The topic argument is the concrete topic being published
@@ -2513,6 +2673,19 @@ export interface PublishOptions {
    * Inert when tracing is disabled.
    */
   traceparent?: string;
+  /**
+   * Application-level message identity for this publish. It is stamped
+   * onto the message envelope (`BusMessage.messageId`) and carried end
+   * to end — durable log, replay, cluster forwarding, redeliveries — so
+   * subscriber-side dedup (`SubscribeOptions.deduplicateMessages`) can
+   * recognize the same logical message across replays and redeliveries.
+   * Unlike `publishIdempotent`'s `messageId` (which suppresses the
+   * publish itself when the `(topic, messageId)` pair was already
+   * admitted), this field never suppresses anything on the publish side:
+   * it only labels the message for downstream dedup. A non-string or
+   * empty value is treated as absent.
+   */
+  messageId?: string;
 }
 
 /**
@@ -2559,6 +2732,13 @@ export interface PublishDelayedOptions {
    * A non-string throws `RangeError` at schedule time.
    */
   traceparent?: string;
+  /**
+   * Application-level message identity, carried on the schedule and
+   * stamped onto the envelope when the message fans out (see
+   * `PublishOptions.messageId`). A non-string or empty value is treated
+   * as absent.
+   */
+  messageId?: string;
 }
 
 /**
@@ -2593,6 +2773,13 @@ interface DelayedFanOut {
    * the message into fan-out order and break publish-order delivery.
    */
   keySeq?: number;
+  /**
+   * Application-level message identity carried from the delayed
+   * schedule into its fan-out (see `PublishDelayedOptions.messageId`):
+   * stamped onto the envelope at fan-out, exactly as if it had been
+   * published with `PublishOptions.messageId` at that moment.
+   */
+  messageId?: string;
 }
 
 /**
@@ -2767,20 +2954,17 @@ function serializeToJson(payload: unknown): string | undefined {
 /**
  * Options for `EventBus.publishIdempotent`: `PublishOptions` plus the
  * idempotency key.
+ *
+ * The idempotency key is `PublishOptions.messageId`: the dedup identity
+ * is the pair `(topic, messageId)` — the same `messageId` on different
+ * topics is independent, so one payment id can be reused across unrelated
+ * topics without interference.
+ *
+ * Absent or empty disables dedup — the publish behaves exactly like
+ * `publish`, still returning an `IdempotentPublishResult` with
+ * `duplicate: false`. A non-string value is treated as absent.
  */
-export interface IdempotentPublishOptions extends PublishOptions {
-  /**
-   * Idempotency key for this publish. The dedup identity is the pair
-   * `(topic, messageId)`: the same `messageId` on different topics is
-   * independent, so one payment id can be reused across unrelated topics
-   * without interference.
-   *
-   * Absent or empty disables dedup — the publish behaves exactly like
-   * `publish`, still returning an `IdempotentPublishResult` with
-   * `duplicate: false`. A non-string value is treated as absent.
-   */
-  messageId?: string;
-}
+export interface IdempotentPublishOptions extends PublishOptions {}
 
 /**
  * Outcome of `EventBus.publishIdempotent`.
@@ -2850,6 +3034,7 @@ export class EventBus {
       rejectedMessages: number;
       duplicateMessages: number;
       filteredMessages: number;
+      dedupDropped: number;
       aliasRetiredMessages: number;
       compressedMessages: number;
       compressedBytesBefore: number;
@@ -3065,6 +3250,14 @@ export class EventBus {
    * budget consumed, no sequence gap reported.
    */
   private totalFiltered = 0;
+  /**
+   * Total messages suppressed by subscriber-side exactly-once dedup
+   * (global total, see `SubscribeOptions.deduplicateMessages`). A
+   * suppressed duplicate was already delivered once — it never re-enters
+   * the subscriber's queue, consumes no backpressure budget, and is
+   * invisible to sequence-gap detection.
+   */
+  private totalDedupDropped = 0;
   /**
    * Total messages moved into subscriber dead-letter queues (see
    * `ReliableSubscribeOptions.deadLetter`). Counts every dead-lettering,
@@ -3289,6 +3482,7 @@ export class EventBus {
           duplicateMessages: 0,
           aliasRetiredMessages: 0,
           filteredMessages: 0,
+          dedupDropped: 0,
           compressedMessages: 0,
           compressedBytesBefore: 0,
           compressedBytesAfter: 0,
@@ -4057,6 +4251,13 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const dedup = resolveDeduplicateMessagesOptions(
+      opts?.deduplicateMessages,
+      this.idempotencyWindowMs,
+      this.durableLog != null,
+    );
     const onDegraded = opts?.onDegraded;
     const filter = opts?.filter;
     if (filter !== undefined && typeof filter !== 'function') {
@@ -4127,8 +4328,27 @@ export class EventBus {
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
       filter,
+      dedup,
     };
     this.subscribers.set(id, subscriber);
+    // Durable dedup window: rehydrate the subscriber's window from the
+    // journal before any replay runs, so a resumed consumer does not
+    // double-deliver messages it already saw before the restart. Entries
+    // that aged out of the window are "unknown" — dropped here, never
+    // rehydrated.
+    if (dedup?.consumerId !== undefined && this.durableLog != null) {
+      const nowMs = this.now();
+      for (const entry of this.durableLog.dedupWindowFor(dedup.consumerId)) {
+        if (nowMs - entry.at < dedup.windowMs) {
+          dedup.table.set(`${entry.topic}\0${entry.messageId}`, entry.at);
+        }
+      }
+      while (dedup.table.size > dedup.maxEntries) {
+        const oldest = dedup.table.keys().next();
+        if (oldest.done) break;
+        dedup.table.delete(oldest.value);
+      }
+    }
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
     // File the subscriber in the publish-side prefix index under its
     // pattern's literal prefix (see `patternPrefixKey`).
@@ -5098,7 +5318,17 @@ export class EventBus {
         return false;
       }
     }
-    const msg: BusMessage = { topic: frame.topic, payload, seq: frame.seq, epoch };
+    const msg: BusMessage = {
+      topic: frame.topic,
+      payload,
+      seq: frame.seq,
+      epoch,
+      // The hub validated the identity's shape; a remote message without
+      // one simply has no identity, like a local plain publish.
+      ...(typeof frame.messageId === 'string' && frame.messageId.length > 0
+        ? { messageId: frame.messageId }
+        : {}),
+    };
     if (frame.expiresAt !== undefined) this.messageDeadlines.set(msg, frame.expiresAt);
     if (frame.compressed === true) {
       // Re-register for transparent inflation at delivery, exactly like a
@@ -5444,7 +5674,17 @@ export class EventBus {
         }
         continue;
       }
-      const msg: BusMessage = { topic: rec.topic, payload: rec.payload, seq: rec.seq };
+      const msg: BusMessage = {
+        topic: rec.topic,
+        payload: rec.payload,
+        seq: rec.seq,
+        // Restores the message identity logged at publish time, so a
+        // resumed dedup window recognizes replays of already-delivered
+        // messages (see `SubscribeOptions.deduplicateMessages`).
+        ...(typeof rec.messageId === 'string' && rec.messageId.length > 0
+          ? { messageId: rec.messageId }
+          : {}),
+      };
       // The log stores the wire payload: a record written while a
       // compression rule was active carries the deflated envelope, so
       // re-register it for transparent inflation at delivery — exactly
@@ -5497,6 +5737,7 @@ export class EventBus {
       opts?.key,
       undefined,
       opts?.traceparent,
+      opts?.messageId,
     );
     this.scheduleFlush();
     return accepted;
@@ -5577,6 +5818,7 @@ export class EventBus {
         opts?.key,
         undefined,
         opts?.traceparent,
+        opts?.messageId,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -5607,6 +5849,7 @@ export class EventBus {
       opts?.key,
       undefined,
       opts?.traceparent,
+      messageId,
     );
     this.scheduleFlush();
     if (admitted) {
@@ -5655,6 +5898,7 @@ export class EventBus {
         msg.key,
         undefined,
         msg.traceparent,
+        msg.messageId,
       ).accepted;
     }
     this.scheduleFlush();
@@ -5758,7 +6002,7 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { payload, key, traceparent } = entries[index];
+      const { payload, key, traceparent, messageId } = entries[index];
       this.fanOut(
         resolvedTopics[index],
         payload,
@@ -5767,6 +6011,7 @@ export class EventBus {
         key,
         keySeqs[index],
         traceparent,
+        messageId,
       );
     }
     this.scheduleFlush();
@@ -5932,6 +6177,9 @@ export class EventBus {
       key,
       keySeq,
       traceparent: opts.traceparent,
+      // Normalized at fan-out (see `fanOut`); stored raw on the schedule
+      // so the record round-trips byte-identically.
+      messageId: opts.messageId,
     };
     // Persist the schedule before it is visible anywhere: a crash between
     // here and the due time must still deliver the message after restart.
@@ -5950,6 +6198,11 @@ export class EventBus {
         key,
         keySeq,
         payload,
+        // The identity rides the schedule record so a restart rebuilds
+        // the timer with it intact (see `DelayedEntry.messageId`).
+        ...(typeof opts.messageId === 'string' && opts.messageId.length > 0
+          ? { messageId: opts.messageId }
+          : {}),
       });
       if (!persisted) {
         // The schedule died before it existed: its keySeq will never fan
@@ -6075,10 +6328,12 @@ export class EventBus {
           expiresAt: top.expiresAt,
           key: top.key,
           keySeq: top.keySeq,
+          messageId: top.messageId,
         },
         undefined,
         undefined,
         top.traceparent,
+        top.messageId,
       );
       this.appendDelayTombstone(top.id, top.topic);
       fannedOut = true;
@@ -6192,6 +6447,7 @@ export class EventBus {
         // key cursors were reseeded from the log, so this entry fans out
         // with its original number — never renumbered, never colliding.
         keySeq: rec.keySeq,
+        messageId: rec.messageId,
       };
       this.delayedById.set(delayId, entry);
       this.delayHeap.push(entry);
@@ -6366,11 +6622,79 @@ export class EventBus {
    * is accepted while an older entry is shed, so the return value alone
    * misses those evictions.
    */
+  /**
+   * Subscriber-side exactly-once dedup (see
+   * `SubscribeOptions.deduplicateMessages`). Returns `true` when the
+   * message was suppressed as a within-window duplicate — the caller
+   * must not queue it. Otherwise records the `(topic, messageId)` in
+   * the subscriber's window (journaling it when the subscriber has a
+   * durable `consumerId`) and returns `false`.
+   *
+   * Only messages carrying a `messageId` participate; everything else
+   * passes through untouched.
+   */
+  private checkSubscriberDedup(subscriber: Subscriber, msg: BusMessage): boolean {
+    const dedup = subscriber.dedup;
+    const messageId = msg.messageId;
+    if (dedup === undefined || typeof messageId !== 'string' || messageId.length === 0) {
+      return false;
+    }
+    const nowMs = this.now();
+    const key = `${msg.topic}\0${messageId}`;
+    // Expire old entries first: the head of the insertion-ordered table
+    // is the oldest, so the first unexpired entry ends the scan.
+    for (const [k, seenAt] of dedup.table) {
+      if (nowMs - seenAt < dedup.windowMs) break;
+      dedup.table.delete(k);
+    }
+    if (dedup.table.has(key)) {
+      // Already delivered within the window: suppress. A re-published
+      // duplicate carries a fresh sequence number, so — like a
+      // content-filtered message — the per-topic baseline advances over
+      // the deliberate skip; otherwise the subscriber would count a
+      // phantom gap for a message it chose not to receive. A requeued or
+      // replayed copy keeps the original seq, and `advanceBaseline` only
+      // moves forward, so those stay no-ops.
+      this.advanceBaseline(subscriber, msg.topic, msg.seq, msg.epoch ?? '');
+      this.statsFor(msg.topic).dedupDropped += 1;
+      this.totalDedupDropped += 1;
+      return true;
+    }
+    // Deleting before re-inserting refreshes the entry's position so the
+    // bounded eviction tracks last-delivery order.
+    dedup.table.delete(key);
+    dedup.table.set(key, nowMs);
+    while (dedup.table.size > dedup.maxEntries) {
+      const oldest = dedup.table.keys().next();
+      if (oldest.done) break;
+      dedup.table.delete(oldest.value);
+    }
+    if (dedup.consumerId !== undefined && this.durableLog != null) {
+      this.durableLog.appendDedup({
+        consumer: dedup.consumerId,
+        topic: msg.topic,
+        messageId,
+        at: nowMs,
+      });
+    }
+    return false;
+  }
+
   private enqueueMessage(
     subscriber: Subscriber,
     msg: BusMessage,
     deadline: number | undefined,
-  ): 'accepted' | 'dropped' {
+    skipDedup = false,
+  ): 'accepted' | 'dropped' | 'duplicate' {
+    // Every queue insertion funnels through here — fan-out, redeliveries,
+    // log replays, DLQ replays, and mid-drain requeues — so the dedup
+    // check here covers every path a duplicate can arrive on. Internal
+    // queue rebuilds (`requeueUndelivered`) and the operator's deliberate
+    // fresh chance (`replayDeadLetter`) bypass it via `skipDedup`: the
+    // former never re-delivers, the latter is explicit operator intent.
+    if (!skipDedup && this.checkSubscriberDedup(subscriber, msg)) {
+      return 'duplicate';
+    }
     const queue = subscriber.queue;
     const droppedBefore = queue.droppedCount;
     const result = queue.push(msg, 0, deadline);
@@ -6878,6 +7202,7 @@ export class EventBus {
     key?: string,
     preassignedKeySeq?: number,
     traceparent?: string,
+    messageId?: string,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -6924,7 +7249,17 @@ export class EventBus {
         return { matched: 0, accepted: 0, admitted: false };
       }
     }
-    const msg: BusMessage = { topic, payload, seq: this.nextSeq(topic) };
+    // The message identity rides the envelope end to end (durable log,
+    // replay, cluster forwarding, redeliveries) for subscriber-side
+    // dedup. Only non-empty strings count — anything else is absent,
+    // mirroring `publishIdempotent`'s lenient treatment.
+    const cleanMessageId = typeof messageId === 'string' && messageId.length > 0 ? messageId : undefined;
+    const msg: BusMessage = {
+      topic,
+      payload,
+      seq: this.nextSeq(topic),
+      ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+    };
     const stats = this.statsFor(topic);
     stats.publishedMessages += 1;
     stats.lastSeq = msg.seq;
@@ -7059,6 +7394,10 @@ export class EventBus {
       // Only present when a preset dictionary compressed this message:
       // replay needs the same bytes to inflate it.
       ...(compressedDictId === undefined ? {} : { dictId: compressedDictId }),
+      // The message identity is logged with the record so replay
+      // restores it onto the envelope — a resumed dedup window can only
+      // suppress what it recognizes.
+      ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
     });
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the
@@ -7081,6 +7420,7 @@ export class EventBus {
           ...(expiresAt === undefined ? {} : { expiresAt }),
           ...(this.compressedPayloads.has(msg) ? { compressed: true as const } : {}),
           ...(compressedDictId === undefined ? {} : { dictId: compressedDictId }),
+          ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
         });
       }
     }
@@ -7322,6 +7662,7 @@ export class EventBus {
       rejectedMessages: this.totalRejected,
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
+      dedupDropped: this.totalDedupDropped,
       aliasRetiredMessages: this.totalAliasRetired,
       aliases: [...this.topicAliases.entries()].map(([oldTopic, entry]) => ({
         oldTopic,
@@ -7394,6 +7735,7 @@ export class EventBus {
         duplicateMessages: stats.duplicateMessages,
         aliasRetiredMessages: stats.aliasRetiredMessages,
         filteredMessages: stats.filteredMessages,
+        dedupDropped: stats.dedupDropped,
         compressedMessages: stats.compressedMessages,
         compressedBytesBefore: stats.compressedBytesBefore,
         compressedBytesAfter: stats.compressedBytesAfter,
@@ -7514,9 +7856,11 @@ export class EventBus {
     if (idx === -1) return false;
     const [record] = dlq.entries.splice(idx, 1);
     // Fresh retry budget: the operator's replay is a new chance, not a
-    // continuation of the poison run.
+    // continuation of the poison run — and it bypasses the dedup window
+    // for the same reason: an explicit operator replay is deliberate
+    // intent, not an accidental redelivery.
     subscriber.reliable?.redeliveries.delete(record.msg);
-    this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg));
+    this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg), true);
     this.scheduleFlush();
     return true;
   }
@@ -7999,13 +8343,18 @@ export class EventBus {
   private requeueUndelivered(subscriber: Subscriber, undelivered: BusMessage[]): void {
     if (undelivered.length === 0) return;
     const queue = subscriber.queue;
+    // skipDedup: this is an internal queue rebuild, not a new delivery —
+    // the messages were already admitted (and dedup-recorded) when first
+    // enqueued; suppressing them here would silently lose them.
     if (queue.size === 0) {
-      for (const msg of undelivered) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
+      for (const msg of undelivered)
+        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true);
       return;
     }
     const rest = queue.drain();
-    for (const msg of undelivered) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
-    for (const msg of rest) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
+    for (const msg of undelivered)
+      this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true);
+    for (const msg of rest) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true);
   }
 
   /**

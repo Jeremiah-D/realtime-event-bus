@@ -601,6 +601,28 @@ library.
   message. A throwing validator propagates to the caller, always during
   admission, so a throw can never leave a half-committed batch. An empty
   batch is a no-op.
+- **Subscriber-side exactly-once dedup window** (in `src/bus.ts`, opt-in via
+  `subscribe(pattern, handler, { deduplicateMessages })`): the complement of
+  `publishIdempotent`'s publish-side dedup. Every publish may carry an
+  application-level identity (`publish(topic, payload, { messageId })` —
+  always stamped by `publishIdempotent`; also on batch/atomic/delayed
+  publishes and forwarded across the cluster), and the bus remembers each
+  `(topic, messageId)` that entered a dedup-enabled subscriber's queue for
+  `windowMs` (default: the bus's publish-side idempotency window, 60 s).
+  A re-arrival within the window — via durable-log replay, ack-timeout /
+  nack redelivery, or a republished retry — is suppressed before the queue:
+  no backpressure budget, no throttle token, and no sequence gap (the
+  baseline advances over the deliberate skip, like a content-filtered
+  message). Only identified messages participate; an identity that aged out
+  of the window is "unknown" and delivered again. Within the window, dedup
+  wins over at-least-once: redeliveries are suppressed instead of requeued
+  (an operator's `replayDeadLetter` stays a deliberate fresh chance and
+  bypasses the window). Pass a stable `consumerId` with
+  `EventBusOptions.durableLogDir` to journal the window to
+  `__dedup.jsonl` — a restarted bus rehydrates it, so crash recovery cannot
+  double-deliver on resume. Suppressions are counted in
+  `getStats().dedupDropped` (per topic and global) and exported as
+  `eventbus_dedup_dropped_messages_total`.
 - **Per-key publish-order delivery** (in `src/bus.ts`, via
   `publish(topic, payload, { key })` — also on batch/atomic/delayed/idempotent
   publishes): every keyed message carries a per-key sequence number assigned
@@ -988,6 +1010,7 @@ Exported series:
 | `eventbus_rate_limited_messages_total` | counter | `rateLimitedMessages` — per-topic rate-limit sheds |
 | `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
+| `eventbus_dedup_dropped_messages_total` | counter | `dedupDropped` — subscriber exactly-once dedup suppressions |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
 | `eventbus_keyed_reordered_messages_total` | counter | `keyedReorderedMessages` — keyed messages held in per-(subscriber, key) reorder buffers |

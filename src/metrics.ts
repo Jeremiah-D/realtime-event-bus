@@ -191,6 +191,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.filteredMessages,
   );
   counter(
+    'eventbus_dedup_dropped_messages_total',
+    'Total messages suppressed by subscriber-side exactly-once dedup windows.',
+    stats.dedupDropped,
+  );
+  counter(
     'eventbus_dead_lettered_messages_total',
     'Total reliable messages moved into subscriber dead-letter queues.',
     stats.deadLetteredMessages,

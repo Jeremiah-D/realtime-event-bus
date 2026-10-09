@@ -129,7 +129,7 @@ type HubFrame =
   | { type: 'hello'; nodeId: string; patterns: string[] }
   | { type: 'heartbeat'; nodeId: string }
   | { type: 'goodbye'; nodeId: string }
-  | { type: 'publish'; topic: string; payload: unknown; key?: string; expiresAt?: number; compressed?: boolean; dictId?: string };
+  | { type: 'publish'; topic: string; payload: unknown; key?: string; expiresAt?: number; compressed?: boolean; dictId?: string; messageId?: string };
 
 type NodeFrame =
   | { type: 'welcome'; nodeId: string; routeVersion: number; hubEpoch: string }
@@ -146,6 +146,7 @@ type NodeFrame =
       epoch: string;
       compressed?: boolean;
       dictId?: string;
+      messageId?: string;
     }
   | { type: 'error'; message: string };
 
@@ -160,6 +161,8 @@ export interface ClusterMessage {
   epoch: string;
   compressed?: boolean;
   dictId?: string;
+  /** Application-level message identity, forwarded for subscriber-side dedup. */
+  messageId?: string;
 }
 
 /** Revives `{ "__buf": "<base64>" }` markers back into Buffers. */
@@ -404,8 +407,14 @@ export class ClusterHub {
   }
 
   private handlePublish(senderId: string, frame: Extract<HubFrame, { type: 'publish' }>): void {
-    const { topic, payload, key, expiresAt, compressed, dictId } = frame;
+    const { topic, payload, key, expiresAt, compressed, dictId, messageId } = frame;
     if (typeof topic !== 'string' || topic.length === 0 || topic.length > 1024) return;
+    // The message identity is untrusted input from a member node: accept
+    // only a bounded non-empty string, never a foreign object shape.
+    const cleanMessageId =
+      typeof messageId === 'string' && messageId.length > 0 && messageId.length <= 1024
+        ? messageId
+        : undefined;
     const seq = (this.topicSeq.get(topic) ?? 0) + 1;
     this.topicSeq.set(topic, seq);
     let keySeq: number | undefined;
@@ -424,6 +433,7 @@ export class ClusterHub {
       ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(compressed === true ? { compressed: true } : {}),
       ...(dictId === undefined ? {} : { dictId }),
+      ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
     };
     const bytes = encodeFrame(out);
     for (const member of this.members.values()) {
@@ -692,6 +702,9 @@ export class ClusterLink {
             ...(msg.expiresAt === undefined ? {} : { expiresAt: msg.expiresAt }),
             ...(msg.compressed === true ? { compressed: true } : {}),
             ...(msg.dictId === undefined ? {} : { dictId: msg.dictId }),
+            ...(typeof msg.messageId === 'string' && msg.messageId.length > 0
+              ? { messageId: msg.messageId }
+              : {}),
           })
         ) {
           this.receiveDropped += 1;
@@ -785,6 +798,7 @@ export class ClusterLink {
     expiresAt?: number;
     compressed?: boolean;
     dictId?: string;
+    messageId?: string;
   }): boolean {
     const socket = this.socket;
     if (socket == null || !this.connectedFlag) {

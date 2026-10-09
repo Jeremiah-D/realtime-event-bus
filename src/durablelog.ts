@@ -13,6 +13,16 @@ export interface DurableLogRecord {
    * and never move the per-topic sequence counter.
    */
   seq: number;
+  /**
+   * Application-level message identity (see `PublishOptions.messageId`),
+   * present when the publish carried one. Replay restores it onto the
+   * envelope so a resumed subscriber-side dedup window
+   * (`SubscribeOptions.deduplicateMessages`) recognizes replays of
+   * already-delivered messages. Also carried on seq-0 delayed-delivery
+   * schedule records so a restart rebuilds the timer with the identity
+   * intact.
+   */
+  messageId?: string;
   /** Concrete topic name, as published. */
   topic: string;
   /** Publish timestamp in milliseconds (the bus clock). */
@@ -117,6 +127,11 @@ interface LogLine {
    * the bus's registry; the id is all replay needs.
    */
   dictId?: string;
+  /**
+   * Application-level message identity (see
+   * `DurableLogRecord.messageId`).
+   */
+  messageId?: string;
   payload: unknown;
 }
 
@@ -224,6 +239,89 @@ function parseOffsetLine(line: string): DurableOffsetCommit | null {
 const OFFSET_JOURNAL_NAME = '__group_offsets.jsonl';
 
 /**
+ * File name of the subscriber-dedup journal (`__dedup.jsonl`) inside the
+ * log directory. A `.jsonl` name — not `.log` — so topic-file recovery
+ * never mistakes it for a topic file, and it can never collide with a
+ * topic file either (`fileFor` always appends `.log`).
+ */
+const DEDUP_JOURNAL_NAME = '__dedup.jsonl';
+
+/**
+ * One persisted subscriber-dedup sighting: the `(consumer, topic,
+ * messageId)` window entry of
+ * `SubscribeOptions.deduplicateMessages`. `at` is the bus-clock
+ * timestamp of the first delivery into the subscriber's queue — the
+ * window's expiry is evaluated against it at rehydration time.
+ */
+export interface DedupEntry {
+  /** Stable consumer identity (`DeduplicateMessagesOptions.consumerId`). */
+  consumer: string;
+  /** Concrete topic the message was published to. */
+  topic: string;
+  /** Application-level message identity. */
+  messageId: string;
+  /** First-delivery timestamp in milliseconds (the bus clock). */
+  at: number;
+}
+
+/** On-disk envelope for one dedup-journal line. `v` pins the format. */
+interface DedupLine {
+  v: 1;
+  consumer: string;
+  topic: string;
+  messageId: string;
+  at: number;
+}
+
+/**
+ * Key for one dedup sighting: consumer, topic and messageId joined by
+ * NUL. None may contain NUL in practice (the bus only journals
+ * identities it normalized; the parser below rejects empties), so the
+ * pairing is unambiguous and reversible.
+ */
+function dedupKey(consumer: string, topic: string, messageId: string): string {
+  return `${consumer}\0${topic}\0${messageId}`;
+}
+
+/** Builds the on-disk envelope for a dedup sighting. */
+function dedupLineOf(entry: DedupEntry): DedupLine {
+  return {
+    v: 1,
+    consumer: entry.consumer,
+    topic: entry.topic,
+    messageId: entry.messageId,
+    at: entry.at,
+  };
+}
+
+/**
+ * Parses one dedup-journal line. Returns `null` for anything malformed —
+ * wrong version, an empty consumer/topic/messageId, or a non-finite
+ * timestamp. Corrupt lines are skipped, never fatal.
+ */
+function parseDedupLine(line: string): DedupEntry | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const o = parsed as Record<string, unknown>;
+  if (o['v'] !== 1) return null;
+  if (typeof o['consumer'] !== 'string' || (o['consumer'] as string).length === 0) return null;
+  if (typeof o['topic'] !== 'string' || (o['topic'] as string).length === 0) return null;
+  if (typeof o['messageId'] !== 'string' || (o['messageId'] as string).length === 0) return null;
+  if (typeof o['at'] !== 'number' || !Number.isFinite(o['at'])) return null;
+  return {
+    consumer: o['consumer'] as string,
+    topic: o['topic'] as string,
+    messageId: o['messageId'] as string,
+    at: o['at'] as number,
+  };
+}
+
+/**
  * Append-only, per-topic durable log for the event bus.
  *
  * Each concrete topic gets one JSONL file (`<url-encoded topic>.log`) under
@@ -323,15 +421,31 @@ export class DurableTopicLog {
   private readonly offsetCommits = new Map<string, DurableOffsetCommit>();
   /** Lines currently in the offset journal, used for compaction. */
   private offsetEntries = 0;
+  /**
+   * Path of the subscriber-dedup journal (`__dedup.jsonl`) inside the
+   * log directory. One append-only file for every dedup-enabled
+   * consumer, separate from the per-topic message files.
+   */
+  private readonly dedupFile: string;
+  /**
+   * Latest dedup sighting per (consumer, topic, messageId), keyed by
+   * `dedupKey(...)` — the in-memory side of the dedup journal, rebuilt
+   * on open and maintained on append.
+   */
+  private readonly dedupSeen = new Map<string, DedupEntry>();
+  /** Lines currently in the dedup journal, used for compaction. */
+  private dedupEntries = 0;
 
   private constructor(dir: string, maxEntriesPerTopic: number, keyCompaction: boolean) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
     this.keyCompaction = keyCompaction;
     this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
+    this.dedupFile = join(dir, DEDUP_JOURNAL_NAME);
     mkdirSync(dir, { recursive: true });
     this.recover();
     this.recoverOffsets();
+    this.recoverDedup();
   }
 
   /**
@@ -693,6 +807,96 @@ export class DurableTopicLog {
     return this.offsetEntries;
   }
 
+  private recoverDedup(): void {
+    let text: string;
+    try {
+      text = readFileSync(this.dedupFile, 'utf8');
+    } catch {
+      return;
+    }
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      this.dedupEntries += 1;
+      const entry = parseDedupLine(line);
+      if (entry == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const key = dedupKey(entry.consumer, entry.topic, entry.messageId);
+      const prev = this.dedupSeen.get(key);
+      if (prev == null || entry.at > prev.at) {
+        this.dedupSeen.set(key, entry);
+      }
+    }
+  }
+
+  /**
+   * Persists one subscriber-dedup sighting to the append-only dedup
+   * journal. Returns `true` when the sighting was persisted, `false`
+   * when it could not be serialized or the write failed — the caller
+   * keeps the in-memory window entry regardless, so a full disk must
+   * not fail the delivery path. Never throws.
+   *
+   * When the journal grows past twice `maxEntriesPerTopic` lines it is
+   * compacted down to the latest sighting per (consumer, topic,
+   * messageId): a consumer that deduplicates every message must not
+   * grow the journal without bound.
+   */
+  appendDedup(entry: DedupEntry): boolean {
+    let line: string;
+    try {
+      line = `${JSON.stringify(dedupLineOf(entry))}\n`;
+    } catch {
+      return false;
+    }
+    try {
+      appendFileSync(this.dedupFile, line, 'utf8');
+    } catch {
+      return false;
+    }
+    const key = dedupKey(entry.consumer, entry.topic, entry.messageId);
+    const prev = this.dedupSeen.get(key);
+    if (prev == null || entry.at > prev.at) {
+      this.dedupSeen.set(key, entry);
+    }
+    this.dedupEntries += 1;
+    if (this.dedupEntries > this.maxEntriesPerTopic * 2) {
+      this.compactDedup();
+    }
+    return true;
+  }
+
+  private compactDedup(): void {
+    const text = [...this.dedupSeen.values()]
+      .map((e) => `${JSON.stringify(dedupLineOf(e))}\n`)
+      .join('');
+    try {
+      writeFileSync(this.dedupFile, text, 'utf8');
+    } catch {
+      return;
+    }
+    this.dedupEntries = this.dedupSeen.size;
+  }
+
+  /**
+   * Dedup sightings recovered for one consumer — the persisted side of
+   * its `deduplicateMessages` window. The caller (the bus, at subscribe
+   * time) prunes entries older than the subscriber's `windowMs`: an
+   * aged-out identity is "unknown" and must not suppress a re-arrival.
+   */
+  dedupWindowFor(consumer: string): DedupEntry[] {
+    const out: DedupEntry[] = [];
+    for (const entry of this.dedupSeen.values()) {
+      if (entry.consumer === consumer) out.push(entry);
+    }
+    return out;
+  }
+
+  /** Lines currently in the dedup journal, 0 when no sighting was ever journaled. */
+  dedupEntryCount(): number {
+    return this.dedupEntries;
+  }
+
   /** Highest seq logged for a topic, 0 when the topic is unknown. */
   lastSeq(topic: string): number {
     return this.lastSeqs.get(topic) ?? 0;
@@ -736,6 +940,8 @@ export class DurableTopicLog {
     keyCompaction: boolean;
     /** Lines in the group-offset journal (`__group_offsets.jsonl`). */
     offsetEntries: number;
+    /** Lines in the subscriber-dedup journal (`__dedup.jsonl`). */
+    dedupEntries: number;
   } {
     let entries = 0;
     for (const count of this.entryCounts.values()) entries += count;
@@ -745,6 +951,7 @@ export class DurableTopicLog {
       corruptLines: this.corruptLines,
       keyCompaction: this.keyCompaction,
       offsetEntries: this.offsetEntries,
+      dedupEntries: this.dedupEntries,
     };
   }
 }
@@ -791,6 +998,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.key !== undefined) line.key = record.key;
   if (record.keySeq !== undefined) line.keySeq = record.keySeq;
   if (record.dictId !== undefined) line.dictId = record.dictId;
+  if (record.messageId !== undefined) line.messageId = record.messageId;
   return line;
 }
 
@@ -871,6 +1079,14 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     // dictionary — replay must never resolve a forged id.
     if (typeof o['dictId'] !== 'string' || !/^[0-9a-f]{64}$/.test(o['dictId'] as string)) return null;
     record.dictId = o['dictId'] as string;
+  }
+  if (o['messageId'] !== undefined) {
+    // The identity is advisory dedup metadata, not structural: a
+    // malformed value is dropped (the message replays without an
+    // identity) rather than failing the whole line.
+    if (typeof o['messageId'] === 'string' && (o['messageId'] as string).length > 0) {
+      record.messageId = o['messageId'] as string;
+    }
   }
   // A non-tombstone schedule record must say when it is due.
   if (isScheduleRecord && record.cancelled !== true && record.deliverAt === undefined) return null;
