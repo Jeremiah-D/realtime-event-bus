@@ -122,7 +122,11 @@ interface LogLine {
 
 /**
  * One persisted consumer-group offset commit: the last per-topic `seq`
- * a consumer of `groupId` durably processed on `topic`.
+ * a consumer of `groupId` durably processed on `topic`. `partition` is
+ * present for partitioned consumer groups (see
+ * `GroupSubscribeOptions.partitions`): a per-partition checkpoint, with
+ * `pattern` identifying which (groupId, pattern) competing set it belongs
+ * to. Absent for classic group-level commits.
  */
 export interface DurableOffsetCommit {
   /** The consumer group that reported the checkpoint. */
@@ -133,6 +137,10 @@ export interface DurableOffsetCommit {
   seq: number;
   /** Commit timestamp in milliseconds (the bus clock). */
   at: number;
+  /** Partition index for partitioned groups; absent for group-level commits. */
+  partition?: number;
+  /** The competing set's pattern, present exactly when `partition` is. */
+  pattern?: string;
 }
 
 /** On-disk envelope for one offset-commit line. `v` pins the format. */
@@ -142,26 +150,38 @@ interface OffsetLine {
   topic: string;
   seq: number;
   at: number;
+  partition?: number;
+  pattern?: string;
 }
 
 /**
- * Key for one (group, topic) checkpoint: groupId and topic joined by NUL.
- * Neither may contain NUL in practice, so the pairing is unambiguous and
- * reversible (see `recoveredCommittedOffsets`).
+ * Key for one checkpoint: groupId and topic joined by NUL, with the
+ * partition and pattern appended for per-partition commits. Neither may
+ * contain NUL in practice, so the pairing is unambiguous and reversible
+ * (see `recoveredCommittedOffsets`).
  */
-function offsetKey(groupId: string, topic: string): string {
-  return `${groupId}\0${topic}`;
+function offsetKey(groupId: string, topic: string, partition?: number, pattern?: string): string {
+  const base = `${groupId}\0${topic}`;
+  return partition === undefined ? base : `${base}\0${partition}\0${pattern ?? ''}`;
 }
 
 /** Builds the on-disk envelope for an offset commit. */
 function offsetLineOf(commit: DurableOffsetCommit): OffsetLine {
-  return { v: 1, group: commit.groupId, topic: commit.topic, seq: commit.seq, at: commit.at };
+  return {
+    v: 1,
+    group: commit.groupId,
+    topic: commit.topic,
+    seq: commit.seq,
+    at: commit.at,
+    ...(commit.partition === undefined ? {} : { partition: commit.partition, pattern: commit.pattern }),
+  };
 }
 
 /**
  * Parses one offset-journal line. Returns `null` for anything malformed —
- * wrong version, empty group/topic, a non-positive-integer seq, or a
- * non-finite timestamp. Corrupt lines are skipped, never fatal.
+ * wrong version, empty group/topic, a non-positive-integer seq, a
+ * non-finite timestamp, a malformed partition, or a partition without its
+ * pattern. Corrupt lines are skipped, never fatal.
  */
 function parseOffsetLine(line: string): DurableOffsetCommit | null {
   let parsed: unknown;
@@ -178,11 +198,20 @@ function parseOffsetLine(line: string): DurableOffsetCommit | null {
   const seq = o['seq'];
   if (!Number.isInteger(seq) || (seq as number) < 1) return null;
   if (typeof o['at'] !== 'number' || !Number.isFinite(o['at'])) return null;
+  const partition = o['partition'];
+  const pattern = o['pattern'];
+  if (partition !== undefined || pattern !== undefined) {
+    if (!Number.isInteger(partition) || (partition as number) < 0) return null;
+    if (typeof pattern !== 'string' || (pattern as string).length === 0) return null;
+  }
   return {
     groupId: o['group'] as string,
     topic: o['topic'] as string,
     seq: seq as number,
     at: o['at'] as number,
+    ...(partition === undefined
+      ? {}
+      : { partition: partition as number, pattern: pattern as string }),
   };
 }
 
@@ -291,7 +320,7 @@ export class DurableTopicLog {
    * `offsetKey(groupId, topic)` — the in-memory side of the offset
    * journal, rebuilt on open and maintained on append.
    */
-  private readonly offsetCommits = new Map<string, { groupId: string; topic: string; seq: number; at: number }>();
+  private readonly offsetCommits = new Map<string, DurableOffsetCommit>();
   /** Lines currently in the offset journal, used for compaction. */
   private offsetEntries = 0;
 
@@ -539,10 +568,18 @@ export class DurableTopicLog {
         this.corruptLines += 1;
         continue;
       }
-      const key = offsetKey(commit.groupId, commit.topic);
+      const key = offsetKey(commit.groupId, commit.topic, commit.partition, commit.pattern);
       const prev = this.offsetCommits.get(key);
       if (prev == null || commit.seq > prev.seq) {
-        this.offsetCommits.set(key, { groupId: commit.groupId, topic: commit.topic, seq: commit.seq, at: commit.at });
+        this.offsetCommits.set(key, {
+          groupId: commit.groupId,
+          topic: commit.topic,
+          seq: commit.seq,
+          at: commit.at,
+          ...(commit.partition === undefined
+            ? {}
+            : { partition: commit.partition, pattern: commit.pattern as string }),
+        });
       }
     }
   }
@@ -554,14 +591,27 @@ export class DurableTopicLog {
    * keeps the in-memory checkpoint regardless, so a full disk must not
    * fail the commit path. Never throws.
    *
+   * `opts.partition` (with `opts.pattern`) persists a per-partition
+   * checkpoint for partitioned consumer groups; without it the commit is
+   * the classic group-level checkpoint.
+   *
    * When the journal grows past twice `maxEntriesPerTopic` lines it is
-   * compacted down to the latest commit per (group, topic): a group that
-   * commits per message must not grow the journal without bound.
+   * compacted down to the latest commit per checkpoint — per
+   * (group, topic), or per (group, topic, partition) for partitioned
+   * commits: a group that commits per message must not grow the journal
+   * without bound.
    */
-  appendOffset(groupId: string, topic: string, seq: number, at: number): boolean {
+  appendOffset(
+    groupId: string,
+    topic: string,
+    seq: number,
+    at: number,
+    opts?: { partition?: number; pattern?: string },
+  ): boolean {
+    const commit: DurableOffsetCommit = { groupId, topic, seq, at, ...opts };
     let line: string;
     try {
-      line = `${JSON.stringify(offsetLineOf({ groupId, topic, seq, at }))}\n`;
+      line = `${JSON.stringify(offsetLineOf(commit))}\n`;
     } catch {
       return false;
     }
@@ -571,10 +621,10 @@ export class DurableTopicLog {
       return false;
     }
     this.offsetEntries += 1;
-    const key = offsetKey(groupId, topic);
+    const key = offsetKey(groupId, topic, opts?.partition, opts?.pattern);
     const prev = this.offsetCommits.get(key);
     if (prev == null || seq > prev.seq) {
-      this.offsetCommits.set(key, { groupId, topic, seq, at });
+      this.offsetCommits.set(key, { groupId, topic, seq, at, ...opts });
     }
     if (this.offsetEntries > this.maxEntriesPerTopic * 2) {
       this.compactOffsets();
@@ -582,10 +632,14 @@ export class DurableTopicLog {
     return true;
   }
 
-  /** Rewrites the offset journal keeping only the latest commit per (group, topic). */
+  /**
+   * Rewrites the offset journal keeping only the latest commit per
+   * checkpoint — per (group, topic), or per (group, topic, partition) for
+   * partitioned commits.
+   */
   private compactOffsets(): void {
     const text = [...this.offsetCommits.values()]
-      .map((c) => `${JSON.stringify(offsetLineOf({ groupId: c.groupId, topic: c.topic, seq: c.seq, at: c.at }))}\n`)
+      .map((c) => `${JSON.stringify(offsetLineOf(c))}\n`)
       .join('');
     try {
       writeFileSync(this.offsetFile, text, 'utf8');
@@ -597,8 +651,10 @@ export class DurableTopicLog {
 
   /**
    * Committed offsets recovered from the offset journal: the highest
-   * committed seq per (group, topic), keyed `${groupId}\0${topic}` (the
-   * same NUL-joined pairing as `EventBus`'s group key).
+   * committed seq per checkpoint, keyed by the NUL-joined checkpoint key
+   * — `${groupId}\0${topic}` for group-level commits, or
+   * `${groupId}\0${topic}\0${partition}\0${pattern}` for per-partition
+   * commits (see `offsetKey`).
    */
   recoveredCommittedOffsets(): Map<string, number> {
     const out = new Map<string, number>();

@@ -79,7 +79,31 @@ library.
   tracks the per-group assignment watermark (`getGroupOffsets`: highest
   per-topic `seq` handed to any member) and consumer checkpoints
   (`commitOffset` / `getCommittedOffsets`); `getStats().consumerGroups`
-  lists live groups. `subscribe()` also accepts an opt-in content `filter`
+  lists live groups. Opt-in `partitions` on `subscribeToGroup` switches a
+  competing set from per-message round-robin to Kafka-style partition
+  assignment: the key space is divided into N logical partitions, each owned
+  exclusively by one member. A keyed message's partition is
+  `sha256("k\0" + key) mod N` (one key always lands on one partition, so
+  per-key order is preserved within its exclusive consumer); a keyless
+  message hashes `(topic, seq)` for a deterministic spread. Assignment is
+  rendezvous (highest-random-weight) hashing over the member roster —
+  deterministic from the roster alone, so joins/leaves only migrate the
+  partitions whose winner actually changed. The bus tracks per-partition
+  assignment watermarks (`getPartitionWatermarks`: highest per-topic `seq`
+  per partition) and per-partition checkpoints
+  (`commitOffset(group, topic, seq, { partition })`, journaled to the offset
+  log and recovered across restarts; `getPartitionCommittedOffsets`). On
+  every rebalance the new owner of each migrated partition automatically
+  replays its uncommitted backlog — `(partitionCommitted ?? groupCommitted,
+  watermark]` per topic — from the durable log (requires `durableLogDir`;
+  without it the rebalance event still carries the watermarks for the
+  operator). `onRebalance` events carry `partitionRebalance`
+  (`assignment` + `migrated[]` with from/to/watermarks); a member that
+  subscribes with `resumeFromSeq` replays only its own partitions past its
+  resume point (its explicit window suppresses the automatic migration
+  replay — no double delivery). The partition count is fixed by the group's
+  first member: a later joiner that disagrees throws `RangeError` and its
+  subscription is rolled back. `subscribe()` also accepts an opt-in content `filter`
   predicate: a message the filter rejects never enters that subscriber's
   queue — no backpressure budget consumed, no adaptive-throttle token
   burned — and the subscriber's per-topic baseline advances over it, so a
@@ -524,6 +548,18 @@ npm test
   payloads surfacing as forward errors, option validation, double-connect
   rejection, `getStats().cluster`, compressed forward + inflate + raw-payload
   filtering.
+- `test/partitions.test.ts` — partitioned consumer groups: deterministic
+  rendezvous assignment, exclusive per-partition delivery for keyed messages
+  (key→partition→owner mapping verified independently), deterministic spread
+  of keyless messages, minimal-disruption migration on join/leave (only the
+  partitions whose winner changed move), automatic backlog replay of a
+  migrated partition to the new owner on leave, replay precision from
+  per-partition commits (not from zero), partition-aware `resumeFromSeq`
+  (only owned partitions, suppressing double delivery), partition option
+  validation with subscriber rollback on count mismatch, per-partition
+  commit validation, per-partition checkpoint persistence across restarts,
+  `getStats().consumerGroups` partition counts, and round-robin groups
+  untouched (no partition metadata).
 - `test/durablelog.test.ts` — durable topic log: append/readSince round-trip,
   reopen recovery of topics/seqs/counts, corrupt-line tolerance, amortized
   compaction, option validation; bus integration: per-publish logging with

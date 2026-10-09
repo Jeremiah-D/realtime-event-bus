@@ -20,6 +20,12 @@ import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import type {
+  ClusterConnectOptions,
+  ClusterLink,
+  ClusterLinkStatus,
+  ClusterMessage,
+} from './cluster.ts';
 
 export type { Delivery } from './ack.ts';
 export type { DeliveryLatencyOptions, DeliveryLatencySummaryStats } from './latency.ts';
@@ -40,6 +46,14 @@ export interface BusMessage {
    * a separate per-subscriber delivery counter.
    */
   seq: number;
+  /**
+   * Sequence epoch for gap detection. Absent (or empty) for messages
+   * published on this node; `hub:<hubEpoch>` for messages received from
+   * the cluster hub (see `EventBus.connectToHub`). The bus resets a
+   * subscriber's per-topic gap baseline when the epoch changes instead of
+   * counting a phantom gap across the local/cluster sequence spaces.
+   */
+  epoch?: string;
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
@@ -551,6 +565,38 @@ export interface DeadLetterEvent {
 }
 
 /** Snapshot delivered to `onRebalance` when a consumer group's membership changes. */
+/**
+ * Partition ownership change from one consumer-group rebalance, for
+ * partitioned groups (see `GroupSubscribeOptions.partitions`).
+ */
+export interface PartitionMigration {
+  /** The partition whose owner changed. */
+  partition: number;
+  /** Previous owner's subscription id, null when it was unassigned. */
+  from: string | null;
+  /** New owner's subscription id. */
+  to: string;
+  /**
+   * Per-topic assignment watermarks for the partition: the highest
+   * per-topic `seq` assigned to this partition so far. The new owner
+   * replays the partition's uncommitted backlog — `(committed, watermark]`
+   * — from the durable log automatically on migration.
+   */
+  watermarks: Record<string, number>;
+}
+
+/**
+ * Partition state carried on `GroupRebalanceEvent` for partitioned groups
+ * (see `GroupSubscribeOptions.partitions`). Absent for classic
+ * round-robin groups.
+ */
+export interface PartitionRebalanceInfo {
+  /** Post-change partition -> member subscription id. */
+  assignment: Record<number, string>;
+  /** Partitions whose owner changed in this rebalance. */
+  migrated: PartitionMigration[];
+}
+
 export interface GroupRebalanceEvent {
   /** The group whose membership changed. */
   groupId: string;
@@ -579,6 +625,11 @@ export interface GroupRebalanceEvent {
    * assigned-inclusive — that replay skips until `lingerUntil`.
    */
   lingering?: Array<{ topic: string; fromSeq: number; toSeq: number }>;
+  /**
+   * Present for partitioned groups (see `GroupSubscribeOptions.partitions`):
+   * the post-change partition assignment and which partitions migrated.
+   */
+  partitionRebalance?: PartitionRebalanceInfo;
 }
 
 /**
@@ -631,6 +682,31 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * not commit (the crash case), exactly like a Kafka rebalance revoke.
    */
   handoffLingerMs?: number;
+  /**
+   * Opt-in Kafka-style partition assignment for the competing set. When
+   * set, the group's messages are divided into `partitions` logical
+   * partitions and each partition is owned by exactly one member, which
+   * exclusively consumes it — instead of the default per-message
+   * round-robin. A keyed message's partition derives from its key
+   * (`hash(key) % partitions`), so one key always lands on one partition;
+   * a keyless message's partition derives from `(topic, seq)`.
+   *
+   * Assignment is deterministic rendezvous hashing over the member roster:
+   * members joining or leaving only migrate the partitions whose winner
+   * changed — unaffected partitions keep their owner and their backlog is
+   * never replayed. On migration the new owner automatically replays the
+   * partition's uncommitted backlog — `(committed, watermark]` per topic —
+   * from the durable log (requires `EventBusOptions.durableLogDir`;
+   * without it the event still carries the watermarks for the operator).
+   * Use `commitOffset(..., { partition })` for per-partition checkpoints.
+   *
+   * The partition count is fixed by the FIRST `subscribeToGroup` for the
+   * (groupId, pattern): a later member that specifies a different count —
+   * or specifies one for a round-robin group — throws `RangeError` and its
+   * subscription is rolled back. Members that omit it simply join the
+   * partitioned group. Must be a positive integer.
+   */
+  partitions?: number;
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -1036,6 +1112,23 @@ export interface BusStats {
    */
   hotTopics: HotTopic[];
   /**
+   * Cluster link state, present only while joined to a hub (see
+   * `connectToHub`). `connected: false` means the transport dropped and
+   * the bus is serving local-only on cached routes (degraded).
+   */
+  cluster?: {
+    connected: boolean;
+    degraded: boolean;
+    nodeId: string;
+    routeVersion: number;
+    hubEpoch: string | null;
+    remoteMembers: number;
+    forwardedMessages: number;
+    receivedMessages: number;
+    forwardErrors: number;
+    receiveDropped: number;
+  };
+  /**
    * Stats for every concrete topic that has seen at least one publish or
    * schema rejection, in order of first publish.
    */
@@ -1045,7 +1138,7 @@ export interface BusStats {
    * with at least one member, in first-registration order. Empty when no
    * group subscription is active.
    */
-  consumerGroups: Array<{ groupId: string; pattern: string; members: number }>;
+  consumerGroups: Array<{ groupId: string; pattern: string; members: number; partitions?: number }>;
   /**
    * Durable topic log state (`EventBusOptions.durableLogDir`). Absent when
    * the durable log is disabled.
@@ -1098,6 +1191,23 @@ interface KeyOrderState {
   buffer: Map<number, KeyedDelivery>;
 }
 
+/**
+ * Key for one per-(subscriber, key) ordering stream, namespaced by
+ * sequence epoch: the node's own publish stream ('') and each hub's
+ * forwarded stream (`hub:<hubEpoch>`) order independently, so a keyed
+ * message from a foreign epoch can neither wedge nor corrupt the local
+ * gate. Epochs never contain NUL, so the first NUL splits unambiguously.
+ */
+function keyOrderKey(epoch: string, key: string): string {
+  return `${epoch}\0${key}`;
+}
+
+/** Splits a `keyOrderKey` back into [epoch, key] on the first NUL. */
+function splitKeyOrderKey(mapKey: string): [string, string] {
+  const sep = mapKey.indexOf('\0');
+  return [mapKey.slice(0, sep), mapKey.slice(sep + 1)];
+}
+
 interface Subscriber {
   id: string;
   pattern: string;
@@ -1133,6 +1243,14 @@ interface Subscriber {
    * pre-subscription messages as lost.
    */
   lastDeliveredSeq: Map<string, number>;
+  /**
+   * Sequence epoch of the last delivery per topic, normalized ('' for the
+   * node's own publishes, `hub:<hubEpoch>` for cluster traffic). Pairs
+   * with `lastDeliveredSeq`: when a delivery arrives from a different
+   * epoch than the previous one on the same topic, the gap baseline is
+   * re-established instead of counting the epoch switch as lost messages.
+   */
+  lastEpoch: Map<string, string>;
   /**
    * Adaptive publish-side throttling state (see `SubscribeOptions.throttle`).
    * Absent when throttling is disabled for this subscriber.
@@ -1935,6 +2053,21 @@ export interface IdempotentPublishResult {
   accepted: number;
 }
 
+/**
+ * One durable-log record as the bus replays it. `dictId` rides along for
+ * dictionary-compressed records (resolved from the registry at admit).
+ */
+interface ReplayRecord {
+  seq: number;
+  topic: string;
+  at: number;
+  expiresAt?: number;
+  payload: unknown;
+  key?: string;
+  keySeq?: number;
+  dictId?: string;
+}
+
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
@@ -2223,6 +2356,33 @@ export class EventBus {
    * Bounded: windows are pruned on every read and capped per group.
    */
   private lingerWindows = new Map<string, LingerWindow[]>();
+  /**
+   * Partition count per competing set (`groupKey(groupId, pattern)`), for
+   * groups that opted into `GroupSubscribeOptions.partitions`. Fixed by
+   * the group's first member; absent for classic round-robin groups.
+   * Retained after the last member leaves so a rejoining group resumes
+   * with the same partition count.
+   */
+  private groupPartitions = new Map<string, number>();
+  /**
+   * Cached rendezvous partition assignment per competing set:
+   * partition -> owner member id. Invalidated on every join/leave.
+   */
+  private partitionAssignmentCache = new Map<string, Map<number, string>>();
+  /**
+   * Per-partition assignment watermarks: groupKey -> partition ->
+   * concrete topic -> highest per-topic `seq` assigned to that partition.
+   * Bounded by (groups x partitions x topics). Drives migration replay:
+   * the new owner replays `(committed, watermark]` per topic.
+   */
+  private groupPartitionOffsets = new Map<string, Map<number, Map<string, number>>>();
+  /**
+   * Per-partition consumer checkpoints: groupKey -> partition ->
+   * concrete topic -> last processed `seq` (see `commitOffset` with
+   * `{ partition }`). Falls back to the group-level checkpoint when a
+   * partition was never committed.
+   */
+  private partitionCommittedOffsets = new Map<string, Map<number, Map<string, number>>>();
   private readonly now: () => number;
   /**
    * Durable topic log, present only when `EventBusOptions.durableLogDir`
@@ -2256,6 +2416,12 @@ export class EventBus {
    * shaping re-flush timer.
    */
   private delayTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Cluster hub link, present after `connectToHub` resolves and until
+   * `disconnectCluster`. Loaded lazily (dynamic import) so buses that
+   * never cluster never load the TCP/TLS code.
+   */
+  private clusterLink: ClusterLink | null = null;
 
   constructor(options?: EventBusOptions) {
     this.now = options?.now ?? Date.now;
@@ -2313,11 +2479,31 @@ export class EventBus {
         this.keyCursors.set(key, maxSeq);
       }
       // Reseed consumer-group checkpoints from the offset journal: the
-      // highest committed seq per (group, topic) wins, so a restarted bus
+      // highest committed seq per checkpoint wins, so a restarted bus
       // resumes committed offsets instead of forgetting them — a rejoining
       // member that seeds `resumeFromSeq` from `getCommittedOffsets` picks
-      // up exactly where its predecessor committed.
+      // up exactly where its predecessor committed. Per-partition commits
+      // (4-part keys) reseed the per-partition checkpoints.
       for (const [key, seq] of this.durableLog.recoveredCommittedOffsets()) {
+        const parts = key.split('\0');
+        if (parts.length === 4) {
+          const [groupId, topic, partitionStr, pattern] = parts;
+          const partition = Number(partitionStr);
+          if (!Number.isInteger(partition) || partition < 0 || pattern.length === 0) continue;
+          const groupKey = `${groupId}\0${pattern}`;
+          let byPartition = this.partitionCommittedOffsets.get(groupKey);
+          if (byPartition == null) {
+            byPartition = new Map();
+            this.partitionCommittedOffsets.set(groupKey, byPartition);
+          }
+          let byTopic = byPartition.get(partition);
+          if (byTopic == null) {
+            byTopic = new Map();
+            byPartition.set(partition, byTopic);
+          }
+          byTopic.set(topic, seq);
+          continue;
+        }
         const sep = key.indexOf('\0');
         const groupId = key.slice(0, sep);
         const topic = key.slice(sep + 1);
@@ -2810,6 +2996,7 @@ export class EventBus {
       handler: handler as MessageHandler,
       queue,
       lastDeliveredSeq: new Map(),
+      lastEpoch: new Map(),
       throttle,
       onThrottled,
       deliveryShaping,
@@ -2834,6 +3021,8 @@ export class EventBus {
       this.prefixIndex.set(indexKey, indexBucket);
     }
     indexBucket.add(id);
+    // A new pattern changes what this node advertises to the cluster hub.
+    this.advertiseClusterPatterns();
 
     // Durable-log resume: pre-fill the queue with logged messages the
     // subscriber missed (seq > resumeFromSeq on matching topics), in
@@ -2871,6 +3060,8 @@ export class EventBus {
         } else {
           this.subscribersByPattern.set(topicPattern, remaining);
         }
+        // The advertised pattern set may have shrunk.
+        this.advertiseClusterPatterns();
       },
     };
   }
@@ -3054,37 +3245,81 @@ export class EventBus {
     if (!Number.isFinite(handoffLingerMs) || handoffLingerMs < 0) {
       throw new RangeError('handoffLingerMs must be a finite number of milliseconds >= 0');
     }
+    const partitions = opts?.partitions;
+    if (partitions !== undefined && (!Number.isInteger(partitions) || partitions < 1)) {
+      throw new RangeError('partitions must be a positive integer');
+    }
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
-    const { resumeFromSeq, ...restOpts } = opts ?? {};
+    const { resumeFromSeq, partitions: _partitions, ...restOpts } = opts ?? {};
     this.validateResumeFromSeq(resumeFromSeq);
     const sub = this.subscribe(topicPattern, handler, restOpts);
+    const key = EventBus.groupKey(groupId, topicPattern);
+    // Partition mode is fixed by the group's first member; a disagreeing
+    // joiner fails fast here, rolling back the just-registered subscriber
+    // so no half-joined member is left behind.
+    try {
+      this.checkPartitionConfig(key, partitions);
+    } catch (err) {
+      sub.unsubscribe();
+      throw err;
+    }
     const subscriber = this.subscribers.get(sub.id);
     if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
     subscriber.groupId = groupId;
     subscriber.onRebalance = opts?.onRebalance;
     subscriber.handoffLingerMs = handoffLingerMs;
-    const key = EventBus.groupKey(groupId, topicPattern);
     let members = this.groupMembers.get(key);
     if (members == null) {
       members = [];
       this.groupMembers.set(key, members);
     }
+    const partitioned = this.groupPartitions.get(key) !== undefined;
+    const beforeAssignment = partitioned ? new Map(this.partitionAssignment(key)) : undefined;
     members.push(sub.id);
-    if (resumeFromSeq !== undefined) {
-      this.replayLog(subscriber, resumeFromSeq);
+    this.invalidatePartitionAssignment(key);
+    let partitionRebalance: PartitionRebalanceInfo | undefined;
+    if (partitioned) {
+      const after = this.partitionAssignment(key);
+      const migrated = this.diffPartitionAssignment(key, beforeAssignment!, after);
+      partitionRebalance = { assignment: Object.fromEntries(after), migrated };
+      // Automatic watermark replay: partitions the newcomer just took over
+      // get their uncommitted backlog `(committed, watermark]` from the
+      // durable log. Skipped when the member chose its own resume point —
+      // its explicit window wins over the automatic one.
+      if (resumeFromSeq === undefined) {
+        for (const m of migrated) {
+          if (m.to === sub.id) this.replayPartitionBacklog(subscriber, key, m.partition);
+        }
+      }
     }
-    this.fireRebalance(groupId, topicPattern, key, 'join', sub.id);
+    if (resumeFromSeq !== undefined) {
+      if (partitioned) this.replayLogForPartitionedMember(subscriber, key, resumeFromSeq);
+      else this.replayLog(subscriber, resumeFromSeq);
+    }
+    this.fireRebalance(groupId, topicPattern, key, 'join', sub.id, undefined, partitionRebalance);
     return {
       id: sub.id,
       unsubscribe: () => {
         // Second call is a no-op: no double leave-event, no roster churn.
         if (!this.subscribers.has(sub.id)) return;
+        const wasPartitioned = this.groupPartitions.get(key) !== undefined;
+        const before = wasPartitioned ? new Map(this.partitionAssignment(key)) : undefined;
         this.removeGroupMember(key, sub.id);
+        let pr: PartitionRebalanceInfo | undefined;
+        if (wasPartitioned) {
+          const after = this.partitionAssignment(key);
+          const migrated = this.diffPartitionAssignment(key, before!, after);
+          pr = { assignment: Object.fromEntries(after), migrated };
+          for (const m of migrated) {
+            const owner = this.subscribers.get(m.to);
+            if (owner !== undefined) this.replayPartitionBacklog(owner, key, m.partition);
+          }
+        }
         const linger = this.beginLingerHandoff(groupId, subscriber);
         sub.unsubscribe();
-        this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id, linger);
+        this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id, linger, pr);
       },
     };
   }
@@ -3100,15 +3335,16 @@ export class EventBus {
 
   /**
    * Removes a member from its competing set. Emptied sets (and their
-   * round-robin cursors) are deleted so churn of short-lived groups cannot
-   * grow the maps without bound; assignment watermarks and committed
-   * offsets are history and are kept.
+   * round-robin cursors and cached partition assignments) are deleted so
+   * churn of short-lived groups cannot grow the maps without bound;
+   * assignment watermarks and committed offsets are history and are kept.
    */
   private removeGroupMember(key: string, memberId: string): void {
     const members = this.groupMembers.get(key);
     if (members == null) return;
     const idx = members.indexOf(memberId);
     if (idx >= 0) members.splice(idx, 1);
+    this.invalidatePartitionAssignment(key);
     if (members.length === 0) {
       this.groupMembers.delete(key);
       this.groupCursors.delete(key);
@@ -3120,6 +3356,8 @@ export class EventBus {
    * Each member receives its own snapshot of the post-change roster.
    * `linger` (leave events only) carries the handoff window opened for
    * the departed member, so the event observes the no-duplicate handoff.
+   * `partitionRebalance` (partitioned groups only) carries the new
+   * partition assignment and which partitions migrated.
    */
   private fireRebalance(
     groupId: string,
@@ -3128,6 +3366,7 @@ export class EventBus {
     trigger: 'join' | 'leave',
     memberId: string,
     linger?: { until: number; windows: LingerWindow[] },
+    partitionRebalance?: PartitionRebalanceInfo,
   ): void {
     const members = this.groupMembers.get(key);
     if (members == null) return;
@@ -3145,6 +3384,7 @@ export class EventBus {
               lingerUntil: linger.until,
               lingering: linger.windows.map((w) => ({ topic: w.topic, fromSeq: w.fromSeq, toSeq: w.toSeq })),
             }),
+        ...(partitionRebalance == null ? {} : { partitionRebalance }),
       });
     }
   }
@@ -3260,6 +3500,157 @@ export class EventBus {
   }
 
   /**
+   * Rendezvous (highest-random-weight) score of a member for a partition:
+   * SHA-256 over `partition\0memberId`, first 8 bytes as uint64. Every
+   * node computes the same winner from the same roster, and adding or
+   * removing a member only changes the winner where the newcomer/leaver
+   * actually wins — the minimal-disruption property rebalancing wants.
+   */
+  private static rendezvousScore(partition: number, memberId: string): bigint {
+    const digest = createHash('sha256').update(`${partition}\0${memberId}`, 'utf8').digest();
+    return digest.readBigUInt64BE(0);
+  }
+
+  /** SHA-256 based 64-bit hash for partition mapping (see `partitionForMessage`). */
+  private static hash64(preimage: string): bigint {
+    return createHash('sha256').update(preimage, 'utf8').digest().readBigUInt64BE(0);
+  }
+
+  /**
+   * Deterministic partition assignment for one competing set: every
+   * partition goes to the member with the highest rendezvous score.
+   * Cached per group key; invalidated on join/leave. Empty when the group
+   * is not partitioned or has no members.
+   */
+  private partitionAssignment(groupKey: string): Map<number, string> {
+    const cached = this.partitionAssignmentCache.get(groupKey);
+    if (cached !== undefined) return cached;
+    const assignment = new Map<number, string>();
+    const n = this.groupPartitions.get(groupKey) ?? 0;
+    const members = this.groupMembers.get(groupKey) ?? [];
+    for (let p = 0; p < n; p++) {
+      let best: string | undefined;
+      let bestScore = -1n;
+      for (const m of members) {
+        const score = EventBus.rendezvousScore(p, m);
+        // Strictly greater: join order breaks the (astronomically
+        // unlikely) tie deterministically.
+        if (score > bestScore) {
+          bestScore = score;
+          best = m;
+        }
+      }
+      if (best !== undefined) assignment.set(p, best);
+    }
+    this.partitionAssignmentCache.set(groupKey, assignment);
+    return assignment;
+  }
+
+  /** Drops the cached assignment for a competing set (join/leave). */
+  private invalidatePartitionAssignment(groupKey: string): void {
+    this.partitionAssignmentCache.delete(groupKey);
+  }
+
+  /**
+   * Which partition a message belongs to: keyed messages hash their key
+   * (one key always lands on one partition, so per-key order is preserved
+   * within the partition's exclusive consumer); keyless messages hash
+   * `(topic, seq)` for an even deterministic spread.
+   */
+  private partitionForMessage(n: number, topic: string, seq: number, key: string | undefined): number {
+    const preimage = key !== undefined ? `k\0${key}` : `t\0${topic}\0${seq}`;
+    return Number(EventBus.hash64(preimage) % BigInt(n));
+  }
+
+  /**
+   * Advances a partition's per-topic assignment watermark. Assignment
+   * follows publish order which follows `seq` order, so the newest
+   * assignment per (partition, topic) is always the maximum.
+   */
+  private recordPartitionOffset(groupKey: string, partition: number, topic: string, seq: number): void {
+    let byPartition = this.groupPartitionOffsets.get(groupKey);
+    if (byPartition == null) {
+      byPartition = new Map();
+      this.groupPartitionOffsets.set(groupKey, byPartition);
+    }
+    let byTopic = byPartition.get(partition);
+    if (byTopic == null) {
+      byTopic = new Map();
+      byPartition.set(partition, byTopic);
+    }
+    const prev = byTopic.get(topic) ?? 0;
+    if (seq > prev) byTopic.set(topic, seq);
+  }
+
+  /**
+   * Partitions whose owner changed between two assignments, with the
+   * per-topic watermarks the new owner replays from. Sorted by partition.
+   */
+  private diffPartitionAssignment(
+    groupKey: string,
+    before: Map<number, string>,
+    after: Map<number, string>,
+  ): PartitionMigration[] {
+    const out: PartitionMigration[] = [];
+    const partitions = new Set<number>([...before.keys(), ...after.keys()]);
+    for (const p of partitions) {
+      const from = before.get(p) ?? null;
+      const to = after.get(p);
+      if (to === undefined || from === to) continue;
+      const watermarks: Record<string, number> = {};
+      for (const [topic, seq] of this.groupPartitionOffsets.get(groupKey)?.get(p) ?? []) {
+        watermarks[topic] = seq;
+      }
+      out.push({ partition: p, from, to, watermarks });
+    }
+    out.sort((a, b) => a.partition - b.partition);
+    return out;
+  }
+
+  /**
+   * Validates a joining member's `partitions` option against the group's
+   * fixed configuration. The group's mode is fixed by its first member:
+   * a new group records the choice (or its absence); a later member that
+   * disagrees throws `RangeError`. Called before the member joins the
+   * competing set, so the caller can roll back the subscription.
+   */
+  private checkPartitionConfig(groupKey: string, partitions: number | undefined): void {
+    if (!this.groupMembers.has(groupKey)) {
+      // New (or fully drained and recreated) group: the first member
+      // fixes the mode; a stale config from a dead generation is dropped.
+      if (partitions !== undefined) this.groupPartitions.set(groupKey, partitions);
+      else this.groupPartitions.delete(groupKey);
+      return;
+    }
+    const configured = this.groupPartitions.get(groupKey);
+    if (partitions !== undefined && partitions !== configured) {
+      throw new RangeError(
+        configured === undefined
+          ? `consumer group is not partitioned (round-robin): cannot join with partitions=${partitions}`
+          : `partition count mismatch: group uses ${configured} partitions, got ${partitions}`,
+      );
+    }
+  }
+
+  /**
+   * Resolves the competing-set key for a per-partition offset commit. The
+   * commit API takes only the groupId, so the bus scans the partitioned
+   * groups: exactly one candidate must exist, otherwise the commit is
+   * ambiguous and fails fast.
+   */
+  private partitionGroupKey(groupId: string): string {
+    const prefix = `${groupId}\0`;
+    const candidates = [...this.groupPartitions.keys()].filter((k) => k.startsWith(prefix));
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length === 0) {
+      throw new RangeError(`no partitioned consumer group found for groupId "${groupId}"`);
+    }
+    throw new RangeError(
+      `groupId "${groupId}" has ${candidates.length} partitioned groups; per-partition commits are ambiguous`,
+    );
+  }
+
+  /**
    * Assignment watermark per concrete topic for a group: the highest
    * per-topic `seq` handed to any member of the group so far. Empty when
    * the group has received nothing (or does not exist). This is what a
@@ -3279,17 +3670,24 @@ export class EventBus {
    * from here. Committing for a group with no live members is allowed:
    * that is exactly the restore-before-rejoin case.
    *
+   * With `opts.partition` (partitioned groups only), the checkpoint is
+   * per-partition instead of group-level: the bus replays a migrated
+   * partition's backlog from `(partitionCommitted, watermark]`, so
+   * per-partition commits are what make migrations precise. Falls back to
+   * the group-level checkpoint for partitions that were never committed.
+   *
    * When a durable log is configured (`EventBusOptions.durableLogDir`)
    * the checkpoint is additionally appended to the log's group-offset
    * journal, so committed offsets survive a process restart (the journal
-   * is append-only; the highest seq per (group, topic) wins at recovery).
+   * is append-only; the highest seq per checkpoint wins at recovery).
    * A journal write failure never fails the in-memory commit — the live
    * process keeps serving from memory.
    *
-   * Throws `RangeError` on an empty groupId/topic or a non-positive
-   * non-integer seq.
+   * Throws `RangeError` on an empty groupId/topic, a non-positive
+   * non-integer seq, a partition for a non-partitioned group, or a
+   * partition index outside the group's partition count.
    */
-  commitOffset(groupId: string, topic: string, seq: number): void {
+  commitOffset(groupId: string, topic: string, seq: number, opts?: { partition?: number }): void {
     if (groupId.length === 0) {
       throw new RangeError('groupId must be a non-empty string');
     }
@@ -3298,6 +3696,34 @@ export class EventBus {
     }
     if (!Number.isInteger(seq) || seq < 1) {
       throw new RangeError('seq must be a positive integer sequence number');
+    }
+    const partition = opts?.partition;
+    if (partition !== undefined) {
+      if (!Number.isInteger(partition) || partition < 0) {
+        throw new RangeError('partition must be a non-negative integer');
+      }
+      const groupKey = this.partitionGroupKey(groupId);
+      const n = this.groupPartitions.get(groupKey) ?? 0;
+      if (partition >= n) {
+        throw new RangeError(`partition ${partition} out of range for a ${n}-partition group`);
+      }
+      let byPartition = this.partitionCommittedOffsets.get(groupKey);
+      if (byPartition == null) {
+        byPartition = new Map();
+        this.partitionCommittedOffsets.set(groupKey, byPartition);
+      }
+      let byTopic = byPartition.get(partition);
+      if (byTopic == null) {
+        byTopic = new Map();
+        byPartition.set(partition, byTopic);
+      }
+      byTopic.set(topic, seq);
+      const sep = groupKey.indexOf('\0');
+      this.durableLog?.appendOffset(groupId, topic, seq, this.now(), {
+        partition,
+        pattern: groupKey.slice(sep + 1),
+      });
+      return;
     }
     let committed = this.committedOffsets.get(groupId);
     if (committed == null) {
@@ -3318,11 +3744,182 @@ export class EventBus {
   }
 
   /**
+   * Current partition -> member subscription id for a partitioned
+   * competing set (see `GroupSubscribeOptions.partitions`). Empty when
+   * the group is not partitioned or has no members.
+   */
+  getPartitionAssignment(groupId: string, pattern: string): Record<number, string> {
+    const key = EventBus.groupKey(groupId, pattern);
+    if (this.groupPartitions.get(key) === undefined) return {};
+    return Object.fromEntries(this.partitionAssignment(key));
+  }
+
+  /**
+   * Per-partition assignment watermarks for a competing set: partition ->
+   * concrete topic -> highest per-topic `seq` assigned to that partition.
+   * Empty when the group is not partitioned or nothing was assigned yet.
+   * This is what a migration replays from (see `PartitionMigration`).
+   */
+  getPartitionWatermarks(groupId: string, pattern: string): Record<number, Record<string, number>> {
+    const key = EventBus.groupKey(groupId, pattern);
+    const byPartition = this.groupPartitionOffsets.get(key);
+    if (byPartition == null) return {};
+    const out: Record<number, Record<string, number>> = {};
+    for (const [p, byTopic] of byPartition) out[p] = Object.fromEntries(byTopic);
+    return out;
+  }
+
+  /**
+   * Per-partition consumer checkpoints for a competing set (see
+   * `commitOffset` with `{ partition }`): partition -> concrete topic ->
+   * last processed `seq`. Empty when nothing was committed per partition.
+   */
+  getPartitionCommittedOffsets(groupId: string, pattern: string): Record<number, Record<string, number>> {
+    const key = EventBus.groupKey(groupId, pattern);
+    const byPartition = this.partitionCommittedOffsets.get(key);
+    if (byPartition == null) return {};
+    const out: Record<number, Record<string, number>> = {};
+    for (const [p, byTopic] of byPartition) out[p] = Object.fromEntries(byTopic);
+    return out;
+  }
+
+  /**
    * Subscription ids of the current members of one competing set, in join
    * order. Empty when the group/pattern has no live members.
    */
   getGroupMembers(groupId: string, pattern: string): string[] {
     return [...(this.groupMembers.get(EventBus.groupKey(groupId, pattern)) ?? [])];
+  }
+
+  /**
+   * Joins this bus to a cluster hub (EB-37): the node advertises its
+   * subscribed topic patterns, receives the hub's route table, and starts
+   * forwarding locally-published messages whose topic matches subscribers
+   * on other members. Messages forwarded through the hub carry
+   * hub-assigned per-topic (and per-key) sequence numbers, globally
+   * monotonic across the cluster; purely local traffic keeps node-local
+   * numbers. See `src/cluster.ts` for the protocol.
+   *
+   * The initial connect honors `options.reconnect`: with the default policy
+   * it rides the backoff and rejects only when the policy gives up; with
+   * `reconnect: false` it is a single attempt that rejects when the hub is
+   * unreachable. After a successful connect, an unexpected transport drop
+   * degrades the bus to local-only mode (cached routes retained) and
+   * reconnects with backoff unless `options.reconnect` is `false`.
+   *
+   * Throws when already connected — `disconnectCluster()` first.
+   */
+  async connectToHub(options: ClusterConnectOptions): Promise<ClusterLink> {
+    if (this.clusterLink != null) {
+      throw new Error('already connected to a cluster hub; call disconnectCluster() first');
+    }
+    // Dynamic import: buses that never cluster never load the TCP/TLS
+    // code, and it keeps the module graph acyclic (cluster.ts imports
+    // compilePattern from here).
+    const cluster = await import('./cluster.ts');
+    const link = new cluster.ClusterLink({
+      ...options,
+      onMessage: (msg) => this.receiveClusterMessage(msg),
+      getPatterns: () => [...this.subscribersByPattern.keys()],
+    });
+    await link.connect();
+    this.clusterLink = link;
+    // A bus that subscribed before connecting joins with its full route
+    // table, not an empty one.
+    link.advertisePatterns([...this.subscribersByPattern.keys()]);
+    return link;
+  }
+
+  /**
+   * Leaves the cluster: sends goodbye, closes the transport, stops
+   * reconnecting. The bus keeps serving locally. Idempotent.
+   */
+  async disconnectCluster(): Promise<void> {
+    const link = this.clusterLink;
+    this.clusterLink = null;
+    if (link != null) await link.disconnect();
+  }
+
+  /**
+   * Cluster link status: connection state, cached route version, hub
+   * epoch, and known members. `connected: false` after any drop —
+   * `degraded` tells whether the bus is serving local-only on cached
+   * routes (as opposed to never having connected).
+   */
+  clusterStatus(): (ClusterLinkStatus & { everConnected: boolean }) | null {
+    const link = this.clusterLink;
+    if (link == null) return null;
+    const status = link.getStatus();
+    return { ...status, everConnected: status.connects > 0 };
+  }
+
+  /**
+   * Delivers one hub-forwarded message to this node's matching
+   * subscribers. Runs the same matching/filter/backpressure/group path
+   * as local publishes (`deliverMatched`); the message keeps the hub's
+   * sequence numbers and epoch, so gap detection and key ordering treat
+   * it as the cluster stream, not the local one.
+   *
+   * Cluster-received messages are intentionally NOT written to this
+   * node's durable log: the log captures the node's own publish stream
+   * (one sequence space per log), and the sending node already logged the
+   * message under its local numbers.
+   *
+   * Returns false when the frame is invalid or cannot be inflated (a
+   * dictionary-compressed message whose dictionary this node never
+   * registered fails closed) — the link counts the drop.
+   */
+  private receiveClusterMessage(frame: ClusterMessage): boolean {
+    if (typeof frame.topic !== 'string' || frame.topic.length === 0 || frame.topic.length > 1024) {
+      return false;
+    }
+    if (!Number.isInteger(frame.seq) || frame.seq < 1) return false;
+    const epoch =
+      typeof frame.epoch === 'string' && frame.epoch.length > 0 ? frame.epoch : 'hub:unknown';
+    const payload = frame.payload;
+    // The wire carries the compressed envelope when compression was on;
+    // the content filter must judge the application payload, so inflate
+    // first. Dictionary bytes come from this node's own registry — every
+    // node in the cluster must register the same preset dictionaries
+    // (identical bytes hash to the same dictId).
+    let rawPayload: unknown = payload;
+    if (frame.compressed === true) {
+      if (!isCompressedPayload(payload)) return false;
+      let dictionary: Buffer | undefined;
+      if (frame.dictId !== undefined) {
+        dictionary = this.compressionDictionaryRegistry.get(frame.dictId);
+        if (dictionary === undefined) return false;
+      }
+      try {
+        rawPayload = inflateEnvelopePayload(payload, dictionary);
+      } catch {
+        return false;
+      }
+    }
+    const msg: BusMessage = { topic: frame.topic, payload, seq: frame.seq, epoch };
+    if (frame.expiresAt !== undefined) this.messageDeadlines.set(msg, frame.expiresAt);
+    if (frame.compressed === true) {
+      // Re-register for transparent inflation at delivery, exactly like a
+      // locally compressed message — gated on this set, never on the
+      // envelope shape alone.
+      this.compressedPayloads.add(msg);
+      if (frame.dictId !== undefined) {
+        const dictionary = this.compressionDictionaryRegistry.get(frame.dictId);
+        if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
+      }
+    }
+    const keyed =
+      frame.key !== undefined && frame.keySeq !== undefined
+        ? { key: frame.key, keySeq: frame.keySeq }
+        : undefined;
+    this.deliverMatched(msg, frame.expiresAt, rawPayload, keyed);
+    this.scheduleFlush();
+    return true;
+  }
+
+  /** Re-announces the node's patterns when the set changed. */
+  private advertiseClusterPatterns(): void {
+    this.clusterLink?.advertisePatterns([...this.subscribersByPattern.keys()]);
   }
 
   /**
@@ -3409,20 +4006,100 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const matcher = subscriber.matcher;
-    const records: Array<{
-      seq: number;
-      topic: string;
-      at: number;
-      expiresAt?: number;
-      payload: unknown;
-      key?: string;
-      keySeq?: number;
-    }> = [];
+    const records: ReplayRecord[] = [];
     for (const topic of log.topics()) {
       if (!matcher.test(topic)) continue;
       for (const rec of log.readSince(topic, fromSeq)) records.push(rec);
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    this.admitReplayRecords(subscriber, records);
+    this.scheduleFlush();
+  }
+
+  /**
+   * Replays the durable log for a member of a partitioned group, filtered
+   * to the partitions currently assigned to it: a resume must not deliver
+   * another member's partitions. Used when a partitioned-group member
+   * subscribes with `resumeFromSeq`.
+   */
+  private replayLogForPartitionedMember(subscriber: Subscriber, groupKey: string, fromSeq: number): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const n = this.groupPartitions.get(groupKey);
+    if (n === undefined) {
+      this.replayLog(subscriber, fromSeq);
+      return;
+    }
+    const assignment = this.partitionAssignment(groupKey);
+    const mine = new Set<number>();
+    for (const [p, memberId] of assignment) {
+      if (memberId === subscriber.id) mine.add(p);
+    }
+    const matcher = subscriber.matcher;
+    const records: ReplayRecord[] = [];
+    for (const topic of log.topics()) {
+      if (!matcher.test(topic)) continue;
+      for (const rec of log.readSince(topic, fromSeq)) {
+        if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
+      }
+    }
+    records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    this.admitReplayRecords(subscriber, records);
+    this.scheduleFlush();
+  }
+
+  /**
+   * Replays one migrated partition's uncommitted backlog into its new
+   * owner: per topic, the log records with `seq` in
+   * `(committed, watermark]` that map to this partition. Committed comes
+   * from the per-partition checkpoint when present, else the group-level
+   * checkpoint. No durable log, no watermarks, or an empty window replays
+   * nothing. The handoff-linger skip does not apply: a migration is a
+   * deliberate partition takeover, not a resume.
+   */
+  private replayPartitionBacklog(subscriber: Subscriber, groupKey: string, partition: number): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const n = this.groupPartitions.get(groupKey);
+    if (n === undefined) return;
+    const sep = groupKey.indexOf('\0');
+    const groupId = groupKey.slice(0, sep);
+    const watermarks = this.groupPartitionOffsets.get(groupKey)?.get(partition);
+    if (watermarks == null) return;
+    const partitionCommitted = this.partitionCommittedOffsets.get(groupKey)?.get(partition);
+    const groupCommitted = this.committedOffsets.get(groupId);
+    const matcher = subscriber.matcher;
+    const records: ReplayRecord[] = [];
+    for (const topic of log.topics()) {
+      if (!matcher.test(topic)) continue;
+      const watermark = watermarks.get(topic);
+      if (watermark === undefined) continue;
+      const committed = partitionCommitted?.get(topic) ?? groupCommitted?.get(topic) ?? 0;
+      if (watermark <= committed) continue;
+      // readSince yields ascending seq: stop at the watermark.
+      for (const rec of log.readSince(topic, committed)) {
+        if (rec.seq > watermark) break;
+        if (this.partitionForMessage(n, rec.topic, rec.seq, rec.key) === partition) records.push(rec);
+      }
+    }
+    if (records.length === 0) return;
+    records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    this.admitReplayRecords(subscriber, records, { ignoreLinger: true });
+    this.scheduleFlush();
+  }
+
+  /**
+   * Admits already-collected durable-log records into a subscriber's
+   * queue: key-baseline seeding, content filter, handoff-linger skip,
+   * compression re-registration, keyed ordering gate. Shared by
+   * `replayLog` (subscribe-time resume), `replayLogForPartitionedMember`,
+   * and `replayPartitionBacklog` (migration replay).
+   */
+  private admitReplayRecords(
+    subscriber: Subscriber,
+    records: ReplayRecord[],
+    opts?: { ignoreLinger?: boolean },
+  ): void {
     // Keyed-ordering replay baseline (see `PublishOptions.key`): seed each
     // replayed key's expectation at its smallest replayed keySeq, so
     // replayed messages are released in keySeq order even when the log's
@@ -3432,11 +4109,13 @@ export class EventBus {
     // exactly as before.
     for (const rec of records) {
       if (rec.key === undefined || rec.keySeq === undefined) continue;
-      let order = subscriber.keyOrder?.get(rec.key);
+      // Replayed records come from this node's own log: the local stream.
+      const mapKey = keyOrderKey('', rec.key);
+      let order = subscriber.keyOrder?.get(mapKey);
       if (order === undefined) {
         if (subscriber.keyOrder === undefined) subscriber.keyOrder = new Map();
         order = { expected: rec.keySeq, skipped: new Set<number>(), buffer: new Map() };
-        subscriber.keyOrder.set(rec.key, order);
+        subscriber.keyOrder.set(mapKey, order);
       } else if (rec.keySeq < order.expected) {
         order.expected = rec.keySeq;
       }
@@ -3472,11 +4151,12 @@ export class EventBus {
       // Like a content filter, the skip must not churn backpressure or
       // count as a sequence gap: the per-topic baseline advances over it.
       // After the window expires the same replay delivers them normally
-      // (the leaver is presumed dead; at-least-once resumes).
+      // (the leaver is presumed dead; at-least-once resumes). Migration
+      // replay (`ignoreLinger`) is a deliberate partition takeover, not a
+      // resume, so it bypasses the linger.
       const groupId = subscriber.groupId;
-      if (groupId !== undefined && this.isLingering(groupId, rec.topic, rec.seq)) {
-        const last = subscriber.lastDeliveredSeq.get(rec.topic);
-        if (last === undefined || rec.seq > last) subscriber.lastDeliveredSeq.set(rec.topic, rec.seq);
+      if (!opts?.ignoreLinger && groupId !== undefined && this.isLingering(groupId, rec.topic, rec.seq)) {
+        this.advanceBaseline(subscriber, rec.topic, rec.seq);
         if (rec.key !== undefined && rec.keySeq !== undefined) {
           this.skipKeySeq(subscriber, rec.key, rec.keySeq);
         }
@@ -3510,7 +4190,6 @@ export class EventBus {
         this.enqueueMessage(subscriber, msg, rec.expiresAt);
       }
     }
-    this.scheduleFlush();
   }
 
   /**
@@ -4345,7 +5024,7 @@ export class EventBus {
       // must not surface as a sequence gap, so the per-topic baseline
       // advances over it (seen, deliberately skipped). A throwing filter
       // propagates to the publish call, like a throwing schema validator.
-      this.countFiltered(subscriber, msg.topic, msg.seq);
+      this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '');
       return false;
     }
     const throttle = subscriber.throttle;
@@ -4389,11 +5068,16 @@ export class EventBus {
     key: string,
     keySeq: number,
   ): boolean {
-    let order = subscriber.keyOrder?.get(key);
+    // Per-epoch ordering streams: the node's own publish stream and each
+    // hub's forwarded stream number the same key independently, so each
+    // epoch gets its own expectation — a foreign epoch can neither wedge
+    // this gate nor corrupt its order.
+    const mapKey = keyOrderKey(delivery.msg.epoch ?? '', key);
+    let order = subscriber.keyOrder?.get(mapKey);
     if (order === undefined) {
       order = { expected: keySeq, skipped: new Set<number>(), buffer: new Map() };
       if (subscriber.keyOrder === undefined) subscriber.keyOrder = new Map();
-      subscriber.keyOrder.set(key, order);
+      subscriber.keyOrder.set(mapKey, order);
     }
     if (order.skipped.delete(keySeq)) {
       // Defensive: a keySeq marked as never-arriving showed up anyway —
@@ -4468,11 +5152,13 @@ export class EventBus {
     keySeq: number,
     matches: boolean,
   ): void {
-    let order = subscriber.keyOrder?.get(key);
+    // Schedule-time admission is always the node's own publish stream.
+    const mapKey = keyOrderKey('', key);
+    let order = subscriber.keyOrder?.get(mapKey);
     if (order === undefined) {
       if (subscriber.keyOrder === undefined) subscriber.keyOrder = new Map();
       order = { expected: matches ? keySeq : keySeq + 1, skipped: new Set(), buffer: new Map() };
-      subscriber.keyOrder.set(key, order);
+      subscriber.keyOrder.set(mapKey, order);
       return;
     }
     if (!matches) this.skipKeySeq(subscriber, key, keySeq);
@@ -4489,12 +5175,16 @@ export class EventBus {
    * or shed by the rate limiter). Without this, a subscriber buffering a
    * later keySeq would wait forever for a predecessor it will never see.
    *
+   * `epoch` selects the ordering stream ('' for the node's own publishes,
+   * `hub:<hubEpoch>` for hub-forwarded traffic): a keySeq that will never
+   * arrive on one stream must not disturb the other's expectation.
+   *
    * No entry (the subscriber never received this key) needs no mark: the
    * baseline rule in `deliverKeyed` establishes `expected` at the first
    * keyed message actually fanned out to it.
    */
-  private skipKeySeq(subscriber: Subscriber, key: string, keySeq: number): void {
-    const order = subscriber.keyOrder?.get(key);
+  private skipKeySeq(subscriber: Subscriber, key: string, keySeq: number, epoch = ''): void {
+    const order = subscriber.keyOrder?.get(keyOrderKey(epoch, key));
     if (order === undefined || keySeq < order.expected || order.skipped.has(keySeq)) return;
     order.skipped.add(keySeq);
     this.cascadeKeyExpected(subscriber, order);
@@ -4505,10 +5195,40 @@ export class EventBus {
    * will never fan out: a cancelled or TTL-expired delayed schedule, a
    * delayed message shed by the rate limiter at fan-out, or a schedule
    * whose durable-log write failed. O(subscribers) on rare paths only.
+   * Only the node's own publish stream ('') is released — hub-forwarded
+   * streams never originate here.
    */
   private releaseKeySequence(key: string, keySeq: number): void {
     for (const subscriber of this.subscribers.values()) {
-      if (subscriber.keyOrder?.has(key)) this.skipKeySeq(subscriber, key, keySeq);
+      const keyOrder = subscriber.keyOrder;
+      if (keyOrder === undefined) continue;
+      for (const [mapKey, order] of keyOrder) {
+        const [epoch, k] = splitKeyOrderKey(mapKey);
+        if (epoch === '' && k === key) {
+          if (keySeq >= order.expected && !order.skipped.has(keySeq)) {
+            order.skipped.add(keySeq);
+            this.cascadeKeyExpected(subscriber, order);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Advances a subscriber's per-topic gap baseline over a deliberately
+   * skipped message (content filter, handoff linger): the skip must not
+   * churn backpressure or count as a sequence gap. Epoch-aware like
+   * `detectGap` — a skip from a different epoch re-establishes the
+   * baseline instead of comparing across numbering spaces.
+   */
+  private advanceBaseline(subscriber: Subscriber, topic: string, seq: number, epoch = ''): void {
+    const last = subscriber.lastDeliveredSeq.get(topic);
+    const lastEpoch = subscriber.lastEpoch.get(topic);
+    if (last === undefined || lastEpoch !== epoch) {
+      subscriber.lastDeliveredSeq.set(topic, seq);
+      subscriber.lastEpoch.set(topic, epoch);
+    } else if (seq > last) {
+      subscriber.lastDeliveredSeq.set(topic, seq);
     }
   }
 
@@ -4523,9 +5243,8 @@ export class EventBus {
    * is filtered stays invisible, because the baseline can only move on
    * deliveries and filter decisions.
    */
-  private countFiltered(subscriber: Subscriber, topic: string, seq: number): void {
-    const last = subscriber.lastDeliveredSeq.get(topic);
-    if (last === undefined || seq > last) subscriber.lastDeliveredSeq.set(topic, seq);
+  private countFiltered(subscriber: Subscriber, topic: string, seq: number, epoch = ''): void {
+    this.advanceBaseline(subscriber, topic, seq, epoch);
     this.statsFor(topic).filteredMessages += 1;
     this.totalFiltered += 1;
   }
@@ -4680,8 +5399,6 @@ export class EventBus {
         if (this.compressedDictionaries.has(msg)) compressedDictId = compressionRule.dictionaryId;
       }
     }
-    let matched = 0;
-    let accepted = 0;
     // One clock reading for the publish: TTL deadline and log timestamp stay
     // consistent even if the injected clock moves between the two.
     const nowMs = this.now();
@@ -4721,11 +5438,65 @@ export class EventBus {
       // replay needs the same bytes to inflate it.
       ...(compressedDictId === undefined ? {} : { dictId: compressedDictId }),
     });
+    // Cluster federation (EB-37): when the hub link is up and the cached
+    // route table shows subscribers for this topic on OTHER members, the
+    // admitted message is additionally forwarded to the hub. The hub
+    // stamps hub-global per-topic (and per-key) sequence numbers and
+    // forwards only to members whose advertised patterns match — the
+    // sender never receives its own forward back. Local delivery below is
+    // unaffected: the node's own subscribers are served from the local
+    // publish stream with node-local sequence numbers, so a transport
+    // failure can never lose an admitted message locally. A forward
+    // failure is counted on the link, never thrown into the publish path.
+    const clusterLink = this.clusterLink;
+    if (clusterLink != null && clusterLink.isConnected()) {
+      const remoteMembers = clusterLink.matchingRemoteMembers(topic);
+      if (remoteMembers.length > 0) {
+        clusterLink.forwardPublish({
+          topic,
+          payload: msg.payload,
+          ...(keyed === undefined ? {} : { key: keyed.key }),
+          ...(expiresAt === undefined ? {} : { expiresAt }),
+          ...(this.compressedPayloads.has(msg) ? { compressed: true as const } : {}),
+          ...(compressedDictId === undefined ? {} : { dictId: compressedDictId }),
+        });
+      }
+    }
     // The prefix index prunes the regex tests down to subscribers whose
     // pattern's literal prefix can plausibly match the topic; the compiled
     // regex stays the final authority, and the no-miss invariant in
     // `candidateIds` keeps matching semantics identical to the old full
     // scan. Iteration order (insertion order) is unchanged.
+    const { matched, accepted } = this.deliverMatched(msg, expiresAt, payload, keyed);
+    stats.subscriberCount = matched;
+    return { matched, accepted, admitted: true };
+  }
+
+  /**
+   * Matches `msg` against every subscriber and delivers it: plain
+   * subscribers each get their own copy; consumer-group members compete
+   * for the group's single copy (round-robin over the competing set).
+   * Shared by the local publish path (`fanOut`) and the cluster receive
+   * path (`receiveClusterMessage`), so both get identical matching,
+   * filtering, backpressure, and group semantics — the only difference is
+   * the message's sequence epoch (`msg.epoch`), which the key-ordering
+   * gate and gap detection already honor per epoch.
+   *
+   * `rawPayload` is the application payload as published — never a
+   * compressed wire envelope — so content filters always judge the real
+   * payload. `keyed` carries the per-key sequence number for the ordering
+   * gate; its epoch is read from `msg.epoch`.
+   */
+  private deliverMatched(
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+    keyed: { key: string; keySeq: number } | undefined,
+  ): { matched: number; accepted: number } {
+    const topic = msg.topic;
+    const epoch = msg.epoch ?? '';
+    let matched = 0;
+    let accepted = 0;
     const candidates = this.candidateIds(topic);
     // Degenerate case: when every subscriber is a candidate (e.g. all on
     // `**`), the membership check would pass for all of them, so skip it.
@@ -4740,7 +5511,7 @@ export class EventBus {
         // pattern cannot match this topic — a definite non-match, so a
         // keyed message advances the subscriber's per-key baseline past
         // its keySeq, exactly like the matcher-tested non-match below.
-        if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq);
+        if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq, epoch);
         continue;
       }
       if (!subscriber.matcher.test(topic)) {
@@ -4748,12 +5519,12 @@ export class EventBus {
         // advance its per-key baseline past this keySeq — otherwise a
         // subscriber buffering a later keySeq for the same key would wait
         // for a predecessor that will never be fanned out to it.
-        if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq);
+        if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq, epoch);
         continue;
       }
       if (subscriber.groupId == null) {
         matched += 1;
-        if (this.deliverToSubscriber(subscriber, msg, expiresAt, payload, keyed)) accepted += 1;
+        if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed)) accepted += 1;
         continue;
       }
       const key = EventBus.groupKey(subscriber.groupId, subscriber.pattern);
@@ -4766,6 +5537,25 @@ export class EventBus {
     }
     for (const [key, hit] of groupHits) {
       matched += 1;
+      const partitionCount = this.groupPartitions.get(key);
+      if (partitionCount !== undefined) {
+        // Partitioned competing set: the message belongs to exactly one
+        // partition, consumed exclusively by its owner. Rendezvous
+        // assignment is deterministic from the roster, so every node
+        // agrees on the owner without coordination.
+        const partition = this.partitionForMessage(partitionCount, topic, msg.seq, keyed?.key);
+        const ownerId = this.partitionAssignment(key).get(partition);
+        const assignee = hit.members.find((m) => m.id === ownerId) ?? hit.members[0];
+        if (keyed !== undefined) {
+          for (const member of hit.members) {
+            if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
+          }
+        }
+        if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed)) accepted += 1;
+        this.recordPartitionOffset(key, partition, topic, msg.seq);
+        this.recordGroupOffset(hit.groupId, topic, msg.seq);
+        continue;
+      }
       const assignee = this.assignGroupMember(key, hit.members);
       if (keyed !== undefined) {
         // Consumer-group members compete per message: a keyed message
@@ -4776,14 +5566,13 @@ export class EventBus {
         // is per member: each member observes an ordered subsequence of
         // the key's stream.
         for (const member of hit.members) {
-          if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq);
+          if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
         }
       }
-      if (this.deliverToSubscriber(assignee, msg, expiresAt, payload, keyed)) accepted += 1;
+      if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed)) accepted += 1;
       this.recordGroupOffset(hit.groupId, topic, msg.seq);
     }
-    stats.subscriberCount = matched;
-    return { matched, accepted, admitted: true };
+    return { matched, accepted };
   }
 
   /**
@@ -4884,12 +5673,33 @@ export class EventBus {
       laggingSubscribers,
       keyedReorderedMessages: this.totalKeyedReordered,
       hotTopics: this.publishRates.hotTopics(ratesNow),
+      ...(this.clusterLink == null
+        ? {}
+        : {
+            cluster: (() => {
+              const s = this.clusterLink!.getStats();
+              return {
+                connected: s.connected,
+                degraded: s.degraded,
+                nodeId: s.nodeId,
+                routeVersion: s.routeVersion,
+                hubEpoch: s.hubEpoch,
+                remoteMembers: s.members.filter((m) => m !== s.nodeId).length,
+                forwardedMessages: s.forwardedMessages,
+                receivedMessages: s.receivedMessages,
+                forwardErrors: s.forwardErrors,
+                receiveDropped: s.receiveDropped,
+              };
+            })(),
+          }),
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
+        const partitions = this.groupPartitions.get(key);
         return {
           groupId: key.slice(0, sep),
           pattern: key.slice(sep + 1),
           members: members.length,
+          ...(partitions === undefined ? {} : { partitions }),
         };
       }),
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
@@ -5617,11 +6427,20 @@ export class EventBus {
    * delivered number is a redelivery (at-least-once `nack()` / ack-timeout
    * requeue): expected, never a gap, and it does not move the baseline
    * backwards.
+   *
+   * Sequence epochs: the node's own publishes and each hub's forwarded
+   * traffic number the same topic independently. When a delivery arrives
+   * from a different epoch than the previous one on the same topic, the
+   * baseline is re-established — the epoch switch itself is never counted
+   * as lost messages.
    */
   private detectGap(subscriber: Subscriber, msg: BusMessage): void {
+    const epoch = msg.epoch ?? '';
+    const lastEpoch = subscriber.lastEpoch.get(msg.topic);
     const last = subscriber.lastDeliveredSeq.get(msg.topic);
-    if (last === undefined) {
+    if (last === undefined || lastEpoch !== epoch) {
       subscriber.lastDeliveredSeq.set(msg.topic, msg.seq);
+      subscriber.lastEpoch.set(msg.topic, epoch);
       return;
     }
     if (msg.seq > last + 1) {
