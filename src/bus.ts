@@ -870,7 +870,8 @@ export interface EventBusOptions {
   idempotencyMaxEntries?: number;
   /**
    * Unified publish-side admission-rejection hook: called once for every
-   * publish the admission gates drop — schema-validation rejections
+   * publish the admission gates drop — ACL denials (`'acl'`, see
+   * `setAclRules`), schema-validation rejections
    * (`'schema'`, see `setTopicSchema`), rate-limit sheds (`'rate-limit'`,
    * see `setTopicRateLimit`), idempotency-duplicate suppressions
    * (`'duplicate'`, see `publishIdempotent`), and `publishAtomic` batch
@@ -890,6 +891,30 @@ export interface EventBusOptions {
    * compatible).
    */
   onAdmissionRejected?: AdmissionRejectionCallback;
+  /**
+   * Broker-level topic ACL (see `AclRule` and `setAclRules`): per-topic
+   * publish/subscribe permissions with allow/deny decisions on wildcard
+   * patterns. Rules are evaluated in order; the first matching rule with
+   * an explicit decision for the action wins; `defaultPolicy` (default
+   * `'allow'`) covers everything no rule decides. Unauthorized publishes
+   * return 0 and are counted as rejections (reason `'acl'`);
+   * unauthorized subscribes throw `AclDeniedError`. Rule changes via
+   * `setAclRules` take effect immediately. Default: unset (no ACL — the
+   * bus behaves exactly as before).
+   */
+  acl?: AclOptions;
+  /**
+   * Authorization-denial audit hook: called once for every publish or
+   * subscribe the ACL denies, with an `AuthzDeniedEvent` carrying the
+   * action and the concrete topic (publish) or subscription pattern
+   * (subscribe) — never the payload. Publish denials additionally surface
+   * on `onAdmissionRejected` with reason `'acl'` (so they stay
+   * reconcilable with the rejection counters); subscribe denials throw
+   * `AclDeniedError`, so this hook is their only audit channel. The
+   * callback is error-isolated: a throwing hook is swallowed so a broken
+   * observer can never disturb the publish/subscribe path. Default: unset.
+   */
+  onAuthzDenied?: AuthzDeniedCallback;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -1070,6 +1095,15 @@ export interface BusStats {
    * exact counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total publish/subscribe operations denied by the broker-level ACL
+   * (see `setAclRules`). Every denied publish is also counted in
+   * `rejectedMessages`; every denied subscribe throws `AclDeniedError`.
+   * The security-relevant counter: a spike here is an unauthorized-access
+   * probe worth alerting on. Denials are audited via
+   * `EventBusOptions.onAuthzDenied`.
+   */
+  authzDenied: number;
   /**
    * Total idempotent publishes suppressed as duplicates — the sum of
    * every topic's `duplicateMessages`. See `TopicStats.duplicateMessages`
@@ -1533,6 +1567,51 @@ function validateMessageKey(key: string | undefined, caller: string): void {
   }
 }
 
+/** An `AclRule` with its pattern pre-compiled for the hot path. */
+interface CompiledAclRule {
+  pattern: string;
+  matcher: RegExp;
+  publish?: AclDecision;
+  subscribe?: AclDecision;
+}
+
+/**
+ * Validates an ACL rule list the way a constructor would and pre-compiles
+ * the patterns. Throws `RangeError` on the first problem — a broken rule
+ * fails at configuration time, never mid-publish. Returns the compiled
+ * rules in evaluation order.
+ */
+function normalizeAclRules(rules: AclRule[] | undefined, caller: string): CompiledAclRule[] {
+  if (rules === undefined) return [];
+  if (!Array.isArray(rules)) {
+    throw new RangeError(`${caller}: acl.rules must be an array`);
+  }
+  return rules.map((rule, index) => {
+    const at = `${caller}: acl.rules[${index}]`;
+    if (typeof rule !== 'object' || rule === null) {
+      throw new RangeError(`${at} must be an object`);
+    }
+    if (typeof rule.pattern !== 'string' || rule.pattern.length === 0) {
+      throw new RangeError(`${at}.pattern must be a non-empty string`);
+    }
+    for (const key of ['publish', 'subscribe'] as const) {
+      const decision = rule[key];
+      if (decision !== undefined && decision !== 'allow' && decision !== 'deny') {
+        throw new RangeError(`${at}.${key} must be 'allow' or 'deny'`);
+      }
+    }
+    if (rule.publish === undefined && rule.subscribe === undefined) {
+      throw new RangeError(`${at} must decide at least one of publish/subscribe`);
+    }
+    return {
+      pattern: rule.pattern,
+      matcher: compilePattern(rule.pattern),
+      publish: rule.publish,
+      subscribe: rule.subscribe,
+    };
+  });
+}
+
 /**
  * Normalizes the `deadLetter` subscribe option into the resolved config,
  * or `null` when the DLQ is disabled. Throws `RangeError` on invalid
@@ -1607,6 +1686,70 @@ export function compilePattern(pattern: string): RegExp {
   }
   source += '$';
   return new RegExp(source);
+}
+
+/**
+ * Collapses runs of consecutive `**` segments into one, mirroring
+ * `compilePattern` (`a.**.**.b` ≡ `a.**.b`).
+ */
+function collapseStars(segments: string[]): string[] {
+  const out: string[] = [];
+  for (const seg of segments) {
+    if (seg === '**' && out[out.length - 1] === '**') continue;
+    out.push(seg);
+  }
+  return out;
+}
+
+/**
+ * Whether two topic patterns can match at least one common topic — the
+ * overlap test the broker-level ACL (EB-41) uses for subscriptions. `*`
+ * matches any single segment, `**` any (possibly empty) run of segments,
+ * other segments match literally; consecutive `**` collapse like in
+ * `compilePattern`.
+ *
+ * Decided by a memoized segment DP: `dp(i, j)` asks whether the pattern
+ * suffixes `a[i:]` and `b[j:]` share a common topic. A `**` on either side
+ * matches zero segments (`dp(i+1, j)` / `dp(i, j+1)`) or consumes one
+ * segment the other side also matches (`dp(i, j+1)` / `dp(i+1, j)`); a
+ * `*` or two equal literals consume one segment each. Every call strictly
+ * grows `i + j`, so the recursion terminates.
+ */
+export function patternsOverlap(a: string, b: string): boolean {
+  const segsA = collapseStars(a.split('.'));
+  const segsB = collapseStars(b.split('.'));
+  const memo = new Map<string, boolean>();
+  const dp = (i: number, j: number): boolean => {
+    const key = `${i},${j}`;
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+    let result: boolean;
+    if (i === segsA.length && j === segsB.length) {
+      result = true;
+    } else if (i === segsA.length) {
+      // `a` is exhausted: `b`'s tail must match zero segments.
+      result = segsB.slice(j).every((s) => s === '**');
+    } else if (j === segsB.length) {
+      result = segsA.slice(i).every((s) => s === '**');
+    } else {
+      const x = segsA[i];
+      const y = segsB[j];
+      if (x === '**' && y === '**') {
+        result = dp(i + 1, j) || dp(i, j + 1) || dp(i + 1, j + 1);
+      } else if (x === '**') {
+        result = dp(i + 1, j) || dp(i, j + 1);
+      } else if (y === '**') {
+        result = dp(i + 1, j) || dp(i, j + 1);
+      } else if (x === '*' || y === '*' || x === y) {
+        result = dp(i + 1, j + 1);
+      } else {
+        result = false;
+      }
+    }
+    memo.set(key, result);
+    return result;
+  };
+  return dp(0, 0);
 }
 
 /**
@@ -1868,18 +2011,22 @@ function resolveHealthProbeOptions(
 export type SchemaValidator = (payload: unknown, topic: string) => boolean;
 
 /**
- * Why one entry of an atomic batch was rejected: its payload failed the
- * topic's schema validator (`'schema'`), or the topic's rate-limit bucket
- * had no token left for it (`'rate-limit'`). TTL expiry is drain-time and
- * never rejects a publish, so it cannot appear here.
+ * Why one entry of an atomic batch was rejected: the ACL denied the publish
+ * (`'acl'`), its payload failed the topic's schema validator (`'schema'`),
+ * or the topic's rate-limit bucket had no token left for it
+ * (`'rate-limit'`). TTL expiry is drain-time and never rejects a publish,
+ * so it cannot appear here.
  */
-export type AtomicRejectReason = 'schema' | 'rate-limit';
+export type AtomicRejectReason = 'acl' | 'schema' | 'rate-limit';
 
 /**
  * Which publish-side admission gate dropped a publish — the unified reason
  * space for `EventBusOptions.onAdmissionRejected`. Each reason maps 1:1
  * onto a stats counter, so hook events reconcile exactly against
  * `getStats()`:
+ * - `'acl'` → `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`
+ *   (broker-level ACL denied the publish, EB-41; shares the rejection
+ *   counter with `'schema'`, distinguished by the reason)
  * - `'schema'` → `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`
  *   (payload failed the topic's schema validator, EB-20)
  * - `'rate-limit'` → `TopicStats.rateLimitedMessages` /
@@ -1888,11 +2035,11 @@ export type AtomicRejectReason = 'schema' | 'rate-limit';
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
- * underlying gate reason (`'schema'` | `'rate-limit'`); the batch rejection
+ * underlying gate reason (`'acl'` | `'schema'` | `'rate-limit'`); the batch rejection
  * is counted once against that entry's topic, so it stays reconcilable
  * too.
  */
-export type AdmissionRejectReason = 'schema' | 'rate-limit' | 'duplicate';
+export type AdmissionRejectReason = 'acl' | 'schema' | 'rate-limit' | 'duplicate';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -1926,6 +2073,117 @@ export interface AdmissionRejectionEvent {
  * the publish path.
  */
 export type AdmissionRejectionCallback = (event: AdmissionRejectionEvent) => void;
+
+/**
+ * Broker-level topic ACL (EB-41): per-topic publish/subscribe permissions
+ * with allow/deny decisions on wildcard patterns.
+ *
+ * Rules are evaluated in registration order; the first rule whose pattern
+ * matches — and that carries an explicit decision for the action being
+ * checked — decides. A rule may decide only one action (the other falls
+ * through to later rules). When no rule decides, `AclOptions.defaultPolicy`
+ * applies (default `'allow'`, so a bus without ACL configured behaves
+ * exactly as before).
+ *
+ * Matching differs by action, because a publish names a concrete topic
+ * while a subscription names a pattern:
+ * - publish: the rule pattern is matched against the concrete topic with
+ *   the bus's usual wildcard semantics (`compilePattern`).
+ * - subscribe: the rule pattern is matched against the *subscription
+ *   pattern* with overlap semantics (`patternsOverlap`) — the rule governs
+ *   the subscription when the two patterns can match at least one common
+ *   topic. This is deliberately conservative for denies: a deny rule
+ *   covering *part* of a subscription's scope denies the whole
+ *   subscription, so a broad pattern cannot silently slip past a narrow
+ *   deny. Design allow-lists with this in mind (prefer exact or narrow
+ *   patterns for subscriptions under `defaultPolicy: 'deny'`).
+ *
+ * Unauthorized publishes are rejected before admission — `publish`
+ * returns 0, the rejection is counted in `TopicStats.rejectedMessages`
+ * (and the global total), surfaced on `onAdmissionRejected` with reason
+ * `'acl'`, and audited via `onAuthzDenied`. Unauthorized subscribes throw
+ * `AclDeniedError` before anything registers, and are audited via
+ * `onAuthzDenied`. Rule changes via `setAclRules` take effect immediately
+ * for subsequent publishes and subscribes — no cached verdicts.
+ */
+export type AclDecision = 'allow' | 'deny';
+
+/** One ACL rule: a topic pattern with allow/deny decisions per action. */
+export interface AclRule {
+  /**
+   * Topic pattern this rule governs (`*` = one segment, `**` = zero or
+   * more segments, same syntax as `subscribe`). Must be non-empty.
+   */
+  pattern: string;
+  /**
+   * Publish decision for topics matching `pattern`; `undefined` means
+   * this rule says nothing about publishing (falls through to later
+   * rules). At least one of `publish`/`subscribe` must be set.
+   */
+  publish?: AclDecision;
+  /**
+   * Subscribe decision for subscription patterns overlapping `pattern`;
+   * `undefined` falls through to later rules.
+   */
+  subscribe?: AclDecision;
+}
+
+/** ACL configuration for `EventBusOptions.acl`. */
+export interface AclOptions {
+  /**
+   * Rules in evaluation order — first matching rule with an explicit
+   * decision for the action wins. Invalid rules throw `RangeError` at
+   * configuration time.
+   */
+  rules?: AclRule[];
+  /**
+   * Verdict when no rule decides an action. Default `'allow'` (a bus
+   * without ACL behaves exactly as before); `'deny'` turns the rule set
+   * into a whitelist.
+   */
+  defaultPolicy?: AclDecision;
+}
+
+/**
+ * Thrown by `subscribe` (and the subscribe-family wrappers) when the
+ * broker-level ACL denies the subscription. The denial is audited via
+ * `EventBusOptions.onAuthzDenied` before the throw, so observers see it
+ * even though the call never returns a subscription.
+ */
+export class AclDeniedError extends Error {
+  /** The denied action — always `'subscribe'` (publishes return 0). */
+  readonly action: 'publish' | 'subscribe';
+  /** The subscription pattern that was denied. */
+  readonly pattern: string;
+
+  constructor(action: 'publish' | 'subscribe', pattern: string) {
+    super(`ACL denied ${action} on pattern "${pattern}"`);
+    this.name = 'AclDeniedError';
+    this.action = action;
+    this.pattern = pattern;
+  }
+}
+
+/**
+ * Authorization-denial audit event (`EventBusOptions.onAuthzDenied`): one
+ * per denied publish or subscribe. Carries the action and the concrete
+ * topic (publish) or subscription pattern (subscribe) — never the
+ * payload. The callback is error-isolated: a throwing hook is swallowed
+ * so a broken observer can never disturb the publish/subscribe path.
+ */
+export interface AuthzDeniedEvent {
+  /** Which operation was denied. */
+  action: 'publish' | 'subscribe';
+  /** The concrete topic of a denied publish (absent for subscribes). */
+  topic?: string;
+  /** The subscription pattern of a denied subscribe (absent for publishes). */
+  pattern?: string;
+  /** Bus-clock timestamp of the denial (`EventBusOptions.now`). */
+  at: number;
+}
+
+/** Authorization-denial audit hook (see `EventBusOptions.onAuthzDenied`). */
+export type AuthzDeniedCallback = (event: AuthzDeniedEvent) => void;
 
 /**
  * Which entry of a `publishAtomic` batch failed admission, and why.
@@ -2469,6 +2727,25 @@ export class EventBus {
    */
   private readonly onAdmissionRejected: AdmissionRejectionCallback | undefined;
   /**
+   * Authorization-denial audit hook (`EventBusOptions.onAuthzDenied`), or
+   * `undefined` when unset.
+   */
+  private readonly onAuthzDenied: AuthzDeniedCallback | undefined;
+  /**
+   * Compiled broker-level ACL rules in evaluation order
+   * (`EventBusOptions.acl` / `setAclRules`). Empty means no ACL — every
+   * verdict falls through to `aclDefault`.
+   */
+  private aclRules: CompiledAclRule[] = [];
+  /** Verdict when no ACL rule decides an action (default `'allow'`). */
+  private aclDefault: AclDecision = 'allow';
+  /**
+   * Publish/subscribe operations denied by the ACL (global total, see
+   * `BusStats.authzDenied`). Denied publishes are additionally counted in
+   * `totalRejected`; denied subscribes throw `AclDeniedError`.
+   */
+  private totalAuthzDenied = 0;
+  /**
    * Messages skipped by subscriber content filters (global total, see
    * `SubscribeOptions.filter`). A filtered message was fanned out but
    * never entered the rejecting subscriber's queue — no backpressure
@@ -2660,6 +2937,17 @@ export class EventBus {
       throw new RangeError('onAdmissionRejected must be a function');
     }
     this.onAdmissionRejected = onAdmissionRejected;
+    const onAuthzDenied = options?.onAuthzDenied;
+    if (onAuthzDenied !== undefined && typeof onAuthzDenied !== 'function') {
+      throw new RangeError('onAuthzDenied must be a function');
+    }
+    this.onAuthzDenied = onAuthzDenied;
+    const aclDefault = options?.acl?.defaultPolicy ?? 'allow';
+    if (aclDefault !== 'allow' && aclDefault !== 'deny') {
+      throw new RangeError("acl.defaultPolicy must be 'allow' or 'deny'");
+    }
+    this.aclDefault = aclDefault;
+    this.aclRules = normalizeAclRules(options?.acl?.rules, 'EventBus');
     if (options?.durableLogDir != null) {
       this.durableLog = DurableTopicLog.open({
         dir: options.durableLogDir,
@@ -2889,6 +3177,67 @@ export class EventBus {
    */
   clearTopicSchema(topicPattern: string): boolean {
     return this.schemaRules.delete(topicPattern);
+  }
+
+  /**
+   * Replaces the broker-level ACL rule list (see `AclRule`). The new rules
+   * take effect immediately: the very next `publish`/`subscribe` is judged
+   * by them — no cached verdicts, no restart needed. This is the runtime
+   * half of the ACL; the initial list comes from `EventBusOptions.acl`
+   * (note: `defaultPolicy` is set once via the constructor options and is
+   * not changed here).
+   *
+   * Rules are evaluated in array order; the first rule whose pattern
+   * matches — with an explicit decision for the action — wins. Publish
+   * checks match the rule pattern against the concrete topic; subscribe
+   * checks use overlap semantics (`patternsOverlap`): a deny rule covering
+   * any part of the subscription's scope denies the whole subscription.
+   * Throws `RangeError` on invalid rules, before anything is replaced.
+   */
+  setAclRules(rules: AclRule[]): void {
+    this.aclRules = normalizeAclRules(rules, 'setAclRules');
+  }
+
+  /**
+   * Returns the current ACL rule list (a copy — mutating it changes
+   * nothing; use `setAclRules` to replace).
+   */
+  getAclRules(): AclRule[] {
+    return this.aclRules.map((rule) => ({
+      pattern: rule.pattern,
+      ...(rule.publish !== undefined ? { publish: rule.publish } : {}),
+      ...(rule.subscribe !== undefined ? { subscribe: rule.subscribe } : {}),
+    }));
+  }
+
+  /**
+   * ACL verdict for a concrete publish topic: the first rule (in
+   * registration order) whose pattern matches the topic and that carries
+   * an explicit publish decision wins; when no rule decides, the default
+   * policy applies.
+   */
+  private aclAllowsPublish(topic: string): boolean {
+    for (const rule of this.aclRules) {
+      if (rule.publish !== undefined && rule.matcher.test(topic)) {
+        return rule.publish === 'allow';
+      }
+    }
+    return this.aclDefault === 'allow';
+  }
+
+  /**
+   * ACL verdict for a subscription pattern: the first rule (in
+   * registration order) whose pattern overlaps the subscription pattern
+   * (`patternsOverlap`) and that carries an explicit subscribe decision
+   * wins; when no rule decides, the default policy applies.
+   */
+  private aclAllowsSubscribe(pattern: string): boolean {
+    for (const rule of this.aclRules) {
+      if (rule.subscribe !== undefined && patternsOverlap(rule.pattern, pattern)) {
+        return rule.subscribe === 'allow';
+      }
+    }
+    return this.aclDefault === 'allow';
   }
 
   /**
@@ -3144,6 +3493,15 @@ export class EventBus {
     // half-registered subscriber behind.
     const resumeFromSeq = opts?.resumeFromSeq;
     this.validateResumeFromSeq(resumeFromSeq);
+    // Broker-level ACL: an unauthorized subscription is audited and then
+    // rejected with a clear error before anything registers — the caller
+    // must not mistake silence for success. Applies to the subscribe
+    // family uniformly (subscribeReliable, consumer groups, ...), since
+    // they all funnel through here.
+    if (!this.aclAllowsSubscribe(topicPattern)) {
+      this.emitAuthzDenied('subscribe', undefined, topicPattern);
+      throw new AclDeniedError('subscribe', topicPattern);
+    }
     const id = `sub-${++this.nextId}`;
     const capacity = opts?.queueSize ?? 100;
     const onBackpressure = opts?.onBackpressure;
@@ -4481,8 +4839,10 @@ export class EventBus {
    * publishing again, so the downstream sees the message exactly once and
    * a retried order or settlement can never double-execute.
    *
-   * The dedup gate runs before admission, ahead of everything else: a
-   * duplicate consumes no sequence number (subscribers see no phantom
+   * The broker-level ACL runs before the dedup gate: a denied publish
+   * claims no dedup slot and reports `{ duplicate: false, accepted: 0 }`.
+   * The dedup gate then runs before admission, ahead of everything else:
+   * a duplicate consumes no sequence number (subscribers see no phantom
    * gap), is never written to the durable log, and burns no rate-limit
    * budget. Schema validation is not re-run for a duplicate either — the
    * gate decides on the identity alone.
@@ -4526,6 +4886,13 @@ export class EventBus {
       const { accepted } = this.fanOut(topic, payload, false, undefined, opts?.key);
       this.scheduleFlush();
       return { duplicate: false, accepted };
+    }
+    // Authorization precedes identity: a denied publish claims no dedup
+    // slot and reports `{ duplicate: false, accepted: 0 }` — it was
+    // denied, not deduplicated, and its retry stays a fresh publish.
+    if (!this.aclAllowsPublish(topic)) {
+      this.countAclDenied(topic, payload);
+      return { duplicate: false, accepted: 0 };
     }
     const nowMs = this.now();
     const dedupKey = `${topic}\0${messageId}`;
@@ -4587,8 +4954,9 @@ export class EventBus {
    * subscriber ever observes a partial batch:
    *
    * 1. Admission: every entry is checked against the same admission gates
-   *    `publish` applies — schema validation, then the per-topic
-   *    rate-limit budget — without mutating any bus state. Rate-limit
+   *    `publish` applies — the broker-level ACL, then schema validation,
+   *    then the per-topic rate-limit budget — without mutating any bus
+   *    state. Rate-limit
    *    tokens are charged against a per-batch shadow balance, so a batch
    *    cannot overdraft the bucket with its own entries. The first entry
    *    that would be rejected or shed aborts the whole batch.
@@ -4645,6 +5013,7 @@ export class EventBus {
         // stays untouched: no sequence numbers, no rate-limit tokens, no
         // durable-log writes.
         if (reason === 'schema') this.countSchemaRejection(topic, payload);
+        else if (reason === 'acl') this.countAclDenied(topic, payload);
         else this.countRateLimited(topic, payload);
         return { published: 0, rejected: { index, topic, reason } };
       }
@@ -4692,6 +5061,9 @@ export class EventBus {
     payload: unknown,
     shadowBudget: Map<string, number>,
   ): AtomicRejectReason | undefined {
+    // The ACL is the first admission gate everywhere, including the atomic
+    // batch's shadow admission: an unauthorized entry aborts the batch.
+    if (!this.aclAllowsPublish(topic)) return 'acl';
     const validator = this.schemaForTopic(topic);
     if (validator !== undefined && !validator(payload, topic)) return 'schema';
     const limit = this.rateLimitForTopic(topic);
@@ -4768,6 +5140,13 @@ export class EventBus {
       if (!Number.isFinite(deliverAt)) {
         throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
       }
+    }
+    // Fail fast on ACL: an unauthorized publish never becomes a scheduled
+    // delivery — no id, nothing in the heap, nothing on disk. Counted the
+    // same way a `publish` ACL denial is.
+    if (!this.aclAllowsPublish(topic)) {
+      this.countAclDenied(topic, payload);
+      return undefined;
     }
     // Fail fast on schema: a rejected payload never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
@@ -5126,6 +5505,44 @@ export class EventBus {
     this.statsFor(topic).duplicateMessages += 1;
     this.totalDuplicates += 1;
     this.emitAdmissionRejected(topic, 'duplicate', payload);
+  }
+
+  /**
+   * Counts one publish denied by the broker-level ACL against the topic
+   * and the global totals. A denial is a rejection before admission — like
+   * a schema rejection it consumes no sequence number, never touches the
+   * durable log, and burns no rate-limit budget — so it lands in
+   * `rejectedMessages` (the backlog-visible "rejected" metric), surfaces on
+   * the admission-rejection hook with reason `'acl'`, and additionally
+   * fires the authz audit hook.
+   */
+  private countAclDenied(topic: string, payload: unknown): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
+    this.emitAdmissionRejected(topic, 'acl', payload);
+    this.emitAuthzDenied('publish', topic, undefined);
+  }
+
+  /**
+   * Fires the authorization-denial audit hook (`authz_denied`) and counts
+   * the denial in `BusStats.authzDenied`. Runs after the stats counters
+   * moved. Error-isolated: a throwing hook is swallowed — a broken
+   * observer must never disturb the publish/subscribe path. No-op when no
+   * hook is configured (the counter still moves).
+   */
+  private emitAuthzDenied(
+    action: 'publish' | 'subscribe',
+    topic: string | undefined,
+    pattern: string | undefined,
+  ): void {
+    this.totalAuthzDenied += 1;
+    const hook = this.onAuthzDenied;
+    if (hook === undefined) return;
+    try {
+      hook({ action, topic, pattern, at: this.now() });
+    } catch {
+      // Swallowed: the hook is an observer, not part of the path.
+    }
   }
 
   /**
@@ -5632,6 +6049,15 @@ export class EventBus {
     // topic's stats entry, which is created here when the topic has never
     // published anything valid yet.
     if (!preAdmitted) {
+      // Broker-level ACL runs before every other admission gate: an
+      // unauthorized publish is rejected before schema validation — it
+      // consumes no sequence number (subscribers see no gap), never touches
+      // the durable log, and burns no rate-limit budget. Counted as a
+      // rejection with reason 'acl' (see countAclDenied).
+      if (!this.aclAllowsPublish(topic)) {
+        this.countAclDenied(topic, payload);
+        return { matched: 0, accepted: 0, admitted: false };
+      }
       const validator = this.schemaForTopic(topic);
       if (validator !== undefined && !validator(payload, topic)) {
         this.countSchemaRejection(topic, payload);
@@ -5983,6 +6409,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       rejectedMessages: this.totalRejected,
+      authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
       filteredMessages: this.totalFiltered,
       deadLetteredMessages: this.totalDeadLettered,

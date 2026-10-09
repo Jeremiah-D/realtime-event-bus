@@ -291,13 +291,38 @@ library.
   idempotency-duplicate suppressions, and `publishAtomic` batch rejections
   (surfaced with the failing entry's gate reason) — fires one
   `AdmissionRejectionEvent { topic, reason, payloadBytes, at }`. `reason`
-  (`'schema' | 'rate-limit' | 'duplicate'`) maps 1:1 onto the stats counters
+  (`'acl' | 'schema' | 'rate-limit' | 'duplicate'`) maps onto the stats counters
   (`rejectedMessages` / `rateLimitedMessages` / `duplicateMessages`), so
   hook events reconcile exactly with `getStats()`. The hook fires after the
   counters move, carries the rejected payload's byte size (never the payload
   itself), and is error-isolated — a throwing hook is swallowed so it can
   never disturb the publish path. Unset by default (stats counting only —
   fully backward compatible).
+- **Broker-level topic ACL** (in `src/bus.ts`, via `EventBusOptions.acl` /
+  `setAclRules(rules)`): per-topic publish/subscribe permissions with
+  allow/deny decisions on wildcard patterns (`{ pattern: 'admin.**',
+  publish: 'deny' }`). Rules are evaluated in registration order — the first
+  rule whose pattern matches, with an explicit decision for the action, wins;
+  `defaultPolicy` (default `'allow'`) covers everything no rule decides, so a
+  bus without ACL behaves exactly as before, while `'deny'` turns the rule
+  set into a whitelist. Publish checks match the rule pattern against the
+  concrete topic; subscribe checks use overlap semantics (`patternsOverlap`,
+  exported): a deny rule covering any part of a subscription's scope denies
+  the whole subscription, so a broad pattern cannot slip past a narrow deny.
+  The ACL is the first admission gate everywhere (`publish`,
+  `publishBatch`, `publishAtomic` shadow admission, `publishDelayed`
+  fail-fast, and before the `publishIdempotent` dedup gate): an unauthorized
+  publish returns 0, consumes no sequence number, never touches the durable
+  log, and burns no rate-limit budget — counted in
+  `TopicStats.rejectedMessages` (the "rejected" metric), surfaced on
+  `onAdmissionRejected` with reason `'acl'`, and audited via
+  `EventBusOptions.onAuthzDenied` as `authz_denied`. An unauthorized
+  subscribe throws `AclDeniedError` before anything registers (also
+  audited — the hook is its only audit channel, since nothing is returned).
+  `setAclRules` replaces the rule list with immediate effect — no cached
+  verdicts, no restart; `getAclRules` returns a copy. `getStats().authzDenied`
+  counts every denied publish and subscribe — the security-relevant counter
+  to alert on. Invalid rules throw `RangeError` at configuration time.
 - **Per-topic payload compression** (in `src/bus.ts`, via
   `setTopicCompression(pattern, { thresholdBytes, level })`): opt-in
   `node:zlib` deflate for large payloads — zero new dependencies. A publish
