@@ -322,6 +322,24 @@ library.
   and `eventbus_delivery_latency_samples{subscriber,pattern}` gauges (four
   series per tracked subscriber; untracked subscribers add none). Invalid
   options throw `RangeError` from `subscribe`. Disabled by default.
+- **Subscriber batch delivery** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { batch: true })`): the drain collects up to `maxSize`
+  queued messages (default 100) and invokes the handler once with the
+  array, amortizing per-message callback overhead — the same `BusMessage`
+  objects a plain handler would receive, in publish order. A partial batch
+  lingers for up to `maxWaitMs` (default 10 ms) to let a burst that is
+  still arriving fill it; a full batch is always delivered immediately.
+  Composes with the other delivery features: reliable subscriptions
+  receive one `Delivery` envelope per message in the batch (ack each to
+  confirm; nacking the whole batch requeues it in FIFO order, and ack
+  timeouts / the DLQ keep per-message semantics); `deliveryShaping` bounds
+  the batch by the shaping budget (the whole batch consumes one token per
+  message); the health probe counts one batch call as one failure; latency
+  sampling records every message individually; a message that expires
+  while its batch is filling is dropped as expired at hand-off, not
+  resurrected. Invalid options throw `RangeError` from `subscribe`.
+  Disabled by default. `bench/batch.bench.ts` measures the before/after
+  throughput — see [Benchmark](#benchmark).
 - **Atomic cross-topic batch publish** (in `src/bus.ts`, via
   `publishAtomic(entries)`): all-or-nothing fan-out for multi-message
   batches — subscribers either see every message or none. Admission runs in
@@ -474,6 +492,18 @@ npm test
   pattern-vs-exact rule resolution matching `publish`, batch-order delivery
   with independent per-topic seqs, durable-log writes on commit, and
   downstream per-message drop policies still applying.
+- `test/batch.test.ts` — subscriber batch delivery: full batches delivered
+  immediately as one array call, partial batches lingering up to
+  `maxWaitMs` (including arrivals during the linger), `maxWaitMs: 0`
+  per-flush delivery, backlog draining across flushes, option validation
+  (`RangeError`/`TypeError` before registering), `batch: true` defaults,
+  unsubscribe dropping the pending batch and clearing the timer, TTL
+  expiry while lingering (dropped, not resurrected), per-message sequence
+  gap detection, per-message latency sampling, reliable batches (per-message
+  `Delivery` envelopes, batch ack, whole-batch nack requeuing in FIFO
+  order, throwing handler with DLQ), and composition with delivery shaping
+  (budget-bounded batches), the health probe (one batch call = one
+  failure), and content filters.
 - `test/delayed.test.ts` — delayed delivery: not delivered before the due
   time, due-time ordering across schedules, immediate fan-out for
   `delayMs: 0` / past `deliverAt`, `cancelDelayed` (pending cancel, double
@@ -584,6 +614,36 @@ B-before). Rerun the script to reproduce.
 
 ```bash
 node bench/index.bench.ts
+```
+
+## Batch delivery benchmark
+
+`bench/batch.bench.ts` measures end-to-end delivery throughput with and
+without `SubscribeOptions.batch` (`maxSize: 100`, `maxWaitMs: 0`) under a
+streaming pattern — 20,000 messages in 200 rounds of 100, one flush per
+round — in two handler profiles:
+
+- **lean handler**: tiny per-message work only (field access + accumulate).
+- **framed handler**: the same plus a fixed ~2.6 µs per-invocation cost
+  (framing a bulk write / opening a transaction — the real reason to
+  batch).
+
+Results measured 2026-10-08 on Node v24.20.0, 2-vCPU AMD EPYC 9D25 VM
+(median of 5 trials per path):
+
+| scenario | plain (20,000 handler calls) | batch (200 handler calls) |
+| -------- | ---------------------------- | ------------------------- |
+| lean handler | 2,070,458 msgs/sec | 1,900,746 msgs/sec (~0.92×) |
+| framed handler | 351,783 msgs/sec | 2,075,355 msgs/sec (~5.9×) |
+
+The honest read: with a trivial handler, batching is throughput-neutral
+(it collapses 20,000 invocations to 200 at no throughput cost); the win
+appears exactly where batching is meant to be used — when the handler
+pays a fixed per-call cost, amortizing it over 100 messages yields ~6×.
+Rerun the script to reproduce.
+
+```bash
+node bench/batch.bench.ts
 ```
 
 ## Prometheus metrics

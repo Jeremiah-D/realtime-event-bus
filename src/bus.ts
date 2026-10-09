@@ -35,6 +35,15 @@ export interface BusMessage {
 export type MessageHandler = (msg: BusMessage) => void;
 
 /**
+ * Handler for batched subscriptions (see `SubscribeOptions.batch`):
+ * receives an array of messages — up to `maxSize` — instead of one
+ * message per call. The array is a fresh array per batch; the messages
+ * inside are the same `BusMessage` objects a plain handler would receive,
+ * in publish order.
+ */
+export type BatchMessageHandler = (messages: BusMessage[]) => void;
+
+/**
  * Subscriber content filter (see `SubscribeOptions.filter`): receives the
  * raw published payload and the concrete topic, returns `true` to accept
  * the message into the subscriber's queue, `false` to skip it. Filters
@@ -49,6 +58,16 @@ export type MessageFilter = (payload: unknown, topic: string) => boolean;
  * envelope with `ack()`/`nack()` instead of a bare message.
  */
 export type ReliableMessageHandler = (delivery: Delivery<BusMessage>) => void;
+
+/**
+ * Handler for batched reliable subscriptions (see `SubscribeOptions.batch`
+ * with `subscribeReliable`): receives one at-least-once `Delivery`
+ * envelope per message in the batch, in publish order. Ack or nack each
+ * delivery individually — acking every delivery confirms the batch, and
+ * nacking requeues that message for redelivery (see `Delivery.nack`),
+ * preserving the batch's FIFO order when the whole batch is nacked.
+ */
+export type ReliableBatchMessageHandler = (deliveries: Delivery<BusMessage>[]) => void;
 
 export interface SubscribeOptions {
   /** Per-subscriber bounded queue capacity (default 100). */
@@ -207,6 +226,59 @@ export interface SubscribeOptions {
    * from `subscribe`. Disabled by default.
    */
   filter?: MessageFilter;
+  /**
+   * Opt-in subscriber-side batch delivery. When enabled, the drain
+   * collects up to `maxSize` queued messages and invokes the handler once
+   * with the array, amortizing per-message callback overhead — the same
+   * messages a plain handler would receive, in publish order. When fewer
+   * than `maxSize` messages are queued, the bus holds the partial batch
+   * for up to `maxWaitMs` to let it fill before delivering it; a full
+   * batch is always delivered immediately, never held for the timer.
+   *
+   * Composes with the other delivery features:
+   * - reliable (`subscribeReliable`): the handler receives one `Delivery`
+   *   envelope per message in the batch — ack each one to confirm the
+   *   batch; nacking requeues that message at the tail, so nacking the
+   *   whole batch requeues it in FIFO order. Ack timeouts and the DLQ
+   *   keep their per-message semantics.
+   * - `deliveryShaping`: the batch is bounded by the shaping budget — the
+   *   whole batch consumes budget, one token per message.
+   * - `throttle`: publish-side shedding is unchanged; only queued
+   *   messages are batched.
+   * - `healthProbe`: the batch is one handler invocation — a throw (or a
+   *   processing timeout) counts as one failure.
+   * - `deliveryLatency`: every message in the batch is sampled
+   *   individually (enqueue→hand-off queue dwell).
+   * - TTL: a message that expires while its batch is filling is dropped
+   *   as expired at hand-off, not resurrected.
+   *
+   * Pass `true` for the defaults (`maxSize` 100, `maxWaitMs` 10), or a
+   * `BatchDeliveryOptions` object to tune them. Invalid values throw
+   * `RangeError` from `subscribe`. Disabled by default.
+   */
+  batch?: boolean | BatchDeliveryOptions;
+}
+
+/**
+ * Tuning for subscriber-side batch delivery (`SubscribeOptions.batch`).
+ * Bounds are validated at `subscribe` time; violations throw `RangeError`.
+ */
+export interface BatchDeliveryOptions {
+  /**
+   * Maximum messages per handler invocation. The drain collects at most
+   * this many queued messages into one batch; a full batch is delivered
+   * immediately. Must be a positive integer. Default 100.
+   */
+  maxSize?: number;
+  /**
+   * How long a partial batch may wait to fill, in milliseconds. When the
+   * drain finds fewer than `maxSize` messages queued, it holds them for up
+   * to this long before delivering the partial batch — the classic
+   * micro-batch linger. `0` disables lingering: each flush delivers
+   * whatever is queued, up to `maxSize`. Must be a finite number `>= 0`.
+   * Default 10.
+   */
+  maxWaitMs?: number;
 }
 
 /**
@@ -985,6 +1057,11 @@ interface Subscriber {
    * Absent when the subscriber has no filter.
    */
   filter?: MessageFilter;
+  /**
+   * Batch-delivery state (see `SubscribeOptions.batch`). Absent when
+   * batching is disabled for this subscriber.
+   */
+  batch?: BatchDeliveryState;
 }
 
 /**
@@ -1272,6 +1349,45 @@ function resolveDeliveryShapingOptions(
     burst,
     timer: undefined,
   };
+}
+
+/**
+ * Per-subscriber batch-delivery state (see `SubscribeOptions.batch`).
+ * `pending` holds messages already dequeued for the current batch while it
+ * waits to fill (up to `maxWaitMs`); they are no longer in the queue, so
+ * unsubscribe drops them like any other undelivered backlog.
+ */
+interface BatchDeliveryState {
+  maxSize: number;
+  maxWaitMs: number;
+  /** Messages collected for the current batch, already dequeued, in order. */
+  pending: BusMessage[];
+  /** Linger timer armed while a partial batch waits to fill. */
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Validates `SubscribeOptions.batch` and builds the initial batch state.
+ * Returns `undefined` when batching is disabled. Throws `RangeError` for
+ * invalid sizes or waits.
+ */
+function resolveBatchDeliveryOptions(
+  opt: boolean | BatchDeliveryOptions | undefined,
+): BatchDeliveryState | undefined {
+  if (opt == null || opt === false) return undefined;
+  if (opt !== true && (typeof opt !== 'object' || opt === null)) {
+    throw new TypeError('batch must be true or a BatchDeliveryOptions object');
+  }
+  const o: BatchDeliveryOptions = opt === true ? {} : opt;
+  const maxSize = o.maxSize ?? 100;
+  if (!Number.isInteger(maxSize) || maxSize <= 0) {
+    throw new RangeError('batch.maxSize must be a positive integer');
+  }
+  const maxWaitMs = o.maxWaitMs ?? 10;
+  if (!Number.isFinite(maxWaitMs) || maxWaitMs < 0) {
+    throw new RangeError('batch.maxWaitMs must be a finite number of milliseconds >= 0');
+  }
+  return { maxSize, maxWaitMs, pending: [], timer: undefined };
 }
 
 /**
@@ -2414,7 +2530,21 @@ export class EventBus {
    * behind (its queue reaches the high-water mark); `droppedCount` reports how
    * many of its messages were shed.
    */
-  subscribe(topicPattern: string, handler: MessageHandler, opts?: SubscribeOptions): Subscription {
+  subscribe(topicPattern: string, handler: MessageHandler, opts?: SubscribeOptions): Subscription;
+  /**
+   * Batched overload: with `batch` enabled the handler receives up to
+   * `maxSize` messages per call (see `BatchMessageHandler`).
+   */
+  subscribe(
+    topicPattern: string,
+    handler: BatchMessageHandler,
+    opts: SubscribeOptions & { batch: true | BatchDeliveryOptions },
+  ): Subscription;
+  subscribe(
+    topicPattern: string,
+    handler: MessageHandler | BatchMessageHandler,
+    opts?: SubscribeOptions,
+  ): Subscription {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const resumeFromSeq = opts?.resumeFromSeq;
@@ -2433,6 +2563,9 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const batch = resolveBatchDeliveryOptions(opts?.batch);
     const onDegraded = opts?.onDegraded;
     const filter = opts?.filter;
     if (filter !== undefined && typeof filter !== 'function') {
@@ -2483,13 +2616,16 @@ export class EventBus {
       id,
       pattern: topicPattern,
       matcher: this.compiledMatcher(topicPattern),
-      handler,
+      // A batched handler receives an array per call; the cast is safe —
+      // drainSubscriber only ever passes an array to batched subscribers.
+      handler: handler as MessageHandler,
       queue,
       lastDeliveredSeq: new Map(),
       throttle,
       onThrottled,
       deliveryShaping,
       latency: deliveryLatency,
+      batch,
       health:
         healthProbe == null
           ? undefined
@@ -2530,6 +2666,7 @@ export class EventBus {
           health.autoResumeTimer = undefined;
         }
         this.clearShapingTimer(subscriber);
+        this.clearBatchTimer(subscriber);
         const bucket = this.prefixIndex.get(indexKey);
         if (bucket != null) {
           bucket.delete(id);
@@ -2574,6 +2711,22 @@ export class EventBus {
     topicPattern: string,
     handler: ReliableMessageHandler,
     opts?: ReliableSubscribeOptions,
+  ): Subscription;
+  /**
+   * Batched reliable overload: with `batch` enabled the handler receives
+   * one `Delivery` envelope per message in the batch (see
+   * `ReliableBatchMessageHandler`) — ack each delivery to confirm the
+   * batch, nack to requeue.
+   */
+  subscribeReliable(
+    topicPattern: string,
+    handler: ReliableBatchMessageHandler,
+    opts: ReliableSubscribeOptions & { batch: true | BatchDeliveryOptions },
+  ): Subscription;
+  subscribeReliable(
+    topicPattern: string,
+    handler: ReliableMessageHandler | ReliableBatchMessageHandler,
+    opts?: ReliableSubscribeOptions,
   ): Subscription {
     // The bus flush calls `Subscriber.handler` with bare messages; wrap it
     // so reliable subscribers transparently get tracked deliveries instead.
@@ -2581,8 +2734,8 @@ export class EventBus {
     // Validate the DLQ options before subscribing: a rejected option must
     // not leave a half-registered subscription behind.
     const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable');
-    let deliver!: (msg: BusMessage) => void;
-    const sub = this.subscribe(topicPattern, (msg) => deliver(msg), opts);
+    let deliver!: (msg: BusMessage | BusMessage[]) => void;
+    const sub = this.subscribe(topicPattern, (msg: BusMessage | BusMessage[]) => deliver(msg), opts);
     const subscriber = this.subscribers.get(sub.id);
     if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
     const redeliveries = new WeakMap<BusMessage, number>();
@@ -2607,10 +2760,32 @@ export class EventBus {
     if (dlq != null) {
       subscriber.deadLetter = { entries: [], nextSeq: 0, ...dlq };
     }
-    deliver = (msg) => {
+    deliver = (msgOrBatch) => {
+      // Batched delivery: one tracked envelope per message in the batch,
+      // handed to the handler as a single array call.
+      if (Array.isArray(msgOrBatch)) {
+        const batchHandler = handler as ReliableBatchMessageHandler;
+        const deliveries = msgOrBatch.map((m) => tracker.track(m, redeliveries.get(m) ?? 0));
+        if (dlq == null) {
+          batchHandler(deliveries);
+          return;
+        }
+        // With a DLQ configured, a synchronously throwing batch handler
+        // nacks the whole batch instead of crashing the bus: every message
+        // is requeued in batch order, so the redelivery preserves FIFO —
+        // the batch analogue of the single-message nack path below.
+        try {
+          batchHandler(deliveries);
+        } catch {
+          for (const d of deliveries) d.nack();
+        }
+        return;
+      }
+      const msg = msgOrBatch;
+      const singleHandler = handler as ReliableMessageHandler;
       const delivery = tracker.track(msg, redeliveries.get(msg) ?? 0);
       if (dlq == null) {
-        handler(delivery);
+        singleHandler(delivery);
         return;
       }
       // With a DLQ configured, a synchronously throwing handler is an
@@ -2621,7 +2796,7 @@ export class EventBus {
       // and inside the redelivery budget — repeated throws land the
       // message in the DLQ instead of crashing the bus.
       try {
-        handler(delivery);
+        singleHandler(delivery);
       } catch {
         delivery.nack();
       }
@@ -4375,6 +4550,12 @@ export class EventBus {
     // queued under the normal backpressure policy, untouched by the
     // drain, so resuming picks up exactly where delivery paused.
     if (subscriber.health?.degraded === true) return;
+    // Batched subscribers collect messages across flush rounds instead of
+    // delivering one message per handler call (see drainBatchedSubscriber).
+    if (subscriber.batch != null) {
+      this.drainBatchedSubscriber(subscriber, nowMs);
+      return;
+    }
     const shaping = subscriber.deliveryShaping;
     const maxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
     const { live, expired } = subscriber.queue.drainLiveUpTo(nowMs, maxLive);
@@ -4422,6 +4603,172 @@ export class EventBus {
       } else {
         this.clearShapingTimer(subscriber);
       }
+    }
+  }
+
+  /**
+   * Drain path for batched subscribers (see `SubscribeOptions.batch`):
+   * instead of handing each message to the handler, the drain collects
+   * queued messages into the subscriber's pending batch. A batch that
+   * reaches `maxSize` is delivered immediately; a partial batch lingers
+   * for up to `maxWaitMs` so a burst that is still arriving fills it
+   * before the handler is invoked.
+   *
+   * With `deliveryShaping` the collection is bounded by the shaping
+   * budget — a batch never delivers more than the budget allows in one
+   * round, and the delivered batch consumes one token per message.
+   */
+  private drainBatchedSubscriber(subscriber: Subscriber, nowMs: number): void {
+    const batch = subscriber.batch;
+    if (batch == null) return;
+    const shaping = subscriber.deliveryShaping;
+    const budget = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
+    if (budget >= 1) {
+      const room = batch.maxSize - batch.pending.length;
+      if (room > 0) {
+        const { live, expired } = subscriber.queue.drainLiveUpTo(nowMs, Math.min(room, budget));
+        for (const msg of expired) {
+          this.recordExpired(msg.topic);
+        }
+        batch.pending.push(...live);
+      }
+    } else if (shaping != null) {
+      // No shaping budget this round: hold everything back, exactly like
+      // the plain path — the pending batch counts as backlog too.
+      shaping.shaping = subscriber.queue.size > 0 || batch.pending.length > 0;
+      if (shaping.shaping) {
+        this.armShapingTimer(subscriber);
+      } else {
+        this.clearShapingTimer(subscriber);
+      }
+      return;
+    }
+    if (batch.pending.length >= batch.maxSize) {
+      this.deliverBatch(subscriber, nowMs);
+    } else if (batch.pending.length > 0) {
+      this.armBatchTimer(subscriber);
+    } else {
+      this.clearBatchTimer(subscriber);
+    }
+  }
+
+  /**
+   * Hands the subscriber's pending batch to its handler as a single
+   * array call. Messages that expired while the batch was filling are
+   * dropped as expired at hand-off, not resurrected; an all-expired batch
+   * never invokes the handler. Per-message bookkeeping (payload
+   * inflation, gap detection, delivery counting, latency sampling) runs
+   * exactly as for single deliveries, then the batch goes through the
+   * one-call health accounting when a probe is configured.
+   *
+   * After delivering, a still-non-empty queue schedules another flush so
+   * batching continues until the backlog is drained.
+   */
+  private deliverBatch(subscriber: Subscriber, nowMs: number): void {
+    const batch = subscriber.batch;
+    if (batch == null) return;
+    this.clearBatchTimer(subscriber);
+    const pending = batch.pending;
+    batch.pending = [];
+    if (pending.length === 0) return;
+    const live: BusMessage[] = [];
+    for (const msg of pending) {
+      const deadline = this.messageDeadlines.get(msg);
+      if (deadline !== undefined && nowMs >= deadline) {
+        this.recordExpired(msg.topic);
+      } else {
+        live.push(msg);
+      }
+    }
+    if (live.length === 0) return;
+    // The whole batch occupies shaping budget: one token per message,
+    // mirroring the plain path's one take per delivered message.
+    const shaping = subscriber.deliveryShaping;
+    if (shaping != null) {
+      for (let i = 0; i < live.length; i += 1) shaping.bucket.take();
+    }
+    for (const msg of live) {
+      this.inflateMessagePayload(msg);
+      this.detectGap(subscriber, msg);
+      this.totalDelivered += 1;
+      // Sampled before the handler runs: queue dwell, not processing time.
+      this.recordDeliveryLatency(subscriber, msg, nowMs);
+    }
+    if (subscriber.health == null) {
+      subscriber.handler(live as unknown as BusMessage);
+    } else {
+      this.deliverBatchWithHealth(subscriber, live, nowMs);
+    }
+    if (subscriber.queue.size > 0) {
+      this.scheduleFlush();
+    }
+  }
+
+  /**
+   * Health-probe accounting for one batched handler invocation: the batch
+   * is a single delivery — a throw (or a processing-timeout overrun)
+   * counts as one failure, a clean return resets the consecutive-failure
+   * counter. Like the single-message path, a failed plain batch is
+   * consumed; reliable subscriptions requeue through the ACK wrapper's
+   * nack path before this accounting runs.
+   */
+  private deliverBatchWithHealth(subscriber: Subscriber, batch: BusMessage[], nowMs: number): void {
+    const health = subscriber.health;
+    if (health == null) return;
+    const budgetMs = health.processingTimeoutMs;
+    const startedAtMs = budgetMs !== undefined ? this.now() : 0;
+    let failed = false;
+    let reason: 'error' | 'timeout' = 'error';
+    try {
+      subscriber.handler(batch as unknown as BusMessage);
+    } catch {
+      failed = true;
+    }
+    if (!failed && budgetMs !== undefined && this.now() - startedAtMs > budgetMs) {
+      failed = true;
+      reason = 'timeout';
+    }
+    if (!failed) {
+      health.consecutiveFailures = 0;
+      return;
+    }
+    health.consecutiveFailures += 1;
+    if (!health.degraded && health.consecutiveFailures >= health.maxConsecutiveFailures) {
+      this.pauseForHealth(subscriber, reason);
+      this.reportDegraded(subscriber);
+    }
+  }
+
+  /**
+   * Arms the linger timer for a partial batch: if no flush fills the
+   * batch within `maxWaitMs`, the timer delivers whatever was collected.
+   * The timer never keeps the process alive on its own, and unsubscribe
+   * clears it (see `clearBatchTimer`).
+   */
+  private armBatchTimer(subscriber: Subscriber): void {
+    const batch = subscriber.batch;
+    if (batch == null || batch.timer !== undefined) return;
+    const timer = setTimeout(() => {
+      batch.timer = undefined;
+      // The subscriber may have unsubscribed while the timer was armed —
+      // only a still-registered subscriber delivers here.
+      if (this.subscribers.get(subscriber.id) !== subscriber) return;
+      if (batch.pending.length === 0) return;
+      this.deliverBatch(subscriber, this.now());
+    }, batch.maxWaitMs);
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    batch.timer = timer;
+  }
+
+  /**
+   * Cancels a batched subscriber's pending linger timer, if any.
+   */
+  private clearBatchTimer(subscriber: Subscriber): void {
+    const batch = subscriber.batch;
+    if (batch?.timer !== undefined) {
+      clearTimeout(batch.timer);
+      batch.timer = undefined;
     }
   }
 
