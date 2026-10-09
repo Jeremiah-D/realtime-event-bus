@@ -6,6 +6,14 @@ import {
   type DeliveryLatencyOptions,
   type DeliveryLatencySummaryStats,
 } from './latency.ts';
+import {
+  LagTracker,
+  resolveLagMonitorOptions,
+  type LagEvent,
+  type LagMonitorOptions,
+  type LagSummaryStats,
+  type SubscriberLagState,
+} from './lag.ts';
 import { DurableTopicLog } from './durablelog.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
@@ -15,6 +23,7 @@ import { Buffer } from 'node:buffer';
 
 export type { Delivery } from './ack.ts';
 export type { DeliveryLatencyOptions, DeliveryLatencySummaryStats } from './latency.ts';
+export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
 
 export interface BusMessage {
   topic: string;
@@ -158,6 +167,34 @@ export interface SubscribeOptions {
    * Invalid values throw `RangeError` from `subscribe`.
    */
   deliveryLatency?: boolean | DeliveryLatencyOptions;
+  /**
+   * Opt-in subscriber lag watermark monitoring. When enabled, the bus
+   * tracks how long the oldest message currently sitting in this
+   * subscriber's queue has been waiting (the live consumer-lag watermark,
+   * `now - enqueuedAt(head)`) and samples every drained message's
+   * enqueue→drain dwell into a bounded rolling window (p50/p99).
+   * `getStats()` exposes the per-subscriber watermark and distribution
+   * (`lag`) and the slowest lagging subscribers (`laggingSubscribers`),
+   * and `src/metrics.ts` renders them as Prometheus gauges.
+   *
+   * Where `deliveryLatency` records a historical distribution of completed
+   * deliveries, the lag monitor answers the live question — "how far
+   * behind is this consumer right now?": a subscriber whose handler is
+   * stuck shows a watermark that keeps growing while nothing is delivered.
+   * With `thresholdMs` + `onLag`, the watermark also drives alerting: the
+   * callback fires once when the watermark reaches the threshold and
+   * re-arms after it drops below, mirroring the `onBackpressure` /
+   * `onDrained` latch. The watermark is evaluated on every enqueue and
+   * every drain, so a crossing is observed on the next bus activity after
+   * it happens.
+   *
+   * Pass `true` for the defaults (1024-sample rolling window, watermark
+   * reporting with no alerting), or a `LagMonitorOptions` object to tune
+   * the window and arm the threshold alert. Invalid values throw
+   * `RangeError` from `subscribe`; `onLag` without `thresholdMs` also
+   * throws, since the callback could never fire. Disabled by default.
+   */
+  lagMonitor?: boolean | LagMonitorOptions;
   /**
    * Opt-in subscriber health probing. When enabled, the bus watches every
    * delivery to this subscriber: a handler that throws, or one that takes
@@ -960,6 +997,31 @@ export interface BusStats {
     samples: number;
   }>;
   /**
+   * Per-subscriber lag watermark monitoring (see
+   * `SubscribeOptions.lagMonitor`): one entry per subscription with
+   * monitoring enabled, in subscription order. Each entry carries the
+   * live consumer-lag watermark (`watermarkMs`: how long the oldest
+   * currently queued message has been waiting, 0 when the queue is
+   * empty) plus the enqueue→drain dwell distribution (p50/p99,
+   * min/max/mean over the subscriber's bounded rolling window). Empty
+   * when no subscriber opts in.
+   */
+  lag: Array<
+    { subscriberId: string; pattern: string; watermarkMs: number } & LagSummaryStats
+  >;
+  /**
+   * The slowest lag-monitored subscribers by p99 drain dwell (top 5,
+   * descending) — the first place to look when the lag watermark keeps
+   * growing. Only subscribers with at least one sample appear.
+   */
+  laggingSubscribers: Array<{
+    subscriberId: string;
+    pattern: string;
+    p99Ms: number;
+    watermarkMs: number;
+    samples: number;
+  }>;
+  /**
    * The hottest topics by 1m publish rate (see `src/rates.ts`), hottest
    * first — at most `HOT_TOPICS_LIMIT` (10) entries; topics with no
    * publishes in the trailing minute never appear. The first place to look
@@ -1047,6 +1109,11 @@ interface Subscriber {
    * Absent when sampling is disabled for this subscriber.
    */
   latency?: SubscriberLatencyState;
+  /**
+   * Lag watermark monitoring state (see `SubscribeOptions.lagMonitor`).
+   * Absent when monitoring is disabled for this subscriber.
+   */
+  lag?: SubscriberLagState;
   /**
    * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
    * Absent when the probe is disabled for this subscriber.
@@ -2590,6 +2657,9 @@ export class EventBus {
     const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
     const onDegraded = opts?.onDegraded;
     const filter = opts?.filter;
@@ -2650,6 +2720,7 @@ export class EventBus {
       onThrottled,
       deliveryShaping,
       latency: deliveryLatency,
+      lag: lagMonitor,
       batch,
       health:
         healthProbe == null
@@ -3917,7 +3988,81 @@ export class EventBus {
       // re-stamp: each delivery samples its own queue dwell.
       latency.enqueuedAt.set(msg, this.now());
     }
+    const lag = subscriber.lag;
+    if (lag != null && result === 'accepted') {
+      // Stamp the enqueue time for the lag watermark monitor (see
+      // `SubscribeOptions.lagMonitor`): the watermark reads the oldest
+      // queued message's stamp, so every accepted enqueue is stamped.
+      // Evaluate the watermark on every enqueue: a message arriving while
+      // the head has been waiting past the threshold trips the alert here,
+      // without waiting for the next drain.
+      const nowMs = this.now();
+      lag.enqueuedAt.set(msg, nowMs);
+      this.checkLag(subscriber, lag, nowMs);
+    }
     return result;
+  }
+
+  /**
+   * Records one enqueue→drain dwell sample for a lag-monitored
+   * subscriber, at the moment a message leaves its queue for delivery.
+   * `nowMs` is the flush's single clock reading, so every sample in one
+   * flush round shares the same drain timestamp.
+   */
+  private recordLagSample(subscriber: Subscriber, msg: BusMessage, nowMs: number): void {
+    const lag = subscriber.lag;
+    if (lag == null) return;
+    const enqueuedAt = lag.enqueuedAt.get(msg);
+    lag.enqueuedAt.delete(msg);
+    if (enqueuedAt === undefined) return;
+    lag.tracker.record(nowMs - enqueuedAt);
+  }
+
+  /**
+   * The subscriber's live consumer-lag watermark: how long the oldest
+   * message currently sitting in its queue has been waiting, in
+   * milliseconds. 0 when the queue is empty or monitoring is disabled.
+   * Messages already dequeued into a batch subscriber's pending batch are
+   * past the queue and no longer count.
+   */
+  private lagWatermarkMs(subscriber: Subscriber, nowMs: number): number {
+    const lag = subscriber.lag;
+    if (lag == null) return 0;
+    const head = subscriber.queue.peekOldest();
+    if (head === undefined) return 0;
+    const enqueuedAt = lag.enqueuedAt.get(head);
+    if (enqueuedAt === undefined) return 0;
+    return Math.max(0, nowMs - enqueuedAt);
+  }
+
+  /**
+   * Evaluates a lag-monitored subscriber's watermark against its alert
+   * threshold. Fires `onLag` once per excursion — when the watermark
+   * reaches `thresholdMs` while the latch is clear — and re-arms the latch
+   * when the watermark drops below the threshold. No threshold (or no
+   * callback) means no alerting; the watermark is still reported by
+   * `getStats()`.
+   */
+  private checkLag(subscriber: Subscriber, lag: SubscriberLagState, nowMs: number): void {
+    const thresholdMs = lag.thresholdMs;
+    const onLag = lag.onLag;
+    if (thresholdMs === undefined || onLag === undefined) return;
+    const watermarkMs = this.lagWatermarkMs(subscriber, nowMs);
+    if (watermarkMs >= thresholdMs) {
+      if (!lag.alerted) {
+        lag.alerted = true;
+        onLag({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          lagMs: watermarkMs,
+          thresholdMs,
+          queueSize: subscriber.queue.size,
+          at: nowMs,
+        });
+      }
+    } else {
+      lag.alerted = false;
+    }
   }
 
   /**
@@ -4210,6 +4355,7 @@ export class EventBus {
     let degradedSubscribers = 0;
     let shapedSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
+    const lag: BusStats['lag'] = [];
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
@@ -4223,6 +4369,17 @@ export class EventBus {
           ...latency.tracker.summary(),
         });
       }
+      const lagState = subscriber.lag;
+      if (lagState != null) {
+        // One clock reading for every watermark in the snapshot, shared
+        // with the rate table above.
+        lag.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          watermarkMs: this.lagWatermarkMs(subscriber, ratesNow),
+          ...lagState.tracker.summary(),
+        });
+      }
     }
     const slowestSubscribers = deliveryLatency
       .filter((s) => s.samples > 0)
@@ -4232,6 +4389,17 @@ export class EventBus {
         subscriberId: s.subscriberId,
         pattern: s.pattern,
         p99Ms: s.p99Ms,
+        samples: s.samples,
+      }));
+    const laggingSubscribers = lag
+      .filter((s) => s.samples > 0)
+      .sort((a, b) => b.p99Ms - a.p99Ms)
+      .slice(0, 5)
+      .map((s) => ({
+        subscriberId: s.subscriberId,
+        pattern: s.pattern,
+        p99Ms: s.p99Ms,
+        watermarkMs: s.watermarkMs,
         samples: s.samples,
       }));
     return {
@@ -4266,6 +4434,8 @@ export class EventBus {
       pendingDelayed: this.delayedById.size,
       deliveryLatency,
       slowestSubscribers,
+      lag,
+      laggingSubscribers,
       hotTopics: this.publishRates.hotTopics(ratesNow),
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
@@ -4595,56 +4765,63 @@ export class EventBus {
     // delivering one message per handler call (see drainBatchedSubscriber).
     if (subscriber.batch != null) {
       this.drainBatchedSubscriber(subscriber, nowMs);
-      return;
-    }
-    const shaping = subscriber.deliveryShaping;
-    const maxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
-    const { live, expired } = subscriber.queue.drainLiveUpTo(nowMs, maxLive);
-    for (const msg of expired) {
-      this.recordExpired(msg.topic);
-    }
-    const health = subscriber.health;
-    if (health == null) {
-      for (const msg of live) {
-        // Guaranteed to succeed: the drain above dequeued at most
-        // floor(availableTokens), and nothing else consumes this
-        // subscriber's bucket in between.
-        shaping?.bucket.take();
-        // Compressed payloads are inflated here — once per message, before
-        // any handler sees it — so every subscriber transparently receives
-        // the original payload. See `inflateMessagePayload` for the
-        // idempotency and envelope-collision notes.
-        this.inflateMessagePayload(msg);
-        this.detectGap(subscriber, msg);
-        this.totalDelivered += 1;
-        // Sampled before the handler runs: queue dwell, not processing time.
-        this.recordDeliveryLatency(subscriber, msg, nowMs);
-        subscriber.handler(msg);
-      }
     } else {
-      for (let i = 0; i < live.length; i += 1) {
-        shaping?.bucket.take();
-        this.inflateMessagePayload(live[i]);
-        this.deliverWithHealth(subscriber, live[i], nowMs);
-        if (!health.degraded) continue;
-        // The threshold tripped mid-drain: everything not yet attempted
-        // goes back to the queue, in FIFO order (see requeueUndelivered).
-        this.requeueUndelivered(subscriber, live.slice(i + 1));
-        this.reportDegraded(subscriber);
-        break;
+      const shaping = subscriber.deliveryShaping;
+      const maxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
+      const { live, expired } = subscriber.queue.drainLiveUpTo(nowMs, maxLive);
+      for (const msg of expired) {
+        this.recordExpired(msg.topic);
       }
-    }
-    if (shaping != null) {
-      // Expired entries were discarded above, so a non-empty queue means
-      // shaping is actively holding this subscriber back for lack of
-      // budget — never because of TTL.
-      shaping.shaping = subscriber.queue.size > 0;
-      if (shaping.shaping) {
-        this.armShapingTimer(subscriber);
+      const health = subscriber.health;
+      if (health == null) {
+        for (const msg of live) {
+          // Guaranteed to succeed: the drain above dequeued at most
+          // floor(availableTokens), and nothing else consumes this
+          // subscriber's bucket in between.
+          shaping?.bucket.take();
+          // Compressed payloads are inflated here — once per message, before
+          // any handler sees it — so every subscriber transparently receives
+          // the original payload. See `inflateMessagePayload` for the
+          // idempotency and envelope-collision notes.
+          this.inflateMessagePayload(msg);
+          this.detectGap(subscriber, msg);
+          this.totalDelivered += 1;
+          // Sampled before the handler runs: queue dwell, not processing time.
+          this.recordDeliveryLatency(subscriber, msg, nowMs);
+          this.recordLagSample(subscriber, msg, nowMs);
+          subscriber.handler(msg);
+        }
       } else {
-        this.clearShapingTimer(subscriber);
+        for (let i = 0; i < live.length; i += 1) {
+          shaping?.bucket.take();
+          this.inflateMessagePayload(live[i]);
+          this.deliverWithHealth(subscriber, live[i], nowMs);
+          if (!health.degraded) continue;
+          // The threshold tripped mid-drain: everything not yet attempted
+          // goes back to the queue, in FIFO order (see requeueUndelivered).
+          this.requeueUndelivered(subscriber, live.slice(i + 1));
+          this.reportDegraded(subscriber);
+          break;
+        }
+      }
+      if (shaping != null) {
+        // Expired entries were discarded above, so a non-empty queue means
+        // shaping is actively holding this subscriber back for lack of
+        // budget — never because of TTL.
+        shaping.shaping = subscriber.queue.size > 0;
+        if (shaping.shaping) {
+          this.armShapingTimer(subscriber);
+        } else {
+          this.clearShapingTimer(subscriber);
+        }
       }
     }
+    // Re-evaluate the lag watermark after the drain: the head may have
+    // moved (re-arming a fired alert) or the remaining backlog may still
+    // sit past the threshold. Runs for plain, health-probed, shaped, and
+    // batched subscribers alike.
+    const lag = subscriber.lag;
+    if (lag != null) this.checkLag(subscriber, lag, nowMs);
   }
 
   /**
@@ -4734,6 +4911,7 @@ export class EventBus {
       this.totalDelivered += 1;
       // Sampled before the handler runs: queue dwell, not processing time.
       this.recordDeliveryLatency(subscriber, msg, nowMs);
+      this.recordLagSample(subscriber, msg, nowMs);
     }
     if (subscriber.health == null) {
       subscriber.handler(live as unknown as BusMessage);
@@ -4898,6 +5076,7 @@ export class EventBus {
     this.totalDelivered += 1;
     // Sampled before the handler runs: queue dwell, not processing time.
     this.recordDeliveryLatency(subscriber, msg, nowMs);
+    this.recordLagSample(subscriber, msg, nowMs);
     try {
       subscriber.handler(msg);
     } catch {

@@ -322,6 +322,28 @@ library.
   and `eventbus_delivery_latency_samples{subscriber,pattern}` gauges (four
   series per tracked subscriber; untracked subscribers add none). Invalid
   options throw `RangeError` from `subscribe`. Disabled by default.
+- **Per-subscriber lag watermark monitoring** (in `src/lag.ts`, opt-in via
+  `subscribe(..., { lagMonitor: true })`): answers the live question — "how
+  far behind is this consumer *right now*?" — Kafka-consumer-lag style.
+  Reports the live watermark (`now - enqueuedAt(oldest queued message)`, 0
+  when the queue is empty) plus a bounded rolling window (default 1024) of
+  enqueue→drain dwell samples (p50/p99 nearest-rank + min/max/mean).
+  Where delivery-latency sampling records a historical distribution of
+  completed deliveries, the watermark is a gauge of current backlog age: a
+  subscriber whose handler is stuck shows a watermark that keeps growing
+  while nothing is delivered. With `thresholdMs` + `onLag`, the watermark
+  also drives alerting — the callback fires once per excursion when the
+  watermark reaches the threshold and re-arms after it drops below
+  (mirroring the `onBackpressure` / `onDrained` latch); the watermark is
+  evaluated on every enqueue and every drain. `getStats()` exposes `lag`
+  (per-subscriber watermark + distribution) and `laggingSubscribers` (top 5
+  by p99); `src/metrics.ts` renders
+  `eventbus_lag_ms{quantile="0.5"|"0.99",subscriber,pattern}`,
+  `eventbus_lag_samples{subscriber,pattern}`, and
+  `eventbus_lag_watermark_ms{subscriber,pattern}` gauges (four series per
+  monitored subscriber). `onLag` without `thresholdMs` throws `RangeError`
+  (a callback that could never fire); other invalid options throw
+  `RangeError`/`TypeError` from `subscribe`. Disabled by default.
 - **Per-topic sliding-window publish rates** (in `src/rates.ts`, always
   on): each topic's publish rate in messages/sec over trailing 1s / 1m / 5m
   windows, load-average style (`r1s` / `r1m` / `r5m`) — the real-time signal
@@ -714,15 +736,19 @@ Exported series:
 | `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
 | `eventbus_delivery_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→delivery queue-dwell p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `deliveryLatency`-tracked subscriptions |
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
+| `eventbus_lag_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→drain dwell p50/p99 (`quantile` = "0.5"/"0.99"); only `lagMonitor`-enabled subscriptions |
+| `eventbus_lag_samples{subscriber,pattern}` | gauge | samples in the subscriber's lag dwell window |
+| `eventbus_lag_watermark_ms{subscriber,pattern}` | gauge | live consumer-lag watermark (oldest queued message dwell, 0 when empty); only `lagMonitor`-enabled subscriptions |
 | `eventbus_topic_rate_msg_per_sec{topic,window}` | gauge | per-topic publish rate in messages/sec over the trailing window (`window` = "1s"/"1m"/"5m"), load-average style; hot topics only (top 10 by 1m rate) |
 
 The per-topic series grow with the distinct topics ever published to — the
 same bound as `BusStats.topics` — so a bus fanning out over millions of
 ad-hoc topic names grows the series count. Topic names come from the
 publisher, so this is bounded by the application's own topic space. The
-per-subscriber latency series (four per tracked subscription) are bounded
-by the tracked-subscriber count — sampling is opt-in, so untracked
-subscribers add no series. `eventbus_topic_rate_msg_per_sec` is the
+per-subscriber latency series (four per latency-tracked subscription) and
+the per-subscriber lag series (four per lag-monitored subscription) are
+bounded by the opted-in subscriber count — monitoring is opt-in, so
+unmonitored subscribers add no series. `eventbus_topic_rate_msg_per_sec` is the
 deliberate exception to the per-topic rule: only the hot-topics set
 carries it (10 topics × 3 windows = 30 series max), because
 rate-limit/scaling decisions need the busiest topics, not the full topic

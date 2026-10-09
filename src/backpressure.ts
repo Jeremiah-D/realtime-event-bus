@@ -170,6 +170,16 @@ export class BoundedQueue<T> {
   }
 
   /**
+   * Returns the oldest queued item without removing it, or `undefined`
+   * when the queue is empty. Entries are kept in push order (append-only
+   * with splice removals), so the head is the oldest surviving entry —
+   * the one whose queue dwell defines a consumer-lag watermark.
+   */
+  peekOldest(): T | undefined {
+    return this.entries[0]?.item;
+  }
+
+  /**
    * Removes and returns every non-expired queued item in FIFO order.
    * Entries whose expiry timestamp is at or before `nowMs` are discarded and
    * counted (see `expiredCount`) instead of being delivered; entries without

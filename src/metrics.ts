@@ -57,6 +57,17 @@
  *   appear.
  * - `eventbus_delivery_latency_samples{subscriber,pattern}`: samples
  *   currently in each tracked subscriber's latency window.
+ * - `eventbus_lag_ms{quantile,subscriber,pattern}`: per-subscriber
+ *   enqueue→drain dwell distribution for subscriptions with `lagMonitor`
+ *   enabled — nearest-rank p50/p99 over each subscriber's bounded rolling
+ *   window (`quantile` is "0.5" or "0.99"). Historical view of how long
+ *   drained messages had waited.
+ * - `eventbus_lag_samples{subscriber,pattern}`: samples currently in each
+ *   lag-monitored subscriber's dwell window.
+ * - `eventbus_lag_watermark_ms{subscriber,pattern}`: the live
+ *   consumer-lag watermark — how long the oldest currently queued message
+ *   has been waiting (0 when the queue is empty). The alerting signal;
+ *   only subscriptions with `lagMonitor` enabled appear.
  * - `eventbus_topic_rate_msg_per_sec{topic,window}`: per-topic publish
  *   rate in messages per second over the trailing 1s / 1m / 5m windows
  *   (`window` is "1s", "1m" or "5m"), load-average style. Only the hot
@@ -68,9 +79,10 @@
  * bus fanning out over millions of ad-hoc topic names will grow the
  * series count. Topic names come from the publisher, never from subscriber
  * input, so this is bounded by the application's own topic space. The
- * per-subscriber latency series (four per tracked subscription) are
- * bounded by the tracked-subscriber count — sampling is opt-in per
- * subscription, so untracked subscribers add no series. The
+ * per-subscriber latency series (four per latency-tracked subscription)
+ * and the per-subscriber lag series (four per lag-monitored subscription)
+ * are bounded by the opted-in subscriber count — monitoring is opt-in per
+ * subscription, so unmonitored subscribers add no series. The
  * `eventbus_topic_rate_msg_per_sec` series are the exception to the
  * per-topic rule: they are deliberately limited to the hot-topics set
  * (10 topics x 3 windows = 30 series max), because rate decisions need
@@ -218,6 +230,30 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_delivery_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
     lines.push(`eventbus_delivery_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
     lines.push(`eventbus_delivery_latency_samples{${labels}} ${s.samples}`);
+  }
+
+  // Per-subscriber lag watermark series (only subscriptions with
+  // `lagMonitor` enabled), in subscription order (same as BusStats.lag).
+  // The `?? []` keeps the renderer tolerant of a stats object that
+  // predates the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_lag_ms Per-subscriber enqueue-to-drain dwell distribution (nearest-rank p50/p99 over the rolling sample window).',
+  );
+  lines.push('# TYPE eventbus_lag_ms gauge');
+  lines.push(
+    '# HELP eventbus_lag_samples Samples currently in the subscriber lag dwell window.',
+  );
+  lines.push('# TYPE eventbus_lag_samples gauge');
+  lines.push(
+    '# HELP eventbus_lag_watermark_ms Live consumer-lag watermark: how long the oldest currently queued message has been waiting (0 when the queue is empty).',
+  );
+  lines.push('# TYPE eventbus_lag_watermark_ms gauge');
+  for (const s of stats.lag ?? []) {
+    const labels = `subscriber="${escapeLabelValue(s.subscriberId)}",pattern="${escapeLabelValue(s.pattern)}"`;
+    lines.push(`eventbus_lag_ms{quantile="0.5",${labels}} ${s.p50Ms}`);
+    lines.push(`eventbus_lag_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
+    lines.push(`eventbus_lag_samples{${labels}} ${s.samples}`);
+    lines.push(`eventbus_lag_watermark_ms{${labels}} ${s.watermarkMs}`);
   }
 
   // Per-topic series, in first-publish order (same as BusStats.topics).
