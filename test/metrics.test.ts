@@ -115,6 +115,7 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     compressedBytesAfter: 0,
     compressionRatio: 0,
     meanCompressionMs: 0,
+    rates: { r1s: 0, r1m: 0, r5m: 0 },
   });
   const stats: BusStats = {
     totalSubscribers: 1,
@@ -144,6 +145,7 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     pendingDelayed: 0,
     deliveryLatency: [],
     slowestSubscribers: [],
+    hotTopics: [],
     topics: [topicStats('we"ird\ntopic\\name')],
     consumerGroups: [],
   };

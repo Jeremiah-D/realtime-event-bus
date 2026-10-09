@@ -8,6 +8,7 @@ import {
 } from './latency.ts';
 import { DurableTopicLog } from './durablelog.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
+import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
@@ -789,6 +790,14 @@ export interface TopicStats {
    * yet.
    */
   meanCompressionMs: number;
+  /**
+   * Publish rate on this topic in messages per second over the trailing
+   * 1s / 1m / 5m windows, load-average style (see `src/rates.ts`). Only
+   * admitted publishes count — schema rejections and rate-limit sheds
+   * never sample. Read at `getStats()` time from the bus clock, so the
+   * values decay as traffic ages out of the windows.
+   */
+  rates: TopicRates;
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -950,6 +959,13 @@ export interface BusStats {
     p99Ms: number;
     samples: number;
   }>;
+  /**
+   * The hottest topics by 1m publish rate (see `src/rates.ts`), hottest
+   * first — at most `HOT_TOPICS_LIMIT` (10) entries; topics with no
+   * publishes in the trailing minute never appear. The first place to look
+   * when deciding where to tighten rate limits or add capacity.
+   */
+  hotTopics: HotTopic[];
   /**
    * Stats for every concrete topic that has seen at least one publish or
    * schema rejection, in order of first publish.
@@ -1846,6 +1862,15 @@ export class EventBus {
    * the same bound as `topicStats`.
    */
   private topicSeq = new Map<string, number>();
+  /**
+   * Per-topic sliding-window publish rate table (see `src/rates.ts`).
+   * Sampled once per accepted publish in `fanOut` — after the admission
+   * gates (schema validation, rate-limit budget) — with the bus's injected
+   * clock, so rates are deterministic in tests. Grows with the distinct
+   * topics ever published to, one fixed-capacity ring per topic — the same
+   * bound as `topicStats`.
+   */
+  private readonly publishRates = new PublishRateTable();
   private nextId = 0;
   private flushScheduled = false;
   /**
@@ -4053,6 +4078,17 @@ export class EventBus {
         return { matched: 0, accepted: 0, admitted: false };
       }
     }
+    // Accepted-for-publish sampling (EB-34): the message cleared the
+    // admission gates (schema validation, rate-limit budget), so it counts
+    // as publish traffic in the per-topic sliding-window rate table —
+    // rejected and shed messages never reach this line and never pollute
+    // the rates. The timestamp comes from the bus's injected clock (one
+    // extra clock read per publish; the publish path stays
+    // allocation-free). Delayed messages fan out through here at their due
+    // time, so their sample lands at actual fan-out — not at schedule
+    // time — keeping the table aligned with real publish load rather than
+    // scheduled intent.
+    this.publishRates.sample(topic, this.now());
     // Publish-side per-topic payload compression (opt-in via
     // `setTopicCompression`). Pipeline order, and why:
     //   1. schema validation ran first and always sees the RAW payload —
@@ -4166,6 +4202,9 @@ export class EventBus {
    * not affect the bus.
    */
   getStats(): BusStats {
+    // One clock reading for the rate table: every per-topic window and the
+    // hot-topics ranking in this snapshot share the same "now".
+    const ratesNow = this.now();
     let unackedDeliveries = 0;
     let throttledSubscribers = 0;
     let degradedSubscribers = 0;
@@ -4227,6 +4266,7 @@ export class EventBus {
       pendingDelayed: this.delayedById.size,
       deliveryLatency,
       slowestSubscribers,
+      hotTopics: this.publishRates.hotTopics(ratesNow),
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
         return {
@@ -4255,6 +4295,7 @@ export class EventBus {
             : 0,
         meanCompressionMs:
           stats.compressedMessages > 0 ? stats.compressionTimeMs / stats.compressedMessages : 0,
+        rates: this.publishRates.ratesFor(topic, ratesNow),
       })),
       ...(this.durableLog == null
         ? {}

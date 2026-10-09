@@ -350,6 +350,9 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       compressedBytesAfter: 0,
       compressionRatio: 0,
       meanCompressionMs: 0,
+      // All publishes happened synchronously within the same wall-clock
+      // millisecond, so every window holds both events.
+      rates: { r1s: 2, r1m: 2 / 60, r5m: 2 / 300 },
     },
     {
       topic: 'market.eth',
@@ -367,6 +370,7 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       compressedBytesAfter: 0,
       compressionRatio: 0,
       meanCompressionMs: 0,
+      rates: { r1s: 1, r1m: 1 / 60, r5m: 1 / 300 },
     },
   ]);
 });

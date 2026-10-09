@@ -322,6 +322,26 @@ library.
   and `eventbus_delivery_latency_samples{subscriber,pattern}` gauges (four
   series per tracked subscriber; untracked subscribers add none). Invalid
   options throw `RangeError` from `subscribe`. Disabled by default.
+- **Per-topic sliding-window publish rates** (in `src/rates.ts`, always
+  on): each topic's publish rate in messages/sec over trailing 1s / 1m / 5m
+  windows, load-average style (`r1s` / `r1m` / `r5m`) — the real-time signal
+  for rate-limiting and scaling decisions. Sampling is a zero-allocation
+  O(1) step on the publish hot path: one timestamp written into a
+  preallocated per-topic ring buffer (a `Float64Array` of 60,000 slots =
+  480 KiB per topic that has ever published), stamped the moment a message
+  is accepted for publish — after schema validation and the rate-limit
+  budget, so rejections and sheds never pollute the rates; delayed messages
+  sample at actual fan-out, not at schedule time. The clock is the bus's
+  injected clock, so rates are deterministic in tests. `getStats()` exposes
+  per-topic `rates` plus `hotTopics` (top 10 by 1m rate, hottest first —
+  the first place to look when deciding where to tighten rate limits or add
+  capacity). `src/metrics.ts` renders
+  `eventbus_topic_rate_msg_per_sec{topic,window="1s"|"1m"|"5m"}` gauges for
+  the hot-topics set only (30 series max — emitting them for every topic
+  would tie series cardinality to publisher-chosen topic names). Sizing
+  tradeoff: the 5m window is exact up to 200 msg/s sustained per topic;
+  past that the ring wraps and the 5m rate degrades to a lower bound, while
+  the 1s/1m windows stay exact much longer.
 - **Subscriber batch delivery** (in `src/bus.ts`, opt-in via
   `subscribe(..., { batch: true })`): the drain collects up to `maxSize`
   queued messages (default 100) and invokes the handler once with the
@@ -540,6 +560,14 @@ npm test
   TTL expiry, schema rejection), `renderPrometheus` exposition output
   (HELP/TYPE lines, per-topic series, label escaping), and the
   `PROMETHEUS_CONTENT_TYPE` media type.
+- `test/rates.test.ts` — per-topic sliding-window publish rates:
+  deterministic 1s/1m/5m counts and window-edge decay with an injected
+  clock, admission-only sampling (schema rejections, rate-limit sheds and
+  idempotency duplicates never count), delayed messages sampled at fan-out
+  time rather than schedule time, ring wrap-around eviction, `hotTopics`
+  ranking by 1m rate with the 10-topic cap, the `getStats` shape, the new
+  Prometheus rate gauges, and renderer tolerance for a stats object
+  without the rate fields.
 
 ## Benchmark
 
@@ -686,6 +714,7 @@ Exported series:
 | `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
 | `eventbus_delivery_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→delivery queue-dwell p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `deliveryLatency`-tracked subscriptions |
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
+| `eventbus_topic_rate_msg_per_sec{topic,window}` | gauge | per-topic publish rate in messages/sec over the trailing window (`window` = "1s"/"1m"/"5m"), load-average style; hot topics only (top 10 by 1m rate) |
 
 The per-topic series grow with the distinct topics ever published to — the
 same bound as `BusStats.topics` — so a bus fanning out over millions of
@@ -693,4 +722,8 @@ ad-hoc topic names grows the series count. Topic names come from the
 publisher, so this is bounded by the application's own topic space. The
 per-subscriber latency series (four per tracked subscription) are bounded
 by the tracked-subscriber count — sampling is opt-in, so untracked
-subscribers add no series.
+subscribers add no series. `eventbus_topic_rate_msg_per_sec` is the
+deliberate exception to the per-topic rule: only the hot-topics set
+carries it (10 topics × 3 windows = 30 series max), because
+rate-limit/scaling decisions need the busiest topics, not the full topic
+space.

@@ -44,6 +44,11 @@
  *   recent publish to the topic — the current fan-out width, so hot
  *   topics are visible at a glance. A matching consumer group counts once
  *   (its copy goes to a single assigned member).
+ * - `eventbus_topic_rate_msg_per_sec{topic,window}`: per-topic publish
+ *   rate (messages/sec) over the trailing 1s / 1m / 5m windows
+ *   (`window` is "1s", "1m" or "5m"), load-average style — the real-time
+ *   signal for rate-limit/scaling decisions. Only the hot-topics set
+ *   (top 10 by 1m rate, see `BusStats.hotTopics`); 30 series max.
  * - `eventbus_delivery_latency_ms{quantile,subscriber,pattern}`: per-subscriber
  *   enqueue→delivery queue-dwell distribution for subscriptions with
  *   `deliveryLatency` enabled — nearest-rank p50/p95/p99 over each
@@ -52,6 +57,11 @@
  *   appear.
  * - `eventbus_delivery_latency_samples{subscriber,pattern}`: samples
  *   currently in each tracked subscriber's latency window.
+ * - `eventbus_topic_rate_msg_per_sec{topic,window}`: per-topic publish
+ *   rate in messages per second over the trailing 1s / 1m / 5m windows
+ *   (`window` is "1s", "1m" or "5m"), load-average style. Only the hot
+ *   topics carry this series — the bus's top-N by 1m rate (see
+ *   `BusStats.hotTopics`) — so at most `HOT_TOPICS_LIMIT * 3` series.
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
@@ -60,7 +70,16 @@
  * input, so this is bounded by the application's own topic space. The
  * per-subscriber latency series (four per tracked subscription) are
  * bounded by the tracked-subscriber count — sampling is opt-in per
- * subscription, so untracked subscribers add no series.
+ * subscription, so untracked subscribers add no series. The
+ * `eventbus_topic_rate_msg_per_sec` series are the exception to the
+ * per-topic rule: they are deliberately limited to the hot-topics set
+ * (10 topics x 3 windows = 30 series max), because rate decisions need
+ * the busiest topics, not the full topic space.
+ *
+ * `renderPrometheus` tolerates a stats object that predates the rate
+ * fields (a missing `hotTopics` renders no rate series instead of
+ * throwing) — the same defensive stance that keeps hand-built `BusStats`
+ * fixtures working across new fields.
  *
  * The bus has no HTTP server of its own; wire the returned text into your
  * scrape endpoint with `PROMETHEUS_CONTENT_TYPE`, e.g.:
@@ -214,6 +233,24 @@ export function renderPrometheus(stats: BusStats): string {
     const label = `topic="${escapeLabelValue(t.topic)}"`;
     lines.push(`eventbus_topic_published_messages_total{${label}} ${t.publishedMessages}`);
     lines.push(`eventbus_topic_subscribers{${label}} ${t.subscriberCount}`);
+  }
+
+  // Per-topic sliding-window publish rates (EB-34), in hot-topics order
+  // (hottest first, same as BusStats.hotTopics). Only the hot set carries
+  // these series — emitting them for every topic ever published to would
+  // tie series cardinality to the topic space; the set is capped at
+  // HOT_TOPICS_LIMIT (10) topics, so at most 30 series. The `?? []`
+  // keeps the renderer tolerant of a stats object that predates the
+  // field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_topic_rate_msg_per_sec Per-topic publish rate in messages per second over the trailing window (load-average style); only the hottest topics by 1m rate.',
+  );
+  lines.push('# TYPE eventbus_topic_rate_msg_per_sec gauge');
+  for (const h of stats.hotTopics ?? []) {
+    const label = `topic="${escapeLabelValue(h.topic)}"`;
+    lines.push(`eventbus_topic_rate_msg_per_sec{${label},window="1s"} ${h.r1s}`);
+    lines.push(`eventbus_topic_rate_msg_per_sec{${label},window="1m"} ${h.r1m}`);
+    lines.push(`eventbus_topic_rate_msg_per_sec{${label},window="5m"} ${h.r5m}`);
   }
 
   return lines.join('\n') + '\n';
