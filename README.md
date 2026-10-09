@@ -285,6 +285,19 @@ library.
   publish caller — validation runs before any state is mutated for that
   message. `clearTopicSchema` removes a rule. Empty patterns and
   non-function validators throw `RangeError`.
+- **Unified admission-rejection hook** (in `src/bus.ts`, via
+  `EventBusOptions.onAdmissionRejected`): every publish-side admission
+  rejection — schema-validation rejections, per-topic rate-limit sheds,
+  idempotency-duplicate suppressions, and `publishAtomic` batch rejections
+  (surfaced with the failing entry's gate reason) — fires one
+  `AdmissionRejectionEvent { topic, reason, payloadBytes, at }`. `reason`
+  (`'schema' | 'rate-limit' | 'duplicate'`) maps 1:1 onto the stats counters
+  (`rejectedMessages` / `rateLimitedMessages` / `duplicateMessages`), so
+  hook events reconcile exactly with `getStats()`. The hook fires after the
+  counters move, carries the rejected payload's byte size (never the payload
+  itself), and is error-isolated — a throwing hook is swallowed so it can
+  never disturb the publish path. Unset by default (stats counting only —
+  fully backward compatible).
 - **Per-topic payload compression** (in `src/bus.ts`, via
   `setTopicCompression(pattern, { thresholdBytes, level })`): opt-in
   `node:zlib` deflate for large payloads — zero new dependencies. A publish

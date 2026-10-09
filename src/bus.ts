@@ -801,6 +801,28 @@ export interface EventBusOptions {
    * to make room. Must be a positive integer. Default 10000.
    */
   idempotencyMaxEntries?: number;
+  /**
+   * Unified publish-side admission-rejection hook: called once for every
+   * publish the admission gates drop — schema-validation rejections
+   * (`'schema'`, see `setTopicSchema`), rate-limit sheds (`'rate-limit'`,
+   * see `setTopicRateLimit`), idempotency-duplicate suppressions
+   * (`'duplicate'`, see `publishIdempotent`), and `publishAtomic` batch
+   * rejections (surfaced with the failing entry's gate reason).
+   *
+   * `reason` maps 1:1 onto the stats counters
+   * (`TopicStats.rejectedMessages` / `.rateLimitedMessages` /
+   * `.duplicateMessages`, and the `BusStats` totals), so hook events
+   * reconcile exactly against `getStats()` — every counted rejection
+   * fires exactly one event, and vice versa.
+   *
+   * The hook fires after the counters move. It receives a snapshot
+   * (`AdmissionRejectionEvent`); the event carries the rejected payload's
+   * byte size, never the payload itself. The callback is error-isolated:
+   * a throwing hook is swallowed so a broken observer can never disturb
+   * the publish path. Default: unset (no hook — fully backward
+   * compatible).
+   */
+  onAdmissionRejected?: AdmissionRejectionCallback;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -1715,6 +1737,58 @@ export type SchemaValidator = (payload: unknown, topic: string) => boolean;
 export type AtomicRejectReason = 'schema' | 'rate-limit';
 
 /**
+ * Which publish-side admission gate dropped a publish — the unified reason
+ * space for `EventBusOptions.onAdmissionRejected`. Each reason maps 1:1
+ * onto a stats counter, so hook events reconcile exactly against
+ * `getStats()`:
+ * - `'schema'` → `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`
+ *   (payload failed the topic's schema validator, EB-20)
+ * - `'rate-limit'` → `TopicStats.rateLimitedMessages` /
+ *   `BusStats.rateLimitedMessages` (topic token bucket empty, EB-19)
+ * - `'duplicate'` → `TopicStats.duplicateMessages` /
+ *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
+ *
+ * A `publishAtomic` batch rejection surfaces as the failing entry's
+ * underlying gate reason (`'schema'` | `'rate-limit'`); the batch rejection
+ * is counted once against that entry's topic, so it stays reconcilable
+ * too.
+ */
+export type AdmissionRejectReason = 'schema' | 'rate-limit' | 'duplicate';
+
+/**
+ * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
+ * publish dropped by the publish-side admission gates. Carries the
+ * rejected payload's size, not the payload itself — the hook is an
+ * observability channel, and large or sensitive payloads never travel
+ * through it.
+ */
+export interface AdmissionRejectionEvent {
+  /** The concrete topic the rejected publish targeted (never a pattern). */
+  topic: string;
+  /**
+   * Which admission gate rejected it — maps 1:1 onto a stats counter
+   * (see `AdmissionRejectReason`).
+   */
+  reason: AdmissionRejectReason;
+  /**
+   * UTF-8 JSON byte size of the rejected payload. 0 when the payload has
+   * no JSON encoding (`undefined`, functions, circular structures,
+   * BigInt).
+   */
+  payloadBytes: number;
+  /** Bus-clock timestamp of the rejection (`EventBusOptions.now`). */
+  at: number;
+}
+
+/**
+ * Publish-side admission-rejection hook (see
+ * `EventBusOptions.onAdmissionRejected`). The callback is error-isolated:
+ * a throwing callback is swallowed so a broken observer can never disturb
+ * the publish path.
+ */
+export type AdmissionRejectionCallback = (event: AdmissionRejectionEvent) => void;
+
+/**
  * Which entry of a `publishAtomic` batch failed admission, and why.
  */
 export interface AtomicPublishRejection {
@@ -1997,14 +2071,13 @@ function isCompressedPayload(value: unknown): value is CompressedPayload {
 }
 
 /**
- * Serializes a payload to its canonical byte form for the compression
- * size check: the UTF-8 JSON encoding. Returns `undefined` for payloads
- * with no JSON encoding (`undefined`, functions, symbols) or ones
- * `JSON.stringify` cannot represent (circular structures, BigInt) — those
- * are uncompressible and pass through untouched, exactly as the durable
- * log already treats them.
+ * Serializes a payload to its canonical byte form: the UTF-8 JSON
+ * encoding. Returns `undefined` for payloads with no JSON encoding
+ * (`undefined`, functions, symbols) or ones `JSON.stringify` cannot
+ * represent (circular structures, BigInt) — exactly as the durable log
+ * already treats them.
  */
-function serializeForCompression(payload: unknown): string | undefined {
+function serializeToJson(payload: unknown): string | undefined {
   try {
     const serialized = JSON.stringify(payload);
     return typeof serialized === 'string' ? serialized : undefined;
@@ -2251,6 +2324,12 @@ export class EventBus {
    */
   private readonly idempotencyMaxEntries: number;
   /**
+   * Unified publish-side admission-rejection hook
+   * (`EventBusOptions.onAdmissionRejected`), or `undefined` when unset —
+   * the bus is then exactly as before (stats counting only).
+   */
+  private readonly onAdmissionRejected: AdmissionRejectionCallback | undefined;
+  /**
    * Messages skipped by subscriber content filters (global total, see
    * `SubscribeOptions.filter`). A filtered message was fanned out but
    * never entered the rejecting subscriber's queue — no backpressure
@@ -2437,6 +2516,11 @@ export class EventBus {
       throw new RangeError('idempotencyMaxEntries must be a positive integer');
     }
     this.idempotencyMaxEntries = idempotencyMaxEntries;
+    const onAdmissionRejected = options?.onAdmissionRejected;
+    if (onAdmissionRejected !== undefined && typeof onAdmissionRejected !== 'function') {
+      throw new RangeError('onAdmissionRejected must be a function');
+    }
+    this.onAdmissionRejected = onAdmissionRejected;
     if (options?.durableLogDir != null) {
       this.durableLog = DurableTopicLog.open({
         dir: options.durableLogDir,
@@ -2827,7 +2911,7 @@ export class EventBus {
     rule: ResolvedCompressionRule,
     stats: { compressedMessages: number; compressedBytesBefore: number; compressedBytesAfter: number; compressionTimeMs: number },
   ): unknown {
-    const serialized = serializeForCompression(payload);
+    const serialized = serializeToJson(payload);
     if (serialized === undefined) return payload;
     const bytesBefore = Buffer.byteLength(serialized, 'utf8');
     // Small messages pass through: compression is opt-in per byte saved,
@@ -4273,8 +4357,8 @@ export class EventBus {
     if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
       // Suppressed duplicate: dropped before admission — no sequence
       // number, no durable-log write, no rate-limit budget. Counted for
-      // observability only.
-      this.countDuplicate(topic);
+      // observability only, and surfaced on the admission-rejection hook.
+      this.countDuplicate(topic, payload);
       return { duplicate: true, accepted: 0 };
     }
     const { accepted, admitted } = this.fanOut(topic, payload, false, undefined, opts?.key);
@@ -4339,9 +4423,13 @@ export class EventBus {
    *
    * On success returns `{ published: entries.length }`. On failure returns
    * `{ published: 0, rejected: { index, topic, reason } }` and the bus is
-   * exactly as before the call: no sequence numbers consumed, no
-   * rate-limit tokens taken, no durable-log writes, no stats changes — not
-   * even the rejection counters move, because nothing was admitted.
+   * exactly as before the call for everything delivery-side: no sequence
+   * numbers consumed, no rate-limit tokens taken, no durable-log writes —
+   * but the rejection IS counted once against the failing entry's
+   * admission-gate counters (`rejectedMessages` / `rateLimitedMessages`)
+   * and surfaced on `EventBusOptions.onAdmissionRejected`, so an atomic
+   * batch rejection stays reconcilable with stats like any other admission
+   * rejection.
    *
    * TTL is drain-time, not an admission gate: a batch containing messages
    * that expire before the flush is still admitted, and each message
@@ -4372,7 +4460,17 @@ export class EventBus {
     for (let index = 0; index < entries.length; index++) {
       const { topic, payload, key } = entries[index];
       const reason = this.admissionVerdict(topic, payload, shadowBudget);
-      if (reason !== undefined) return { published: 0, rejected: { index, topic, reason } };
+      if (reason !== undefined) {
+        // The batch is rejected on the failing entry: count it once against
+        // that entry's admission-gate counters and surface it on the unified
+        // admission-rejection hook, so an atomic rejection stays reconcilable
+        // with stats like any other admission rejection. Everything else
+        // stays untouched: no sequence numbers, no rate-limit tokens, no
+        // durable-log writes.
+        if (reason === 'schema') this.countSchemaRejection(topic, payload);
+        else this.countRateLimited(topic, payload);
+        return { published: 0, rejected: { index, topic, reason } };
+      }
       if (key !== undefined) {
         const keySeq = (shadowKeyCursors.get(key) ?? this.keyCursors.get(key) ?? 0) + 1;
         shadowKeyCursors.set(key, keySeq);
@@ -4499,7 +4597,7 @@ export class EventBus {
     // same way a `publish` rejection is.
     const validator = this.schemaForTopic(topic);
     if (validator !== undefined && !validator(payload, topic)) {
-      this.countSchemaRejection(topic);
+      this.countSchemaRejection(topic, payload);
       return undefined;
     }
     const ttlMs = this.ttlForTopic(topic);
@@ -4816,25 +4914,64 @@ export class EventBus {
 
   /**
    * Counts one publish rejected by schema validation against the topic and
-   * the global total. A rejection happens before admission: the payload
-   * never becomes a message — no sequence number is consumed (subscribers
-   * see no gap), the durable log never sees it, and it does not burn
-   * rate-limit budget.
+   * the global total, then fires the admission-rejection hook. A rejection
+   * happens before admission: the payload never becomes a message — no
+   * sequence number is consumed (subscribers see no gap), the durable log
+   * never sees it, and it does not burn rate-limit budget.
    */
-  private countSchemaRejection(topic: string): void {
+  private countSchemaRejection(topic: string, payload: unknown): void {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
+    this.emitAdmissionRejected(topic, 'schema', payload);
+  }
+
+  /**
+   * Counts one publish shed by publish-side rate limiting against the
+   * topic and the global total, then fires the admission-rejection hook.
+   * The shed consumes a sequence number (subscribers see a gap) — the
+   * caller stamps it before this runs, so the stats entry must already
+   * exist here.
+   */
+  private countRateLimited(topic: string, payload: unknown): void {
+    this.statsFor(topic).rateLimitedMessages += 1;
+    this.totalRateLimited += 1;
+    this.emitAdmissionRejected(topic, 'rate-limit', payload);
   }
 
   /**
    * Counts one publish suppressed as an idempotency duplicate against the
-   * topic and the global total. A duplicate is dropped before admission, so
-   * — like a schema rejection — it creates the topic's stats entry when the
-   * topic has never published anything yet.
+   * topic and the global total, then fires the admission-rejection hook.
+   * A duplicate is dropped before admission, so — like a schema rejection
+   * — it creates the topic's stats entry when the topic has never
+   * published anything yet.
    */
-  private countDuplicate(topic: string): void {
+  private countDuplicate(topic: string, payload: unknown): void {
     this.statsFor(topic).duplicateMessages += 1;
     this.totalDuplicates += 1;
+    this.emitAdmissionRejected(topic, 'duplicate', payload);
+  }
+
+  /**
+   * Fires the unified admission-rejection hook for one publish-side
+   * rejection. Runs after the stats counters moved, so hook events and
+   * `getStats()` stay exactly reconcilable. Error-isolated: a throwing
+   * hook is swallowed — a broken observer must never disturb the publish
+   * path. No-op when no hook is configured.
+   */
+  private emitAdmissionRejected(
+    topic: string,
+    reason: AdmissionRejectReason,
+    payload: unknown,
+  ): void {
+    const hook = this.onAdmissionRejected;
+    if (hook === undefined) return;
+    const serialized = serializeToJson(payload);
+    const payloadBytes = serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+    try {
+      hook({ topic, reason, payloadBytes, at: this.now() });
+    } catch {
+      // Swallowed: the hook is an observer, not part of the publish path.
+    }
   }
 
   /**
@@ -5310,7 +5447,7 @@ export class EventBus {
     if (!preAdmitted) {
       const validator = this.schemaForTopic(topic);
       if (validator !== undefined && !validator(payload, topic)) {
-        this.countSchemaRejection(topic);
+        this.countSchemaRejection(topic, payload);
         return { matched: 0, accepted: 0, admitted: false };
       }
     }
@@ -5340,8 +5477,7 @@ export class EventBus {
         this.rateLimitBuckets.set(topic, bucket);
       }
       if (!bucket.take()) {
-        stats.rateLimitedMessages += 1;
-        this.totalRateLimited += 1;
+        this.countRateLimited(topic, payload);
         // The keySeq was consumed at schedule time but the message never
         // fans out: release every subscriber's expectation past it, or a
         // subscriber buffering a later keySeq for the same key would wait

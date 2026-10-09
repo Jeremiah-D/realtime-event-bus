@@ -63,10 +63,12 @@ test('a schema rejection aborts the batch with zero side effects', async () => {
   assert.deepEqual(received, []);
   const stats = bus.getStats();
   assert.equal(stats.totalPublished, 0);
-  // The atomic rejection itself is not counted: nothing was admitted.
-  assert.equal(stats.rejectedMessages, 0);
+  // The batch rejection is counted once against the failing entry's
+  // admission-gate counters (EB-39 unified admission-rejection channel),
+  // while everything delivery-side stays untouched.
+  assert.equal(stats.rejectedMessages, 1);
   assert.equal(stats.rateLimitedMessages, 0);
-  assert.equal(stats.topics.length, 0); // no stats entries created
+  assert.equal(stats.topics.length, 1); // 'orders' stats entry from the rejection
   assert.equal(stats.durableLog?.entries, 0); // nothing written to the log
   // Sequence numbers were not consumed: the next publish starts at 1.
   const seqs: number[] = [];
@@ -90,14 +92,16 @@ test('a rate-limit shed aborts the batch and the budget is fully restored', () =
   assert.deepEqual(res, { published: 0, rejected: { index: 2, topic: 'hot', reason: 'rate-limit' } });
   const stats = bus.getStats();
   assert.equal(stats.totalPublished, 0);
-  assert.equal(stats.rateLimitedMessages, 0);
-  assert.equal(stats.topics.length, 0);
+  // The batch rejection is counted once against the failing entry's
+  // rate-limit counter (EB-39 unified admission-rejection channel).
+  assert.equal(stats.rateLimitedMessages, 1);
+  assert.equal(stats.topics.length, 1);
   // The shadow budget was never charged against the real bucket: the full
   // burst is still available for later publishes.
   assert.equal(bus.publish('hot', 'a'), 1);
   assert.equal(bus.publish('hot', 'b'), 1);
   assert.equal(bus.publish('hot', 'c'), 0); // now the bucket is genuinely empty
-  assert.equal(bus.getStats().rateLimitedMessages, 1);
+  assert.equal(bus.getStats().rateLimitedMessages, 2);
 });
 
 test('repeated same-topic entries share one shadow budget: an exact-fit batch commits', async () => {
