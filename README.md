@@ -404,6 +404,32 @@ library.
   draining the backlog when no new publishes arrive; `getStats()` reports
   actively-shaped subscribers via `shapedSubscribers`. Invalid options throw
   `RangeError` from `subscribe`. Disabled by default.
+- **Per-subscriber sliding-window delivery rate limit** (in
+  `src/ratewindow.ts`, opt-in via
+  `subscribe(..., { rateLimit: { maxMessages, perWindowMs } })`): a hard
+  delivery ceiling for a downstream with a strict quota. At most
+  `maxMessages` deliveries per rolling `perWindowMs` window — the window is
+  exact, not a token bucket: a delivery counts for a full `perWindowMs`
+  after it happens (a delivery exactly `perWindowMs` old still counts, one
+  millisecond older does not), so there is no gradual refill and two quick
+  deliveries block the window for its whole width. Messages over budget stay
+  queued — in FIFO order, never dropped, never counted as sequence gaps —
+  and are delivered on later flush rounds as the window slides, so the
+  backlog drains even when no new publishes arrive. Composes with
+  delivery-side shaping: shaping paces each flush round first (smoothing
+  bursts), then the window enforces the hard cap — a message is delivered
+  only when both allow it; it also composes with batch delivery (the window
+  bounds batch collection, with pending messages reserving budget until
+  hand-off), reliable subscriptions, TTL expiry (an expired waiter is
+  dropped without consuming window budget), content filters (filtered
+  messages never reach the window), and health probing (a degraded
+  subscriber consumes nothing while paused). A re-flush timer (unref'd,
+  derived from the bus clock, cleared on unsubscribe) fires when the oldest
+  delivery slides out of the window; `getStats()` exposes the per-subscriber
+  backlog held back by the window via `rateLimitedWaiting`. `maxMessages`
+  must be an integer >= 1 and `perWindowMs` a positive finite number of
+  milliseconds — invalid values throw `RangeError` from `subscribe`.
+  Disabled by default.
 - **Per-subscriber delivery-latency sampling** (in `src/latency.ts`, opt-in
   via `subscribe(..., { deliveryLatency: true })`): measures each delivered
   message's queue dwell — from enqueue into the subscriber's queue to the

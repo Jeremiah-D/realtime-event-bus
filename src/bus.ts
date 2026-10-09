@@ -1,6 +1,7 @@
 import { BoundedQueue, type DropPolicy } from './backpressure.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
+import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
   DeliveryLatencyTracker,
   type DeliveryLatencyOptions,
@@ -176,6 +177,31 @@ export interface SubscribeOptions {
    * throw `RangeError` from `subscribe`.
    */
   deliveryShaping?: boolean | DeliveryShapingOptions;
+  /**
+   * Opt-in per-subscriber sliding-window delivery rate limit: at most
+   * `maxMessages` deliveries per rolling `perWindowMs` window. Unlike
+   * `deliveryShaping` (a token bucket that smooths bursts), the window is
+   * exact — a delivery counts for a full `perWindowMs` after it happens, so
+   * two quick deliveries still block the window for its whole width; there
+   * is no gradual refill. Messages over budget stay queued — in FIFO order,
+   * never dropped, never counted as sequence gaps — and are delivered on
+   * later flush rounds as the window slides, so the backlog drains even
+   * when no new publishes arrive.
+   *
+   * Composes with `deliveryShaping`: shaping paces each flush round first
+   * (smoothing bursts), then the window enforces the hard cap — a message
+   * is delivered only when both allow it. Content filters run at fan-out,
+   * before either; TTL expiry still drops waiting messages without
+   * consuming window budget; a health-probed subscriber that degrades keeps
+   * its window (no deliveries happen while paused, so nothing is
+   * consumed). `getStats()` exposes the per-subscriber backlog held back
+   * by the window (`rateLimitedWaiting`).
+   *
+   * `maxMessages` must be an integer >= 1 and `perWindowMs` a positive
+   * finite number of milliseconds — invalid values throw `RangeError` from
+   * `subscribe`. Disabled by default.
+   */
+  rateLimit?: RateLimitOptions;
   /**
    * Opt-in per-subscriber delivery-latency sampling. When enabled, the bus
    * stamps every message enqueued for this subscriber with the bus clock
@@ -456,6 +482,26 @@ export interface DeliveryShapingOptions {
    * `setTopicRateLimit`.
    */
   burst?: number;
+}
+
+/**
+ * Tuning for the per-subscriber sliding-window delivery rate limit
+ * (`SubscribeOptions.rateLimit`). Both fields are required — there is no
+ * sensible default for a hard cap. Bounds are validated at `subscribe`
+ * time; violations throw `RangeError`.
+ */
+export interface RateLimitOptions {
+  /**
+   * Maximum deliveries in one sliding window. Must be an integer >= 1.
+   */
+  maxMessages: number;
+  /**
+   * Width of the sliding window in milliseconds. Must be a positive finite
+   * number. A delivery counts against the window for a full `perWindowMs`
+   * after it happens — there is no gradual refill, unlike the
+   * `deliveryShaping` token bucket.
+   */
+  perWindowMs: number;
 }
 
 /** Snapshot delivered to `onThrottled` when adaptive throttling engages. */
@@ -1193,6 +1239,22 @@ export interface BusStats {
    */
   shapedSubscribers: number;
   /**
+   * Per-subscriber sliding-window rate-limit backlog (see
+   * `SubscribeOptions.rateLimit`): one row per subscriber with the limit
+   * enabled, carrying the messages currently held back for lack of window
+   * budget (queued entries plus, for batched subscribers, messages already
+   * collected into the pending batch). 0 when the window has budget — a
+   * backlog held back by shaping or the health probe does not count here.
+   */
+  rateLimitedWaiting: Array<{
+    /** The subscriber's id (see `Subscription.id`). */
+    subscriberId: string;
+    /** The topic pattern the subscription was registered with. */
+    pattern: string;
+    /** Messages currently held back by the sliding window. */
+    waiting: number;
+  }>;
+  /**
    * Delayed messages currently scheduled (see `publishDelayed`): accepted,
    * not yet due, fanned out, cancelled, or expired. Each one holds a slot
    * in the timer heap until its due time.
@@ -1423,6 +1485,12 @@ interface Subscriber {
    * Absent when shaping is disabled for this subscriber.
    */
   deliveryShaping?: DeliveryShapingState;
+  /**
+   * Sliding-window delivery rate limit state (see
+   * `SubscribeOptions.rateLimit`). Absent when the limit is disabled for
+   * this subscriber.
+   */
+  rateLimit?: RateWindowState;
   /**
    * Delivery-latency sampling state (see `SubscribeOptions.deliveryLatency`).
    * Absent when sampling is disabled for this subscriber.
@@ -1871,6 +1939,46 @@ function resolveDeliveryShapingOptions(
     shaping: false,
     messagesPerSec,
     burst,
+    timer: undefined,
+  };
+}
+
+/**
+ * Per-subscriber sliding-window delivery rate limit state (see
+ * `SubscribeOptions.rateLimit`). The limiter counts actual deliveries in
+ * the rolling window; `rateLimiting` is true while queued messages are
+ * held back for lack of window budget, and `timer` is the pending re-flush
+ * scheduled for when the oldest delivery slides out of the window.
+ */
+interface RateWindowState {
+  limiter: SlidingWindowLimiter;
+  /** True while queued messages are held back for lack of window budget. */
+  rateLimiting: boolean;
+  /** Pending re-flush timer, armed while `rateLimiting` is true. */
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Validates `SubscribeOptions.rateLimit` and builds the initial
+ * per-subscriber rate-limit state. Returns `undefined` when the limit is
+ * disabled. Throws `RangeError` for invalid bounds.
+ */
+function resolveRateLimitOptions(opt: RateLimitOptions | undefined): RateWindowState | undefined {
+  if (opt == null) return undefined;
+  if (typeof opt !== 'object') {
+    throw new RangeError('rateLimit must be a RateLimitOptions object with maxMessages and perWindowMs');
+  }
+  const maxMessages = opt.maxMessages;
+  if (!Number.isInteger(maxMessages) || maxMessages < 1) {
+    throw new RangeError('rateLimit.maxMessages must be an integer >= 1');
+  }
+  const perWindowMs = opt.perWindowMs;
+  if (!Number.isFinite(perWindowMs) || perWindowMs <= 0) {
+    throw new RangeError('rateLimit.perWindowMs must be a positive finite number of milliseconds');
+  }
+  return {
+    limiter: new SlidingWindowLimiter(maxMessages, perWindowMs),
+    rateLimiting: false,
     timer: undefined,
   };
 }
@@ -3542,6 +3650,9 @@ export class EventBus {
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const rateLimit = resolveRateLimitOptions(opts?.rateLimit);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -3618,6 +3729,7 @@ export class EventBus {
       throttle,
       onThrottled,
       deliveryShaping,
+      rateLimit,
       latency: deliveryLatency,
       ackLatency,
       lag: lagMonitor,
@@ -3667,6 +3779,7 @@ export class EventBus {
           health.autoResumeTimer = undefined;
         }
         this.clearShapingTimer(subscriber);
+        this.clearRateLimitTimer(subscriber);
         this.clearBatchTimer(subscriber);
         const bucket = this.prefixIndex.get(indexKey);
         if (bucket != null) {
@@ -6464,11 +6577,22 @@ export class EventBus {
     const deliveryLatency: BusStats['deliveryLatency'] = [];
     const ackLatency: BusStats['ackLatency'] = [];
     const lag: BusStats['lag'] = [];
+    const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
+      const rateLimit = subscriber.rateLimit;
+      if (rateLimit != null) {
+        rateLimitedWaiting.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          waiting: rateLimit.rateLimiting
+            ? subscriber.queue.size + (subscriber.batch?.pending.length ?? 0)
+            : 0,
+        });
+      }
       const latency = subscriber.latency;
       if (latency != null) {
         deliveryLatency.push({
@@ -6548,6 +6672,7 @@ export class EventBus {
       throttledSubscribers,
       degradedSubscribers,
       shapedSubscribers,
+      rateLimitedWaiting,
       pendingDelayed: this.delayedById.size,
       deliveryLatency,
       ackLatency,
@@ -6907,8 +7032,16 @@ export class EventBus {
       this.drainBatchedSubscriber(subscriber, nowMs);
     } else {
       const shaping = subscriber.deliveryShaping;
-      const maxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
-      const { live, expired } = subscriber.queue.drainLiveUpTo(nowMs, maxLive);
+      const rateLimit = subscriber.rateLimit;
+      // Shaping paces the round first (smoothing bursts); the sliding
+      // window then enforces the hard cap — a message is delivered only
+      // when both allow it.
+      const shapingMaxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
+      const rateLimitMaxLive = rateLimit == null ? Infinity : rateLimit.limiter.budget(nowMs);
+      const { live, expired } = subscriber.queue.drainLiveUpTo(
+        nowMs,
+        Math.min(shapingMaxLive, rateLimitMaxLive),
+      );
       for (const msg of expired) {
         this.recordExpired(msg.topic);
       }
@@ -6919,6 +7052,10 @@ export class EventBus {
           // floor(availableTokens), and nothing else consumes this
           // subscriber's bucket in between.
           shaping?.bucket.take();
+          // The window counts actual deliveries, mirroring the shaping
+          // take: dequeued-but-expired messages never reach this loop, so
+          // TTL expiry consumes no window budget.
+          rateLimit?.limiter.record(nowMs);
           // Compressed payloads are inflated here — once per message, before
           // any handler sees it — so every subscriber transparently receives
           // the original payload. See `inflateMessagePayload` for the
@@ -6934,11 +7071,14 @@ export class EventBus {
       } else {
         for (let i = 0; i < live.length; i += 1) {
           shaping?.bucket.take();
+          rateLimit?.limiter.record(nowMs);
           this.inflateMessagePayload(live[i]);
           this.deliverWithHealth(subscriber, live[i], nowMs);
           if (!health.degraded) continue;
           // The threshold tripped mid-drain: everything not yet attempted
           // goes back to the queue, in FIFO order (see requeueUndelivered).
+          // Only attempted messages were recorded in the window, so the
+          // requeued backlog keeps its full budget on resume.
           this.requeueUndelivered(subscriber, live.slice(i + 1));
           this.reportDegraded(subscriber);
           break;
@@ -6953,6 +7093,19 @@ export class EventBus {
           this.armShapingTimer(subscriber);
         } else {
           this.clearShapingTimer(subscriber);
+        }
+      }
+      if (rateLimit != null) {
+        // Held back by the window only when the queue is non-empty AND the
+        // window shows no budget left: a backlog held back by shaping (or
+        // requeued by a mid-drain health trip) while the window still has
+        // room is not the rate limit's doing.
+        rateLimit.rateLimiting =
+          subscriber.queue.size > 0 && rateLimit.limiter.budget(nowMs) < 1;
+        if (rateLimit.rateLimiting) {
+          this.armRateLimitTimer(subscriber, nowMs);
+        } else {
+          this.clearRateLimitTimer(subscriber);
         }
       }
     }
@@ -6980,7 +7133,15 @@ export class EventBus {
     const batch = subscriber.batch;
     if (batch == null) return;
     const shaping = subscriber.deliveryShaping;
-    const budget = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
+    const rateLimit = subscriber.rateLimit;
+    const shapingBudget = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
+    // Pending messages already reserve window budget (recorded at hand-off
+    // in deliverBatch), so collection must not exceed what is still free —
+    // otherwise a batch filled across several rounds could over-deliver the
+    // window before any delivery is recorded.
+    const rateLimitBudget =
+      rateLimit == null ? Infinity : Math.max(0, rateLimit.limiter.budget(nowMs) - batch.pending.length);
+    const budget = Math.min(shapingBudget, rateLimitBudget);
     if (budget >= 1) {
       const room = batch.maxSize - batch.pending.length;
       if (room > 0) {
@@ -6990,14 +7151,25 @@ export class EventBus {
         }
         batch.pending.push(...live);
       }
-    } else if (shaping != null) {
-      // No shaping budget this round: hold everything back, exactly like
-      // the plain path — the pending batch counts as backlog too.
-      shaping.shaping = subscriber.queue.size > 0 || batch.pending.length > 0;
-      if (shaping.shaping) {
-        this.armShapingTimer(subscriber);
-      } else {
-        this.clearShapingTimer(subscriber);
+    } else {
+      // No shaping or window budget this round: hold everything back,
+      // exactly like the plain path — the pending batch counts as backlog
+      // too.
+      if (shaping != null) {
+        shaping.shaping = subscriber.queue.size > 0 || batch.pending.length > 0;
+        if (shaping.shaping) {
+          this.armShapingTimer(subscriber);
+        } else {
+          this.clearShapingTimer(subscriber);
+        }
+      }
+      if (rateLimit != null) {
+        rateLimit.rateLimiting = subscriber.queue.size > 0 || batch.pending.length > 0;
+        if (rateLimit.rateLimiting) {
+          this.armRateLimitTimer(subscriber, nowMs);
+        } else {
+          this.clearRateLimitTimer(subscriber);
+        }
       }
       return;
     }
@@ -7044,6 +7216,14 @@ export class EventBus {
     const shaping = subscriber.deliveryShaping;
     if (shaping != null) {
       for (let i = 0; i < live.length; i += 1) shaping.bucket.take();
+    }
+    // The whole batch occupies window budget the same way: one recorded
+    // delivery per message, stamped at hand-off — a message that expired
+    // while the batch was filling is dropped above and never counted, so
+    // TTL expiry consumes no window budget.
+    const rateLimit = subscriber.rateLimit;
+    if (rateLimit != null) {
+      for (let i = 0; i < live.length; i += 1) rateLimit.limiter.record(nowMs);
     }
     for (const msg of live) {
       this.inflateMessagePayload(msg);
@@ -7189,6 +7369,47 @@ export class EventBus {
     if (shaping?.timer !== undefined) {
       clearTimeout(shaping.timer);
       shaping.timer = undefined;
+    }
+  }
+
+  /**
+   * Arms the re-flush timer for a rate-limited subscriber that is holding
+   * messages back: when the oldest delivery slides out of the window, the
+   * timer triggers another flush so the backlog drains even when no new
+   * publishes arrive. The delay is derived from the bus clock (consistent
+   * with the window); the timer itself is a real wall-clock timeout — like
+   * the shaping re-flush timer — and never keeps the process alive on its
+   * own. Firing only schedules a flush when the subscriber is still
+   * rate-limited and the window actually has budget; otherwise it re-arms,
+   * so a clock that has not advanced cannot spin the flush loop.
+   */
+  private armRateLimitTimer(subscriber: Subscriber, nowMs: number): void {
+    const rateLimit = subscriber.rateLimit;
+    if (rateLimit == null || rateLimit.timer !== undefined) return;
+    const delayMs = Math.max(0, Math.ceil(rateLimit.limiter.msUntilBudget(nowMs)));
+    const timer = setTimeout(() => {
+      rateLimit.timer = undefined;
+      if (!rateLimit.rateLimiting || this.subscribers.get(subscriber.id) !== subscriber) return;
+      if (rateLimit.limiter.budget(this.now()) < 1) {
+        this.armRateLimitTimer(subscriber, this.now());
+        return;
+      }
+      this.scheduleFlush();
+    }, delayMs);
+    // A rate-limited backlog must not keep the process alive on its own.
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    rateLimit.timer = timer;
+  }
+
+  /**
+   * Cancels a rate-limited subscriber's pending re-flush timer, if any.
+   */
+  private clearRateLimitTimer(subscriber: Subscriber): void {
+    const rateLimit = subscriber.rateLimit;
+    if (rateLimit?.timer !== undefined) {
+      clearTimeout(rateLimit.timer);
+      rateLimit.timer = undefined;
     }
   }
 
