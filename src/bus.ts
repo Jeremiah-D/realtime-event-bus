@@ -312,6 +312,31 @@ export interface SubscribeOptions {
    */
   resumeFromSeq?: number;
   /**
+   * Time-based resume for durable-log replay. When the bus has a durable
+   * log (`EventBusOptions.durableLogDir`), the subscriber's queue is
+   * pre-filled at subscribe time with every logged message on topics
+   * matching its pattern published strictly after `resumeFromTime` (a
+   * wall-clock timestamp in milliseconds on the bus clock —
+   * `EventBusOptions.now`), in publish-time order — so a brand-new
+   * consumer (cold start) or a disaster-recovery replay catches up
+   * everything since a moment in time without needing a per-topic
+   * sequence checkpoint. Messages keep their original `seq` and TTL
+   * deadline; ones whose TTL already expired are dropped as expired at
+   * drain time, not resurrected. Like `resumeFromSeq`, replay honors
+   * the content `filter`, handoff-linger windows, keyed compaction
+   * (only the latest value per key replays), compression
+   * re-registration and the keyed-ordering baseline, and goes through
+   * the subscriber's normal backpressure policy.
+   *
+   * Mutually exclusive with `resumeFromSeq`: a replay has exactly one
+   * cursor, so passing both throws `RangeError`. Requires
+   * `durableLogDir`: passing `resumeFromTime` without it throws
+   * `RangeError` instead of silently replaying nothing. Must be a
+   * finite number of milliseconds `>= 0`. For consumer-group members
+   * the replay is per member, like `resumeFromSeq`.
+   */
+  resumeFromTime?: number;
+  /**
    * Opt-in subscriber-side content filter. When set, every message fanned
    * out to this subscriber first passes the predicate at the publish side:
    * a message the filter rejects never enters the subscriber's queue — it
@@ -3493,6 +3518,8 @@ export class EventBus {
     // half-registered subscriber behind.
     const resumeFromSeq = opts?.resumeFromSeq;
     this.validateResumeFromSeq(resumeFromSeq);
+    const resumeFromTime = opts?.resumeFromTime;
+    this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
     // Broker-level ACL: an unauthorized subscription is audited and then
     // rejected with a clear error before anything registers — the caller
     // must not mistake silence for success. Applies to the subscribe
@@ -3617,11 +3644,14 @@ export class EventBus {
     this.advertiseClusterPatterns();
 
     // Durable-log resume: pre-fill the queue with logged messages the
-    // subscriber missed (seq > resumeFromSeq on matching topics), in
-    // publish-time order per topic, before any live message. Queue push
-    // applies the subscriber's normal backpressure policy to replayed
-    // messages too; a flush is scheduled so they are delivered promptly.
-    if (resumeFromSeq !== undefined) {
+    // subscriber missed (seq > resumeFromSeq on matching topics, or —
+    // with resumeFromTime — at > resumeFromTime), in publish-time order
+    // per topic, before any live message. Queue push applies the
+    // subscriber's normal backpressure policy to replayed messages too;
+    // a flush is scheduled so they are delivered promptly.
+    if (resumeFromTime !== undefined) {
+      this.replayLogSinceTime(subscriber, resumeFromTime);
+    } else if (resumeFromSeq !== undefined) {
       this.replayLog(subscriber, resumeFromSeq);
     }
 
@@ -3871,8 +3901,9 @@ export class EventBus {
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
-    const { resumeFromSeq, partitions: _partitions, ...restOpts } = opts ?? {};
+    const { resumeFromSeq, resumeFromTime, partitions: _partitions, ...restOpts } = opts ?? {};
     this.validateResumeFromSeq(resumeFromSeq);
+    this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
     const sub = this.subscribe(topicPattern, handler, restOpts);
     const key = EventBus.groupKey(groupId, topicPattern);
     // Partition mode is fixed by the group's first member; a disagreeing
@@ -3907,13 +3938,16 @@ export class EventBus {
       // get their uncommitted backlog `(committed, watermark]` from the
       // durable log. Skipped when the member chose its own resume point —
       // its explicit window wins over the automatic one.
-      if (resumeFromSeq === undefined) {
+      if (resumeFromSeq === undefined && resumeFromTime === undefined) {
         for (const m of migrated) {
           if (m.to === sub.id) this.replayPartitionBacklog(subscriber, key, m.partition);
         }
       }
     }
-    if (resumeFromSeq !== undefined) {
+    if (resumeFromTime !== undefined) {
+      if (partitioned) this.replayLogSinceTimeForPartitionedMember(subscriber, key, resumeFromTime);
+      else this.replayLogSinceTime(subscriber, resumeFromTime);
+    } else if (resumeFromSeq !== undefined) {
       if (partitioned) this.replayLogForPartitionedMember(subscriber, key, resumeFromSeq);
       else this.replayLog(subscriber, resumeFromSeq);
     }
@@ -4088,6 +4122,30 @@ export class EventBus {
     }
     if (!Number.isInteger(resumeFromSeq) || resumeFromSeq < 0) {
       throw new RangeError('resumeFromSeq must be a non-negative integer');
+    }
+  }
+
+  /**
+   * Validates the time-based durable-log resume option before anything
+   * registers: a throw must not leave a half-registered subscriber
+   * behind. A replay has exactly one cursor, so `resumeFromTime` and
+   * `resumeFromSeq` are mutually exclusive; otherwise the same contract
+   * as `validateResumeFromSeq` — it requires `durableLogDir` and a sane
+   * value (a finite millisecond timestamp `>= 0`).
+   */
+  private validateResumeFromTime(
+    resumeFromTime: number | undefined,
+    resumeFromSeq: number | undefined,
+  ): void {
+    if (resumeFromTime === undefined) return;
+    if (resumeFromSeq !== undefined) {
+      throw new RangeError('resumeFromTime and resumeFromSeq are mutually exclusive');
+    }
+    if (this.durableLog == null) {
+      throw new RangeError('resumeFromTime requires EventBusOptions.durableLogDir to be set');
+    }
+    if (!Number.isFinite(resumeFromTime) || resumeFromTime < 0) {
+      throw new RangeError('resumeFromTime must be a finite number of milliseconds >= 0');
     }
   }
 
@@ -4659,6 +4717,71 @@ export class EventBus {
     for (const topic of log.topics()) {
       if (!matcher.test(topic)) continue;
       for (const rec of log.readSince(topic, fromSeq)) {
+        if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
+      }
+    }
+    records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    this.admitReplayRecords(subscriber, records);
+    this.scheduleFlush();
+  }
+
+  /**
+   * Replays durable-log records into a resubscribing subscriber's queue
+   * by wall-clock time: every logged message on a topic matching the
+   * subscriber's pattern with `at` strictly greater than `fromTime` is
+   * re-enqueued with its original `seq` and TTL deadline, in
+   * publish-time (`at`, then `seq`, then topic) order — deterministic,
+   * and the same cross-topic order `replayLog` uses. The cold-start /
+   * disaster-recovery counterpart to `replayLog`'s seq-based resume
+   * (see `SubscribeOptions.resumeFromTime`). Expired deadlines are
+   * kept on the message so the drain drops them as expired instead of
+   * resurrecting stale data. Shares `admitReplayRecords` with every
+   * other replay path, so the content filter, handoff linger,
+   * compression re-registration and keyed ordering behave identically.
+   */
+  private replayLogSinceTime(subscriber: Subscriber, fromTime: number): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const matcher = subscriber.matcher;
+    const records: ReplayRecord[] = [];
+    for (const topic of log.topics()) {
+      if (!matcher.test(topic)) continue;
+      for (const rec of log.readSinceTime(topic, fromTime)) records.push(rec);
+    }
+    records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    this.admitReplayRecords(subscriber, records);
+    this.scheduleFlush();
+  }
+
+  /**
+   * Replays the durable log for a member of a partitioned group by
+   * wall-clock time, filtered to the partitions currently assigned to
+   * it: a resume must not deliver another member's partitions. The
+   * time-based counterpart of `replayLogForPartitionedMember` (see
+   * `SubscribeOptions.resumeFromTime`).
+   */
+  private replayLogSinceTimeForPartitionedMember(
+    subscriber: Subscriber,
+    groupKey: string,
+    fromTime: number,
+  ): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const n = this.groupPartitions.get(groupKey);
+    if (n === undefined) {
+      this.replayLogSinceTime(subscriber, fromTime);
+      return;
+    }
+    const assignment = this.partitionAssignment(groupKey);
+    const mine = new Set<number>();
+    for (const [p, memberId] of assignment) {
+      if (memberId === subscriber.id) mine.add(p);
+    }
+    const matcher = subscriber.matcher;
+    const records: ReplayRecord[] = [];
+    for (const topic of log.topics()) {
+      if (!matcher.test(topic)) continue;
+      for (const rec of log.readSinceTime(topic, fromTime)) {
         if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
       }
     }

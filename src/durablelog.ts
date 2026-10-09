@@ -541,6 +541,32 @@ export class DurableTopicLog {
     return records.filter((rec) => rec.key === undefined || rec.seq < 1 || latestByKey.get(rec.key) === rec);
   }
 
+  /**
+   * Every logged record for `topic` with `at` strictly greater than
+   * `fromTimeExclusive`, in file (ascending seq) order. Used for
+   * time-based catch-up replay
+   * (`SubscribeOptions.resumeFromTime`): a new consumer (cold start)
+   * or a disaster-recovery replay starts from a wall-clock moment on
+   * the bus clock instead of a per-topic sequence checkpoint.
+   *
+   * With keyed compaction on, only the latest record per key is
+   * returned — the same "latest per key" rule `readSince` applies, so
+   * a superseded value is never replayed by time either. seq-0
+   * schedule records (timer intents) pass through untouched.
+   */
+  readSinceTime(topic: string, fromTimeExclusive: number): DurableLogRecord[] {
+    const records = this.readFileRecords(topic).filter((rec) => rec.at > fromTimeExclusive);
+    if (!this.keyCompaction) return records;
+    const latestByKey = new Map<string, DurableLogRecord>();
+    for (const rec of records) {
+      // File order is ascending seq, so the last write per key wins —
+      // identical to `readSince`'s dedup.
+      if (rec.key !== undefined && rec.seq >= 1) latestByKey.set(rec.key, rec);
+    }
+    if (latestByKey.size === 0) return records;
+    return records.filter((rec) => rec.key === undefined || rec.seq < 1 || latestByKey.get(rec.key) === rec);
+  }
+
   /** Topics with at least one log file, in first-seen order. */
   topics(): string[] {
     return [...this.topicsSeen];

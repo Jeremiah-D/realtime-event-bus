@@ -156,7 +156,15 @@ library.
   (already-expired replays are dropped as expired at drain, not resurrected),
   and replay goes through the normal queue backpressure policy. For
   consumer-group members replay is per member from each member's own offset
-  (seed from that member's `commitOffset`). `resumeFromSeq` without
+  (seed from that member's `commitOffset`). A brand-new consumer (cold start)
+  or a disaster-recovery replay that has no seq checkpoint can instead pass
+  `subscribe(pattern, handler, { resumeFromTime })`: the queue is pre-filled
+  with every logged message published strictly after that wall-clock
+  timestamp (bus clock, `EventBusOptions.now`), in publish-time order, with
+  the same TTL/filter/backpressure semantics. `resumeFromTime` and
+  `resumeFromSeq` are mutually exclusive (one replay cursor), and honest
+  about history: only what the log still retains replays — messages already
+  compacted away cannot be recovered by time. `resumeFromSeq` without
   `durableLogDir` throws instead of silently replaying nothing. Hot topics
   compact automatically (`durableLogMaxEntriesPerTopic`, default 10000,
   amortized rewrite at 2x). Corrupt log lines are skipped and counted
