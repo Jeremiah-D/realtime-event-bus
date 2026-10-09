@@ -1022,6 +1022,13 @@ export interface BusStats {
     samples: number;
   }>;
   /**
+   * Keyed messages held in per-(subscriber, key) reorder buffers because
+   * an earlier keySeq had not been fanned out yet — the observable count
+   * of per-key publish-order enforcement (see `PublishOptions.key`).
+   * Monotonic.
+   */
+  keyedReorderedMessages: number;
+  /**
    * The hottest topics by 1m publish rate (see `src/rates.ts`), hottest
    * first — at most `HOT_TOPICS_LIMIT` (10) entries; topics with no
    * publishes in the trailing minute never appear. The first place to look
@@ -1055,6 +1062,40 @@ export interface BusStats {
     /** Whether keyed log compaction is enabled (`durableLogKeyCompaction`). */
     keyCompaction: boolean;
   };
+}
+
+/**
+ * One keyed message moving through the per-(subscriber, key) ordering
+ * gate: either delivered in keySeq order or held in the reorder buffer
+ * until its predecessors are admitted.
+ */
+interface KeyedDelivery {
+  msg: BusMessage;
+  expiresAt: number | undefined;
+  rawPayload: unknown;
+  /**
+   * True for durable-log replay: the content filter and handoff-linger
+   * checks already ran in `replayLog`, so admission goes straight to the
+   * queue — replay never burned throttle budget and must not start now.
+   */
+  replay: boolean;
+}
+
+/**
+ * Per-(subscriber, key) publish-order state (see `PublishOptions.key`).
+ *
+ * `expected` is the next per-key sequence number this subscriber's stream
+ * needs; `skipped` holds keySeqs at or above `expected` that will never be
+ * fanned out to this subscriber — published to topics its pattern does not
+ * match, or lost before fan-out (cancelled/expired/shed delayed schedules,
+ * filtered replay) — so the stream advances past them instead of hanging;
+ * `buffer` holds early arrivals (keySeq > expected, not skipped) until
+ * their predecessors are admitted.
+ */
+interface KeyOrderState {
+  expected: number;
+  skipped: Set<number>;
+  buffer: Map<number, KeyedDelivery>;
 }
 
 interface Subscriber {
@@ -1114,6 +1155,13 @@ interface Subscriber {
    * Absent when monitoring is disabled for this subscriber.
    */
   lag?: SubscriberLagState;
+  /**
+   * Per-(subscriber, key) publish-order state for keyed messages (see
+   * `PublishOptions.key`). Created lazily — a subscriber that never
+   * receives a keyed message pays nothing, and entries only exist for
+   * keys actually fanned out to this subscriber.
+   */
+  keyOrder?: Map<string, KeyOrderState>;
   /**
    * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
    * Absent when the probe is disabled for this subscriber.
@@ -1576,17 +1624,30 @@ export interface AtomicPublishResult {
  */
 export interface PublishOptions {
   /**
-   * Compaction key for the durable log's keyed compaction (requires
-   * `EventBusOptions.durableLogKeyCompaction`, Kafka-style): only the
-   * latest record per (topic, key) is retained and replayed — publishing a
-   * new message with an existing key supersedes the old value. Use it for
-   * state snapshots (latest price per symbol, latest config per service)
-   * rather than event streams. Keyless messages are ordinary log entries.
+   * Message key with two roles:
+   *
+   * 1. Compaction key for the durable log's keyed compaction (requires
+   *    `EventBusOptions.durableLogKeyCompaction`, Kafka-style): only the
+   *    latest record per (topic, key) is retained and replayed — publishing
+   *    a new message with an existing key supersedes the old value. Use it
+   *    for state snapshots (latest price per symbol, latest config per
+   *    service) rather than event streams. Keyless messages are ordinary
+   *    log entries.
+   * 2. Publish-order key: every keyed message carries a per-key sequence
+   *    number assigned by the bus at admission (publish order — schedule
+   *    time for delayed deliveries, fan-out for direct publishes), and each
+   *    subscriber receives same-key messages in strict publish order across
+   *    topics. When a keyed message would arrive out of order (a delayed
+   *    schedule fanning out after a live publish with a higher keySeq), the
+   *    bus holds it in a per-(subscriber, key) reorder buffer — pre-queue,
+   *    consuming no backpressure budget — until its predecessors are
+   *    enqueued. Different keys have independent buffers and never block
+   *    each other; unkeyed messages are unaffected.
    *
    * Must be a non-empty string when provided; anything else throws
    * `RangeError` from `publish`. The key is recorded on the durable-log
    * record regardless, but without `durableLogKeyCompaction` it has no
-   * behavioral effect.
+   * compaction effect (ordering always applies).
    */
   key?: string;
 }
@@ -1594,7 +1655,8 @@ export interface PublishOptions {
 /**
  * One message in a `publishBatch` / `publishAtomic` batch: topic and
  * payload, with the bus assigning `seq` at fan-out. `key` opts the message
- * into durable-log keyed compaction (see `PublishOptions.key`).
+ * into durable-log keyed compaction and per-key publish-order delivery
+ * (see `PublishOptions.key`).
  */
 export type BatchMessage = Omit<BusMessage, 'seq'> & { key?: string };
 
@@ -1620,7 +1682,10 @@ export interface PublishDelayedOptions {
    * Compaction key for the durable log's keyed compaction (see
    * `PublishOptions.key`): persisted on the schedule record so a restart
    * rebuilds the timer with the key intact, and recorded on the delivery
-   * record when the message fans out. Must be a non-empty string when
+   * record when the message fans out. The per-key sequence number is
+   * assigned at schedule time (publish order), so a delayed keyed message
+   * keeps its schedule-order position even when it fans out after live
+   * publishes with higher keySeqs. Must be a non-empty string when
    * provided; anything else throws `RangeError`.
    */
   key?: string;
@@ -1651,6 +1716,13 @@ interface DelayedFanOut {
    * durable-log record.
    */
   key?: string;
+  /**
+   * Per-key sequence number assigned at schedule time (see
+   * `DelayedEntry.keySeq`). Present exactly when `key` is present; the
+   * fan-out must use it verbatim — reassigning at fan-out would renumber
+   * the message into fan-out order and break publish-order delivery.
+   */
+  keySeq?: number;
 }
 
 /**
@@ -1929,6 +2001,22 @@ export class EventBus {
    * the same bound as `topicStats`.
    */
   private topicSeq = new Map<string, number>();
+  /**
+   * Next per-key sequence number to assign, per key. KeySeqs are assigned
+   * at admission — in publish order: direct publishes assign in `fanOut`
+   * after the admission gates; `publishAtomic` draws from a shadow copy so
+   * a rejected batch consumes nothing; `publishDelayed` assigns at schedule
+   * time. Seeded from the durable log at construction so numbering never
+   * restarts across restarts (mirrors the per-topic `topicSeq` recovery).
+   */
+  private keyCursors = new Map<string, number>();
+  /**
+   * Keyed messages held in per-(subscriber, key) reorder buffers because
+   * an earlier keySeq had not been fanned out yet — the observable count
+   * of publish-order enforcement (delayed schedules interleaved with live
+   * publishes). Monotonic.
+   */
+  private totalKeyedReordered = 0;
   /**
    * Per-topic sliding-window publish rate table (see `src/rates.ts`).
    * Sampled once per accepted publish in `fanOut` — after the admission
@@ -2218,6 +2306,12 @@ export class EventBus {
       // that never fanned out (and were not cancelled) survive the
       // restart. Already-due entries fan out immediately.
       this.recoverDelayed();
+      // Reseed per-key sequence cursors: the next keyed publish continues
+      // the on-disk numbering instead of restarting at 1, which would
+      // collide with replayed keySeqs and corrupt per-key ordering.
+      for (const [key, maxSeq] of this.durableLog.recoveredKeySeqs()) {
+        this.keyCursors.set(key, maxSeq);
+      }
       // Reseed consumer-group checkpoints from the offset journal: the
       // highest committed seq per (group, topic) wins, so a restarted bus
       // resumes committed offsets instead of forgetting them — a rejoining
@@ -3315,12 +3409,38 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const matcher = subscriber.matcher;
-    const records: Array<{ seq: number; topic: string; at: number; expiresAt?: number; payload: unknown }> = [];
+    const records: Array<{
+      seq: number;
+      topic: string;
+      at: number;
+      expiresAt?: number;
+      payload: unknown;
+      key?: string;
+      keySeq?: number;
+    }> = [];
     for (const topic of log.topics()) {
       if (!matcher.test(topic)) continue;
       for (const rec of log.readSince(topic, fromSeq)) records.push(rec);
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    // Keyed-ordering replay baseline (see `PublishOptions.key`): seed each
+    // replayed key's expectation at its smallest replayed keySeq, so
+    // replayed messages are released in keySeq order even when the log's
+    // at-order differs from keySeq order (delayed deliveries are logged at
+    // fan-out but numbered at schedule time). Records without a keySeq —
+    // logs written before keyed ordering, or unkeyed messages — replay
+    // exactly as before.
+    for (const rec of records) {
+      if (rec.key === undefined || rec.keySeq === undefined) continue;
+      let order = subscriber.keyOrder?.get(rec.key);
+      if (order === undefined) {
+        if (subscriber.keyOrder === undefined) subscriber.keyOrder = new Map();
+        order = { expected: rec.keySeq, skipped: new Set<number>(), buffer: new Map() };
+        subscriber.keyOrder.set(rec.key, order);
+      } else if (rec.keySeq < order.expected) {
+        order.expected = rec.keySeq;
+      }
+    }
     const filter = subscriber.filter;
     for (const rec of records) {
       // A subscriber content filter applies to replay exactly as it does
@@ -3337,6 +3457,12 @@ export class EventBus {
           : rec.payload;
         if (!filter(rawPayload, rec.topic)) {
           this.countFiltered(subscriber, rec.topic, rec.seq);
+          // A filtered replayed message is deliberately skipped: advance
+          // the key baseline past it like the live path does, or a later
+          // keySeq for the same key would buffer forever.
+          if (rec.key !== undefined && rec.keySeq !== undefined) {
+            this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+          }
           continue;
         }
       }
@@ -3351,6 +3477,9 @@ export class EventBus {
       if (groupId !== undefined && this.isLingering(groupId, rec.topic, rec.seq)) {
         const last = subscriber.lastDeliveredSeq.get(rec.topic);
         if (last === undefined || rec.seq > last) subscriber.lastDeliveredSeq.set(rec.topic, rec.seq);
+        if (rec.key !== undefined && rec.keySeq !== undefined) {
+          this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+        }
         continue;
       }
       const msg: BusMessage = { topic: rec.topic, payload: rec.payload, seq: rec.seq };
@@ -3367,7 +3496,19 @@ export class EventBus {
         if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
       }
       if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
-      this.enqueueMessage(subscriber, msg, rec.expiresAt);
+      if (rec.key !== undefined && rec.keySeq !== undefined) {
+        // Keyed replay: the filter and linger checks above already ran, so
+        // the ordering gate admits straight into the queue — replay never
+        // burned throttle budget and must not start now.
+        this.deliverKeyed(
+          subscriber,
+          { msg, expiresAt: rec.expiresAt, rawPayload: rec.payload, replay: true },
+          rec.key,
+          rec.keySeq,
+        );
+      } else {
+        this.enqueueMessage(subscriber, msg, rec.expiresAt);
+      }
     }
     this.scheduleFlush();
   }
@@ -3544,14 +3685,28 @@ export class EventBus {
     for (const entry of entries) validateMessageKey(entry.key, 'publishAtomic');
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
+    // Per-key sequence numbers are drawn in entry order (publish order)
+    // against a shadow cursor: a rejected batch leaves the live cursors —
+    // and every subscriber's key baseline — exactly untouched.
+    const shadowKeyCursors = new Map<string, number>();
+    const keySeqs: Array<number | undefined> = new Array(entries.length);
     for (let index = 0; index < entries.length; index++) {
-      const { topic, payload } = entries[index];
+      const { topic, payload, key } = entries[index];
       const reason = this.admissionVerdict(topic, payload, shadowBudget);
       if (reason !== undefined) return { published: 0, rejected: { index, topic, reason } };
+      if (key !== undefined) {
+        const keySeq = (shadowKeyCursors.get(key) ?? this.keyCursors.get(key) ?? 0) + 1;
+        shadowKeyCursors.set(key, keySeq);
+        keySeqs[index] = keySeq;
+      }
     }
     // Phase 2: everything was admitted — commit through the normal
     // publish path in one synchronous turn, then flush once.
-    for (const { topic, payload, key } of entries) this.fanOut(topic, payload, true, undefined, key);
+    for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
+    for (let index = 0; index < entries.length; index++) {
+      const { topic, payload, key } = entries[index];
+      this.fanOut(topic, payload, true, undefined, key, keySeqs[index]);
+    }
     this.scheduleFlush();
     return { published: entries.length };
   }
@@ -3671,14 +3826,20 @@ export class EventBus {
     const ttlMs = this.ttlForTopic(topic);
     const expiresAt = ttlMs === undefined ? undefined : nowMs + ttlMs;
     validateMessageKey(opts.key, 'publishDelayed');
+    const key = opts.key;
+    // The per-key sequence number is assigned at schedule time: for keyed
+    // messages, publish order is schedule order, so a delayed keyed
+    // message keeps its schedule-order position even when it fans out
+    // after live publishes with higher keySeqs.
+    const keySeq = key === undefined ? undefined : this.nextKeySeq(key);
     const id = `delayed-${++this.nextDelayedId}`;
-    const entry: DelayedEntry = { id, topic, payload, deliverAt, expiresAt, cancelled: false, key: opts.key };
+    const entry: DelayedEntry = { id, topic, payload, deliverAt, expiresAt, cancelled: false, key, keySeq };
     // Persist the schedule before it is visible anywhere: a crash between
     // here and the due time must still deliver the message after restart.
     // The schedule record carries no sequence number and burns no
     // rate-limit budget — those happen at fan-out, via the normal path.
-    // It does carry the compaction key, so a restart rebuilds the timer
-    // with the key intact.
+    // It does carry the compaction key and the per-key sequence number, so
+    // a restart rebuilds the timer with both intact.
     if (this.durableLog != null) {
       const persisted = this.durableLog.append({
         seq: 0,
@@ -3687,10 +3848,15 @@ export class EventBus {
         deliverAt,
         expiresAt,
         delayId: id,
-        key: opts.key,
+        key,
+        keySeq,
         payload,
       });
       if (!persisted) {
+        // The schedule died before it existed: its keySeq will never fan
+        // out — release every subscriber's expectation past the phantom
+        // sequence so no key stream hangs on it.
+        if (key !== undefined && keySeq !== undefined) this.releaseKeySequence(key, keySeq);
         throw new Error(
           `publishDelayed: the schedule for topic "${topic}" could not be persisted to the ` +
             'durable log (payload is not JSON-serializable or the log write failed); the ' +
@@ -3700,6 +3866,18 @@ export class EventBus {
     }
     this.delayedById.set(id, entry);
     this.delayHeap.push(entry);
+    // A keyed schedule on a topic a subscriber's pattern does not match
+    // advances that subscriber's per-key baseline NOW (schedule time), not
+    // at fan-out: otherwise a subscriber buffering a later keySeq for the
+    // same key would stall until this schedule's due time waiting for a
+    // predecessor it will never receive. Matching subscribers learn the
+    // admitted keySeq now, so a later keySeq fanned out first cannot
+    // establish the baseline above it (see `initKeyBaseline`).
+    if (key !== undefined && keySeq !== undefined) {
+      for (const subscriber of this.subscribers.values()) {
+        this.initKeyBaseline(subscriber, key, keySeq, subscriber.matcher.test(topic));
+      }
+    }
     // An already-due entry (`delayMs: 0`, past `deliverAt`) fans out on the
     // next flush — the sweep below fans it into the queues synchronously
     // and schedules the flush, exactly like `publish`.
@@ -3725,6 +3903,14 @@ export class EventBus {
     entry.cancelled = true;
     this.delayedById.delete(delayId);
     this.appendDelayTombstone(delayId, entry.topic);
+    // A cancelled keyed schedule never fans out: release every
+    // subscriber's per-key expectation past its keySeq, or a subscriber
+    // buffering a later keySeq for the same key would wait forever. The
+    // release enqueues buffered successors, so flush afterwards.
+    if (entry.key !== undefined && entry.keySeq !== undefined) {
+      this.releaseKeySequence(entry.key, entry.keySeq);
+      this.scheduleFlush();
+    }
     this.armDelayTimer();
     return true;
   }
@@ -3768,6 +3954,14 @@ export class EventBus {
       if (top.expiresAt !== undefined && nowMs >= top.expiresAt) {
         this.recordExpired(top.topic);
         this.appendDelayTombstone(top.id, top.topic);
+        // A keyed schedule that expired while delayed never fans out:
+        // release every subscriber's per-key expectation past its keySeq.
+        // The release enqueues buffered successors, so the sweep must
+        // flush afterwards exactly as if it had fanned something out.
+        if (top.key !== undefined && top.keySeq !== undefined) {
+          this.releaseKeySequence(top.key, top.keySeq);
+          fannedOut = true;
+        }
         continue;
       }
       // `preAdmitted`: schema already ran once at schedule time
@@ -3777,6 +3971,7 @@ export class EventBus {
         deliverAt: top.deliverAt,
         expiresAt: top.expiresAt,
         key: top.key,
+        keySeq: top.keySeq,
       });
       this.appendDelayTombstone(top.id, top.topic);
       fannedOut = true;
@@ -3846,7 +4041,7 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const nowMs = this.now();
-    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string }>();
+    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string; keySeq?: number }>();
     const closed = new Set<string>();
     // `readSince(topic, -1)`: the exclusive bound sits below every real
     // seq, so seq-0 schedule records and tombstones come along too.
@@ -3866,6 +4061,7 @@ export class EventBus {
             expiresAt: rec.expiresAt,
             payload: rec.payload,
             key: rec.key,
+            keySeq: rec.keySeq,
           });
         }
       }
@@ -3885,6 +4081,10 @@ export class EventBus {
         expiresAt: rec.expiresAt,
         cancelled: false,
         key: rec.key,
+        // The schedule consumed its keySeq before the restart; the bus's
+        // key cursors were reseeded from the log, so this entry fans out
+        // with its original number — never renumbered, never colliding.
+        keySeq: rec.keySeq,
       };
       this.delayedById.set(delayId, entry);
       this.delayHeap.push(entry);
@@ -3908,6 +4108,18 @@ export class EventBus {
   private nextSeq(topic: string): number {
     const seq = (this.topicSeq.get(topic) ?? 0) + 1;
     this.topicSeq.set(topic, seq);
+    return seq;
+  }
+
+  /**
+   * Draws the next per-key sequence number for `key` (see `keyCursors`).
+   * KeySeqs start at 1 per key and increase by 1 for every admitted keyed
+   * message, regardless of topic — this is the cross-topic publish order
+   * that per-(subscriber, key) delivery enforces.
+   */
+  private nextKeySeq(key: string): number {
+    const seq = (this.keyCursors.get(key) ?? 0) + 1;
+    this.keyCursors.set(key, seq);
     return seq;
   }
 
@@ -4091,8 +4303,36 @@ export class EventBus {
    * `rawPayload` is the application payload as published — never a
    * compressed wire envelope — so the content filter always judges the
    * real payload, exactly like a schema validator does.
+   *
+   * `keyed` carries the message's per-key sequence number (see
+   * `PublishOptions.key`): when present, delivery goes through the
+   * per-(subscriber, key) ordering gate (`deliverKeyed`) instead of
+   * straight to the queue.
    */
   private deliverToSubscriber(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+    keyed?: { key: string; keySeq: number },
+  ): boolean {
+    if (keyed !== undefined) {
+      return this.deliverKeyed(
+        subscriber,
+        { msg, expiresAt, rawPayload, replay: false },
+        keyed.key,
+        keyed.keySeq,
+      );
+    }
+    return this.deliverUnkeyed(subscriber, msg, expiresAt, rawPayload);
+  }
+
+  /**
+   * The unordered delivery path: content filter, then adaptive
+   * publish-side throttling, then the queue. Keyed messages reach it
+   * through `deliverKeyed` once the ordering gate admits them.
+   */
+  private deliverUnkeyed(
     subscriber: Subscriber,
     msg: BusMessage,
     expiresAt: number | undefined,
@@ -4118,6 +4358,158 @@ export class EventBus {
       return false;
     }
     return this.enqueueMessage(subscriber, msg, expiresAt) === 'accepted';
+  }
+
+  /**
+   * Per-(subscriber, key) publish-order delivery gate (see
+   * `PublishOptions.key`). KeySeqs are assigned at admission in publish
+   * order, but fan-out order can differ — a delayed schedule fans out
+   * after live publishes with higher keySeqs — so a keyed message whose
+   * predecessors have not been fanned out yet waits in the per-key reorder
+   * buffer (pre-queue: no backpressure budget consumed, no filter or
+   * throttle evaluated yet) until they are admitted.
+   *
+   * Baseline rule, mirroring gap detection: the first keyed message fanned
+   * out to this subscriber for a key establishes `expected` at its keySeq —
+   * a subscriber that joins late must not hang on keySeqs admitted before
+   * it existed. A keySeq below `expected` is a late arrival (admitted
+   * before the baseline, e.g. a delayed message scheduled before this
+   * subscriber subscribed): it is delivered immediately, never blocking
+   * the stream on the past.
+   *
+   * Every wait terminates: a keySeq that will never be fanned out to this
+   * subscriber is marked skipped (`skipKeySeq`) — published to a
+   * non-matching topic, or lost before fan-out (cancelled/expired/shed
+   * delayed schedule, filtered replay) — and the expectation cascades past
+   * contiguous skips, releasing buffered successors in order.
+   */
+  private deliverKeyed(
+    subscriber: Subscriber,
+    delivery: KeyedDelivery,
+    key: string,
+    keySeq: number,
+  ): boolean {
+    let order = subscriber.keyOrder?.get(key);
+    if (order === undefined) {
+      order = { expected: keySeq, skipped: new Set<number>(), buffer: new Map() };
+      if (subscriber.keyOrder === undefined) subscriber.keyOrder = new Map();
+      subscriber.keyOrder.set(key, order);
+    }
+    if (order.skipped.delete(keySeq)) {
+      // Defensive: a keySeq marked as never-arriving showed up anyway —
+      // deliver it rather than hang the key on a stale mark.
+      return this.admitKeyed(subscriber, delivery);
+    }
+    if (keySeq < order.expected) {
+      return this.admitKeyed(subscriber, delivery);
+    }
+    if (keySeq > order.expected) {
+      order.buffer.set(keySeq, delivery);
+      this.totalKeyedReordered += 1;
+      // Admitted into the ordering layer — it will reach the queue once
+      // its predecessors are admitted, so it counts as accepted for the
+      // fan-out width, exactly like a queued message.
+      return true;
+    }
+    const accepted = this.admitKeyed(subscriber, delivery);
+    order.expected = keySeq + 1;
+    this.cascadeKeyExpected(subscriber, order);
+    return accepted;
+  }
+
+  /**
+   * Admits one keyed delivery whose turn has come: live messages run the
+   * filter/throttle/queue gate (`deliverUnkeyed`); replayed messages go
+   * straight to the queue (the filter and linger checks already ran in
+   * `replayLog`, and replay never burned throttle budget).
+   */
+  private admitKeyed(subscriber: Subscriber, delivery: KeyedDelivery): boolean {
+    if (delivery.replay) {
+      return this.enqueueMessage(subscriber, delivery.msg, delivery.expiresAt) === 'accepted';
+    }
+    return this.deliverUnkeyed(subscriber, delivery.msg, delivery.expiresAt, delivery.rawPayload);
+  }
+
+  /**
+   * Advances a per-key expectation past everything now deliverable:
+   * contiguous skipped keySeqs are dropped, then contiguous buffered
+   * messages are admitted in keySeq order. Each iteration strictly moves
+   * `expected` forward, so the loop always terminates.
+   */
+  private cascadeKeyExpected(subscriber: Subscriber, order: KeyOrderState): void {
+    for (;;) {
+      if (order.skipped.delete(order.expected)) {
+        order.expected += 1;
+        continue;
+      }
+      const next = order.buffer.get(order.expected);
+      if (next === undefined) return;
+      order.buffer.delete(order.expected);
+      this.admitKeyed(subscriber, next);
+      order.expected += 1;
+    }
+  }
+
+  /**
+   * Ensures a per-(subscriber, key) ordering entry exists at keyed
+   * admission time. Used by `publishDelayed`: admission (schedule) and
+   * fan-out (due time) are separated, so a matching subscriber must learn
+   * the admitted keySeq NOW — otherwise a later keySeq fanned out first
+   * would establish the baseline there and the delayed message would
+   * arrive as a "late" out-of-order delivery. A non-matching subscriber's
+   * baseline moves past the keySeq (it will never be fanned out to it).
+   * Direct publishes need no eager init: admission and fan-out are one
+   * synchronous step, so `deliverKeyed`'s baseline rule establishes the
+   * same expectation at fan-out.
+   */
+  private initKeyBaseline(
+    subscriber: Subscriber,
+    key: string,
+    keySeq: number,
+    matches: boolean,
+  ): void {
+    let order = subscriber.keyOrder?.get(key);
+    if (order === undefined) {
+      if (subscriber.keyOrder === undefined) subscriber.keyOrder = new Map();
+      order = { expected: matches ? keySeq : keySeq + 1, skipped: new Set(), buffer: new Map() };
+      subscriber.keyOrder.set(key, order);
+      return;
+    }
+    if (!matches) this.skipKeySeq(subscriber, key, keySeq);
+    // Matching with an existing entry: the baseline already covers this
+    // keySeq's position — nothing to do.
+  }
+
+  /**
+   * Marks one keySeq as never-to-be-fanned-out for this subscriber and
+   * cascades the expectation past it. Called when a keyed message is
+   * published to a topic the subscriber's pattern does not match (at
+   * schedule time for delayed messages, at fan-out time for direct ones),
+   * and when a keyed schedule dies before fan-out (cancelled, TTL-expired,
+   * or shed by the rate limiter). Without this, a subscriber buffering a
+   * later keySeq would wait forever for a predecessor it will never see.
+   *
+   * No entry (the subscriber never received this key) needs no mark: the
+   * baseline rule in `deliverKeyed` establishes `expected` at the first
+   * keyed message actually fanned out to it.
+   */
+  private skipKeySeq(subscriber: Subscriber, key: string, keySeq: number): void {
+    const order = subscriber.keyOrder?.get(key);
+    if (order === undefined || keySeq < order.expected || order.skipped.has(keySeq)) return;
+    order.skipped.add(keySeq);
+    this.cascadeKeyExpected(subscriber, order);
+  }
+
+  /**
+   * Releases every subscriber's per-key expectation past a keySeq that
+   * will never fan out: a cancelled or TTL-expired delayed schedule, a
+   * delayed message shed by the rate limiter at fan-out, or a schedule
+   * whose durable-log write failed. O(subscribers) on rare paths only.
+   */
+  private releaseKeySequence(key: string, keySeq: number): void {
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.keyOrder?.has(key)) this.skipKeySeq(subscriber, key, keySeq);
+    }
   }
 
   /**
@@ -4175,9 +4567,12 @@ export class EventBus {
    * message), and the durable-log record carries `deliverAt`/`delayId` so
    * restart recovery can tell it apart from a still-pending schedule.
    *
-   * `key` is the durable-log compaction key for direct publishes (see
-   * `PublishOptions.key`); delayed messages carry theirs on `delayed`
-   * instead. The key is stamped onto the delivery's durable-log record.
+   * `key` is the message key for direct publishes (see `PublishOptions.key`);
+   * delayed messages carry theirs on `delayed` instead. The key is stamped
+   * onto the delivery's durable-log record. `preassignedKeySeq` carries a
+   * per-key sequence number drawn during `publishAtomic` admission — the
+   * commit phase must reuse it verbatim so the batch keeps its admission
+   * order; direct publishes draw theirs below, after the admission gates.
    */
   private fanOut(
     topic: string,
@@ -4185,6 +4580,7 @@ export class EventBus {
     preAdmitted = false,
     delayed?: DelayedFanOut,
     key?: string,
+    preassignedKeySeq?: number,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Publish-side schema validation runs before admission: a rejected
     // payload never becomes a message — no sequence number is consumed
@@ -4204,6 +4600,13 @@ export class EventBus {
     stats.publishedMessages += 1;
     stats.lastSeq = msg.seq;
     this.totalPublished += 1;
+    // A delayed fan-out carries the per-key sequence number assigned at
+    // schedule time (publish order) — it is used verbatim below, and it is
+    // what the release hook needs when the rate limiter sheds the message.
+    const delayedKeyed =
+      delayed?.key !== undefined && delayed.keySeq !== undefined
+        ? { key: delayed.key, keySeq: delayed.keySeq }
+        : undefined;
     // Publish-side per-topic rate limiting: when the topic's token bucket
     // is empty the message is shed here — never fanned out, never logged,
     // never queued. The shed consumes the sequence number stamped above so
@@ -4220,9 +4623,26 @@ export class EventBus {
       if (!bucket.take()) {
         stats.rateLimitedMessages += 1;
         this.totalRateLimited += 1;
+        // The keySeq was consumed at schedule time but the message never
+        // fans out: release every subscriber's expectation past it, or a
+        // subscriber buffering a later keySeq for the same key would wait
+        // forever. (Direct publishes draw their keySeq after this gate,
+        // so a shed direct publish consumes nothing.)
+        if (delayedKeyed !== undefined) {
+          this.releaseKeySequence(delayedKeyed.key, delayedKeyed.keySeq);
+        }
         return { matched: 0, accepted: 0, admitted: false };
       }
     }
+    // Per-key publish-order sequence (see `PublishOptions.key`). Delayed
+    // messages reuse their schedule-time keySeq; `publishAtomic` reuses its
+    // admission-time keySeq; direct publishes draw here — after the
+    // admission gates, so a schema rejection or rate-limit shed never
+    // consumes a key sequence (a consumed-but-never-fanned-out keySeq
+    // would hang every subscriber buffering a later keySeq for the key).
+    const keyed =
+      delayedKeyed ??
+      (key === undefined ? undefined : { key, keySeq: preassignedKeySeq ?? this.nextKeySeq(key) });
     // Accepted-for-publish sampling (EB-34): the message cleared the
     // admission gates (schema validation, rate-limit budget), so it counts
     // as publish traffic in the per-topic sliding-window rate table —
@@ -4285,10 +4705,10 @@ export class EventBus {
     // A delayed delivery's record additionally carries its schedule
     // identity (`deliverAt`/`delayId`): restart recovery tells a fulfilled
     // schedule (delivery record present) from a still-pending one
-    // (schedule record only). A compaction `key` — from the direct publish
-    // options or carried over from the delayed schedule — rides on the
-    // delivery record.
-    const recordKey = key ?? delayed?.key;
+    // delivery record. A message `key` — from the direct publish options
+    // or carried over from the delayed schedule — rides on the delivery
+    // record together with its per-key sequence number, so restart
+    // recovery and replay can preserve per-key publish order.
     this.durableLog?.append({
       seq: msg.seq,
       topic,
@@ -4296,7 +4716,7 @@ export class EventBus {
       expiresAt,
       payload: msg.payload,
       ...(delayed == null ? {} : { deliverAt: delayed.deliverAt, delayId: delayed.delayId }),
-      ...(recordKey === undefined ? {} : { key: recordKey }),
+      ...(keyed === undefined ? {} : { key: keyed.key, keySeq: keyed.keySeq }),
       // Only present when a preset dictionary compressed this message:
       // replay needs the same bytes to inflate it.
       ...(compressedDictId === undefined ? {} : { dictId: compressedDictId }),
@@ -4315,11 +4735,25 @@ export class EventBus {
     // single copy is assigned round-robin after the scan.
     const groupHits = new Map<string, { groupId: string; members: Subscriber[] }>();
     for (const subscriber of this.subscribers.values()) {
-      if (prune && !candidates.has(subscriber.id)) continue;
-      if (!subscriber.matcher.test(topic)) continue;
+      if (prune && !candidates.has(subscriber.id)) {
+        // Pruned by the prefix index: under the no-miss invariant the
+        // pattern cannot match this topic — a definite non-match, so a
+        // keyed message advances the subscriber's per-key baseline past
+        // its keySeq, exactly like the matcher-tested non-match below.
+        if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq);
+        continue;
+      }
+      if (!subscriber.matcher.test(topic)) {
+        // A keyed message on a topic this subscriber never sees must still
+        // advance its per-key baseline past this keySeq — otherwise a
+        // subscriber buffering a later keySeq for the same key would wait
+        // for a predecessor that will never be fanned out to it.
+        if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq);
+        continue;
+      }
       if (subscriber.groupId == null) {
         matched += 1;
-        if (this.deliverToSubscriber(subscriber, msg, expiresAt, payload)) accepted += 1;
+        if (this.deliverToSubscriber(subscriber, msg, expiresAt, payload, keyed)) accepted += 1;
         continue;
       }
       const key = EventBus.groupKey(subscriber.groupId, subscriber.pattern);
@@ -4333,7 +4767,19 @@ export class EventBus {
     for (const [key, hit] of groupHits) {
       matched += 1;
       const assignee = this.assignGroupMember(key, hit.members);
-      if (this.deliverToSubscriber(assignee, msg, expiresAt, payload)) accepted += 1;
+      if (keyed !== undefined) {
+        // Consumer-group members compete per message: a keyed message
+        // assigned to one member will never be fanned out to the others,
+        // so their per-key baselines advance past its keySeq — otherwise a
+        // member buffering a later keySeq would wait for a predecessor
+        // that went to a different member. Per-(subscriber, key) ordering
+        // is per member: each member observes an ordered subsequence of
+        // the key's stream.
+        for (const member of hit.members) {
+          if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq);
+        }
+      }
+      if (this.deliverToSubscriber(assignee, msg, expiresAt, payload, keyed)) accepted += 1;
       this.recordGroupOffset(hit.groupId, topic, msg.seq);
     }
     stats.subscriberCount = matched;
@@ -4436,6 +4882,7 @@ export class EventBus {
       slowestSubscribers,
       lag,
       laggingSubscribers,
+      keyedReorderedMessages: this.totalKeyedReordered,
       hotTopics: this.publishRates.hotTopics(ratesNow),
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');

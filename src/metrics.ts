@@ -26,6 +26,10 @@
  *   subscriber dead-letter queues.
  * - `eventbus_sequence_gaps_total`: sequence numbers observed missing by
  *   subscribers (see `TopicStats.sequenceGaps` for the counting rules).
+ * - `eventbus_keyed_reordered_messages_total`: keyed messages held in
+ *   per-(subscriber, key) reorder buffers because an earlier keySeq had not
+ *   been fanned out yet — the observable count of per-key publish-order
+ *   enforcement (see `PublishOptions.key`).
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
  *
  * Gauges (point-in-time):
@@ -184,6 +188,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_sequence_gaps_total',
     'Total sequence numbers observed missing by subscribers.',
     stats.sequenceGaps,
+  );
+  counter(
+    'eventbus_keyed_reordered_messages_total',
+    'Total keyed messages held in per-(subscriber, key) reorder buffers because an earlier keySeq had not been fanned out yet.',
+    stats.keyedReorderedMessages,
   );
 
   gauge('eventbus_subscribers', 'Currently active subscriptions.', stats.totalSubscribers);

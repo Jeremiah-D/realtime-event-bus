@@ -33,6 +33,13 @@ export interface DelayedEntry {
    * schedule record and stamped onto the delivery record at fan-out.
    */
   key?: string;
+  /**
+   * Per-key publish-order sequence number, assigned at schedule time
+   * (publish order). Present exactly when `key` is present; the sweep
+   * fans the entry out with this keySeq so subscribers observe the
+   * schedule-order position, not the fan-out-order position.
+   */
+  keySeq?: number;
 }
 
 interface HeapNode {

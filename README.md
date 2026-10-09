@@ -400,6 +400,34 @@ library.
   message. A throwing validator propagates to the caller, always during
   admission, so a throw can never leave a half-committed batch. An empty
   batch is a no-op.
+- **Per-key publish-order delivery** (in `src/bus.ts`, via
+  `publish(topic, payload, { key })` — also on batch/atomic/delayed/idempotent
+  publishes): every keyed message carries a per-key sequence number assigned
+  by the bus at admission in publish order (schedule time for delayed
+  deliveries, fan-out for direct publishes; `publishAtomic` draws from a
+  shadow cursor so a rejected batch consumes nothing), and each subscriber
+  receives same-key messages in strict publish order across topics. When a
+  keyed message would arrive out of order — a delayed schedule fanning out
+  after a live publish with a higher keySeq — it waits in a per-(subscriber,
+  key) reorder buffer, pre-queue (no backpressure budget consumed, no filter
+  or throttle evaluated yet), until its predecessors are admitted; different
+  keys have independent buffers and never block each other, and unkeyed
+  messages bypass the gate entirely. The baseline rule mirrors gap
+  detection: the first keyed message fanned out to a subscriber for a key
+  establishes its expectation — a late joiner never hangs on pre-subscription
+  keySeqs. Every wait terminates: keySeqs that will never be fanned out to a
+  subscriber are marked skipped (published to non-matching topics, at
+  schedule time for delayed and at fan-out for direct; cancelled/expired/shed
+  delayed schedules; filtered replay), so the expectation cascades past
+  them instead of hanging. Consumer-group members each observe an ordered
+  subsequence (a keyed message assigned to one member advances the others'
+  baselines past it). The keySeq rides the durable-log record, so replay
+  preserves per-key order and a restarted bus reseeds its cursors instead of
+  renumbering. `getStats().keyedReorderedMessages` counts buffered messages;
+  `src/metrics.ts` renders `eventbus_keyed_reordered_messages_total`. Composes
+  with batch delivery, reliable ACK, health probing, and delivery shaping —
+  the gate runs before the queue, so downstream features see messages in
+  order.
 - **Delayed delivery** (in `src/bus.ts` + `src/delayed.ts`, via
   `publishDelayed(topic, payload, { delayMs } | { deliverAt })`): the message
   waits in a timer min-heap and fans out once the bus clock reaches its due
@@ -726,6 +754,7 @@ Exported series:
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
+| `eventbus_keyed_reordered_messages_total` | counter | `keyedReorderedMessages` — keyed messages held in per-(subscriber, key) reorder buffers |
 | `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
 | `eventbus_subscribers` | gauge | `totalSubscribers` |
 | `eventbus_unacked_deliveries` | gauge | `unackedDeliveries` |

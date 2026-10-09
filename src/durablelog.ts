@@ -50,6 +50,16 @@ export interface DurableLogRecord {
    */
   key?: string;
   /**
+   * Per-key publish-order sequence number for keyed messages (see
+   * `PublishOptions.key`): assigned by the bus at admission — at schedule
+   * time for delayed deliveries, at fan-out for direct publishes — so
+   * subscribers can deliver same-key messages in strict publish order
+   * across topics. Present exactly when `key` is present (on message
+   * records and on delayed-delivery schedule records); a line carrying
+   * `keySeq` without `key` is corrupt.
+   */
+  keySeq?: number;
+  /**
    * SHA-256 id of the preset dictionary that compressed this record's
    * payload (see `setTopicCompression`'s `dictionary` option). Present
    * only on dictionary-compressed records. The bytes themselves live in
@@ -99,6 +109,8 @@ interface LogLine {
   delayId?: string;
   cancelled?: boolean;
   key?: string;
+  /** Per-key publish-order sequence number, present exactly when `key` is. */
+  keySeq?: number;
   /**
    * SHA-256 id of the preset dictionary that compressed `payload`, when
    * the payload is a dictionary-compressed envelope. The bytes live in
@@ -252,6 +264,14 @@ export class DurableTopicLog {
    */
   private readonly keyIndex = new Map<string, Map<string, number>>();
   /**
+   * Highest per-key sequence number observed per key (recovered + appended).
+   * Seeds the bus's key cursors on restart so per-key publish-order
+   * numbering never restarts (mirrors the per-topic `lastSeqs` recovery).
+   * Tracked for every keyed record — schedule records included, since a
+   * delayed schedule already consumed its keySeq at schedule time.
+   */
+  private readonly maxKeySeqs = new Map<string, number>();
+  /**
    * Per-topic count of keyed records superseded by a newer record for the
    * same key and still sitting in the file. Drives the compaction trigger
    * for keyed topics: waiting for the 2x entry-count trigger would let a
@@ -341,6 +361,7 @@ export class DurableTopicLog {
         if (rec.seq > last) last = rec.seq;
         // seq 0 schedule records and tombstones are log lines, not messages.
         if (rec.seq >= 1) messages += 1;
+        this.noteKeySeq(rec.key, rec.keySeq);
       }
       this.lastSeqs.set(topic, last);
       this.messageCounts.set(topic, messages);
@@ -399,6 +420,7 @@ export class DurableTopicLog {
     if (record.seq > (this.lastSeqs.get(record.topic) ?? 0)) {
       this.lastSeqs.set(record.topic, record.seq);
     }
+    this.noteKeySeq(record.key, record.keySeq);
     if (this.keyCompaction && record.key !== undefined && record.seq >= 1) {
       let keys = this.keyIndex.get(record.topic);
       if (keys == null) {
@@ -594,6 +616,22 @@ export class DurableTopicLog {
     return this.lastSeqs.get(topic) ?? 0;
   }
 
+  /**
+   * Highest per-key sequence number observed per key, recovered from disk
+   * and maintained on append. The bus seeds its key cursors from this so
+   * per-key publish-order numbering continues across restarts instead of
+   * restarting at 1 (which would collide with replayed keySeqs).
+   */
+  recoveredKeySeqs(): Map<string, number> {
+    return new Map(this.maxKeySeqs);
+  }
+
+  /** Records the highest keySeq seen for a key; ignores keyless records. */
+  private noteKeySeq(key: string | undefined, keySeq: number | undefined): void {
+    if (key === undefined || keySeq === undefined) return;
+    if (keySeq > (this.maxKeySeqs.get(key) ?? 0)) this.maxKeySeqs.set(key, keySeq);
+  }
+
   /** Entries retained for a topic, 0 when the topic is unknown. */
   entryCount(topic: string): number {
     return this.entryCounts.get(topic) ?? 0;
@@ -669,6 +707,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.delayId !== undefined) line.delayId = record.delayId;
   if (record.cancelled !== undefined) line.cancelled = record.cancelled;
   if (record.key !== undefined) line.key = record.key;
+  if (record.keySeq !== undefined) line.keySeq = record.keySeq;
   if (record.dictId !== undefined) line.dictId = record.dictId;
   return line;
 }
@@ -685,7 +724,8 @@ function logLineOf(record: DurableLogRecord): LogLine {
  * valid with `seq` 0.
  *
  * A `key`, when present, must be a non-empty string; anything else makes
- * the line corrupt.
+ * the line corrupt. A `keySeq`, when present, must be a positive integer
+ * and requires `key` — the bus always writes both together.
  */
 function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | null {
   let parsed: unknown;
@@ -733,6 +773,15 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   if (o['key'] !== undefined) {
     if (typeof o['key'] !== 'string' || (o['key'] as string).length === 0) return null;
     record.key = o['key'] as string;
+  }
+  if (o['keySeq'] !== undefined) {
+    // A per-key sequence number is meaningless without its key: the bus
+    // always writes both together, so a lone keySeq is a corrupt line,
+    // never a keyed message.
+    if (!Number.isInteger(o['keySeq']) || (o['keySeq'] as number) < 1 || record.key === undefined) {
+      return null;
+    }
+    record.keySeq = o['keySeq'] as number;
   }
   if (o['dictId'] !== undefined) {
     // A preset-dictionary id is the SHA-256 hex of the dictionary bytes:
