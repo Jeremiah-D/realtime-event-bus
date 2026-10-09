@@ -89,6 +89,35 @@ library.
   application payload and the concrete topic, applies to durable-log replay
   too, and for group members is evaluated on the assigned member only;
   `getStats()` reports `filteredMessages` per topic and globally.
+- **`src/cluster.ts` — `ClusterHub` / `ClusterLink`**: cross-process
+  cluster federation. Multiple Node processes form a cluster through a
+  central TCP hub (`new ClusterHub({ port })`, TLS via `tls: { key, cert }`);
+  each node joins with `bus.connectToHub({ url: 'tcp://host:port' })`,
+  advertises its subscribed topic patterns, and receives the hub's route
+  table. The hub is authoritative for routing: every membership or pattern
+  change bumps a monotonic route version and rebroadcasts the table; nodes
+  apply only newer versions (a hub restart is detected via a new hub epoch,
+  which supersedes the version — the version-conflict merge). A publish
+  whose topic matches subscribers on other members is additionally forwarded
+  to the hub, which stamps hub-global per-topic sequence numbers (and
+  hub-global per-key numbers for keyed messages) and forwards only to the
+  members whose advertised patterns match — route-aware, never a blind
+  broadcast; purely local traffic never touches the network. The sending
+  node serves its own subscribers from its local publish stream, so a
+  transport failure can never lose an admitted message locally. Sequence
+  epochs (`BusMessage.epoch`: absent locally, `hub:<epoch>` for cluster
+  traffic) keep gap detection and per-key ordering honest across the two
+  numbering spaces: an epoch change re-establishes the baseline instead of
+  counting a phantom gap. When the transport drops, the node degrades to
+  local-only mode on its cached routes (`clusterStatus()` /
+  `getStats().cluster` report `degraded`) and reconnects with backoff
+  (see `src/reconnect.ts`; `reconnect: false` disables it). Hub-side
+  heartbeat management sweeps members that stop heartbeating
+  (`heartbeatIntervalMs` / `heartbeatTimeoutMs`). Payloads must be
+  JSON-serializable for the wire (`Buffer` payloads travel as base64);
+  compressed payloads are forwarded as envelopes and inflated on receipt
+  (preset-dictionary bytes must be registered identically on every node).
+  `ClusterLink.getStats()` exposes forwarded/received/error counters.
 - **`src/durablelog.ts` — `DurableTopicLog`**: opt-in append-only per-topic
   JSONL log (`new EventBus({ durableLogDir })`). Every published message is
   appended as one line (`{v, seq, topic, at, expiresAt?, payload}`, one file
@@ -485,6 +514,16 @@ npm test
   skipping in-flight seqs during the window, live traffic unaffected,
   backlog replayable after expiry, no window when fully committed, inert
   without a durable log, option validation.
+- `test/cluster.test.ts` — cluster federation: route-table sync on join,
+  route-aware forwarding with hub-global per-topic seqs, monotonic hub seqs
+  across publishers, local vs hub seq spaces, no phantom gaps across seq
+  epochs, pattern re-announce + route version bumps, degrade-to-local on hub
+  death, reconnect with a new hub epoch, hub heartbeat sweep of dead
+  members (raw TCP abrupt death), stale route versions ignored, TLS hub,
+  plain-vs-TLS rejection, keyed ordering via hub keySeq, unserializable
+  payloads surfacing as forward errors, option validation, double-connect
+  rejection, `getStats().cluster`, compressed forward + inflate + raw-payload
+  filtering.
 - `test/durablelog.test.ts` — durable topic log: append/readSince round-trip,
   reopen recovery of topics/seqs/counts, corrupt-line tolerance, amortized
   compaction, option validation; bus integration: per-publish logging with
