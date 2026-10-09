@@ -61,6 +61,15 @@
  *   appear.
  * - `eventbus_delivery_latency_samples{subscriber,pattern}`: samples
  *   currently in each tracked subscriber's latency window.
+ * - `eventbus_ack_latency_ms{quantile,subscriber,pattern}`: per-subscriber
+ *   accepted→ack end-to-end latency distribution for reliable
+ *   subscriptions with `ackLatency` enabled — nearest-rank p50/p95/p99
+ *   over each subscriber's bounded rolling window (`quantile` is "0.5",
+ *   "0.95" or "0.99"). The full round trip the producer's SLO depends
+ *   on: queue dwell plus handler processing and consumer think time.
+ *   Only ack-tracked subscribers appear.
+ * - `eventbus_ack_latency_samples{subscriber,pattern}`: samples
+ *   currently in each tracked subscriber's ack-latency window.
  * - `eventbus_lag_ms{quantile,subscriber,pattern}`: per-subscriber
  *   enqueue→drain dwell distribution for subscriptions with `lagMonitor`
  *   enabled — nearest-rank p50/p99 over each subscriber's bounded rolling
@@ -83,10 +92,12 @@
  * bus fanning out over millions of ad-hoc topic names will grow the
  * series count. Topic names come from the publisher, never from subscriber
  * input, so this is bounded by the application's own topic space. The
- * per-subscriber latency series (four per latency-tracked subscription)
- * and the per-subscriber lag series (four per lag-monitored subscription)
- * are bounded by the opted-in subscriber count — monitoring is opt-in per
- * subscription, so unmonitored subscribers add no series. The
+ * per-subscriber latency series (four per latency-tracked subscription),
+ * the per-subscriber ack-latency series (four per ack-tracked reliable
+ * subscription), and the per-subscriber lag series (four per
+ * lag-monitored subscription) are bounded by the opted-in subscriber
+ * count — monitoring is opt-in per subscription, so unmonitored
+ * subscribers add no series. The
  * `eventbus_topic_rate_msg_per_sec` series are the exception to the
  * per-topic rule: they are deliberately limited to the hot-topics set
  * (10 topics x 3 windows = 30 series max), because rate decisions need
@@ -239,6 +250,26 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_delivery_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
     lines.push(`eventbus_delivery_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
     lines.push(`eventbus_delivery_latency_samples{${labels}} ${s.samples}`);
+  }
+
+  // Per-subscriber ack-latency series (only reliable subscriptions with
+  // `ackLatency` enabled), in subscription order (same as
+  // BusStats.ackLatency). The `?? []` keeps the renderer tolerant of a
+  // stats object that predates the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_ack_latency_ms Per-subscriber accepted-to-ack end-to-end latency distribution for reliable subscriptions (nearest-rank quantiles over the rolling sample window).',
+  );
+  lines.push('# TYPE eventbus_ack_latency_ms gauge');
+  lines.push(
+    '# HELP eventbus_ack_latency_samples Samples currently in the subscriber ack-latency window.',
+  );
+  lines.push('# TYPE eventbus_ack_latency_samples gauge');
+  for (const s of stats.ackLatency ?? []) {
+    const labels = `subscriber="${escapeLabelValue(s.subscriberId)}",pattern="${escapeLabelValue(s.pattern)}"`;
+    lines.push(`eventbus_ack_latency_ms{quantile="0.5",${labels}} ${s.p50Ms}`);
+    lines.push(`eventbus_ack_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
+    lines.push(`eventbus_ack_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
+    lines.push(`eventbus_ack_latency_samples{${labels}} ${s.samples}`);
   }
 
   // Per-subscriber lag watermark series (only subscriptions with

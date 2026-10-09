@@ -388,6 +388,28 @@ library.
   and `eventbus_delivery_latency_samples{subscriber,pattern}` gauges (four
   series per tracked subscriber; untracked subscribers add none). Invalid
   options throw `RangeError` from `subscribe`. Disabled by default.
+- **Per-subscriber end-to-end ack-latency SLO tracking** (in
+  `src/acklatency.ts`, opt-in via
+  `subscribeReliable(..., { ackLatency: true })`): measures each reliably
+  delivered message's full accepted→ack round trip — from the moment the
+  message is accepted into the subscriber's queue to the moment its
+  delivery's `ack()` finishes. Where delivery-latency sampling records the
+  enqueue→handler-hand-off queue dwell (handler time excluded), this
+  includes handler processing and consumer think time: the round trip the
+  producer's SLO actually depends on. `nack()` and ack-timeout redeliveries
+  restart the accepted clock, but each message still contributes exactly
+  one sample — repeated deliveries never sample twice, and acking a stale
+  delivery handle records nothing. Each `Delivery` carries the bus-clock
+  `acceptedAtMs` stamp of its hand-off. `getStats()` exposes `ackLatency`
+  (per-subscriber p50/p95/p99 nearest-rank + min/max/mean over a bounded
+  rolling window, default 1024, plus `withinSlo` / `sloAttainment` against
+  `ackSloMs`, default 30000ms); `src/metrics.ts` renders
+  `eventbus_ack_latency_ms{quantile="0.5"|"0.95"|"0.99",subscriber,pattern}`
+  and `eventbus_ack_latency_samples{subscriber,pattern}` gauges (four
+  series per tracked subscriber). An over-budget ack fires `onAckSloMiss`
+  synchronously with the sample, the SLO, and the subscriber's identity.
+  Invalid options throw `RangeError` from `subscribe`. Disabled by
+  default.
 - **Per-subscriber lag watermark monitoring** (in `src/lag.ts`, opt-in via
   `subscribe(..., { lagMonitor: true })`): answers the live question — "how
   far behind is this consumer *right now*?" — Kafka-consumer-lag style.
@@ -853,6 +875,8 @@ Exported series:
 | `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
 | `eventbus_delivery_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→delivery queue-dwell p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `deliveryLatency`-tracked subscriptions |
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
+| `eventbus_ack_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber accepted→ack end-to-end latency p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `ackLatency`-enabled reliable subscriptions |
+| `eventbus_ack_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's ack-latency window |
 | `eventbus_lag_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→drain dwell p50/p99 (`quantile` = "0.5"/"0.99"); only `lagMonitor`-enabled subscriptions |
 | `eventbus_lag_samples{subscriber,pattern}` | gauge | samples in the subscriber's lag dwell window |
 | `eventbus_lag_watermark_ms{subscriber,pattern}` | gauge | live consumer-lag watermark (oldest queued message dwell, 0 when empty); only `lagMonitor`-enabled subscriptions |
@@ -862,10 +886,11 @@ The per-topic series grow with the distinct topics ever published to — the
 same bound as `BusStats.topics` — so a bus fanning out over millions of
 ad-hoc topic names grows the series count. Topic names come from the
 publisher, so this is bounded by the application's own topic space. The
-per-subscriber latency series (four per latency-tracked subscription) and
-the per-subscriber lag series (four per lag-monitored subscription) are
-bounded by the opted-in subscriber count — monitoring is opt-in, so
-unmonitored subscribers add no series. `eventbus_topic_rate_msg_per_sec` is the
+per-subscriber latency series (four per latency-tracked subscription),
+the per-subscriber ack-latency series (four per ack-tracked reliable
+subscription), and the per-subscriber lag series (four per lag-monitored
+subscription) are bounded by the opted-in subscriber count — monitoring is
+opt-in, so unmonitored subscribers add no series. `eventbus_topic_rate_msg_per_sec` is the
 deliberate exception to the per-topic rule: only the hot-topics set
 carries it (10 topics × 3 windows = 30 series max), because
 rate-limit/scaling decisions need the busiest topics, not the full topic

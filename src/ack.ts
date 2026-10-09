@@ -26,6 +26,13 @@ export interface Delivery<T> {
   /** How many times this message was requeued before this delivery. */
   readonly redeliveries: number;
   /**
+   * Bus-clock reading (`EventBusOptions.now`) of the moment this delivery
+   * was handed to the handler. The bus injects its clock into the tracker,
+   * so every redelivery re-stamps: this is the restartable accepted clock
+   * the ack-latency tracker (`src/acklatency.ts`) samples against.
+   */
+  readonly acceptedAtMs: number;
+  /**
    * Confirms receipt. Cancels the redelivery timer and the tracker forgets
    * the delivery. Calling it more than once — or after the delivery already
    * timed out — is a no-op.
@@ -51,6 +58,12 @@ export interface AckTrackerOptions<T> {
    * this runs, so reentrancy is safe.
    */
   onRedeliver: (msg: T) => void;
+  /**
+   * Clock used to stamp `Delivery.acceptedAtMs`. Defaults to `Date.now`;
+   * the bus passes its own injected clock (`EventBusOptions.now`) so the
+   * stamp shares the bus's time base.
+   */
+  now?: () => number;
 }
 
 interface PendingDelivery<T> {
@@ -67,6 +80,7 @@ interface PendingDelivery<T> {
 export class AckTracker<T> {
   private readonly ackTimeoutMs: number;
   private readonly onRedeliver: (msg: T) => void;
+  private readonly now: () => number;
   private readonly pending = new Map<number, PendingDelivery<T>>();
   private nextSeq = 0;
 
@@ -76,6 +90,7 @@ export class AckTracker<T> {
     }
     this.ackTimeoutMs = options.ackTimeoutMs;
     this.onRedeliver = options.onRedeliver;
+    this.now = options.now ?? Date.now;
   }
 
   /** Deliveries currently outstanding, awaiting `ack()` or `nack()`. */
@@ -107,6 +122,7 @@ export class AckTracker<T> {
       msg,
       seq,
       redeliveries,
+      acceptedAtMs: this.now(),
       ack: () => settle(false),
       nack: () => settle(true),
     };

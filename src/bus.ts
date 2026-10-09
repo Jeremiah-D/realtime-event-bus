@@ -7,6 +7,12 @@ import {
   type DeliveryLatencySummaryStats,
 } from './latency.ts';
 import {
+  AckLatencyTracker,
+  type AckLatencyOptions,
+  type AckLatencySummaryStats,
+  type AckSloMissEvent,
+} from './acklatency.ts';
+import {
   LagTracker,
   resolveLagMonitorOptions,
   type LagEvent,
@@ -29,6 +35,11 @@ import type {
 
 export type { Delivery } from './ack.ts';
 export type { DeliveryLatencyOptions, DeliveryLatencySummaryStats } from './latency.ts';
+export type {
+  AckLatencyOptions,
+  AckLatencySummaryStats,
+  AckSloMissEvent,
+} from './acklatency.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
 
 export interface BusMessage {
@@ -181,6 +192,49 @@ export interface SubscribeOptions {
    * Invalid values throw `RangeError` from `subscribe`.
    */
   deliveryLatency?: boolean | DeliveryLatencyOptions;
+  /**
+   * Opt-in per-subscriber end-to-end ack-latency sampling. When enabled,
+   * the bus stamps every message accepted into this subscriber's queue
+   * with the bus clock and records one sample per message when its
+   * delivery's `ack()` finishes: the accepted→ack latency in
+   * milliseconds. Unlike `deliveryLatency` (enqueue→handler-hand-off
+   * queue dwell), this includes handler processing time and any consumer
+   * think time before `ack()` — the full round trip the producer's SLO
+   * actually depends on. `getStats()` exposes the per-subscriber
+   * p50/p95/p99 distribution plus the SLO attainment rate (`ackLatency`),
+   * and `src/metrics.ts` renders them as Prometheus gauges. Only
+   * reliable subscriptions (`subscribeReliable`) ever sample — a plain
+   * subscription has no `ack()`, so its window stays empty. Disabled by
+   * default.
+   *
+   * Sampling semantics: `nack()` and ack-timeout redeliveries restart the
+   * accepted clock, but each message still contributes exactly one sample
+   * — repeated deliveries never sample twice, and acking a stale delivery
+   * handle (one whose delivery already timed out and requeued) records
+   * nothing.
+   *
+   * Pass `true` for the defaults (1024-sample rolling window per
+   * subscriber), or an `AckLatencyOptions` object to tune the window.
+   * Invalid values throw `RangeError` from `subscribe`.
+   */
+  ackLatency?: boolean | AckLatencyOptions;
+  /**
+   * The ack-latency SLO in milliseconds for this subscriber: samples
+   * above it fire `onAckSloMiss` and count against the SLO attainment
+   * rate (`sloAttainment` in `getStats().ackLatency`). Defaults to 30000.
+   * Must be a positive finite number — invalid values throw `RangeError`
+   * from `subscribe`. Only meaningful with `ackLatency` enabled;
+   * providing it (or `onAckSloMiss`) without `ackLatency` also throws
+   * `RangeError`, since the value could never take effect.
+   */
+  ackSloMs?: number;
+  /**
+   * Fired synchronously when an acked delivery's accepted→ack latency
+   * exceeds `ackSloMs` — once per over-budget ack, with the sample, the
+   * SLO, and the subscriber's identity. Must be a function; only
+   * meaningful with `ackLatency` enabled (see `ackSloMs`).
+   */
+  onAckSloMiss?: (event: AckSloMiss) => void;
   /**
    * Opt-in subscriber lag watermark monitoring. When enabled, the bus
    * tracks how long the oldest message currently sitting in this
@@ -459,6 +513,19 @@ export interface SubscriberHealth {
    * delivery and on every resume; always 0 when the probe is disabled.
    */
   consecutiveFailures: number;
+}
+
+/**
+ * Fired when a reliable subscriber's acked delivery exceeds its ack-latency
+ * SLO (see `SubscribeOptions.onAckSloMiss`): once per over-budget ack,
+ * synchronously with the sample. `subscriberId` / `pattern` identify whose
+ * SLO was missed; `latencyMs` / `sloMs` / `at` carry the sample.
+ */
+export interface AckSloMiss extends AckSloMissEvent {
+  /** The subscriber whose ack missed the SLO. */
+  subscriberId: string;
+  /** The topic pattern the subscriber registered. */
+  pattern: string;
 }
 
 export interface ReliableSubscribeOptions extends SubscribeOptions {
@@ -1084,6 +1151,18 @@ export interface BusStats {
     { subscriberId: string; pattern: string } & DeliveryLatencySummaryStats
   >;
   /**
+   * Per-subscriber end-to-end ack-latency summaries (see
+   * `SubscribeOptions.ackLatency`): one entry per subscription with
+   * sampling enabled, in subscription order. Each entry carries the
+   * accepted→ack latency distribution (p50/p95/p99, min/max/mean over the
+   * subscriber's bounded rolling window) plus the SLO attainment rate
+   * (`withinSlo` / `sloAttainment` against `ackSloMs`, default 30000).
+   * Empty when no subscriber opts in.
+   */
+  ackLatency: Array<
+    { subscriberId: string; pattern: string } & AckLatencySummaryStats
+  >;
+  /**
    * The slowest latency-tracked subscribers by p99 queue dwell (top 5,
    * descending) — the first place to look when end-to-end lag grows.
    * Only subscribers with at least one sample appear.
@@ -1290,6 +1369,12 @@ interface Subscriber {
    * Absent when sampling is disabled for this subscriber.
    */
   latency?: SubscriberLatencyState;
+  /**
+   * End-to-end ack-latency sampling state (see
+   * `SubscribeOptions.ackLatency`). Absent when sampling is disabled for
+   * this subscriber.
+   */
+  ackLatency?: SubscriberAckLatencyState;
   /**
    * Lag watermark monitoring state (see `SubscribeOptions.lagMonitor`).
    * Absent when monitoring is disabled for this subscriber.
@@ -1687,6 +1772,60 @@ function resolveDeliveryLatencyOptions(
     throw new RangeError('deliveryLatency.windowSize must be a positive integer');
   }
   return { tracker: new DeliveryLatencyTracker(windowSize), enqueuedAt: new WeakMap() };
+}
+
+/**
+ * Per-subscriber end-to-end ack-latency sampling state (see
+ * `SubscribeOptions.ackLatency`). The tracker's per-message accept clocks
+ * are keyed by message identity (WeakMap), so entries die with their
+ * messages and no cleanup is needed on unsubscribe.
+ */
+interface SubscriberAckLatencyState {
+  tracker: AckLatencyTracker;
+}
+
+/**
+ * Validates `SubscribeOptions.ackLatency` / `ackSloMs` / `onAckSloMiss`
+ * and builds the initial per-subscriber sampling state. Returns
+ * `undefined` when sampling is disabled. Throws `RangeError` for an
+ * invalid window size, an invalid SLO, or SLO options provided without
+ * the opt-in (a value that could never take effect); throws `TypeError`
+ * for a non-function `onAckSloMiss`.
+ */
+function resolveAckLatencyOptions(
+  opt: boolean | AckLatencyOptions | undefined,
+  ackSloMs: number | undefined,
+  onAckSloMiss: ((event: AckSloMiss) => void) | undefined,
+  subscriberId: string,
+  pattern: string,
+  now: () => number,
+): SubscriberAckLatencyState | undefined {
+  if (ackSloMs !== undefined && (!Number.isFinite(ackSloMs) || ackSloMs <= 0)) {
+    throw new RangeError('ackSloMs must be a positive finite number of milliseconds');
+  }
+  if (onAckSloMiss !== undefined && typeof onAckSloMiss !== 'function') {
+    throw new TypeError('onAckSloMiss must be a function');
+  }
+  if (opt == null || opt === false) {
+    if (ackSloMs !== undefined || onAckSloMiss !== undefined) {
+      throw new RangeError('ackSloMs/onAckSloMiss require ackLatency to be enabled');
+    }
+    return undefined;
+  }
+  const o: AckLatencyOptions = opt === true ? {} : opt;
+  const windowSize = o.windowSize ?? 1024;
+  if (!Number.isInteger(windowSize) || windowSize <= 0) {
+    throw new RangeError('ackLatency.windowSize must be a positive integer');
+  }
+  return {
+    tracker: new AckLatencyTracker({
+      windowSize,
+      sloMs: ackSloMs ?? 30000,
+      now,
+      onSloMiss: (event) =>
+        onAckSloMiss?.({ subscriberId, pattern, ...event }),
+    }),
+  };
 }
 
 /**
@@ -3021,6 +3160,16 @@ export class EventBus {
     const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const ackLatency = resolveAckLatencyOptions(
+      opts?.ackLatency,
+      opts?.ackSloMs,
+      opts?.onAckSloMiss,
+      id,
+      topicPattern,
+      this.now,
+    );
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -3085,6 +3234,7 @@ export class EventBus {
       onThrottled,
       deliveryShaping,
       latency: deliveryLatency,
+      ackLatency,
       lag: lagMonitor,
       batch,
       health:
@@ -3204,9 +3354,18 @@ export class EventBus {
     const subscriber = this.subscribers.get(sub.id);
     if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
     const redeliveries = new WeakMap<BusMessage, number>();
+    // Which delivery handle is currently outstanding per message. A
+    // redelivery (nack / ack timeout) retires the previous handle, so only
+    // the live one may sample the ack-latency tracker when its ack()
+    // finishes — a late ack() on a stale handle records nothing against
+    // the restarted clock.
+    const liveDeliveries = new WeakMap<BusMessage, { live: boolean }>();
     const tracker = new AckTracker<BusMessage>({
       ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
+      now: this.now,
       onRedeliver: (msg) => {
+        const live = liveDeliveries.get(msg);
+        if (live !== undefined) live.live = false;
         const count = (redeliveries.get(msg) ?? 0) + 1;
         redeliveries.set(msg, count);
         // The redelivery budget is exhausted: the message is poison
@@ -3225,12 +3384,30 @@ export class EventBus {
     if (dlq != null) {
       subscriber.deadLetter = { entries: [], nextSeq: 0, ...dlq };
     }
+    // Tracks one delivery, wrapping the handle so the ack-latency tracker
+    // (when enabled) samples when ack() finishes. Each message contributes
+    // at most one sample, no matter how many times it is redelivered.
+    const ackState = subscriber.ackLatency;
+    const trackDelivery = (msg: BusMessage): Delivery<BusMessage> => {
+      const delivery = tracker.track(msg, redeliveries.get(msg) ?? 0);
+      if (ackState == null) return delivery;
+      const live = { live: true };
+      liveDeliveries.set(msg, live);
+      return {
+        ...delivery,
+        ack: () => {
+          delivery.ack();
+          if (live.live) ackState.tracker.sampleOnAck(msg);
+        },
+        nack: () => delivery.nack(),
+      };
+    };
     deliver = (msgOrBatch) => {
       // Batched delivery: one tracked envelope per message in the batch,
       // handed to the handler as a single array call.
       if (Array.isArray(msgOrBatch)) {
         const batchHandler = handler as ReliableBatchMessageHandler;
-        const deliveries = msgOrBatch.map((m) => tracker.track(m, redeliveries.get(m) ?? 0));
+        const deliveries = msgOrBatch.map((m) => trackDelivery(m));
         if (dlq == null) {
           batchHandler(deliveries);
           return;
@@ -3248,7 +3425,7 @@ export class EventBus {
       }
       const msg = msgOrBatch;
       const singleHandler = handler as ReliableMessageHandler;
-      const delivery = tracker.track(msg, redeliveries.get(msg) ?? 0);
+      const delivery = trackDelivery(msg);
       if (dlq == null) {
         singleHandler(delivery);
         return;
@@ -5028,6 +5205,16 @@ export class EventBus {
       lag.enqueuedAt.set(msg, nowMs);
       this.checkLag(subscriber, lag, nowMs);
     }
+    const ackLatency = subscriber.ackLatency;
+    if (ackLatency != null && result === 'accepted') {
+      // Stamp the accepted time for the ack-latency tracker (see
+      // `SubscribeOptions.ackLatency`). Only tracked subscribers pay for
+      // the clock read; a dropped message never reaches a handler, so it
+      // is never stamped. Requeues (nack redelivery, ack-timeout requeue)
+      // re-stamp: the ack clock restarts on every redelivery, while the
+      // tracker still records at most one sample per message.
+      ackLatency.tracker.accepted(msg);
+    }
     return result;
   }
 
@@ -5726,6 +5913,7 @@ export class EventBus {
     let degradedSubscribers = 0;
     let shapedSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
+    const ackLatency: BusStats['ackLatency'] = [];
     const lag: BusStats['lag'] = [];
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
@@ -5738,6 +5926,14 @@ export class EventBus {
           subscriberId: subscriber.id,
           pattern: subscriber.pattern,
           ...latency.tracker.summary(),
+        });
+      }
+      const ack = subscriber.ackLatency;
+      if (ack != null) {
+        ackLatency.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          ...ack.tracker.summary(),
         });
       }
       const lagState = subscriber.lag;
@@ -5804,6 +6000,7 @@ export class EventBus {
       shapedSubscribers,
       pendingDelayed: this.delayedById.size,
       deliveryLatency,
+      ackLatency,
       slowestSubscribers,
       lag,
       laggingSubscribers,
