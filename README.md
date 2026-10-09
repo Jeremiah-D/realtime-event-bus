@@ -299,8 +299,9 @@ library.
   idempotency-duplicate suppressions, and `publishAtomic` batch rejections
   (surfaced with the failing entry's gate reason) — fires one
   `AdmissionRejectionEvent { topic, reason, payloadBytes, at }`. `reason`
-  (`'acl' | 'schema' | 'rate-limit' | 'duplicate'`) maps onto the stats counters
-  (`rejectedMessages` / `rateLimitedMessages` / `duplicateMessages`), so
+  (`'acl' | 'schema' | 'rate-limit' | 'duplicate' | 'alias-retired'`) maps onto the stats counters
+  (`rejectedMessages` / `rateLimitedMessages` / `duplicateMessages` /
+  `aliasRetiredMessages`), so
   hook events reconcile exactly with `getStats()`. The hook fires after the
   counters move, carries the rejected payload's byte size (never the payload
   itself), and is error-isolated — a throwing hook is swallowed so it can
@@ -331,6 +332,38 @@ library.
   verdicts, no restart; `getAclRules` returns a copy. `getStats().authzDenied`
   counts every denied publish and subscribe — the security-relevant counter
   to alert on. Invalid rules throw `RangeError` at configuration time.
+- **Topic aliases with zero-downtime migration** (in `src/bus.ts`, via
+  `setTopicAlias(oldTopic, newTopic, { ttlMs })`): rename a topic without
+  dropping a single consumer. While the alias is live, publishes to
+  `oldTopic` resolve to `newTopic` *before every other admission gate*
+  (ACL, schema, rate-limit, TTL, compression, the durable log and the
+  per-topic sequence all key off the resolved topic) — producers still
+  writing the old name are transparently redirected — and fan-out to
+  `newTopic` additionally reaches subscribers of `oldTopic` (the dual-write
+  window), so consumers still on the old name keep flowing. The mirror is
+  one fan-out pass testing the resolved topic and the aliased old topics
+  together: a subscriber matching via old and new patterns is still visited
+  exactly once — the admitted message keeps a single `(topic, seq)` identity
+  and is never double-delivered. Alias chains (`a → b → c`) forward through
+  the whole live chain; a registration that would close a cycle (or a
+  self-alias) throws `RangeError`. With `ttlMs` the alias retires that many
+  milliseconds after registration: the old topic becomes read-only and
+  publishes to it are rejected with admission reason `'alias-retired'` — no
+  sequence number consumed, counted in `TopicStats.aliasRetiredMessages` /
+  `BusStats.aliasRetiredMessages` and surfaced on `onAdmissionRejected`
+  like every other admission rejection. Without `ttlMs` the alias never
+  expires. Re-registering replaces the alias (and restarts its TTL);
+  `clearTopicAlias(oldTopic)` removes it. `getStats().aliases` exposes the
+  table (`{ oldTopic, newTopic, expiresAt, expired }`). Durable-log replay
+  (`resumeFromSeq` / `resumeFromTime`) attributes records to their
+  alias-resolved topic: a new consumer subscribing with the new topic name
+  replays history logged under the old name (records keep their logged
+  topic and per-topic seq identity — only matching widens), and old-topic
+  subscribers replay the mirrored new-topic history. Alias-aware publish
+  paths: `publish`, `publishBatch`, `publishIdempotent` (the dedup identity
+  is `(resolved topic, messageId)`), `publishAtomic` (shadow admission
+  resolves first; a retired old topic aborts the batch with reason
+  `'alias-retired'`), and `publishDelayed` (resolved at schedule time).
 - **Per-topic payload compression** (in `src/bus.ts`, via
   `setTopicCompression(pattern, { thresholdBytes, level })`): opt-in
   `node:zlib` deflate for large payloads — zero new dependencies. A publish

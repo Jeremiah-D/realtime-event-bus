@@ -945,12 +945,13 @@ export interface EventBusOptions {
    * `setAclRules`), schema-validation rejections
    * (`'schema'`, see `setTopicSchema`), rate-limit sheds (`'rate-limit'`,
    * see `setTopicRateLimit`), idempotency-duplicate suppressions
-   * (`'duplicate'`, see `publishIdempotent`), and `publishAtomic` batch
+   * (`'duplicate'`, see `publishIdempotent`), retired-alias rejections
+   * (`'alias-retired'`, see `setTopicAlias`), and `publishAtomic` batch
    * rejections (surfaced with the failing entry's gate reason).
    *
    * `reason` maps 1:1 onto the stats counters
    * (`TopicStats.rejectedMessages` / `.rateLimitedMessages` /
-   * `.duplicateMessages`, and the `BusStats` totals), so hook events
+   * `.duplicateMessages` / `.aliasRetiredMessages`, and the `BusStats` totals), so hook events
    * reconcile exactly against `getStats()` — every counted rejection
    * fires exactly one event, and vice versa.
    *
@@ -1059,6 +1060,15 @@ export interface TopicStats {
    * to sequence-gap detection.
    */
   filteredMessages: number;
+  /**
+   * Publishes to this topic rejected because its migration alias expired
+   * (see `EventBus.setTopicAlias`): the old topic is read-only, so the
+   * publish was refused before admission — no sequence number consumed
+   * (subscribers see no gap), the durable log never sees it, and it burns
+   * no rate-limit budget. Surfaced on `onAdmissionRejected` with reason
+   * `'alias-retired'`.
+   */
+  aliasRetiredMessages: number;
   /**
    * Messages on this topic delivered with a compressed payload (see
    * `setTopicCompression`): the payload's serialized size exceeded the
@@ -1181,6 +1191,19 @@ export interface BusStats {
    * for the exact counting rules.
    */
   duplicateMessages: number;
+  /**
+   * Total publishes rejected because the target topic's migration alias
+   * expired (the old topic is read-only) — the sum of every topic's
+   * `aliasRetiredMessages`. See `TopicStats.aliasRetiredMessages` for the
+   * exact counting rules.
+   */
+  aliasRetiredMessages: number;
+  /**
+   * Every registered topic alias (see `EventBus.setTopicAlias`), live and
+   * retired — the zero-downtime migration table. A snapshot; each entry
+   * carries its `expiresAt` and whether it has `expired` on the bus clock.
+   */
+  aliases: TopicAliasInfo[];
   /**
    * Total messages skipped by subscriber content filters — the sum of
    * every topic's `filteredMessages`. See `TopicStats.filteredMessages`
@@ -1625,6 +1648,7 @@ function zeroedTopicStats(): {
   rejectedMessages: number;
   duplicateMessages: number;
   filteredMessages: number;
+  aliasRetiredMessages: number;
   compressedMessages: number;
   compressedBytesBefore: number;
   compressedBytesAfter: number;
@@ -1640,6 +1664,7 @@ function zeroedTopicStats(): {
     rejectedMessages: 0,
     duplicateMessages: 0,
     filteredMessages: 0,
+    aliasRetiredMessages: 0,
     compressedMessages: 0,
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,
@@ -2150,7 +2175,7 @@ export type SchemaValidator = (payload: unknown, topic: string) => boolean;
  * (`'rate-limit'`). TTL expiry is drain-time and never rejects a publish,
  * so it cannot appear here.
  */
-export type AtomicRejectReason = 'acl' | 'schema' | 'rate-limit';
+export type AtomicRejectReason = 'acl' | 'schema' | 'rate-limit' | 'alias-retired';
 
 /**
  * Which publish-side admission gate dropped a publish — the unified reason
@@ -2166,13 +2191,17 @@ export type AtomicRejectReason = 'acl' | 'schema' | 'rate-limit';
  *   `BusStats.rateLimitedMessages` (topic token bucket empty, EB-19)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
+ * - `'alias-retired'` → `TopicStats.aliasRetiredMessages` /
+ *   `BusStats.aliasRetiredMessages` (publish to a topic whose migration
+ *   alias expired — the old topic is read-only, EB-44)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
- * underlying gate reason (`'acl'` | `'schema'` | `'rate-limit'`); the batch rejection
+ * underlying gate reason (`'acl'` | `'schema'` | `'rate-limit'` |
+ * `'alias-retired'`); the batch rejection
  * is counted once against that entry's topic, so it stays reconcilable
  * too.
  */
-export type AdmissionRejectReason = 'acl' | 'schema' | 'rate-limit' | 'duplicate';
+export type AdmissionRejectReason = 'acl' | 'schema' | 'rate-limit' | 'duplicate' | 'alias-retired';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -2206,6 +2235,52 @@ export interface AdmissionRejectionEvent {
  * the publish path.
  */
 export type AdmissionRejectionCallback = (event: AdmissionRejectionEvent) => void;
+
+/**
+ * Options for `EventBus.setTopicAlias`: how long the migration alias stays
+ * live.
+ */
+export interface TopicAliasOptions {
+  /**
+   * How long the alias stays live, in milliseconds on the bus clock
+   * (`EventBusOptions.now`), measured from registration. While live,
+   * publishes to `oldTopic` resolve to `newTopic` — transparently, before
+   * every other admission gate — and fan-out to `newTopic` additionally
+   * reaches subscribers of `oldTopic` (the dual-write migration window).
+   * Once the TTL passes, the alias is retired: the old topic becomes
+   * read-only and publishes to it are rejected with admission reason
+   * `'alias-retired'` (see `AdmissionRejectReason`) — they consume no
+   * sequence number, never touch the durable log, and burn no rate-limit
+   * budget. Absent means the alias never expires. Must be a finite number
+   * `>= 0`; anything else throws `RangeError` from `setTopicAlias`.
+   */
+  ttlMs?: number;
+}
+
+/**
+ * One registered topic alias (see `EventBus.setTopicAlias`), as exposed by
+ * `getStats().aliases`. A snapshot — mutating it does not affect the bus.
+ */
+export interface TopicAliasInfo {
+  /**
+   * The migrating topic name: while the alias is live, publishes to it
+   * resolve to `newTopic`; once retired, publishes to it are rejected
+   * (admission reason `'alias-retired'`).
+   */
+  oldTopic: string;
+  /** The migration target: the real publish topic while the alias is live. */
+  newTopic: string;
+  /**
+   * Bus-clock timestamp (ms) when the alias retires. Absent when the alias
+   * never expires.
+   */
+  expiresAt?: number;
+  /**
+   * True once `expiresAt` has passed on the bus clock — the alias no
+   * longer forwards or mirrors, and the old topic is read-only.
+   */
+  expired: boolean;
+}
 
 /**
  * Broker-level topic ACL (EB-41): per-topic publish/subscribe permissions
@@ -2702,6 +2777,7 @@ export class EventBus {
       rejectedMessages: number;
       duplicateMessages: number;
       filteredMessages: number;
+      aliasRetiredMessages: number;
       compressedMessages: number;
       compressedBytesBefore: number;
       compressedBytesAfter: number;
@@ -2872,6 +2948,31 @@ export class EventBus {
   private aclRules: CompiledAclRule[] = [];
   /** Verdict when no ACL rule decides an action (default `'allow'`). */
   private aclDefault: AclDecision = 'allow';
+  /**
+   * Registered topic aliases (EB-44), keyed by old topic: while live,
+   * publishes to the old topic resolve to `newTopic` before every other
+   * admission gate, and fan-out to the resolved topic additionally reaches
+   * subscribers of the old topic (the dual-write migration window). An
+   * expired entry retires the old topic instead: publishes to it are
+   * rejected with admission reason `'alias-retired'` until the alias is
+   * cleared or re-registered.
+   */
+  private topicAliases = new Map<string, { newTopic: string; expiresAt?: number }>();
+  /**
+   * Reverse alias index: resolved (post-walk) topic → the live old topics
+   * whose aliases resolve to it. Rebuilt by `setTopicAlias` /
+   * `clearTopicAlias`; entries whose TTL lapsed since the rebuild are
+   * filtered by `liveAliasSources`, so the index can never resurrect a
+   * retired alias.
+   */
+  private aliasReverse = new Map<string, Set<string>>();
+  /**
+   * Publishes rejected because the target topic's migration alias expired
+   * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
+   * rejection it consumes no sequence number, never touches the durable
+   * log, and burns no rate-limit budget.
+   */
+  private totalAliasRetired = 0;
   /**
    * Publish/subscribe operations denied by the ACL (global total, see
    * `BusStats.authzDenied`). Denied publishes are additionally counted in
@@ -3105,6 +3206,7 @@ export class EventBus {
           rateLimitedMessages: 0,
           rejectedMessages: 0,
           duplicateMessages: 0,
+          aliasRetiredMessages: 0,
           filteredMessages: 0,
           compressedMessages: 0,
           compressedBytesBefore: 0,
@@ -3255,6 +3357,210 @@ export class EventBus {
     const removed = this.rateLimitRules.delete(topicPattern);
     if (removed) this.rateLimitBuckets.clear();
     return removed;
+  }
+
+  /**
+   * Registers a topic alias for zero-downtime topic migration: `oldTopic`
+   * becomes an alias of `newTopic`. While the alias is live:
+   * - publishes to `oldTopic` resolve to `newTopic` before every other
+   *   admission gate (ACL, schema, rate-limit, TTL, compression, the
+   *   durable log and the per-topic sequence all key off the resolved
+   *   topic) — producers still writing the old name are transparently
+   *   redirected;
+   * - fan-out to `newTopic` additionally reaches subscribers of
+   *   `oldTopic` (the dual-write window) — consumers still on the old
+   *   name keep flowing. One fan-out pass tests both the resolved topic
+   *   and the aliased old topics, so a subscriber matching via old and new
+   *   patterns is still visited exactly once: the admitted message keeps a
+   *   single `(topic, seq)` identity and is never double-delivered.
+   *
+   * Alias chains are supported: when `newTopic` is itself a live old
+   * topic, publishes walk the whole live chain to its final target. A
+   * registration that would close a cycle (`a → b` live, then `b → a`)
+   * throws `RangeError`, as does a self-alias (`oldTopic === newTopic`).
+   * Only live links count for cycle detection — an expired alias is inert
+   * and can neither forward nor close a cycle.
+   *
+   * With `opts.ttlMs` the alias retires that many milliseconds after
+   * registration (bus clock): the old topic becomes read-only and
+   * publishes to it are rejected with admission reason `'alias-retired'`
+   * (no sequence number consumed, counted in
+   * `TopicStats.aliasRetiredMessages` / `BusStats.aliasRetiredMessages`,
+   * surfaced on `onAdmissionRejected`). Without `ttlMs` the alias never
+   * expires.
+   *
+   * Re-registering an existing `oldTopic` replaces its alias (and
+   * restarts its TTL). Durable-log replay resolves record topics through
+   * live aliases too, so a new consumer subscribing with the new topic
+   * name replays history logged under the old name.
+   *
+   * Throws `RangeError` on empty topic names, a self-alias, a cycle, or
+   * an invalid `ttlMs` — before anything is mutated.
+   */
+  setTopicAlias(oldTopic: string, newTopic: string, opts?: TopicAliasOptions): void {
+    if (typeof oldTopic !== 'string' || oldTopic.length === 0) {
+      throw new RangeError('oldTopic must be a non-empty string');
+    }
+    if (typeof newTopic !== 'string' || newTopic.length === 0) {
+      throw new RangeError('newTopic must be a non-empty string');
+    }
+    if (oldTopic === newTopic) {
+      throw new RangeError(`topic alias "${oldTopic}" cannot target itself`);
+    }
+    const ttlMs = opts?.ttlMs;
+    if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 0)) {
+      throw new RangeError('ttlMs must be a non-negative finite number of milliseconds');
+    }
+    // Cycle check: following the LIVE links from newTopic must not reach
+    // oldTopic, or the new registration would close a forwarding loop.
+    // The entry being replaced (if any) is ignored — it cannot be part of
+    // the walk from newTopic unless some other live link points back to
+    // oldTopic, which is exactly the cycle being rejected.
+    let cursor: string | undefined = newTopic;
+    const seen = new Set<string>();
+    while (cursor !== undefined && !seen.has(cursor)) {
+      if (cursor === oldTopic) {
+        throw new RangeError(
+          `topic alias "${oldTopic}" -> "${newTopic}" would close an alias cycle`,
+        );
+      }
+      seen.add(cursor);
+      const entry = this.topicAliases.get(cursor);
+      cursor = entry !== undefined && this.aliasEntryLive(entry) ? entry.newTopic : undefined;
+    }
+    const expiresAt = ttlMs === undefined ? undefined : this.now() + ttlMs;
+    this.topicAliases.set(oldTopic, { newTopic, expiresAt });
+    this.rebuildAliasReverse();
+  }
+
+  /**
+   * Removes the topic alias previously registered for `oldTopic`.
+   * Returns true when an alias existed and was removed. After removal the
+   * old topic is an ordinary topic again: publishes to it are no longer
+   * resolved or rejected, and fan-out to the former target no longer
+   * mirrors to its subscribers.
+   */
+  clearTopicAlias(oldTopic: string): boolean {
+    const removed = this.topicAliases.delete(oldTopic);
+    if (removed) this.rebuildAliasReverse();
+    return removed;
+  }
+
+  /** True while the alias entry still forwards on the bus clock. */
+  private aliasEntryLive(entry: { newTopic: string; expiresAt?: number }): boolean {
+    return entry.expiresAt === undefined || this.now() < entry.expiresAt;
+  }
+
+  /**
+   * Follows live alias links from `topic` to the final publish topic.
+   * Expired links end the walk at their source — they are inert, so the
+   * walk never forwards through a retired alias. The `seen` guard is
+   * purely defensive: `setTopicAlias` rejects cycles at registration, so a
+   * live cycle can never exist.
+   */
+  private walkLiveLinks(topic: string): string {
+    let cursor = topic;
+    const seen = new Set<string>([cursor]);
+    for (;;) {
+      const entry = this.topicAliases.get(cursor);
+      if (entry === undefined || !this.aliasEntryLive(entry)) return cursor;
+      const next = entry.newTopic;
+      if (seen.has(next)) return cursor;
+      seen.add(next);
+      cursor = next;
+    }
+  }
+
+  /**
+   * Resolves `topic` through live alias links — the publish-side view. A
+   * topic whose own alias entry expired is retired: publishes naming it
+   * are rejected (admission reason `'alias-retired'`), never forwarded.
+   * An expired link deeper in a chain only ends the walk at its source —
+   * retirement gates the published name, not the whole chain.
+   */
+  private resolvePublishTopic(topic: string): { topic: string; retired: boolean } {
+    const entry = this.topicAliases.get(topic);
+    if (entry !== undefined && !this.aliasEntryLive(entry)) return { topic, retired: true };
+    return { topic: this.walkLiveLinks(topic), retired: false };
+  }
+
+  /** Alias resolution for matching (fan-out, replay): never "retired" — an
+   * expired link just ends the walk, so history stays attributable. */
+  private resolveLiveTopic(topic: string): string {
+    return this.walkLiveLinks(topic);
+  }
+
+  /**
+   * Rebuilds the reverse alias index: resolved topic → the live old topics
+   * that resolve to it. Only live entries are indexed; anything whose TTL
+   * lapsed since the last rebuild is additionally filtered by
+   * `liveAliasSources` at use time.
+   */
+  private rebuildAliasReverse(): void {
+    this.aliasReverse.clear();
+    for (const [oldTopic, entry] of this.topicAliases) {
+      if (!this.aliasEntryLive(entry)) continue;
+      const resolved = this.walkLiveLinks(oldTopic);
+      let sources = this.aliasReverse.get(resolved);
+      if (sources === undefined) {
+        sources = new Set();
+        this.aliasReverse.set(resolved, sources);
+      }
+      sources.add(oldTopic);
+    }
+  }
+
+  /**
+   * The live old topics whose aliases resolve to `resolvedTopic` — the
+   * mirror set for fan-out and replay. Re-verifies liveness and the
+   * resolved target at use time, so a TTL that lapsed since the last
+   * index rebuild can never resurrect a retired alias.
+   */
+  private liveAliasSources(resolvedTopic: string): string[] {
+    const sources = this.aliasReverse.get(resolvedTopic);
+    if (sources === undefined || sources.size === 0) return [];
+    const live: string[] = [];
+    for (const oldTopic of sources) {
+      const entry = this.topicAliases.get(oldTopic);
+      if (entry === undefined || !this.aliasEntryLive(entry)) continue;
+      if (this.walkLiveLinks(oldTopic) !== resolvedTopic) continue;
+      live.push(oldTopic);
+    }
+    return live;
+  }
+
+  /**
+   * Alias-aware topic matching for fan-out and durable-log replay: the
+   * pattern matches when it matches the (resolved) topic itself or any
+   * live old topic that resolves to it. `topic` is the concrete topic as
+   * carried by the message/record, `effectiveTopic` its live-alias
+   * resolution (identical when no alias applies).
+   */
+  private topicMatchesWithAliases(
+    matcher: RegExp,
+    topic: string,
+    effectiveTopic: string,
+  ): boolean {
+    if (matcher.test(topic)) return true;
+    if (effectiveTopic !== topic && matcher.test(effectiveTopic)) return true;
+    for (const oldTopic of this.liveAliasSources(effectiveTopic)) {
+      if (oldTopic !== topic && matcher.test(oldTopic)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Counts one publish rejected because its topic's migration alias
+   * expired (the old topic is read-only) against the topic and the global
+   * total, then fires the admission-rejection hook with reason
+   * `'alias-retired'`. Like a schema rejection it is dropped before
+   * admission: no sequence number consumed (subscribers see no gap), the
+   * durable log never sees it, no rate-limit budget burned.
+   */
+  private countAliasRetired(topic: string, payload: unknown): void {
+    this.statsFor(topic).aliasRetiredMessages += 1;
+    this.totalAliasRetired += 1;
+    this.emitAdmissionRejected(topic, 'alias-retired', payload);
   }
 
   /**
@@ -4798,7 +5104,13 @@ export class EventBus {
     const matcher = subscriber.matcher;
     const records: ReplayRecord[] = [];
     for (const topic of log.topics()) {
-      if (!matcher.test(topic)) continue;
+      // Topic aliases (EB-44): replay attributes each record to its
+      // alias-resolved topic — a subscriber on the new topic name replays
+      // history logged under the old name, and an old-topic subscriber
+      // still replays the mirrored new-topic history (the live fan-out's
+      // dual-write window, applied to history). The record keeps its
+      // logged topic and per-topic seq identity; only matching widens.
+      if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
       for (const rec of log.readSince(topic, fromSeq)) records.push(rec);
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
@@ -4828,7 +5140,10 @@ export class EventBus {
     const matcher = subscriber.matcher;
     const records: ReplayRecord[] = [];
     for (const topic of log.topics()) {
-      if (!matcher.test(topic)) continue;
+      // Alias-aware matching (EB-44): records are attributed to their
+      // alias-resolved topic, mirroring the live fan-out's dual-write
+      // window for history. See `replayLog`.
+      if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
       for (const rec of log.readSince(topic, fromSeq)) {
         if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
       }
@@ -4858,7 +5173,10 @@ export class EventBus {
     const matcher = subscriber.matcher;
     const records: ReplayRecord[] = [];
     for (const topic of log.topics()) {
-      if (!matcher.test(topic)) continue;
+      // Alias-aware matching (EB-44): records are attributed to their
+      // alias-resolved topic, mirroring the live fan-out's dual-write
+      // window for history. See `replayLog`.
+      if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
       for (const rec of log.readSinceTime(topic, fromTime)) records.push(rec);
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
@@ -4893,7 +5211,10 @@ export class EventBus {
     const matcher = subscriber.matcher;
     const records: ReplayRecord[] = [];
     for (const topic of log.topics()) {
-      if (!matcher.test(topic)) continue;
+      // Alias-aware matching (EB-44): records are attributed to their
+      // alias-resolved topic, mirroring the live fan-out's dual-write
+      // window for history. See `replayLog`.
+      if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
       for (const rec of log.readSinceTime(topic, fromTime)) {
         if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
       }
@@ -5075,7 +5396,8 @@ export class EventBus {
    * publishing again, so the downstream sees the message exactly once and
    * a retried order or settlement can never double-execute.
    *
-   * The broker-level ACL runs before the dedup gate: a denied publish
+   * The topic alias (if any) resolves before the dedup gate, and the
+   * broker-level ACL runs before the dedup gate: a denied publish
    * claims no dedup slot and reports `{ duplicate: false, accepted: 0 }`.
    * The dedup gate then runs before admission, ahead of everything else:
    * a duplicate consumes no sequence number (subscribers see no phantom
@@ -5116,6 +5438,18 @@ export class EventBus {
   ): IdempotentPublishResult {
     validateMessageKey(opts?.key, 'publishIdempotent');
     const messageId = opts?.messageId;
+    // Topic aliases (EB-44) resolve before everything else: the resolved
+    // topic is the real publish topic — the ACL check, the dedup identity
+    // (`(topic, messageId)`), and `fanOut` all see it. A publish to a
+    // retired old topic claims no dedup slot and reports
+    // `{ duplicate: false, accepted: 0 }` — it was refused, not
+    // deduplicated, and its retry stays a fresh publish.
+    const aliasResolution = this.resolvePublishTopic(topic);
+    if (aliasResolution.retired) {
+      this.countAliasRetired(topic, payload);
+      return { duplicate: false, accepted: 0 };
+    }
+    topic = aliasResolution.topic;
     // No identity, no dedup: a plain publish that still reports the same
     // result shape.
     if (typeof messageId !== 'string' || messageId.length === 0) {
@@ -5238,9 +5572,23 @@ export class EventBus {
     // and every subscriber's key baseline — exactly untouched.
     const shadowKeyCursors = new Map<string, number>();
     const keySeqs: Array<number | undefined> = new Array(entries.length);
+    // Alias-resolved topics, one per entry: the commit phase publishes the
+    // resolved topics, never the raw entry topics.
+    const resolvedTopics: string[] = new Array(entries.length);
     for (let index = 0; index < entries.length; index++) {
       const { topic, payload, key } = entries[index];
-      const reason = this.admissionVerdict(topic, payload, shadowBudget);
+      // Topic aliases (EB-44) resolve before every admission gate: the
+      // resolved topic is what the shadow admission checks (ACL, schema,
+      // rate-limit) and what the commit phase publishes. A retired old
+      // topic aborts the batch like any other admission failure.
+      const aliasResolution = this.resolvePublishTopic(topic);
+      if (aliasResolution.retired) {
+        this.countAliasRetired(topic, payload);
+        return { published: 0, rejected: { index, topic, reason: 'alias-retired' } };
+      }
+      const resolvedTopic = aliasResolution.topic;
+      resolvedTopics[index] = resolvedTopic;
+      const reason = this.admissionVerdict(resolvedTopic, payload, shadowBudget);
       if (reason !== undefined) {
         // The batch is rejected on the failing entry: count it once against
         // that entry's admission-gate counters and surface it on the unified
@@ -5250,6 +5598,7 @@ export class EventBus {
         // durable-log writes.
         if (reason === 'schema') this.countSchemaRejection(topic, payload);
         else if (reason === 'acl') this.countAclDenied(topic, payload);
+        else if (reason === 'alias-retired') this.countAliasRetired(topic, payload);
         else this.countRateLimited(topic, payload);
         return { published: 0, rejected: { index, topic, reason } };
       }
@@ -5263,8 +5612,8 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { topic, payload, key } = entries[index];
-      this.fanOut(topic, payload, true, undefined, key, keySeqs[index]);
+      const { payload, key } = entries[index];
+      this.fanOut(resolvedTopics[index], payload, true, undefined, key, keySeqs[index]);
     }
     this.scheduleFlush();
     return { published: entries.length };
@@ -5297,8 +5646,10 @@ export class EventBus {
     payload: unknown,
     shadowBudget: Map<string, number>,
   ): AtomicRejectReason | undefined {
-    // The ACL is the first admission gate everywhere, including the atomic
-    // batch's shadow admission: an unauthorized entry aborts the batch.
+    // The ACL is the first admission gate everywhere (after topic-alias
+    // resolution, which rewrites the topic before the gates), including
+    // the atomic batch's shadow admission: an unauthorized entry aborts
+    // the batch.
     if (!this.aclAllowsPublish(topic)) return 'acl';
     const validator = this.schemaForTopic(topic);
     if (validator !== undefined && !validator(payload, topic)) return 'schema';
@@ -5326,6 +5677,10 @@ export class EventBus {
    * exactly like `publish`.
    *
    * Admission semantics, and why they are this way:
+   * - Topic-alias resolution runs first (see `setTopicAlias`): the schedule
+   *   is filed under the resolved topic, and a retired old topic is
+   *   refused with admission reason `'alias-retired'` before anything is
+   *   scheduled.
    * - Schema validation runs NOW, fail-fast: a rejected payload never
    *   becomes a scheduled delivery. A throwing validator propagates,
    *   exactly as in `publish`. Validation is not re-run at fan-out
@@ -5377,6 +5732,16 @@ export class EventBus {
         throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
       }
     }
+    // Topic aliases (EB-44) resolve before every other gate: the schedule
+    // is filed under the resolved topic — the fail-fast ACL/schema checks
+    // below, the stamped TTL, and the fan-out at due time all see it. A
+    // publish to a retired old topic never becomes a scheduled delivery.
+    const aliasResolution = this.resolvePublishTopic(topic);
+    if (aliasResolution.retired) {
+      this.countAliasRetired(topic, payload);
+      return undefined;
+    }
+    topic = aliasResolution.topic;
     // Fail fast on ACL: an unauthorized publish never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
@@ -6278,6 +6643,23 @@ export class EventBus {
     key?: string,
     preassignedKeySeq?: number,
   ): { matched: number; accepted: number; admitted: boolean } {
+    // Topic aliases (EB-44) resolve before every other admission gate: the
+    // resolved topic is the real publish topic — ACL, schema validation,
+    // rate-limit budget, TTL, compression, the durable log and the
+    // per-topic sequence number all key off it. A publish naming a retired
+    // (TTL-expired) old topic is rejected here with reason 'alias-retired':
+    // it consumes no sequence number (subscribers see no gap), never
+    // touches the durable log, and burns no rate-limit budget. Resolution
+    // is idempotent, so pre-admitted paths (atomic commit, delayed
+    // fan-out) that already resolved at their own admission simply no-op
+    // here — while an alias registered in between still takes effect, and
+    // an alias that retired in between still refuses the publish.
+    const aliasResolution = this.resolvePublishTopic(topic);
+    if (aliasResolution.retired) {
+      this.countAliasRetired(topic, payload);
+      return { matched: 0, accepted: 0, admitted: false };
+    }
+    topic = aliasResolution.topic;
     // Publish-side schema validation runs before admission: a rejected
     // payload never becomes a message — no sequence number is consumed
     // (subscribers see no gap), the durable log never sees it, and it
@@ -6285,7 +6667,8 @@ export class EventBus {
     // topic's stats entry, which is created here when the topic has never
     // published anything valid yet.
     if (!preAdmitted) {
-      // Broker-level ACL runs before every other admission gate: an
+      // Broker-level ACL runs before every other admission gate (topic
+      // aliases already resolved above): an
       // unauthorized publish is rejected before schema validation — it
       // consumes no sequence number (subscribers see no gap), never touches
       // the durable log, and burns no rate-limit budget. Counted as a
@@ -6482,7 +6865,27 @@ export class EventBus {
     const epoch = msg.epoch ?? '';
     let matched = 0;
     let accepted = 0;
+    // Topic aliases (EB-44): the mirror side of the dual-write window. A
+    // message on the resolved topic additionally reaches subscribers of
+    // every live old topic that resolves to it — old consumers keep
+    // flowing while producers and new consumers move to the new name.
+    // One fan-out pass tests the resolved topic and the aliased old topics
+    // together, so a subscriber matching via both is still visited exactly
+    // once: the admitted message keeps a single (topic, seq) identity and
+    // can never be double-delivered. `effectiveTopic` differs from `topic`
+    // only on the cluster receive path, where a remote message may still
+    // name an old topic — local publishes are already resolved in
+    // `fanOut`.
+    const effectiveTopic = this.resolveLiveTopic(topic);
+    const aliasSources = this.liveAliasSources(effectiveTopic);
     const candidates = this.candidateIds(topic);
+    if (effectiveTopic !== topic) {
+      for (const id of this.candidateIds(effectiveTopic)) candidates.add(id);
+    }
+    for (const oldTopic of aliasSources) {
+      if (oldTopic === topic || oldTopic === effectiveTopic) continue;
+      for (const id of this.candidateIds(oldTopic)) candidates.add(id);
+    }
     // Degenerate case: when every subscriber is a candidate (e.g. all on
     // `**`), the membership check would pass for all of them, so skip it.
     // Semantically identical, avoids a Set lookup per subscriber.
@@ -6499,7 +6902,7 @@ export class EventBus {
         if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq, epoch);
         continue;
       }
-      if (!subscriber.matcher.test(topic)) {
+      if (!this.topicMatchesWithAliases(subscriber.matcher, topic, effectiveTopic)) {
         // A keyed message on a topic this subscriber never sees must still
         // advance its per-key baseline past this keySeq — otherwise a
         // subscriber buffering a later keySeq for the same key would wait
@@ -6658,6 +7061,13 @@ export class EventBus {
       rejectedMessages: this.totalRejected,
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
+      aliasRetiredMessages: this.totalAliasRetired,
+      aliases: [...this.topicAliases.entries()].map(([oldTopic, entry]) => ({
+        oldTopic,
+        newTopic: entry.newTopic,
+        ...(entry.expiresAt === undefined ? {} : { expiresAt: entry.expiresAt }),
+        expired: !this.aliasEntryLive(entry),
+      })),
       filteredMessages: this.totalFiltered,
       deadLetteredMessages: this.totalDeadLettered,
       compressedMessages: this.totalCompressed,
@@ -6720,6 +7130,7 @@ export class EventBus {
         rateLimitedMessages: stats.rateLimitedMessages,
         rejectedMessages: stats.rejectedMessages,
         duplicateMessages: stats.duplicateMessages,
+        aliasRetiredMessages: stats.aliasRetiredMessages,
         filteredMessages: stats.filteredMessages,
         compressedMessages: stats.compressedMessages,
         compressedBytesBefore: stats.compressedBytesBefore,
