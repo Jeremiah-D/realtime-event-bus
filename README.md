@@ -524,6 +524,27 @@ library.
   monitored subscriber). `onLag` without `thresholdMs` throws `RangeError`
   (a callback that could never fire); other invalid options throw
   `RangeError`/`TypeError` from `subscribe`. Disabled by default.
+- **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
+  `new EventBus({ trace: true })`): one trace per sampled publish, threading
+  the message through `bus.publish` → `bus.admission` → `bus.fanout` →
+  `bus.enqueue` (per subscriber) → `bus.deliver` (per subscriber) →
+  `bus.ack` (reliable subscriptions, when `ack()` finishes). Each span
+  carries `{ traceId, spanId, parentId, name, at, durationMs, attrs }`, with
+  `traceId` in 32-hex — the same format as the `webhook-relay-ts` WR-18
+  trace ID, so traces correlate across the two by string equality. Sampling
+  is head-based: the decision is taken once at admission (rejected or shed
+  publishes never start a trace) and every downstream span shares the
+  verdict; `sampleRate` (default 1) keeps a fixed fraction, or `sampler`
+  plugs in a custom decision. A publish may continue an upstream trace via
+  `PublishOptions.traceparent` (W3C `traceparent` header value; also
+  accepted per message by `publishBatch`/`publishAtomic` and carried by
+  `publishDelayed` to fan-out time) — a missing or malformed value mints a
+  fresh trace id. Sampled spans go to the error-isolated `onTraceSpan`
+  callback and to a bounded ring buffer exported as
+  `getStats().traceSpans` (oldest evicted first, `bufferSize` default
+  1024). Disabled by default, and the disabled path is allocation-free
+  (one branch per instrumentation site — no WeakMap lookup, no clock read).
+  Invalid options throw `RangeError` from the constructor.
 - **Per-topic sliding-window publish rates** (in `src/rates.ts`, always
   on): each topic's publish rate in messages/sec over trailing 1s / 1m / 5m
   windows, load-average style (`r1s` / `r1m` / `r5m`) — the real-time signal
@@ -820,6 +841,19 @@ npm test
   ranking by 1m rate with the 10-topic cap, the `getStats` shape, the new
   Prometheus rate gauges, and renderer tolerance for a stats object
   without the rate fields.
+- `test/trace.test.ts` — opt-in delivery tracing: `trace.ts` unit tests
+  (32-hex trace ids, 16-hex span ids, traceparent parse/format round-trip,
+  option validation), disabled-by-default with an empty `traceSpans`
+  buffer, `sampleRate: 0` silence, rejected publishes never starting a
+  trace, the full publish→admission→fanout→enqueue→deliver span chain with
+  parent linkage and attribute shape, per-subscriber enqueue/deliver spans,
+  `onTraceSpan` receiving the same spans as the ring buffer (and a throwing
+  callback never disturbing delivery), head-based `sampleRate` + custom
+  `sampler` override, `traceparent` continuation vs. fresh-id minting on
+  malformed values (`RangeError` on non-strings), `bus.ack` spans on ack
+  (nack/timeout abandon, stale-handle ack emits nothing, redelivery opens a
+  fresh span), ring-buffer oldest-first eviction, batch/delayed publish
+  paths, and snapshot isolation of `getStats().traceSpans`.
 
 ## Benchmark
 

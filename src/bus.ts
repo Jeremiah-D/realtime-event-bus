@@ -27,6 +27,13 @@ import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import {
+  TraceRecorder,
+  resolveTraceOptions,
+  validateTraceparent,
+  type TraceOptions,
+  type TraceSpan,
+} from './trace.ts';
 import type {
   ClusterConnectOptions,
   ClusterLink,
@@ -42,6 +49,12 @@ export type {
   AckSloMissEvent,
 } from './acklatency.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
+export type {
+  TraceOptions,
+  TraceSampler,
+  TraceSamplingDecision,
+  TraceSpan,
+} from './trace.ts';
 
 export interface BusMessage {
   topic: string;
@@ -987,6 +1000,37 @@ export interface EventBusOptions {
    * observer can never disturb the publish/subscribe path. Default: unset.
    */
   onAuthzDenied?: AuthzDeniedCallback;
+  /**
+   * Opt-in delivery-pipeline trace spans (see `src/trace.ts`). When
+   * enabled, the bus emits one trace per sampled publish, threading the
+   * message through `bus.publish` → `bus.admission` → `bus.fanout` →
+   * `bus.enqueue` (per subscriber) → `bus.deliver` (per subscriber) →
+   * `bus.ack` (reliable subscriptions, on `ack()`). Each span carries
+   * `{ traceId, spanId, parentId, name, at, durationMs, attrs }`, with
+   * `traceId` in 32-hex — the same format as the `webhook-relay-ts`
+   * WR-18 trace ID, so traces correlate across the two by string
+   * equality.
+   *
+   * Sampling is head-based: the decision is taken once at admission, and
+   * every downstream span of the same publish shares the verdict.
+   * `sampleRate` (default 1) keeps a fixed fraction of admitted
+   * publishes; `sampler` plugs in a custom decision and overrides the
+   * rate. A publish may continue an upstream trace via
+   * `PublishOptions.traceparent` (W3C `traceparent` header value); a
+   * missing or malformed value mints a fresh trace id. Sampled spans go
+   * to `onTraceSpan` (error-isolated, like `onAdmissionRejected`) and to
+   * a bounded ring buffer exported as `getStats().traceSpans` (oldest
+   * evicted first, `bufferSize` default 1024).
+   *
+   * Disabled by default, and the disabled path is allocation-free: when
+   * tracing is off the publish/deliver path pays one branch and nothing
+   * else — no WeakMap lookup, no clock read, no object creation.
+   *
+   * Pass `true` for the defaults (sample everything admitted), or a
+   * `TraceOptions` object to tune the rate, plug in a sampler, and arm
+   * the callback. Invalid values throw `RangeError` from the constructor.
+   */
+  trace?: boolean | TraceOptions;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -1349,6 +1393,16 @@ export interface BusStats {
    * Monotonic.
    */
   keyedReorderedMessages: number;
+  /**
+   * Sampled delivery-trace spans (see `EventBusOptions.trace` and
+   * `src/trace.ts`), oldest first: every span of every sampled publish
+   * since the bus was created, in completion order, bounded by
+   * `TraceOptions.bufferSize` (oldest evicted first). Empty when tracing
+   * is disabled. Each span carries `{ traceId, spanId, parentId, name,
+   * at, durationMs, attrs }` — the same spans the `onTraceSpan` callback
+   * receives. A snapshot — mutating it does not affect the bus.
+   */
+  traceSpans: TraceSpan[];
   /**
    * The hottest topics by 1m publish rate (see `src/rates.ts`), hottest
    * first — at most `HOT_TOPICS_LIMIT` (10) entries; topics with no
@@ -2447,15 +2501,28 @@ export interface PublishOptions {
    * compaction effect (ordering always applies).
    */
   key?: string;
+  /**
+   * Upstream W3C `traceparent` header value (`00-<32hex trace
+   * id>-<16hex span id>-<flags>`) for delivery tracing (see
+   * `EventBusOptions.trace`): when tracing is enabled and the value is
+   * valid, the publish continues that trace — every span of the delivery
+   * shares the header's trace id and the `bus.publish` root span's
+   * `parentId` is the header's span id. A missing or malformed value
+   * mints a fresh trace id (the same lenient rule `webhook-relay-ts`
+   * applies to its `x-trace-id` header); a non-string throws `RangeError`.
+   * Inert when tracing is disabled.
+   */
+  traceparent?: string;
 }
 
 /**
  * One message in a `publishBatch` / `publishAtomic` batch: topic and
  * payload, with the bus assigning `seq` at fan-out. `key` opts the message
  * into durable-log keyed compaction and per-key publish-order delivery
- * (see `PublishOptions.key`).
+ * (see `PublishOptions.key`); `traceparent` continues an upstream trace
+ * (see `PublishOptions.traceparent`).
  */
-export type BatchMessage = Omit<BusMessage, 'seq'> & { key?: string };
+export type BatchMessage = Omit<BusMessage, 'seq'> & { key?: string; traceparent?: string };
 
 /**
  * When a `publishDelayed` message becomes due. Exactly one of the two
@@ -2486,6 +2553,12 @@ export interface PublishDelayedOptions {
    * provided; anything else throws `RangeError`.
    */
   key?: string;
+  /**
+   * Upstream W3C `traceparent` header value, carried on the schedule and
+   * applied when the message fans out (see `PublishOptions.traceparent`).
+   * A non-string throws `RangeError` at schedule time.
+   */
+  traceparent?: string;
 }
 
 /**
@@ -2941,6 +3014,12 @@ export class EventBus {
    */
   private readonly onAuthzDenied: AuthzDeniedCallback | undefined;
   /**
+   * Delivery-trace recorder (`EventBusOptions.trace`), or `undefined`
+   * when tracing is disabled — every instrumentation site checks this one
+   * field first, which is what keeps the disabled path allocation-free.
+   */
+  private readonly trace: TraceRecorder | undefined;
+  /**
    * Compiled broker-level ACL rules in evaluation order
    * (`EventBusOptions.acl` / `setAclRules`). Empty means no ACL — every
    * verdict falls through to `aclDefault`.
@@ -3176,6 +3255,8 @@ export class EventBus {
       throw new RangeError('onAuthzDenied must be a function');
     }
     this.onAuthzDenied = onAuthzDenied;
+    const resolvedTrace = resolveTraceOptions(options?.trace, 'EventBus');
+    this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     const aclDefault = options?.acl?.defaultPolicy ?? 'allow';
     if (aclDefault !== 'allow' && aclDefault !== 'deny') {
       throw new RangeError("acl.defaultPolicy must be 'allow' or 'deny'");
@@ -4171,6 +4252,11 @@ export class EventBus {
       ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
       now: this.now,
       onRedeliver: (msg) => {
+        // EB-45: the outstanding delivery's `bus.ack` span never
+        // completes — abandon it. The requeue below emits a fresh
+        // `bus.enqueue` span in the same trace, and the redelivery opens
+        // a new ack span when it is handed to the handler.
+        this.trace?.abandonAckSpan(msg);
         const live = liveDeliveries.get(msg);
         if (live !== undefined) live.live = false;
         const count = (redeliveries.get(msg) ?? 0) + 1;
@@ -4197,16 +4283,36 @@ export class EventBus {
     const ackState = subscriber.ackLatency;
     const trackDelivery = (msg: BusMessage): Delivery<BusMessage> => {
       const delivery = tracker.track(msg, redeliveries.get(msg) ?? 0);
-      if (ackState == null) return delivery;
+      // EB-45: open the `bus.ack` span when the message is part of a
+      // sampled trace. The span completes when `ack()` finishes; `nack()`
+      // and ack timeouts abandon it (see `onRedeliver` above). Only the
+      // currently outstanding delivery may close it — a stale handle's
+      // `ack()` finds nothing open and emits nothing, mirroring the
+      // ack-latency tracker's single-sample rule.
+      const tracer = this.trace;
+      const ackTraced =
+        tracer !== undefined && tracer.hasTrace(msg)
+          ? tracer.openAckSpan(msg, redeliveries.get(msg) ?? 0, this.now())
+          : false;
+      if (ackState == null && !ackTraced) return delivery;
       const live = { live: true };
       liveDeliveries.set(msg, live);
       return {
         ...delivery,
         ack: () => {
           delivery.ack();
-          if (live.live) ackState.tracker.sampleOnAck(msg);
+          if (live.live) {
+            if (ackState != null) ackState.tracker.sampleOnAck(msg);
+            tracer?.closeAckSpan(subscriber, msg, this.now());
+          }
+          // A stale handle (acked after nack/timeout already requeued)
+          // leaves the trace alone: the redelivery owns the open ack
+          // span now, and abandoning it here would steal its span.
         },
-        nack: () => delivery.nack(),
+        nack: () => {
+          tracer?.abandonAckSpan(msg);
+          delivery.nack();
+        },
       };
     };
     deliver = (msgOrBatch) => {
@@ -5382,7 +5488,16 @@ export class EventBus {
    */
   publish(topic: string, payload: unknown, opts?: PublishOptions): number {
     validateMessageKey(opts?.key, 'publish');
-    const { accepted } = this.fanOut(topic, payload, false, undefined, opts?.key);
+    validateTraceparent(opts?.traceparent, 'publish');
+    const { accepted } = this.fanOut(
+      topic,
+      payload,
+      false,
+      undefined,
+      opts?.key,
+      undefined,
+      opts?.traceparent,
+    );
     this.scheduleFlush();
     return accepted;
   }
@@ -5437,6 +5552,7 @@ export class EventBus {
     opts?: IdempotentPublishOptions,
   ): IdempotentPublishResult {
     validateMessageKey(opts?.key, 'publishIdempotent');
+    validateTraceparent(opts?.traceparent, 'publishIdempotent');
     const messageId = opts?.messageId;
     // Topic aliases (EB-44) resolve before everything else: the resolved
     // topic is the real publish topic — the ACL check, the dedup identity
@@ -5453,7 +5569,15 @@ export class EventBus {
     // No identity, no dedup: a plain publish that still reports the same
     // result shape.
     if (typeof messageId !== 'string' || messageId.length === 0) {
-      const { accepted } = this.fanOut(topic, payload, false, undefined, opts?.key);
+      const { accepted } = this.fanOut(
+        topic,
+        payload,
+        false,
+        undefined,
+        opts?.key,
+        undefined,
+        opts?.traceparent,
+      );
       this.scheduleFlush();
       return { duplicate: false, accepted };
     }
@@ -5475,7 +5599,15 @@ export class EventBus {
       this.countDuplicate(topic, payload);
       return { duplicate: true, accepted: 0 };
     }
-    const { accepted, admitted } = this.fanOut(topic, payload, false, undefined, opts?.key);
+    const { accepted, admitted } = this.fanOut(
+      topic,
+      payload,
+      false,
+      undefined,
+      opts?.key,
+      undefined,
+      opts?.traceparent,
+    );
     this.scheduleFlush();
     if (admitted) {
       // Only an admitted message claims a dedup slot: the window starts at
@@ -5509,10 +5641,21 @@ export class EventBus {
    */
   publishBatch(messages: Array<BatchMessage>): number {
     if (messages.length === 0) return 0;
-    for (const msg of messages) validateMessageKey(msg.key, 'publishBatch');
+    for (const msg of messages) {
+      validateMessageKey(msg.key, 'publishBatch');
+      validateTraceparent(msg.traceparent, 'publishBatch');
+    }
     let accepted = 0;
     for (const msg of messages) {
-      accepted += this.fanOut(msg.topic, msg.payload, false, undefined, msg.key).accepted;
+      accepted += this.fanOut(
+        msg.topic,
+        msg.payload,
+        false,
+        undefined,
+        msg.key,
+        undefined,
+        msg.traceparent,
+      ).accepted;
     }
     this.scheduleFlush();
     return accepted;
@@ -5564,7 +5707,10 @@ export class EventBus {
     if (entries.length === 0) return { published: 0 };
     // Key validation first: a throw must leave zero state behind, and
     // validation mutates nothing.
-    for (const entry of entries) validateMessageKey(entry.key, 'publishAtomic');
+    for (const entry of entries) {
+      validateMessageKey(entry.key, 'publishAtomic');
+      validateTraceparent(entry.traceparent, 'publishAtomic');
+    }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
     // Per-key sequence numbers are drawn in entry order (publish order)
@@ -5612,8 +5758,16 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { payload, key } = entries[index];
-      this.fanOut(resolvedTopics[index], payload, true, undefined, key, keySeqs[index]);
+      const { payload, key, traceparent } = entries[index];
+      this.fanOut(
+        resolvedTopics[index],
+        payload,
+        true,
+        undefined,
+        key,
+        keySeqs[index],
+        traceparent,
+      );
     }
     this.scheduleFlush();
     return { published: entries.length };
@@ -5760,6 +5914,7 @@ export class EventBus {
     const ttlMs = this.ttlForTopic(topic);
     const expiresAt = ttlMs === undefined ? undefined : nowMs + ttlMs;
     validateMessageKey(opts.key, 'publishDelayed');
+    validateTraceparent(opts.traceparent, 'publishDelayed');
     const key = opts.key;
     // The per-key sequence number is assigned at schedule time: for keyed
     // messages, publish order is schedule order, so a delayed keyed
@@ -5767,7 +5922,17 @@ export class EventBus {
     // after live publishes with higher keySeqs.
     const keySeq = key === undefined ? undefined : this.nextKeySeq(key);
     const id = `delayed-${++this.nextDelayedId}`;
-    const entry: DelayedEntry = { id, topic, payload, deliverAt, expiresAt, cancelled: false, key, keySeq };
+    const entry: DelayedEntry = {
+      id,
+      topic,
+      payload,
+      deliverAt,
+      expiresAt,
+      cancelled: false,
+      key,
+      keySeq,
+      traceparent: opts.traceparent,
+    };
     // Persist the schedule before it is visible anywhere: a crash between
     // here and the due time must still deliver the message after restart.
     // The schedule record carries no sequence number and burns no
@@ -5900,13 +6065,21 @@ export class EventBus {
       }
       // `preAdmitted`: schema already ran once at schedule time
       // (fail-fast); validators are expected pure.
-      this.fanOut(top.topic, top.payload, true, {
-        delayId: top.id,
-        deliverAt: top.deliverAt,
-        expiresAt: top.expiresAt,
-        key: top.key,
-        keySeq: top.keySeq,
-      });
+      this.fanOut(
+        top.topic,
+        top.payload,
+        true,
+        {
+          delayId: top.id,
+          deliverAt: top.deliverAt,
+          expiresAt: top.expiresAt,
+          key: top.key,
+          keySeq: top.keySeq,
+        },
+        undefined,
+        undefined,
+        top.traceparent,
+      );
       this.appendDelayTombstone(top.id, top.topic);
       fannedOut = true;
     }
@@ -6233,7 +6406,69 @@ export class EventBus {
       // tracker still records at most one sample per message.
       ackLatency.tracker.accepted(msg);
     }
+    const tracer = this.trace;
+    if (tracer !== undefined && result === 'accepted' && tracer.hasTrace(msg)) {
+      // One `bus.enqueue` span per subscriber that accepted the message,
+      // parented to the publish root (see `EventBusOptions.trace`). A
+      // dropped message never reaches a handler, so it leaves no span —
+      // the drop is already visible in the drop counters. Requeues (nack /
+      // ack-timeout redelivery) emit again: the retry is a new enqueue
+      // event in the same trace.
+      tracer.enqueueSpan(subscriber, msg, this.now(), 0);
+    }
     return result;
+  }
+
+  /**
+   * Invokes a subscriber's handler wrapped in a `bus.deliver` trace span
+   * when the message is part of a sampled trace (EB-45). Untraced
+   * messages — including every message when tracing is disabled — pay a
+   * single branch: no allocation, no clock read.
+   */
+  private deliverTraced(subscriber: Subscriber, msg: BusMessage, invoke: () => void): void {
+    const tracer = this.trace;
+    if (tracer === undefined || !tracer.hasTrace(msg)) {
+      invoke();
+      return;
+    }
+    const at = this.now();
+    invoke();
+    tracer.deliverSpan(subscriber, msg, at, this.now() - at);
+  }
+
+  /**
+   * Batch variant of `deliverTraced`: one handler invocation delivers the
+   * whole batch, so every traced message in it shares the invocation's
+   * span window — each message still gets its own `bus.deliver` span,
+   * parented to its own `bus.enqueue` span.
+   */
+  private deliverBatchTraced(
+    subscriber: Subscriber,
+    batch: BusMessage[],
+    invoke: () => void,
+  ): void {
+    const tracer = this.trace;
+    if (tracer === undefined) {
+      invoke();
+      return;
+    }
+    let anyTraced = false;
+    for (const msg of batch) {
+      if (tracer.hasTrace(msg)) {
+        anyTraced = true;
+        break;
+      }
+    }
+    if (!anyTraced) {
+      invoke();
+      return;
+    }
+    const at = this.now();
+    invoke();
+    const durationMs = this.now() - at;
+    for (const msg of batch) {
+      if (tracer.hasTrace(msg)) tracer.deliverSpan(subscriber, msg, at, durationMs);
+    }
   }
 
   /**
@@ -6642,7 +6877,13 @@ export class EventBus {
     delayed?: DelayedFanOut,
     key?: string,
     preassignedKeySeq?: number,
+    traceparent?: string,
   ): { matched: number; accepted: number; admitted: boolean } {
+    // Delivery tracing (EB-45): one clock read for the publish span, taken
+    // only when tracing is enabled — the disabled path pays this single
+    // branch and nothing else (no allocation, no WeakMap lookup).
+    const tracer = this.trace;
+    const fanOutStart = tracer !== undefined ? this.now() : 0;
     // Topic aliases (EB-44) resolve before every other admission gate: the
     // resolved topic is the real publish topic — ACL, schema validation,
     // rate-limit budget, TTL, compression, the durable log and the
@@ -6719,6 +6960,19 @@ export class EventBus {
           this.releaseKeySequence(delayedKeyed.key, delayedKeyed.keySeq);
         }
         return { matched: 0, accepted: 0, admitted: false };
+      }
+    }
+    // Delivery-trace sampling decision (EB-45): head-based, taken once the
+    // message is admitted — a schema rejection or rate-limit shed above
+    // never starts a trace. Every downstream span of this publish shares
+    // the verdict. `beginPublish` registers the trace record before
+    // fan-out, so the enqueue spans below can find it.
+    let openTrace: ReturnType<TraceRecorder['beginPublish']> | undefined;
+    if (tracer !== undefined) {
+      const sampled = tracer.sample(topic, traceparent);
+      if (sampled !== undefined) {
+        openTrace = tracer.beginPublish(msg, topic, msg.seq, sampled, fanOutStart);
+        openTrace.endAdmission(this.now());
       }
     }
     // Per-key publish-order sequence (see `PublishOptions.key`). Delayed
@@ -6837,6 +7091,13 @@ export class EventBus {
     // scan. Iteration order (insertion order) is unchanged.
     const { matched, accepted } = this.deliverMatched(msg, expiresAt, payload, keyed);
     stats.subscriberCount = matched;
+    if (openTrace !== undefined) {
+      // Spans emit in completion order — fanout, then the publish root —
+      // so the ring buffer reads as a causal narrative per trace.
+      const traceEnd = this.now();
+      openTrace.endFanout(traceEnd, matched, accepted);
+      openTrace.endPublish(traceEnd);
+    }
     return { matched, accepted, admitted: true };
   }
 
@@ -7090,6 +7351,7 @@ export class EventBus {
       lag,
       laggingSubscribers,
       keyedReorderedMessages: this.totalKeyedReordered,
+      traceSpans: this.trace?.snapshot() ?? [],
       hotTopics: this.publishRates.hotTopics(ratesNow),
       ...(this.clusterLink == null
         ? {}
@@ -7477,7 +7739,7 @@ export class EventBus {
           // Sampled before the handler runs: queue dwell, not processing time.
           this.recordDeliveryLatency(subscriber, msg, nowMs);
           this.recordLagSample(subscriber, msg, nowMs);
-          subscriber.handler(msg);
+          this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
         }
       } else {
         for (let i = 0; i < live.length; i += 1) {
@@ -7645,9 +7907,13 @@ export class EventBus {
       this.recordLagSample(subscriber, msg, nowMs);
     }
     if (subscriber.health == null) {
-      subscriber.handler(live as unknown as BusMessage);
+      this.deliverBatchTraced(subscriber, live, () =>
+        subscriber.handler(live as unknown as BusMessage),
+      );
     } else {
-      this.deliverBatchWithHealth(subscriber, live, nowMs);
+      this.deliverBatchTraced(subscriber, live, () =>
+        this.deliverBatchWithHealth(subscriber, live, nowMs),
+      );
     }
     if (subscriber.queue.size > 0) {
       this.scheduleFlush();
@@ -7849,11 +8115,13 @@ export class EventBus {
     // Sampled before the handler runs: queue dwell, not processing time.
     this.recordDeliveryLatency(subscriber, msg, nowMs);
     this.recordLagSample(subscriber, msg, nowMs);
-    try {
-      subscriber.handler(msg);
-    } catch {
-      failed = true;
-    }
+    this.deliverTraced(subscriber, msg, () => {
+      try {
+        subscriber.handler(msg);
+      } catch {
+        failed = true;
+      }
+    });
     if (!failed && budgetMs !== undefined && this.now() - startedAtMs > budgetMs) {
       failed = true;
       reason = 'timeout';

@@ -40,6 +40,11 @@ export interface DelayedEntry {
    * schedule-order position, not the fan-out-order position.
    */
   keySeq?: number;
+  /**
+   * Upstream W3C `traceparent` carried from `PublishDelayedOptions` into
+   * the fan-out (see `PublishOptions.traceparent`).
+   */
+  traceparent?: string;
 }
 
 interface HeapNode {
