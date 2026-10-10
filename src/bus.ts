@@ -3463,6 +3463,115 @@ export interface TopicCompressionOptions {
    * for as long as you need to replay logs written with it.
    */
   dictionary?: Uint8Array | ArrayBuffer | DataView;
+  /**
+   * Opt-in automatic dictionary training (EB-60): while enabled, the bus
+   * samples the serialized payloads of admitted publishes on the topic
+   * into a bounded sliding window and periodically derives a fresh preset
+   * deflate dictionary from the recent corpus — no manual dictionary
+   * building, zero new dependencies. Disabled by default; see
+   * `CompressionAutoTrainOptions`.
+   */
+  autoTrain?: CompressionAutoTrainOptions;
+}
+
+/**
+ * Tuning for automatic per-topic deflate-dictionary training (see
+ * `EventBus.setTopicCompression`). While enabled, every admitted publish
+ * on the topic contributes its serialized (UTF-8 JSON) payload to a
+ * sliding sample window — bounded by BOTH `sampleCount` and
+ * `sampleMaxBytes`, oldest evicted first, always retaining the newest
+ * sample — and a background (unref'd) training pass derives a new
+ * dictionary from the corpus whenever a retrain trigger fires.
+ *
+ * The derivation is a trailing-window heuristic: the samples are
+ * concatenated and the last up-to-32 KiB are taken as the dictionary
+ * candidate — a standard sampling-based approach that needs no new
+ * dependencies, but honestly a heuristic: it captures the topic's recent
+ * recurring byte patterns (field names, enum values, venue prefixes)
+ * well, and a coverage-based trainer (like `zstd --train`) would do
+ * better on adversarial shapes. Training never runs inline in the
+ * publish path: publishes always compress with the dictionary in force
+ * when they were admitted, and a completed training atomically swaps the
+ * rule to the new dictionary (new SHA-256 `dictId`, version incremented)
+ * while old dictionaries stay in the registry, so durable-log replay
+ * fail-closed semantics are unchanged.
+ */
+export interface CompressionAutoTrainOptions {
+  /**
+   * How many of the most recent sampled payloads the training window
+   * retains. Must be a positive integer.
+   */
+  sampleCount: number;
+  /**
+   * Maximum total serialized bytes retained across the window; oldest
+   * samples are evicted first (the newest sample is always kept, even if
+   * it alone exceeds the cap). Must be a positive finite number of bytes.
+   */
+  sampleMaxBytes: number;
+  /**
+   * Retrain after this many newly sampled publishes since the last
+   * training completed. Must be a positive integer when given. Optional —
+   * when neither trigger is set, the bus retrains on a 60-second cadence
+   * instead.
+   */
+  retrainEveryMessages?: number;
+  /**
+   * Retrain cadence in milliseconds: the bus re-derives the dictionary at
+   * most this often, and only when new samples arrived since the last
+   * training. Must be a positive finite number of milliseconds when
+   * given. Optional — defaults to 60_000 when `retrainEveryMessages` is
+   * also unset.
+   */
+  retrainEveryMs?: number;
+  /**
+   * Called after every completed training with the new dictionary's
+   * details. A throwing callback is swallowed — user code must never
+   * break the bus — and the callback never keeps the process alive.
+   */
+  onTrained?: (event: CompressionAutoTrainedEvent) => void;
+}
+
+/**
+ * Delivered to `CompressionAutoTrainOptions.onTrained` after a training
+ * pass completes and the new dictionary is live on the rule.
+ */
+export interface CompressionAutoTrainedEvent {
+  /** The `topicPattern` the rule was registered with. */
+  topicPattern: string;
+  /**
+   * 1-based training count for this rule: increments on every completed
+   * training, even when the derived bytes hash to the already-active
+   * `dictId` (a stable corpus re-derives the same dictionary).
+   */
+  version: number;
+  /** SHA-256 id of the newly registered dictionary (the EB-30 registry key). */
+  dictionaryId: string;
+  /** Samples in the window the dictionary was derived from. */
+  sampleMessages: number;
+  /** Serialized bytes across those samples. */
+  sampleBytes: number;
+  /** Size of the derived dictionary in bytes (≤ 32 KiB). */
+  dictionaryBytes: number;
+  /** Bus-clock time the training completed. */
+  trainedAt: number;
+}
+
+/**
+ * Per-topic auto-train state as exposed by `getStats()` — present on a
+ * topic row only when the topic's matching compression rule has
+ * `autoTrain` enabled.
+ */
+export interface CompressionAutoTrainState {
+  /** Completed trainings for the current rule (0 = none yet). */
+  version: number;
+  /** SHA-256 id of the dictionary currently compressing publishes, if any. */
+  dictionaryId?: string;
+  /** Bus-clock time of the last completed training, if any. */
+  lastTrainedAt?: number;
+  /** Lifetime payloads admitted into the sample window. */
+  sampledMessages: number;
+  /** Serialized bytes currently retained in the window. */
+  sampledBytes: number;
 }
 
 /**
@@ -3476,6 +3585,252 @@ interface ResolvedCompressionRule {
   level: number;
   dictionary?: Buffer;
   dictionaryId?: string;
+  /** Auto-trainer for the rule (EB-60), present when `autoTrain` was enabled. */
+  autoTrainState?: CompressionAutoTrainer;
+}
+
+/**
+ * Default auto-train retrain cadence: 60 seconds, used when neither
+ * `retrainEveryMessages` nor `retrainEveryMs` is configured.
+ */
+const DEFAULT_AUTO_TRAIN_RETRAIN_MS = 60_000;
+
+/** Resolved (validated, defaulted) form of `CompressionAutoTrainOptions`. */
+interface ResolvedAutoTrainOptions {
+  sampleCount: number;
+  sampleMaxBytes: number;
+  retrainEveryMessages?: number;
+  retrainEveryMs?: number;
+  onTrained?: (event: CompressionAutoTrainedEvent) => void;
+}
+
+/**
+ * Validates `CompressionAutoTrainOptions` fail-fast with `RangeError`,
+ * like every other options object on this bus. Returns the resolved
+ * options with the retrain-cadence default applied.
+ */
+function resolveAutoTrainOptions(autoTrain: CompressionAutoTrainOptions, where: string): ResolvedAutoTrainOptions {
+  if (autoTrain == null || typeof autoTrain !== 'object') {
+    throw new RangeError(`${where}: autoTrain must be an object`);
+  }
+  const { sampleCount, sampleMaxBytes, retrainEveryMessages, retrainEveryMs, onTrained } = autoTrain;
+  if (!Number.isInteger(sampleCount) || sampleCount < 1) {
+    throw new RangeError(`${where}: autoTrain.sampleCount must be a positive integer`);
+  }
+  if (!Number.isFinite(sampleMaxBytes) || sampleMaxBytes <= 0) {
+    throw new RangeError(`${where}: autoTrain.sampleMaxBytes must be a positive finite number of bytes`);
+  }
+  if (retrainEveryMessages !== undefined && (!Number.isInteger(retrainEveryMessages) || retrainEveryMessages < 1)) {
+    throw new RangeError(`${where}: autoTrain.retrainEveryMessages must be a positive integer`);
+  }
+  if (retrainEveryMs !== undefined && (!Number.isFinite(retrainEveryMs) || retrainEveryMs <= 0)) {
+    throw new RangeError(`${where}: autoTrain.retrainEveryMs must be a positive finite number of milliseconds`);
+  }
+  if (onTrained !== undefined && typeof onTrained !== 'function') {
+    throw new RangeError(`${where}: autoTrain.onTrained must be a function`);
+  }
+  return {
+    sampleCount,
+    sampleMaxBytes,
+    retrainEveryMessages,
+    retrainEveryMs: retrainEveryMs ?? (retrainEveryMessages === undefined ? DEFAULT_AUTO_TRAIN_RETRAIN_MS : undefined),
+    onTrained,
+  };
+}
+
+/**
+ * Marks a timer as not keeping the process alive, tolerating timer-like
+ * objects without `unref` (the same defensive shape used by the delayed
+ * delivery and rate-window timers).
+ */
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  const handle = timer as unknown as { unref?: () => unknown };
+  if (typeof handle.unref === 'function') handle.unref();
+}
+
+/**
+ * Per-rule automatic dictionary trainer (EB-60). Owns the sample window,
+ * the retrain triggers, and the background training pass; the bus owns
+ * the rule table and the dictionary registry, reached through `hooks`.
+ *
+ * Threading model: training is DEFERRED, never inline. Both triggers —
+ * `retrainEveryMessages` reached in the publish path, and the
+ * `retrainEveryMs` cadence timer — only schedule a `setTimeout(0)` pass,
+ * so the publish stack never pays derivation CPU and a publish admitted
+ * while a training is pending still compresses with the old dictionary.
+ * Single-threaded JS makes the swap atomic with respect to publishes:
+ * the rule table entry is replaced between publish calls, never during
+ * one.
+ */
+class CompressionAutoTrainer {
+  private readonly pattern: string;
+  private readonly config: ResolvedAutoTrainOptions;
+  private readonly hooks: {
+    now: () => number;
+    registerDictionary: (id: string, dictionary: Buffer) => void;
+    swapDictionary: (pattern: string, dictionary: Buffer, dictionaryId: string) => void;
+  };
+  /** Sliding window of serialized payloads, oldest first. */
+  private samples: string[] = [];
+  /** Serialized bytes currently retained in `samples`. */
+  private sampleBytes = 0;
+  /** Lifetime payloads admitted into the window (for stats). */
+  private sampledMessagesTotal = 0;
+  /** Samples admitted since the last completed training. */
+  private sinceLastTrain = 0;
+  private version = 0;
+  private lastTrainedAt?: number;
+  private dictionaryId?: string;
+  /** Deferred training pass, if one is queued. */
+  private pendingTimer?: ReturnType<typeof setTimeout>;
+  private trainingQueued = false;
+  /** Cadence timer for `retrainEveryMs`, if configured. */
+  private cadenceTimer?: ReturnType<typeof setTimeout>;
+
+  constructor(
+    pattern: string,
+    config: ResolvedAutoTrainOptions,
+    hooks: {
+      now: () => number;
+      registerDictionary: (id: string, dictionary: Buffer) => void;
+      swapDictionary: (pattern: string, dictionary: Buffer, dictionaryId: string) => void;
+    },
+    initialDictionaryId?: string,
+  ) {
+    this.pattern = pattern;
+    this.config = config;
+    this.hooks = hooks;
+    this.dictionaryId = initialDictionaryId;
+    if (config.retrainEveryMs !== undefined) this.armCadenceTimer();
+  }
+
+  /**
+   * Admits one published payload into the sample window. Runs in the
+   * publish path, so it is deliberately cheap: one serialization plus
+   * amortized-constant window maintenance — no deflate, no hashing, no
+   * timer work beyond arming. Unserializable payloads (see
+   * `serializeToJson`) contribute nothing to the corpus.
+   */
+  sample(payload: unknown): void {
+    const serialized = serializeToJson(payload);
+    if (serialized === undefined) return;
+    const bytes = Buffer.byteLength(serialized, 'utf8');
+    this.samples.push(serialized);
+    this.sampleBytes += bytes;
+    this.sampledMessagesTotal += 1;
+    this.sinceLastTrain += 1;
+    // Dual-bounded window: evict oldest first, but always retain the
+    // newest sample — a single payload larger than `sampleMaxBytes` still
+    // trains, it just trains alone.
+    while (
+      this.samples.length > 1 &&
+      (this.samples.length > this.config.sampleCount || this.sampleBytes > this.config.sampleMaxBytes)
+    ) {
+      const evicted = this.samples.shift();
+      if (evicted !== undefined) this.sampleBytes -= Buffer.byteLength(evicted, 'utf8');
+    }
+    const every = this.config.retrainEveryMessages;
+    if (every !== undefined && this.sinceLastTrain >= every) this.requestTraining();
+  }
+
+  /** Retires the trainer: drops a queued training and clears the cadence timer. */
+  clear(): void {
+    if (this.pendingTimer !== undefined) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = undefined;
+    }
+    this.trainingQueued = false;
+    if (this.cadenceTimer !== undefined) {
+      clearTimeout(this.cadenceTimer);
+      this.cadenceTimer = undefined;
+    }
+  }
+
+  /** Snapshot for `getStats()`. */
+  snapshot(): CompressionAutoTrainState {
+    return {
+      version: this.version,
+      ...(this.dictionaryId === undefined ? {} : { dictionaryId: this.dictionaryId }),
+      ...(this.lastTrainedAt === undefined ? {} : { lastTrainedAt: this.lastTrainedAt }),
+      sampledMessages: this.sampledMessagesTotal,
+      sampledBytes: this.sampleBytes,
+    };
+  }
+
+  /**
+   * Schedules one training pass on an unref'd zero-delay timer — off the
+   * publish stack, and deduped so a burst of publishes past the message
+   * trigger queues exactly one pass.
+   */
+  private requestTraining(): void {
+    if (this.trainingQueued) return;
+    this.trainingQueued = true;
+    const timer = setTimeout(() => {
+      this.trainingQueued = false;
+      this.pendingTimer = undefined;
+      this.train();
+    }, 0);
+    unrefTimer(timer);
+    this.pendingTimer = timer;
+  }
+
+  /** Arms (or re-arms) the wall-clock cadence timer. Unref'd: a training cadence never keeps the process alive. */
+  private armCadenceTimer(): void {
+    const everyMs = this.config.retrainEveryMs;
+    if (everyMs === undefined) return;
+    const timer = setTimeout(() => {
+      this.cadenceTimer = undefined;
+      // Only train on fresh signal: a quiet topic re-derives nothing.
+      if (this.sinceLastTrain > 0) this.requestTraining();
+      this.armCadenceTimer();
+    }, Math.min(everyMs, 2_147_483_647));
+    unrefTimer(timer);
+    this.cadenceTimer = timer;
+  }
+
+  /**
+   * Derives a dictionary from the current window and swaps it into the
+   * rule through the EB-30 registration path. Runs on the background
+   * timer, never in the publish path.
+   */
+  private train(): void {
+    if (this.sinceLastTrain === 0 || this.samples.length === 0) return;
+    // Trailing-window heuristic: the corpus's most recent bytes carry the
+    // topic's current recurring patterns. Documented as a heuristic, not
+    // a coverage-based trainer — see `CompressionAutoTrainOptions`.
+    let dictionary = Buffer.from(this.samples.join('\n'), 'utf8');
+    if (dictionary.length > MAX_COMPRESSION_DICTIONARY_BYTES) {
+      dictionary = dictionary.subarray(dictionary.length - MAX_COMPRESSION_DICTIONARY_BYTES);
+    }
+    const dictionaryId = createHash('sha256').update(dictionary).digest('hex');
+    // EB-30 registration: the id is new (or re-registered idempotently
+    // when the corpus re-derives identical bytes), and old dictionaries
+    // stay in the registry — replay fail-closed semantics unchanged.
+    this.hooks.registerDictionary(dictionaryId, dictionary);
+    this.hooks.swapDictionary(this.pattern, dictionary, dictionaryId);
+    this.version += 1;
+    this.lastTrainedAt = this.hooks.now();
+    this.dictionaryId = dictionaryId;
+    this.sinceLastTrain = 0;
+    const onTrained = this.config.onTrained;
+    if (onTrained !== undefined) {
+      const event: CompressionAutoTrainedEvent = {
+        topicPattern: this.pattern,
+        version: this.version,
+        dictionaryId,
+        sampleMessages: this.samples.length,
+        sampleBytes: this.sampleBytes,
+        dictionaryBytes: dictionary.length,
+        trainedAt: this.lastTrainedAt,
+      };
+      try {
+        onTrained(event);
+      } catch {
+        // Swallowed: a user callback must never break the bus (same rule
+        // as `onGroupLag`).
+      }
+    }
+  }
 }
 
 /**
@@ -4028,6 +4383,12 @@ export class EventBus {
    * never inflates `patternCacheSize`.
    */
   private compressionMatcherCache = new Map<string, RegExp>();
+  /**
+   * Active auto-trainers (EB-60), keyed by the exact `topicPattern` the
+   * rule was registered with. One trainer per auto-trained rule; retired
+   * (timers cleared) when the rule is replaced or cleared.
+   */
+  private compressionAutoTrainers = new Map<string, CompressionAutoTrainer>();
   /**
    * Preset dictionaries by SHA-256 id, registered by `setTopicCompression`.
    * Lets durable-log replay inflate dictionary-compressed records after a
@@ -5115,7 +5476,30 @@ export class EventBus {
       dictionaryId = createHash('sha256').update(dictionary).digest('hex');
       this.registerCompressionDictionary(dictionaryId, dictionary);
     }
-    this.compressionRules.set(topicPattern, { thresholdBytes: opts.thresholdBytes, level, dictionary, dictionaryId });
+    // Replacing a rule retires its auto-trainer first: the old cadence
+    // and pending timers are cleared so a replaced rule can never train
+    // again, and its samples are dropped with it.
+    const previousTrainer = this.compressionAutoTrainers.get(topicPattern);
+    if (previousTrainer !== undefined) {
+      previousTrainer.clear();
+      this.compressionAutoTrainers.delete(topicPattern);
+    }
+    let autoTrainState: CompressionAutoTrainer | undefined;
+    if (opts.autoTrain !== undefined) {
+      const resolved = resolveAutoTrainOptions(opts.autoTrain, `setTopicCompression("${topicPattern}")`);
+      autoTrainState = new CompressionAutoTrainer(
+        topicPattern,
+        resolved,
+        {
+          now: () => this.now(),
+          registerDictionary: (id, dict) => this.registerCompressionDictionary(id, dict),
+          swapDictionary: (pattern, dict, id) => this.applyTrainedDictionary(pattern, dict, id),
+        },
+        dictionaryId,
+      );
+      this.compressionAutoTrainers.set(topicPattern, autoTrainState);
+    }
+    this.compressionRules.set(topicPattern, { thresholdBytes: opts.thresholdBytes, level, dictionary, dictionaryId, autoTrainState });
   }
 
   /**
@@ -5132,6 +5516,24 @@ export class EventBus {
       if (oldest.done) break;
       this.compressionDictionaryRegistry.delete(oldest.value);
     }
+  }
+
+  /**
+   * Atomically swaps a rule's preset dictionary after an auto-training
+   * pass (EB-60), through the EB-30 registration path: the rule keeps
+   * compressing with the new bytes under a new SHA-256 id, while every
+   * previous dictionary stays in the registry — in-flight messages carry
+   * their own bytes and durable-log replay keeps resolving old ids, so
+   * fail-closed replay semantics are unchanged. The swap replaces the
+   * rule-table entry between publishes (never during one), so no publish
+   * ever compresses with half-old state. A no-op when the rule was
+   * replaced or cleared while the training was queued.
+   */
+  private applyTrainedDictionary(pattern: string, dictionary: Buffer, dictionaryId: string): void {
+    const rule = this.compressionRules.get(pattern);
+    if (rule === undefined || rule.autoTrainState === undefined) return;
+    if (this.compressionAutoTrainers.get(pattern) !== rule.autoTrainState) return;
+    this.compressionRules.set(pattern, { ...rule, dictionary, dictionaryId });
   }
 
   /**
@@ -5168,6 +5570,14 @@ export class EventBus {
    * was removed.
    */
   clearTopicCompression(topicPattern: string): boolean {
+    const trainer = this.compressionAutoTrainers.get(topicPattern);
+    if (trainer !== undefined) {
+      // Retire the auto-trainer with the rule: a queued training is
+      // dropped, the cadence timer is cleared, and later publishes are no
+      // longer sampled — a cleared rule never trains again.
+      trainer.clear();
+      this.compressionAutoTrainers.delete(topicPattern);
+    }
     return this.compressionRules.delete(topicPattern);
   }
 
@@ -9298,6 +9708,14 @@ export class EventBus {
         msg.payload = wirePayload;
         if (this.compressedDictionaries.has(msg)) compressedDictId = compressionRule.dictionaryId;
       }
+      // Auto-trained dictionaries (EB-60): admitted publishes feed the
+      // topic's sample window. Sampling costs one serialization per
+      // publish on auto-trained topics — the price of a training corpus —
+      // and nothing more on this path: training itself runs on an unref'd
+      // background timer, and publishes always compress with the
+      // dictionary in force when they were admitted.
+      const autoTrainer = compressionRule.autoTrainState;
+      if (autoTrainer !== undefined) autoTrainer.sample(payload);
     }
     // One clock reading for the publish: TTL deadline and log timestamp stay
     // consistent even if the injected clock moves between the two.
@@ -9903,6 +10321,14 @@ export class EventBus {
             : 0,
         meanCompressionMs:
           stats.compressedMessages > 0 ? stats.compressionTimeMs / stats.compressedMessages : 0,
+        // Auto-trained dictionary state (EB-60): present only when the
+        // topic's matching compression rule has `autoTrain` enabled.
+        // Omitted otherwise, so stats snapshots without auto-train are
+        // byte-identical to before.
+        ...(() => {
+          const trainer = this.compressionForTopic(topic)?.autoTrainState;
+          return trainer === undefined ? {} : { autoTrain: trainer.snapshot() };
+        })(),
         rates: this.publishRates.ratesFor(topic, ratesNow),
       })),
       // Per-namespace aggregates (EB-52), in registration order — derived

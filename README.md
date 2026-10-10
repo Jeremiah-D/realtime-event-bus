@@ -544,6 +544,46 @@ library.
     plain deflate fails the never-adopt-a-larger-encoding guard on the
     least redundant ones. The trade is CPU: dictionary deflate costs ~4x
     the p50 time, so size the threshold for your payload family.
+  - **Auto-trained dictionaries** (`autoTrain` option): instead of
+    hand-building the dictionary, the bus can derive it from the topic's
+    own recent publishes — zero new dependencies. While enabled, every
+    admitted publish contributes its serialized payload to a sliding
+    sample window (bounded by both `sampleCount` and `sampleMaxBytes`,
+    oldest evicted first), and a background training pass re-derives the
+    dictionary whenever `retrainEveryMessages` publishes have been sampled
+    or every `retrainEveryMs` (default 60s, only when new samples
+    arrived). The derivation is a documented trailing-window heuristic —
+    the window's samples concatenated, last 32 KiB kept — not a
+    coverage-based trainer. Training never runs inline in the publish
+    path: it is scheduled on an unref'd timer, publishes admitted while a
+    training is pending keep compressing with the old dictionary, and a
+    completed training atomically swaps the rule to the new dictionary
+    (new SHA-256 `dictId`, version incremented) while old dictionaries
+    stay registered — durable-log replay fail-closed semantics are
+    unchanged, and each log record keeps carrying the `dictId` in force
+    when it was written. Sampling costs one serialization per publish on
+    auto-trained topics; `getStats()` exposes per-topic `autoTrain`
+    (`version`, `dictionaryId`, `lastTrainedAt`, `sampledMessages`,
+    `sampledBytes`). `clearTopicCompression` (or replacing the rule)
+    retires the trainer — queued trainings are dropped and timers
+    cleared. Invalid options throw `RangeError`; an `onTrained` callback
+    fires after each completed training (a throwing callback is
+    swallowed). Disabled by default. Measured on
+    `bench/dict-train.bench.ts` (2,000 market-tick messages, mean 142
+    bytes serialized; dictionary auto-trained from the first 300 samples,
+    32 KiB cap, then applied to the full corpus including 1,700 unseen
+    messages; Node v24.20.0, AMD EPYC 9D25):
+
+    | mode | wire ratio (after/before) | deflate p50 | deflate p99 |
+    | ---- | ------------------------- | ----------- | ----------- |
+    | no dictionary | 0.909 | ~20µs | ~160µs |
+    | auto-trained dictionary | 0.192 | ~89µs | ~380µs |
+
+    The auto-trained dictionary matches the hand-built one (0.192 in both
+    benches) — the trailing-window heuristic captures this payload
+    family's recurring patterns as well as manual curation. Derivation
+    itself took 0.11ms, one-time, off the publish path. Same CPU trade as
+    above: dictionary deflate costs ~4x the p50 time.
 - **Subscriber output rate shaping** (in `src/bus.ts`, opt-in via
   `subscribe(..., { deliveryShaping: true })`): delivery-side pacing for a
   slow downstream consumer. A per-subscriber token bucket caps deliveries at
@@ -1105,6 +1145,20 @@ npm test
   resume inflates), ACK redelivery of compressed messages, TTL deadline
   preservation, envelope-shaped user payloads never mistaken for
   compressed, and option validation.
+- `test/dict-train.test.ts` — auto-trained per-topic deflate dictionaries:
+  `autoTrain` option validation (`RangeError` fail-fast), disabled by
+  default (no stats field, no timers), message-count trigger training with
+  atomic dictionary swap and transparent inflation afterwards, training
+  never running inline in the publish path (a publish admitted while a
+  training is pending carries the old `dictId` on its durable-log
+  record), old dictionaries staying registered so pre-train records still
+  replay while fail-closed semantics are unchanged for unknown
+  dictionaries, `retrainEveryMs` wall-clock cadence firing only on new
+  samples, `clearTopicCompression` and rule replacement retiring the
+  trainer (timers cleared, no further training, stats gone), the
+  dual-bounded sample window (count and bytes, unserializable payloads
+  skipped), a throwing `onTrained` callback being swallowed, and
+  `getStats()` auto-train state before/after training.
 - `test/atomic.test.ts` — atomic cross-topic batch publish: all-or-nothing
   commit across topics, schema rejection rolling back with zero side effects
   (no seq consumed, no rate-limit budget burned, no durable-log writes, no
