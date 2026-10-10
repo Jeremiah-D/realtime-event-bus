@@ -75,6 +75,10 @@
  *   Only ack-tracked subscribers appear.
  * - `eventbus_ack_latency_samples{subscriber,pattern}`: samples
  *   currently in each tracked subscriber's ack-latency window.
+ * - `eventbus_subscriber_processing_latency_p99{subscriber,pattern}`:
+ *   per-subscriber handler processing-latency p99 for subscriptions with
+ *   `latencySlo` enabled — the windowed nearest-rank p99 the SLO alert
+ *   fires on. Only SLO-tracked subscribers appear.
  * - `eventbus_lag_ms{quantile,subscriber,pattern}`: per-subscriber
  *   enqueue→drain dwell distribution for subscriptions with `lagMonitor`
  *   enabled — nearest-rank p50/p99 over each subscriber's bounded rolling
@@ -117,7 +121,9 @@
  * subscription), and the per-subscriber lag series (four per
  * lag-monitored subscription) are bounded by the opted-in subscriber
  * count — monitoring is opt-in per subscription, so unmonitored
- * subscribers add no series. The
+ * subscribers add no series. The per-subscriber processing-latency p99
+ * series (one per `latencySlo`-tracked subscription) is bounded the same
+ * way. The
  * `eventbus_topic_rate_msg_per_sec` series are the exception to the
  * per-topic rule: they are deliberately limited to the hot-topics set
  * (10 topics x 3 windows = 30 series max), because rate decisions need
@@ -298,6 +304,21 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_ack_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
     lines.push(`eventbus_ack_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
     lines.push(`eventbus_ack_latency_samples{${labels}} ${s.samples}`);
+  }
+
+  // Per-subscriber handler processing-latency p99 (only subscriptions
+  // with `latencySlo` enabled), in subscription order (same as
+  // BusStats.subscriberLatencyP99). One series per tracked subscriber —
+  // the SLO alerting signal; unmonitored subscribers add none. The `?? []`
+  // keeps the renderer tolerant of a stats object that predates the field
+  // (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_subscriber_processing_latency_p99 Per-subscriber handler processing-latency p99 over the rolling sample window (nearest-rank); the latency-SLO alerting signal.',
+  );
+  lines.push('# TYPE eventbus_subscriber_processing_latency_p99 gauge');
+  for (const s of stats.subscriberLatencyP99 ?? []) {
+    const labels = `subscriber="${escapeLabelValue(s.subscriberId)}",pattern="${escapeLabelValue(s.pattern)}"`;
+    lines.push(`eventbus_subscriber_processing_latency_p99{${labels}} ${s.p99Ms}`);
   }
 
   // Per-subscriber lag watermark series (only subscriptions with

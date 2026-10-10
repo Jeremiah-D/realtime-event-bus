@@ -27,6 +27,13 @@
  *   wait-to-die one.
  * - A clock that moved backwards between enqueue and delivery clamps the
  *   sample at 0.
+ *
+ * EB-53 reuses this tracker for handler *processing*-latency p99 SLO
+ * alerting (`SubscribeOptions.latencySlo`): the bus computes
+ * delivery→completion deltas from its injected clock and feeds them here,
+ * exactly like the queue-dwell samples above. The tracker itself stays
+ * delta-based and clock-free, so both features share one window
+ * implementation with no duplication.
  */
 
 /** Tuning for per-subscriber delivery-latency sampling. */
@@ -105,4 +112,61 @@ export class DeliveryLatencyTracker {
       meanMs: this.sumMs / n,
     };
   }
+}
+
+/**
+ * Tuning for per-subscriber handler processing-latency p99 SLO alerting
+ * (EB-53). Opt-in by presence: `subscribe(..., { latencySlo: {
+ * p99ThresholdMs: 50 } })`.
+ *
+ * The bus measures every handler invocation's processing time —
+ * delivery→handler-return for plain subscriptions,
+ * delivery→`ack()` completion for reliable ones — and feeds the deltas
+ * into a `DeliveryLatencyTracker` window (shared with the queue-dwell
+ * sampler above; each feature keeps its own window, so enabling one never
+ * double-samples the other). When the windowed nearest-rank p99 exceeds
+ * `p99ThresholdMs`, the bus fires `onLatencySloMiss` once per excursion
+ * (re-arming after the p99 drops back to or below the threshold) — an
+ * advisory alert that never disturbs delivery.
+ */
+export interface ProcessingLatencySloOptions {
+  /**
+   * How many of the most recent processing-time samples to keep per
+   * subscriber; the oldest samples are evicted past this bound. Must be
+   * a positive integer. Default 1024.
+   */
+  windowSize?: number;
+  /**
+   * The p99 SLO in milliseconds: the alert fires when the windowed
+   * nearest-rank p99 exceeds this. Required; must be a positive finite
+   * number.
+   */
+  p99ThresholdMs: number;
+  /**
+   * Fired once per excursion when the windowed p99 exceeds
+   * `p99ThresholdMs`, with the p99, the threshold, and the subscriber's
+   * identity. Advisory only and error-isolated: a throwing callback is
+   * swallowed and never disturbs the delivery flow.
+   */
+  onLatencySloMiss?: (event: LatencySloMissEvent) => void;
+}
+
+/**
+ * Fired when a subscriber's windowed handler processing-latency p99
+ * exceeds its SLO (`SubscribeOptions.latencySlo`). The bus fills in the
+ * subscriber's identity when it fires the callback.
+ */
+export interface LatencySloMissEvent {
+  /** The subscriber whose processing-latency p99 missed the SLO. */
+  subscriberId: string;
+  /** The topic pattern the subscriber registered. */
+  pattern: string;
+  /** The windowed nearest-rank p99 handler processing latency, in milliseconds. */
+  p99Ms: number;
+  /** The SLO threshold it exceeded, in milliseconds. */
+  thresholdMs: number;
+  /** Samples in the window at the moment the alert fired. */
+  samples: number;
+  /** Bus-clock reading at the moment the alert fired. */
+  at: number;
 }

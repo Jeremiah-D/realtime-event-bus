@@ -570,6 +570,35 @@ library.
   synchronously with the sample, the SLO, and the subscriber's identity.
   Invalid options throw `RangeError` from `subscribe`. Disabled by
   default.
+- **Per-subscriber handler processing-latency p99 SLO alerting** (in
+  `src/latency.ts` + `src/bus.ts`, opt-in via
+  `subscribe(..., { latencySlo: { p99ThresholdMs: 50 } })`): measures each
+  handler invocation's *processing* time — delivery→handler-return for
+  plain subscriptions, delivery→`ack()` completion for reliable ones —
+  into a bounded rolling window (default 1024 samples, `windowSize`
+  tunable, oldest evicted) and fires `onLatencySloMiss` once when the
+  windowed nearest-rank p99 exceeds `p99ThresholdMs`, re-arming after it
+  drops back to or below the threshold (the `onBackpressure` / `onLag`
+  latch). The alert is advisory only: it never pauses, degrades, or
+  otherwise disturbs delivery, and a throwing callback is swallowed —
+  unlike the other monitoring callbacks it cannot propagate into the
+  flush loop. Relationship to the neighboring features: `deliveryLatency`
+  (EB-31) measures enqueue→hand-off queue dwell (handler time *excluded*);
+  `ackLatency` (EB-40) measures the accepted→ack round trip per message
+  with a *per-sample* SLO; this one isolates pure consumer processing
+  time and alerts on the *windowed p99*. It is orthogonal to `healthProbe`
+  (EB-18): a slow handler trips this alert while only throws and
+  `processingTimeoutMs` overruns count toward health degradation. All
+  three latency features sample independently — a reliable subscriber's
+  processing samples come from `ack()` completion only, never from the
+  synchronous invocation timing, so enabling several never double-counts.
+  `getStats()` exposes `subscriberLatencyP99` (per-subscriber p99,
+  sample count, threshold, and whether the alert latch is set), and
+  `src/metrics.ts` renders
+  `eventbus_subscriber_processing_latency_p99{subscriber,pattern}` (one
+  series per tracked subscriber). `p99ThresholdMs` is required and must
+  be a positive finite number; invalid options throw `RangeError` /
+  `TypeError` from `subscribe`. Disabled by default.
 - **Per-subscriber lag watermark monitoring** (in `src/lag.ts`, opt-in via
   `subscribe(..., { lagMonitor: true })`): answers the live question — "how
   far behind is this consumer *right now*?" — Kafka-consumer-lag style.
@@ -1197,6 +1226,7 @@ Exported series:
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
 | `eventbus_ack_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber accepted→ack end-to-end latency p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `ackLatency`-enabled reliable subscriptions |
 | `eventbus_ack_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's ack-latency window |
+| `eventbus_subscriber_processing_latency_p99{subscriber,pattern}` | gauge | per-subscriber handler processing-latency windowed p99 — the `latencySlo` alerting signal; only SLO-tracked subscriptions |
 | `eventbus_key_hotspot_buffer_depth{subscriber,pattern,key}` | gauge | current per-(subscriber, key) reorder-buffer depth, hottest 10; only `keyHotspot`-enabled subscriptions |
 | `eventbus_lag_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→drain dwell p50/p99 (`quantile` = "0.5"/"0.99"); only `lagMonitor`-enabled subscriptions |
 | `eventbus_lag_samples{subscriber,pattern}` | gauge | samples in the subscriber's lag dwell window |
@@ -1213,7 +1243,9 @@ per-subscriber latency series (four per latency-tracked subscription),
 the per-subscriber ack-latency series (four per ack-tracked reliable
 subscription), and the per-subscriber lag series (four per lag-monitored
 subscription) are bounded by the opted-in subscriber count — monitoring is
-opt-in, so unmonitored subscribers add no series. `eventbus_topic_rate_msg_per_sec` is the
+opt-in, so unmonitored subscribers add no series. The per-subscriber
+processing-latency p99 series (one per `latencySlo`-tracked subscription)
+is bounded the same way. `eventbus_topic_rate_msg_per_sec` is the
 deliberate exception to the per-topic rule: only the hot-topics set
 carries it (10 topics × 3 windows = 30 series max), because
 rate-limit/scaling decisions need the busiest topics, not the full topic

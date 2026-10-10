@@ -6,6 +6,8 @@ import {
   DeliveryLatencyTracker,
   type DeliveryLatencyOptions,
   type DeliveryLatencySummaryStats,
+  type LatencySloMissEvent,
+  type ProcessingLatencySloOptions,
 } from './latency.ts';
 import {
   AckLatencyTracker,
@@ -81,7 +83,12 @@ export type {
   BridgeStats,
   BridgeTransport,
 } from './bridge.ts';
-export type { DeliveryLatencyOptions, DeliveryLatencySummaryStats } from './latency.ts';
+export type {
+  DeliveryLatencyOptions,
+  DeliveryLatencySummaryStats,
+  LatencySloMissEvent,
+  ProcessingLatencySloOptions,
+} from './latency.ts';
 export type {
   AckLatencyOptions,
   AckLatencySummaryStats,
@@ -356,6 +363,39 @@ export interface SubscribeOptions {
    * meaningful with `ackLatency` enabled (see `ackSloMs`).
    */
   onAckSloMiss?: (event: AckSloMiss) => void;
+  /**
+   * Opt-in per-subscriber handler processing-latency p99 SLO alerting.
+   * When enabled, the bus measures every handler invocation's processing
+   * time — delivery→handler-return for plain subscriptions,
+   * delivery→`ack()` completion for reliable ones — into a bounded
+   * rolling window (nearest-rank p99, default 1024 samples, `windowSize`
+   * tunable) and fires `onLatencySloMiss` once when the windowed p99
+   * exceeds `p99ThresholdMs`, re-arming after it drops back to or below
+   * the threshold (the `onBackpressure` / `onLag` latch). The alert is
+   * advisory only: it never pauses, degrades, or otherwise disturbs
+   * delivery, and a throwing callback is swallowed — unlike the other
+   * subscriber monitoring callbacks, it cannot propagate into the flush
+   * loop. It is orthogonal to `healthProbe` (EB-18): a slow handler trips
+   * this alert while only throws and `processingTimeoutMs` overruns count
+   * toward health degradation.
+   *
+   * How it differs from the neighboring latency features: `deliveryLatency`
+   * (EB-31) measures the enqueue→hand-off queue dwell (handler time
+   * excluded); `ackLatency` (EB-40) measures the accepted→ack round trip
+   * per message with a per-sample SLO; this one measures pure consumer
+   * processing time and alerts on the windowed p99. All three sample
+   * independently — enabling one never double-samples another (a reliable
+   * subscriber's processing samples come from `ack()` completion only,
+   * never from the synchronous handler-invocation timing).
+   *
+   * `getStats()` exposes the per-subscriber p99 snapshot
+   * (`subscriberLatencyP99`), and `src/metrics.ts` renders
+   * `eventbus_subscriber_processing_latency_p99{subscriber,pattern}`.
+   * `p99ThresholdMs` is required and must be a positive finite number;
+   * invalid values throw `RangeError` from `subscribe` (`TypeError` for a
+   * non-function `onLatencySloMiss`). Disabled by default.
+   */
+  latencySlo?: ProcessingLatencySloOptions;
   /**
    * Opt-in subscriber lag watermark monitoring. When enabled, the bus
    * tracks how long the oldest message currently sitting in this
@@ -1581,6 +1621,28 @@ export interface BusStats {
     { subscriberId: string; pattern: string } & AckLatencySummaryStats
   >;
   /**
+   * Per-subscriber handler processing-latency p99 snapshots (see
+   * `SubscribeOptions.latencySlo`): one entry per subscription with SLO
+   * tracking enabled, in subscription order. Each entry carries the
+   * windowed nearest-rank p99 of handler processing time (delivery→
+   * handler-return for plain subscriptions, delivery→`ack()` completion
+   * for reliable ones), the sample count, the configured threshold, and
+   * whether the p99 is currently above the threshold (`breaching`, i.e.
+   * the alert latch is set). Empty when no subscriber opts in.
+   */
+  subscriberLatencyP99: Array<{
+    subscriberId: string;
+    pattern: string;
+    /** Windowed nearest-rank p99 handler processing latency, in milliseconds. 0 when empty. */
+    p99Ms: number;
+    /** Samples currently in the window. */
+    samples: number;
+    /** The configured `p99ThresholdMs`. */
+    thresholdMs: number;
+    /** Whether the windowed p99 is currently above the threshold. */
+    breaching: boolean;
+  }>;
+  /**
    * The slowest latency-tracked subscribers by p99 queue dwell (top 5,
    * descending) — the first place to look when end-to-end lag grows.
    * Only subscribers with at least one sample appear.
@@ -1868,6 +1930,12 @@ interface Subscriber {
    * this subscriber.
    */
   ackLatency?: SubscriberAckLatencyState;
+  /**
+   * Handler processing-latency p99 SLO state (see
+   * `SubscribeOptions.latencySlo`). Absent when SLO tracking is disabled
+   * for this subscriber.
+   */
+  latencySlo?: SubscriberLatencySloState;
   /**
    * Lag watermark monitoring state (see `SubscribeOptions.lagMonitor`).
    * Absent when monitoring is disabled for this subscriber.
@@ -2509,6 +2577,60 @@ function resolveAckLatencyOptions(
       onSloMiss: (event) =>
         onAckSloMiss?.({ subscriberId, pattern, ...event }),
     }),
+  };
+}
+
+/**
+ * Per-subscriber handler processing-latency SLO state (see
+ * `SubscribeOptions.latencySlo`). The tracker is EB-31's
+ * `DeliveryLatencyTracker` reused for processing-time deltas — the bus
+ * computes each delta from its injected clock, so the tracker stays
+ * clock-free. `alerted` is the excursion latch (see
+ * `checkProcessingLatencySlo`): set while the windowed p99 is above the
+ * threshold, cleared when it drops back to or below it.
+ */
+interface SubscriberLatencySloState {
+  tracker: DeliveryLatencyTracker;
+  thresholdMs: number;
+  alerted: boolean;
+  onLatencySloMiss?: (event: LatencySloMissEvent) => void;
+}
+
+/**
+ * Validates `SubscribeOptions.latencySlo` and builds the initial
+ * per-subscriber SLO state. Returns `undefined` when the feature is
+ * disabled. Throws `RangeError` for a missing/invalid `p99ThresholdMs`
+ * or an invalid window size; throws `TypeError` for a non-function
+ * `onLatencySloMiss`. Unlike `ackSloMs`, the threshold has no default —
+ * an SLO with no threshold could never fire, so omitting it is a
+ * configuration error, not a silent opt-out.
+ */
+function resolveLatencySloOptions(
+  opt: ProcessingLatencySloOptions | undefined,
+): SubscriberLatencySloState | undefined {
+  if (opt == null) return undefined;
+  if (typeof opt !== 'object') {
+    throw new TypeError('latencySlo must be an options object');
+  }
+  const windowSize = opt.windowSize ?? 1024;
+  if (!Number.isInteger(windowSize) || windowSize <= 0) {
+    throw new RangeError('latencySlo.windowSize must be a positive integer');
+  }
+  const thresholdMs = opt.p99ThresholdMs;
+  if (!Number.isFinite(thresholdMs) || thresholdMs <= 0) {
+    throw new RangeError(
+      'latencySlo.p99ThresholdMs must be a positive finite number of milliseconds',
+    );
+  }
+  const onLatencySloMiss = opt.onLatencySloMiss;
+  if (onLatencySloMiss !== undefined && typeof onLatencySloMiss !== 'function') {
+    throw new TypeError('latencySlo.onLatencySloMiss must be a function');
+  }
+  return {
+    tracker: new DeliveryLatencyTracker(windowSize),
+    thresholdMs,
+    alerted: false,
+    onLatencySloMiss,
   };
 }
 
@@ -4931,6 +5053,9 @@ export class EventBus {
     );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const latencySlo = resolveLatencySloOptions(opts?.latencySlo);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -5011,6 +5136,7 @@ export class EventBus {
       rateLimit,
       latency: deliveryLatency,
       ackLatency,
+      latencySlo,
       lag: lagMonitor,
       keyHotspot,
       batch,
@@ -5224,7 +5350,14 @@ export class EventBus {
         tracer !== undefined && tracer.hasTrace(msg)
           ? tracer.openAckSpan(msg, redeliveries.get(msg) ?? 0, this.now())
           : false;
-      if (ackState == null && !ackTraced) return delivery;
+      // EB-53: stamp the hand-off when SLO tracking is enabled, so the
+      // sample taken on ack() completion measures delivery→ack
+      // processing time, queue dwell excluded. A redelivery re-stamps
+      // here; a stale handle's ack() records nothing (the live.live
+      // guard), mirroring the ack-latency tracker's single-sample rule.
+      const sloState = subscriber.latencySlo;
+      const deliveredAtMs = sloState === undefined ? 0 : this.now();
+      if (ackState == null && !ackTraced && sloState === undefined) return delivery;
       const live = { live: true };
       liveDeliveries.set(msg, live);
       return {
@@ -5233,6 +5366,9 @@ export class EventBus {
           delivery.ack();
           if (live.live) {
             if (ackState != null) ackState.tracker.sampleOnAck(msg);
+            if (sloState !== undefined) {
+              this.recordProcessingLatency(subscriber, sloState, deliveredAtMs);
+            }
             tracer?.closeAckSpan(subscriber, msg, this.now());
           }
           // A stale handle (acked after nack/timeout already requeued)
@@ -7891,6 +8027,84 @@ export class EventBus {
   }
 
   /**
+   * Records one handler processing-time sample for an SLO-tracked
+   * subscriber: `now - startedAtMs`, where `startedAtMs` is the bus-clock
+   * reading taken immediately before the handler invocation (plain and
+   * batched paths) or before the delivery was handed out (reliable path,
+   * sampled on `ack()` completion). A clock that moved backwards clamps
+   * the sample at 0. Call sites only invoke this when SLO tracking is
+   * enabled for the subscriber — untracked subscribers pay no clock read
+   * and no branch beyond the call-site check. Evaluates the SLO after
+   * every sample, so a threshold crossing fires on the sample that
+   * crossed it.
+   */
+  private recordProcessingLatency(
+    subscriber: Subscriber,
+    slo: SubscriberLatencySloState,
+    startedAtMs: number,
+  ): void {
+    slo.tracker.record(Math.max(0, this.now() - startedAtMs));
+    this.checkProcessingLatencySlo(subscriber, slo);
+  }
+
+  /**
+   * The invocation-time SLO state to sample, if any: reliable
+   * subscribers sample exclusively on `ack()` completion (see the ack
+   * wrapper in `subscribeReliable`), so the synchronous
+   * handler-invocation timing must not sample them too — otherwise every
+   * acked message would contribute two samples. Plain (and batched)
+   * subscribers sample on handler invocation.
+   */
+  private invocationLatencySlo(subscriber: Subscriber): SubscriberLatencySloState | undefined {
+    return subscriber.reliable == null ? subscriber.latencySlo : undefined;
+  }
+
+  /**
+   * Evaluates a subscriber's windowed processing-latency p99 against its
+   * SLO threshold (`SubscribeOptions.latencySlo`). Fires
+   * `onLatencySloMiss` once per excursion — when the p99 exceeds the
+   * threshold while the latch is clear — and re-arms the latch when the
+   * p99 drops back to or below the threshold, mirroring the `onLag`
+   * latch in `checkLag`.
+   *
+   * Advisory only: the alert never pauses, degrades, or otherwise
+   * disturbs delivery — it is orthogonal to the health probe (a slow
+   * handler trips this alert; only throws and `processingTimeoutMs`
+   * overruns count toward health degradation). A throwing callback is
+   * swallowed deliberately: unlike the other subscriber monitoring
+   * callbacks, an SLO alert must never propagate into the flush loop.
+   */
+  private checkProcessingLatencySlo(
+    subscriber: Subscriber,
+    slo: SubscriberLatencySloState,
+  ): void {
+    const summary = slo.tracker.summary();
+    if (summary.p99Ms > slo.thresholdMs) {
+      if (!slo.alerted) {
+        slo.alerted = true;
+        const onLatencySloMiss = slo.onLatencySloMiss;
+        if (onLatencySloMiss !== undefined) {
+          try {
+            onLatencySloMiss({
+              subscriberId: subscriber.id,
+              pattern: subscriber.pattern,
+              p99Ms: summary.p99Ms,
+              thresholdMs: slo.thresholdMs,
+              samples: summary.samples,
+              at: this.now(),
+            });
+          } catch {
+            // Advisory-only alert: a throwing SLO callback must never
+            // disturb the delivery flow.
+          }
+        }
+      }
+    } else {
+      slo.alerted = false;
+    }
+  }
+
+  /**
    * Pushes one message into a subscriber's queue, honoring the
    * subscriber's content filter and adaptive publish-side throttling.
    * Returns true when the queue accepted the message. Shared by the plain
@@ -8711,6 +8925,7 @@ export class EventBus {
     let shapedSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
     const ackLatency: BusStats['ackLatency'] = [];
+    const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const hotKeys: HotKeyStat[] = [];
@@ -8743,6 +8958,18 @@ export class EventBus {
           subscriberId: subscriber.id,
           pattern: subscriber.pattern,
           ...ack.tracker.summary(),
+        });
+      }
+      const slo = subscriber.latencySlo;
+      if (slo != null) {
+        const p99 = slo.tracker.summary();
+        subscriberLatencyP99.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          p99Ms: p99.p99Ms,
+          samples: p99.samples,
+          thresholdMs: slo.thresholdMs,
+          breaching: slo.alerted,
         });
       }
       const lagState = subscriber.lag;
@@ -8859,6 +9086,7 @@ export class EventBus {
       pendingDelayed: this.delayedById.size,
       deliveryLatency,
       ackLatency,
+      subscriberLatencyP99,
       slowestSubscribers,
       lag,
       laggingSubscribers,
@@ -9280,7 +9508,24 @@ export class EventBus {
           // Sampled before the handler runs: queue dwell, not processing time.
           this.recordDeliveryLatency(subscriber, msg, nowMs);
           this.recordLagSample(subscriber, msg, nowMs);
-          this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+          // Handler processing time (EB-53): sampled per invocation for
+          // plain subscribers. Reliable subscribers sample on ack()
+          // completion instead (see invocationLatencySlo), so the
+          // synchronous timing here must not sample them too. A throwing
+          // handler still records its partial processing time — the
+          // invocation occupied the consumer that long — and the throw
+          // propagates exactly as before.
+          const invocationSlo = this.invocationLatencySlo(subscriber);
+          if (invocationSlo == null) {
+            this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+          } else {
+            const processingStartedAtMs = this.now();
+            try {
+              this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+            } finally {
+              this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
+            }
+          }
         }
       } else {
         for (let i = 0; i < live.length; i += 1) {
@@ -9448,16 +9693,41 @@ export class EventBus {
       this.recordLagSample(subscriber, msg, nowMs);
     }
     if (subscriber.health == null) {
-      this.deliverBatchTraced(subscriber, live, () =>
-        subscriber.handler(live as unknown as BusMessage),
+      this.invokeBatchWithProcessingLatency(subscriber, () =>
+        this.deliverBatchTraced(subscriber, live, () =>
+          subscriber.handler(live as unknown as BusMessage),
+        ),
       );
     } else {
-      this.deliverBatchTraced(subscriber, live, () =>
-        this.deliverBatchWithHealth(subscriber, live, nowMs),
+      this.invokeBatchWithProcessingLatency(subscriber, () =>
+        this.deliverBatchTraced(subscriber, live, () =>
+          this.deliverBatchWithHealth(subscriber, live, nowMs),
+        ),
       );
     }
     if (subscriber.queue.size > 0) {
       this.scheduleFlush();
+    }
+  }
+
+  /**
+   * Times one batched handler invocation for SLO-tracked subscribers
+   * (EB-53): a batch is a single handler call, so it contributes one
+   * processing-time sample covering the whole batch — not one per
+   * message. Reliable subscribers sample on `ack()` completion instead
+   * (see `invocationLatencySlo`). Untracked subscribers pay no clock read.
+   */
+  private invokeBatchWithProcessingLatency(subscriber: Subscriber, invoke: () => void): void {
+    const slo = this.invocationLatencySlo(subscriber);
+    if (slo == null) {
+      invoke();
+      return;
+    }
+    const startedAtMs = this.now();
+    try {
+      invoke();
+    } finally {
+      this.recordProcessingLatency(subscriber, slo, startedAtMs);
     }
   }
 
@@ -9654,7 +9924,14 @@ export class EventBus {
     if (health == null) return;
     this.detectGap(subscriber, msg);
     const budgetMs = health.processingTimeoutMs;
-    const startedAtMs = budgetMs !== undefined ? this.now() : 0;
+    // The health probe reads the clock only when it enforces a processing
+    // budget; the SLO tracker needs the same reading on every invocation.
+    // A failed invocation (throw or timeout overrun) still records its
+    // processing time — the SLO measures consumer load, not success — but
+    // only failures count toward health degradation: the alert itself is
+    // advisory and orthogonal (EB-53).
+    const invocationSlo = this.invocationLatencySlo(subscriber);
+    const startedAtMs = budgetMs !== undefined || invocationSlo != null ? this.now() : 0;
     let failed = false;
     let reason: 'error' | 'timeout' = 'error';
     this.totalDelivered += 1;
@@ -9668,6 +9945,9 @@ export class EventBus {
         failed = true;
       }
     });
+    if (invocationSlo != null) {
+      this.recordProcessingLatency(subscriber, invocationSlo, startedAtMs);
+    }
     if (!failed && budgetMs !== undefined && this.now() - startedAtMs > budgetMs) {
       failed = true;
       reason = 'timeout';
