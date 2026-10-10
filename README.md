@@ -162,6 +162,29 @@ library.
   compressed payloads are forwarded as envelopes and inflated on receipt
   (preset-dictionary bytes must be registered identically on every node).
   `ClusterLink.getStats()` exposes forwarded/received/error counters.
+- **`src/bridge.ts` — `BridgeTransport` / `receiveFromBridge`**: cross-process
+  fan-out bridge. Where the cluster link federates buses through a dedicated
+  TCP hub, the bridge is the generic alternative: a pluggable transport
+  interface (`new EventBus({ bridge: { transport } })`) that mirrors every
+  admitted local publish to an external broker — Redis Streams, NATS, a queue —
+  with the core staying zero-dependency (the adapter is implemented by the
+  caller). Outbound, the bus hands the transport a `BridgeEnvelope` carrying
+  the raw application payload (never a compressed envelope); a throwing
+  transport or a rejected promise never reaches the publish path. Inbound,
+  the transport hands envelopes to `bus.receiveFromBridge(envelope)`: they
+  go through the same admission local publishes go through (alias
+  resolution, ACL, schema validation, per-topic rate-limit budget, TTL at
+  drain), get node-local sequence numbers, and are never mirrored back —
+  the bridge stays loop-free. `key` (with its publish-order `keySeq`, so
+  per-key ordering survives out-of-order transport delivery when each key
+  has a single publishing node), `messageId`, the end-to-end `traceId`
+  (32-hex, continued as a W3C `traceparent` on the peer), and the source
+  TTL deadline (verbatim; otherwise the peer's own TTL rules apply) ride
+  the envelope. Inbound envelopes queue in a bounded ingress buffer
+  (`maxInboundQueue`, default 1024) drained on a microtask — a full buffer
+  sheds the newest envelope and counts it. `getStats().bridge` reports
+  `{ inbound, outbound, dropped }`, and the Prometheus exposition carries
+  `eventbus_bridge_{outbound,inbound,dropped}_total`.
 - **`src/durablelog.ts` — `DurableTopicLog`**: opt-in append-only per-topic
   JSONL log (`new EventBus({ durableLogDir })`). Every published message is
   appended as one line (`{v, seq, topic, at, expiresAt?, payload}`, one file
@@ -780,6 +803,16 @@ npm test
   payloads surfacing as forward errors, option validation, double-connect
   rejection, `getStats().cluster`, compressed forward + inflate + raw-payload
   filtering.
+- `test/bridge.test.ts` — cross-process fan-out bridge: two-node mirror via
+  an in-memory transport, loop-free inbound (no re-mirror), key/keySeq/
+  messageId/traceId passthrough with trace continuation on the peer,
+  per-key publish order surviving out-of-order transport delivery, inbound
+  keySeq advancing the local key cursor, inbound admission (schema
+  rejection, ACL deny), source TTL deadline carried verbatim and expiring
+  at drain, full ingress buffer shedding the newest envelope with
+  `bridgeDropped` counting, malformed envelopes reported never thrown,
+  `not-configured`, constructor validation, throwing/rejecting transports
+  never breaking publishing, and the bridge Prometheus series.
 - `test/partitions.test.ts` — partitioned consumer groups: deterministic
   rendezvous assignment, exclusive per-partition delivery for keyed messages
   (key→partition→owner mapping verified independently), deterministic spread

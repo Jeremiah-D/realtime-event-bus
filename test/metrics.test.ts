@@ -150,6 +150,7 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     keyedReorderedMessages: 0,
     hotKeys: [],
     hotTopics: [],
+    bridge: { inbound: 3, outbound: 7, dropped: 1 },
     topics: [topicStats('we"ird\ntopic\\name')],
     consumerGroups: [],
   };
@@ -162,6 +163,9 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     text.includes('eventbus_topic_published_messages_total{topic="we\\"ird\\ntopic\\\\name"} 1'),
     `unexpected label escaping in:\n${text}`,
   );
+  assert.ok(text.includes('eventbus_bridge_outbound_total 7'), `missing bridge series in:\n${text}`);
+  assert.ok(text.includes('eventbus_bridge_inbound_total 3'), `missing bridge series in:\n${text}`);
+  assert.ok(text.includes('eventbus_bridge_dropped_total 1'), `missing bridge series in:\n${text}`);
 });
 
 test('PROMETHEUS_CONTENT_TYPE matches the exposition 0.0.4 media type', () => {

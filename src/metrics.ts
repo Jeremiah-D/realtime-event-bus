@@ -388,5 +388,25 @@ export function renderPrometheus(stats: BusStats): string {
     }
   }
 
+  // Cross-process bridge counters (EB-51). The `??` keeps the renderer
+  // tolerant of a stats object that predates the field (hand-built
+  // fixtures included).
+  const bridge = stats.bridge ?? { inbound: 0, outbound: 0, dropped: 0 };
+  counter(
+    'eventbus_bridge_outbound_total',
+    'Total local admitted publishes mirrored to the bridge transport.',
+    bridge.outbound,
+  );
+  counter(
+    'eventbus_bridge_inbound_total',
+    'Total bridge envelopes admitted and fanned out locally.',
+    bridge.inbound,
+  );
+  counter(
+    'eventbus_bridge_dropped_total',
+    'Total inbound bridge envelopes shed on a full ingress buffer.',
+    bridge.dropped,
+  );
+
   return lines.join('\n') + '\n';
 }

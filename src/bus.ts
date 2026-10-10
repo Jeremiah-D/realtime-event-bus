@@ -54,8 +54,23 @@ import type {
   ClusterLinkStatus,
   ClusterMessage,
 } from './cluster.ts';
+import {
+  resolveBridgeOptions,
+  validateBridgeEnvelope,
+  type BridgeEnvelope,
+  type BridgeReceiveResult,
+  type ResolvedBridgeOptions,
+} from './bridge.ts';
 
 export type { Delivery, RedeliveryReason } from './ack.ts';
+export type {
+  BridgeEnvelope,
+  BridgeOptions,
+  BridgeReceiveReason,
+  BridgeReceiveResult,
+  BridgeStats,
+  BridgeTransport,
+} from './bridge.ts';
 export type { DeliveryLatencyOptions, DeliveryLatencySummaryStats } from './latency.ts';
 export type {
   AckLatencyOptions,
@@ -1185,6 +1200,21 @@ export interface EventBusOptions {
    * the callback. Invalid values throw `RangeError` from the constructor.
    */
   trace?: boolean | TraceOptions;
+  /**
+   * Cross-process fan-out bridge (see `src/bridge.ts`, EB-51): a pluggable
+   * `BridgeTransport` that mirrors every admitted local publish to an
+   * external broker (Redis Streams, NATS, … — the adapter is implemented
+   * by the caller, the core stays zero-dependency) so other nodes can fan
+   * it out. Inbound envelopes arrive via `receiveFromBridge` and go
+   * through the same admission as local publishes (alias resolution, ACL,
+   * schema validation, per-topic rate-limit budget, TTL at drain) with
+   * node-local sequence numbers, and are never mirrored back — the bridge
+   * stays loop-free. `key` (with its publish-order `keySeq`), `messageId`,
+   * the end-to-end `traceId`, and the source TTL deadline ride the
+   * envelope. Disabled by default; an invalid config throws `RangeError`
+   * from the constructor.
+   */
+  bridge?: BridgeOptions;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -1613,6 +1643,14 @@ export interface BusStats {
     forwardErrors: number;
     receiveDropped: number;
   };
+  /**
+   * Cross-process bridge counters (see `src/bridge.ts`, EB-51):
+   * `outbound` local publishes mirrored to the transport, `inbound`
+   * bridge envelopes admitted and fanned out locally, `dropped` inbound
+   * envelopes shed on a full ingress buffer. All zero when no bridge is
+   * configured.
+   */
+  bridge: BridgeStats;
   /**
    * Stats for every concrete topic that has seen at least one publish or
    * schema rejection, in order of first publish.
@@ -3620,6 +3658,24 @@ export class EventBus {
    * never cluster never load the TCP/TLS code.
    */
   private clusterLink: ClusterLink | null = null;
+  /**
+   * Cross-process bridge config (see `src/bridge.ts`, EB-51), present when
+   * `EventBusOptions.bridge` was given. The transport is caller-owned:
+   * the bus never closes it.
+   */
+  private readonly bridge: ResolvedBridgeOptions | undefined;
+  /** Envelopes mirrored to the bridge transport (see `BridgeStats`). */
+  private bridgeOutbound = 0;
+  /** Bridge envelopes admitted and fanned out locally. */
+  private bridgeInbound = 0;
+  /** Inbound bridge envelopes shed on a full ingress buffer. */
+  private bridgeDropped = 0;
+  /**
+   * Bounded bridge ingress buffer. Envelopes queue here until the
+   * microtask drain admits them; a full buffer sheds the newest envelope.
+   */
+  private readonly bridgeInboundQueue: BridgeEnvelope[] = [];
+  private bridgeDrainScheduled = false;
 
   constructor(options?: EventBusOptions) {
     this.now = options?.now ?? Date.now;
@@ -3647,6 +3703,7 @@ export class EventBus {
     this.onAuthzDenied = onAuthzDenied;
     const resolvedTrace = resolveTraceOptions(options?.trace, 'EventBus');
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
+    this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
     this.groupLagMonitor = new GroupLagMonitor(resolveGroupLagOptions(options?.groupLag, 'EventBus'));
     const aclDefault = options?.acl?.defaultPolicy ?? 'allow';
     if (aclDefault !== 'allow' && aclDefault !== 'deny') {
@@ -5801,6 +5858,104 @@ export class EventBus {
     return true;
   }
 
+  /**
+   * Receives one message from the bridge transport (EB-51): the inbound
+   * half of the cross-process fan-out bridge. The envelope is validated
+   * (a malformed envelope is reported, never thrown — a remote peer is
+   * not trusted input), then queued in the bounded ingress buffer and
+   * admitted on a microtask: admission is the SAME `fanOut` local
+   * publishes go through — alias resolution, ACL, schema validation,
+   * per-topic rate-limit budget, TTL at drain — with node-local sequence
+   * numbers, and the message is never mirrored back to the bridge
+   * (`fromBridge`), which keeps a multi-node bridge loop-free. The
+   * source TTL deadline rides verbatim when the envelope carries one
+   * (a message that expires in flight expires at drain instead of being
+   * resurrected); otherwise the node's own TTL rules apply. The
+   * `traceId` continues the end-to-end trace as a `traceparent`.
+   *
+   * Backpressure: a full ingress buffer sheds the NEWEST envelope
+   * (drop-newest keeps the older publish order intact) and counts it in
+   * `getStats().bridge.dropped`. Envelopes rejected by admission are not
+   * counted as inbound — they surface on the normal admission counters
+   * and `onAdmissionRejected`, like local publishes.
+   *
+   * Returns `{ accepted: false, reason }` when the envelope was not
+   * queued: `'not-configured'` (no `EventBusOptions.bridge`),
+   * `'invalid-envelope'` (shape validation failed), or `'shed'`
+   * (ingress buffer full).
+   */
+  receiveFromBridge(envelope: BridgeEnvelope): BridgeReceiveResult {
+    const bridge = this.bridge;
+    if (bridge === undefined) {
+      return { accepted: false, reason: 'not-configured' };
+    }
+    const validated = validateBridgeEnvelope(envelope);
+    if (!validated.ok) {
+      return { accepted: false, reason: 'invalid-envelope' };
+    }
+    if (this.bridgeInboundQueue.length >= bridge.maxInboundQueue) {
+      this.bridgeDropped += 1;
+      return { accepted: false, reason: 'shed' };
+    }
+    this.bridgeInboundQueue.push(validated.envelope);
+    this.scheduleBridgeDrain();
+    return { accepted: true };
+  }
+
+  /**
+   * Arms the microtask that drains the bridge ingress buffer. Deferred
+   * (not synchronous) so a transport that delivers synchronously from
+   * inside a publish — e.g. an in-process loopback — can never recurse
+   * into the bus; the buffer absorbs the burst and the shed path above
+   * bounds it.
+   */
+  private scheduleBridgeDrain(): void {
+    if (this.bridgeDrainScheduled) return;
+    this.bridgeDrainScheduled = true;
+    queueMicrotask(() => {
+      this.bridgeDrainScheduled = false;
+      this.drainBridgeInbound();
+    });
+  }
+
+  /** Admits every queued bridge envelope through `fanOut`, in order. */
+  private drainBridgeInbound(): void {
+    while (this.bridgeInboundQueue.length > 0) {
+      const env = this.bridgeInboundQueue.shift() as BridgeEnvelope;
+      // The traceId continues the end-to-end trace: a fresh parent span
+      // under the source's trace, in the same W3C format `publish` takes.
+      const traceparent =
+        env.traceId === undefined ? undefined : formatTraceparent(env.traceId, newSpanId());
+      const { admitted } = this.fanOut(
+        env.topic,
+        env.payload,
+        false,
+        undefined,
+        env.key,
+        env.keySeq,
+        traceparent,
+        env.messageId,
+        false,
+        env.expiresAt,
+        true,
+      );
+      if (admitted) {
+        this.bridgeInbound += 1;
+        // A remote keySeq becomes this node's high-water mark for the
+        // key: the next LOCAL keyed publish draws past it instead of
+        // reusing a number a subscriber already consumed from the bridge.
+        // Only admitted messages advance the cursor — a rejected message
+        // never reached any subscriber, so reusing its number locally
+        // cannot disturb per-key order.
+        if (env.key !== undefined && env.keySeq !== undefined) {
+          const cursor = this.keyCursors.get(env.key) ?? 0;
+          if (env.keySeq > cursor) this.keyCursors.set(env.key, env.keySeq);
+        }
+      }
+    }
+    this.scheduleFlush();
+  }
+
   /** Re-announces the node's patterns when the set changed. */
   private advertiseClusterPatterns(): void {
     this.clusterLink?.advertisePatterns([...this.subscribersByPattern.keys()]);
@@ -7717,6 +7872,7 @@ export class EventBus {
     messageId?: string,
     routed = false,
     routedExpiresAt?: number,
+    fromBridge = false,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -7892,6 +8048,44 @@ export class EventBus {
             ? undefined
             : nowMs + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
+    // Cross-process bridge (EB-51): an admitted local publish is mirrored
+    // to the configured transport so other nodes can fan it out. The RAW
+    // application payload is mirrored — never the compressed envelope —
+    // and the receiving node applies its own admission (schema,
+    // rate-limit, TTL), compression, and durable-log rules. Identity
+    // rides along: the key with its publish-order keySeq (per-key ordering
+    // survives the hop when each key has a single publishing node), the
+    // messageId, the end-to-end traceId, and the source TTL deadline
+    // verbatim. A mirror failure (throw or rejected promise) is swallowed:
+    // the bus keeps serving locally, exactly like the cluster forward
+    // path. Envelopes arriving FROM the bridge (`receiveFromBridge`) are
+    // never mirrored back — that is what keeps a multi-node bridge
+    // loop-free.
+    const bridge = this.bridge;
+    if (bridge !== undefined && !fromBridge) {
+      this.bridgeOutbound += 1;
+      const traceId = this.trace?.traceIdOf(msg);
+      const envelope: BridgeEnvelope = {
+        topic,
+        payload,
+        ...(keyed === undefined
+          ? {}
+          : { key: keyed.key, keySeq: keyed.keySeq }),
+        ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+        ...(traceId === undefined ? {} : { traceId }),
+        ...(expiresAt === undefined ? {} : { expiresAt }),
+      };
+      try {
+        const result = bridge.transport.publish(envelope);
+        if (result !== undefined && typeof (result as Promise<void>).catch === 'function') {
+          (result as Promise<void>).catch(() => {
+            // Swallowed: a failing transport must never break publishing.
+          });
+        }
+      } catch {
+        // Swallowed: see above.
+      }
+    }
     // Durable log (opt-in): persist the stamped message before fan-out, so a
     // crash between publish and delivery still leaves it replayable. Logging
     // never throws into the publish path — see `DurableTopicLog.append`.
@@ -8259,6 +8453,11 @@ export class EventBus {
       duplicateMessages: this.totalDuplicates,
       dedupDropped: this.totalDedupDropped,
       aliasRetiredMessages: this.totalAliasRetired,
+      bridge: {
+        inbound: this.bridgeInbound,
+        outbound: this.bridgeOutbound,
+        dropped: this.bridgeDropped,
+      },
       aliases: [...this.topicAliases.entries()].map(([oldTopic, entry]) => ({
         oldTopic,
         newTopic: entry.newTopic,
