@@ -31,6 +31,11 @@
  *   been fanned out yet — the observable count of per-key publish-order
  *   enforcement (see `PublishOptions.key`).
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
+ * - `eventbus_namespace_published_messages_total{namespace}`: publishes
+ *   per namespace (EB-52; only emitted when namespaces are registered).
+ * - `eventbus_namespace_subscribers{namespace}`: live namespaced
+ *   subscriptions per namespace (EB-52; only emitted when namespaces
+ *   are registered).
  *
  * Gauges (point-in-time):
  * - `eventbus_subscribers`: currently active subscriptions.
@@ -347,6 +352,28 @@ export function renderPrometheus(stats: BusStats): string {
     const label = `topic="${escapeLabelValue(t.topic)}"`;
     lines.push(`eventbus_topic_published_messages_total{${label}} ${t.publishedMessages}`);
     lines.push(`eventbus_topic_subscribers{${label}} ${t.subscriberCount}`);
+  }
+
+  // Per-namespace aggregates (EB-52), in registration order (same as
+  // BusStats.namespaces). Emitted only when the bus has namespaces
+  // registered — a namespace-free bus renders byte-identical exposition
+  // to before. The `?? []` keeps the renderer tolerant of a stats object
+  // that predates the field (hand-built fixtures included).
+  const namespaces = stats.namespaces ?? [];
+  if (namespaces.length > 0) {
+    lines.push(
+      '# HELP eventbus_namespace_published_messages_total Total messages published to topics in the namespace.',
+    );
+    lines.push('# TYPE eventbus_namespace_published_messages_total counter');
+    lines.push(
+      '# HELP eventbus_namespace_subscribers Currently active subscriptions registered through the namespace.',
+    );
+    lines.push('# TYPE eventbus_namespace_subscribers gauge');
+    for (const ns of namespaces) {
+      const label = `namespace="${escapeLabelValue(ns.namespace)}"`;
+      lines.push(`eventbus_namespace_published_messages_total{${label}} ${ns.publishedMessages}`);
+      lines.push(`eventbus_namespace_subscribers{${label}} ${ns.subscribers}`);
+    }
   }
 
   // Per-topic sliding-window publish rates (EB-34), in hot-topics order

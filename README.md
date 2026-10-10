@@ -761,6 +761,75 @@ library.
   log, a non-JSON-serializable payload throws instead of scheduling
   something that could not survive a restart.
 
+## Multi-tenant namespaces
+
+`bus.createNamespace(prefix)` registers a tenant scope and returns a
+thin handle; topics inside namespace `t1` are stored as `t1/<topic>`:
+
+```ts
+const t1 = bus.createNamespace('t1');          // NamespaceHandle
+const t2 = bus.createNamespace('t2');
+
+t1.subscribe('**', (msg) => { /* every t1 topic; never t2's */ });
+t1.publish('orders', { id: 1 });               // → concrete topic `t1/orders`
+t2.publish('orders', { id: 2 });               // → concrete topic `t2/orders`
+```
+
+Semantics:
+
+- **Isolation is between tenants.** A namespaced publish resolves to
+  the concrete `<prefix>/<topic>` and runs the *full* admission
+  pipeline on it — ACL, schema, rate limit, TTL, idempotency, durable
+  log — exactly like a global publish. A namespaced subscribe matches
+  the sub-topic after the prefix, so `**` receives everything in the
+  namespace and structurally cannot reach another namespace's topics.
+  The global bus (no namespace) is the admin view and still sees every
+  topic.
+- **Escape attempts are denied.** Topics/patterns passed with a
+  namespace must not contain `/` — `publish('t2/x', …, { namespace:
+  't1' })` throws `NamespaceDeniedError` (as does any `/` in a
+  namespaced topic). Unknown namespaces throw `RangeError`.
+- **Flags.** `createNamespace(prefix, { allowPublish: false })` makes a
+  read-only scope (publishes → `NamespaceDeniedError`);
+  `allowSubscribe: false` makes a write-only scope.
+- **Lifecycle.** `getNamespaces()` snapshots prefix, flags, and live
+  subscriber counts. `deleteNamespace(prefix)` throws
+  `NamespaceNotEmptyError` while live subscribers or retained
+  durable-log entries remain, and `RangeError` for an unknown prefix.
+- **Durable log.** With `durableLogDir`, each namespace gets a child
+  `DurableTopicLog` under
+  `<durableLogDir>/namespaces/<url-encoded-prefix>/`: namespaced
+  publishes append there, and namespaced replays (`resumeFromSeq` /
+  `resumeFromTime`) read from it. Re-registering a namespace recovers
+  its on-disk history (sequence/stats cursors reseeded, like the root
+  log's construction-time recovery).
+- **Stats & metrics.** `getStats()` gains per-namespace aggregates
+  (derived from the existing per-topic `TopicStats`); Prometheus
+  exposition adds `eventbus_namespace_published_messages_total{namespace}`
+  and `eventbus_namespace_subscribers{namespace}`. Both are omitted
+  entirely when no namespace is registered, so a namespace-free bus is
+  byte-for-byte identical to before.
+- **Deliveries name the concrete topic** (`t1/orders`): the handle is a
+  scope, not a rename.
+
+Implementation note (deliberate deviation): the bus's wildcard segments
+split on `.` only — `/` is a literal character *inside* a segment. That
+means the string pattern `t1/**` is a single literal segment matching
+nothing but the exact topic `t1/**`, so a namespaced `**` is *not*
+translated to the string `t1/**`. Instead the namespace compiles to a
+regex prefix `^t1/` over the user's pattern (`**` → `^t1/.*$`), which
+is exactly equivalent to string-prefixing wherever string-prefixing
+works, and correct where it doesn't. The registered pattern *string*
+stays the readable `t1/<pattern>` form. The same literal-`/` property
+keeps the EB-15 publish-side prefix index sound: index keys are computed
+as `<prefix>/<literal-dot-prefix>`, a candidate key of every concrete
+`<prefix>/…` topic. One corollary for operators: no single pattern
+covers a whole namespace subtree in TTL / rate-limit / schema / ACL
+rule tables (e.g. `t1/**` won't match `t1/orders`) — write
+namespace-aware rules against concrete `t1/<topic>` forms. Cluster
+advertisement of a leading-`**` namespaced pattern (`t1/**`) likewise
+carries hub-native scope; namespace-aware federation is out of scope.
+
 ## Run
 
 Requires Node.js ≥ 22 (uses native TypeScript type stripping — no build step,

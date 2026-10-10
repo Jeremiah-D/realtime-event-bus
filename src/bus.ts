@@ -34,6 +34,16 @@ import {
   type GroupLagStat,
 } from './grouplag.ts';
 import { DurableTopicLog } from './durablelog.ts';
+import {
+  NamespaceDeniedError,
+  NamespaceHandle,
+  NamespaceNotEmptyError,
+  resolveNamespaceOptions,
+  validateNamespacePrefix,
+  type NamespaceInfo,
+  type NamespaceOptions,
+  type NamespaceStats,
+} from './namespace.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -558,6 +568,21 @@ export interface SubscribeOptions {
    * `RangeError` from `subscribe`. Disabled by default.
    */
   batch?: boolean | BatchDeliveryOptions;
+  /**
+   * Multi-tenant namespace (EB-52, see `EventBus.createNamespace`): the
+   * subscription is scoped to the namespace — `topicPattern` is matched
+   * against the sub-topic after the `<namespace>/` prefix, so `**`
+   * receives everything in the namespace and structurally cannot reach
+   * another namespace's topics. The registered pattern is recorded as
+   * `<namespace>/<topicPattern>`. The pattern itself must not contain
+   * `/` (an attempted escape throws `NamespaceDeniedError`); an unknown
+   * namespace throws `RangeError`. A namespace that disallows subscribing
+   * (`allowSubscribe: false`) rejects with `NamespaceDeniedError`.
+   * Durable-log replays (`resumeFromSeq`/`resumeFromTime`) read the
+   * namespace's own log. Deliveries name the concrete
+   * `<namespace>/<topic>` topic.
+   */
+  namespace?: string;
 }
 
 /**
@@ -1657,6 +1682,14 @@ export interface BusStats {
    */
   topics: TopicStats[];
   /**
+   * Per-namespace aggregates (EB-52), in namespace registration order.
+   * Derived from the per-topic `TopicStats`: every concrete topic of the
+   * form `<prefix>/...` belongs to its namespace. Absent when no
+   * namespace is registered, so snapshots from a namespace-free bus are
+   * unchanged.
+   */
+  namespaces?: NamespaceStats[];
+  /**
    * Live consumer groups: one entry per (groupId, pattern) competing set
    * with at least one member, in first-registration order. Empty when no
    * group subscription is active.
@@ -1748,6 +1781,18 @@ interface Subscriber {
   pattern: string;
   /** Compiled form of `pattern`, shared with every subscriber on the pattern. */
   matcher: RegExp;
+  /**
+   * Namespace prefix this subscription was registered through (EB-52),
+   * if any. The stored `pattern` is the translated `<prefix>/<pattern>`
+   * form; deliveries name concrete `<prefix>/<topic>` topics.
+   */
+  namespacePrefix?: string;
+  /**
+   * Durable log this subscription replays from: the namespace's child
+   * log for namespaced subscriptions, otherwise the bus's root log.
+   * Undefined when the bus has no `durableLogDir`.
+   */
+  durableLog?: DurableTopicLog;
   handler: MessageHandler;
   queue: BoundedQueue<BusMessage>;
   /**
@@ -1954,7 +1999,7 @@ interface HealthProbeState {
   autoResumeTimer?: ReturnType<typeof setTimeout>;
 }
 
-function escapeRegExp(literal: string): string {
+export function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -2906,6 +2951,18 @@ export interface PublishOptions {
    * the topic.
    */
   routed?: boolean;
+  /**
+   * Multi-tenant namespace (EB-52, see `EventBus.createNamespace`): the
+   * publish is scoped to the namespace — `topic` resolves to the
+   * concrete topic `<namespace>/<topic>` and runs the full normal
+   * admission pipeline (ACL, schema, rate limit, TTL, idempotency,
+   * durable log) on that concrete topic. The topic itself must not
+   * contain `/` (an attempted escape, e.g. `t2/x` with
+   * `namespace: 't1'`, throws `NamespaceDeniedError`); an unknown
+   * namespace throws `RangeError`. A namespace that disallows publishing
+   * (`allowPublish: false`) rejects with `NamespaceDeniedError`.
+   */
+  namespace?: string;
 }
 
 /**
@@ -3221,6 +3278,24 @@ interface ReplayRecord {
   key?: string;
   keySeq?: number;
   dictId?: string;
+}
+
+/**
+ * Resolved namespace scope for one subscription (EB-52): everything the
+ * subscribe path needs after `resolveNamespaceForSubscribe` translates
+ * the user's pattern into the concrete namespaced topic space.
+ */
+interface NamespaceSubscriptionScope {
+  /** The namespace prefix. */
+  prefix: string;
+  /** Registered pattern string: `<prefix>/<pattern>`. */
+  internalPattern: string;
+  /** Matcher over concrete `<prefix>/<topic>` topics. */
+  matcher: RegExp;
+  /** Publish-side prefix-index key (EB-15 no-miss invariant). */
+  indexKey: string;
+  /** Durable log replays read from (undefined without `durableLogDir`). */
+  log?: DurableTopicLog;
 }
 
 export class EventBus {
@@ -3628,6 +3703,31 @@ export class EventBus {
    */
   private readonly durableLog?: DurableTopicLog;
   /**
+   * `durableLogMaxEntriesPerTopic` as configured — namespace child logs
+   * (EB-52) open with the same per-topic budget as the root log.
+   */
+  private readonly durableLogMaxEntriesPerTopic?: number;
+  /**
+   * `durableLogKeyCompaction` as configured — namespace child logs
+   * (EB-52) open with the same compaction mode as the root log.
+   */
+  private readonly durableLogKeyCompaction: boolean = false;
+  /**
+   * Registered multi-tenant namespaces (EB-52): prefix → effective
+   * flags. Concrete namespaced topics are `<prefix>/<topic>`; the `/`
+   * separator is matched literally by the wildcard engine, so one
+   * namespace's patterns structurally cannot cross into another's.
+   */
+  private readonly namespaces = new Map<string, { allowPublish: boolean; allowSubscribe: boolean }>();
+  /**
+   * Per-namespace child durable logs, opened under
+   * `<durableLogDir>/namespaces/<url-encoded-prefix>/` when the bus has
+   * a `durableLogDir`. Namespaced publishes append here; namespaced
+   * replays read here. Present exactly for the registered namespaces
+   * when the root log exists.
+   */
+  private readonly namespaceLogs = new Map<string, DurableTopicLog>();
+  /**
    * Timer heap of scheduled delayed deliveries, ordered by due time (see
    * `publishDelayed`). Entries wait here — consuming no sequence number,
    * no durable-log message record, and no rate-limit budget — until the
@@ -3712,48 +3812,23 @@ export class EventBus {
     this.aclDefault = aclDefault;
     this.aclRules = normalizeAclRules(options?.acl?.rules, 'EventBus');
     if (options?.durableLogDir != null) {
-      this.durableLog = DurableTopicLog.open({
+      const log = DurableTopicLog.open({
         dir: options.durableLogDir,
         maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
         keyCompaction: options.durableLogKeyCompaction,
       });
-      // Recover numbering continuity: the next publish on a logged topic
-      // continues the on-disk sequence, and stats reflect the recovered
-      // history instead of pretending the bus is brand new.
-      for (const topic of this.durableLog.topics()) {
-        const lastSeq = this.durableLog.lastSeq(topic);
-        this.topicSeq.set(topic, lastSeq);
-        this.topicStats.set(topic, {
-          subscriberCount: 0,
-          // `messageCount` excludes the seq-0 delayed-delivery schedule
-          // records: a scheduled-but-pending message has not fanned out
-          // yet, so it must not count as published.
-          publishedMessages: this.durableLog.messageCount(topic),
-          expiredMessages: 0,
-          lastSeq,
-          sequenceGaps: 0,
-          rateLimitedMessages: 0,
-          rejectedMessages: 0,
-          duplicateMessages: 0,
-          aliasRetiredMessages: 0,
-          filteredMessages: 0,
-          dedupDropped: 0,
-          compressedMessages: 0,
-          compressedBytesBefore: 0,
-          compressedBytesAfter: 0,
-          compressionTimeMs: 0,
-        });
-      }
+      this.durableLog = log;
+      // Remembered for namespace child logs (EB-52): children open with
+      // the same per-topic budget and compaction mode as the root log.
+      this.durableLogMaxEntriesPerTopic = options.durableLogMaxEntriesPerTopic;
+      this.durableLogKeyCompaction = options.durableLogKeyCompaction ?? false;
+      // Recover numbering continuity and per-key cursors from the log —
+      // shared with namespace child logs (see `recoverLogState`).
+      this.recoverLogState(log);
       // Rebuild pending delayed-delivery timers from the log: schedules
       // that never fanned out (and were not cancelled) survive the
       // restart. Already-due entries fan out immediately.
       this.recoverDelayed();
-      // Reseed per-key sequence cursors: the next keyed publish continues
-      // the on-disk numbering instead of restarting at 1, which would
-      // collide with replayed keySeqs and corrupt per-key ordering.
-      for (const [key, maxSeq] of this.durableLog.recoveredKeySeqs()) {
-        this.keyCursors.set(key, maxSeq);
-      }
       // Reseed consumer-group checkpoints from the offset journal: the
       // highest committed seq per checkpoint wins, so a restarted bus
       // resumes committed offsets instead of forgetting them — a rejoining
@@ -4516,6 +4591,268 @@ export class EventBus {
     msg.payload = inflateEnvelopePayload(payload, dictionary);
   }
 
+  // ------------------------------------------------------------------
+  // Multi-tenant topic namespaces (EB-52)
+  // ------------------------------------------------------------------
+
+  /**
+   * Registers a tenant namespace and returns its handle. From then on,
+   * `handle.publish('orders', …)` publishes to the concrete topic
+   * `t1/orders`, and `handle.subscribe('**', …)` receives everything in
+   * the namespace — one tenant's patterns structurally cannot match
+   * another tenant's topics, because the `/` separator is matched
+   * literally by the wildcard engine (segments split on `.` only).
+   *
+   * The global bus (no namespace) is the admin view: it still sees every
+   * topic, including namespaced ones. Isolation is between tenants, not
+   * between a tenant and the operator.
+   *
+   * Invalid prefixes (empty, blank, containing `/` or `*`) and duplicate
+   * registration throw `RangeError`. When the bus has a `durableLogDir`,
+   * the namespace gets its own child durable log under
+   * `<durableLogDir>/namespaces/<url-encoded-prefix>/`, recovering any
+   * history already on disk.
+   */
+  createNamespace(prefix: string, opts?: NamespaceOptions): NamespaceHandle {
+    validateNamespacePrefix(prefix);
+    if (this.namespaces.has(prefix)) {
+      throw new RangeError(`namespace "${prefix}" is already registered`);
+    }
+    const resolved = resolveNamespaceOptions(opts);
+    this.namespaces.set(prefix, resolved);
+    if (this.durableLog != null) {
+      const child = DurableTopicLog.open({
+        dir: `${this.durableLog.dir}/namespaces/${encodeURIComponent(prefix)}`,
+        maxEntriesPerTopic: this.durableLogMaxEntriesPerTopic,
+        keyCompaction: this.durableLogKeyCompaction,
+      });
+      this.namespaceLogs.set(prefix, child);
+      // A restarted bus reopens the namespace's on-disk history: reseed
+      // the bus-side sequence/stats cursors from it, like the root log's
+      // construction-time recovery, so numbering continues instead of
+      // restarting at 1.
+      this.recoverLogState(child);
+    }
+    return new NamespaceHandle(this, prefix);
+  }
+
+  /**
+   * Deletes a namespace registration. Throws `RangeError` for an unknown
+   * prefix, and `NamespaceNotEmptyError` when the namespace still has
+   * live subscribers or retained durable-log entries — drain those first;
+   * a namespace is never deleted out from under live consumers. The
+   * child log directory is left on disk (it holds no live state once the
+   * checks pass) and is recovered if the namespace is re-registered.
+   */
+  deleteNamespace(prefix: string): void {
+    if (!this.namespaces.has(prefix)) {
+      throw new RangeError(`unknown namespace "${prefix}"`);
+    }
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.namespacePrefix === prefix) {
+        throw new NamespaceNotEmptyError(prefix, 'subscribers');
+      }
+    }
+    const child = this.namespaceLogs.get(prefix);
+    if (child !== undefined) {
+      for (const topic of child.topics()) {
+        if (child.messageCount(topic) > 0) {
+          throw new NamespaceNotEmptyError(prefix, 'durable-entries');
+        }
+      }
+    }
+    this.namespaces.delete(prefix);
+    this.namespaceLogs.delete(prefix);
+  }
+
+  /**
+   * Snapshot of the registered namespaces, in registration order: the
+   * prefix, its effective flags, and the current live subscriber count.
+   */
+  getNamespaces(): NamespaceInfo[] {
+    const infos: NamespaceInfo[] = [];
+    for (const [prefix, flags] of this.namespaces) {
+      let subscribers = 0;
+      for (const subscriber of this.subscribers.values()) {
+        if (subscriber.namespacePrefix === prefix) subscribers += 1;
+      }
+      infos.push({
+        prefix,
+        allowPublish: flags.allowPublish,
+        allowSubscribe: flags.allowSubscribe,
+        subscribers,
+      });
+    }
+    return infos;
+  }
+
+  /**
+   * Compiles a namespaced subscription pattern into its matcher.
+   *
+   * `compilePattern` always yields an anchored `^…$` source, so the
+   * namespace is enforced by anchoring the literal `prefix/` in front of
+   * the user's pattern with the leading `^` stripped: the pattern then
+   * matches the sub-topic after the prefix. A namespaced `**` becomes
+   * `^t1/.*$` — every topic in the namespace, structurally unable to
+   * match `t2/…` (or `t10/x`: the anchor plus the literal `/` keeps the
+   * prefix boundary exact).
+   *
+   * Note this is deliberately NOT the string pattern `t1/**`: segments
+   * split on `.` only, so `t1/**` is a single literal segment matching
+   * nothing but the exact topic `t1/**` — never `t1/orders`. The
+   * registered pattern *string* is still the readable `t1/<pattern>`
+   * form; only the matcher takes this compiled shape.
+   */
+  private compileNamespacedMatcher(prefix: string, pattern: string): RegExp {
+    const inner = compilePattern(pattern).source;
+    const body = inner.startsWith('^') ? inner.slice(1) : inner;
+    return new RegExp(`^${escapeRegExp(`${prefix}/`)}${body}`);
+  }
+
+  /**
+   * Resolves `PublishOptions.namespace` to the concrete topic. Returns
+   * `topic` unchanged when no namespace is given (the namespace-free
+   * path). Unknown namespaces throw `RangeError`; a publish-disallowed
+   * namespace or a topic containing `/` (an attempted escape — including
+   * naming another registered namespace, e.g. `t2/x` with
+   * `namespace: 't1'`) throws `NamespaceDeniedError`.
+   */
+  private resolveNamespaceForPublish(namespace: string | undefined, topic: string): string {
+    if (namespace === undefined) return topic;
+    const entry = this.namespaces.get(namespace);
+    if (entry === undefined) {
+      throw new RangeError(`unknown namespace "${String(namespace)}"`);
+    }
+    if (!entry.allowPublish) {
+      throw new NamespaceDeniedError('publish', namespace, { topic });
+    }
+    if (topic.includes('/')) {
+      throw new NamespaceDeniedError('publish', namespace, { topic });
+    }
+    return `${namespace}/${topic}`;
+  }
+
+  /**
+   * Resolves `SubscribeOptions.namespace` to the subscription scope, or
+   * `undefined` when no namespace is given. Throws `RangeError` for an
+   * unknown namespace and `NamespaceDeniedError` for a
+   * subscribe-disallowed namespace or a pattern containing `/` (an
+   * attempted escape). The returned scope carries the translated
+   * `<prefix>/<pattern>` registration string, the compiled matcher, the
+   * publish-side prefix-index key, and the durable log replays read
+   * from.
+   */
+  private resolveNamespaceForSubscribe(
+    namespace: string | undefined,
+    pattern: string,
+  ): NamespaceSubscriptionScope | undefined {
+    if (namespace === undefined) return undefined;
+    const entry = this.namespaces.get(namespace);
+    if (entry === undefined) {
+      throw new RangeError(`unknown namespace "${String(namespace)}"`);
+    }
+    if (!entry.allowSubscribe) {
+      throw new NamespaceDeniedError('subscribe', namespace, { pattern });
+    }
+    if (pattern.includes('/')) {
+      throw new NamespaceDeniedError('subscribe', namespace, { pattern });
+    }
+    // Prefix-index key (EB-15): the pattern's literal dot-prefix, glued
+    // under the namespace — `orders.*` in `t1` files under `t1/orders`,
+    // a candidate key of every concrete `t1/orders.…` topic, so the
+    // no-miss invariant holds. A leading-wildcard pattern files under
+    // the empty key, like its global counterpart.
+    const literal = EventBus.patternPrefixKey(pattern);
+    return {
+      prefix: namespace,
+      internalPattern: `${namespace}/${pattern}`,
+      matcher: this.compileNamespacedMatcher(namespace, pattern),
+      indexKey: literal === '' ? '' : `${namespace}/${literal}`,
+      log: this.namespaceLogs.get(namespace),
+    };
+  }
+
+  /**
+   * The durable log a topic's records belong in: the namespace's child
+   * log when the topic names a registered namespace (`<prefix>/…`),
+   * otherwise the root log. With no namespaces registered this is a
+   * single branch to the root log — the namespace-free path pays for one
+   * predictable branch and nothing else.
+   */
+  private durableLogForTopic(topic: string): DurableTopicLog | undefined {
+    const root = this.durableLog;
+    if (root === undefined || this.namespaces.size === 0) return root;
+    for (const prefix of this.namespaces.keys()) {
+      // The trailing `/` is structural: prefix `t1` never matches topic
+      // `t10/x` — the same anchor property the wildcard engine relies on
+      // to keep namespaces from crossing.
+      if (topic.startsWith(`${prefix}/`)) {
+        return this.namespaceLogs.get(prefix) ?? root;
+      }
+    }
+    return root;
+  }
+
+  /**
+   * Per-namespace aggregate for `getStats()`, derived from the existing
+   * per-topic `TopicStats`: every concrete topic starting with
+   * `<prefix>/` belongs to the namespace.
+   */
+  private namespaceStatsFor(prefix: string): NamespaceStats {
+    const marker = `${prefix}/`;
+    let topics = 0;
+    let publishedMessages = 0;
+    for (const [topic, stats] of this.topicStats) {
+      if (topic.startsWith(marker)) {
+        topics += 1;
+        publishedMessages += stats.publishedMessages;
+      }
+    }
+    let subscribers = 0;
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.namespacePrefix === prefix) subscribers += 1;
+    }
+    return { namespace: prefix, topics, subscribers, publishedMessages };
+  }
+
+  /**
+   * Reseeds bus-side cursors from a durable log: per-topic sequence
+   * numbers and stats entries (so the next publish continues the
+   * on-disk numbering and stats reflect recovered history), plus the
+   * per-key sequence cursors (so keyed publishes never restart at 1 and
+   * corrupt per-key ordering). The root log gets this at construction;
+   * a namespace child log gets it at `createNamespace`.
+   */
+  private recoverLogState(log: DurableTopicLog): void {
+    for (const topic of log.topics()) {
+      const lastSeq = log.lastSeq(topic);
+      this.topicSeq.set(topic, lastSeq);
+      this.topicStats.set(topic, {
+        subscriberCount: 0,
+        // `messageCount` excludes the seq-0 delayed-delivery schedule
+        // records: a scheduled-but-pending message has not fanned out
+        // yet, so it must not count as published.
+        publishedMessages: log.messageCount(topic),
+        expiredMessages: 0,
+        lastSeq,
+        sequenceGaps: 0,
+        rateLimitedMessages: 0,
+        rejectedMessages: 0,
+        duplicateMessages: 0,
+        aliasRetiredMessages: 0,
+        filteredMessages: 0,
+        dedupDropped: 0,
+        compressedMessages: 0,
+        compressedBytesBefore: 0,
+        compressedBytesAfter: 0,
+        compressionTimeMs: 0,
+      });
+    }
+    for (const [key, maxSeq] of log.recoveredKeySeqs()) {
+      this.keyCursors.set(key, maxSeq);
+    }
+  }
+
   /**
    * Registers a handler for topics matching `topicPattern`.
    * `*` matches a single topic segment (`market.*` matches `market.btc`);
@@ -4542,6 +4879,14 @@ export class EventBus {
     handler: MessageHandler | BatchMessageHandler,
     opts?: SubscribeOptions,
   ): Subscription {
+    // Multi-tenant namespace (EB-52): resolve the scope first — unknown
+    // namespaces, disallowed actions and escape attempts throw here, so
+    // a throw leaves no half-registered subscriber behind. The
+    // registered pattern becomes the translated `<prefix>/<pattern>`
+    // form; matching, the prefix index and replays all operate on the
+    // concrete namespaced topic space.
+    const ns = this.resolveNamespaceForSubscribe(opts?.namespace, topicPattern);
+    if (ns !== undefined) topicPattern = ns.internalPattern;
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const resumeFromSeq = opts?.resumeFromSeq;
@@ -4649,7 +4994,11 @@ export class EventBus {
     const subscriber: Subscriber = {
       id,
       pattern: topicPattern,
-      matcher: this.compiledMatcher(topicPattern),
+      // Namespaced subscriptions (EB-52) match with the compiled
+      // namespace matcher; everything else shares the pattern cache.
+      matcher: ns?.matcher ?? this.compiledMatcher(topicPattern),
+      namespacePrefix: ns?.prefix,
+      durableLog: ns?.log,
       // A batched handler receives an array per call; the cast is safe —
       // drainSubscriber only ever passes an array to batched subscribers.
       handler: handler as MessageHandler,
@@ -4678,10 +5027,12 @@ export class EventBus {
     // journal before any replay runs, so a resumed consumer does not
     // double-deliver messages it already saw before the restart. Entries
     // that aged out of the window are "unknown" — dropped here, never
-    // rehydrated.
-    if (dedup?.consumerId !== undefined && this.durableLog != null) {
+    // rehydrated. Namespaced subscribers (EB-52) rehydrate from their
+    // namespace's child log.
+    const replaySource = ns?.log ?? this.durableLog;
+    if (dedup?.consumerId !== undefined && replaySource != null) {
       const nowMs = this.now();
-      for (const entry of this.durableLog.dedupWindowFor(dedup.consumerId)) {
+      for (const entry of replaySource.dedupWindowFor(dedup.consumerId)) {
         if (nowMs - entry.at < dedup.windowMs) {
           dedup.table.set(`${entry.topic}\0${entry.messageId}`, entry.at);
         }
@@ -4694,8 +5045,10 @@ export class EventBus {
     }
     this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
     // File the subscriber in the publish-side prefix index under its
-    // pattern's literal prefix (see `patternPrefixKey`).
-    const indexKey = EventBus.patternPrefixKey(topicPattern);
+    // pattern's literal prefix (see `patternPrefixKey`) — or the
+    // namespace-computed key for namespaced subscriptions, which keeps
+    // the no-miss invariant over concrete `<prefix>/…` topics.
+    const indexKey = ns?.indexKey ?? EventBus.patternPrefixKey(topicPattern);
     let indexBucket = this.prefixIndex.get(indexKey);
     if (indexBucket == null) {
       indexBucket = new Set<string>();
@@ -6042,7 +6395,9 @@ export class EventBus {
    * is per member, from each member's own offset.
    */
   private replayLog(subscriber: Subscriber, fromSeq: number): void {
-    const log = this.durableLog;
+    // Namespaced subscribers (EB-52) replay from their namespace's child
+    // log; everyone else replays from the root log.
+    const log = subscriber.durableLog ?? this.durableLog;
     if (log == null) return;
     const matcher = subscriber.matcher;
     const records: ReplayRecord[] = [];
@@ -6111,7 +6466,9 @@ export class EventBus {
    * compression re-registration and keyed ordering behave identically.
    */
   private replayLogSinceTime(subscriber: Subscriber, fromTime: number): void {
-    const log = this.durableLog;
+    // Namespaced subscribers (EB-52) replay from their namespace's child
+    // log; everyone else replays from the root log.
+    const log = subscriber.durableLog ?? this.durableLog;
     if (log == null) return;
     const matcher = subscriber.matcher;
     const records: ReplayRecord[] = [];
@@ -6336,6 +6693,11 @@ export class EventBus {
   publish(topic: string, payload: unknown, opts?: PublishOptions): number {
     validateMessageKey(opts?.key, 'publish');
     validateTraceparent(opts?.traceparent, 'publish');
+    // Multi-tenant namespace (EB-52): resolve to the concrete
+    // `<namespace>/<topic>` before admission — the full pipeline below
+    // (ACL, schema, rate limit, TTL, idempotency, durable log) then
+    // operates on the concrete topic, exactly as for a global publish.
+    topic = this.resolveNamespaceForPublish(opts?.namespace, topic);
     const { accepted } = this.fanOut(
       topic,
       payload,
@@ -6403,6 +6765,10 @@ export class EventBus {
     validateMessageKey(opts?.key, 'publishIdempotent');
     validateTraceparent(opts?.traceparent, 'publishIdempotent');
     const messageId = opts?.messageId;
+    // Multi-tenant namespace (EB-52): the `(topic, messageId)` dedup
+    // identity below is scoped to the concrete `<namespace>/<topic>`, so
+    // the same messageId in two namespaces never collides.
+    topic = this.resolveNamespaceForPublish(opts?.namespace, topic);
     // Topic aliases (EB-44) resolve before everything else: the resolved
     // topic is the real publish topic — the ACL check, the dedup identity
     // (`(topic, messageId)`), and `fanOut` all see it. A publish to a
@@ -6798,7 +7164,7 @@ export class EventBus {
     // It does carry the compaction key and the per-key sequence number, so
     // a restart rebuilds the timer with both intact.
     if (this.durableLog != null) {
-      const persisted = this.durableLog.append({
+      const persisted = this.durableLogForTopic(topic)?.append({
         seq: 0,
         topic,
         at: nowMs,
@@ -6993,7 +7359,7 @@ export class EventBus {
    * writes: a failed append never throws into the caller.
    */
   private appendDelayTombstone(delayId: string, topic: string): void {
-    this.durableLog?.append({ seq: 0, topic, at: this.now(), delayId, cancelled: true, payload: null });
+    this.durableLogForTopic(topic)?.append({ seq: 0, topic, at: this.now(), delayId, cancelled: true, payload: null });
   }
 
   /**
@@ -7280,7 +7646,11 @@ export class EventBus {
       dedup.table.delete(oldest.value);
     }
     if (dedup.consumerId !== undefined && this.durableLog != null) {
-      this.durableLog.appendDedup({
+      // The journal lives on the subscriber's own log: a namespaced
+      // subscriber (EB-52) rehydrates from its namespace's child log, so
+      // its sightings must be journaled there too.
+      const journal = subscriber.durableLog ?? this.durableLog;
+      journal.appendDedup({
         consumer: dedup.consumerId,
         topic: msg.topic,
         messageId,
@@ -8100,7 +8470,8 @@ export class EventBus {
     // or carried over from the delayed schedule — rides on the delivery
     // record together with its per-key sequence number, so restart
     // recovery and replay can preserve per-key publish order.
-    this.durableLog?.append({
+    // Namespaced topics (EB-52) append to their namespace's child log.
+    this.durableLogForTopic(topic)?.append({
       seq: msg.seq,
       topic,
       at: nowMs,
@@ -8549,6 +8920,15 @@ export class EventBus {
           stats.compressedMessages > 0 ? stats.compressionTimeMs / stats.compressedMessages : 0,
         rates: this.publishRates.ratesFor(topic, ratesNow),
       })),
+      // Per-namespace aggregates (EB-52), in registration order — derived
+      // from the per-topic stats above. Omitted when no namespace is
+      // registered, so namespace-free snapshots are byte-identical to
+      // before.
+      ...(this.namespaces.size === 0
+        ? {}
+        : {
+            namespaces: [...this.namespaces.keys()].map((prefix) => this.namespaceStatsFor(prefix)),
+          }),
       ...(this.durableLog == null
         ? {}
         : {
