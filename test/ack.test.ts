@@ -204,3 +204,15 @@ test('AckTracker.clear cancels timers without requeueing', () => {
   assert.equal(redelivered, 0);
   assert.equal(tracker.clear(), 0);
 });
+
+test('AckTracker reports the redelivery reason to onRedeliver', async () => {
+  const reasons: string[] = [];
+  const tracker = new AckTracker<string>({
+    ackTimeoutMs: 10,
+    onRedeliver: (_msg, reason) => reasons.push(reason),
+  });
+  tracker.track('explicit', 0).nack();
+  tracker.track('silent', 0); // never settled: the timer fires
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(reasons, ['nack', 'ack-timeout']);
+});

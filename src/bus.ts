@@ -53,7 +53,7 @@ import type {
   ClusterMessage,
 } from './cluster.ts';
 
-export type { Delivery } from './ack.ts';
+export type { Delivery, RedeliveryReason } from './ack.ts';
 export type { DeliveryLatencyOptions, DeliveryLatencySummaryStats } from './latency.ts';
 export type {
   AckLatencyOptions,
@@ -806,6 +806,22 @@ export interface DeadLetterEntry {
   redeliveries: number;
   /** Bus-clock timestamp when the message entered the DLQ. */
   deadLetteredAt: number;
+  /**
+   * What the message's final delivery attempt failed with: the handler's
+   * thrown error message when the handler threw, otherwise the tracker's
+   * redelivery reason (`'nack'` for an explicit `nack()`, `'ack-timeout'`
+   * when the ack deadline passed silently). The poison-message signal an
+   * operator reads first — it says *why* the message kept failing, not
+   * just how often.
+   */
+  lastError?: string;
+  /**
+   * The end-to-end trace id the message carried (`EventBusOptions.trace`),
+   * so a poison message can still be correlated with its publish → fanout
+   * → deliver spans after it leaves the delivery pipeline. Absent when
+   * the message was not part of a sampled trace.
+   */
+  traceId?: string;
   /**
    * The message's original TTL deadline, preserved so a replayed message
    * expires on the same schedule instead of being resurrected. Absent when
@@ -1696,6 +1712,14 @@ interface Subscriber {
   reliable?: {
     tracker: AckTracker<BusMessage>;
     redeliveries: WeakMap<BusMessage, number>;
+    /**
+     * The failure that triggered the most recent redelivery of each
+     * message: the handler's thrown error message, or the tracker's
+     * reason (`'nack'` / `'ack-timeout'`) when nothing was thrown.
+     * Read-and-cleared when a message is dead-lettered, so
+     * `DeadLetterEntry.lastError` always describes the final failure.
+     */
+    lastFailure: WeakMap<BusMessage, string>;
   };
   /**
    * Present for reliable subscriptions with `deadLetter` enabled: the
@@ -1985,6 +2009,17 @@ function normalizeAclRules(rules: AclRule[] | undefined, caller: string): Compil
       subscribe: rule.subscribe,
     };
   });
+}
+
+/**
+ * Renders a value a reliable handler threw as a short diagnostic string
+ * for `DeadLetterEntry.lastError`. `Error` instances contribute their
+ * message (not the stack — the DLQ record stays small and serializable);
+ * anything else is stringified as-is.
+ */
+function thrownErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
 
 /**
@@ -4555,6 +4590,13 @@ export class EventBus {
     const subscriber = this.subscribers.get(sub.id);
     if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
     const redeliveries = new WeakMap<BusMessage, number>();
+    // The failure behind the most recent redelivery of each message: the
+    // handler's thrown error message when it threw, otherwise the
+    // tracker's reason ('nack' / 'ack-timeout'). Read-and-cleared when the
+    // message is dead-lettered, so `DeadLetterEntry.lastError` always
+    // describes the final failure, never a stale one from an earlier
+    // delivery round.
+    const lastFailure = new WeakMap<BusMessage, string>();
     // Which delivery handle is currently outstanding per message. A
     // redelivery (nack / ack timeout) retires the previous handle, so only
     // the live one may sample the ack-latency tracker when its ack()
@@ -4564,7 +4606,7 @@ export class EventBus {
     const tracker = new AckTracker<BusMessage>({
       ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
       now: this.now,
-      onRedeliver: (msg) => {
+      onRedeliver: (msg, reason) => {
         // EB-45: the outstanding delivery's `bus.ack` span never
         // completes — abandon it. The requeue below emits a fresh
         // `bus.enqueue` span in the same trace, and the redelivery opens
@@ -4574,19 +4616,26 @@ export class EventBus {
         if (live !== undefined) live.live = false;
         const count = (redeliveries.get(msg) ?? 0) + 1;
         redeliveries.set(msg, count);
+        // The failure that triggered this redelivery: the handler's
+        // thrown error when it threw on this delivery, otherwise the
+        // tracker's reason. Cleared now so a later explicit nack() does
+        // not inherit a stale throw from an earlier round.
+        const thrown = lastFailure.get(msg);
+        lastFailure.delete(msg);
+        const lastError = thrown ?? reason;
         // The redelivery budget is exhausted: the message is poison
         // (repeated nacks, ack timeouts, or a handler that keeps throwing
         // and never settles). Dead-letter it instead of requeueing
         // forever.
         if (dlq != null && count > dlq.maxRedeliveries) {
-          this.moveToDeadLetter(subscriber, msg, count - 1);
+          this.moveToDeadLetter(subscriber, msg, count - 1, lastError);
           return;
         }
         this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
         this.scheduleFlush();
       },
     });
-    subscriber.reliable = { tracker, redeliveries };
+    subscriber.reliable = { tracker, redeliveries, lastFailure };
     if (dlq != null) {
       subscriber.deadLetter = { entries: [], nextSeq: 0, ...dlq };
     }
@@ -4644,7 +4693,9 @@ export class EventBus {
         // the batch analogue of the single-message nack path below.
         try {
           batchHandler(deliveries);
-        } catch {
+        } catch (err) {
+          const message = thrownErrorMessage(err);
+          for (const m of msgOrBatch) lastFailure.set(m, message);
           for (const d of deliveries) d.nack();
         }
         return;
@@ -4665,7 +4716,8 @@ export class EventBus {
       // message in the DLQ instead of crashing the bus.
       try {
         singleHandler(delivery);
-      } catch {
+      } catch (err) {
+        lastFailure.set(msg, thrownErrorMessage(err));
         delivery.nack();
       }
     };
@@ -8110,6 +8162,7 @@ export class EventBus {
     subscriber: Subscriber,
     msg: BusMessage,
     redeliveries: number,
+    lastError?: string,
   ): void {
     const dlq = subscriber.deadLetter;
     if (dlq == null) return;
@@ -8124,6 +8177,8 @@ export class EventBus {
       payload: msg.payload,
       redeliveries,
       deadLetteredAt: this.now(),
+      lastError,
+      traceId: this.trace?.traceIdOf(msg),
       expiresAt: this.messageDeadlines.get(msg),
     };
     dlq.entries.push({ ...entry, msg });
@@ -8145,13 +8200,24 @@ export class EventBus {
    * snapshots — mutating them does not affect the bus; `payload` is the
    * original published object, shared by reference (see
    * `DeadLetterEntry.payload`).
+   *
+   * `opts.limit` caps the result to the most recently dead-lettered
+   * entries — poison-message triage usually wants the newest failures
+   * first. Must be a positive integer when given.
    */
-  getDeadLetterMessages(subId: string): DeadLetterEntry[] {
+  getDeadLetterMessages(subId: string, opts?: { limit?: number }): DeadLetterEntry[] {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
-    return (subscriber.deadLetter?.entries ?? []).map(
-      ({ msg: _msg, ...entry }) => ({ ...entry }),
-    );
+    if (opts?.limit !== undefined) {
+      const limit = opts.limit;
+      if (!Number.isInteger(limit) || limit <= 0) {
+        throw new RangeError('getDeadLetterMessages: limit must be a positive integer');
+      }
+    }
+    const entries = subscriber.deadLetter?.entries ?? [];
+    const windowed =
+      opts?.limit === undefined ? entries : entries.slice(-opts.limit);
+    return windowed.map(({ msg: _msg, ...entry }) => ({ ...entry }));
   }
 
   /**
@@ -8181,6 +8247,7 @@ export class EventBus {
     // for the same reason: an explicit operator replay is deliberate
     // intent, not an accidental redelivery.
     subscriber.reliable?.redeliveries.delete(record.msg);
+    subscriber.reliable?.lastFailure.delete(record.msg);
     this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg), true);
     this.scheduleFlush();
     return true;

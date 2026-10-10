@@ -46,6 +46,14 @@ export interface Delivery<T> {
   nack(): void;
 }
 
+/**
+ * Why a message is being requeued. The tracker reports the trigger so
+ * callers can tell an explicit `nack()` from a silent ack timeout —
+ * poison-message diagnosis (see the dead-letter queue) needs to know
+ * which one kept failing.
+ */
+export type RedeliveryReason = 'nack' | 'ack-timeout';
+
 export interface AckTrackerOptions<T> {
   /**
    * Milliseconds an unacked delivery may stay outstanding before it is
@@ -54,10 +62,11 @@ export interface AckTrackerOptions<T> {
   ackTimeoutMs: number;
   /**
    * Requeues a message for redelivery. Called with the message on `nack()`
-   * and on ack timeout; the tracker has already forgotten the delivery when
-   * this runs, so reentrancy is safe.
+   * (reason `'nack'`) and on ack timeout (reason `'ack-timeout'`); the
+   * tracker has already forgotten the delivery when this runs, so
+   * reentrancy is safe.
    */
-  onRedeliver: (msg: T) => void;
+  onRedeliver: (msg: T, reason: RedeliveryReason) => void;
   /**
    * Clock used to stamp `Delivery.acceptedAtMs`. Defaults to `Date.now`;
    * the bus passes its own injected clock (`EventBusOptions.now`) so the
@@ -79,7 +88,7 @@ interface PendingDelivery<T> {
  */
 export class AckTracker<T> {
   private readonly ackTimeoutMs: number;
-  private readonly onRedeliver: (msg: T) => void;
+  private readonly onRedeliver: (msg: T, reason: RedeliveryReason) => void;
   private readonly now: () => number;
   private readonly pending = new Map<number, PendingDelivery<T>>();
   private nextSeq = 0;
@@ -106,14 +115,14 @@ export class AckTracker<T> {
   track(msg: T, redeliveries: number): Delivery<T> {
     const seq = ++this.nextSeq;
     const record: PendingDelivery<T> = { msg, settled: false };
-    const settle = (requeue: boolean): void => {
+    const settle = (requeue: boolean, reason?: RedeliveryReason): void => {
       if (record.settled) return;
       record.settled = true;
       if (record.timer !== undefined) clearTimeout(record.timer);
       this.pending.delete(seq);
-      if (requeue) this.onRedeliver(msg);
+      if (requeue) this.onRedeliver(msg, reason ?? 'nack');
     };
-    record.timer = setTimeout(() => settle(true), this.ackTimeoutMs);
+    record.timer = setTimeout(() => settle(true, 'ack-timeout'), this.ackTimeoutMs);
     // An unacked delivery must not keep the process alive on its own.
     const handle = record.timer as unknown as { unref?: () => unknown };
     if (typeof handle.unref === 'function') handle.unref();

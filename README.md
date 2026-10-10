@@ -56,9 +56,12 @@ library.
   a message requeued more than `maxRedeliveries` times (default 5) moves to
   the subscriber's dead-letter queue instead of being retried forever —
   inspect it with `getDeadLetterMessages(subId)` (DLQ-local `seq`, topic,
-  payload, `redeliveries` count, `deadLetteredAt`, original TTL deadline)
-  and hand it back with `replayDeadLetter(subId, seq)` (fresh redelivery
-  budget, original `seq`/deadline preserved — no false sequence gap). The
+  payload, `redeliveries` count, `deadLetteredAt`, `lastError` — the thrown
+  error message, or `nack`/`ack-timeout` when nothing was thrown — the
+  end-to-end `traceId` when the message was traced, original TTL deadline;
+  `{ limit }` caps the result to the newest entries) and hand it back with
+  `replayDeadLetter(subId, seq)` (fresh redelivery budget, original
+  `seq`/deadline preserved — no false sequence gap). The
   DLQ is bounded (`maxEntries`, default 1000, oldest evicted first) and a
   synchronously throwing handler counts as an immediate redelivery attempt
   rather than crashing the flush. `getStats().deadLetteredMessages` counts
@@ -788,6 +791,13 @@ npm test
   expired), fresh redelivery budget on replay, bounded eviction with
   `onDeadLetter`, option validation, `deadLetter: true` defaults, and the
   unchanged retry-forever behavior without the option.
+- `test/poison.test.ts` — poison-message diagnosability on the DLQ:
+  `lastError` records the handler's thrown message (or `nack`/`ack-timeout`
+  when nothing was thrown) and always describes the final failure, batch
+  handlers record per message, DLQ entries carry the end-to-end `traceId`,
+  `{ limit }` newest-first triage queries, unsubscribe clears the DLQ,
+  replay resets the failure record with the budget, and
+  `deadLetteredMessages` accounting.
 - `test/health.test.ts` — subscriber health probing: consecutive-error and
   processing-timeout thresholds auto-pause delivery, success resets the
   counter, a mid-drain degradation requeues unattempted messages in order,

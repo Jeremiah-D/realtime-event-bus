@@ -371,6 +371,16 @@ export class TraceRecorder {
   }
 
   /**
+   * The trace id of a traced message, or `undefined` when the message is
+   * not part of a sampled trace. Lets consumers that outlive the
+   * delivery pipeline — the dead-letter queue, for example — keep the
+   * end-to-end trace correlation for a message.
+   */
+  traceIdOf(msg: object): string | undefined {
+    return this.traces.get(msg)?.traceId;
+  }
+
+  /**
    * Emits one `bus.enqueue` span for a subscriber that accepted the
    * message, and records it so the later `bus.deliver` / `bus.ack` spans
    * can parent to it. No-op when the message is not traced.
