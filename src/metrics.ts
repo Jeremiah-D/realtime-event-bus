@@ -92,6 +92,16 @@
  *   topics carry this series — the bus's top-N by 1m rate (see
  *   `BusStats.hotTopics`) — so at most `HOT_TOPICS_LIMIT * 3` series.
  *
+ * - `eventbus_group_lag_messages{group,topic}`: consumer-group
+ *   consumption lag for classic round-robin groups — the highest
+ *   per-topic `seq` assigned to any member minus the consumer checkpoint
+ *   (`commitOffset`), excluding backlog held by live handoff-linger
+ *   windows (see `BusStats.groupLag`). The Kafka-style lag number an
+ *   operator pages on.
+ * - `eventbus_group_partition_lag_messages{group,topic,partition}`: the
+ *   same, per partition, for groups that opted into
+ *   `GroupSubscribeOptions.partitions`.
+ *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
  * bus fanning out over millions of ad-hoc topic names will grow the
@@ -355,6 +365,27 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_topic_rate_msg_per_sec{${label},window="1s"} ${h.r1s}`);
     lines.push(`eventbus_topic_rate_msg_per_sec{${label},window="1m"} ${h.r1m}`);
     lines.push(`eventbus_topic_rate_msg_per_sec{${label},window="5m"} ${h.r5m}`);
+  }
+
+  // Consumer-group consumption lag (EB-48), one series per (group, topic)
+  // row plus one per (group, partition, topic) row for partitioned
+  // groups. The `?? []` keeps the renderer tolerant of a stats object
+  // that predates the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_group_lag_messages Consumer-group consumption lag: highest assigned per-topic seq minus the consumer checkpoint, excluding backlog held by live handoff-linger windows.',
+  );
+  lines.push('# TYPE eventbus_group_lag_messages gauge');
+  lines.push(
+    '# HELP eventbus_group_partition_lag_messages Per-partition consumer-group consumption lag (see eventbus_group_lag_messages).',
+  );
+  lines.push('# TYPE eventbus_group_partition_lag_messages gauge');
+  for (const g of stats.groupLag ?? []) {
+    const label = `group="${escapeLabelValue(g.groupId)}",topic="${escapeLabelValue(g.topic)}"`;
+    if (g.partition === undefined) {
+      lines.push(`eventbus_group_lag_messages{${label}} ${g.lag}`);
+    } else {
+      lines.push(`eventbus_group_partition_lag_messages{${label},partition="${g.partition}"} ${g.lag}`);
+    }
   }
 
   return lines.join('\n') + '\n';

@@ -103,7 +103,24 @@ library.
   resume point (its explicit window suppresses the automatic migration
   replay — no double delivery). The partition count is fixed by the group's
   first member: a later joiner that disagrees throws `RangeError` and its
-  subscription is rolled back. `subscribe()` also accepts an opt-in content `filter`
+  subscription is rolled back. **Consumer-group lag monitoring**
+  (`src/grouplag.ts`): `getStats().groupLag` reports one row per
+  (group, topic) — per (group, partition, topic) for partitioned groups —
+  with `assignedSeq` (highest seq handed to the group), `committedSeq`
+  (consumer checkpoint), and `lag = assigned - max(committed, lingerHeld)`.
+  Live handoff-linger windows are excluded from lag (reported separately as
+  `lingerHeldToSeq`), so a rebalance holding a leaver's backlog does not
+  read as consumer lag. Alerting is opt-in via
+  `EventBusOptions.groupLag`: `onGroupLag` fires once per threshold
+  excursion (latch semantics: rearms after the lag falls back),
+  `thresholdMessages` sets the default (100; `0` alerts on any lag),
+  `thresholds` overrides per groupId, and
+  `setGroupLagThreshold`/`clearGroupLagThreshold` adjust at runtime with an
+  immediate re-evaluation — lag is re-checked on every assignment, commit,
+  and rebalance, so a lag spike during a rebalance alerts promptly. Lag rows
+  are exposed as `eventbus_group_lag_messages{group,topic}` and
+  `eventbus_group_partition_lag_messages{group,topic,partition}` gauges in
+  `src/metrics.ts`. `subscribe()` also accepts an opt-in content `filter`
   predicate: a message the filter rejects never enters that subscriber's
   queue — no backpressure budget consumed, no adaptive-throttle token
   burned — and the subscriber's per-topic baseline advances over it, so a
@@ -1048,6 +1065,8 @@ Exported series:
 | `eventbus_lag_samples{subscriber,pattern}` | gauge | samples in the subscriber's lag dwell window |
 | `eventbus_lag_watermark_ms{subscriber,pattern}` | gauge | live consumer-lag watermark (oldest queued message dwell, 0 when empty); only `lagMonitor`-enabled subscriptions |
 | `eventbus_topic_rate_msg_per_sec{topic,window}` | gauge | per-topic publish rate in messages/sec over the trailing window (`window` = "1s"/"1m"/"5m"), load-average style; hot topics only (top 10 by 1m rate) |
+| `eventbus_group_lag_messages{group,topic}` | gauge | consumer-group lag per (group, topic): assigned seq minus consumer checkpoint, excluding live handoff-linger holds |
+| `eventbus_group_partition_lag_messages{group,topic,partition}` | gauge | per-partition consumer-group lag for partitioned groups |
 
 The per-topic series grow with the distinct topics ever published to — the
 same bound as `BusStats.topics` — so a bus fanning out over millions of

@@ -28,6 +28,11 @@ import {
   type KeyHotspotOptions,
   type SubscriberKeyHotspotState,
 } from './keyhotspot.ts';
+import {
+  GroupLagMonitor,
+  resolveGroupLagOptions,
+  type GroupLagStat,
+} from './grouplag.ts';
 import { DurableTopicLog } from './durablelog.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
@@ -1062,6 +1067,28 @@ export interface EventBusOptions {
    */
   idempotencyMaxEntries?: number;
   /**
+   * Opt-in consumer-group lag alerting (see `src/grouplag.ts`): per
+   * (group, topic) lag — the highest per-topic `seq` assigned to any
+   * member minus the consumer checkpoint (`commitOffset`) — is computed
+   * on every assignment, commit, and rebalance, and `onGroupLag` fires
+   * once per threshold excursion, with latch semantics (rearms only after
+   * the lag falls back to or below the threshold).
+   *
+   * Live handoff-linger windows (`GroupSubscribeOptions.handoffLingerMs`)
+   * are excluded from lag: backlog a departed member is presumed to still
+   * be processing never reads as consumer lag, so a rebalance with a
+   * lingering handoff does not false-alarm.
+   *
+   * `thresholdMessages` is the default lag threshold in messages for all
+   * groups (default 100; `0` alerts on any positive lag); `thresholds`
+   * overrides it per groupId, also updatable at runtime via
+   * `EventBus.setGroupLagThreshold` / `clearGroupLagThreshold`. Values
+   * must be finite numbers `>= 0`, else `RangeError` at construction.
+   * Lag rows are always observable via `EventBus.getStats().groupLag`
+   * regardless of this option; this only enables the alert callback.
+   */
+  groupLag?: GroupLagMonitorOptions;
+  /**
    * Unified publish-side admission-rejection hook: called once for every
    * publish the admission gates drop — ACL denials (`'acl'`, see
    * `setAclRules`), schema-validation rejections
@@ -1573,6 +1600,18 @@ export interface BusStats {
    * group subscription is active.
    */
   consumerGroups: Array<{ groupId: string; pattern: string; members: number; partitions?: number }>;
+  /**
+   * Consumer-group consumption lag (see `src/grouplag.ts`): one row per
+   * (group, topic) for classic round-robin groups and one per (group,
+   * partition, topic) for partitioned groups, sorted by (groupId,
+   * pattern, topic, partition). `lag` is
+   * `assignedSeq - max(committedSeq, lingerHeldToSeq)` floored at 0:
+   * assigned but not yet consumed, excluding the backlog a live
+   * handoff-linger window holds for a departed member. Always present —
+   * lag observation needs no opt-in; only `onGroupLag` alerting does (see
+   * `EventBusOptions.groupLag`).
+   */
+  groupLag: GroupLagStat[];
   /**
    * Durable topic log state (`EventBusOptions.durableLogDir`). Absent when
    * the durable log is disabled.
@@ -3384,6 +3423,12 @@ export class EventBus {
    */
   private groupOffsets = new Map<string, Map<string, number>>();
   /**
+   * Consumer-group lag alert monitor (see `src/grouplag.ts`). Rows for
+   * `getStats().groupLag` are always computed; `onGroupLag` alerting only
+   * fires when `EventBusOptions.groupLag.onGroupLag` is configured.
+   */
+  private readonly groupLagMonitor: GroupLagMonitor;
+  /**
    * Consumer-checkpointed offsets: groupId -> concrete topic -> last
    * processed `seq` as reported by the consumer via `commitOffset`. Pure
    * bookkeeping for operators and resume-after-restart; the bus never acts
@@ -3493,6 +3538,7 @@ export class EventBus {
     this.onAuthzDenied = onAuthzDenied;
     const resolvedTrace = resolveTraceOptions(options?.trace, 'EventBus');
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
+    this.groupLagMonitor = new GroupLagMonitor(resolveGroupLagOptions(options?.groupLag, 'EventBus'));
     const aclDefault = options?.acl?.defaultPolicy ?? 'allow';
     if (aclDefault !== 'allow' && aclDefault !== 'deny') {
       throw new RangeError("acl.defaultPolicy must be 'allow' or 'deny'");
@@ -4832,6 +4878,13 @@ export class EventBus {
         ...(partitionRebalance == null ? {} : { partitionRebalance }),
       });
     }
+    // Membership changed: the assignment-to-commitment balance for the
+    // group just shifted (a member's uncommitted backlog may now be
+    // redelivered by someone else), so re-evaluate lag alerts. A
+    // linger window opened for the leaver is already recorded by now, so
+    // the held backlog is excluded and the rebalance itself never
+    // false-alarms.
+    this.checkGroupLagForGroup(groupId);
   }
 
   /**
@@ -4966,6 +5019,9 @@ export class EventBus {
       this.groupOffsets.set(groupId, offsets);
     }
     offsets.set(topic, seq);
+    // The group's assigned watermark moved: lag may have crossed the
+    // alert threshold (no-op unless alerting is enabled).
+    this.checkGroupLagForGroup(groupId);
   }
 
   /**
@@ -5049,6 +5105,9 @@ export class EventBus {
     }
     const prev = byTopic.get(topic) ?? 0;
     if (seq > prev) byTopic.set(topic, seq);
+    // The partition's assigned watermark moved: lag may have crossed the
+    // alert threshold (no-op unless alerting is enabled).
+    this.checkGroupLagForGroup(groupKey.slice(0, groupKey.indexOf('\0')));
   }
 
   /**
@@ -5192,6 +5251,9 @@ export class EventBus {
         partition,
         pattern: groupKey.slice(sep + 1),
       });
+      // A checkpoint moved: lag may have fallen back below the threshold
+      // (rearming the alert latch), so re-evaluate.
+      this.checkGroupLagForGroup(groupId);
       return;
     }
     let committed = this.committedOffsets.get(groupId);
@@ -5201,6 +5263,139 @@ export class EventBus {
     }
     committed.set(topic, seq);
     this.durableLog?.appendOffset(groupId, topic, seq, this.now());
+    // Same re-evaluation as the partitioned branch above.
+    this.checkGroupLagForGroup(groupId);
+  }
+
+  /**
+   * Sets (or replaces) the lag-alert threshold for one consumer group at
+   * runtime (see `EventBusOptions.groupLag`): `onGroupLag` fires when the
+   * group's lag first exceeds this many messages. Re-evaluates immediately,
+   * so a lowered threshold alerts on an already-lagging group without
+   * waiting for new publishes; a raised threshold rearms a firing alarm
+   * the same way. Throws `RangeError` on an empty groupId or a non-finite
+   * threshold `< 0`.
+   */
+  setGroupLagThreshold(groupId: string, thresholdMessages: number): void {
+    this.groupLagMonitor.setThreshold(groupId, thresholdMessages);
+    this.checkGroupLagForGroup(groupId);
+  }
+
+  /**
+   * Clears a runtime per-group lag threshold set via `setGroupLagThreshold`,
+   * restoring the group's configured (or default) threshold. Re-evaluates
+   * immediately. Throws `RangeError` on an empty groupId.
+   */
+  clearGroupLagThreshold(groupId: string): void {
+    if (groupId.length === 0) {
+      throw new RangeError('groupId must be a non-empty string');
+    }
+    this.groupLagMonitor.clearThreshold(groupId);
+    this.checkGroupLagForGroup(groupId);
+  }
+
+  /**
+   * One lag row per (group, topic) for classic round-robin groups and per
+   * (group, partition, topic) for partitioned groups (see
+   * `src/grouplag.ts`). Live handoff-linger windows are excluded from lag
+   * (see `lingerHeldToSeq`). Rows are sorted by (groupId, pattern, topic,
+   * partition) so snapshots are deterministic. `groupId` narrows to one
+   * group; `undefined` scans all groups.
+   */
+  private groupLagRowsFor(groupId: string | undefined): GroupLagStat[] {
+    const rows: GroupLagStat[] = [];
+    // Highest live linger-window `toSeq` per (group, topic), cached across
+    // the topics scanned for one call (pruning reads the bus clock).
+    const lingerHeld = new Map<string, number>();
+    const lingerHeldToSeq = (gid: string, topic: string): number => {
+      const cacheKey = `${gid}\0${topic}`;
+      let held = lingerHeld.get(cacheKey);
+      if (held === undefined) {
+        held = 0;
+        for (const w of this.pruneLingerWindows(gid)) {
+          if (w.topic === topic && w.toSeq > held) held = w.toSeq;
+        }
+        lingerHeld.set(cacheKey, held);
+      }
+      return held;
+    };
+    const pushRow = (
+      gid: string,
+      pattern: string,
+      topic: string,
+      assignedSeq: number,
+      committedSeq: number,
+      partition?: number,
+    ): void => {
+      const heldToSeq = lingerHeldToSeq(gid, topic);
+      rows.push({
+        groupId: gid,
+        pattern,
+        topic,
+        ...(partition === undefined ? {} : { partition }),
+        assignedSeq,
+        committedSeq,
+        lingerHeldToSeq: heldToSeq,
+        lag: Math.max(0, assignedSeq - Math.max(committedSeq, heldToSeq)),
+      });
+    };
+    // Classic rows: assignment watermarks are keyed by group only, so the
+    // pattern is attributable only when the group runs one competing set.
+    const patternsByGroup = new Map<string, string[]>();
+    for (const key of this.groupMembers.keys()) {
+      const sep = key.indexOf('\0');
+      const gid = key.slice(0, sep);
+      if (groupId !== undefined && gid !== groupId) continue;
+      let list = patternsByGroup.get(gid);
+      if (list == null) {
+        list = [];
+        patternsByGroup.set(gid, list);
+      }
+      list.push(key.slice(sep + 1));
+    }
+    for (const [gid, byTopic] of this.groupOffsets) {
+      if (groupId !== undefined && gid !== groupId) continue;
+      const patterns = patternsByGroup.get(gid) ?? [];
+      const pattern = patterns.length === 1 ? patterns[0] : '';
+      const committed = this.committedOffsets.get(gid);
+      for (const [topic, assignedSeq] of byTopic) {
+        pushRow(gid, pattern, topic, assignedSeq, committed?.get(topic) ?? 0);
+      }
+    }
+    // Partitioned rows: one per (partition, topic), with per-partition
+    // checkpoints falling back to the group-level checkpoint.
+    for (const [key, byPartition] of this.groupPartitionOffsets) {
+      const sep = key.indexOf('\0');
+      const gid = key.slice(0, sep);
+      if (groupId !== undefined && gid !== groupId) continue;
+      const pattern = key.slice(sep + 1);
+      const groupCommitted = this.committedOffsets.get(gid);
+      const partitionCommitted = this.partitionCommittedOffsets.get(key);
+      for (const [partition, byTopic] of byPartition) {
+        const pCommitted = partitionCommitted?.get(partition);
+        for (const [topic, assignedSeq] of byTopic) {
+          pushRow(gid, pattern, topic, assignedSeq, pCommitted?.get(topic) ?? groupCommitted?.get(topic) ?? 0, partition);
+        }
+      }
+    }
+    rows.sort(
+      (a, b) =>
+        (a.groupId < b.groupId ? -1 : a.groupId > b.groupId ? 1 : 0) ||
+        (a.pattern < b.pattern ? -1 : a.pattern > b.pattern ? 1 : 0) ||
+        (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0) ||
+        (a.partition ?? -1) - (b.partition ?? -1),
+    );
+    return rows;
+  }
+
+  /**
+   * Feeds one group's current lag rows to the alert monitor. No-op unless
+   * `onGroupLag` alerting is enabled, so the publish/commit/rebalance hot
+   * paths stay cheap for buses that only observe lag via `getStats()`.
+   */
+  private checkGroupLagForGroup(groupId: string): void {
+    if (!this.groupLagMonitor.enabled()) return;
+    this.groupLagMonitor.check(this.groupLagRowsFor(groupId));
   }
 
   /**
@@ -7848,6 +8043,7 @@ export class EventBus {
           ...(partitions === undefined ? {} : { partitions }),
         };
       }),
+      groupLag: this.groupLagRowsFor(undefined),
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,
