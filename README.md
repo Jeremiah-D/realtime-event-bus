@@ -91,7 +91,15 @@ library.
   message hashes `(topic, seq)` for a deterministic spread. Assignment is
   rendezvous (highest-random-weight) hashing over the member roster —
   deterministic from the roster alone, so joins/leaves only migrate the
-  partitions whose winner actually changed. The bus tracks per-partition
+  partitions whose winner actually changed — or, with opt-in
+  `assignment: 'sticky'` on `subscribeToGroup`, the sticky balanced
+  assignor (`src/sticky.ts`, EB-54): every member owns `floor(P/N)` or
+  `ceil(P/N)` partitions and each rebalance migrates exactly the minimal
+  diff the balance requires, so unaffected partitions keep consuming
+  through the rebalance with no pause and no replay (cooperative
+  protocol, no stop-the-world reassignment). The strategy is fixed by the
+  group's first member (like the partition count); `onRebalance` events
+  report it as `partitionRebalance.strategy`. The bus tracks per-partition
   assignment watermarks (`getPartitionWatermarks`: highest per-topic `seq`
   per partition) and per-partition checkpoints
   (`commitOffset(group, topic, seq, { partition })`, journaled to the offset
@@ -923,6 +931,17 @@ npm test
   commit validation, per-partition checkpoint persistence across restarts,
   `getStats().consumerGroups` partition counts, and round-robin groups
   untouched (no partition metadata).
+- `test/cooperative-rebalance.test.ts` — sticky balanced partition
+  assignment (EB-54): `src/sticky.ts` unit tests (2/2/2 balance vs
+  rendezvous 3/2/1 skew, determinism, maximal stickiness under the
+  balance target over seeded roster churn, fewer-partitions-than-members,
+  empty roster, invalid input) and bus integration (join migrates exactly
+  the minimal diff with one shed partition per incumbent, leave
+  redistributes only the departed member's partitions, stable partitions
+  keep consuming through a rebalance with no loss/duplication —
+  cooperative no-stop-the-world, strategy mismatch rolls back the join,
+  invalid value rejected before registration, rendezvous stays the
+  default, fully drained groups start fresh without pinning).
 - `test/durablelog.test.ts` — durable topic log: append/readSince round-trip,
   reopen recovery of topics/seqs/counts, corrupt-line tolerance, amortized
   compaction, option validation; bus integration: per-publish logging with
