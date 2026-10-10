@@ -734,6 +734,34 @@ library.
   tradeoff: the 5m window is exact up to 200 msg/s sustained per topic;
   past that the ring wraps and the 5m rate degrades to a lower bound, while
   the 1s/1m windows stay exact much longer.
+- **Event-time watermarks and late-message detection** (in
+  `src/watermark.ts` + `src/bus.ts`, via `PublishOptions.eventTime`):
+  stream-processing semantics, Kafka/Flink-style. A publish may carry its
+  business event time (epoch ms — when the event happened, not when the bus
+  sees it); the bus tracks a per-topic watermark — `max(eventTime) −
+  allowedLatenessMs` — and treats a message with `eventTime < watermark` as
+  late. Late messages are still delivered normally (lateness never blocks
+  delivery); they are counted (`TopicStats.lateMessages`,
+  `BusStats.lateMessages`) and reported once each on the bus-level
+  `EventBusOptions.onLate` hook (error-isolated, like `onAdmissionRejected`).
+  The watermark is orthogonal to the publish-order `seq` (EB-13): `seq`
+  orders arrivals, the watermark orders business time — out-of-order
+  arrivals with on-time business times are not late. `allowedLatenessMs`
+  is configurable bus-wide (`EventBusOptions.allowedLatenessMs`, default 0)
+  and per topic/pattern (`setTopicAllowedLateness` /
+  `clearTopicAllowedLateness`, exact-topic rule wins over patterns, invalid
+  values throw `RangeError`); only admitted publishes move the watermark —
+  schema rejections and rate-limit sheds never do. Publishes without an
+  event time never participate (the watermark stays unknown), and the event
+  time rides the envelope end to end — durable-log record and replay,
+  topic routes, and cross-bus forwards carry it verbatim — so replayed and
+  forwarded messages keep their business-time metadata. `getStats()`
+  exposes per-topic `watermark` (epoch ms, `undefined` until the first
+  event-time publish) and `lateMessages`, and `src/metrics.ts` renders
+  `eventbus_topic_late_messages_total{topic}` and
+  `eventbus_topic_event_time_watermark{topic}`. Natural fit for
+  fintech/settlement feeds: a retried settlement that arrives after the
+  stream moved on is flagged late instead of silently double-applied.
 - **Subscriber batch delivery** (in `src/bus.ts`, opt-in via
   `subscribe(..., { batch: true })`): the drain collects up to `maxSize`
   queued messages (default 100) and invokes the handler once with the
@@ -1156,6 +1184,19 @@ npm test
   (nack/timeout abandon, stale-handle ack emits nothing, redelivery opens a
   fresh span), ring-buffer oldest-first eviction, batch/delayed publish
   paths, and snapshot isolation of `getStats().traceSpans`.
+- `test/watermark.test.ts` — event-time watermarks (EB-59): `src/watermark.ts`
+  unit tests (peak tracking, pre-fold lateness judgement, boundary on-time,
+  monotone watermark, validation helpers), watermark advancement with the
+  maximum event time, plain publishes never moving the watermark, late
+  messages still delivered but counted per topic and bus-wide, `onLate`
+  event shape and error isolation, bus-level and per-topic/pattern
+  `allowedLatenessMs` with exact-wins-over-pattern resolution and
+  setter/clearer semantics, invalid config throwing `RangeError`/`TypeError`,
+  invalid `eventTime` throwing from every publish entry point without
+  mutating state, orthogonality to publish-order `seq`, rejected/shed
+  publishes never moving the watermark, `eventTime` on batch/atomic
+  entries, durable-log persistence with replay restoring the envelope, and
+  the late-message/watermark Prometheus series.
 
 ## Benchmark
 
@@ -1287,6 +1328,7 @@ Exported series:
 | `eventbus_expired_messages_total` | counter | `expiredMessages` — TTL discards |
 | `eventbus_throttled_messages_total` | counter | `throttledMessages` — publish-side adaptive throttle sheds |
 | `eventbus_rejected_messages_total` | counter | `rejectedMessages` — schema rejections |
+| `eventbus_late_messages_total` | counter | `lateMessages` — admitted messages older than their topic's event-time watermark (EB-59; still delivered) |
 | `eventbus_rate_limited_messages_total` | counter | `rateLimitedMessages` — per-topic rate-limit sheds |
 | `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
@@ -1296,6 +1338,8 @@ Exported series:
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
 | `eventbus_keyed_reordered_messages_total` | counter | `keyedReorderedMessages` — keyed messages held in per-(subscriber, key) reorder buffers |
 | `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
+| `eventbus_topic_late_messages_total{topic}` | counter | per-topic `lateMessages` (EB-59) |
+| `eventbus_topic_event_time_watermark{topic}` | gauge | per-topic event-time watermark in epoch ms (EB-59); only emitted for topics with at least one event-time publish |
 | `eventbus_subscribers` | gauge | `totalSubscribers` |
 | `eventbus_unacked_deliveries` | gauge | `unackedDeliveries` |
 | `eventbus_throttled_subscribers` | gauge | `throttledSubscribers` |

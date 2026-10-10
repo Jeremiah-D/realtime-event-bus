@@ -25,6 +25,14 @@ export interface DurableLogRecord {
   messageId?: string;
   /** Concrete topic name, as published. */
   topic: string;
+  /**
+   * Business event time in epoch milliseconds (see
+   * `PublishOptions.eventTime`), present when the publish carried one.
+   * Replay restores it onto the envelope so subscribers keep seeing the
+   * original business time; the runtime event-time watermark itself is
+   * not persisted — a restarted bus rebuilds it from new publishes.
+   */
+  eventTime?: number;
   /** Publish timestamp in milliseconds (the bus clock). */
   at: number;
   /** TTL expiry deadline in milliseconds, when a TTL rule matched at publish. */
@@ -132,6 +140,11 @@ interface LogLine {
    * `DurableLogRecord.messageId`).
    */
   messageId?: string;
+  /**
+   * Business event time in epoch milliseconds (see
+   * `DurableLogRecord.eventTime`).
+   */
+  eventTime?: number;
   payload: unknown;
 }
 
@@ -999,6 +1012,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.keySeq !== undefined) line.keySeq = record.keySeq;
   if (record.dictId !== undefined) line.dictId = record.dictId;
   if (record.messageId !== undefined) line.messageId = record.messageId;
+  if (record.eventTime !== undefined) line.eventTime = record.eventTime;
   return line;
 }
 
@@ -1086,6 +1100,15 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     // identity) rather than failing the whole line.
     if (typeof o['messageId'] === 'string' && (o['messageId'] as string).length > 0) {
       record.messageId = o['messageId'] as string;
+    }
+  }
+  if (o['eventTime'] !== undefined) {
+    // The event time is advisory business metadata, not structural: a
+    // malformed value is dropped (the message replays without an event
+    // time) rather than failing the whole line.
+    const eventTime = o['eventTime'] as number;
+    if (typeof eventTime === 'number' && Number.isFinite(eventTime) && eventTime >= 0) {
+      record.eventTime = eventTime;
     }
   }
   // A non-tombstone schedule record must say when it is due.

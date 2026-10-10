@@ -16,6 +16,8 @@
  *   side by adaptive throttling.
  * - `eventbus_rejected_messages_total`: publishes rejected by schema
  *   validation.
+ * - `eventbus_late_messages_total`: messages admitted with a business
+ *   event time older than their topic's event-time watermark (EB-59).
  * - `eventbus_rate_limited_messages_total`: messages shed by publish-side
  *   per-topic rate limiting.
  * - `eventbus_duplicate_messages_total`: idempotent publishes suppressed
@@ -31,6 +33,13 @@
  *   been fanned out yet — the observable count of per-key publish-order
  *   enforcement (see `PublishOptions.key`).
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
+ * - `eventbus_topic_late_messages_total{topic}`: messages per topic whose
+ *   business event time was older than the topic's event-time watermark
+ *   (EB-59; still delivered — a data-quality counter, not a loss
+ *   counter).
+ * - `eventbus_topic_event_time_watermark{topic}`: the topic's event-time
+ *   watermark in epoch milliseconds (EB-59); emitted only for topics that
+ *   have seen at least one event-time publish.
  * - `eventbus_namespace_published_messages_total{namespace}`: publishes
  *   per namespace (EB-52; only emitted when namespaces are registered).
  * - `eventbus_namespace_subscribers{namespace}`: live namespaced
@@ -203,6 +212,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_rejected_messages_total',
     'Total publishes rejected by schema validation.',
     stats.rejectedMessages,
+  );
+  counter(
+    'eventbus_late_messages_total',
+    'Total messages admitted with a business event time older than their topic event-time watermark (EB-59).',
+    stats.lateMessages ?? 0,
   );
   counter(
     'eventbus_rate_limited_messages_total',
@@ -379,10 +393,25 @@ export function renderPrometheus(stats: BusStats): string {
     '# HELP eventbus_topic_subscribers Subscribers matched by the most recent publish to the topic (fan-out width).',
   );
   lines.push('# TYPE eventbus_topic_subscribers gauge');
+  lines.push(
+    '# HELP eventbus_topic_late_messages_total Messages whose business event time was older than the topic event-time watermark (EB-59).',
+  );
+  lines.push('# TYPE eventbus_topic_late_messages_total counter');
+  lines.push(
+    '# HELP eventbus_topic_event_time_watermark The topic event-time watermark in epoch milliseconds (EB-59); absent until the first event-time publish.',
+  );
+  lines.push('# TYPE eventbus_topic_event_time_watermark gauge');
   for (const t of stats.topics) {
     const label = `topic="${escapeLabelValue(t.topic)}"`;
     lines.push(`eventbus_topic_published_messages_total{${label}} ${t.publishedMessages}`);
     lines.push(`eventbus_topic_subscribers{${label}} ${t.subscriberCount}`);
+    // `?? 0` keeps the renderer tolerant of a stats object that predates
+    // the field (hand-built fixtures included), mirroring the namespaces
+    // idiom below.
+    lines.push(`eventbus_topic_late_messages_total{${label}} ${t.lateMessages ?? 0}`);
+    if (t.watermark !== undefined) {
+      lines.push(`eventbus_topic_event_time_watermark{${label}} ${t.watermark}`);
+    }
   }
 
   // Per-namespace aggregates (EB-52), in registration order (same as

@@ -74,6 +74,13 @@ import {
   type BridgeReceiveResult,
   type ResolvedBridgeOptions,
 } from './bridge.ts';
+import {
+  EventTimeWatermark,
+  validateAllowedLatenessMs,
+  validateEventTime,
+  type LateMessageCallback,
+  type LateMessageEvent,
+} from './watermark.ts';
 
 export type { Delivery, RedeliveryReason } from './ack.ts';
 export type {
@@ -96,6 +103,7 @@ export type {
   AckSloMissEvent,
 } from './acklatency.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
+export type { LateMessageCallback, LateMessageEvent } from './watermark.ts';
 export type {
   TraceOptions,
   TraceSampler,
@@ -136,6 +144,17 @@ export interface BusMessage {
    * Absent for plain publishes without an identity.
    */
   messageId?: string;
+  /**
+   * Business event time of the message in epoch milliseconds, set when the
+   * publish carried one (`PublishOptions.eventTime`). Unlike `seq` — the
+   * bus-assigned publish-order number (EB-13) — this is the application's
+   * own clock: when the event happened, not when the bus saw it. It rides
+   * the envelope end to end (durable log, replay) and drives the
+   * per-topic event-time watermark (EB-59): a message whose event time is
+   * older than the topic's watermark is delivered normally but counted as
+   * late. Absent for publishes that did not carry an event time.
+   */
+  eventTime?: number;
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
@@ -1344,6 +1363,27 @@ export interface EventBusOptions {
    * from the constructor.
    */
   bridge?: BridgeOptions;
+  /**
+   * Bus-wide default allowed lateness in milliseconds for event-time
+   * watermark tracking (EB-59): a message is late when its business event
+   * time (`PublishOptions.eventTime`) is older than the topic's watermark
+   * (`max(eventTime) - allowedLatenessMs`). Per-topic overrides via
+   * `EventBus.setTopicAllowedLateness` win over this default. Must be a
+   * non-negative finite number; anything else throws `RangeError` from the
+   * constructor. Default 0 — any event time below the observed peak is
+   * late.
+   */
+  allowedLatenessMs?: number;
+  /**
+   * Late-message hook for event-time watermark tracking (EB-59): called
+   * once for every admitted publish whose event time is older than its
+   * topic's watermark. The message is still delivered normally — this is
+   * the observability signal, not a gate. The callback is error-isolated:
+   * a throwing hook is swallowed so a broken observer can never disturb
+   * the publish path. Default: unset (no hook — fully backward
+   * compatible).
+   */
+  onLate?: LateMessageCallback;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -1399,6 +1439,24 @@ export interface TopicStats {
    * invisible to gap detection.
    */
   rejectedMessages: number;
+  /**
+   * Messages on this topic whose business event time was older than the
+   * topic's event-time watermark when admitted (`PublishOptions.eventTime`
+   * below `max(eventTime) - allowedLatenessMs`, EB-59). Late messages are
+   * still delivered normally — this is the data-quality counter, not a
+   * loss counter — and are also reported on `EventBusOptions.onLate`.
+   */
+  lateMessages: number;
+  /**
+   * The topic's event-time watermark in epoch milliseconds:
+   * `max(eventTime) - allowedLatenessMs` over the admitted publishes that
+   * carried an event time (EB-59). `undefined` until the first event-time
+   * publish on the topic — messages without an event time never move it.
+   * Reflects the currently configured allowed lateness (bus-level default
+   * or the per-topic override), so reconfiguring the lateness changes this
+   * reading immediately.
+   */
+  watermark: number | undefined;
   /**
    * Idempotent publishes to this topic suppressed as duplicates (see
    * `publishIdempotent`): the retry arrived with a `(topic, messageId)`
@@ -1549,6 +1607,14 @@ export interface BusStats {
    * exact counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total messages admitted with a business event time older than their
+   * topic's event-time watermark — the sum of every topic's
+   * `lateMessages` (EB-59). Late messages are still delivered; this is the
+   * bus-wide data-quality signal (stale producers, clock skew, replayed
+   * feeds), also reported per occurrence on `EventBusOptions.onLate`.
+   */
+  lateMessages: number;
   /**
    * Total publish/subscribe operations denied by the broker-level ACL
    * (see `setAclRules`). Every denied publish is also counted in
@@ -2170,6 +2236,7 @@ function zeroedTopicStats(): {
   sequenceGaps: number;
   rateLimitedMessages: number;
   rejectedMessages: number;
+  lateMessages: number;
   duplicateMessages: number;
   filteredMessages: number;
   dedupDropped: number;
@@ -2187,6 +2254,7 @@ function zeroedTopicStats(): {
     sequenceGaps: 0,
     rateLimitedMessages: 0,
     rejectedMessages: 0,
+    lateMessages: 0,
     duplicateMessages: 0,
     filteredMessages: 0,
     dedupDropped: 0,
@@ -3019,6 +3087,13 @@ export interface ForwardFrame {
    * destination bus's TTL rules apply normally.
    */
   expiresAt?: number;
+  /**
+   * Business event time in epoch milliseconds (see
+   * `PublishOptions.eventTime`): the forwarded message is the same logical
+   * event, so its business time rides along verbatim — the destination bus
+   * observes it into its own per-topic event-time watermark (EB-59).
+   */
+  eventTime?: number;
 }
 
 /**
@@ -3234,6 +3309,22 @@ export interface PublishOptions {
    * (`allowPublish: false`) rejects with `NamespaceDeniedError`.
    */
   namespace?: string;
+  /**
+   * Business event time of the message in epoch milliseconds — when the
+   * event happened, not when the bus sees it (Kafka/Flink event-time
+   * semantics, EB-59). The bus tracks a per-topic event-time watermark —
+   * `max(eventTime) - allowedLatenessMs` — and treats a message with
+   * `eventTime < watermark` as late: it is still delivered normally, but
+   * it is counted (`TopicStats.lateMessages`, `BusStats.lateMessages`)
+   * and reported on `EventBusOptions.onLate`. Out-of-order *arrival* with
+   * on-time business times is not lateness — the watermark is orthogonal
+   * to the publish-order sequence `BusMessage.seq` (EB-13). Publishes
+   * without an event time never move the watermark. Stamped onto the
+   * envelope (`BusMessage.eventTime`) and persisted on the durable-log
+   * record so replay restores it. Must be a finite number `>= 0` when
+   * provided; anything else throws `RangeError` from `publish`.
+   */
+  eventTime?: number;
 }
 
 /**
@@ -3561,6 +3652,8 @@ interface ReplayRecord {
   key?: string;
   keySeq?: number;
   dictId?: string;
+  messageId?: string;
+  eventTime?: number;
 }
 
 /**
@@ -3711,6 +3804,47 @@ export class EventBus {
    */
   private rateLimitBuckets = new Map<string, TokenBucket>();
   private totalRateLimited = 0;
+  /**
+   * Bus-wide default allowed lateness in milliseconds for event-time
+   * watermark tracking (see `EventBusOptions.allowedLatenessMs`).
+   * Per-topic overrides (`setTopicAllowedLateness`) win over this at
+   * observation time.
+   */
+  private readonly allowedLatenessMs: number;
+  /**
+   * Bus-level late-message hook (see `EventBusOptions.onLate`), fired
+   * error-isolated once per late publish.
+   */
+  private readonly onLate?: LateMessageCallback;
+  /**
+   * Per-topic allowed-lateness overrides, keyed by the exact string passed
+   * to `setTopicAllowedLateness` — either a concrete topic name or a
+   * wildcard pattern. Match resolution mirrors the TTL and rate-limit
+   * rules: an exact-topic rule wins over any pattern; between patterns the
+   * earliest-registered rule wins.
+   */
+  private allowedLatenessRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in
+   * `allowedLatenessRules`, kept apart from the subscriber pattern cache
+   * so lateness configuration never inflates `patternCacheSize`.
+   */
+  private allowedLatenessMatcherCache = new Map<string, RegExp>();
+  /**
+   * Per-topic event-time watermark state (EB-59). An entry appears on the
+   * first admitted publish to the topic that carries an event time and
+   * persists for the bus's lifetime — topics without event-time publishes
+   * never appear here, and their watermark reads as unknown. Bounded by
+   * the distinct topics ever published with an event time, the same bound
+   * as `topicStats`.
+   */
+  private readonly eventWatermarks = new Map<string, EventTimeWatermark>();
+  /**
+   * Messages admitted with a business event time older than their topic's
+   * event-time watermark (global total). Late messages are still
+   * delivered — this is the bus-wide data-quality signal.
+   */
+  private totalLateMessages = 0;
   /**
    * Per-topic schema validators, keyed by the exact string passed to
    * `setTopicSchema` — either a concrete topic name or a wildcard pattern.
@@ -4128,6 +4262,14 @@ export class EventBus {
       throw new RangeError('onAuthzDenied must be a function');
     }
     this.onAuthzDenied = onAuthzDenied;
+    const allowedLatenessMs = options?.allowedLatenessMs ?? 0;
+    validateAllowedLatenessMs(allowedLatenessMs, 'EventBus');
+    this.allowedLatenessMs = allowedLatenessMs;
+    const onLate = options?.onLate;
+    if (onLate !== undefined && typeof onLate !== 'function') {
+      throw new TypeError('onLate must be a function');
+    }
+    this.onLate = onLate;
     const resolvedTrace = resolveTraceOptions(options?.trace, 'EventBus');
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
@@ -4289,6 +4431,92 @@ export class EventBus {
     const removed = this.rateLimitRules.delete(topicPattern);
     if (removed) this.rateLimitBuckets.clear();
     return removed;
+  }
+
+  /**
+   * Sets the allowed lateness in milliseconds for event-time watermark
+   * tracking (EB-59) on one topic or topic pattern. `topicPattern`
+   * accepts the same wildcard syntax as `subscribe` (or an exact topic
+   * name): a message is late when its business event time
+   * (`PublishOptions.eventTime`) is older than the topic's watermark
+   * (`max(eventTime) - allowedLatenessMs`). Late messages are still
+   * delivered normally — they are counted (`TopicStats.lateMessages`,
+   * `BusStats.lateMessages`) and reported on `EventBusOptions.onLate`.
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins.
+   * Re-setting a rule replaces it; the change is reflected in the next
+   * observation and in the next `getStats()` watermark reading
+   * immediately — no restart, no re-observation. Throws when
+   * `topicPattern` is empty or `allowedLatenessMs` is not a non-negative
+   * finite number.
+   */
+  setTopicAllowedLateness(topicPattern: string, allowedLatenessMs: number): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    validateAllowedLatenessMs(allowedLatenessMs, 'setTopicAllowedLateness');
+    this.allowedLatenessRules.set(topicPattern, allowedLatenessMs);
+  }
+
+  /**
+   * Removes the allowed-lateness rule previously registered for
+   * `topicPattern`. The topic falls back to the next matching rule, or to
+   * the bus-wide default (`EventBusOptions.allowedLatenessMs`). Returns
+   * true when a rule existed and was removed.
+   */
+  clearTopicAllowedLateness(topicPattern: string): boolean {
+    return this.allowedLatenessRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the allowed lateness in milliseconds that applies to `topic`:
+   * the exact-topic rule first, then the earliest-registered matching
+   * pattern, then the bus-wide default. Never undefined — the default is
+   * always a valid number.
+   */
+  private allowedLatenessForTopic(topic: string): number {
+    const exact = this.allowedLatenessRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, ms] of this.allowedLatenessRules) {
+      let matcher = this.allowedLatenessMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.allowedLatenessMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return ms;
+    }
+    return this.allowedLatenessMs;
+  }
+
+  /**
+   * Folds one admitted publish's event time into the topic's event-time
+   * watermark (EB-59). A message older than the watermark is late: it is
+   * counted on the topic and the bus total, and the bus-level `onLate`
+   * hook fires — error-isolated, so a broken observer can never disturb
+   * the publish path. Lateness never blocks delivery; that decision was
+   * already made by the fan-out below.
+   */
+  private observeEventTime(topic: string, seq: number, eventTime: number): void {
+    let state = this.eventWatermarks.get(topic);
+    if (state == null) {
+      state = new EventTimeWatermark();
+      this.eventWatermarks.set(topic, state);
+    }
+    const allowedLatenessMs = this.allowedLatenessForTopic(topic);
+    const observation = state.observe(eventTime, allowedLatenessMs);
+    if (!observation.late) return;
+    this.statsFor(topic).lateMessages += 1;
+    this.totalLateMessages += 1;
+    const onLate = this.onLate;
+    if (onLate === undefined) return;
+    try {
+      // A late message never advances the watermark, so the watermark on
+      // the event is exactly the one the message was judged against.
+      onLate({ topic, seq, eventTime, watermark: observation.watermark, allowedLatenessMs });
+    } catch {
+      // Swallowed: a failing observer must never break publishing.
+    }
   }
 
   /**
@@ -4569,6 +4797,7 @@ export class EventBus {
     if (frame === null || typeof frame !== 'object') return;
     const topic = frame.topic;
     if (typeof topic !== 'string' || topic.length === 0) return;
+    validateEventTime(frame.eventTime, 'receiveForward');
     this.fanOut(
       topic,
       frame.payload,
@@ -4580,6 +4809,9 @@ export class EventBus {
       frame.messageId,
       true, // routed: never triggers destination routes/forwards again
       frame.expiresAt, // verbatim TTL deadline from the source message
+      false, // fromBridge
+      false, // diagnostic
+      frame.eventTime, // same logical event: business event time rides along verbatim
     );
     this.scheduleFlush();
   }
@@ -5287,6 +5519,7 @@ export class EventBus {
         sequenceGaps: 0,
         rateLimitedMessages: 0,
         rejectedMessages: 0,
+        lateMessages: 0,
         duplicateMessages: 0,
         aliasRetiredMessages: 0,
         filteredMessages: 0,
@@ -7184,6 +7417,12 @@ export class EventBus {
         ...(typeof rec.messageId === 'string' && rec.messageId.length > 0
           ? { messageId: rec.messageId }
           : {}),
+        // Restores the business event time logged at publish time, so a
+        // resumed subscriber sees the same event-time metadata the live
+        // delivery carried (see `PublishOptions.eventTime`).
+        ...(typeof rec.eventTime === 'number' && Number.isFinite(rec.eventTime) && rec.eventTime >= 0
+          ? { eventTime: rec.eventTime }
+          : {}),
       };
       // The log stores the wire payload: a record written while a
       // compression rule was active carries the deflated envelope, so
@@ -7229,6 +7468,7 @@ export class EventBus {
   publish(topic: string, payload: unknown, opts?: PublishOptions): number {
     validateMessageKey(opts?.key, 'publish');
     validateTraceparent(opts?.traceparent, 'publish');
+    validateEventTime(opts?.eventTime, 'publish');
     // Multi-tenant namespace (EB-52): resolve to the concrete
     // `<namespace>/<topic>` before admission — the full pipeline below
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
@@ -7244,6 +7484,10 @@ export class EventBus {
       opts?.traceparent,
       opts?.messageId,
       opts?.routed ?? false,
+      undefined,
+      false,
+      false,
+      opts?.eventTime,
     );
     this.scheduleFlush();
     return accepted;
@@ -7300,6 +7544,7 @@ export class EventBus {
   ): IdempotentPublishResult {
     validateMessageKey(opts?.key, 'publishIdempotent');
     validateTraceparent(opts?.traceparent, 'publishIdempotent');
+    validateEventTime(opts?.eventTime, 'publishIdempotent');
     const messageId = opts?.messageId;
     // Multi-tenant namespace (EB-52): the `(topic, messageId)` dedup
     // identity below is scoped to the concrete `<namespace>/<topic>`, so
@@ -7330,6 +7575,10 @@ export class EventBus {
         opts?.traceparent,
         opts?.messageId,
         opts?.routed ?? false,
+        undefined,
+        false,
+        false,
+        opts?.eventTime,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -7362,6 +7611,10 @@ export class EventBus {
       opts?.traceparent,
       messageId,
       opts?.routed ?? false,
+      undefined,
+      false,
+      false,
+      opts?.eventTime,
     );
     this.scheduleFlush();
     if (admitted) {
@@ -7399,6 +7652,7 @@ export class EventBus {
     for (const msg of messages) {
       validateMessageKey(msg.key, 'publishBatch');
       validateTraceparent(msg.traceparent, 'publishBatch');
+      validateEventTime(msg.eventTime, 'publishBatch');
     }
     let accepted = 0;
     for (const msg of messages) {
@@ -7411,6 +7665,11 @@ export class EventBus {
         undefined,
         msg.traceparent,
         msg.messageId,
+        false,
+        undefined,
+        false,
+        false,
+        msg.eventTime,
       ).accepted;
     }
     this.scheduleFlush();
@@ -7466,6 +7725,7 @@ export class EventBus {
     for (const entry of entries) {
       validateMessageKey(entry.key, 'publishAtomic');
       validateTraceparent(entry.traceparent, 'publishAtomic');
+      validateEventTime(entry.eventTime, 'publishAtomic');
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
@@ -7514,7 +7774,7 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { payload, key, traceparent, messageId } = entries[index];
+      const { payload, key, traceparent, messageId, eventTime } = entries[index];
       this.fanOut(
         resolvedTopics[index],
         payload,
@@ -7524,6 +7784,11 @@ export class EventBus {
         keySeqs[index],
         traceparent,
         messageId,
+        false,
+        undefined,
+        false,
+        false,
+        eventTime,
       );
     }
     this.scheduleFlush();
@@ -8863,6 +9128,7 @@ export class EventBus {
     routedExpiresAt?: number,
     fromBridge = false,
     diagnostic = false,
+    eventTime?: number,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -8919,6 +9185,10 @@ export class EventBus {
       payload,
       seq: this.nextSeq(topic),
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+      // Business event time rides the envelope (see `PublishOptions.eventTime`):
+      // undefined stays absent, so messages without one never participate in
+      // the watermark.
+      ...(eventTime === undefined ? {} : { eventTime }),
     };
     // EB-57: mark DLQ diagnostic messages at creation (the envelope marker
     // is bus-side, so a user's payload can never collide with it) — a
@@ -8994,6 +9264,15 @@ export class EventBus {
     // time — keeping the table aligned with real publish load rather than
     // scheduled intent.
     this.publishRates.sample(topic, this.now());
+    // Event-time watermark (EB-59): observed once per accepted publish —
+    // after the admission gates (schema validation, rate-limit budget), so
+    // a rejected or shed message never moves the watermark, exactly like
+    // the publish-rate table above. The watermark is orthogonal to the
+    // publish-order `seq` stamped at the top: `seq` orders arrivals, the
+    // watermark orders business time.
+    if (eventTime !== undefined) {
+      this.observeEventTime(topic, msg.seq, eventTime);
+    }
     // Publish-side per-topic payload compression (opt-in via
     // `setTopicCompression`). Pipeline order, and why:
     //   1. schema validation ran first and always sees the RAW payload —
@@ -9110,6 +9389,11 @@ export class EventBus {
       // restores it onto the envelope — a resumed dedup window can only
       // suppress what it recognizes.
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+      // The business event time rides the log record so replay restores it
+      // onto the envelope (see `PublishOptions.eventTime`). The runtime
+      // watermark itself is not persisted — a restarted bus rebuilds it
+      // from new publishes.
+      ...(eventTime === undefined ? {} : { eventTime }),
     });
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the
@@ -9189,6 +9473,12 @@ export class EventBus {
             cleanMessageId,
             true,
             expiresAt,
+            false,
+            false,
+            // The forwarded message is the same logical event on the
+            // destination topic: its business event time rides along so the
+            // destination's event-time watermark sees the same stream.
+            eventTime,
           );
         }
       }
@@ -9224,6 +9514,7 @@ export class EventBus {
               : { traceparent: formatTraceparent(openTrace.traceId, newSpanId()) }),
             ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
             ...(expiresAt === undefined ? {} : { expiresAt }),
+            ...(eventTime === undefined ? {} : { eventTime }),
           });
         }
       }
@@ -9498,6 +9789,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       rejectedMessages: this.totalRejected,
+      lateMessages: this.totalLateMessages,
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
       dedupDropped: this.totalDedupDropped,
@@ -9592,6 +9884,12 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         rejectedMessages: stats.rejectedMessages,
+        lateMessages: stats.lateMessages,
+        // Resolved with the currently configured allowed lateness, so a
+        // reconfigured `setTopicAllowedLateness` is reflected here
+        // immediately; `undefined` when no event-time publish has ever
+        // been admitted on the topic.
+        watermark: this.eventWatermarks.get(topic)?.watermarkFor(this.allowedLatenessForTopic(topic)),
         duplicateMessages: stats.duplicateMessages,
         aliasRetiredMessages: stats.aliasRetiredMessages,
         filteredMessages: stats.filteredMessages,
