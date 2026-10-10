@@ -41,6 +41,8 @@ import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import {
   TraceRecorder,
+  formatTraceparent,
+  newSpanId,
   resolveTraceOptions,
   validateTraceparent,
   type TraceOptions,
@@ -1416,6 +1418,12 @@ export interface BusStats {
    */
   aliases: TopicAliasInfo[];
   /**
+   * Every registered topic route (see `EventBus.setTopicRoute`): the
+   * forwarding table with each route's forward count. A snapshot —
+   * mutating it does not affect the bus.
+   */
+  routes: TopicRouteInfo[];
+  /**
    * Total messages skipped by subscriber content filters — the sum of
    * every topic's `filteredMessages`. See `TopicStats.filteredMessages`
    * for the exact counting rules.
@@ -2614,6 +2622,52 @@ export interface TopicAliasInfo {
 }
 
 /**
+ * Filter for a topic route (see `EventBus.setTopicRoute`): decides which
+ * admitted messages on the source topic are forwarded to the destination.
+ * Receives the message payload and a small metadata record (`topic` is the
+ * alias-resolved source topic, `seq` the message's per-topic sequence
+ * number, `messageId` the envelope identity when the publish carried
+ * one). Return `true` to forward, `false` to skip. A predicate that throws
+ * propagates the error to the publish caller — like a throwing schema
+ * validator — after the source message itself was admitted and fanned
+ * out; keep predicates pure and total.
+ */
+export type RoutePredicate = (
+  payload: unknown,
+  meta: { topic: string; seq: number; messageId?: string },
+) => boolean;
+
+/** Options for `EventBus.setTopicRoute`. */
+export interface TopicRouteOptions {
+  /**
+   * Optional per-message filter (see `RoutePredicate`): only messages the
+   * predicate accepts are forwarded. Absent means every admitted message
+   * on the source topic is forwarded.
+   */
+  predicate?: RoutePredicate;
+}
+
+/**
+ * One registered topic route (see `EventBus.setTopicRoute`), as exposed by
+ * `getStats().routes`. A snapshot — mutating it does not affect the bus.
+ */
+export interface TopicRouteInfo {
+  /** The source topic: admitted messages here are forwarded. */
+  src: string;
+  /** The destination topic: the forwarded publish's topic. */
+  dst: string;
+  /** Whether the route carries a predicate filter. */
+  predicate: boolean;
+  /**
+   * How many source messages this route forwarded: incremented every time
+   * the route matched and a destination publish was initiated — including
+   * attempts the destination's admission gates (ACL, schema, rate-limit)
+   * then rejected. Re-registering the route resets the count.
+   */
+  forwarded: number;
+}
+
+/**
  * Broker-level topic ACL (EB-41): per-topic publish/subscribe permissions
  * with allow/deny decisions on wildcard patterns.
  *
@@ -2803,6 +2857,17 @@ export interface PublishOptions {
    * empty value is treated as absent.
    */
   messageId?: string;
+  /**
+   * Marks this publish as already-routed (see `EventBus.setTopicRoute`):
+   * a routed message never triggers topic routing again, so a route
+   * chain (`a → b → c`) forwards one hop per message and a publish can
+   * never be amplified into a loop by the route table. The bus sets this
+   * on the forwarded publish itself; setting it on a direct publish opts
+   * that publish out of routing (an escape hatch for producers that
+   * already handled the fan-out themselves). Inert when no route matches
+   * the topic.
+   */
+  routed?: boolean;
 }
 
 /**
@@ -3348,6 +3413,15 @@ export class EventBus {
    */
   private aliasReverse = new Map<string, Set<string>>();
   /**
+   * Registered topic routes (EB-50), keyed by source topic: at most one
+   * route per source — re-registering replaces it (and resets its
+   * forwarded count). A route fires when a non-routed message is admitted
+   * on `src`: the message is forwarded to `dst` as a normal destination
+   * publish (full dst admission, dst-side sequence and rate-limit budget),
+   * carrying the source message's trace id and TTL deadline.
+   */
+  private topicRoutes = new Map<string, { dst: string; predicate?: RoutePredicate; forwarded: number }>();
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -3843,6 +3917,90 @@ export class EventBus {
     const removed = this.topicAliases.delete(oldTopic);
     if (removed) this.rebuildAliasReverse();
     return removed;
+  }
+
+  /**
+   * Registers a topic route: every message admitted on `src` is
+   * automatically forwarded to `dst` (EB-50). The forward is a normal
+   * `dst` publish — it goes through the destination's full admission
+   * pipeline (broker-level ACL, schema validation, rate-limit budget) and
+   * consumes the destination's sequence number and rate-limit budget, so
+   * destination-side gates see the routed message exactly as if a
+   * producer had published it there directly. The routed message keeps
+   * the source message's identity where it matters:
+   * - the end-to-end trace id is propagated (the forwarded publish
+   *   continues the source message's trace — its `bus.publish` root span
+   *   shares the trace id), and the application `key` / `messageId` ride
+   *   along so per-key publish order (EB-36) and subscriber-side dedup
+   *   keep working across the route;
+   * - the TTL deadline is carried over verbatim — routing never resets
+   *   it. When the source message had no deadline, the destination's TTL
+   *   rules apply normally (ordinary `publish(dst)` semantics).
+   *
+   * The forwarded message is marked `routed` (`PublishOptions.routed`), so
+   * it never triggers routing again: a route chain (`a → b → c`) forwards
+   * one hop per message, and the route table can never amplify a message
+   * into a loop. Registration additionally rejects cycles outright — a
+   * route that would close a loop (`a → b` live, then `b → a`; longer
+   * chains like `a → b → c → a` too) throws `RangeError`, as does a
+   * self-route (`src === dst`).
+   *
+   * Routes are matched against the alias-resolved publish topic (see
+   * `setTopicAlias`): like schema, rate-limit and TTL, routing keys off
+   * the real topic, so a route registered on an old topic name does not
+   * fire while that name is aliased elsewhere.
+   *
+   * With `opts.predicate` only messages the predicate accepts are
+   * forwarded (see `RoutePredicate`); without it every admitted message
+   * forwards. The predicate runs after the source message is admitted and
+   * fanned out — a throwing predicate propagates to the publish caller,
+   * like a throwing schema validator.
+   *
+   * Re-registering an existing `src` replaces its route (and resets its
+   * forwarded count). `getStats().routes` exposes the live route table.
+   *
+   * Throws `RangeError` on empty topic names, a self-route, a cycle, or a
+   * non-function `predicate` — before anything is mutated.
+   */
+  setTopicRoute(src: string, dst: string, opts?: TopicRouteOptions): void {
+    if (typeof src !== 'string' || src.length === 0) {
+      throw new RangeError('src must be a non-empty string');
+    }
+    if (typeof dst !== 'string' || dst.length === 0) {
+      throw new RangeError('dst must be a non-empty string');
+    }
+    if (src === dst) {
+      throw new RangeError(`topic route "${src}" cannot target itself`);
+    }
+    const predicate = opts?.predicate;
+    if (predicate !== undefined && typeof predicate !== 'function') {
+      throw new RangeError('predicate must be a function');
+    }
+    // Cycle check: following the registered routes from dst must not reach
+    // src, or the new registration would close a forwarding loop. At most
+    // one route exists per source, so the walk is a simple chain; reaching
+    // src throws before the table is mutated.
+    let cursor: string | undefined = dst;
+    const seen = new Set<string>();
+    while (cursor !== undefined && !seen.has(cursor)) {
+      if (cursor === src) {
+        throw new RangeError(
+          `topic route "${src}" -> "${dst}" would close a routing cycle`,
+        );
+      }
+      seen.add(cursor);
+      cursor = this.topicRoutes.get(cursor)?.dst;
+    }
+    this.topicRoutes.set(src, { dst, predicate, forwarded: 0 });
+  }
+
+  /**
+   * Removes the topic route previously registered for `src`. Returns true
+   * when a route existed and was removed. After removal, publishes to
+   * `src` are no longer forwarded.
+   */
+  clearTopicRoute(src: string): boolean {
+    return this.topicRoutes.delete(src);
   }
 
   /** True while the alias entry still forwards on the bus clock. */
@@ -6032,6 +6190,7 @@ export class EventBus {
       undefined,
       opts?.traceparent,
       opts?.messageId,
+      opts?.routed ?? false,
     );
     this.scheduleFlush();
     return accepted;
@@ -6113,6 +6272,7 @@ export class EventBus {
         undefined,
         opts?.traceparent,
         opts?.messageId,
+        opts?.routed ?? false,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -6144,6 +6304,7 @@ export class EventBus {
       undefined,
       opts?.traceparent,
       messageId,
+      opts?.routed ?? false,
     );
     this.scheduleFlush();
     if (admitted) {
@@ -7535,6 +7696,15 @@ export class EventBus {
    * per-key sequence number drawn during `publishAtomic` admission — the
    * commit phase must reuse it verbatim so the batch keeps its admission
    * order; direct publishes draw theirs below, after the admission gates.
+   *
+   * `routed` marks a publish that already travelled a topic route (see
+   * `PublishOptions.routed` / `EventBus.setTopicRoute`): routed messages
+   * never trigger routing again, so one message forwards at most one hop
+   * and the route table cannot amplify it into a loop. `routedExpiresAt`
+   * carries a TTL deadline stamped by an earlier publish in the chain —
+   * when defined it is used verbatim (a route forward never resets the
+   * deadline); when undefined the destination's own TTL rules apply
+   * normally. Only the route forwarder sets it.
    */
   private fanOut(
     topic: string,
@@ -7545,6 +7715,8 @@ export class EventBus {
     preassignedKeySeq?: number,
     traceparent?: string,
     messageId?: string,
+    routed = false,
+    routedExpiresAt?: number,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -7707,9 +7879,18 @@ export class EventBus {
     // `delayed !== undefined` check instead of `??`: an explicit "no
     // deadline" from schedule time must not fall through to the rules in
     // effect now (a rule added in between does not retroactively expire
-    // the message).
+    // the message). A routed forward carries the source message's deadline
+    // verbatim — routing never resets it — so it wins over the
+    // destination's own TTL rules; when the source message had no
+    // deadline, the destination's rules apply normally.
     const expiresAt =
-      delayed !== undefined ? delayed.expiresAt : ttlMs === undefined ? undefined : nowMs + ttlMs;
+      routedExpiresAt !== undefined
+        ? routedExpiresAt
+        : delayed !== undefined
+          ? delayed.expiresAt
+          : ttlMs === undefined
+            ? undefined
+            : nowMs + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
     // Durable log (opt-in): persist the stamped message before fan-out, so a
     // crash between publish and delivery still leaves it replayable. Logging
@@ -7779,6 +7960,49 @@ export class EventBus {
       const traceEnd = this.now();
       openTrace.endFanout(traceEnd, matched, accepted);
       openTrace.endPublish(traceEnd);
+    }
+    // Topic routes (EB-50): a non-routed message admitted on a routed
+    // topic is forwarded to the route's destination as a normal dst
+    // publish — full dst admission (ACL, schema, rate-limit), dst-side
+    // sequence and rate-limit budget. Placement is deliberate: routing runs
+    // after the source message is admitted, logged and fanned out, so a
+    // throwing predicate can never corrupt the source delivery — it
+    // propagates to the publish caller, like a throwing schema validator.
+    // The forward carries the source message's trace id (the forwarded
+    // publish continues the same trace) and its TTL deadline verbatim
+    // (never reset by routing); the application key and message id ride
+    // along so per-key publish order and subscriber-side dedup keep
+    // working across the route. The forwarded message is marked routed,
+    // so it never triggers routing again — one hop per message. The
+    // forward is a side effect: it does not change this call's returned
+    // accepted count, and the outer publish still schedules a single
+    // flush for both messages.
+    if (!routed && this.topicRoutes.size > 0) {
+      const route = this.topicRoutes.get(topic);
+      if (route !== undefined) {
+        const routeMeta = {
+          topic,
+          seq: msg.seq,
+          ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+        };
+        if (route.predicate === undefined || route.predicate(payload, routeMeta)) {
+          route.forwarded += 1;
+          this.fanOut(
+            route.dst,
+            payload,
+            false,
+            undefined,
+            keyed?.key,
+            undefined,
+            openTrace === undefined
+              ? undefined
+              : formatTraceparent(openTrace.traceId, newSpanId()),
+            cleanMessageId,
+            true,
+            expiresAt,
+          );
+        }
+      }
     }
     return { matched, accepted, admitted: true };
   }
@@ -8040,6 +8264,12 @@ export class EventBus {
         newTopic: entry.newTopic,
         ...(entry.expiresAt === undefined ? {} : { expiresAt: entry.expiresAt }),
         expired: !this.aliasEntryLive(entry),
+      })),
+      routes: [...this.topicRoutes.entries()].map(([src, entry]) => ({
+        src,
+        dst: entry.dst,
+        predicate: entry.predicate !== undefined,
+        forwarded: entry.forwarded,
       })),
       filteredMessages: this.totalFiltered,
       deadLetteredMessages: this.totalDeadLettered,

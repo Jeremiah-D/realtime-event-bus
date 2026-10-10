@@ -384,6 +384,31 @@ library.
   is `(resolved topic, messageId)`), `publishAtomic` (shadow admission
   resolves first; a retired old topic aborts the batch with reason
   `'alias-retired'`), and `publishDelayed` (resolved at schedule time).
+- **Topic routes** (in `src/bus.ts`, via `setTopicRoute(src, dst,
+  { predicate })`): forward every message admitted on `src` to `dst`
+  automatically. The forward is a normal `dst` publish — it passes the
+  destination's full admission pipeline (broker-level ACL, schema
+  validation, rate-limit budget) and consumes the destination's sequence
+  number and rate-limit budget, exactly as if a producer had published
+  there directly. Identity is preserved across the hop: the forwarded
+  message continues the source message's end-to-end trace (same `traceId`),
+  keeps its TTL deadline verbatim (routing never resets it — when the
+  source message had no deadline, the destination's TTL rules apply
+  normally), and carries the application `key` / `messageId` along so
+  per-key publish order and subscriber-side dedup keep working across the
+  route. The forwarded message is marked `routed`
+  (`PublishOptions.routed`), so it never triggers routing again — a route
+  chain (`a → b → c`) forwards one hop per message, and registration
+  additionally rejects cycles (`a → b` live, then `b → a`, or longer
+  chains) and self-routes with `RangeError`. Routes match the
+  alias-resolved publish topic, like every other admission gate. An
+  optional `predicate(payload, { topic, seq, messageId })` filters which
+  messages forward (a throwing predicate propagates to the publish caller,
+  like a throwing schema validator). Re-registering a `src` replaces its
+  route (and resets its count); `clearTopicRoute(src)` removes it.
+  `getStats().routes` exposes the table (`{ src, dst, predicate,
+  forwarded }`), with `forwarded` counting every forward attempt —
+  including attempts the destination's admission gates then rejected.
 - **Per-topic payload compression** (in `src/bus.ts`, via
   `setTopicCompression(pattern, { thresholdBytes, level })`): opt-in
   `node:zlib` deflate for large payloads — zero new dependencies. A publish
