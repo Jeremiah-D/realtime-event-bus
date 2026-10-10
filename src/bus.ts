@@ -214,6 +214,19 @@ export interface SubscribeOptions {
   /** Drop policy when the queue is full (default 'drop-oldest'). */
   dropPolicy?: DropPolicy;
   /**
+   * Opt-in byte budget for the subscriber's backpressure queue, in bytes.
+   * With it, the queue is bounded by both `queueSize` (count) and
+   * `queueMaxBytes` (bytes): a message whose admission would push the
+   * buffered payload total over the budget sheds entries per
+   * `dropPolicy`, exactly like count evictions — the shed counts into
+   * `droppedCount` and surfaces as a sequence gap. Payload size is
+   * estimated as JSON UTF-8 bytes (unserializable payloads count as 0);
+   * mixed big/small message streams can no longer blow memory through a
+   * count-only queue. Disabled by default. Must be a positive finite
+   * number when given.
+   */
+  queueMaxBytes?: number;
+  /**
    * Called when the subscriber falls behind: its queue reached the high-water
    * mark (80% of capacity). Fires once per excursion and re-arms after the
    * queue drains below the mark — use it to shed load upstream, alert an
@@ -1480,6 +1493,13 @@ export interface BusStats {
    * sum of the per-subscriber `droppedCount` values for live subscribers.
    */
   droppedMessages: number;
+  /**
+   * Estimated buffered payload bytes across all live subscriber
+   * backpressure queues (see `SubscribeOptions.queueMaxBytes`). The
+   * memory-pressure signal that a count-only queue hides: with mixed
+   * big/small messages, `droppedMessages` stays 0 while this climbs.
+   */
+  queueBytes: number;
   /**
    * Total messages shed at the publish side by adaptive publish-side
    * throttling (see `SubscribeOptions.throttle`) — the sum of every
@@ -3480,6 +3500,18 @@ function serializeToJson(payload: unknown): string | undefined {
 }
 
 /**
+ * Estimates a payload's buffered byte size as JSON UTF-8 bytes — the
+ * estimator the bus hands to byte-budgeted backpressure queues (see
+ * `SubscribeOptions.queueMaxBytes`). Unserializable payloads estimate as
+ * 0 (see `serializeToJson`): the byte budget is a JSON-shape measure, and
+ * pretending an unknown size is a real number would corrupt it.
+ */
+function payloadByteSize(payload: unknown): number {
+  const serialized = serializeToJson(payload);
+  return serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+}
+
+/**
  * Options for `EventBus.publishIdempotent`: `PublishOptions` plus the
  * idempotency key.
  *
@@ -5321,6 +5353,10 @@ export class EventBus {
     }
     const id = `sub-${++this.nextId}`;
     const capacity = opts?.queueSize ?? 100;
+    const queueMaxBytes = opts?.queueMaxBytes;
+    if (queueMaxBytes !== undefined && (!Number.isFinite(queueMaxBytes) || queueMaxBytes <= 0)) {
+      throw new RangeError('subscribe: queueMaxBytes must be a positive finite number of bytes');
+    }
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
     const onThrottled = opts?.onThrottled;
@@ -5374,6 +5410,12 @@ export class EventBus {
       capacity,
       policy: opts?.dropPolicy ?? 'drop-oldest',
       highWaterMarkRatio: opts?.highWaterMarkRatio,
+      ...(queueMaxBytes === undefined
+        ? {}
+        : {
+            maxBytes: queueMaxBytes,
+            byteSize: (msg: BusMessage) => payloadByteSize(msg.payload),
+          }),
       // The internal wrappers are registered whenever throttling is enabled,
       // even without user callbacks: the bus needs the excursion signals to
       // engage/disengage the throttle.
@@ -9444,6 +9486,10 @@ export class EventBus {
       totalPublished: this.totalPublished,
       deliveredMessages: this.totalDelivered,
       droppedMessages: this.totalDropped,
+      queueBytes: [...this.subscribers.values()].reduce(
+        (sum, subscriber) => sum + subscriber.queue.queueBytes,
+        0,
+      ),
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
       unackedDeliveries,

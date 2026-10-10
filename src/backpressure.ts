@@ -23,16 +23,47 @@ export interface BoundedQueueOptions<T> {
    * (0, 1]. Adjustable at runtime via `setHighWaterMarkRatio`.
    */
   highWaterMarkRatio?: number;
+  /**
+   * Opt-in byte budget for the queued items, in bytes. When set, the queue
+   * is bounded by both `capacity` (count) and `maxBytes` (bytes): an item
+   * whose admission would push the buffered total over `maxBytes` sheds
+   * entries per `policy` until it fits. `drop-newest` discards the incoming
+   * item; `drop-oldest` evicts the oldest lowest-priority entries (the
+   * incoming item itself when it is strictly the lowest priority). An item
+   * larger than the entire budget is never admitted — with `drop-oldest`
+   * there is nothing to evict for it. Must be a positive finite number
+   * when given. Byte-budget evictions count into `droppedCount` (and
+   * `droppedByPriority`) exactly like count evictions.
+   */
+  maxBytes?: number;
+  /**
+   * Estimates an item's buffered byte size. Defaults to the item's JSON
+   * UTF-8 byte length (unserializable items estimate as 0). Must return a
+   * non-negative finite number — a push whose estimate is not finite or
+   * negative throws `RangeError`.
+   */
+  byteSize?: (item: T) => number;
 }
 
 interface QueueEntry<T> {
   item: T;
   priority: Priority;
+  bytes: number;
   /**
    * Absolute expiry timestamp in milliseconds (same clock as the caller's
    * `nowMs` argument to `drainLive`). Entries without one never expire.
    */
   expiresAt?: number;
+}
+
+/** Default byte estimator: JSON UTF-8 byte length, 0 when unserializable. */
+function defaultByteSize(item: unknown): number {
+  try {
+    const serialized = JSON.stringify(item);
+    return serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+  } catch {
+    return 0;
+  }
 }
 
 export class BoundedQueue<T> {
@@ -46,6 +77,9 @@ export class BoundedQueue<T> {
   private dropped = 0;
   private readonly droppedByPriorityCount = new Map<Priority, number>();
   private expired = 0;
+  private readonly maxBytes?: number;
+  private readonly byteSize: (item: T) => number;
+  private bytesTotal = 0;
 
   constructor(options: BoundedQueueOptions<T>) {
     if (!Number.isInteger(options.capacity) || options.capacity <= 0) {
@@ -57,6 +91,16 @@ export class BoundedQueue<T> {
     this.onDrained = options.onDrained;
     this.highWaterMarkFraction = options.highWaterMarkRatio ?? 0.8;
     BoundedQueue.checkRatio(this.highWaterMarkFraction);
+    if (options.maxBytes !== undefined) {
+      if (!Number.isFinite(options.maxBytes) || options.maxBytes <= 0) {
+        throw new RangeError('maxBytes must be a positive finite number of bytes');
+      }
+      this.maxBytes = options.maxBytes;
+    }
+    if (options.byteSize !== undefined && typeof options.byteSize !== 'function') {
+      throw new TypeError('byteSize must be a function');
+    }
+    this.byteSize = options.byteSize ?? defaultByteSize;
   }
 
   private static checkRatio(ratio: number): void {
@@ -67,6 +111,16 @@ export class BoundedQueue<T> {
 
   get size(): number {
     return this.entries.length;
+  }
+
+  /**
+   * Estimated buffered bytes across the queued entries (see
+   * `BoundedQueueOptions.maxBytes` / `byteSize`). Always 0 when no byte
+   * budget is configured — the queue does not measure items it does not
+   * need to budget.
+   */
+  get queueBytes(): number {
+    return this.bytesTotal;
   }
 
   get droppedCount(): number {
@@ -118,12 +172,19 @@ export class BoundedQueue<T> {
   }
 
   /**
-   * Enqueues an item. When the queue is full:
-   * - `drop-newest`: the incoming item is discarded.
-   * - `drop-oldest`: the oldest entry with the lowest priority is shed to make
-   *   room — unless the incoming item itself is the strictly lowest-priority
-   *   one, in which case the incoming item is discarded instead. High-priority
-   *   messages are therefore dropped last.
+   * Enqueues an item. The queue is bounded by `capacity` (count) and,
+   * when configured, by `maxBytes` (bytes) — the count dimension is
+   * enforced first, then the byte dimension:
+   * - `drop-newest`: the incoming item is discarded on either dimension.
+   * - `drop-oldest`: the oldest entry with the lowest priority is shed to
+   *   make room — unless the incoming item itself is the strictly
+   *   lowest-priority one, in which case the incoming item is discarded
+   *   instead. High-priority messages are therefore dropped last.
+   *
+   * When the byte budget is configured, an item larger than the entire
+   * budget is never admitted: `drop-newest` discards it, and `drop-oldest`
+   * has nothing to evict for it. Byte-budget evictions count into
+   * `droppedCount` (and `droppedByPriority`) exactly like count evictions.
    *
    * `expiresAt` is an absolute timestamp (milliseconds, same clock the caller
    * passes to `drainLive`); entries without one never expire. Expiry is only
@@ -137,26 +198,41 @@ export class BoundedQueue<T> {
     if (expiresAt !== undefined && (!Number.isFinite(expiresAt) || expiresAt < 0)) {
       throw new RangeError('expiresAt must be a non-negative finite timestamp');
     }
-    if (this.entries.length < this.capacity) {
-      this.entries.push({ item, priority, expiresAt });
-      this.checkHighWaterMark();
-      return 'accepted';
+    const bytes = this.maxBytes === undefined ? 0 : this.measure(item);
+    if (this.entries.length >= this.capacity) {
+      if (this.policy === 'drop-newest') {
+        this.recordDrop(priority);
+        return 'dropped';
+      }
+      const victimIndex = this.findShedVictimIndex(priority);
+      if (victimIndex === -1) {
+        // The incoming item is strictly lower priority than everything queued:
+        // dropping it protects the higher-priority backlog.
+        this.recordDrop(priority);
+        return 'dropped';
+      }
+      this.evict(victimIndex);
     }
-    if (this.policy === 'drop-newest') {
-      this.recordDrop(priority);
-      return 'dropped';
+    if (this.maxBytes !== undefined) {
+      // Byte dimension: shed per the drop policy until the incoming item
+      // fits. `drop-newest` never evicts for the newcomer; with an empty
+      // queue there is nothing to evict — an item larger than the whole
+      // budget is never admitted, whichever the policy.
+      while (this.bytesTotal + bytes > this.maxBytes) {
+        if (this.policy === 'drop-newest' || this.entries.length === 0) {
+          this.recordDrop(priority);
+          return 'dropped';
+        }
+        const victimIndex = this.findShedVictimIndex(priority);
+        if (victimIndex === -1) {
+          this.recordDrop(priority);
+          return 'dropped';
+        }
+        this.evict(victimIndex);
+      }
     }
-    // 'drop-oldest' with priority-aware shedding.
-    const victimIndex = this.findShedVictimIndex(priority);
-    if (victimIndex === -1) {
-      // The incoming item is strictly lower priority than everything queued:
-      // dropping it protects the higher-priority backlog.
-      this.recordDrop(priority);
-      return 'dropped';
-    }
-    this.recordDrop(this.entries[victimIndex].priority);
-    this.entries.splice(victimIndex, 1);
-    this.entries.push({ item, priority, expiresAt });
+    this.entries.push({ item, priority, bytes, expiresAt });
+    this.bytesTotal += bytes;
     this.checkHighWaterMark();
     return 'accepted';
   }
@@ -165,6 +241,7 @@ export class BoundedQueue<T> {
   drain(): T[] {
     const items = this.entries.map((entry) => entry.item);
     this.entries = [];
+    this.bytesTotal = 0;
     this.maybeFireDrained();
     return items;
   }
@@ -206,18 +283,22 @@ export class BoundedQueue<T> {
     const live: T[] = [];
     const expired: T[] = [];
     const rest: QueueEntry<T>[] = [];
+    let removedBytes = 0;
     for (const entry of this.entries) {
       if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) {
         expired.push(entry.item);
+        removedBytes += entry.bytes;
         continue;
       }
       if (live.length < maxLive) {
         live.push(entry.item);
+        removedBytes += entry.bytes;
       } else {
         rest.push(entry);
       }
     }
     this.entries = rest;
+    this.bytesTotal -= removedBytes;
     this.maybeFireDrained();
     this.expired += expired.length;
     return { live, expired };
@@ -243,6 +324,26 @@ export class BoundedQueue<T> {
       priority,
       (this.droppedByPriorityCount.get(priority) ?? 0) + 1,
     );
+  }
+
+  /**
+   * Measures an item's buffered byte size via the configured estimator.
+   * Throws `RangeError` when the estimator does not return a non-negative
+   * finite number — a silently wrong size would corrupt the budget.
+   */
+  private measure(item: T): number {
+    const bytes = this.byteSize(item);
+    if (!Number.isFinite(bytes) || bytes < 0) {
+      throw new RangeError('byteSize must return a non-negative finite number');
+    }
+    return bytes;
+  }
+
+  /** Sheds one queued entry: removes it, frees its bytes, counts the drop. */
+  private evict(index: number): void {
+    const [entry] = this.entries.splice(index, 1);
+    this.bytesTotal -= entry.bytes;
+    this.recordDrop(entry.priority);
   }
 
   private checkHighWaterMark(): void {

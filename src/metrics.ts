@@ -271,6 +271,11 @@ export function renderPrometheus(stats: BusStats): string {
     'Delayed messages scheduled but not yet due.',
     stats.pendingDelayed,
   );
+  gauge(
+    'eventbus_queue_bytes',
+    'Estimated buffered payload bytes across all live subscriber backpressure queues.',
+    stats.queueBytes ?? 0,
+  );
 
   // Per-subscriber delivery-latency series (only subscriptions with
   // `deliveryLatency` enabled), in subscription order (same as

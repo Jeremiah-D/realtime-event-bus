@@ -135,6 +135,7 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     filteredMessages: 0,
     deadLetteredMessages: 0,
     diagnosticEvents: 0,
+    queueBytes: 0,
     compressedMessages: 0,
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,

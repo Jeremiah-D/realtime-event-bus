@@ -45,7 +45,14 @@ library.
   queue drains — when a subscriber's queue reaches its 80% high-water mark,
   reporting queue size, capacity, and the cumulative `droppedCount`. A
   mirrored `onDrained` callback fires when the queue recedes below the mark,
-  signalling the consumer may resume full speed. `subscribeReliable()` opts a
+  signalling the consumer may resume full speed. Opt-in `queueMaxBytes`
+  adds a byte budget on top of the count bound: payloads are estimated as
+  JSON UTF-8 bytes, and a message whose admission would overflow the budget
+  sheds entries per the subscriber's `dropPolicy` exactly like count
+  evictions — the shed counts into `droppedCount` and surfaces as a
+  sequence gap. A count-only queue cannot see memory pressure from a few
+  huge messages among many small ones; `getStats().queueBytes` exposes the
+  live buffered byte total across subscribers. `subscribeReliable()` opts a
   subscriber into at-least-once delivery: the handler receives a `Delivery`
   envelope (`msg`, per-subscriber `seq`, `redeliveries` count) with `ack()` /
   `nack()` — `nack()` requeues immediately at the tail (FIFO order kept),
@@ -994,6 +1001,13 @@ npm test
   behavior, drain ordering, runtime watermark adjustment (`setHighWaterMarkRatio`,
   validation, mid-excursion lowering/raising semantics) and the `onDrained`
   recovery callback.
+- `test/byte-budget.test.ts` — byte-budgeted backpressure queues: count+bytes
+  dual-dimension shedding per drop policy, priority-aware byte eviction,
+  oversized-item rejection, byte accounting across `drainLiveUpTo`,
+  `maxBytes`/`byteSize` validation, the JSON default estimator, the bus-level
+  `queueMaxBytes` subscribe option (dropped + sequence-gap parity with count
+  evictions, fail-fast validation, `getStats().queueBytes`, the
+  `eventbus_queue_bytes` gauge), and zero overhead when the budget is off.
 - `test/ack.test.ts` — at-least-once delivery: ack suppresses redelivery,
   nack redelivers immediately with a bumped `redeliveries` count, ack timeout
   auto-requeues, double/late settles are no-ops, unsubscribe cancels pending
@@ -1278,6 +1292,7 @@ Exported series:
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
 | `eventbus_dedup_dropped_messages_total` | counter | `dedupDropped` — subscriber exactly-once dedup suppressions |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
+| `eventbus_diagnostic_events_total` | counter | `diagnosticEvents` — admitted DLQ diagnostic events |
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
 | `eventbus_keyed_reordered_messages_total` | counter | `keyedReorderedMessages` — keyed messages held in per-(subscriber, key) reorder buffers |
 | `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
@@ -1287,6 +1302,7 @@ Exported series:
 | `eventbus_degraded_subscribers` | gauge | `degradedSubscribers` |
 | `eventbus_shaped_subscribers` | gauge | `shapedSubscribers` |
 | `eventbus_pending_delayed` | gauge | `pendingDelayed` |
+| `eventbus_queue_bytes` | gauge | `queueBytes` — buffered payload bytes across subscriber queues |
 | `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
 | `eventbus_delivery_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→delivery queue-dwell p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `deliveryLatency`-tracked subscriptions |
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
