@@ -856,6 +856,23 @@ export interface DeadLetterOptions {
    * dead-lettering, synchronously with the move.
    */
   onDeadLetter?: (event: DeadLetterEvent) => void;
+  /**
+   * Opt-in centralized poison-message diagnostics (see
+   * `ReliableSubscribeOptions.deadLetter`): when a message is
+   * dead-lettered, the bus publishes one diagnostic event to this topic —
+   * the original payload plus `{ subscriberId, pattern, seq, lastError,
+   * redeliveries, traceId, deadLetteredAt }` metadata — so operators can
+   * consume and alert on every poison message from a single topic instead
+   * of polling per-subscriber DLQs.
+   *
+   * The diagnostic event goes through the normal publish pipeline (ACL,
+   * schema validation, rate limiting); when admission rejects it, no
+   * diagnostic is emitted but the DLQ move itself is unaffected. A
+   * diagnostic event that itself dead-letters never emits a second
+   * diagnostic — recursion is cut at the source. Must be a non-empty
+   * string when given.
+   */
+  diagnosticTopic?: string;
 }
 
 /**
@@ -1571,6 +1588,14 @@ export interface BusStats {
    */
   deadLetteredMessages: number;
   /**
+   * Total DLQ diagnostic events admitted to their diagnostic topic (see
+   * `DeadLetterOptions.diagnosticTopic`). Counted on admission, not
+   * delivery — the event exists even when nothing subscribes to the
+   * diagnostic topic yet. Admission rejections (ACL, schema validation)
+   * do not count.
+   */
+  diagnosticEvents: number;
+  /**
    * Total messages delivered with a compressed payload — the sum of every
    * topic's `compressedMessages`. See `TopicStats.compressedMessages` for
    * the exact counting rules.
@@ -2086,6 +2111,7 @@ interface SubscriberDeadLetter {
   maxEntries: number;
   nextSeq: number;
   onDeadLetter?: (event: DeadLetterEvent) => void;
+  diagnosticTopic?: string;
 }
 
 /**
@@ -2230,7 +2256,7 @@ function thrownErrorMessage(err: unknown): string {
 function normalizeDeadLetterOptions(
   opt: boolean | DeadLetterOptions | undefined,
   caller: string,
-): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'onDeadLetter'> | null {
+): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'onDeadLetter' | 'diagnosticTopic'> | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError(`${caller}: deadLetter must be true or a DeadLetterOptions object`);
@@ -2247,7 +2273,11 @@ function normalizeDeadLetterOptions(
   if (o.onDeadLetter !== undefined && typeof o.onDeadLetter !== 'function') {
     throw new TypeError(`${caller}: deadLetter.onDeadLetter must be a function`);
   }
-  return { maxRedeliveries, maxEntries, onDeadLetter: o.onDeadLetter };
+  const diagnosticTopic = o.diagnosticTopic;
+  if (diagnosticTopic !== undefined && (typeof diagnosticTopic !== 'string' || diagnosticTopic.length === 0)) {
+    throw new RangeError(`${caller}: deadLetter.diagnosticTopic must be a non-empty string`);
+  }
+  return { maxRedeliveries, maxEntries, onDeadLetter: o.onDeadLetter, diagnosticTopic };
 }
 
 /**
@@ -3804,6 +3834,20 @@ export class EventBus {
    * including replays that failed again.
    */
   private totalDeadLettered = 0;
+  /**
+   * Messages flagged as DLQ diagnostics at creation (see
+   * `DeadLetterOptions.diagnosticTopic`). A dead-lettered diagnostic
+   * message never emits a second diagnostic — the recursion cut. The mark
+   * is bus-side so a user payload can never collide with it.
+   */
+  private readonly diagnosticMessages = new WeakSet<BusMessage>();
+  /**
+   * Total DLQ diagnostic events admitted to their diagnostic topic (see
+   * `DeadLetterOptions.diagnosticTopic`). Counted on admission, not
+   * delivery: the event exists even when nobody subscribes to the topic
+   * yet. Admission rejections (ACL/schema) do not count.
+   */
+  private totalDiagnosticEvents = 0;
   /**
    * Per-topic payload compression rules, keyed by the exact string passed
    * to `setTopicCompression` — either a concrete topic name or a wildcard
@@ -8758,6 +8802,11 @@ export class EventBus {
    * when defined it is used verbatim (a route forward never resets the
    * deadline); when undefined the destination's own TTL rules apply
    * normally. Only the route forwarder sets it.
+   *
+   * `diagnostic` marks a message published by the DLQ diagnostic emitter
+   * (see `DeadLetterOptions.diagnosticTopic`): a dead-lettered diagnostic
+   * message never emits a second diagnostic, cutting the recursion at the
+   * source. Only the bus's own diagnostic emitter sets it.
    */
   private fanOut(
     topic: string,
@@ -8771,6 +8820,7 @@ export class EventBus {
     routed = false,
     routedExpiresAt?: number,
     fromBridge = false,
+    diagnostic = false,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -8828,6 +8878,10 @@ export class EventBus {
       seq: this.nextSeq(topic),
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
     };
+    // EB-57: mark DLQ diagnostic messages at creation (the envelope marker
+    // is bus-side, so a user's payload can never collide with it) — a
+    // dead-lettered diagnostic message must not emit a second diagnostic.
+    if (diagnostic) this.diagnosticMessages.add(msg);
     const stats = this.statsFor(topic);
     stats.publishedMessages += 1;
     stats.lastSeq = msg.seq;
@@ -9428,6 +9482,7 @@ export class EventBus {
       ),
       filteredMessages: this.totalFiltered,
       deadLetteredMessages: this.totalDeadLettered,
+      diagnosticEvents: this.totalDiagnosticEvents,
       compressedMessages: this.totalCompressed,
       compressedBytesBefore: this.totalCompressedBytesBefore,
       compressedBytesAfter: this.totalCompressedBytesAfter,
@@ -9584,6 +9639,41 @@ export class EventBus {
       entry,
       evictedOldest,
     });
+    // EB-57: centralized poison-message diagnostics. A dead-lettered
+    // diagnostic message never emits a second diagnostic — the recursion
+    // cut above guarantees the fan-out here cannot loop back into itself.
+    // The diagnostic goes through the normal publish pipeline (ACL,
+    // schema, rate limit): an admission rejection means no diagnostic is
+    // emitted, and the DLQ move itself is unaffected. This runs inside the
+    // flush that dead-lettered the message; fan-out plus scheduleFlush is
+    // the same pattern the redelivery path below already uses.
+    if (dlq.diagnosticTopic !== undefined && !this.diagnosticMessages.has(msg)) {
+      const { admitted } = this.fanOut(
+        dlq.diagnosticTopic,
+        {
+          payload: msg.payload,
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          seq: entry.seq,
+          lastError: entry.lastError,
+          redeliveries: entry.redeliveries,
+          traceId: entry.traceId,
+          deadLetteredAt: entry.deadLetteredAt,
+        },
+        false, // preAdmitted
+        undefined, // delayed
+        undefined, // key
+        undefined, // preassignedKeySeq
+        undefined, // traceparent
+        undefined, // messageId
+        false, // routed
+        undefined, // routedExpiresAt
+        false, // fromBridge
+        true, // diagnostic
+      );
+      this.scheduleFlush();
+      if (admitted) this.totalDiagnosticEvents += 1;
+    }
   }
 
   /**

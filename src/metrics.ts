@@ -230,6 +230,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.deadLetteredMessages,
   );
   counter(
+    'eventbus_diagnostic_events_total',
+    'Total DLQ diagnostic events admitted to their diagnostic topic.',
+    stats.diagnosticEvents ?? 0,
+  );
+  counter(
     'eventbus_sequence_gaps_total',
     'Total sequence numbers observed missing by subscribers.',
     stats.sequenceGaps,

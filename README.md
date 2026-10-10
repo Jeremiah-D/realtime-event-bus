@@ -65,7 +65,16 @@ library.
   DLQ is bounded (`maxEntries`, default 1000, oldest evicted first) and a
   synchronously throwing handler counts as an immediate redelivery attempt
   rather than crashing the flush. `getStats().deadLetteredMessages` counts
-  every dead-lettering. Every message carries a per-topic `seq`
+  every dead-lettering. Opt-in `deadLetter.diagnosticTopic` fans each
+  dead-lettering out as one diagnostic event on the configured topic — the
+  original payload plus `{ subscriberId, pattern, seq, lastError,
+  redeliveries, traceId, deadLetteredAt }` metadata — so operators consume
+  and alert on every poison message from a single topic instead of polling
+  per-subscriber DLQs. The diagnostic goes through the normal publish
+  pipeline (ACL, schema validation, rate limiting); an admission rejection
+  suppresses it without affecting the DLQ move, and a dead-lettered
+  diagnostic message never emits a second diagnostic (no recursion).
+  `getStats().diagnosticEvents` counts admitted diagnostics. Every message carries a per-topic `seq`
   (monotonic from 1, assigned at publish time); the bus watches each
   subscriber's deliveries and counts skipped numbers into `getStats()`
   `sequenceGaps` (per topic and global, with `lastSeq` per topic) —
@@ -997,6 +1006,13 @@ npm test
   expired), fresh redelivery budget on replay, bounded eviction with
   `onDeadLetter`, option validation, `deadLetter: true` defaults, and the
   unchanged retry-forever behavior without the option.
+- `test/deadletter-topic.test.ts` — centralized poison-message diagnostics:
+  `deadLetter.diagnosticTopic` publishes one diagnostic event per
+  dead-lettering (original payload + subscriber/seq/error/traceId metadata),
+  a dead-lettered diagnostic never emits a second diagnostic (recursion
+  cut), diagnostics go through normal admission (ACL denial suppresses
+  without affecting the DLQ move), admission-time counting, and the
+  `eventbus_diagnostic_events_total` exposition series.
 - `test/poison.test.ts` — poison-message diagnosability on the DLQ:
   `lastError` records the handler's thrown message (or `nack`/`ack-timeout`
   when nothing was thrown) and always describes the final failure, batch
