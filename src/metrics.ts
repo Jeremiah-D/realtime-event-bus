@@ -81,6 +81,11 @@
  *   consumer-lag watermark — how long the oldest currently queued message
  *   has been waiting (0 when the queue is empty). The alerting signal;
  *   only subscriptions with `lagMonitor` enabled appear.
+ * - `eventbus_key_hotspot_buffer_depth{subscriber,pattern,key}`: the
+ *   current per-(subscriber, key) reorder-buffer depth for the hottest
+ *   keyed ordering streams (see `BusStats.hotKeys`) — the live signal
+ *   for per-key publish-order pile-up; only subscriptions with
+ *   `keyHotspot` enabled appear.
  * - `eventbus_topic_rate_msg_per_sec{topic,window}`: per-topic publish
  *   rate in messages per second over the trailing 1s / 1m / 5m windows
  *   (`window` is "1s", "1m" or "5m"), load-average style. Only the hot
@@ -101,7 +106,10 @@
  * `eventbus_topic_rate_msg_per_sec` series are the exception to the
  * per-topic rule: they are deliberately limited to the hot-topics set
  * (10 topics x 3 windows = 30 series max), because rate decisions need
- * the busiest topics, not the full topic space.
+ * the busiest topics, not the full topic space. The
+ * `eventbus_key_hotspot_buffer_depth` series are capped the same way at
+ * `HOT_KEYS_LIMIT` (10) by `BusStats.hotKeys`, and only hotspot-monitored
+ * subscriptions are sampled at all.
  *
  * `renderPrometheus` tolerates a stats object that predates the rate
  * fields (a missing `hotTopics` renders no rate series instead of
@@ -299,6 +307,21 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_lag_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
     lines.push(`eventbus_lag_samples{${labels}} ${s.samples}`);
     lines.push(`eventbus_lag_watermark_ms{${labels}} ${s.watermarkMs}`);
+  }
+
+  // Per-(subscriber, key) keyed ordering reorder-buffer depth (EB-47, only
+  // subscriptions with `keyHotspot` enabled), hottest first (same order as
+  // BusStats.hotKeys) — the live signal for per-key publish-order pile-up:
+  // a key whose depth keeps growing has a predecessor that is not fanning
+  // out. The `?? []` keeps the renderer tolerant of a stats object that
+  // predates the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_key_hotspot_buffer_depth Current per-(subscriber, key) reorder-buffer depth for the hottest keyed ordering streams (hottest first, at most 10).',
+  );
+  lines.push('# TYPE eventbus_key_hotspot_buffer_depth gauge');
+  for (const h of stats.hotKeys ?? []) {
+    const labels = `subscriber="${escapeLabelValue(h.subscriberId)}",pattern="${escapeLabelValue(h.pattern)}",key="${escapeLabelValue(h.key)}"`;
+    lines.push(`eventbus_key_hotspot_buffer_depth{${labels}} ${h.bufferedDepth}`);
   }
 
   // Per-topic series, in first-publish order (same as BusStats.topics).

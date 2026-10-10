@@ -524,6 +524,23 @@ library.
   monitored subscriber). `onLag` without `thresholdMs` throws `RangeError`
   (a callback that could never fire); other invalid options throw
   `RangeError`/`TypeError` from `subscribe`. Disabled by default.
+- **Per-(subscriber, key) hotspot monitoring** (in `src/keyhotspot.ts`, opt-in
+  via `subscribe(..., { keyHotspot: true })`): samples the depth of each of
+  the subscription's keyed ordering reorder buffers (see `PublishOptions.key`)
+  — the number of keyed messages held because an earlier keySeq has not been
+  fanned out yet. A shallow buffer is normal; a deep one means a predecessor
+  is stuck (a delayed schedule that never becomes due, a shed keySeq only
+  lazily skipped), the Kafka-hot-partition signal for keyed delivery.
+  `getStats()` exposes `hotKeys` (top 10 by depth, hottest first, each with
+  subscriber/pattern/key/depth/threshold); `src/metrics.ts` renders the
+  `eventbus_key_hotspot_buffer_depth{subscriber,pattern,key}` gauge (at most
+  10 series). With `onKeyHotspot`, a stream whose buffer reaches
+  `thresholdDepth` (default 100) fires the callback once per excursion,
+  re-arming after the depth drains below the threshold. Detection only reads
+  buffer depth — it never mutates the reorder buffer, the per-key
+  expectation, or delivery order. Only monitored subscriptions are sampled;
+  invalid options throw `RangeError`/`TypeError` from `subscribe`. Disabled
+  by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
   `new EventBus({ trace: true })`): one trace per sampled publish, threading
   the message through `bus.publish` → `bus.admission` → `bus.fanout` →
@@ -1026,6 +1043,7 @@ Exported series:
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
 | `eventbus_ack_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber accepted→ack end-to-end latency p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `ackLatency`-enabled reliable subscriptions |
 | `eventbus_ack_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's ack-latency window |
+| `eventbus_key_hotspot_buffer_depth{subscriber,pattern,key}` | gauge | current per-(subscriber, key) reorder-buffer depth, hottest 10; only `keyHotspot`-enabled subscriptions |
 | `eventbus_lag_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→drain dwell p50/p99 (`quantile` = "0.5"/"0.99"); only `lagMonitor`-enabled subscriptions |
 | `eventbus_lag_samples{subscriber,pattern}` | gauge | samples in the subscriber's lag dwell window |
 | `eventbus_lag_watermark_ms{subscriber,pattern}` | gauge | live consumer-lag watermark (oldest queued message dwell, 0 when empty); only `lagMonitor`-enabled subscriptions |

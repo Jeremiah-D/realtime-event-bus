@@ -21,6 +21,13 @@ import {
   type LagSummaryStats,
   type SubscriberLagState,
 } from './lag.ts';
+import {
+  HOT_KEYS_LIMIT,
+  resolveKeyHotspotOptions,
+  type HotKeyStat,
+  type KeyHotspotOptions,
+  type SubscriberKeyHotspotState,
+} from './keyhotspot.ts';
 import { DurableTopicLog } from './durablelog.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
@@ -345,6 +352,26 @@ export interface SubscribeOptions {
    * throws, since the callback could never fire. Disabled by default.
    */
   lagMonitor?: boolean | LagMonitorOptions;
+  /**
+   * Opt-in per-(subscriber, key) hotspot monitoring (see `PublishOptions.key`
+   * and `src/keyhotspot.ts`). When enabled, the bus samples the depth of
+   * each of this subscription's keyed ordering reorder buffers — the
+   * number of keyed messages held because an earlier keySeq has not been
+   * fanned out yet — and `getStats()` exposes the deepest streams as
+   * `hotKeys` (top 10, hottest first), with
+   * `eventbus_key_hotspot_buffer_depth` in `src/metrics.ts`. With
+   * `onKeyHotspot`, a stream whose buffer reaches `thresholdDepth` fires
+   * the callback once per excursion, re-arming after the depth drains
+   * below the threshold (mirroring `onBackpressure` / `onLag` latch
+   * semantics). Detection only reads buffer depth: it never mutates the
+   * reorder buffer, the per-key expectation, or delivery order.
+   *
+   * Pass `true` for the defaults (threshold 100, depth reporting with no
+   * alerting), or a `KeyHotspotOptions` object to tune the threshold and
+   * arm the alert. Invalid values throw `RangeError` / `TypeError` from
+   * `subscribe`. Disabled by default.
+   */
+  keyHotspot?: boolean | KeyHotspotOptions;
   /**
    * Opt-in subscriber health probing. When enabled, the bus watches every
    * delivery to this subscriber: a handler that throws, or one that takes
@@ -1491,6 +1518,17 @@ export interface BusStats {
    */
   keyedReorderedMessages: number;
   /**
+   * The hottest per-(subscriber, key) ordering streams by current
+   * reorder-buffer depth (see `SubscribeOptions.keyHotspot` and
+   * `src/keyhotspot.ts`), hottest first — at most `HOT_KEYS_LIMIT` (10)
+   * entries. Only subscriptions with hotspot monitoring enabled are
+   * sampled; entries carry the piling-up key, its current buffer depth,
+   * and the subscription's alert threshold. Empty when nothing is
+   * buffered anywhere monitored. The first place to look when keyed
+   * delivery stalls on a hot key.
+   */
+  hotKeys: HotKeyStat[];
+  /**
    * Sampled delivery-trace spans (see `EventBusOptions.trace` and
    * `src/trace.ts`), oldest first: every span of every sampled publish
    * since the bus was created, in completion order, bounded by
@@ -1681,6 +1719,11 @@ interface Subscriber {
    * Absent when monitoring is disabled for this subscriber.
    */
   lag?: SubscriberLagState;
+  /**
+   * Keyed hotspot monitoring state (see `SubscribeOptions.keyHotspot`).
+   * Absent when monitoring is disabled for this subscriber.
+   */
+  keyHotspot?: SubscriberKeyHotspotState;
   /**
    * Per-(subscriber, key) publish-order state for keyed messages (see
    * `PublishOptions.key`). Created lazily — a subscriber that never
@@ -4250,6 +4293,9 @@ export class EventBus {
     const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const keyHotspot = resolveKeyHotspotOptions(opts?.keyHotspot);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -4321,6 +4367,7 @@ export class EventBus {
       latency: deliveryLatency,
       ackLatency,
       lag: lagMonitor,
+      keyHotspot,
       batch,
       health:
         healthProbe == null
@@ -6858,6 +6905,43 @@ export class EventBus {
   }
 
   /**
+   * Evaluates one (subscriber, key) ordering stream's reorder-buffer depth
+   * against the hotspot alert threshold (see `SubscribeOptions.keyHotspot`
+   * and `src/keyhotspot.ts`). Fires `onKeyHotspot` once per excursion —
+   * when the depth reaches `thresholdDepth` while the stream's latch is
+   * clear — and re-arms the latch when the depth drops below the
+   * threshold. A pure read of `order.buffer.size`: the reorder buffer,
+   * the per-key expectation, and delivery order are never touched, so
+   * detection cannot disturb per-key publish-order enforcement. A
+   * throwing callback propagates to the caller, like the other subscriber
+   * monitoring callbacks.
+   */
+  private checkKeyHotspot(subscriber: Subscriber, mapKey: string, order: KeyOrderState): void {
+    const monitor = subscriber.keyHotspot;
+    if (monitor === undefined) return;
+    const depth = order.buffer.size;
+    if (depth >= monitor.thresholdDepth) {
+      if (!monitor.alertedKeys.has(mapKey)) {
+        monitor.alertedKeys.add(mapKey);
+        const onKeyHotspot = monitor.onKeyHotspot;
+        if (onKeyHotspot !== undefined) {
+          const [, key] = splitKeyOrderKey(mapKey);
+          onKeyHotspot({
+            subscriberId: subscriber.id,
+            pattern: subscriber.pattern,
+            key,
+            bufferedDepth: depth,
+            thresholdDepth: monitor.thresholdDepth,
+            at: this.now(),
+          });
+        }
+      }
+    } else {
+      monitor.alertedKeys.delete(mapKey);
+    }
+  }
+
+  /**
    * Records one enqueue→delivery latency sample for a tracked subscriber,
    * at the moment a message is handed to its handler. The sample measures
    * queue dwell (enqueue to hand-off), never handler processing time.
@@ -6991,6 +7075,10 @@ export class EventBus {
     if (keySeq > order.expected) {
       order.buffer.set(keySeq, delivery);
       this.totalKeyedReordered += 1;
+      // Keyed hotspot sampling (see `SubscribeOptions.keyHotspot`): a pure
+      // read of the buffer depth — the reorder buffer itself is untouched,
+      // so detection can never disturb per-key publish-order enforcement.
+      this.checkKeyHotspot(subscriber, mapKey, order);
       // Admitted into the ordering layer — it will reach the queue once
       // its predecessors are admitted, so it counts as accepted for the
       // fan-out width, exactly like a queued message.
@@ -6998,7 +7086,7 @@ export class EventBus {
     }
     const accepted = this.admitKeyed(subscriber, delivery);
     order.expected = keySeq + 1;
-    this.cascadeKeyExpected(subscriber, order);
+    this.cascadeKeyExpected(subscriber, order, mapKey);
     return accepted;
   }
 
@@ -7019,20 +7107,27 @@ export class EventBus {
    * Advances a per-key expectation past everything now deliverable:
    * contiguous skipped keySeqs are dropped, then contiguous buffered
    * messages are admitted in keySeq order. Each iteration strictly moves
-   * `expected` forward, so the loop always terminates.
+   * `expected` forward, so the loop always terminates. `mapKey` is the
+   * epoch-scoped ordering-stream key (`keyOrderKey`), used for the
+   * hotspot depth check at the end — the buffer only ever shrinks here,
+   * so one end-of-cascade evaluation covers every release.
    */
-  private cascadeKeyExpected(subscriber: Subscriber, order: KeyOrderState): void {
+  private cascadeKeyExpected(subscriber: Subscriber, order: KeyOrderState, mapKey: string): void {
     for (;;) {
       if (order.skipped.delete(order.expected)) {
         order.expected += 1;
         continue;
       }
       const next = order.buffer.get(order.expected);
-      if (next === undefined) return;
+      if (next === undefined) break;
       order.buffer.delete(order.expected);
       this.admitKeyed(subscriber, next);
       order.expected += 1;
     }
+    // The cascade only ever shrinks the buffer, so a single end-of-cascade
+    // evaluation covers every release — the re-arm point for the hotspot
+    // alert latch (see `SubscribeOptions.keyHotspot`).
+    this.checkKeyHotspot(subscriber, mapKey, order);
   }
 
   /**
@@ -7088,7 +7183,7 @@ export class EventBus {
     const order = subscriber.keyOrder?.get(keyOrderKey(epoch, key));
     if (order === undefined || keySeq < order.expected || order.skipped.has(keySeq)) return;
     order.skipped.add(keySeq);
-    this.cascadeKeyExpected(subscriber, order);
+    this.cascadeKeyExpected(subscriber, order, keyOrderKey(epoch, key));
   }
 
   /**
@@ -7108,7 +7203,7 @@ export class EventBus {
         if (epoch === '' && k === key) {
           if (keySeq >= order.expected && !order.skipped.has(keySeq)) {
             order.skipped.add(keySeq);
-            this.cascadeKeyExpected(subscriber, order);
+            this.cascadeKeyExpected(subscriber, order, mapKey);
           }
         }
       }
@@ -7582,6 +7677,7 @@ export class EventBus {
     const ackLatency: BusStats['ackLatency'] = [];
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
+    const hotKeys: HotKeyStat[] = [];
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
@@ -7624,6 +7720,25 @@ export class EventBus {
           ...lagState.tracker.summary(),
         });
       }
+      // Keyed hotspot sampling (see `SubscribeOptions.keyHotspot`): only
+      // monitored subscriptions are scanned — a pure read of each
+      // (subscriber, key) stream's reorder-buffer depth, so the ordering
+      // gate is never disturbed.
+      const keyHotspot = subscriber.keyHotspot;
+      if (keyHotspot != null && subscriber.keyOrder !== undefined) {
+        for (const [mapKey, order] of subscriber.keyOrder) {
+          const depth = order.buffer.size;
+          if (depth === 0) continue;
+          const [, key] = splitKeyOrderKey(mapKey);
+          hotKeys.push({
+            subscriberId: subscriber.id,
+            pattern: subscriber.pattern,
+            key,
+            bufferedDepth: depth,
+            thresholdDepth: keyHotspot.thresholdDepth,
+          });
+        }
+      }
     }
     const slowestSubscribers = deliveryLatency
       .filter((s) => s.samples > 0)
@@ -7646,6 +7761,15 @@ export class EventBus {
         watermarkMs: s.watermarkMs,
         samples: s.samples,
       }));
+    // Hottest first; ties break on (subscriberId, key) so the ranking is
+    // deterministic across snapshots.
+    const hottestKeys = hotKeys
+      .sort((a, b) => {
+        if (b.bufferedDepth !== a.bufferedDepth) return b.bufferedDepth - a.bufferedDepth;
+        if (a.subscriberId !== b.subscriberId) return a.subscriberId < b.subscriberId ? -1 : 1;
+        return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+      })
+      .slice(0, HOT_KEYS_LIMIT);
     return {
       totalSubscribers: this.subscribers.size,
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
@@ -7692,6 +7816,7 @@ export class EventBus {
       lag,
       laggingSubscribers,
       keyedReorderedMessages: this.totalKeyedReordered,
+      hotKeys: hottestKeys,
       traceSpans: this.trace?.snapshot() ?? [],
       hotTopics: this.publishRates.hotTopics(ratesNow),
       ...(this.clusterLink == null

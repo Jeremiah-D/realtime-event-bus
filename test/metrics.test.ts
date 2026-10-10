@@ -148,6 +148,7 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     lag: [],
     laggingSubscribers: [],
     keyedReorderedMessages: 0,
+    hotKeys: [],
     hotTopics: [],
     topics: [topicStats('we"ird\ntopic\\name')],
     consumerGroups: [],
