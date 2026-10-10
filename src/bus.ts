@@ -1553,6 +1553,12 @@ export interface BusStats {
    */
   routes: TopicRouteInfo[];
   /**
+   * Every registered cross-bus forward rule (see `EventBus.forward`): the
+   * forwarding table with each rule's forward count. A snapshot —
+   * mutating it does not affect the bus.
+   */
+  forwards: ForwardRuleInfo[];
+  /**
    * Total messages skipped by subscriber content filters — the sum of
    * every topic's `filteredMessages`. See `TopicStats.filteredMessages`
    * for the exact counting rules.
@@ -2906,6 +2912,65 @@ export interface TopicRouteInfo {
   forwarded: number;
 }
 
+/** Options for `EventBus.forward`. */
+export interface ForwardOptions {
+  /**
+   * The destination topic on the destination bus. Defaults to the
+   * published (alias-resolved) topic when omitted.
+   */
+  dstTopic?: string;
+}
+
+/**
+ * One registered cross-bus forward rule (see `EventBus.forward`), as
+ * exposed by `getStats().forwards`. A snapshot — mutating it does not
+ * affect the bus.
+ */
+export interface ForwardRuleInfo {
+  /** Source pattern: admitted messages on matching topics are forwarded. */
+  srcPattern: string;
+  /**
+   * Destination topic on the destination bus; absent when the rule
+   * forwards to the published topic unchanged.
+   */
+  dstTopic?: string;
+  /**
+   * How many source messages this rule forwarded: incremented every time
+   * the rule matched and a destination forward was initiated — including
+   * attempts the destination's admission gates (ACL, schema, rate-limit)
+   * then rejected. Re-registering the rule resets the count.
+   */
+  forwarded: number;
+}
+
+/**
+ * The envelope carried across a cross-bus forward registration (EB-56),
+ * from the source bus's forward rule to the destination bus's
+ * `receiveForward`. INTERNAL USE ONLY — constructed solely by forward
+ * registrations; application code must not build or send it.
+ */
+export interface ForwardFrame {
+  /** Destination topic on the destination bus. */
+  topic: string;
+  /** The raw application payload. */
+  payload: unknown;
+  /**
+   * Application message key — the destination bus draws its own per-key
+   * sequence number, so per-key publish order is preserved per bus.
+   */
+  key?: string;
+  /** Continues the source-side trace on the destination bus. */
+  traceparent?: string;
+  /** Application message identity, carried end to end. */
+  messageId?: string;
+  /**
+   * The source message's TTL deadline, verbatim — a forward never resets
+   * it. Absent when the source message had no deadline, in which case the
+   * destination bus's TTL rules apply normally.
+   */
+  expiresAt?: number;
+}
+
 /**
  * Broker-level topic ACL (EB-41): per-topic publish/subscribe permissions
  * with allow/deny decisions on wildcard patterns.
@@ -3691,6 +3756,21 @@ export class EventBus {
    */
   private topicRoutes = new Map<string, { dst: string; predicate?: RoutePredicate; forwarded: number }>();
   /**
+   * Cross-bus forward rules (EB-56): per destination bus, per source
+   * pattern, the forwarding table. Unlike `topicRoutes` (same-bus,
+   * one route per source), a bus may forward to several destination
+   * buses and hold several patterns per destination. A message admitted
+   * on this bus and matching a rule's pattern is additionally offered to
+   * that destination bus's `receiveForward` — the destination runs its
+   * own full admission pipeline on it. The source pattern always matches
+   * the published (alias-resolved) topic with the bus's wildcard
+   * semantics (`compilePattern`).
+   */
+  private forwardRules = new Map<
+    EventBus,
+    Map<string, { srcPattern: string; matcher: RegExp; dstTopic?: string; forwarded: number }>
+  >();
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -4304,6 +4384,128 @@ export class EventBus {
    */
   clearTopicRoute(src: string): boolean {
     return this.topicRoutes.delete(src);
+  }
+
+  /**
+   * Registers a cross-bus forward rule (EB-56): every admitted,
+   * non-routed message on this bus whose alias-resolved topic matches
+   * `srcPattern` is additionally forwarded to `dstBus` — on topic
+   * `opts.dstTopic`, or the published topic when omitted.
+   *
+   * Same-process multi-instance fan-out. `setTopicRoute` is the same-bus
+   * mechanism; EB-51's bridge is the cross-process one. The forwarded
+   * message runs the destination bus's FULL admission pipeline (ACL,
+   * schema, rate-limit, TTL, ...) exactly as if a producer published it
+   * there directly, stamped `routed` so it never triggers the
+   * destination's routes or forwards again — one hop per message, no
+   * amplification. The forward carries the source message's trace id
+   * (continues the same end-to-end trace), its application key and
+   * message id, and its TTL deadline verbatim (a forward never resets
+   * the deadline; when the source message had none, the destination's
+   * TTL rules apply normally).
+   *
+   * `forwarded` counts every forward attempt — including attempts the
+   * destination's admission gates then reject. Re-registering an
+   * identical (`dstBus`, `srcPattern`) rule replaces it and resets its
+   * `forwarded` count (mirrors `setTopicRoute`). `getStats().forwards`
+   * exposes the live forward table.
+   *
+   * Throws before anything is mutated: `TypeError` when `dstBus` is not
+   * an `EventBus`; `RangeError` on a self-forward, an empty or invalid
+   * `srcPattern`, an empty `dstTopic`, or a registration that would
+   * close a forwarding cycle (the forward graph is walked
+   * bus-level, pattern-agnostic, so transitive A→B→C→A cycles are
+   * caught too).
+   */
+  forward(dstBus: EventBus, srcPattern: string, opts?: ForwardOptions): void {
+    if (!(dstBus instanceof EventBus)) {
+      throw new TypeError('dstBus must be an EventBus instance');
+    }
+    if (dstBus === this) {
+      throw new RangeError(
+        'forward cannot target the same bus — use setTopicRoute for same-bus routing',
+      );
+    }
+    if (typeof srcPattern !== 'string' || srcPattern.length === 0) {
+      throw new RangeError('srcPattern must be a non-empty string');
+    }
+    const dstTopic = opts?.dstTopic;
+    if (dstTopic !== undefined && (typeof dstTopic !== 'string' || dstTopic.length === 0)) {
+      throw new RangeError('dstTopic must be a non-empty string when given');
+    }
+    // compilePattern is total for non-empty patterns (same wildcard
+    // semantics as subscriptions); compiling here also surfaces any
+    // future pattern-shape rejection before the table is mutated.
+    const matcher = compilePattern(srcPattern);
+    // Cycle check: walking the forward graph from dstBus must not reach
+    // this bus, or the new rule would let a message loop back here.
+    // Conservative and pattern-agnostic — one edge per registered rule —
+    // so transitive cycles are caught the same way.
+    const seen = new Set<EventBus>();
+    const frontier: EventBus[] = [dstBus];
+    while (frontier.length > 0) {
+      const cursor = frontier.pop() as EventBus;
+      if (cursor === this) {
+        throw new RangeError('forward would close a cross-bus forwarding cycle');
+      }
+      if (seen.has(cursor)) continue;
+      seen.add(cursor);
+      for (const next of cursor.forwardRules.keys()) frontier.push(next);
+    }
+    let rules = this.forwardRules.get(dstBus);
+    if (rules === undefined) {
+      rules = new Map();
+      this.forwardRules.set(dstBus, rules);
+    }
+    rules.set(srcPattern, { srcPattern, matcher, dstTopic, forwarded: 0 });
+  }
+
+  /**
+   * Removes the forward rule previously registered for (`dstBus`,
+   * `srcPattern`). Returns true when a rule existed and was removed.
+   * After removal, messages matching `srcPattern` are no longer forwarded
+   * to `dstBus`.
+   */
+  clearForward(dstBus: EventBus, srcPattern: string): boolean {
+    const rules = this.forwardRules.get(dstBus);
+    if (rules === undefined) return false;
+    const removed = rules.delete(srcPattern);
+    if (rules.size === 0) this.forwardRules.delete(dstBus);
+    return removed;
+  }
+
+  /**
+   * Receives one forwarded message from another bus's forward rule
+   * (EB-56) — the destination-side half of `forward()`. INTERNAL USE
+   * ONLY: only forward registrations call this; producers must use
+   * `publish()`.
+   *
+   * The frame goes through this bus's full publish admission pipeline
+   * (alias resolution, ACL, schema, rate-limit, TTL, ...) with this
+   * bus's own sequence numbers and rate-limit budget, marked `routed` so
+   * it never triggers this bus's routes or forwards again (one hop per
+   * message). The source TTL deadline rides verbatim (never reset by a
+   * forward); when the source message had none, this bus's TTL rules
+   * apply normally. A malformed frame is dropped silently — admission
+   * rejections are a normal, counted outcome, never an exception.
+   */
+  receiveForward(frame: ForwardFrame): void {
+    if (frame === null || typeof frame !== 'object') return;
+    const topic = frame.topic;
+    if (typeof topic !== 'string' || topic.length === 0) return;
+    this.fanOut(
+      topic,
+      frame.payload,
+      false, // preAdmitted: full destination admission — ACL, schema, rate-limit, TTL
+      undefined, // delayed
+      frame.key,
+      undefined, // preassignedKeySeq: the destination draws its own key sequence
+      frame.traceparent,
+      frame.messageId,
+      true, // routed: never triggers destination routes/forwards again
+      frame.expiresAt, // verbatim TTL deadline from the source message
+    );
+    this.scheduleFlush();
   }
 
   /** True while the alias entry still forwards on the bus clock. */
@@ -8895,6 +9097,41 @@ export class EventBus {
         }
       }
     }
+    // Cross-bus forward rules (EB-56): a non-routed message admitted on a
+    // bus holding forward rules is additionally offered to every matching
+    // rule's destination bus — same placement as the EB-50 topic routes
+    // above, after the source message is admitted, logged and fanned out.
+    // A rule fires when its srcPattern matches the published
+    // (alias-resolved) topic. The destination bus runs its own full
+    // admission pipeline on the forwarded message (`receiveForward`), so
+    // the forward honors the destination's ACL, schema, rate-limit and
+    // TTL rules with destination-side sequence numbers and budgets; the
+    // forwarded message is stamped routed, so it never triggers the
+    // destination's routes or forwards again — one hop per message. The
+    // forward carries the source message's trace id (continues the same
+    // end-to-end trace), its application key and message id, and its TTL
+    // deadline verbatim (never reset by a forward; when the source had
+    // none, the destination's TTL rules apply normally). The forward is a
+    // side effect: it does not change this call's returned accepted
+    // count, and each bus schedules its own flush.
+    if (!routed && this.forwardRules.size > 0) {
+      for (const [dstBus, rules] of this.forwardRules) {
+        for (const rule of rules.values()) {
+          if (!rule.matcher.test(topic)) continue;
+          rule.forwarded += 1;
+          dstBus.receiveForward({
+            topic: rule.dstTopic ?? topic,
+            payload,
+            ...(keyed === undefined ? {} : { key: keyed.key }),
+            ...(openTrace === undefined
+              ? {}
+              : { traceparent: formatTraceparent(openTrace.traceId, newSpanId()) }),
+            ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+            ...(expiresAt === undefined ? {} : { expiresAt }),
+          });
+        }
+      }
+    }
     return { matched, accepted, admitted: true };
   }
 
@@ -9182,6 +9419,13 @@ export class EventBus {
         predicate: entry.predicate !== undefined,
         forwarded: entry.forwarded,
       })),
+      forwards: [...this.forwardRules.values()].flatMap((rules) =>
+        [...rules.values()].map((rule) => ({
+          srcPattern: rule.srcPattern,
+          ...(rule.dstTopic === undefined ? {} : { dstTopic: rule.dstTopic }),
+          forwarded: rule.forwarded,
+        })),
+      ),
       filteredMessages: this.totalFiltered,
       deadLetteredMessages: this.totalDeadLettered,
       compressedMessages: this.totalCompressed,

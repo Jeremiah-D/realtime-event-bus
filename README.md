@@ -440,6 +440,37 @@ library.
   `getStats().routes` exposes the table (`{ src, dst, predicate,
   forwarded }`), with `forwarded` counting every forward attempt —
   including attempts the destination's admission gates then rejected.
+- **Cross-bus forward rules** (in `src/bus.ts`, via `forward(dstBus,
+  srcPattern, { dstTopic })`): fan-out across multiple `EventBus`
+  instances in the same process. `setTopicRoute` only routes within one
+  bus; the EB-51 bridge crosses processes via an external broker —
+  forward rules fill the middle: every admitted, non-routed message on
+  the source bus whose alias-resolved topic matches `srcPattern` (the
+  usual wildcard semantics, `compilePattern`) is additionally offered to
+  `dstBus`, on `dstTopic` or the published topic when omitted. The
+  forwarded message runs the destination bus's full admission pipeline
+  (`receiveForward`, internal use only — not part of the public publish
+  API) — ACL, schema, rate-limit, TTL — with destination-side sequence
+  numbers and budgets, exactly as if a producer published it there
+  directly. Identity is preserved across the hop: the forward continues
+  the source message's end-to-end trace (same `traceId`, continued as a
+  W3C `traceparent`), keeps its TTL deadline verbatim (a forward never
+  resets it — when the source message had no deadline, the destination's
+  TTL rules apply normally), and carries the application `key` /
+  `messageId` along. The forwarded message is marked `routed`, so it
+  never triggers the destination's routes or forwards again — one hop
+  per message, no amplification. Registration fails fast before anything
+  is mutated: `TypeError` when `dstBus` is not an `EventBus`,
+  `RangeError` on a self-forward, an empty/invalid `srcPattern`, an
+  empty `dstTopic`, or a registration that would close a forwarding
+  cycle — the forward graph is walked bus-level and pattern-agnostic, so
+  transitive `A→B→C→A` cycles are caught too. Re-registering an
+  identical (`dstBus`, `srcPattern`) rule replaces it (and resets its
+  count); `clearForward(dstBus, srcPattern)` removes it.
+  `getStats().forwards` exposes the table (`{ srcPattern, dstTopic?,
+  forwarded }`) as a snapshot — mutating it does not affect the bus —
+  with `forwarded` counting every forward attempt, including attempts the
+  destination's admission gates then rejected.
 - **Per-topic payload compression** (in `src/bus.ts`, via
   `setTopicCompression(pattern, { thresholdBytes, level })`): opt-in
   `node:zlib` deflate for large payloads — zero new dependencies. A publish
