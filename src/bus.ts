@@ -35,7 +35,7 @@ import {
   resolveGroupLagOptions,
   type GroupLagStat,
 } from './grouplag.ts';
-import { DurableTopicLog } from './durablelog.ts';
+import { DurableTopicLog, type SegmentRotationOptions } from './durablelog.ts';
 import {
   NamespaceDeniedError,
   NamespaceHandle,
@@ -1227,6 +1227,21 @@ export interface EventBusOptions {
    */
   durableLogKeyCompaction?: boolean;
   /**
+   * Opt-in segment rotation for the durable log (see
+   * `SegmentRotationOptions` in `src/durablelog.ts`): the per-topic live
+   * file holds the current segment, and closed segments are gzipped to
+   * `<topic>.seg-<seqStart>-<seqEnd>.jsonl.gz` with an append-only
+   * archive index (`__archive_index.jsonl`) by an unref'd background
+   * pass — publishing never waits for compression. Replay
+   * (`SubscribeOptions.resumeFromSeq` / `resumeFromTime`) reads the live
+   * segment by default; archived segments are read on demand via
+   * `DurableTopicLog.readSince` / `readSinceTime` with
+   * `{ includeArchived: true }`. Only meaningful with `durableLogDir`.
+   * Default: absent (no rotation — one live file per topic, as before).
+   * Invalid triggers throw `RangeError` at construction.
+   */
+  durableLogSegmentRotation?: SegmentRotationOptions;
+  /**
    * Enables publish-side idempotent dedup for `publishIdempotent`: within
    * this many milliseconds of an admitted publish, a retry carrying the
    * same `messageId` on the same topic is suppressed as a duplicate — it
@@ -1935,6 +1950,15 @@ export interface BusStats {
     corruptLines: number;
     /** Whether keyed log compaction is enabled (`durableLogKeyCompaction`). */
     keyCompaction: boolean;
+    /** Archive files that failed to decompress during archived reads. */
+    corruptArchives: number;
+    /** Total entries across all archived segments. */
+    archived: number;
+    /**
+     * Per-topic segment view: live entries in the current segment,
+     * closed archived segment count, and archived entries.
+     */
+    segments: Record<string, { live: number; segments: number; archived: number }>;
   };
 }
 
@@ -4535,6 +4559,11 @@ export class EventBus {
    */
   private readonly durableLogKeyCompaction: boolean = false;
   /**
+   * `durableLogSegmentRotation` as configured — namespace child logs
+   * (EB-52) open with the same rotation triggers as the root log.
+   */
+  private readonly durableLogSegmentRotation?: SegmentRotationOptions;
+  /**
    * Registered multi-tenant namespaces (EB-52): prefix → effective
    * flags. Concrete namespaced topics are `<prefix>/<topic>`; the `/`
    * separator is matched literally by the wildcard engine, so one
@@ -4646,12 +4675,15 @@ export class EventBus {
         dir: options.durableLogDir,
         maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
         keyCompaction: options.durableLogKeyCompaction,
+        segmentRotation: options.durableLogSegmentRotation,
       });
       this.durableLog = log;
       // Remembered for namespace child logs (EB-52): children open with
-      // the same per-topic budget and compaction mode as the root log.
+      // the same per-topic budget, compaction mode and rotation triggers
+      // as the root log.
       this.durableLogMaxEntriesPerTopic = options.durableLogMaxEntriesPerTopic;
       this.durableLogKeyCompaction = options.durableLogKeyCompaction ?? false;
+      this.durableLogSegmentRotation = options.durableLogSegmentRotation;
       // Recover numbering continuity and per-key cursors from the log —
       // shared with namespace child logs (see `recoverLogState`).
       this.recoverLogState(log);
@@ -5716,6 +5748,7 @@ export class EventBus {
         dir: `${this.durableLog.dir}/namespaces/${encodeURIComponent(prefix)}`,
         maxEntriesPerTopic: this.durableLogMaxEntriesPerTopic,
         keyCompaction: this.durableLogKeyCompaction,
+        segmentRotation: this.durableLogSegmentRotation,
       });
       this.namespaceLogs.set(prefix, child);
       // A restarted bus reopens the namespace's on-disk history: reseed

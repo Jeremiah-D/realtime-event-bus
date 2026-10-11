@@ -1,4 +1,13 @@
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { join } from 'node:path';
 
 /**
@@ -114,6 +123,37 @@ export interface DurableLogOptions {
    * before. Default false.
    */
   keyCompaction?: boolean;
+  /**
+   * Opt-in segment rotation for the durable log (see
+   * `SegmentRotationOptions`): the per-topic live file holds the current
+   * segment; when a rotation trigger fires the live file is closed and
+   * archived (gzipped) in the background, and a fresh live segment
+   * starts. Absent by default — without it the log keeps one live file
+   * per topic exactly as before.
+   */
+  segmentRotation?: SegmentRotationOptions;
+}
+
+/**
+ * Opt-in rotation triggers for the durable log's per-topic segments.
+ * At least one trigger must be set; an empty object is a `RangeError`
+ * (a rotation with no trigger is meaningless).
+ */
+export interface SegmentRotationOptions {
+  /**
+   * Maximum entries in the live segment. When an append brings the live
+   * segment to this many entries it is closed and archived, and the next
+   * append starts a fresh segment. Must be a positive integer.
+   */
+  maxEntriesPerSegment?: number;
+  /**
+   * Maximum age of the live segment in milliseconds, measured on the
+   * record timestamps (`DurableLogRecord.at`, i.e. the bus clock): when an
+   * append's timestamp is at least this far past the segment's first
+   * record, the segment is closed and archived. Must be a positive finite
+   * number.
+   */
+  maxSegmentAgeMs?: number;
 }
 
 /** On-disk envelope for one log line. `v` pins the format for future readers. */
@@ -260,6 +300,195 @@ const OFFSET_JOURNAL_NAME = '__group_offsets.jsonl';
 const DEDUP_JOURNAL_NAME = '__dedup.jsonl';
 
 /**
+ * File name of the segment-archive index (`__archive_index.jsonl`)
+ * inside the log directory. A `.jsonl` name — not `.log` — so topic-file
+ * recovery never mistakes it for a topic file, and it can never collide
+ * with a topic file either (`fileFor` always appends `.log`).
+ */
+const ARCHIVE_INDEX_NAME = '__archive_index.jsonl';
+
+/**
+ * One closed, gzipped log segment: the on-disk archive of a rotated
+ * per-topic live segment, described by one line of the archive index.
+ */
+export interface ArchiveEntry {
+  /** Concrete topic the segment belongs to. */
+  topic: string;
+  /** Segment identity: `<seqStart>-<seqEnd>` of the segment's records. */
+  segmentId: string;
+  /** Archive file name inside the log directory. */
+  path: string;
+  /** First record's `seq` in the segment. */
+  seqStart: number;
+  /** Last record's `seq` in the segment. */
+  seqEnd: number;
+  /** First record's `at` (bus clock) in the segment. */
+  atStart: number;
+  /** Last record's `at` (bus clock) in the segment. */
+  atEnd: number;
+  /** Records in the segment, including seq-0 schedule records. */
+  entries: number;
+  /** Messages in the segment (`seq >= 1`), excluding schedule records. */
+  messages: number;
+  /** Highest per-key sequence number per key observed in the segment. */
+  keySeqs: Map<string, number>;
+}
+
+/** On-disk envelope for one archive-index line. `v` pins the format. */
+interface ArchiveIndexLine {
+  v: 1;
+  topic: string;
+  segmentId: string;
+  path: string;
+  seqStart: number;
+  seqEnd: number;
+  atStart: number;
+  atEnd: number;
+  entries: number;
+  messages: number;
+  /** Highest per-key sequence number per key in the segment, when any. */
+  keySeqs?: Record<string, number>;
+}
+
+/** Builds the on-disk envelope for an archive index entry. */
+function archiveIndexLineOf(entry: ArchiveEntry): ArchiveIndexLine {
+  const line: ArchiveIndexLine = {
+    v: 1,
+    topic: entry.topic,
+    segmentId: entry.segmentId,
+    path: entry.path,
+    seqStart: entry.seqStart,
+    seqEnd: entry.seqEnd,
+    atStart: entry.atStart,
+    atEnd: entry.atEnd,
+    entries: entry.entries,
+    messages: entry.messages,
+  };
+  if (entry.keySeqs.size > 0) {
+    const keySeqs: Record<string, number> = {};
+    for (const [key, seq] of entry.keySeqs) keySeqs[key] = seq;
+    line.keySeqs = keySeqs;
+  }
+  return line;
+}
+
+/**
+ * Parses one archive-index line. Returns `null` for anything malformed —
+ * wrong version, an empty topic/segmentId/path, non-integer seq bounds,
+ * non-finite time bounds, a non-positive-integer entry count, a negative
+ * message count, or a malformed keySeqs table. Corrupt lines are skipped,
+ * never fatal.
+ */
+function parseArchiveIndexLine(line: string): ArchiveEntry | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const o = parsed as Record<string, unknown>;
+  if (o['v'] !== 1) return null;
+  for (const field of ['topic', 'segmentId', 'path'] as const) {
+    if (typeof o[field] !== 'string' || (o[field] as string).length === 0) return null;
+  }
+  for (const field of ['seqStart', 'seqEnd'] as const) {
+    if (!Number.isInteger(o[field]) || (o[field] as number) < 0) return null;
+  }
+  for (const field of ['atStart', 'atEnd'] as const) {
+    if (typeof o[field] !== 'number' || !Number.isFinite(o[field])) return null;
+  }
+  if (!Number.isInteger(o['entries']) || (o['entries'] as number) < 1) return null;
+  if (!Number.isInteger(o['messages']) || (o['messages'] as number) < 0) return null;
+  const keySeqs = new Map<string, number>();
+  if (o['keySeqs'] !== undefined) {
+    if (typeof o['keySeqs'] !== 'object' || o['keySeqs'] === null) return null;
+    for (const [key, seq] of Object.entries(o['keySeqs'] as Record<string, unknown>)) {
+      if (key.length === 0 || !Number.isInteger(seq) || (seq as number) < 1) return null;
+      keySeqs.set(key, seq as number);
+    }
+  }
+  return {
+    topic: o['topic'] as string,
+    segmentId: o['segmentId'] as string,
+    path: o['path'] as string,
+    seqStart: o['seqStart'] as number,
+    seqEnd: o['seqEnd'] as number,
+    atStart: o['atStart'] as number,
+    atEnd: o['atEnd'] as number,
+    entries: o['entries'] as number,
+    messages: o['messages'] as number,
+    keySeqs,
+  };
+}
+
+/**
+ * Validates `SegmentRotationOptions`, returning the resolved triggers.
+ * `undefined` stays `undefined` (rotation disabled — fully backward
+ * compatible). Anything else must be an object with at least one valid
+ * trigger, else `RangeError`.
+ */
+function resolveSegmentRotationOptions(
+  options: SegmentRotationOptions | undefined,
+): SegmentRotationOptions | undefined {
+  if (options === undefined) return undefined;
+  if (typeof options !== 'object' || options === null) {
+    throw new RangeError('durableLogSegmentRotation must be an object');
+  }
+  const { maxEntriesPerSegment, maxSegmentAgeMs } = options;
+  if (maxEntriesPerSegment === undefined && maxSegmentAgeMs === undefined) {
+    throw new RangeError(
+      'durableLogSegmentRotation needs at least one of maxEntriesPerSegment / maxSegmentAgeMs',
+    );
+  }
+  if (
+    maxEntriesPerSegment !== undefined &&
+    (!Number.isInteger(maxEntriesPerSegment) || maxEntriesPerSegment < 1)
+  ) {
+    throw new RangeError('durableLogSegmentRotation.maxEntriesPerSegment must be a positive integer');
+  }
+  if (
+    maxSegmentAgeMs !== undefined &&
+    (typeof maxSegmentAgeMs !== 'number' || !Number.isFinite(maxSegmentAgeMs) || maxSegmentAgeMs <= 0)
+  ) {
+    throw new RangeError(
+      'durableLogSegmentRotation.maxSegmentAgeMs must be a positive finite number of milliseconds',
+    );
+  }
+  return { ...(maxEntriesPerSegment === undefined ? {} : { maxEntriesPerSegment }), ...(maxSegmentAgeMs === undefined ? {} : { maxSegmentAgeMs }) };
+}
+
+/**
+ * Splits an archived-segment file name back into its topic and
+ * `<seqStart>-<seqEnd>` identity. The split is on the LAST `.seg-`
+ * occurrence: the URL-encoded topic may itself contain `.seg-`
+ * (`encodeURIComponent` leaves dots unescaped), while seq bounds are
+ * non-negative integers and can never contain a dash. Returns `null`
+ * when the name is not a segment file.
+ */
+function parseSegmentFileName(name: string): { topic: string; seqStart: number; seqEnd: number } | null {
+  const gzSuffix = '.jsonl.gz';
+  if (!name.endsWith(gzSuffix)) return null;
+  const stem = name.slice(0, -gzSuffix.length);
+  const marker = stem.lastIndexOf('.seg-');
+  if (marker < 0) return null;
+  let topic: string;
+  try {
+    topic = decodeURIComponent(stem.slice(0, marker));
+  } catch {
+    return null;
+  }
+  const bounds = stem.slice(marker + '.seg-'.length).split('-');
+  if (bounds.length !== 2) return null;
+  const seqStart = Number(bounds[0]);
+  const seqEnd = Number(bounds[1]);
+  if (!Number.isInteger(seqStart) || seqStart < 0 || !Number.isInteger(seqEnd) || seqEnd < 0) {
+    return null;
+  }
+  return { topic, seqStart, seqEnd };
+}
+
+/**
  * One persisted subscriber-dedup sighting: the `(consumer, topic,
  * messageId)` window entry of
  * `SubscribeOptions.deduplicateMessages`. `at` is the bus-clock
@@ -366,6 +595,25 @@ function parseDedupLine(line: string): DedupEntry | null {
  * latest commit per (group, topic) when it grows past twice
  * `maxEntriesPerTopic` lines.
  *
+ * Segment archiving (`DurableLogOptions.segmentRotation`, opt-in): the
+ * per-topic live file holds the current segment. When an append reaches
+ * `maxEntriesPerSegment` entries or the segment's age reaches
+ * `maxSegmentAgeMs` (measured on the record timestamps), the live file is
+ * atomically renamed aside and a fresh live segment starts — the publish
+ * path only does the O(1) rename. An unref'd background pass then gzips
+ * the closed segment to `<topic>.seg-<seqStart>-<seqEnd>.jsonl.gz` and
+ * appends one line to the append-only archive index
+ * (`__archive_index.jsonl`): `{topic, segmentId, path, seqStart, seqEnd,
+ * atStart, atEnd, entries, messages}` plus the segment's per-key seq
+ * highs. Replay (`readSince`/`readSinceTime`) reads the live segment by
+ * default; `{ includeArchived: true }` decompresses the archived segments
+ * on demand and merges them in seq order ahead of the live records, under
+ * the same TTL/keyed-compaction rules. Archive files that fail to
+ * decompress are skipped and counted (`stats().corruptArchives`), never
+ * fatal; restart recovery rebuilds the archive view from the index and
+ * adopts orphan archives, so seq/keySeq numbering never reuses an
+ * archived number.
+ *
  * Durability note: appends are synchronous (`appendFileSync`), so a record
  * is handed to the OS before `append` returns. A power loss can still lose
  * whatever the OS had not flushed to disk — this is crash recovery for
@@ -448,22 +696,61 @@ export class DurableTopicLog {
   private readonly dedupSeen = new Map<string, DedupEntry>();
   /** Lines currently in the dedup journal, used for compaction. */
   private dedupEntries = 0;
+  /**
+   * Opt-in segment rotation triggers, `undefined` when rotation is
+   * disabled (the default — one live file per topic, as before).
+   */
+  private readonly segmentRotation?: SegmentRotationOptions;
+  /**
+   * Entries appended to the current live segment per topic. Reset on
+   * every rotation; seeded from the live file on recovery.
+   */
+  private readonly segmentEntries = new Map<string, number>();
+  /** First record's `seq` of the current live segment per topic. */
+  private readonly segmentStartSeq = new Map<string, number>();
+  /** First record's `at` of the current live segment per topic. */
+  private readonly segmentStartAt = new Map<string, number>();
+  /**
+   * Closed archive segments in index order — the in-memory view of
+   * `__archive_index.jsonl`, rebuilt on open.
+   */
+  private readonly archives: ArchiveEntry[] = [];
+  /** Archive segments per topic, in ascending `seqStart` order. */
+  private readonly archivesByTopic = new Map<string, ArchiveEntry[]>();
+  /**
+   * Archive files that failed to decompress during archived reads.
+   * Skipped, never fatal.
+   */
+  private corruptArchives = 0;
+  /** Path of the archive index (`__archive_index.jsonl`) in the log dir. */
+  private readonly archiveIndexFile: string;
+  /** Set while a background archive pass is scheduled. */
+  private archiveScheduled = false;
 
-  private constructor(dir: string, maxEntriesPerTopic: number, keyCompaction: boolean) {
+  private constructor(
+    dir: string,
+    maxEntriesPerTopic: number,
+    keyCompaction: boolean,
+    segmentRotation?: SegmentRotationOptions,
+  ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
     this.keyCompaction = keyCompaction;
+    this.segmentRotation = segmentRotation;
     this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
     this.dedupFile = join(dir, DEDUP_JOURNAL_NAME);
+    this.archiveIndexFile = join(dir, ARCHIVE_INDEX_NAME);
     mkdirSync(dir, { recursive: true });
     this.recover();
+    this.recoverArchiveIndex();
     this.recoverOffsets();
     this.recoverDedup();
   }
 
   /**
    * Opens (or creates) the durable log at `dir`. Throws `RangeError` for an
-   * empty `dir` or a non-positive-integer `maxEntriesPerTopic`.
+   * empty `dir`, a non-positive-integer `maxEntriesPerTopic`, or invalid
+   * `segmentRotation` triggers.
    */
   static open(options: DurableLogOptions): DurableTopicLog {
     const dir = options.dir;
@@ -474,7 +761,12 @@ export class DurableTopicLog {
     if (!Number.isInteger(maxEntriesPerTopic) || maxEntriesPerTopic < 1) {
       throw new RangeError('durableLogMaxEntriesPerTopic must be a positive integer');
     }
-    return new DurableTopicLog(dir, maxEntriesPerTopic, options.keyCompaction ?? false);
+    return new DurableTopicLog(
+      dir,
+      maxEntriesPerTopic,
+      options.keyCompaction ?? false,
+      resolveSegmentRotationOptions(options.segmentRotation),
+    );
   }
 
   /** The log directory, as configured. */
@@ -522,7 +814,157 @@ export class DurableTopicLog {
       this.lastSeqs.set(topic, last);
       this.messageCounts.set(topic, messages);
       if (this.keyCompaction) this.rebuildKeyIndex(topic, records);
+      if (this.segmentRotation !== undefined && records.length > 0) {
+        // The live file is the current segment: its first record opens
+        // the segment's identity (start seq/time), its length is the
+        // segment's entry count.
+        this.segmentEntries.set(topic, records.length);
+        this.segmentStartSeq.set(topic, records[0].seq);
+        this.segmentStartAt.set(topic, records[0].at);
+      }
     }
+  }
+
+  /**
+   * Rebuilds the archive view from `__archive_index.jsonl`: every
+   * well-formed line becomes an in-memory segment entry, corrupt lines
+   * are counted and skipped. Archive files on disk but missing from the
+   * index (a crash between the `.gz` write and the index append) are
+   * adopted: their records are read to rebuild the entry and the index
+   * line is appended, so the view heals itself. Leftover pending
+   * segments (`*.jsonl.tmp` — a crash before the archive pass ran) are
+   * re-queued for background archiving. Archived seq bounds fold into
+   * the per-topic seq/message cursors, so a restart never reuses a
+   * sequence number from an archived segment.
+   */
+  private recoverArchiveIndex(): void {
+    let text: string | undefined;
+    try {
+      text = readFileSync(this.archiveIndexFile, 'utf8');
+    } catch {
+      text = undefined;
+    }
+    if (text !== undefined) {
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue;
+        const entry = parseArchiveIndexLine(line);
+        if (entry == null) {
+          this.corruptLines += 1;
+          continue;
+        }
+        this.addArchiveEntry(entry);
+      }
+    }
+    let names: string[];
+    try {
+      names = readdirSync(this.logDir);
+    } catch {
+      return;
+    }
+    let pending = false;
+    for (const name of names) {
+      if (name.endsWith('.jsonl.tmp')) {
+        pending = true;
+        continue;
+      }
+      const parsed = parseSegmentFileName(name);
+      if (parsed == null) continue;
+      if (this.archives.some((e) => e.path === name)) continue;
+      const adopted = this.readAdoptedSegment(name, parsed.topic);
+      if (adopted == null) continue;
+      this.addArchiveEntry(adopted);
+      try {
+        appendFileSync(this.archiveIndexFile, `${JSON.stringify(archiveIndexLineOf(adopted))}\n`, 'utf8');
+      } catch {
+        // The in-memory view is rebuilt; the index rewrite is retried on
+        // the next adoption — a missing line never loses data, the file
+        // itself is the archive.
+      }
+    }
+    // Leftover pending segments (a crash before the archive pass ran)
+    // are re-queued even when rotation is now disabled: they are closed
+    // history from a previous configuration, and leaving them would lose
+    // their records to `includeArchived` reads.
+    if (pending) this.scheduleArchive();
+  }
+
+  /**
+   * Reads an on-disk archive that the index does not know about (orphan
+   * adoption during recovery). Returns `null` — and counts one corrupt
+   * archive — when the file cannot be decompressed or holds no records.
+   */
+  private readAdoptedSegment(
+    name: string,
+    topic: string,
+  ): ArchiveEntry | null {
+    let text: string;
+    try {
+      text = gunzipSync(readFileSync(join(this.logDir, name))).toString('utf8');
+    } catch {
+      this.corruptArchives += 1;
+      return null;
+    }
+    const records: DurableLogRecord[] = [];
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      const rec = parseLogLine(line, topic);
+      if (rec == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      records.push(rec);
+    }
+    if (records.length === 0) return null;
+    return this.summarizeSegment(topic, name, records);
+  }
+
+  /**
+   * Records one archive segment in the in-memory view: per-topic
+   * grouping (kept in ascending `seqStart` order), the topic's seq and
+   * message cursors, and the per-key seq cursors — so restarts continue
+   * numbering exactly where the archived history left off.
+   */
+  private addArchiveEntry(entry: ArchiveEntry): void {
+    this.archives.push(entry);
+    let byTopic = this.archivesByTopic.get(entry.topic);
+    if (byTopic === undefined) {
+      byTopic = [];
+      this.archivesByTopic.set(entry.topic, byTopic);
+    }
+    byTopic.push(entry);
+    byTopic.sort((a, b) => a.seqStart - b.seqStart);
+    this.topicsSeen.add(entry.topic);
+    if (entry.seqEnd > (this.lastSeqs.get(entry.topic) ?? 0)) {
+      this.lastSeqs.set(entry.topic, entry.seqEnd);
+    }
+    this.messageCounts.set(entry.topic, (this.messageCounts.get(entry.topic) ?? 0) + entry.messages);
+    for (const [key, seq] of entry.keySeqs) this.noteKeySeq(key, seq);
+  }
+
+  /** Summarizes parsed records into an archive entry. */
+  private summarizeSegment(topic: string, path: string, records: DurableLogRecord[]): ArchiveEntry {
+    const first = records[0];
+    const last = records[records.length - 1];
+    let messages = 0;
+    const keySeqs = new Map<string, number>();
+    for (const rec of records) {
+      if (rec.seq >= 1) messages += 1;
+      if (rec.key !== undefined && rec.keySeq !== undefined && rec.keySeq > (keySeqs.get(rec.key) ?? 0)) {
+        keySeqs.set(rec.key, rec.keySeq);
+      }
+    }
+    return {
+      topic,
+      segmentId: `${first.seq}-${last.seq}`,
+      path,
+      seqStart: first.seq,
+      seqEnd: last.seq,
+      atStart: first.at,
+      atEnd: last.at,
+      entries: records.length,
+      messages,
+      keySeqs,
+    };
   }
 
   /** Reads and parses every well-formed record for a topic. */
@@ -600,11 +1042,215 @@ export class DurableTopicLog {
     // With keyed compaction a hot single key would otherwise bloat the
     // file with superseded records long before the 2x trigger, so a full
     // budget's worth of dead keyed records compacts too.
+    //
+    // Segment rotation (opt-in) runs before the compaction trigger: the
+    // triggering record belongs to the closed segment, so a rotation
+    // resets the live counts and the trigger below must read them fresh
+    // — never the stale pre-rotation count.
+    if (this.segmentRotation !== undefined) this.noteSegmentAppend(record);
+    const liveCount = this.entryCounts.get(record.topic) ?? 0;
     const superseded = this.supersededCounts.get(record.topic) ?? 0;
-    if (count > this.maxEntriesPerTopic * 2 || (this.keyCompaction && superseded >= this.maxEntriesPerTopic)) {
+    if (liveCount > this.maxEntriesPerTopic * 2 || (this.keyCompaction && superseded >= this.maxEntriesPerTopic)) {
       this.compact(record.topic);
     }
     return true;
+  }
+
+  /**
+   * File name for a topic's archived segment: the URL-encoded topic plus
+   * the deterministic `<seqStart>-<seqEnd>` identity, so re-archiving the
+   * same content (a crash between the index append and the pending-file
+   * delete) addresses the identical file and index entry — archive is
+   * idempotent by construction.
+   */
+  private archivedSegmentName(topic: string, seqStart: number, seqEnd: number): string {
+    return `${encodeURIComponent(topic)}.seg-${seqStart}-${seqEnd}.jsonl.gz`;
+  }
+
+  /** Pending (not yet gzipped) name for a closed segment awaiting archive. */
+  private pendingSegmentName(topic: string, seqStart: number, seqEnd: number): string {
+    return `${encodeURIComponent(topic)}.seg-${seqStart}-${seqEnd}.jsonl.tmp`;
+  }
+
+  /**
+   * Segment-rotation bookkeeping for one append (rotation enabled only).
+   * The publish path does nothing heavier than integer comparisons here:
+   * closing a segment is an atomic file rename and the gzip + index
+   * write happen on the background archive pass, so archiving can never
+   * block publishing.
+   */
+  private noteSegmentAppend(record: DurableLogRecord): void {
+    const rotation = this.segmentRotation as SegmentRotationOptions;
+    const topic = record.topic;
+    if (!this.segmentStartSeq.has(topic)) {
+      this.segmentStartSeq.set(topic, record.seq);
+      this.segmentStartAt.set(topic, record.at);
+    }
+    const entries = (this.segmentEntries.get(topic) ?? 0) + 1;
+    this.segmentEntries.set(topic, entries);
+    const maxEntries = rotation.maxEntriesPerSegment;
+    const maxAge = rotation.maxSegmentAgeMs;
+    const startAt = this.segmentStartAt.get(topic) as number;
+    if (
+      (maxEntries !== undefined && entries >= maxEntries) ||
+      (maxAge !== undefined && record.at - startAt >= maxAge)
+    ) {
+      this.rotateSegment(topic);
+    }
+  }
+
+  /**
+   * Closes the topic's live segment: the live file is atomically renamed
+   * to its pending archive name and the in-memory live counts reset — a
+   * fresh live segment starts with the next append. The rename is O(1);
+   * the expensive work (gzip + index) runs on the background archive
+   * pass. Never throws: a failed rename just leaves the records in the
+   * live file and the segment keeps growing until the next append
+   * retries the rotation.
+   */
+  private rotateSegment(topic: string): void {
+    const seqStart = this.segmentStartSeq.get(topic) ?? 0;
+    const seqEnd = this.lastSeqs.get(topic) ?? seqStart;
+    const live = this.fileFor(topic);
+    const pending = join(this.logDir, this.pendingSegmentName(topic, seqStart, seqEnd));
+    try {
+      renameSync(live, pending);
+    } catch {
+      return;
+    }
+    // The archived records leave the live view: live counts reset, while
+    // `lastSeqs` keeps the max so numbering never reuses an archived seq.
+    // The live file is empty again, so its key index and superseded
+    // counts reset too — archived keyed records are superseded-agnostic
+    // now, resolved by the merged read instead.
+    this.entryCounts.set(topic, 0);
+    this.messageCounts.set(topic, 0);
+    this.segmentEntries.set(topic, 0);
+    this.segmentStartSeq.delete(topic);
+    this.segmentStartAt.delete(topic);
+    if (this.keyCompaction) {
+      this.keyIndex.delete(topic);
+      this.supersededCounts.delete(topic);
+    }
+    this.scheduleArchive();
+  }
+
+  /**
+   * Arms the background archive pass on an unref'd timer: pending
+   * segments are gzipped and indexed without ever blocking the publish
+   * path, and a pending archive never keeps the process alive on its
+   * own. Coalesced — one timer drains every pending segment.
+   */
+  private scheduleArchive(): void {
+    if (this.archiveScheduled) return;
+    this.archiveScheduled = true;
+    const timer = setTimeout(() => {
+      this.archiveScheduled = false;
+      this.drainArchiveQueue();
+    }, 0);
+    timer.unref();
+  }
+
+  /** Archives every pending segment (`*.jsonl.tmp`) in the log directory. */
+  private drainArchiveQueue(): void {
+    let names: string[];
+    try {
+      names = readdirSync(this.logDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (name.endsWith('.jsonl.tmp')) this.archiveOne(name);
+    }
+  }
+
+  /**
+   * Archives one pending segment: parses its records, gzips them to the
+   * deterministic archive name, appends the index line, and deletes the
+   * pending file. Crash-safe ordering — `.gz` first, index second,
+   * pending delete last — so a crash either leaves an orphan `.gz`
+   * (adopted on the next open) or a leftover pending file (re-archived
+   * idempotently: the same content addresses the same archive name, and
+   * an already-indexed segment just drops its pending file). Never
+   * throws: a failure leaves the pending file for the next pass.
+   */
+  private archiveOne(pendingName: string): void {
+    const pendingPath = join(this.logDir, pendingName);
+    let text: string;
+    try {
+      text = readFileSync(pendingPath, 'utf8');
+    } catch {
+      return;
+    }
+    // The topic rides the file name (see `pendingSegmentName`); records
+    // are validated against it, so a renamed file can never corrupt reads.
+    const marker = pendingName.lastIndexOf('.seg-');
+    if (marker < 0) return;
+    let topic: string;
+    try {
+      topic = decodeURIComponent(pendingName.slice(0, marker));
+    } catch {
+      return;
+    }
+    const records: DurableLogRecord[] = [];
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      const rec = parseLogLine(line, topic);
+      if (rec == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      records.push(rec);
+    }
+    if (records.length === 0) {
+      try {
+        unlinkSync(pendingPath);
+      } catch {
+        // Left for the next pass.
+      }
+      return;
+    }
+    const first = records[0];
+    const last = records[records.length - 1];
+    const entry = this.summarizeSegment(
+      topic,
+      this.archivedSegmentName(topic, first.seq, last.seq),
+      records,
+    );
+    if (this.archives.some((e) => e.path === entry.path && e.entries === entry.entries)) {
+      // Already indexed (crash between the index append and the pending
+      // delete): drop the leftover, the archive itself is intact.
+      try {
+        unlinkSync(pendingPath);
+      } catch {
+        // Left for the next pass.
+      }
+      return;
+    }
+    const gzPath = join(this.logDir, entry.path);
+    try {
+      const canonical = records.map((rec) => `${JSON.stringify(logLineOf(rec))}\n`).join('');
+      writeFileSync(gzPath, gzipSync(canonical), { flag: 'wx' });
+    } catch {
+      // Either the gzip/write failed or the archive already exists (a
+      // concurrent pass won the race): leave the pending file for the
+      // next pass, which dedupes against the index.
+      return;
+    }
+    try {
+      appendFileSync(this.archiveIndexFile, `${JSON.stringify(archiveIndexLineOf(entry))}\n`, 'utf8');
+    } catch {
+      // The `.gz` is safely on disk; the index append is retried via
+      // orphan adoption on the next open.
+      return;
+    }
+    try {
+      unlinkSync(pendingPath);
+    } catch {
+      // The archive and index are complete; the leftover pending file is
+      // dropped idempotently by the next pass.
+    }
+    this.addArchiveEntry(entry);
   }
 
   /** Rewrites a topic's file keeping only the newest entries. */
@@ -649,14 +1295,35 @@ export class DurableTopicLog {
    * `fromSeqExclusive`, in ascending seq order. Used to refill a
    * resubscribing consumer's queue from where it left off.
    *
+   * By default only the live segment is read: closed segments are
+   * history, and a resume must not pay decompression for data it already
+   * consumed. Pass `{ includeArchived: true }` to also read the archived
+   * segments on demand — archived records are decompressed, filtered by
+   * the same cursor, and merged in ascending seq order ahead of the live
+   * records. An archive file that fails to decompress is skipped and
+   * counted (`stats().corruptArchives`), never fatal.
+   *
    * With keyed compaction on, only the latest record per key is returned:
-   * a superseded value is never replayed, even before compaction rewrites
-   * the file. Keyless records pass through untouched, and seq-0 schedule
-   * records (timer intents, requested via a negative bound by delayed-
-   * delivery recovery) are never deduped.
+   * a superseded value is never replayed, even before the file is
+   * rewritten — and an archived value superseded by a live record is not
+   * resurrected by `includeArchived` either. Keyless records pass through
+   * untouched, and seq-0 schedule records (timer intents, requested via a
+   * negative bound by delayed-delivery recovery) are never deduped.
    */
-  readSince(topic: string, fromSeqExclusive: number): DurableLogRecord[] {
-    const records = this.readFileRecords(topic).filter((rec) => rec.seq > fromSeqExclusive);
+  readSince(
+    topic: string,
+    fromSeqExclusive: number,
+    opts?: { includeArchived?: boolean },
+  ): DurableLogRecord[] {
+    const live = this.readFileRecords(topic).filter((rec) => rec.seq > fromSeqExclusive);
+    let records = live;
+    if (opts?.includeArchived === true) {
+      const archived = this.readArchivedRecords(topic, fromSeqExclusive);
+      // Archived segments predate the live segment; the stable sort keeps
+      // file order for equal seqs (which cannot happen across segments —
+      // seq ranges are disjoint — but defensively).
+      records = [...archived, ...live].sort((a, b) => a.seq - b.seq);
+    }
     if (!this.keyCompaction) return records;
     const latestByKey = new Map<string, DurableLogRecord>();
     for (const rec of records) {
@@ -666,6 +1333,65 @@ export class DurableTopicLog {
     }
     if (latestByKey.size === 0) return records;
     return records.filter((rec) => rec.key === undefined || rec.seq < 1 || latestByKey.get(rec.key) === rec);
+  }
+
+  /**
+   * Reads one topic's archived segments: every record with `seq`
+   * strictly greater than `fromSeqExclusive`, in ascending seq order.
+   * Pending (rotated but not yet gzipped) segments are read too — they
+   * are logically archived, only the compression is still in flight.
+   */
+  private readArchivedRecords(topic: string, fromSeqExclusive: number): DurableLogRecord[] {
+    const out: DurableLogRecord[] = [];
+    const segments = this.archivesByTopic.get(topic) ?? [];
+    for (const segment of segments) {
+      if (segment.seqEnd <= fromSeqExclusive) continue;
+      let text: string;
+      try {
+        text = gunzipSync(readFileSync(join(this.logDir, segment.path))).toString('utf8');
+      } catch {
+        this.corruptArchives += 1;
+        continue;
+      }
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue;
+        const rec = parseLogLine(line, topic);
+        if (rec == null) {
+          this.corruptLines += 1;
+          continue;
+        }
+        if (rec.seq > fromSeqExclusive) out.push(rec);
+      }
+    }
+    // Pending segments: rotated, awaiting the background archive pass.
+    // The rename is atomic, so the file is complete and safe to read.
+    const prefix = `${encodeURIComponent(topic)}.seg-`;
+    let names: string[];
+    try {
+      names = readdirSync(this.logDir);
+    } catch {
+      return out;
+    }
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith('.jsonl.tmp')) continue;
+      let text: string;
+      try {
+        text = readFileSync(join(this.logDir, name), 'utf8');
+      } catch {
+        continue;
+      }
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue;
+        const rec = parseLogLine(line, topic);
+        if (rec == null) {
+          this.corruptLines += 1;
+          continue;
+        }
+        if (rec.seq > fromSeqExclusive) out.push(rec);
+      }
+    }
+    out.sort((a, b) => a.seq - b.seq);
+    return out;
   }
 
   /**
@@ -681,13 +1407,26 @@ export class DurableTopicLog {
    * a superseded value is never replayed by time either. seq-0
    * schedule records (timer intents) pass through untouched.
    */
-  readSinceTime(topic: string, fromTimeExclusive: number): DurableLogRecord[] {
-    const records = this.readFileRecords(topic).filter((rec) => rec.at > fromTimeExclusive);
+  readSinceTime(
+    topic: string,
+    fromTimeExclusive: number,
+    opts?: { includeArchived?: boolean },
+  ): DurableLogRecord[] {
+    const live = this.readFileRecords(topic).filter((rec) => rec.at > fromTimeExclusive);
+    let records = live;
+    if (opts?.includeArchived === true) {
+      // Time cursors have no seq bound: read every archived record and
+      // filter by time, like the live path.
+      const archived = this.readArchivedRecords(topic, -1).filter(
+        (rec) => rec.at > fromTimeExclusive,
+      );
+      records = [...archived, ...live].sort((a, b) => a.at - b.at || a.seq - b.seq);
+    }
     if (!this.keyCompaction) return records;
     const latestByKey = new Map<string, DurableLogRecord>();
-    for (const rec of records) {
-      // File order is ascending seq, so the last write per key wins —
-      // identical to `readSince`'s dedup.
+    // Dedup in seq order: the last write per key wins, regardless of the
+    // time-ordered return order above.
+    for (const rec of [...records].sort((a, b) => a.seq - b.seq)) {
       if (rec.key !== undefined && rec.seq >= 1) latestByKey.set(rec.key, rec);
     }
     if (latestByKey.size === 0) return records;
@@ -955,9 +1694,33 @@ export class DurableTopicLog {
     offsetEntries: number;
     /** Lines in the subscriber-dedup journal (`__dedup.jsonl`). */
     dedupEntries: number;
+    /** Archive files that failed to decompress during archived reads. */
+    corruptArchives: number;
+    /** Total entries across all archived segments. */
+    archived: number;
+    /**
+     * Per-topic segment view: live entries in the current segment,
+     * closed archived segment count, and archived entries — in
+     * first-seen order.
+     */
+    segments: Record<string, { live: number; segments: number; archived: number }>;
   } {
     let entries = 0;
     for (const count of this.entryCounts.values()) entries += count;
+    const segments: Record<string, { live: number; segments: number; archived: number }> = {};
+    for (const topic of this.topicsSeen) {
+      segments[topic] = {
+        live: this.entryCounts.get(topic) ?? 0,
+        segments: this.archivesByTopic.get(topic)?.length ?? 0,
+        archived: 0,
+      };
+    }
+    let archived = 0;
+    for (const entry of this.archives) {
+      archived += entry.entries;
+      const view = segments[entry.topic];
+      if (view !== undefined) view.archived += entry.entries;
+    }
     return {
       topics: this.topicsSeen.size,
       entries,
@@ -965,6 +1728,9 @@ export class DurableTopicLog {
       keyCompaction: this.keyCompaction,
       offsetEntries: this.offsetEntries,
       dedupEntries: this.dedupEntries,
+      corruptArchives: this.corruptArchives,
+      archived,
+      segments,
     };
   }
 }

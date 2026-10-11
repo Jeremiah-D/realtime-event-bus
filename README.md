@@ -265,7 +265,32 @@ library.
   the backlog becomes replayable again (at-least-once). The `leave`
   rebalance event carries `lingerUntil` / `lingering` so operators can see
   the handoff; the operational recipe is `commitOffset` before leaving —
-  the linger only covers what the leaver did not commit.
+  the linger only covers what the leaver did not commit. Opt-in segment
+  rotation (`durableLogSegmentRotation: { maxEntriesPerSegment?,
+  maxSegmentAgeMs? }`, validated `RangeError`): the per-topic live file
+  holds the current segment, and when an append reaches the entry budget
+  or the segment's age (on the record timestamps, i.e. the bus clock)
+  reaches the age budget, the live file is atomically renamed aside and a
+  fresh live segment starts — the publish path only does the O(1) rename.
+  An unref'd background pass then gzips the closed segment to
+  `<topic>.seg-<seqStart>-<seqEnd>.jsonl.gz` and appends one line to the
+  append-only archive index (`__archive_index.jsonl`):
+  `{topic, segmentId, path, seqStart, seqEnd, atStart, atEnd, entries,
+  messages}` plus the segment's per-key seq highs — so archiving never
+  blocks publishing and never keeps the process alive. Replay
+  (`resumeFromSeq` / `resumeFromTime`) reads the live segment by default;
+  `DurableTopicLog.readSince` / `readSinceTime` take
+  `{ includeArchived: true }` to decompress archived segments on demand
+  and merge them in seq order ahead of the live records, under the same
+  TTL and keyed-compaction rules (an archived value superseded by a live
+  record is never resurrected). Archive files that fail to decompress are
+  skipped and counted (`getStats().durableLog.corruptArchives`), never
+  fatal; restart recovery rebuilds the archive view from the index, adopts
+  orphan archives, and folds archived seq/keySeq bounds into the cursors —
+  numbering never reuses an archived number.
+  `getStats().durableLog` additionally reports `archived` (total archived
+  entries), `corruptArchives`, and per-topic `segments`
+  (`{ live, segments, archived }`).
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
@@ -1065,6 +1090,17 @@ npm test
   `durableLogDir` is missing, TTL-expired replays counted as expired, no
   phantom sequence gaps after replay, per-member group replay, unserializable
   payloads delivered live but not logged, and the on-disk JSONL line format.
+- `test/archive.test.ts` — durable-log segment archiving: count-based and
+  age-based rotation triggers, the archive index format
+  (`{topic, segmentId, path, seqStart, seqEnd, atStart, atEnd, entries}`),
+  background archiving never blocking the publish path (rotation renames
+  synchronously; the gzip lands later), default replay reading only the
+  live segment, opt-in `{ includeArchived: true }` reads merging archives
+  in seq order, corrupt gzips skipped and counted, corrupt index lines
+  tolerated on recovery, restart rebuilding the archive view without seq
+  reuse (keySeqs reseeded), keyed-compaction dedup across the
+  live/archive boundary, no archiving without the opt-in, and `RangeError`
+  on invalid rotation options.
 - `test/backpressure.test.ts` — both drop policies, one-shot high-water-mark
   behavior, drain ordering, runtime watermark adjustment (`setHighWaterMarkRatio`,
   validation, mid-excursion lowering/raising semantics) and the `onDrained`
