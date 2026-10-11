@@ -1,4 +1,5 @@
 import { BoundedQueue, type DropPolicy } from './backpressure.ts';
+import { LeaseManager, type LeaseExpiredCallback, type LeaseExpiredEvent } from './lease.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
@@ -103,6 +104,7 @@ export type {
   AckSloMissEvent,
 } from './acklatency.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
+export type { LeaseExpiredCallback, LeaseExpiredEvent } from './lease.ts';
 export type { LateMessageCallback, LateMessageEvent } from './watermark.ts';
 export type {
   TraceOptions,
@@ -271,6 +273,22 @@ export interface SubscribeOptions {
    * number when given.
    */
   queueMaxBytes?: number;
+  /**
+   * Opt-in subscription lease, in milliseconds (see `src/lease.ts`,
+   * EB-69): the subscription automatically unsubscribes when the lease
+   * expires, exactly as if `unsubscribe()` had been called — consumer
+   * group leave handling, reliable-delivery ack-tracker teardown and
+   * queue disposal all run identically, and messages still queued at
+   * expiry are discarded with the queue (the subscriber's own
+   * `dropPolicy` semantics). `EventBusOptions.onLeaseExpired` fires once
+   * per expired lease (error-isolated), and `getStats().expiredLeases`
+   * counts expiries. `renewLease(subId, ms)` extends the lease from the
+   * renewal moment; `unsubscribe()` clears it. The expiry timer is
+   * `unref()`'d, so a pending lease never keeps the process alive.
+   * Disabled by default (absent). Must be a positive integer when
+   * given — anything else throws `RangeError` at subscribe time.
+   */
+  leaseMs?: number;
   /**
    * Called when the subscriber falls behind: its queue reached the high-water
    * mark (80% of capacity). Fires once per excursion and re-arms after the
@@ -1513,6 +1531,17 @@ export interface EventBusOptions {
    */
   onAuthzDenied?: AuthzDeniedCallback;
   /**
+   * Fires once per expired subscription lease (see
+   * `SubscribeOptions.leaseMs`, EB-69): the bus has already unsubscribed
+   * the subscriber through its normal unsubscribe path when this fires,
+   * so the subscription is gone and `getStats().expiredLeases` has
+   * already been incremented. The callback is error-isolated: a throwing
+   * hook is swallowed so a broken observer can never disturb the
+   * unsubscribe path. Default: unset (no hook — fully backward
+   * compatible).
+   */
+  onLeaseExpired?: LeaseExpiredCallback;
+  /**
    * Opt-in delivery-pipeline trace spans (see `src/trace.ts`). When
    * enabled, the bus emits one trace per sampled publish, threading the
    * message through `bus.publish` → `bus.admission` → `bus.fanout` →
@@ -1800,6 +1829,14 @@ export interface BusStats {
    * discarded queue entry once — see `TopicStats.expiredMessages`).
    */
   expiredMessages: number;
+  /**
+   * Total subscription leases that expired and auto-unsubscribed their
+   * subscriber (see `SubscribeOptions.leaseMs`, EB-69). Counts each
+   * expiry once, after the unsubscribe ran and `onLeaseExpired` fired.
+   * 0 when no lease was ever armed — the field is always present, so
+   * readers never need a fallback.
+   */
+  expiredLeases: number;
   /**
    * Deliveries currently outstanding — handed to reliable subscribers but
    * not yet acked or nacked — across all subscriptions.
@@ -4766,6 +4803,20 @@ export class EventBus {
   private readonly publisherCounts = new Map<string, number>();
   private totalExpired = 0;
   /**
+   * Subscription leases that expired and auto-unsubscribed their
+   * subscriber (see `src/lease.ts`, EB-69). Surfaced as
+   * `getStats().expiredLeases`.
+   */
+  private totalExpiredLeases = 0;
+  /**
+   * Active subscription-lease timers (see `src/lease.ts`, EB-69), keyed
+   * by subscription id. Armed at subscribe time, cleared from every
+   * unsubscribe path, and renewed via `renewLease`.
+   */
+  private readonly leases: LeaseManager;
+  /** Observer hook for expired leases (`EventBusOptions.onLeaseExpired`). */
+  private readonly onLeaseExpired?: LeaseExpiredCallback;
+  /**
    * Messages handed to subscriber handlers (global total). Counts each
    * handler invocation, so at-least-once redeliveries count again; a
    * handler that throws still received the message, and still counts.
@@ -5383,6 +5434,12 @@ export class EventBus {
       throw new RangeError('onAuthzDenied must be a function');
     }
     this.onAuthzDenied = onAuthzDenied;
+    const onLeaseExpired = options?.onLeaseExpired;
+    if (onLeaseExpired !== undefined && typeof onLeaseExpired !== 'function') {
+      throw new RangeError('onLeaseExpired must be a function');
+    }
+    this.onLeaseExpired = onLeaseExpired;
+    this.leases = new LeaseManager((expired) => this.handleLeaseExpiry(expired));
     const allowedLatenessMs = options?.allowedLatenessMs ?? 0;
     validateAllowedLatenessMs(allowedLatenessMs, 'EventBus');
     this.allowedLatenessMs = allowedLatenessMs;
@@ -6972,6 +7029,12 @@ export class EventBus {
     if (queueMaxBytes !== undefined && (!Number.isFinite(queueMaxBytes) || queueMaxBytes <= 0)) {
       throw new RangeError('subscribe: queueMaxBytes must be a positive finite number of bytes');
     }
+    // Subscription lease (EB-69): validated before anything registers, so
+    // a throw leaves no half-registered subscriber behind.
+    const leaseMs = opts?.leaseMs;
+    if (leaseMs !== undefined && (!Number.isInteger(leaseMs) || leaseMs <= 0)) {
+      throw new RangeError('subscribe: leaseMs must be a positive integer number of milliseconds');
+    }
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
     const onThrottled = opts?.onThrottled;
@@ -7169,10 +7232,13 @@ export class EventBus {
       this.replayLog(subscriber, resumeFromSeq);
     }
 
-    return {
+    const subscription: Subscription = {
       id,
       unsubscribe: () => {
         if (!this.subscribers.delete(id)) return;
+        // A lease must not outlive its subscriber: no phantom expiry
+        // after unsubscribe (EB-69).
+        this.leases.clear(id);
         // Pending timers must not outlive the subscriber: no phantom
         // resume or re-flush after unsubscribe.
         const health = subscriber.health;
@@ -7201,6 +7267,52 @@ export class EventBus {
         this.advertiseClusterPatterns();
       },
     };
+    // Subscription lease (EB-69): opt-in only. Armed after the
+    // subscription object exists so expiry can unsubscribe through the
+    // outermost wrapper (see `subscribeReliable` / `subscribeToGroup`,
+    // which adopt their outer closure below).
+    if (leaseMs !== undefined) {
+      this.leases.arm(id, leaseMs, topicPattern, subscription.unsubscribe);
+    }
+    return subscription;
+  }
+
+  /**
+   * Renews the subscription lease for `subId` (see
+   * `SubscribeOptions.leaseMs`, EB-69): the expiry timer restarts,
+   * measuring a fresh `ms` window from the renewal moment. Returns
+   * `true` on success, `false` when `subId` holds no active lease
+   * (unknown subscription id, or a subscription that never opted into a
+   * lease). Throws `RangeError` for a non-positive-integer `ms`.
+   */
+  renewLease(subId: string, ms: number): boolean {
+    if (!Number.isInteger(ms) || ms <= 0) {
+      throw new RangeError('renewLease: ms must be a positive integer number of milliseconds');
+    }
+    return this.leases.renew(subId, ms);
+  }
+
+  /**
+   * Runs once per expired lease, after `LeaseManager` disarmed the entry
+   * and ran the subscription's outermost unsubscribe closure. Counts the
+   * expiry, then fires `EventBusOptions.onLeaseExpired` (error-isolated:
+   * a throwing hook is swallowed so a broken observer can never disturb
+   * the unsubscribe path, the same rule as `onAdmissionRejected`).
+   */
+  private handleLeaseExpiry(expired: { subId: string; leaseMs: number; pattern: string }): void {
+    this.totalExpiredLeases += 1;
+    const onLeaseExpired = this.onLeaseExpired;
+    if (onLeaseExpired === undefined) return;
+    const event: LeaseExpiredEvent = {
+      subscriberId: expired.subId,
+      pattern: expired.pattern,
+      leaseMs: expired.leaseMs,
+    };
+    try {
+      onLeaseExpired(event);
+    } catch {
+      // Swallowed: a user callback must never break the bus.
+    }
   }
 
   /**
@@ -7415,7 +7527,7 @@ export class EventBus {
         delivery.nack();
       }
     };
-    return {
+    const reliableSubscription: Subscription = {
       id: sub.id,
       unsubscribe: () => {
         // Cancel pending ack timers first: no phantom redeliveries after unsubscribe.
@@ -7423,6 +7535,10 @@ export class EventBus {
         sub.unsubscribe();
       },
     };
+    // Lease expiry must run the outermost teardown (ack-tracker clear
+    // above); the inner closure alone would skip it (EB-69).
+    this.leases.adoptUnsubscribe(sub.id, reliableSubscription.unsubscribe);
+    return reliableSubscription;
   }
 
   /**
@@ -7552,7 +7668,7 @@ export class EventBus {
       else this.replayLog(subscriber, resumeFromSeq);
     }
     this.fireRebalance(groupId, topicPattern, key, 'join', sub.id, undefined, partitionRebalance);
-    return {
+    const groupSubscription: Subscription = {
       id: sub.id,
       unsubscribe: () => {
         // Second call is a no-op: no double leave-event, no roster churn.
@@ -7579,6 +7695,10 @@ export class EventBus {
         this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id, linger, pr);
       },
     };
+    // Lease expiry must run the outermost teardown (group leave above);
+    // the inner closure alone would leak the roster entry (EB-69).
+    this.leases.adoptUnsubscribe(sub.id, groupSubscription.unsubscribe);
+    return groupSubscription;
   }
 
   /**
@@ -11798,6 +11918,7 @@ export class EventBus {
       ),
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
+      expiredLeases: this.totalExpiredLeases,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       indexSize: this.prefixIndex.size,

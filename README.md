@@ -357,6 +357,24 @@ library.
   per-subscriber state. Invalid probe options throw `RangeError` from
   `subscribe`. Disabled by default — a throwing handler behaves exactly as
   before unless a subscriber opts in.
+- **Subscription leases** (in `src/lease.ts`, opt-in via
+  `subscribe(..., { leaseMs })`): a lifetime bound on a subscription — when
+  the lease expires, the bus unsubscribes the subscriber automatically,
+  through the exact same unsubscribe path a manual `unsubscribe()` takes
+  (consumer-group leave handling, reliable-delivery ack-tracker teardown
+  and queue disposal all run identically; messages still queued at expiry
+  are discarded with the queue, per the subscriber's own `dropPolicy`
+  semantics — no new drop semantic is invented). `renewLease(subId, ms)`
+  restarts the timer from the renewal moment and returns `false` for an
+  unknown id or a lease-less subscription; `unsubscribe()` clears the
+  timer, so no phantom expiry can fire afterwards. The expiry timer is
+  `unref()`'d, so a pending lease never keeps the process alive.
+  `EventBusOptions.onLeaseExpired` fires once per expiry (error-isolated —
+  a throwing hook is swallowed) and `getStats().expiredLeases` counts
+  expiries. Works for consumer-group members too (`subscribeToGroup` passes
+  the option through). Non-positive-integer `leaseMs` (including `NaN`)
+  throws `RangeError` at subscribe time. Disabled by default — fully
+  backward compatible.
 - **Per-topic publish rate limiting** (in `src/bus.ts`, via
   `setTopicRateLimit(pattern, messagesPerSec, { burst })`): a token bucket
   per concrete topic (refilled from the bus clock, so tests stay
