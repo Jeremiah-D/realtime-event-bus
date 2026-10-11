@@ -975,6 +975,43 @@ library.
   scheduled count. Invalid timing options throw `RangeError`; with a durable
   log, a non-JSON-serializable payload throws instead of scheduling
   something that could not survive a restart.
+- **Shadow subscriber traffic mirroring** (in `src/bus.ts`, via
+  `subscribe(pattern, handler, { shadow: true | { queueSize?,
+  dropPolicy? } })`): the subscription becomes a shadow subscriber — it
+  receives a full copy of production traffic for regression / load-test
+  validation, in its own independent queue with its own backpressure
+  policy, and it can never disturb production. The mirror is excluded from
+  the `publish` fan-out width (`matched`/`accepted`), from the topic's
+  `subscriberCount`, and from `deliveredMessages`/`droppedMessages`/
+  `sequenceGaps` and every topic/group stat; shadow deliveries are tracked
+  in independent counters only — `shadowed`/`dropped` per subscriber in
+  `getStats().shadows`, `shadowedMessages`/`shadowDroppedMessages`
+  bus-wide, and `eventbus_shadowed_messages_total` /
+  `eventbus_shadow_dropped_messages_total` in `src/metrics.ts`. A shadow
+  subscriber never joins group assignment: it cannot steal a consumer
+  group's copy, advance the assignment watermark, or touch committed
+  offsets (`commitOffset`). A throwing shadow handler is swallowed — it
+  never breaks the flush loop or affects production delivery, and the
+  message still counts as shadowed, exactly like production counts a
+  throwing handler's message as delivered. The shadow queue is sized by
+  `ShadowSubscribeOptions` (falling back to the subscription's own
+  `queueSize`/`dropPolicy`); a saturated shadow sheds only its own copy.
+  The shadow copy bypasses the per-subscriber ordering gates (keyed /
+  causal) — it mirrors fan-out order — and skips sequence-gap tracking
+  (loss is visible in the shadow `dropped` counter); TTL expiry still
+  discards an unexpired-in-time copy, uncounted. Incompatible options fail
+  fast with `RangeError`: `subscribeReliable` and `subscribeToGroup`
+  reject `shadow` outright, and within `subscribe` so do
+  `resumeFromSeq`/`resumeFromTime`, `throttle`, `deliveryShaping`,
+  `rateLimit`, `healthProbe`, `batch`, `causal`, `deduplicateMessages`,
+  `keyHotspot`, and `ackLatency` — a shadow mirror is a plain
+  live-traffic tap. The passive observability knobs compose normally:
+  `filter` (a throwing filter still propagates to the publish call, like
+  production), `deliveryLatency`, `lagMonitor`, `latencySlo`,
+  `onBackpressure`, `onDrained`. Disabled by default — without the opt-in
+  the subscriber builds no shadow state: zero overhead, zero behavior
+  change. Invalid shadow tuning throws `RangeError` (`TypeError` for a
+  non-object value).
 
 ## Multi-tenant namespaces
 
@@ -1339,6 +1376,22 @@ npm test
   publishes never moving the watermark, `eventTime` on batch/atomic
   entries, durable-log persistence with replay restoring the envelope, and
   the late-message/watermark Prometheus series.
+- `test/shadow.test.ts` — shadow subscriber traffic mirroring (EB-63): a
+  shadow subscription receiving a full copy of production traffic, the
+  mirror excluded from the `publish` fan-out width and the topic's
+  `subscriberCount`, the shadow queue shedding independently (drop-oldest
+  evictions and drop-newest discards) with zero movement in production
+  `droppedMessages`/`deliveredMessages`, a throwing shadow handler isolated
+  from production delivery and the flush loop, consumer-group assignment
+  and committed offsets undisturbed by a same-pattern shadow, `RangeError`
+  on every incompatible option (`subscribeReliable`, `subscribeToGroup`,
+  throttle/shaping/rate-limit/health/batch/causal/dedup/keyHotspot/
+  ackLatency/resume) plus invalid shadow tuning with zero state change, a
+  shadow content filter narrowing the mirror without touching production
+  filter stats, composition with `deliveryLatency`/`lagMonitor`, the
+  shadowed/shadow-dropped Prometheus counters, shadow sheds never
+  surfacing as production sequence gaps, and unsubscribe stopping the
+  mirror.
 
 ## Benchmark
 

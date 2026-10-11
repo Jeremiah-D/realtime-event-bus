@@ -10,6 +10,12 @@
  *   again).
  * - `eventbus_dropped_messages_total`: messages shed by subscriber
  *   backpressure queues.
+ * - `eventbus_shadowed_messages_total`: messages handed to shadow-subscriber
+ *   handlers — the mirror deliveries (see `SubscribeOptions.shadow`); never
+ *   counted in `eventbus_delivered_messages_total`.
+ * - `eventbus_shadow_dropped_messages_total`: messages shed by shadow
+ *   subscribers' independent backpressure queues; never counted in
+ *   `eventbus_dropped_messages_total`.
  * - `eventbus_expired_messages_total`: messages discarded by TTL before
  *   delivery.
  * - `eventbus_throttled_messages_total`: messages shed at the publish
@@ -206,6 +212,16 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_dropped_messages_total',
     'Total messages shed by subscriber backpressure queues.',
     stats.droppedMessages,
+  );
+  counter(
+    'eventbus_shadowed_messages_total',
+    'Total messages handed to shadow-subscriber handlers (mirror deliveries; never counted in delivered).',
+    stats.shadowedMessages ?? 0,
+  );
+  counter(
+    'eventbus_shadow_dropped_messages_total',
+    "Total messages shed by shadow subscribers' independent backpressure queues.",
+    stats.shadowDroppedMessages ?? 0,
   );
   counter(
     'eventbus_expired_messages_total',

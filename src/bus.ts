@@ -713,6 +713,94 @@ export interface SubscribeOptions {
    * `<namespace>/<topic>` topic.
    */
   namespace?: string;
+  /**
+   * Opt-in shadow traffic mirroring (EB-63): the subscription becomes a
+   * shadow subscriber — it receives a full copy of production traffic for
+   * regression / load-test validation, in its own independent queue with
+   * its own backpressure policy, and it can never disturb production.
+   *
+   * Isolation guarantees, all enforced by the bus:
+   * - the shadow's copy is never counted in `publish()`'s matched /
+   *   accepted fan-out width, in `deliveredMessages`, `droppedMessages`,
+   *   `sequenceGaps`, or any topic/group stat — shadow deliveries are
+   *   tracked in independent counters only (`shadowed` / `dropped` per
+   *   subscriber, `shadowedMessages` / `shadowDroppedMessages` bus-wide,
+   *   plus `eventbus_shadowed_messages_total` and
+   *   `eventbus_shadow_dropped_messages_total` in `src/metrics.ts`);
+   * - a shadow subscriber never joins group assignment: it cannot steal a
+   *   consumer group's copy, advance the group's assignment watermark, or
+   *   touch committed offsets (`commitOffset`, EB-32);
+   * - a throwing shadow handler is swallowed — it never breaks the flush
+   *   loop and never affects production delivery; the message still
+   *   counts as shadowed, exactly like production counts a throwing
+   *   handler's message as delivered.
+   *
+   * The shadow queue is the subscription's own queue, sized by
+   * `ShadowSubscribeOptions` (falling back to the subscription's
+   * `queueSize` / `dropPolicy`): a saturated shadow sheds only its own
+   * copy per its own drop policy. The shadow copy bypasses the
+   * per-subscriber ordering gates (keyed / causal) — it mirrors fan-out
+   * order — and skips sequence-gap tracking (loss is visible in the
+   * shadow `dropped` counter). TTL expiry still applies: a shadow copy
+   * whose deadline passes before the drain is discarded, uncounted.
+   *
+   * Incompatible options throw `RangeError` from `subscribe` (a shadow
+   * mirror is a plain live-traffic tap): `subscribeReliable` and
+   * `subscribeToGroup` reject `shadow` outright, and within `subscribe`
+   * so do `resumeFromSeq` / `resumeFromTime`, `throttle`,
+   * `deliveryShaping`, `rateLimit`, `healthProbe`, `batch`, `causal`,
+   * `deduplicateMessages`, `keyHotspot`, and `ackLatency`. The passive
+   * observability knobs compose normally: `filter` (a throwing filter
+   * still propagates to the publish call, like production),
+   * `deliveryLatency`, `lagMonitor`, `latencySlo`, `onBackpressure`,
+   * `onDrained`.
+   *
+   * Pass `true` for the defaults (the subscription's own `queueSize` /
+   * `dropPolicy`), or a `ShadowSubscribeOptions` object to size the
+   * shadow queue independently. Disabled by default.
+   */
+  shadow?: boolean | ShadowSubscribeOptions;
+}
+
+/**
+ * Tuning for a shadow subscriber's independent backpressure queue (see
+ * `SubscribeOptions.shadow`). Unset fields fall back to the
+ * subscription's own `queueSize` / `dropPolicy`, so `shadow: true` needs
+ * no tuning at all; set them to size the mirror independently of any
+ * production subscriber's queue. Bounds are validated at `subscribe`
+ * time; violations throw `RangeError`.
+ */
+export interface ShadowSubscribeOptions {
+  /**
+   * Capacity of the shadow queue. Must be a positive integer. Defaults
+   * to the subscription's `queueSize` (100).
+   */
+  queueSize?: number;
+  /**
+   * Drop policy of the shadow queue when full. Must be `'drop-oldest'`
+   * or `'drop-newest'`. Defaults to the subscription's `dropPolicy`
+   * (`'drop-oldest'`).
+   */
+  dropPolicy?: DropPolicy;
+}
+
+/**
+ * Per-shadow-subscriber mirror counters (see `SubscribeOptions.shadow`),
+ * in subscription order — one row per subscription with `shadow`
+ * enabled. The independent stats surface for shadow traffic: these never
+ * mix into the production delivery/drop counters.
+ */
+export interface ShadowSubscriberStat {
+  /** The shadow subscription this row describes. */
+  subscriberId: string;
+  /** The topic pattern the shadow subscriber registered. */
+  pattern: string;
+  /** Messages handed to the shadow handler (a throwing handler still counts). */
+  shadowed: number;
+  /** Messages shed by the shadow queue's independent backpressure policy. */
+  dropped: number;
+  /** Current depth of the shadow queue. */
+  queueSize: number;
 }
 
 /**
@@ -1624,6 +1712,26 @@ export interface BusStats {
    */
   droppedMessages: number;
   /**
+   * Total messages handed to shadow-subscriber handlers (see
+   * `SubscribeOptions.shadow`) — the mirror deliveries. Tracked
+   * independently: never counted in `deliveredMessages`, so validating a
+   * new handler version against production traffic cannot move the
+   * production delivery counter.
+   */
+  shadowedMessages: number;
+  /**
+   * Total messages shed by shadow subscribers' independent backpressure
+   * queues. Never counted in `droppedMessages` — a saturated shadow
+   * mirror sheds only its own copy.
+   */
+  shadowDroppedMessages: number;
+  /**
+   * Per-shadow-subscriber mirror counters (see `SubscribeOptions.shadow`),
+   * in subscription order — one row per subscription with `shadow`
+   * enabled. Empty when no shadow subscription is live.
+   */
+  shadows: ShadowSubscriberStat[];
+  /**
    * Estimated buffered payload bytes across all live subscriber
    * backpressure queues (see `SubscribeOptions.queueMaxBytes`). The
    * memory-pressure signal that a count-only queue hides: with mixed
@@ -2299,6 +2407,14 @@ interface Subscriber {
    * disabled for this subscriber.
    */
   dedup?: SubscriberDedupState;
+  /**
+   * Shadow traffic mirroring state (see `SubscribeOptions.shadow`).
+   * Present only for shadow subscriptions: the subscriber receives a
+   * full copy of production traffic in its own queue, tracked in
+   * independent counters, with a throwing handler isolated from the
+   * flush loop.
+   */
+  shadow?: ShadowState;
 }
 
 /**
@@ -2356,6 +2472,20 @@ interface SubscriberDeadLetter {
   nextSeq: number;
   onDeadLetter?: (event: DeadLetterEvent) => void;
   diagnosticTopic?: string;
+}
+
+/**
+ * Per-subscriber shadow mirroring state (see `SubscribeOptions.shadow`).
+ * Present only for shadow subscriptions. `delivered` / `dropped` are the
+ * shadow's independent counters — they never feed the bus-wide
+ * `totalDelivered` / `totalDropped`, so a saturated or failing shadow
+ * mirror cannot move production stats.
+ */
+interface ShadowState {
+  /** Messages handed to the shadow handler (a throwing handler still counts). */
+  delivered: number;
+  /** Messages shed by the shadow queue's independent backpressure policy. */
+  dropped: number;
 }
 
 /**
@@ -2857,6 +2987,33 @@ function resolveBatchDeliveryOptions(
     throw new RangeError('batch.maxWaitMs must be a finite number of milliseconds >= 0');
   }
   return { maxSize, maxWaitMs, pending: [], timer: undefined };
+}
+
+/**
+ * Validates `SubscribeOptions.shadow` and returns the shadow queue's
+ * explicit overrides (unset fields fall back to the subscription's own
+ * `queueSize` / `dropPolicy` at the `subscribe` call site). Returns
+ * `undefined` when shadowing is disabled. Throws `TypeError` for a
+ * non-object value and `RangeError` for an invalid queue size or drop
+ * policy.
+ */
+function resolveShadowOptions(
+  shadow: boolean | ShadowSubscribeOptions | undefined,
+): { queueSize?: number; dropPolicy?: DropPolicy } | undefined {
+  if (shadow === undefined || shadow === false) return undefined;
+  if (shadow === true) return {};
+  if (typeof shadow !== 'object' || shadow === null) {
+    throw new TypeError('subscribe: shadow must be a boolean or a ShadowSubscribeOptions object');
+  }
+  const queueSize = shadow.queueSize;
+  if (queueSize !== undefined && (!Number.isInteger(queueSize) || queueSize <= 0)) {
+    throw new RangeError('subscribe: shadow.queueSize must be a positive integer');
+  }
+  const dropPolicy = shadow.dropPolicy;
+  if (dropPolicy !== undefined && dropPolicy !== 'drop-oldest' && dropPolicy !== 'drop-newest') {
+    throw new RangeError("subscribe: shadow.dropPolicy must be 'drop-oldest' or 'drop-newest'");
+  }
+  return { queueSize, dropPolicy };
 }
 
 /**
@@ -4305,6 +4462,19 @@ export class EventBus {
    * sum of the per-subscriber `droppedCount` values for live subscribers.
    */
   private totalDropped = 0;
+  /**
+   * Messages handed to shadow-subscriber handlers (global total). A
+   * shadow handler that throws still received the message, and still
+   * counts — mirroring `totalDelivered`'s rule. Never mixed into
+   * `totalDelivered`: shadow traffic is observability plumbing, not
+   * production fan-out.
+   */
+  private totalShadowed = 0;
+  /**
+   * Messages shed by shadow subscribers' independent backpressure queues
+   * (global total). Never mixed into `totalDropped`.
+   */
+  private totalShadowDropped = 0;
   /**
    * Messages shed at the publish side by adaptive throttling (global
    * total). Incremented next to the per-subscriber `throttledDrops` (see
@@ -6238,7 +6408,40 @@ export class EventBus {
       throw new AclDeniedError('subscribe', topicPattern);
     }
     const id = `sub-${++this.nextId}`;
-    const capacity = opts?.queueSize ?? 100;
+    // Shadow traffic mirroring (EB-63): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    // A shadow mirror is a plain live-traffic tap — the delivery-control
+    // and ordering features below would either silently do nothing or
+    // need shadow-aware plumbing the spec does not ask for, so combining
+    // them fails fast instead of pretending to work. Durable-log replay
+    // would pre-fill the mirror with history through the shared
+    // backpressure counters, so it is rejected too: a shadow subscribes
+    // to live production traffic, nothing else.
+    const shadowOpts = resolveShadowOptions(opts?.shadow);
+    if (shadowOpts !== undefined) {
+      if (resumeFromSeq !== undefined || resumeFromTime !== undefined) {
+        throw new RangeError(
+          'subscribe: shadow cannot be combined with resumeFromSeq/resumeFromTime',
+        );
+      }
+      const incompatible: Array<[string, unknown]> = [
+        ['throttle', opts?.throttle],
+        ['deliveryShaping', opts?.deliveryShaping],
+        ['rateLimit', opts?.rateLimit],
+        ['healthProbe', opts?.healthProbe],
+        ['batch', opts?.batch],
+        ['causal', opts?.causal],
+        ['deduplicateMessages', opts?.deduplicateMessages],
+        ['keyHotspot', opts?.keyHotspot],
+        ['ackLatency', opts?.ackLatency],
+      ];
+      for (const [name, value] of incompatible) {
+        if (value !== undefined && value !== false) {
+          throw new RangeError(`subscribe: shadow cannot be combined with ${name}`);
+        }
+      }
+    }
+    const capacity = shadowOpts?.queueSize ?? opts?.queueSize ?? 100;
     const queueMaxBytes = opts?.queueMaxBytes;
     if (queueMaxBytes !== undefined && (!Number.isFinite(queueMaxBytes) || queueMaxBytes <= 0)) {
       throw new RangeError('subscribe: queueMaxBytes must be a positive finite number of bytes');
@@ -6297,7 +6500,10 @@ export class EventBus {
     }
     const queue = new BoundedQueue<BusMessage>({
       capacity,
-      policy: opts?.dropPolicy ?? 'drop-oldest',
+      // The shadow queue's backpressure policy is independently tunable
+      // via `ShadowSubscribeOptions`; otherwise the subscription's own
+      // `dropPolicy` applies, exactly as for a production subscriber.
+      policy: shadowOpts?.dropPolicy ?? opts?.dropPolicy ?? 'drop-oldest',
       highWaterMarkRatio: opts?.highWaterMarkRatio,
       ...(queueMaxBytes === undefined
         ? {}
@@ -6374,6 +6580,10 @@ export class EventBus {
       onDegraded,
       filter,
       dedup,
+      // Shadow traffic mirroring (EB-63): the independent per-subscriber
+      // counters start at zero; the queue above is already the shadow's
+      // own, sized by its independent backpressure policy.
+      shadow: shadowOpts === undefined ? undefined : { delivered: 0, dropped: 0 },
     };
     this.subscribers.set(id, subscriber);
     // Durable dedup window: rehydrate the subscriber's window from the
@@ -6505,6 +6715,12 @@ export class EventBus {
     // Assigned synchronously here, before any flush microtask can run.
     // Validate the DLQ options before subscribing: a rejected option must
     // not leave a half-registered subscription behind.
+    // Shadow mirroring (EB-63) is incoherent with at-least-once delivery:
+    // a mirror copy has no acks, no redelivery budget, and no DLQ — it is
+    // a fire-and-forget tap for validation, so combining them fails fast.
+    if (opts?.shadow !== undefined && opts.shadow !== false) {
+      throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
+    }
     const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable');
     let deliver!: (msg: BusMessage | BusMessage[]) => void;
     const sub = this.subscribe(topicPattern, (msg: BusMessage | BusMessage[]) => deliver(msg), opts);
@@ -6708,6 +6924,13 @@ export class EventBus {
   ): Subscription {
     if (groupId.length === 0) {
       throw new RangeError('groupId must be a non-empty string');
+    }
+    // Shadow mirroring (EB-63) can never be a competing consumer: a shadow
+    // must not steal a group's copy, advance the assignment watermark, or
+    // touch committed offsets (EB-32) — so group membership rejects it
+    // before anything registers.
+    if (opts?.shadow !== undefined && opts.shadow !== false) {
+      throw new RangeError('subscribeToGroup: shadow cannot be combined with consumer groups');
     }
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -9562,6 +9785,81 @@ export class EventBus {
   }
 
   /**
+   * The shadow-mirror delivery path (see `SubscribeOptions.shadow`): a
+   * content filter (when the shadow subscriber has one), then the
+   * shadow's independent backpressure queue. Unlike `deliverUnkeyed` it
+   * touches no shared counters — no throttle shedding, no gap-baseline
+   * bookkeeping, no filtered-message accounting — so the mirror can
+   * never move production stats. A throwing filter propagates to the
+   * publish call, exactly like a production filter: filters are expected
+   * pure.
+   */
+  private deliverShadow(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+  ): void {
+    const filter = subscriber.filter;
+    if (filter !== undefined && !filter(rawPayload, msg.topic)) {
+      // A filter-rejected shadow copy is deliberately skipped: never
+      // queued, never counted anywhere. Shadow deliveries track no
+      // sequence gaps, so — unlike production — there is no baseline to
+      // advance over the skip.
+      return;
+    }
+    this.enqueueShadowMessage(subscriber, msg, expiresAt);
+  }
+
+  /**
+   * Pushes one message into a shadow subscriber's independent queue. The
+   * shed accounting is shadow-local: a full shadow queue counts into the
+   * shadow's own `dropped` counter and the bus-wide
+   * `totalShadowDropped` — never into the bus-wide `droppedMessages` —
+   * so a saturated mirror cannot move production stats. Delivery-latency
+   * and lag-watermark stamping compose exactly as for production (both
+   * are per-subscriber state), and a sampled trace still gets its
+   * per-subscriber `bus.enqueue` span for the mirror copy. Dedup and
+   * ack-latency stamping are absent: both are rejected as shadow
+   * combinations at `subscribe` time, so there is nothing to stamp.
+   */
+  private enqueueShadowMessage(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    deadline: number | undefined,
+  ): 'accepted' | 'dropped' {
+    const shadow = subscriber.shadow;
+    if (shadow === undefined) return 'dropped';
+    const queue = subscriber.queue;
+    // Diff the queue's drop counter around the push: with `drop-oldest`
+    // a full queue sheds an OLD entry to admit the newcomer, so `push`
+    // returns 'accepted' while still shedding — the eviction is only
+    // visible in `droppedCount` (same accounting as `enqueueMessage`).
+    const droppedBefore = queue.droppedCount;
+    const result = queue.push(msg, 0, deadline);
+    const shed = queue.droppedCount - droppedBefore;
+    if (shed > 0) {
+      shadow.dropped += shed;
+      this.totalShadowDropped += shed;
+    }
+    const latency = subscriber.latency;
+    if (latency != null && result === 'accepted') {
+      latency.enqueuedAt.set(msg, this.now());
+    }
+    const lag = subscriber.lag;
+    if (lag != null && result === 'accepted') {
+      const nowMs = this.now();
+      lag.enqueuedAt.set(msg, nowMs);
+      this.checkLag(subscriber, lag, nowMs);
+    }
+    const tracer = this.trace;
+    if (tracer !== undefined && result === 'accepted' && tracer.hasTrace(msg)) {
+      tracer.enqueueSpan(subscriber, msg, this.now(), 0);
+    }
+    return result;
+  }
+
+  /**
    * Per-(subscriber, key) publish-order delivery gate (see
    * `PublishOptions.key`). KeySeqs are assigned at admission in publish
    * order, but fan-out order can differ — a delayed schedule fans out
@@ -10520,6 +10818,17 @@ export class EventBus {
         continue;
       }
       if (subscriber.groupId == null) {
+        if (subscriber.shadow !== undefined) {
+          // Shadow mirror (EB-63): the subscription receives a full copy
+          // of production traffic in its own queue, but it is not
+          // production fan-out — never counted in matched/accepted, never
+          // competing with a group, never advancing group assignment
+          // watermarks or committed offsets (EB-32). The shadow copy
+          // bypasses the per-subscriber ordering gates (keyed/causal): it
+          // mirrors fan-out order into an independent queue.
+          this.deliverShadow(subscriber, msg, expiresAt, rawPayload);
+          continue;
+        }
         matched += 1;
         if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed, causal)) accepted += 1;
         continue;
@@ -10610,6 +10919,7 @@ export class EventBus {
     const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
+    const shadows: BusStats['shadows'] = [];
     const hotKeys: HotKeyStat[] = [];
     let causalBufferDepth = 0;
     for (const subscriber of this.subscribers.values()) {
@@ -10617,6 +10927,19 @@ export class EventBus {
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
+      // Shadow mirror counters (see `SubscribeOptions.shadow`): the
+      // independent stats surface for shadow traffic, in subscription
+      // order — one row per live shadow subscription.
+      const shadow = subscriber.shadow;
+      if (shadow !== undefined) {
+        shadows.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          shadowed: shadow.delivered,
+          dropped: shadow.dropped,
+          queueSize: subscriber.queue.size,
+        });
+      }
       const causalGate = subscriber.causal;
       if (causalGate !== undefined) {
         for (const buffer of causalGate.buffers.values()) causalBufferDepth += buffer.size;
@@ -10726,6 +11049,9 @@ export class EventBus {
       totalPublished: this.totalPublished,
       deliveredMessages: this.totalDelivered,
       droppedMessages: this.totalDropped,
+      shadowedMessages: this.totalShadowed,
+      shadowDroppedMessages: this.totalShadowDropped,
+      shadows,
       queueBytes: [...this.subscribers.values()].reduce(
         (sum, subscriber) => sum + subscriber.queue.queueBytes,
         0,
@@ -11226,6 +11552,72 @@ export class EventBus {
   }
 
   /**
+   * Drain path for shadow subscribers (see `SubscribeOptions.shadow`):
+   * dequeues the mirror copy and hands each message to the shadow
+   * handler with throw isolation. Shadow deliveries are tracked in the
+   * shadow's independent counters only — never in `totalDelivered`, and
+   * never in the topic's `sequenceGaps` (a shadow tracks no gap
+   * baseline; loss is visible in its `dropped` counter). A shadow copy
+   * whose TTL deadline passed before the drain is discarded silently:
+   * the production copy was already accounted for, so counting it again
+   * would double-count one logical expiry.
+   */
+  private drainShadowSubscriber(
+    subscriber: Subscriber,
+    shadow: ShadowState,
+    nowMs: number,
+  ): void {
+    const { live } = subscriber.queue.drainLive(nowMs);
+    for (const msg of live) {
+      // Compressed payloads inflate once per message before any handler
+      // sees them — idempotent, so the production copy's earlier
+      // inflation is harmless (see `inflateMessagePayload`).
+      this.inflateMessagePayload(msg);
+      // Sampled before the handler runs: queue dwell, not processing
+      // time — same rule as production.
+      this.recordDeliveryLatency(subscriber, msg, nowMs);
+      this.recordLagSample(subscriber, msg, nowMs);
+      shadow.delivered += 1;
+      this.totalShadowed += 1;
+      const invocationSlo = this.invocationLatencySlo(subscriber);
+      if (invocationSlo == null) {
+        this.invokeShadowHandler(subscriber, msg);
+      } else {
+        const processingStartedAtMs = this.now();
+        try {
+          this.invokeShadowHandler(subscriber, msg);
+        } finally {
+          this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
+        }
+      }
+    }
+    // Re-evaluate the lag watermark after the drain, mirroring the
+    // production path's tail.
+    const lag = subscriber.lag;
+    if (lag != null) this.checkLag(subscriber, lag, nowMs);
+  }
+
+  /**
+   * Invokes a shadow subscriber's handler with throw isolation: a
+   * throwing shadow handler must never break the flush loop or affect
+   * production delivery. The swallow lives inside the traced invocation
+   * so a sampled trace still records the `bus.deliver` span for the
+   * mirror copy. The message still counts as shadowed — it was handed to
+   * the handler, exactly like production's deliveredMessages counting a
+   * throwing handler's message.
+   */
+  private invokeShadowHandler(subscriber: Subscriber, msg: BusMessage): void {
+    this.deliverTraced(subscriber, msg, () => {
+      try {
+        subscriber.handler(msg);
+      } catch {
+        // Swallowed: shadow validation code must never disturb
+        // production delivery or the flush loop.
+      }
+    });
+  }
+
+  /**
    * Drains one subscriber's queue and delivers the dequeued messages,
    * honoring delivery-side rate shaping when enabled. A shaped subscriber
    * dequeues at most what its token budget allows this round (whole tokens
@@ -11234,6 +11626,14 @@ export class EventBus {
    * backlog drains even when no new publishes arrive.
    */
   private drainSubscriber(subscriber: Subscriber, nowMs: number): void {
+    // Shadow subscribers drain through their own isolated path: their
+    // deliveries never touch production counters, and a throwing shadow
+    // handler never escapes into this flush loop.
+    const shadow = subscriber.shadow;
+    if (shadow !== undefined) {
+      this.drainShadowSubscriber(subscriber, shadow, nowMs);
+      return;
+    }
     // A degraded subscriber's deliveries are paused: its backlog stays
     // queued under the normal backpressure policy, untouched by the
     // drain, so resuming picks up exactly where delivery paused.
