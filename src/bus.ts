@@ -636,7 +636,9 @@ export interface SubscribeOptions {
    * non-negative integer. For consumer-group members the replay is per
    * member — each member replays into its own queue from its own offset,
    * so seed it from that member's own committed offset (see
-   * `commitOffset`), not the group's assignment watermark.
+   * `commitOffset`), not the group's assignment watermark. Replay
+   * progress for the pass is observable per subscriber in
+   * `getStats().replayProgress` (see `onReplayProgress`, EB-71).
    */
   resumeFromSeq?: number;
   /**
@@ -661,9 +663,41 @@ export interface SubscribeOptions {
    * `durableLogDir`: passing `resumeFromTime` without it throws
    * `RangeError` instead of silently replaying nothing. Must be a
    * finite number of milliseconds `>= 0`. For consumer-group members
-   * the replay is per member, like `resumeFromSeq`.
+   * the replay is per member, like `resumeFromSeq`. Replay progress for
+   * the pass is observable per subscriber in
+   * `getStats().replayProgress` (see `onReplayProgress`, EB-71).
    */
   resumeFromTime?: number;
+  /**
+   * Opt-in durable-log replay progress observer (EB-71). When set, the
+   * subscriber's `resumeFromSeq` / `resumeFromTime` replay pass reports
+   * its progress as `{ subscriberId, pattern, total, replayed, skipped,
+   * done, failed, error? }`: `total` records were read for the pass,
+   * `replayed` admitted into the queue, `skipped` deliberately not
+   * queued (content filter, composite pattern, handoff-linger window, or
+   * an already-expired TTL — never a failure). The callback fires at
+   * most every `progressInterval` processed entries (default 100), plus
+   * exactly once when the pass finishes (`done: true`) or aborts on an
+   * error (`failed: true`, `error` carries the message — the error still
+   * propagates to the `subscribe` caller, replay stays fail-closed).
+   * Error-isolated like `onAdmissionRejected`: a throwing hook is
+   * swallowed so a broken observer can never disturb replay. The same
+   * progress is always visible in `getStats().replayProgress`, even
+   * without this callback.
+   *
+   * Requires a resume cursor: passing it without `resumeFromSeq` /
+   * `resumeFromTime` throws `RangeError` instead of silently never
+   * firing. Must be a function when provided.
+   */
+  onReplayProgress?: ReplayProgressCallback;
+  /**
+   * Replay entries processed between `onReplayProgress` fires (EB-71):
+   * a throttle so a large replay does not spam the observer. Must be a
+   * positive integer; defaults to 100. The completion/failure event
+   * always fires exactly once, regardless of the interval. Requires
+   * `onReplayProgress` — passing it alone throws `RangeError`.
+   */
+  progressInterval?: number;
   /**
    * Opt-in subscriber-side content filter. When set, every message fanned
    * out to this subscriber first passes the predicate at the publish side:
@@ -926,6 +960,73 @@ export interface ShadowSubscriberStat {
   /** Current depth of the shadow queue. */
   queueSize: number;
 }
+
+/**
+ * Default number of processed replay entries between
+ * `SubscribeOptions.onReplayProgress` fires (EB-71). Overridable with
+ * `SubscribeOptions.progressInterval`.
+ */
+const REPLAY_PROGRESS_INTERVAL_DEFAULT = 100;
+
+/**
+ * One subscriber's durable-log replay progress (see
+ * `SubscribeOptions.onReplayProgress`, EB-71): `total` records were
+ * read from the durable log for this replay pass, `replayed` were
+ * admitted into the subscriber's queue, and `skipped` were deliberately
+ * not queued — content-filter rejections, composite-pattern rejections,
+ * handoff-linger skips, or records whose TTL had already expired (an
+ * expired TTL is never a failure). `done` is true once the pass
+ * finished without error; `failed` is true when the pass aborted on an
+ * error, with `error` carrying the aborting error's message. Counting is
+ * per subscriber: consumer-group members and partitioned members each
+ * track their own replay.
+ */
+export interface ReplayProgressState {
+  /** Records read from the durable log for this replay pass. */
+  total: number;
+  /** Records admitted into the subscriber's queue. */
+  replayed: number;
+  /**
+   * Records deliberately not queued: content-filter rejections,
+   * composite-pattern rejections, handoff-linger skips, and records
+   * whose TTL had already expired. None of these is a failure.
+   */
+  skipped: number;
+  /** True once the replay pass finished without error. */
+  done: boolean;
+  /** True when the replay pass aborted on an error. */
+  failed: boolean;
+  /** The aborting error's message, present only when `failed`. */
+  error?: string;
+}
+
+/**
+ * Snapshot delivered to `SubscribeOptions.onReplayProgress` (EB-71):
+ * the subscriber's replay progress plus its identity.
+ */
+export interface ReplayProgressEvent extends ReplayProgressState {
+  /** The subscriber's id (see `Subscription.id`). */
+  subscriberId: string;
+  /** The topic pattern the subscription was registered with. */
+  pattern: string;
+}
+
+/** Callback type for `SubscribeOptions.onReplayProgress` (EB-71). */
+export type ReplayProgressCallback = (event: ReplayProgressEvent) => void;
+
+/**
+ * One row of `BusStats.replayProgress` (EB-71): a subscriber's latest
+ * durable-log replay progress, in subscription order. Only
+ * subscriptions that ran a `resumeFromSeq` / `resumeFromTime` replay
+ * appear — a subscriber that never replayed leaves no row.
+ */
+export interface ReplayProgressStat extends ReplayProgressState {
+  /** The subscriber's id (see `Subscription.id`). */
+  subscriberId: string;
+  /** The topic pattern the subscription was registered with. */
+  pattern: string;
+}
+
 
 /**
  * Tuning for subscriber-side batch delivery (`SubscribeOptions.batch`).
@@ -2330,6 +2431,17 @@ export interface BusStats {
    */
   groupLag: GroupLagStat[];
   /**
+   * Per-subscriber durable-log replay progress (EB-71): one row per
+   * subscription that ran a `resumeFromSeq` / `resumeFromTime` replay,
+   * in subscription order. Each row carries the pass's `total`,
+   * `replayed`, `skipped`, and `done` / `failed` state (plus the
+   * aborting `error` when failed). Counting is independent per
+   * subscriber — consumer-group members and partitioned members each
+   * have their own row. Always present; empty when no subscriber has
+   * replayed yet.
+   */
+  replayProgress: ReplayProgressStat[];
+  /**
    * Durable topic log state (`EventBusOptions.durableLogDir`). Absent when
    * the durable log is disabled.
    */
@@ -2621,6 +2733,24 @@ interface Subscriber {
    * Absent when the subscriber has no filter.
    */
   filter?: MessageFilter;
+  /**
+   * Opt-in durable-log replay progress observer (see
+   * `SubscribeOptions.onReplayProgress`, EB-71). Absent unless the
+   * subscriber opted in.
+   */
+  onReplayProgress?: ReplayProgressCallback;
+  /**
+   * Processed replay entries between `onReplayProgress` fires (see
+   * `SubscribeOptions.progressInterval`, EB-71). Defaults to 100.
+   */
+  progressInterval: number;
+  /**
+   * This subscriber's latest durable-log replay progress (EB-71).
+   * Absent until the first resume replay (`resumeFromSeq` /
+   * `resumeFromTime`) runs; kept after the pass finishes so
+   * `getStats().replayProgress` stays observable.
+   */
+  replayProgress?: ReplayProgressState;
   /**
    * Compiled composite include/exclude patterns (see
    * `SubscribeOptions.patterns`, EB-70). Absent when the subscriber has
@@ -7301,6 +7431,14 @@ export class EventBus {
     this.validateResumeFromSeq(resumeFromSeq);
     const resumeFromTime = opts?.resumeFromTime;
     this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
+    // Durable-log replay progress (EB-71): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    this.validateReplayProgressOptions(
+      opts?.onReplayProgress,
+      opts?.progressInterval,
+      resumeFromSeq,
+      resumeFromTime,
+    );
     // Broker-level ACL: an unauthorized subscription is audited and then
     // rejected with a clear error before anything registers — the caller
     // must not mistake silence for success. Applies to the subscribe
@@ -7417,6 +7555,10 @@ export class EventBus {
     if (filter !== undefined && typeof filter !== 'function') {
       throw new TypeError('filter must be a function');
     }
+    // Durable-log replay progress (EB-71): the observer was validated
+    // above; the interval falls back to the 100-entry default.
+    const onReplayProgress = opts?.onReplayProgress;
+    const progressInterval = opts?.progressInterval ?? REPLAY_PROGRESS_INTERVAL_DEFAULT;
     // Multi-pattern composite subscription (EB-70): validated before
     // anything registers, so a throw leaves no half-registered subscriber
     // behind.
@@ -7510,6 +7652,11 @@ export class EventBus {
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
       filter,
+      // Durable-log replay progress observability (EB-71): the
+      // per-subscriber progress state appears on the first resume
+      // replay (see `admitReplayRecords`).
+      onReplayProgress,
+      progressInterval,
       // Composite include/exclude patterns (EB-70), evaluated per message
       // after the content filter in `deliverUnkeyed`/`deliverShadow`.
       composite,
@@ -7954,9 +8101,14 @@ export class EventBus {
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
-    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, ...restOpts } = opts ?? {};
+    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, onReplayProgress: replayObserver, progressInterval: replayInterval, ...restOpts } = opts ?? {};
     this.validateResumeFromSeq(resumeFromSeq);
     this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
+    // Durable-log replay progress (EB-71): validated before anything
+    // registers; stripped from `restOpts` like the resume cursors (the
+    // replay runs below, after the group assignment is recorded) and
+    // re-attached to the subscriber afterwards.
+    this.validateReplayProgressOptions(replayObserver, replayInterval, resumeFromSeq, resumeFromTime);
     const sub = this.subscribe(topicPattern, handler, restOpts);
     const key = EventBus.groupKey(groupId, topicPattern);
     // Partition mode is fixed by the group's first member; a disagreeing
@@ -7974,6 +8126,11 @@ export class EventBus {
     subscriber.groupId = groupId;
     subscriber.onRebalance = opts?.onRebalance;
     subscriber.handoffLingerMs = handoffLingerMs;
+    // Durable-log replay progress observer (EB-71): stripped from
+    // `restOpts` above so the inner `subscribe` does not replay early —
+    // the observer is attached here, before the group replay runs below.
+    subscriber.onReplayProgress = replayObserver;
+    if (replayInterval !== undefined) subscriber.progressInterval = replayInterval;
     let members = this.groupMembers.get(key);
     if (members == null) {
       members = [];
@@ -8223,6 +8380,35 @@ export class EventBus {
     }
     if (!Number.isFinite(resumeFromTime) || resumeFromTime < 0) {
       throw new RangeError('resumeFromTime must be a finite number of milliseconds >= 0');
+    }
+  }
+
+  /**
+   * Validates the opt-in durable-log replay progress observer (EB-71)
+   * before anything registers: a throw must not leave a
+   * half-registered subscriber behind. The observer only observes a
+   * resume replay, so it requires a resume cursor
+   * (`resumeFromSeq` / `resumeFromTime`) — otherwise it would silently
+   * never fire; the throttle interval only tunes the observer, so it
+   * requires the observer itself.
+   */
+  private validateReplayProgressOptions(
+    onReplayProgress: ReplayProgressCallback | undefined,
+    progressInterval: number | undefined,
+    resumeFromSeq: number | undefined,
+    resumeFromTime: number | undefined,
+  ): void {
+    if (onReplayProgress !== undefined && typeof onReplayProgress !== 'function') {
+      throw new RangeError('onReplayProgress must be a function');
+    }
+    if (progressInterval !== undefined && (!Number.isInteger(progressInterval) || progressInterval < 1)) {
+      throw new RangeError('progressInterval must be a positive integer');
+    }
+    if (progressInterval !== undefined && onReplayProgress === undefined) {
+      throw new RangeError('progressInterval requires onReplayProgress to be set');
+    }
+    if (onReplayProgress !== undefined && resumeFromSeq === undefined && resumeFromTime === undefined) {
+      throw new RangeError('onReplayProgress requires resumeFromSeq or resumeFromTime to be set');
     }
   }
 
@@ -9144,7 +9330,7 @@ export class EventBus {
       for (const rec of log.readSince(topic, fromSeq)) records.push(rec);
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
-    this.admitReplayRecords(subscriber, records);
+    this.admitReplayRecords(subscriber, records, { trackProgress: true });
     this.scheduleFlush();
   }
 
@@ -9179,7 +9365,7 @@ export class EventBus {
       }
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
-    this.admitReplayRecords(subscriber, records);
+    this.admitReplayRecords(subscriber, records, { trackProgress: true });
     this.scheduleFlush();
   }
 
@@ -9212,7 +9398,7 @@ export class EventBus {
       for (const rec of log.readSinceTime(topic, fromTime)) records.push(rec);
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
-    this.admitReplayRecords(subscriber, records);
+    this.admitReplayRecords(subscriber, records, { trackProgress: true });
     this.scheduleFlush();
   }
 
@@ -9252,7 +9438,7 @@ export class EventBus {
       }
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
-    this.admitReplayRecords(subscriber, records);
+    this.admitReplayRecords(subscriber, records, { trackProgress: true });
     this.scheduleFlush();
   }
 
@@ -9301,13 +9487,74 @@ export class EventBus {
    * queue: key-baseline seeding, content filter, handoff-linger skip,
    * compression re-registration, keyed ordering gate. Shared by
    * `replayLog` (subscribe-time resume), `replayLogForPartitionedMember`,
-   * and `replayPartitionBacklog` (migration replay).
+   * `replayLogSinceTime`, `replayLogSinceTimeForPartitionedMember`, and
+   * `replayPartitionBacklog` (migration replay).
+   *
+   * With `trackProgress` (EB-71) the pass is observed per subscriber:
+   * the state lives on `subscriber.replayProgress` and the opt-in
+   * `onReplayProgress` observer fires throttled plus once on completion
+   * or abort. Only resume replays pass it — the migration replay
+   * (`replayPartitionBacklog`) is a deliberate partition takeover, not
+   * a resume, and stays unobserved. An aborting record (e.g. a
+   * dictionary-compressed record whose dictionary is not registered —
+   * replay stays fail-closed) marks the pass failed, surfaces the error
+   * on the observer, and rethrows.
    */
   private admitReplayRecords(
     subscriber: Subscriber,
     records: ReplayRecord[],
-    opts?: { ignoreLinger?: boolean },
+    opts?: { ignoreLinger?: boolean; trackProgress?: boolean },
   ): void {
+    // Durable-log replay progress (EB-71): recorded on the subscriber
+    // so `getStats().replayProgress` stays observable after the pass.
+    const observe = opts?.trackProgress === true;
+    const progress: ReplayProgressState | undefined = observe
+      ? { total: records.length, replayed: 0, skipped: 0, done: false, failed: false }
+      : undefined;
+    if (progress !== undefined) subscriber.replayProgress = progress;
+    const onReplayProgress = observe ? subscriber.onReplayProgress : undefined;
+    const progressInterval = subscriber.progressInterval;
+    let nextProgressFireAt = progressInterval;
+    // One clock reading for the whole pass: every record's TTL is
+    // judged against the same "now", like the rate table in `getStats`.
+    const replayNow = this.now();
+    const fireReplayProgress = (done: boolean, failed: boolean, error?: string): void => {
+      if (progress === undefined || onReplayProgress === undefined) return;
+      const event: ReplayProgressEvent = {
+        subscriberId: subscriber.id,
+        pattern: subscriber.pattern,
+        total: progress.total,
+        replayed: progress.replayed,
+        skipped: progress.skipped,
+        done,
+        failed,
+        ...(error === undefined ? {} : { error }),
+      };
+      try {
+        // Error-isolated, like `onAdmissionRejected`: a broken observer
+        // must never disturb replay.
+        onReplayProgress(event);
+      } catch {
+        // Swallowed.
+      }
+    };
+    const maybeFireThrottled = (): void => {
+      if (progress === undefined) return;
+      if (progress.replayed + progress.skipped >= nextProgressFireAt) {
+        nextProgressFireAt += progressInterval;
+        fireReplayProgress(false, false);
+      }
+    };
+    const countReplaySkipped = (): void => {
+      if (progress === undefined) return;
+      progress.skipped += 1;
+      maybeFireThrottled();
+    };
+    const countReplayed = (): void => {
+      if (progress === undefined) return;
+      progress.replayed += 1;
+      maybeFireThrottled();
+    };
     // Keyed-ordering replay baseline (see `PublishOptions.key`): seed each
     // replayed key's expectation at its smallest replayed keySeq, so
     // replayed messages are released in keySeq order even when the log's
@@ -9346,143 +9593,180 @@ export class EventBus {
       }
     }
     const filter = subscriber.filter;
-    for (const rec of records) {
-      // A subscriber content filter applies to replay exactly as it does
-      // to live fan-out: a rejected replayed message is never queued (it
-      // must not churn the backpressure budget on reconnect) and advances
-      // the per-topic baseline so it never counts as a gap. The log holds
-      // the wire payload — inflate a compressed envelope first so the
-      // filter judges the raw application payload. A dictionary-compressed
-      // record resolves its bytes from the registry here; an unregistered
-      // dictionary fails loudly rather than judging garbage.
-      if (filter !== undefined) {
-        const rawPayload = isCompressedPayload(rec.payload)
-          ? inflateEnvelopePayload(rec.payload, this.dictionaryForRecord(rec))
-          : rec.payload;
-        if (!filter(rawPayload, rec.topic)) {
+    try {
+      for (const rec of records) {
+        // A subscriber content filter applies to replay exactly as it does
+        // to live fan-out: a rejected replayed message is never queued (it
+        // must not churn the backpressure budget on reconnect) and advances
+        // the per-topic baseline so it never counts as a gap. The log holds
+        // the wire payload — inflate a compressed envelope first so the
+        // filter judges the raw application payload. A dictionary-compressed
+        // record resolves its bytes from the registry here; an unregistered
+        // dictionary fails loudly rather than judging garbage.
+        if (filter !== undefined) {
+          const rawPayload = isCompressedPayload(rec.payload)
+            ? inflateEnvelopePayload(rec.payload, this.dictionaryForRecord(rec))
+            : rec.payload;
+          if (!filter(rawPayload, rec.topic)) {
+            this.countFiltered(subscriber, rec.topic, rec.seq);
+            // A filtered replayed message is deliberately skipped: advance
+            // the key baseline past it like the live path does, or a later
+            // keySeq for the same key would buffer forever.
+            if (rec.key !== undefined && rec.keySeq !== undefined) {
+              this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+            }
+            // Same for a filtered causal message: its clock will never be
+            // fanned out to this subscriber, so the source's expectation
+            // advances past it instead of hanging on a missing dependency.
+            if (rec.causal !== undefined) {
+              this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+            }
+            countReplaySkipped();
+            continue;
+          }
+        }
+        const composite = subscriber.composite;
+        if (composite !== undefined && !this.matchesComposite(composite, rec.topic)) {
+          // A composite-rejected replayed message is deliberately skipped,
+          // exactly like a filter rejection above: never queued (it must not
+          // churn the backpressure budget on reconnect), never a sequence
+          // gap, and the key/causal baselines advance past it like the live
+          // path does.
           this.countFiltered(subscriber, rec.topic, rec.seq);
-          // A filtered replayed message is deliberately skipped: advance
-          // the key baseline past it like the live path does, or a later
-          // keySeq for the same key would buffer forever.
           if (rec.key !== undefined && rec.keySeq !== undefined) {
             this.skipKeySeq(subscriber, rec.key, rec.keySeq);
           }
-          // Same for a filtered causal message: its clock will never be
-          // fanned out to this subscriber, so the source's expectation
-          // advances past it instead of hanging on a missing dependency.
           if (rec.causal !== undefined) {
             this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
           }
+          countReplaySkipped();
           continue;
         }
-      }
-      const composite = subscriber.composite;
-      if (composite !== undefined && !this.matchesComposite(composite, rec.topic)) {
-        // A composite-rejected replayed message is deliberately skipped,
-        // exactly like a filter rejection above: never queued (it must not
-        // churn the backpressure budget on reconnect), never a sequence
-        // gap, and the key/causal baselines advance past it like the live
-        // path does.
-        this.countFiltered(subscriber, rec.topic, rec.seq);
-        if (rec.key !== undefined && rec.keySeq !== undefined) {
-          this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+        // Handoff linger: a group member that left within its linger window
+        // is presumed still processing these seqs — skip them so the
+        // rejoining member's resume never delivers in-flight work twice.
+        // Like a content filter, the skip must not churn backpressure or
+        // count as a sequence gap: the per-topic baseline advances over it.
+        // After the window expires the same replay delivers them normally
+        // (the leaver is presumed dead; at-least-once resumes). Migration
+        // replay (`ignoreLinger`) is a deliberate partition takeover, not a
+        // resume, so it bypasses the linger.
+        const groupId = subscriber.groupId;
+        if (!opts?.ignoreLinger && groupId !== undefined && this.isLingering(groupId, rec.topic, rec.seq)) {
+          this.advanceBaseline(subscriber, rec.topic, rec.seq);
+          if (rec.key !== undefined && rec.keySeq !== undefined) {
+            this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+          }
+          // A lingered causal message replays after the window expires: the
+          // skip advances the expectation now, and the later replay arrives
+          // as a (harmless, immediately delivered) regression.
+          if (rec.causal !== undefined) {
+            this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+          }
+          countReplaySkipped();
+          continue;
         }
-        if (rec.causal !== undefined) {
-          this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+        // An already-expired TTL is deliberately not resurrected: the
+        // record still goes through the normal queue so the drain drops
+        // it as expired (unchanged behavior), but for replay progress it
+        // counts as skipped — never failed, and never replayed, so
+        // `replayed + skipped` always equals the records this pass saw.
+        const ttlExpired = rec.expiresAt !== undefined && rec.expiresAt <= replayNow;
+        if (ttlExpired) {
+          countReplaySkipped();
         }
-        continue;
-      }
-      // Handoff linger: a group member that left within its linger window
-      // is presumed still processing these seqs — skip them so the
-      // rejoining member's resume never delivers in-flight work twice.
-      // Like a content filter, the skip must not churn backpressure or
-      // count as a sequence gap: the per-topic baseline advances over it.
-      // After the window expires the same replay delivers them normally
-      // (the leaver is presumed dead; at-least-once resumes). Migration
-      // replay (`ignoreLinger`) is a deliberate partition takeover, not a
-      // resume, so it bypasses the linger.
-      const groupId = subscriber.groupId;
-      if (!opts?.ignoreLinger && groupId !== undefined && this.isLingering(groupId, rec.topic, rec.seq)) {
-        this.advanceBaseline(subscriber, rec.topic, rec.seq);
-        if (rec.key !== undefined && rec.keySeq !== undefined) {
-          this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+        const msg: BusMessage = {
+          topic: rec.topic,
+          payload: rec.payload,
+          seq: rec.seq,
+          // Restores the message identity logged at publish time, so a
+          // resumed dedup window recognizes replays of already-delivered
+          // messages (see `SubscribeOptions.deduplicateMessages`).
+          ...(typeof rec.messageId === 'string' && rec.messageId.length > 0
+            ? { messageId: rec.messageId }
+            : {}),
+          // Restores the business event time logged at publish time, so a
+          // resumed subscriber sees the same event-time metadata the live
+          // delivery carried (see `PublishOptions.eventTime`).
+          ...(typeof rec.eventTime === 'number' && Number.isFinite(rec.eventTime) && rec.eventTime >= 0
+            ? { eventTime: rec.eventTime }
+            : {}),
+          // Restores the publisher identity logged at publish time, so a
+          // resumed subscriber sees the same producer attribution the live
+          // delivery carried (see `PublishOptions.publisherId`).
+          ...(typeof rec.publisherId === 'string' && rec.publisherId.length > 0
+            ? { publisherId: rec.publisherId }
+            : {}),
+        };
+        // The log stores the wire payload: a record written while a
+        // compression rule was active carries the deflated envelope, so
+        // re-register it for transparent inflation at delivery — exactly
+        // like a live compressed message. Dictionary-compressed records
+        // additionally re-register their dictionary from the registry; a
+        // missing dictionary throws here (fail closed at replay) instead of
+        // corrupting data at delivery.
+        if (isCompressedPayload(rec.payload)) {
+          this.compressedPayloads.add(msg);
+          const dictionary = this.dictionaryForRecord(rec);
+          if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
         }
-        // A lingered causal message replays after the window expires: the
-        // skip advances the expectation now, and the later replay arrives
-        // as a (harmless, immediately delivered) regression.
-        if (rec.causal !== undefined) {
-          this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+        if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
+        if (rec.causal !== undefined && subscriber.causal !== undefined) {
+          // Causal replay: the filter and linger checks above already ran,
+          // so the gate admits straight into the queue — replay never burned
+          // throttle budget and must not start now. Keyed causal messages
+          // run the keyed gate second, exactly like the live path.
+          this.deliverCausal(
+            subscriber,
+            {
+              msg,
+              expiresAt: rec.expiresAt,
+              rawPayload: rec.payload,
+              replay: true,
+              ...(rec.key !== undefined && rec.keySeq !== undefined
+                ? { keyed: { key: rec.key, keySeq: rec.keySeq } }
+                : {}),
+            },
+            rec.causal.source,
+            rec.causal.clock,
+          );
+        } else if (rec.key !== undefined && rec.keySeq !== undefined) {
+          // Keyed replay: the filter and linger checks above already ran, so
+          // the ordering gate admits straight into the queue — replay never
+          // burned throttle budget and must not start now.
+          this.deliverKeyed(
+            subscriber,
+            { msg, expiresAt: rec.expiresAt, rawPayload: rec.payload, replay: true },
+            rec.key,
+            rec.keySeq,
+          );
+        } else {
+          this.enqueueMessage(subscriber, msg, rec.expiresAt);
         }
-        continue;
+        // An already-expired record was counted as skipped above: it was
+        // queued (so the drain still drops it as expired) but never
+        // replayed to the handler.
+        if (!ttlExpired) {
+          countReplayed();
+        }
       }
-      const msg: BusMessage = {
-        topic: rec.topic,
-        payload: rec.payload,
-        seq: rec.seq,
-        // Restores the message identity logged at publish time, so a
-        // resumed dedup window recognizes replays of already-delivered
-        // messages (see `SubscribeOptions.deduplicateMessages`).
-        ...(typeof rec.messageId === 'string' && rec.messageId.length > 0
-          ? { messageId: rec.messageId }
-          : {}),
-        // Restores the business event time logged at publish time, so a
-        // resumed subscriber sees the same event-time metadata the live
-        // delivery carried (see `PublishOptions.eventTime`).
-        ...(typeof rec.eventTime === 'number' && Number.isFinite(rec.eventTime) && rec.eventTime >= 0
-          ? { eventTime: rec.eventTime }
-          : {}),
-        // Restores the publisher identity logged at publish time, so a
-        // resumed subscriber sees the same producer attribution the live
-        // delivery carried (see `PublishOptions.publisherId`).
-        ...(typeof rec.publisherId === 'string' && rec.publisherId.length > 0
-          ? { publisherId: rec.publisherId }
-          : {}),
-      };
-      // The log stores the wire payload: a record written while a
-      // compression rule was active carries the deflated envelope, so
-      // re-register it for transparent inflation at delivery — exactly
-      // like a live compressed message. Dictionary-compressed records
-      // additionally re-register their dictionary from the registry; a
-      // missing dictionary throws here (fail closed at replay) instead of
-      // corrupting data at delivery.
-      if (isCompressedPayload(rec.payload)) {
-        this.compressedPayloads.add(msg);
-        const dictionary = this.dictionaryForRecord(rec);
-        if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
+    } catch (err) {
+      // An aborting record (e.g. a dictionary-compressed record whose
+      // dictionary is not registered — replay stays fail-closed) marks
+      // the pass failed and surfaces the error on the observer, then
+      // rethrows so the `subscribe` caller still sees the original
+      // failure.
+      if (progress !== undefined) {
+        progress.failed = true;
+        const message = err instanceof Error ? err.message : String(err);
+        progress.error = message;
+        fireReplayProgress(false, true, message);
       }
-      if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
-      if (rec.causal !== undefined && subscriber.causal !== undefined) {
-        // Causal replay: the filter and linger checks above already ran,
-        // so the gate admits straight into the queue — replay never burned
-        // throttle budget and must not start now. Keyed causal messages
-        // run the keyed gate second, exactly like the live path.
-        this.deliverCausal(
-          subscriber,
-          {
-            msg,
-            expiresAt: rec.expiresAt,
-            rawPayload: rec.payload,
-            replay: true,
-            ...(rec.key !== undefined && rec.keySeq !== undefined
-              ? { keyed: { key: rec.key, keySeq: rec.keySeq } }
-              : {}),
-          },
-          rec.causal.source,
-          rec.causal.clock,
-        );
-      } else if (rec.key !== undefined && rec.keySeq !== undefined) {
-        // Keyed replay: the filter and linger checks above already ran, so
-        // the ordering gate admits straight into the queue — replay never
-        // burned throttle budget and must not start now.
-        this.deliverKeyed(
-          subscriber,
-          { msg, expiresAt: rec.expiresAt, rawPayload: rec.payload, replay: true },
-          rec.key,
-          rec.keySeq,
-        );
-      } else {
-        this.enqueueMessage(subscriber, msg, rec.expiresAt);
-      }
+      throw err;
+    }
+    if (progress !== undefined) {
+      progress.done = true;
+      fireReplayProgress(true, false);
     }
   }
 
@@ -12218,6 +12502,7 @@ export class EventBus {
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const inFlightUsage: BusStats['inFlightUsage'] = [];
     const shadows: BusStats['shadows'] = [];
+    const replayProgress: BusStats['replayProgress'] = [];
     const hotKeys: HotKeyStat[] = [];
     let causalBufferDepth = 0;
     for (const subscriber of this.subscribers.values()) {
@@ -12236,6 +12521,22 @@ export class EventBus {
           shadowed: shadow.delivered,
           dropped: shadow.dropped,
           queueSize: subscriber.queue.size,
+        });
+      }
+      // Durable-log replay progress (EB-71): one row per subscription
+      // that ran a resume replay — a snapshot of its latest pass, kept
+      // on the subscriber after the pass finishes.
+      const rp = subscriber.replayProgress;
+      if (rp !== undefined) {
+        replayProgress.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          total: rp.total,
+          replayed: rp.replayed,
+          skipped: rp.skipped,
+          done: rp.done,
+          failed: rp.failed,
+          ...(rp.error === undefined ? {} : { error: rp.error }),
         });
       }
       const causalGate = subscriber.causal;
@@ -12478,6 +12779,7 @@ export class EventBus {
         };
       }),
       groupLag: this.groupLagRowsFor(undefined),
+      replayProgress,
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,

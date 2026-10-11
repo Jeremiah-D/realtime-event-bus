@@ -281,7 +281,22 @@ library.
   the backlog becomes replayable again (at-least-once). The `leave`
   rebalance event carries `lingerUntil` / `lingering` so operators can see
   the handoff; the operational recipe is `commitOffset` before leaving —
-  the linger only covers what the leaver did not commit. Opt-in segment
+  the linger only covers what the leaver did not commit. Every resume
+  replay is observable per subscriber: `getStats().replayProgress` carries
+  one row per subscription that replayed — `{ subscriberId, pattern,
+  total, replayed, skipped, done, failed, error? }` — counting is
+  independent per subscriber, so consumer-group members and partitioned
+  members each get their own row. `skipped` counts deliberately
+  unqueued records (content-filter / composite-pattern rejections,
+  handoff-linger skips, already-expired TTLs — never failures);
+  `failed` with `error` marks a pass that aborted on an error (replay
+  stays fail-closed: the error still propagates to the `subscribe`
+  caller). For a live feed of the same numbers, pass
+  `onReplayProgress` (requires `resumeFromSeq` / `resumeFromTime`):
+  it fires at most every `progressInterval` processed entries (default
+  100) plus exactly once on completion (`done: true`) or abort
+  (`failed: true`), and is error-isolated — a throwing observer can
+  never disturb replay. Opt-in segment
   rotation (`durableLogSegmentRotation: { maxEntriesPerSegment?,
   maxSegmentAgeMs? }`, validated `RangeError`): the per-topic live file
   holds the current segment, and when an append reaches the entry budget
