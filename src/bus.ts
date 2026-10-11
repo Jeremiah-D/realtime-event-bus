@@ -255,6 +255,51 @@ export type ReliableMessageHandler = (delivery: Delivery<BusMessage>) => void;
  */
 export type ReliableBatchMessageHandler = (deliveries: Delivery<BusMessage>[]) => void;
 
+/**
+ * Multi-pattern composite subscription options (EB-70): include/exclude
+ * topic-pattern matching evaluated per message, after the subscriber's
+ * content `filter` (see `SubscribeOptions.patterns`). The include list is
+ * matched in `mode` — `'any'` (default) delivers when any include pattern
+ * matches the message's topic, `'all'` only when every include pattern
+ * does — and any message whose topic matches one of `exclude` is never
+ * delivered, e.g. include `['market.*']` with `exclude: ['market.btc.*']`
+ * to subscribe to the market feed while dropping the noisy BTC leg.
+ *
+ * The include/exclude patterns use the same wildcard semantics as
+ * `subscribe` patterns (`compilePattern`): `*` matches one segment,
+ * `**` zero or more. Each distinct pattern is compiled once and shared
+ * across composite subscribers through a dedicated composite cache —
+ * separate from the `patternCache` that backs single-pattern
+ * subscriptions, so `getStats().patternCacheSize` keeps its meaning
+ * (see `EventBus`).
+ *
+ * Layering: the `subscribe` topic-pattern argument stays the fan-out
+ * pre-filter (prefix index + compiled matcher), and the composite match
+ * is an additional delivery-time gate — a message must pass both. Pick
+ * the base pattern at least as broad as the union of the include
+ * patterns (e.g. `'**'`); a narrower base pattern silently pre-filters
+ * messages the composite would have accepted.
+ */
+export interface CompositeSubscribeOptions {
+  /**
+   * Include patterns: at least one non-empty pattern string. `'any'`
+   * mode delivers when any of them matches; `'all'` mode requires all
+   * of them to match.
+   */
+  patterns: string[];
+  /**
+   * Include-match mode: `'any'` (default) or `'all'`. Anything else
+   * throws `RangeError` at subscribe time.
+   */
+  mode?: 'any' | 'all';
+  /**
+   * Exclude patterns: a message whose topic matches any of them is
+   * never delivered, regardless of the include match. Optional; an
+   * empty array behaves as no exclusions.
+   */
+  exclude?: string[];
+}
+
 export interface SubscribeOptions {
   /** Per-subscriber bounded queue capacity (default 100). */
   queueSize?: number;
@@ -640,6 +685,32 @@ export interface SubscribeOptions {
    * from `subscribe`. Disabled by default.
    */
   filter?: MessageFilter;
+  /**
+   * Opt-in multi-pattern composite subscription (EB-70). When set, every
+   * message fanned out to this subscriber — after it passes the content
+   * `filter` above — is additionally tested against include/exclude topic
+   * patterns: `mode: 'any'` (default) delivers when any include pattern
+   * matches the topic, `mode: 'all'` only when every include pattern
+   * does, and any `exclude` match drops the message. A composite-rejected
+   * message is skipped exactly like a filter rejection — never queued,
+   * no backpressure budget, no throttle token, no sequence gap (the
+   * per-topic baseline advances over it) — and counts into
+   * `getStats().filteredMessages`. Applies to durable-log replay too,
+   * and for shadow subscribers to the mirror copy. `getStats()` exposes
+   * the live composite-subscription count as `compositeSubscriptions`.
+   *
+   * Invalid combinations throw `RangeError` from `subscribe`: an empty
+   * `patterns` array, a non-`'any'`/`'all'` mode, a non-string/empty
+   * pattern, or an `exclude` set that covers the include space so no
+   * message could ever be delivered (mode `'any'`: every include pattern
+   * covered by some exclude pattern; mode `'all'`: one exclude pattern
+   * covering every include pattern — coverage decided by
+   * `patternCovers`).
+   *
+   * See `CompositeSubscribeOptions` for the shape and the layering with
+   * the `subscribe` topic-pattern argument. Disabled by default.
+   */
+  patterns?: CompositeSubscribeOptions;
   /**
    * Opt-in subscriber-side exactly-once dedup window. When enabled, the
    * bus remembers the `messageId` of every message that entered this
@@ -1697,8 +1768,10 @@ export interface TopicStats {
   duplicateMessages: number;
   /**
    * Messages fanned out on this topic that a subscriber's content filter
-   * rejected (see `SubscribeOptions.filter`): the message never entered
-   * that subscriber's queue — no backpressure budget consumed — and the
+   * rejected (see `SubscribeOptions.filter`), or that a composite
+   * subscription's include/exclude patterns rejected (see
+   * `SubscribeOptions.patterns`): the message never entered that
+   * subscriber's queue — no backpressure budget consumed — and the
    * subscriber's per-topic baseline advanced over it, so it is invisible
    * to sequence-gap detection.
    */
@@ -1848,6 +1921,14 @@ export interface BusStats {
    */
   patternCacheSize: number;
   /**
+   * Currently active subscriptions with composite include/exclude patterns
+   * (see `SubscribeOptions.patterns`, EB-70). The composite patterns are
+   * compiled through a dedicated composite cache that never feeds
+   * `patternCacheSize`, so this count is the only place composite
+   * subscriptions surface in the cache stats.
+   */
+  compositeSubscriptions: number;
+  /**
    * Number of distinct literal-prefix keys currently held in the
    * publish-side prefix index — one entry per prefix with at least one
    * active subscriber. Patterns that share a literal prefix (e.g. several
@@ -1939,9 +2020,10 @@ export interface BusStats {
    */
   forwards: ForwardRuleInfo[];
   /**
-   * Total messages skipped by subscriber content filters — the sum of
-   * every topic's `filteredMessages`. See `TopicStats.filteredMessages`
-   * for the exact counting rules.
+   * Total messages skipped by subscriber content filters and composite
+   * include/exclude patterns — the sum of every topic's
+   * `filteredMessages`. See `TopicStats.filteredMessages` for the exact
+   * counting rules.
    */
   filteredMessages: number;
   /**
@@ -2368,6 +2450,24 @@ function splitKeyOrderKey(mapKey: string): [string, string] {
   return [mapKey.slice(0, sep), mapKey.slice(sep + 1)];
 }
 
+/**
+ * Compiled composite include/exclude patterns for one subscriber (see
+ * `SubscribeOptions.patterns`, EB-70). The RegExps are shared instances
+ * from the bus's composite pattern cache; `cacheKeys` are the (possibly
+ * namespace-translated) pattern strings this subscription holds
+ * references on, released on unsubscribe.
+ */
+interface CompositeSubscriberState {
+  /** Compiled include patterns, in `SubscribeOptions.patterns` order. */
+  include: RegExp[];
+  /** Compiled exclude patterns, in `SubscribeOptions.patterns` order. */
+  exclude: RegExp[];
+  /** Include-match mode: `'any'` or `'all'`. */
+  mode: 'any' | 'all';
+  /** Composite-cache keys held by this subscription. */
+  cacheKeys: string[];
+}
+
 interface Subscriber {
   id: string;
   pattern: string;
@@ -2521,6 +2621,12 @@ interface Subscriber {
    * Absent when the subscriber has no filter.
    */
   filter?: MessageFilter;
+  /**
+   * Compiled composite include/exclude patterns (see
+   * `SubscribeOptions.patterns`, EB-70). Absent when the subscriber has
+   * no composite patterns.
+   */
+  composite?: CompositeSubscriberState;
   /**
    * Batch-delivery state (see `SubscribeOptions.batch`). Absent when
    * batching is disabled for this subscriber.
@@ -2935,6 +3041,206 @@ export function patternsOverlap(a: string, b: string): boolean {
     return result;
   };
   return dp(0, 0);
+}
+
+/**
+ * Whether every topic matched by pattern `sub` is also matched by pattern
+ * `cover` — the language-inclusion test the composite-subscription (EB-70)
+ * validation uses to reject exclude sets that could never let a message
+ * through. Uses exactly the `compilePattern` wildcard semantics: `*`
+ * matches one segment, `**` zero or more, other segments literally; a
+ * bare `*` or `**` matches every topic; consecutive `**` collapse like in
+ * `compilePattern`.
+ *
+ * Decided by NFA subset construction: both patterns become segment NFAs
+ * (`**` is an epsilon plus an any-segment self-loop), the cover NFA is
+ * determinized, and a product BFS looks for a sub-accepting state paired
+ * with a cover-rejecting DFA state — i.e. a witness topic in
+ * `L(sub) \ L(cover)`. The alphabet is every literal segment appearing in
+ * either pattern plus one symbol for "any other segment" (a single fresh
+ * segment works as the witness wherever that symbol appears, because no
+ * literal transition can fire on it). Finite state space, so the search
+ * always terminates.
+ */
+export function patternCovers(cover: string, sub: string): boolean {
+  // Normalize the bare-`*` special case (`compilePattern` treats a lone
+  // `*` like `**`: matches every topic) and collapse `**` runs, exactly
+  // as `compilePattern` does.
+  const normalize = (pattern: string): string[] =>
+    collapseStars((pattern === '*' ? '**' : pattern).split('.'));
+  const cSegs = normalize(cover);
+  const sSegs = normalize(sub);
+  // One NFA per pattern: states 0..n, n accepting. `**` at j contributes
+  // an epsilon j -> j+1 and an any-segment self-loop j -> j; `*` an
+  // any-segment j -> j+1; a literal an l-labelled j -> j+1.
+  const buildNfa = (segs: string[]) => {
+    const n = segs.length;
+    const eps: number[][] = Array.from({ length: n + 1 }, () => []);
+    const any: number[][] = Array.from({ length: n + 1 }, () => []);
+    const lit: Array<Map<string, number[]>> = Array.from(
+      { length: n + 1 },
+      () => new Map<string, number[]>(),
+    );
+    for (let j = 0; j < n; j++) {
+      const seg = segs[j];
+      if (seg === '**') {
+        eps[j].push(j + 1);
+        any[j].push(j);
+      } else if (seg === '*') {
+        any[j].push(j + 1);
+      } else {
+        const targets = lit[j].get(seg);
+        if (targets === undefined) lit[j].set(seg, [j + 1]);
+        else targets.push(j + 1);
+      }
+    }
+    return { n, eps, any, lit };
+  };
+  const cNfa = buildNfa(cSegs);
+  const sNfa = buildNfa(sSegs);
+  // The OTHER symbol stands for any segment that is none of the literals
+  // appearing in either pattern.
+  const OTHER = '\0';
+  const alphabet = new Set<string>([OTHER]);
+  for (const seg of [...cSegs, ...sSegs]) {
+    if (seg !== '*' && seg !== '**') alphabet.add(seg);
+  }
+  const closure = (
+    nfa: ReturnType<typeof buildNfa>,
+    states: Iterable<number>,
+  ): Set<number> => {
+    const closed = new Set<number>(states);
+    const stack = [...closed];
+    while (stack.length > 0) {
+      const q = stack.pop() as number;
+      for (const next of nfa.eps[q]) {
+        if (!closed.has(next)) {
+          closed.add(next);
+          stack.push(next);
+        }
+      }
+    }
+    return closed;
+  };
+  const nfaMove = (
+    nfa: ReturnType<typeof buildNfa>,
+    states: Set<number>,
+    symbol: string,
+  ): Set<number> => {
+    const targets = new Set<number>();
+    for (const q of states) {
+      for (const next of nfa.any[q]) targets.add(next);
+      if (symbol !== OTHER) {
+        const litTargets = nfa.lit[q].get(symbol);
+        if (litTargets !== undefined) {
+          for (const next of litTargets) targets.add(next);
+        }
+      }
+    }
+    return closure(nfa, targets);
+  };
+  // Determinize the cover NFA: a DFA state is the epsilon-closed set of
+  // NFA states, keyed by its sorted join.
+  const dfaKey = (states: Set<number>): string =>
+    [...states].sort((a, b) => a - b).join(',');
+  const dfaStart = closure(cNfa, [0]);
+  const dfaMoveCache = new Map<string, Set<number>>();
+  const dfaMove = (states: Set<number>, symbol: string): Set<number> => {
+    const key = `${dfaKey(states)}@${symbol}`;
+    const cached = dfaMoveCache.get(key);
+    if (cached !== undefined) return cached;
+    const moved = nfaMove(cNfa, states, symbol);
+    dfaMoveCache.set(key, moved);
+    return moved;
+  };
+  // Product BFS over (sub-NFA state set, cover-DFA state): a witness is
+  // a reachable pair where the sub side accepts and the cover side does
+  // not — a topic `sub` matches that `cover` rejects.
+  const sStart = closure(sNfa, [0]);
+  const seen = new Set<string>([`${dfaKey(sStart)}|${dfaKey(dfaStart)}`]);
+  const queue: Array<[Set<number>, Set<number>]> = [[sStart, dfaStart]];
+  while (queue.length > 0) {
+    const [sStates, cStates] = queue.pop() as [Set<number>, Set<number>];
+    for (const symbol of alphabet) {
+      const sNext = nfaMove(sNfa, sStates, symbol);
+      const cNext = dfaMove(cStates, symbol);
+      if (sNext.has(sNfa.n) && !cNext.has(cNfa.n)) {
+        // Witness topic found: `cover` does not cover `sub`.
+        return false;
+      }
+      const seenKey = `${dfaKey(sNext)}|${dfaKey(cNext)}`;
+      if (!seen.has(seenKey)) {
+        seen.add(seenKey);
+        queue.push([sNext, cNext]);
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Validates `SubscribeOptions.patterns` (see `CompositeSubscribeOptions`,
+ * EB-70) and returns the resolved include/exclude lists with the effective
+ * mode. Returns `undefined` when the option is absent. Throws `TypeError`
+ * for a non-object option and `RangeError` for invalid combinations: an
+ * empty `patterns` array, a non-`'any'`/`'all'` mode, a non-string or
+ * empty pattern, or an exclude set that covers the include space so no
+ * message could ever be delivered (mode `'any'`: every include pattern
+ * covered by some exclude pattern; mode `'all'`: one exclude pattern
+ * covering every include pattern — coverage decided by `patternCovers`).
+ *
+ * The returned lists are copies: later mutation of the caller's arrays
+ * cannot change the subscription.
+ */
+function resolveCompositeOptions(
+  opt: CompositeSubscribeOptions | undefined,
+): { patterns: string[]; exclude: string[]; mode: 'any' | 'all' } | undefined {
+  if (opt === undefined) return undefined;
+  const caller = 'subscribe';
+  if (opt === null || typeof opt !== 'object' || Array.isArray(opt)) {
+    throw new TypeError(`${caller}: patterns must be an object`);
+  }
+  const { patterns, mode, exclude } = opt;
+  if (!Array.isArray(patterns) || patterns.length === 0) {
+    throw new RangeError(
+      `${caller}: patterns.patterns must be a non-empty array of topic patterns`,
+    );
+  }
+  for (const pattern of patterns) {
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError(
+        `${caller}: patterns.patterns must contain only non-empty pattern strings`,
+      );
+    }
+  }
+  const resolvedMode = mode ?? 'any';
+  if (resolvedMode !== 'any' && resolvedMode !== 'all') {
+    throw new RangeError(`${caller}: patterns.mode must be 'any' or 'all'`);
+  }
+  const resolvedExclude = exclude ?? [];
+  if (!Array.isArray(resolvedExclude)) {
+    throw new RangeError(`${caller}: patterns.exclude must be an array of topic patterns`);
+  }
+  for (const pattern of resolvedExclude) {
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError(
+        `${caller}: patterns.exclude must contain only non-empty pattern strings`,
+      );
+    }
+  }
+  // An exclude set that covers the include space makes the subscription
+  // permanently silent — every message the includes admit, an exclude
+  // drops — so fail fast instead of registering a dead subscription.
+  const coversAll =
+    resolvedMode === 'any'
+      ? patterns.every((p) => resolvedExclude.some((e) => patternCovers(e, p)))
+      : resolvedExclude.some((e) => patterns.every((p) => patternCovers(e, p)));
+  if (coversAll) {
+    throw new RangeError(
+      `${caller}: patterns.exclude covers the include patterns — no message could ever be delivered`,
+    );
+  }
+  return { patterns: [...patterns], exclude: [...resolvedExclude], mode: resolvedMode };
 }
 
 /**
@@ -4763,6 +5069,21 @@ export class EventBus {
    * cache cannot grow without bound.
    */
   private patternCache = new Map<string, RegExp>();
+  /**
+   * Dedicated compiled-pattern cache for composite subscriptions (see
+   * `SubscribeOptions.patterns`, EB-70): one entry per distinct
+   * include/exclude pattern with at least one active composite
+   * subscriber, shared across those subscribers like `patternCache`.
+   * Deliberately separate from `patternCache` — composite patterns never
+   * inflate `getStats().patternCacheSize`, whose semantics stay
+   * single-pattern-only. Entries are reference-counted
+   * (`compositePatternRefs`) and evicted when their last composite
+   * subscriber leaves, mirroring the `patternCache` lifecycle.
+   */
+  private compositePatternCache = new Map<string, RegExp>();
+  private compositePatternRefs = new Map<string, number>();
+  /** Live subscriptions with `SubscribeOptions.patterns` (EB-70). */
+  private compositeSubscriptionCount = 0;
   /**
    * Publish-side prefix inverted index: maps a pattern's literal-segment
    * prefix to the ids of the subscribers registered on patterns with that
@@ -7096,6 +7417,10 @@ export class EventBus {
     if (filter !== undefined && typeof filter !== 'function') {
       throw new TypeError('filter must be a function');
     }
+    // Multi-pattern composite subscription (EB-70): validated before
+    // anything registers, so a throw leaves no half-registered subscriber
+    // behind.
+    const compositeOpts = resolveCompositeOptions(opts?.patterns);
     const queue = new BoundedQueue<BusMessage>({
       capacity,
       // The shadow queue's backpressure policy is independently tunable
@@ -7146,6 +7471,13 @@ export class EventBus {
             },
           }),
     });
+    // Composite patterns (EB-70): translated under the namespace exactly
+    // like the base pattern, then compiled through the dedicated
+    // composite cache (reference-counted; released on unsubscribe). Like
+    // `compiledMatcher` above, the refs are acquired before registration —
+    // nothing between here and `subscribers.set` throws.
+    const composite =
+      compositeOpts === undefined ? undefined : this.acquireComposite(compositeOpts, ns?.prefix);
     const subscriber: Subscriber = {
       id,
       pattern: topicPattern,
@@ -7178,6 +7510,9 @@ export class EventBus {
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
       filter,
+      // Composite include/exclude patterns (EB-70), evaluated per message
+      // after the content filter in `deliverUnkeyed`/`deliverShadow`.
+      composite,
       dedup,
       // Shadow traffic mirroring (EB-63): the independent per-subscriber
       // counters start at zero; the queue above is already the shadow's
@@ -7185,6 +7520,7 @@ export class EventBus {
       shadow: shadowOpts === undefined ? undefined : { delivered: 0, dropped: 0 },
     };
     this.subscribers.set(id, subscriber);
+    if (composite !== undefined) this.compositeSubscriptionCount += 1;
     // Durable dedup window: rehydrate the subscriber's window from the
     // journal before any replay runs, so a resumed consumer does not
     // double-deliver messages it already saw before the restart. Entries
@@ -7262,6 +7598,12 @@ export class EventBus {
           this.patternCache.delete(topicPattern);
         } else {
           this.subscribersByPattern.set(topicPattern, remaining);
+        }
+        // Composite subscriptions (EB-70): release the composite-cache
+        // references and drop the live count.
+        if (subscriber.composite !== undefined) {
+          this.releaseComposite(subscriber.composite);
+          this.compositeSubscriptionCount -= 1;
         }
         // The advertised pattern set may have shrunk.
         this.advertiseClusterPatterns();
@@ -8697,6 +9039,80 @@ export class EventBus {
   }
 
   /**
+   * Compiles one composite subscription's include/exclude patterns (see
+   * `SubscribeOptions.patterns`, EB-70) through the dedicated composite
+   * cache, reference-counting each distinct pattern. `namespacePrefix`
+   * translates the patterns exactly like the base pattern of a namespaced
+   * subscription (EB-52), so composite matching operates on the concrete
+   * `<prefix>/…` topic space. The caller releases the references with
+   * `releaseComposite` on unsubscribe.
+   */
+  private acquireComposite(
+    opts: { patterns: string[]; exclude: string[]; mode: 'any' | 'all' },
+    namespacePrefix: string | undefined,
+  ): CompositeSubscriberState {
+    const cacheKeys: string[] = [];
+    const compileAll = (patterns: string[]): RegExp[] =>
+      patterns.map((pattern) => {
+        const key = namespacePrefix === undefined ? pattern : `${namespacePrefix}/${pattern}`;
+        let matcher = this.compositePatternCache.get(key);
+        if (matcher == null) {
+          matcher = compilePattern(key);
+          this.compositePatternCache.set(key, matcher);
+        }
+        this.compositePatternRefs.set(key, (this.compositePatternRefs.get(key) ?? 0) + 1);
+        cacheKeys.push(key);
+        return matcher;
+      });
+    return {
+      include: compileAll(opts.patterns),
+      exclude: compileAll(opts.exclude),
+      mode: opts.mode,
+      cacheKeys,
+    };
+  }
+
+  /**
+   * Releases one composite subscription's composite-cache references,
+   * evicting patterns whose last composite subscriber left — the
+   * composite-cache counterpart of the `patternCache` eviction in the
+   * unsubscribe path.
+   */
+  private releaseComposite(state: CompositeSubscriberState): void {
+    for (const key of state.cacheKeys) {
+      const remaining = (this.compositePatternRefs.get(key) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.compositePatternRefs.delete(key);
+        this.compositePatternCache.delete(key);
+      } else {
+        this.compositePatternRefs.set(key, remaining);
+      }
+    }
+  }
+
+  /**
+   * Evaluates a subscriber's composite include/exclude patterns against a
+   * concrete topic (EB-70): any exclude match rejects the message;
+   * otherwise `'any'` mode accepts when some include pattern matches and
+   * `'all'` mode only when every include pattern matches.
+   */
+  private matchesComposite(state: CompositeSubscriberState, topic: string): boolean {
+    for (const matcher of state.exclude) {
+      if (matcher.test(topic)) return false;
+    }
+    if (state.mode === 'all') {
+      for (const matcher of state.include) {
+        if (!matcher.test(topic)) return false;
+      }
+      return true;
+    }
+    for (const matcher of state.include) {
+      if (matcher.test(topic)) return true;
+    }
+    return false;
+  }
+
+  /**
    * Replays durable-log records into a resubscribing subscriber's queue:
    * every logged message on a topic matching the subscriber's pattern with
    * `seq` greater than `fromSeq` is re-enqueued with its original `seq` and
@@ -8959,6 +9375,22 @@ export class EventBus {
           }
           continue;
         }
+      }
+      const composite = subscriber.composite;
+      if (composite !== undefined && !this.matchesComposite(composite, rec.topic)) {
+        // A composite-rejected replayed message is deliberately skipped,
+        // exactly like a filter rejection above: never queued (it must not
+        // churn the backpressure budget on reconnect), never a sequence
+        // gap, and the key/causal baselines advance past it like the live
+        // path does.
+        this.countFiltered(subscriber, rec.topic, rec.seq);
+        if (rec.key !== undefined && rec.keySeq !== undefined) {
+          this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+        }
+        if (rec.causal !== undefined) {
+          this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+        }
+        continue;
       }
       // Handoff linger: a group member that left within its linger window
       // is presumed still processing these seqs — skip them so the
@@ -10570,6 +11002,17 @@ export class EventBus {
       this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '');
       return false;
     }
+    const composite = subscriber.composite;
+    if (composite !== undefined && !this.matchesComposite(composite, msg.topic)) {
+      // Composite-pattern (EB-70) rejection, evaluated after the content
+      // filter: the message never reaches the queue — no backpressure
+      // budget consumed, no throttle token burned — and the per-topic
+      // baseline advances over it so the deliberate skip never counts as
+      // a sequence gap. Counted like a filter rejection: both are
+      // subscriber-side narrowing, invisible to gap detection.
+      this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '');
+      return false;
+    }
     const throttle = subscriber.throttle;
     if (throttle != null && throttle.throttled && !throttle.bucket.take()) {
       // Publish-side shed: the message never reaches the queue, so the
@@ -10604,6 +11047,13 @@ export class EventBus {
       // queued, never counted anywhere. Shadow deliveries track no
       // sequence gaps, so — unlike production — there is no baseline to
       // advance over the skip.
+      return;
+    }
+    const composite = subscriber.composite;
+    if (composite !== undefined && !this.matchesComposite(composite, msg.topic)) {
+      // A composite-rejected shadow copy is deliberately skipped, exactly
+      // like a filter rejection above: never queued, never counted
+      // anywhere, so the mirror cannot move production stats.
       return;
     }
     this.enqueueShadowMessage(subscriber, msg, expiresAt);
@@ -11921,6 +12371,7 @@ export class EventBus {
       expiredLeases: this.totalExpiredLeases,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
+      compositeSubscriptions: this.compositeSubscriptionCount,
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,

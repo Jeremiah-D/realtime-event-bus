@@ -157,6 +157,22 @@ library.
   application payload and the concrete topic, applies to durable-log replay
   too, and for group members is evaluated on the assigned member only;
   `getStats()` reports `filteredMessages` per topic and globally.
+  Opt-in composite `patterns` (`{ patterns, mode, exclude }`, EB-70) add
+  multi-pattern include/exclude matching per message, evaluated after the
+  content filter: `mode: 'any'` (default) delivers when any include pattern
+  matches the topic, `mode: 'all'` only when every include pattern does, and
+  any `exclude` match drops the message — e.g. include `market.**` with
+  `exclude: ['market.btc.*']` to take the market feed while dropping the noisy
+  BTC leg. Composite-rejected messages are skipped exactly like filter
+  rejections (never queued, no backpressure budget, no throttle token, no
+  sequence gap) and count into `filteredMessages`; the same narrowing applies
+  to durable-log replay and to shadow mirrors. Patterns compile through a
+  dedicated composite cache — separate from the single-pattern
+  `patternCache`, so `getStats().patternCacheSize` keeps its meaning — and
+  `getStats().compositeSubscriptions` reports the live composite count.
+  Illegal combinations throw `RangeError` at subscribe time: an empty
+  `patterns` array, a bad `mode`, or an `exclude` set covering the include
+  space so no message could ever be delivered.
 - **`src/cluster.ts` — `ClusterHub` / `ClusterLink`**: cross-process
   cluster federation. Multiple Node processes form a cluster through a
   central TCP hub (`new ClusterHub({ port })`, TLS via `tls: { key, cert }`);
