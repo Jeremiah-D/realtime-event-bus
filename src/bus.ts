@@ -1592,11 +1592,15 @@ export interface TopicStats {
    */
   rateLimitedMessages: number;
   /**
-   * Publishes to this topic rejected by schema validation (see
-   * `setTopicSchema`): the payload failed the topic's validator. Unlike
-   * rate-limit sheds, a rejection happens before admission — the payload
-   * never became a message, so it consumed no sequence number and is
-   * invisible to gap detection.
+   * Publishes to this topic rejected by admission gates that fire before
+   * admission — schema validation (see `setTopicSchema`), the broker-level
+   * ACL (see `setAclRules`), the per-topic message-size cap (see
+   * `setTopicMaxMessageBytes`), and expired migration aliases (see
+   * `EventBus.setTopicAlias`). Unlike rate-limit sheds, a rejection happens
+   * before admission — the payload never became a message, so it consumed
+   * no sequence number and is invisible to gap detection. The
+   * `onAdmissionRejected` hook's `reason` distinguishes the gates sharing
+   * this counter.
    */
   rejectedMessages: number;
   /**
@@ -1782,9 +1786,11 @@ export interface BusStats {
    */
   rateLimitedMessages: number;
   /**
-   * Total publishes rejected by schema validation — the sum of every
-   * topic's `rejectedMessages`. See `TopicStats.rejectedMessages` for the
-   * exact counting rules.
+   * Total publishes rejected by admission gates before admission — schema
+   * validation, the broker-level ACL, the per-topic message-size cap, and
+   * expired migration aliases — the sum of every topic's
+   * `rejectedMessages`. See `TopicStats.rejectedMessages` for the exact
+   * counting rules.
    */
   rejectedMessages: number;
   /**
@@ -3233,11 +3239,17 @@ export type SchemaValidator = (payload: unknown, topic: string) => boolean;
 /**
  * Why one entry of an atomic batch was rejected: the ACL denied the publish
  * (`'acl'`), its payload failed the topic's schema validator (`'schema'`),
- * or the topic's rate-limit bucket had no token left for it
- * (`'rate-limit'`). TTL expiry is drain-time and never rejects a publish,
- * so it cannot appear here.
+ * its payload exceeded the topic's per-message size cap
+ * (`'message-too-big'`), or the topic's rate-limit bucket had no token left
+ * for it (`'rate-limit'`). TTL expiry is drain-time and never rejects a
+ * publish, so it cannot appear here.
  */
-export type AtomicRejectReason = 'acl' | 'schema' | 'rate-limit' | 'alias-retired';
+export type AtomicRejectReason =
+  | 'acl'
+  | 'schema'
+  | 'message-too-big'
+  | 'rate-limit'
+  | 'alias-retired';
 
 /**
  * Which publish-side admission gate dropped a publish — the unified reason
@@ -3249,6 +3261,10 @@ export type AtomicRejectReason = 'acl' | 'schema' | 'rate-limit' | 'alias-retire
  *   counter with `'schema'`, distinguished by the reason)
  * - `'schema'` → `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`
  *   (payload failed the topic's schema validator, EB-20)
+ * - `'message-too-big'` → `TopicStats.rejectedMessages` /
+ *   `BusStats.rejectedMessages` (payload's JSON byte size exceeded the
+ *   topic's per-message size cap, EB-64; shares the rejection counter with
+ *   `'schema'`, distinguished by the reason)
  * - `'rate-limit'` → `TopicStats.rateLimitedMessages` /
  *   `BusStats.rateLimitedMessages` (topic token bucket empty, EB-19)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
@@ -3258,12 +3274,18 @@ export type AtomicRejectReason = 'acl' | 'schema' | 'rate-limit' | 'alias-retire
  *   alias expired — the old topic is read-only, EB-44)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
- * underlying gate reason (`'acl'` | `'schema'` | `'rate-limit'` |
- * `'alias-retired'`); the batch rejection
+ * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
+ * `'rate-limit'` | `'alias-retired'`); the batch rejection
  * is counted once against that entry's topic, so it stays reconcilable
  * too.
  */
-export type AdmissionRejectReason = 'acl' | 'schema' | 'rate-limit' | 'duplicate' | 'alias-retired';
+export type AdmissionRejectReason =
+  | 'acl'
+  | 'schema'
+  | 'message-too-big'
+  | 'rate-limit'
+  | 'duplicate'
+  | 'alias-retired';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -4619,6 +4641,20 @@ export class EventBus {
    */
   private schemaMatcherCache = new Map<string, RegExp>();
   /**
+   * Per-topic maximum single-message size caps (UTF-8 JSON bytes), keyed by
+   * the exact string passed to `setTopicMaxMessageBytes` — either a
+   * concrete topic name or a wildcard pattern. Match resolution mirrors the
+   * schema rules: an exact-topic rule wins over any pattern; between
+   * patterns the earliest-registered rule wins.
+   */
+  private maxMessageBytesRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in `maxMessageBytesRules`,
+   * kept apart from the subscriber pattern cache so size-cap configuration
+   * never inflates `patternCacheSize`.
+   */
+  private maxMessageBytesMatcherCache = new Map<string, RegExp>();
+  /**
    * Messages rejected by schema validation (global total). A rejection
    * happens before admission: the payload never becomes a message, so it
    * consumes no sequence number, is never written to the durable log, and
@@ -5759,6 +5795,67 @@ export class EventBus {
    */
   clearTopicSchema(topicPattern: string): boolean {
     return this.schemaRules.delete(topicPattern);
+  }
+
+  /**
+   * Caps the JSON byte size of a single publish to topics matching
+   * `topicPattern` — an admission gate for oversized payloads. `topicPattern`
+   * accepts the same wildcard syntax as `subscribe` (or an exact topic
+   * name); a publish whose payload serializes to more than `maxBytes` UTF-8
+   * JSON bytes is rejected: it is never fanned out, never written to the
+   * durable log, and never reaches a subscriber queue — `publish` returns 0
+   * for it.
+   *
+   * A rejection happens before admission, so it consumes no sequence number
+   * (subscribers see no gap), does not burn rate-limit budget, and is counted
+   * in `TopicStats.rejectedMessages` (and the global total) — the same
+   * rejection semantics as a schema rejection — surfaced on
+   * `onAdmissionRejected` with reason `'message-too-big'`. The gate runs
+   * after schema validation and before sequence-number assignment, so an
+   * oversized publish cannot hide behind a validator pass or disturb the
+   * rate limiter. Payloads with no JSON encoding (`undefined`, functions,
+   * symbols, circular structures, BigInt) measure 0 bytes (see
+   * `payloadByteSize`) and never trip the cap.
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * patterns, the earliest-registered matching pattern wins. Re-setting a
+   * rule replaces it. Throws `RangeError` when `topicPattern` is empty or
+   * `maxBytes` is not a positive integer.
+   */
+  setTopicMaxMessageBytes(topicPattern: string, maxBytes: number): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+      throw new RangeError('maxBytes must be a positive integer number of bytes');
+    }
+    this.maxMessageBytesRules.set(topicPattern, maxBytes);
+  }
+
+  /**
+   * Removes the per-topic message-size cap previously registered for
+   * `topicPattern`. Returns true when a rule existed and was removed.
+   */
+  clearTopicMaxMessageBytes(topicPattern: string): boolean {
+    return this.maxMessageBytesRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the per-message byte cap that applies to `topic`, or `undefined`
+   * when no rule matches. Same precedence as `ttlForTopic`.
+   */
+  private maxMessageBytesForTopic(topic: string): number | undefined {
+    const exact = this.maxMessageBytesRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, maxBytes] of this.maxMessageBytesRules) {
+      let matcher = this.maxMessageBytesMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.maxMessageBytesMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return maxBytes;
+    }
+    return undefined;
   }
 
   /**
@@ -8615,7 +8712,8 @@ export class EventBus {
    *
    * 1. Admission: every entry is checked against the same admission gates
    *    `publish` applies — the broker-level ACL, then schema validation,
-   *    then the per-topic rate-limit budget — without mutating any bus
+   *    then the per-topic message-size cap, then the per-topic rate-limit
+   *    budget — without mutating any bus
    *    state. Rate-limit
    *    tokens are charged against a per-batch shadow balance, so a batch
    *    cannot overdraft the bucket with its own entries. The first entry
@@ -8693,6 +8791,7 @@ export class EventBus {
         if (reason === 'schema') this.countSchemaRejection(topic, payload);
         else if (reason === 'acl') this.countAclDenied(topic, payload);
         else if (reason === 'alias-retired') this.countAliasRetired(topic, payload);
+        else if (reason === 'message-too-big') this.countMessageTooBig(topic, payload);
         else this.countRateLimited(topic, payload);
         return { published: 0, rejected: { index, topic, reason } };
       }
@@ -8730,7 +8829,8 @@ export class EventBus {
   /**
    * Runs the admission gate of the publish pipeline — schema validation
    * first (rejections happen before admission: no seq, no rate-limit
-   * budget), then the per-topic rate-limit budget — WITHOUT mutating any
+   * budget), then the per-topic message-size cap, then the per-topic
+   * rate-limit budget — WITHOUT mutating any
    * bus state, so `publishAtomic` can pre-validate a batch before
    * committing anything. Returns the rejection reason when the publish
    * would be rejected or shed, `undefined` when it would be admitted.
@@ -8761,6 +8861,11 @@ export class EventBus {
     if (!this.aclAllowsPublish(topic)) return 'acl';
     const validator = this.schemaForTopic(topic);
     if (validator !== undefined && !validator(payload, topic)) return 'schema';
+    // Per-message size cap, same position as in `fanOut` (after schema, and
+    // before any sequence number or rate-limit budget is touched): an
+    // oversized entry aborts the batch like a schema rejection.
+    const maxBytes = this.maxMessageBytesForTopic(topic);
+    if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) return 'message-too-big';
     const limit = this.rateLimitForTopic(topic);
     if (limit !== undefined) {
       let bucket = this.rateLimitBuckets.get(topic);
@@ -8795,6 +8900,9 @@ export class EventBus {
    *   (validators are expected pure — the same contract `publishAtomic`
    *   relies on), so a payload accepted here is never rejected at its due
    *   time.
+   * - The per-topic message-size cap (`setTopicMaxMessageBytes`) also runs
+   *   NOW, fail-fast, right after schema validation: an oversized payload
+   *   never becomes a scheduled delivery and is not re-checked at fan-out.
    * - Everything else waits for the due time: the message consumes no
    *   sequence number, is written to no durable-log message record, and
    *   burns no rate-limit budget until it actually fans out (the EB-20 /
@@ -8863,6 +8971,14 @@ export class EventBus {
     const validator = this.schemaForTopic(topic);
     if (validator !== undefined && !validator(payload, topic)) {
       this.countSchemaRejection(topic, payload);
+      return undefined;
+    }
+    // Fail fast on the per-topic message-size cap: an oversized payload
+    // never becomes a scheduled delivery — same zero-side-effect semantics
+    // as the schema fail-fast above.
+    const maxBytes = this.maxMessageBytesForTopic(topic);
+    if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
+      this.countMessageTooBig(topic, payload);
       return undefined;
     }
     const ttlMs = this.ttlForTopic(topic);
@@ -9218,6 +9334,22 @@ export class EventBus {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
     this.emitAdmissionRejected(topic, 'schema', payload);
+  }
+
+  /**
+   * Counts one publish rejected by the per-topic message-size cap against
+   * the topic and the global total, then fires the admission-rejection
+   * hook. Like a schema rejection this happens before admission: the
+   * payload never becomes a message — no sequence number is consumed
+   * (subscribers see no gap), the durable log never sees it, and it does
+   * not burn rate-limit budget. The rejection shares the `rejectedMessages`
+   * counter with schema rejections, distinguished by the `'message-too-big'`
+   * hook reason.
+   */
+  private countMessageTooBig(topic: string, payload: unknown): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
+    this.emitAdmissionRejected(topic, 'message-too-big', payload);
   }
 
   /**
@@ -10376,6 +10508,18 @@ export class EventBus {
       const validator = this.schemaForTopic(topic);
       if (validator !== undefined && !validator(payload, topic)) {
         this.countSchemaRejection(topic, payload);
+        return { matched: 0, accepted: 0, admitted: false };
+      }
+      // Per-topic maximum message size runs after schema validation and
+      // before sequence-number assignment: an oversized payload is rejected
+      // before admission — no sequence number consumed (subscribers see no
+      // gap), the durable log never sees it, and it burns no rate-limit
+      // budget — exactly the schema-rejection semantics. Counted in
+      // `rejectedMessages`, surfaced on the admission-rejection hook with
+      // reason 'message-too-big'.
+      const maxBytes = this.maxMessageBytesForTopic(topic);
+      if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
+        this.countMessageTooBig(topic, payload);
         return { matched: 0, accepted: 0, admitted: false };
       }
     }

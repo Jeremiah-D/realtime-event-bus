@@ -20,8 +20,9 @@
  *   delivery.
  * - `eventbus_throttled_messages_total`: messages shed at the publish
  *   side by adaptive throttling.
- * - `eventbus_rejected_messages_total`: publishes rejected by schema
- *   validation.
+ * - `eventbus_rejected_messages_total`: publishes rejected by admission
+ *   gates before admission (schema validation, broker ACL, per-topic
+ *   message-size caps, expired migration aliases).
  * - `eventbus_late_messages_total`: messages admitted with a business
  *   event time older than their topic's event-time watermark (EB-59).
  * - `eventbus_rate_limited_messages_total`: messages shed by publish-side
@@ -235,7 +236,7 @@ export function renderPrometheus(stats: BusStats): string {
   );
   counter(
     'eventbus_rejected_messages_total',
-    'Total publishes rejected by schema validation.',
+    'Total publishes rejected by admission gates before admission (schema validation, broker ACL, per-topic message-size caps, expired migration aliases).',
     stats.rejectedMessages,
   );
   counter(

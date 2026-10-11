@@ -385,13 +385,32 @@ library.
   publish caller — validation runs before any state is mutated for that
   message. `clearTopicSchema` removes a rule. Empty patterns and
   non-function validators throw `RangeError`.
+- **Per-topic max message size** (in `src/bus.ts`, via
+  `setTopicMaxMessageBytes(pattern, maxBytes)`): an admission gate for
+  oversized payloads (backend/real-time systems). A publish whose payload
+  serializes to more than `maxBytes` UTF-8 JSON bytes is rejected before
+  admission — the same zero-side-effect semantics as a schema rejection: it
+  consumes no sequence number (subscribers see no gap), is never written to
+  the durable log, never reaches a queue, and does not burn rate-limit
+  budget; `publish` returns 0 for it. The gate runs after schema validation
+  and before sequence-number assignment. Rejections share
+  `TopicStats.rejectedMessages` (and the global total) with the other
+  pre-admission rejections and surface on `onAdmissionRejected` with reason
+  `'message-too-big'`. Rule matching mirrors `setTopicTtl`: an exact-topic
+  rule wins over patterns, the earliest-registered matching pattern wins,
+  and re-setting a rule replaces it. `clearTopicMaxMessageBytes` removes a
+  rule. Empty patterns and non-positive-integer sizes throw `RangeError`.
+  `publishAtomic` runs the cap in shadow admission (an oversized entry aborts
+  the batch with reason `'message-too-big'`), and `publishDelayed`
+  fail-fasts on it at schedule time, exactly like schema validation.
 - **Unified admission-rejection hook** (in `src/bus.ts`, via
   `EventBusOptions.onAdmissionRejected`): every publish-side admission
-  rejection — schema-validation rejections, per-topic rate-limit sheds,
+  rejection — schema-validation rejections, per-topic message-size
+  rejections, per-topic rate-limit sheds,
   idempotency-duplicate suppressions, and `publishAtomic` batch rejections
   (surfaced with the failing entry's gate reason) — fires one
   `AdmissionRejectionEvent { topic, reason, payloadBytes, at }`. `reason`
-  (`'acl' | 'schema' | 'rate-limit' | 'duplicate' | 'alias-retired'`) maps onto the stats counters
+  (`'acl' | 'schema' | 'message-too-big' | 'rate-limit' | 'duplicate' | 'alias-retired'`) maps onto the stats counters
   (`rejectedMessages` / `rateLimitedMessages` / `duplicateMessages` /
   `aliasRetiredMessages`), so
   hook events reconcile exactly with `getStats()`. The hook fires after the
