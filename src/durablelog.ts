@@ -129,6 +129,15 @@ export interface DurableLogOptions {
    */
   maxEntriesPerTopic?: number;
   /**
+   * Bound for the publish-dedup journal (`__publish_dedup.jsonl`, EB-66):
+   * the journal compacts itself to the latest claim per (topic, messageId)
+   * when it grows past twice this value. The bus passes its own
+   * `idempotencyMaxEntries` here so the journal's size guard tracks the
+   * publish-side dedup window it persists. Must be a positive integer.
+   * Default 10000.
+   */
+  publishDedupMaxEntries?: number;
+  /**
    * Opt-in Kafka-style keyed compaction: when a published message carries
    * a `key` (see `DurableLogRecord.key`), only the latest record per
    * (topic, key) is retained and replayed — older values for the same key
@@ -546,6 +555,76 @@ function dedupKey(consumer: string, topic: string, messageId: string): string {
   return `${consumer}\0${topic}\0${messageId}`;
 }
 
+/**
+ * One persisted publish-side idempotent-dedup claim: the
+ * `(topic, messageId)` window entry of `EventBus.publishIdempotent`
+ * (EB-27). `at` is the bus-clock timestamp of the first admitted publish —
+ * the window's expiry is evaluated against it at rehydration time.
+ */
+export interface PublishDedupEntry {
+  /** Concrete topic the message was published to. */
+  topic: string;
+  /** Application-level message identity. */
+  messageId: string;
+  /** First-admission timestamp in milliseconds (the bus clock). */
+  at: number;
+}
+
+/** On-disk envelope for one publish-dedup-journal line. `v` pins the format. */
+interface PublishDedupLine {
+  v: 1;
+  topic: string;
+  messageId: string;
+  at: number;
+}
+
+/**
+ * Key for one publish-dedup claim: topic and messageId joined by NUL —
+ * the same identity the bus's in-memory dedup table keys on
+ * (`${topic}\0${messageId}`), so journal and memory agree exactly.
+ */
+function publishDedupKey(topic: string, messageId: string): string {
+  return `${topic}\0${messageId}`;
+}
+
+/** Builds the on-disk envelope for a publish-dedup claim. */
+function publishDedupLineOf(entry: PublishDedupEntry): PublishDedupLine {
+  return {
+    v: 1,
+    topic: entry.topic,
+    messageId: entry.messageId,
+    at: entry.at,
+  };
+}
+
+/**
+ * Parses one publish-dedup-journal line. Returns `null` for anything
+ * malformed — wrong version, an empty topic/messageId, or a non-finite
+ * timestamp. Corrupt lines are skipped, never fatal.
+ */
+function parsePublishDedupLine(line: string): PublishDedupEntry | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const o = parsed as Record<string, unknown>;
+  if (o['v'] !== 1) return null;
+  if (typeof o['topic'] !== 'string' || (o['topic'] as string).length === 0) return null;
+  if (typeof o['messageId'] !== 'string' || (o['messageId'] as string).length === 0) return null;
+  if (typeof o['at'] !== 'number' || !Number.isFinite(o['at'])) return null;
+  return {
+    topic: o['topic'] as string,
+    messageId: o['messageId'] as string,
+    at: o['at'] as number,
+  };
+}
+
+/** Journal file name for the publish-side idempotent-dedup claims. */
+const PUBLISH_DEDUP_JOURNAL_NAME = '__publish_dedup.jsonl';
+
 /** Builds the on-disk envelope for a dedup sighting. */
 function dedupLineOf(entry: DedupEntry): DedupLine {
   return {
@@ -615,6 +694,16 @@ function parseDedupLine(line: string): DedupEntry | null {
  * lose its checkpoint across restarts. The journal compacts itself to the
  * latest commit per (group, topic) when it grows past twice
  * `maxEntriesPerTopic` lines.
+ *
+ * The log also maintains one publish-dedup journal
+ * (`__publish_dedup.jsonl`): every publish-side idempotent-dedup claim
+ * (`EventBus.publishIdempotent`) is appended as one line, and opening the
+ * log recovers the claims that have not aged out of the idempotency
+ * window. A restarted bus seeded from the same directory therefore keeps
+ * suppressing within-window retries — the payment/fintech retry pattern
+ * survives process restarts. The journal compacts itself to the newest
+ * `publishDedupMaxEntries` claims when it grows past twice that many
+ * lines.
  *
  * Segment archiving (`DurableLogOptions.segmentRotation`, opt-in): the
  * per-topic live file holds the current segment. When an append reaches
@@ -718,6 +807,29 @@ export class DurableTopicLog {
   /** Lines currently in the dedup journal, used for compaction. */
   private dedupEntries = 0;
   /**
+   * Path of the publish-dedup journal (`__publish_dedup.jsonl`) inside
+   * the log directory. One append-only file for the whole bus —
+   * publish-side dedup identities are scoped to concrete topics (which
+   * already include any namespace prefix), so a single root journal
+   * covers every namespace.
+   */
+  private readonly publishDedupFile: string;
+  /**
+   * Latest claim per (topic, messageId), keyed by
+   * `publishDedupKey(...)` — the in-memory side of the publish-dedup
+   * journal, rebuilt on open and maintained on append.
+   */
+  private readonly publishDedupSeen = new Map<string, PublishDedupEntry>();
+  /** Lines currently in the publish-dedup journal, used for compaction. */
+  private publishDedupEntries = 0;
+  /**
+   * Publish-dedup window bound (see `DurableLogOptions.publishDedupMaxEntries`):
+   * the journal compacts itself to the latest claim per (topic, messageId)
+   * when it grows past twice this value, so an idempotent-heavy producer
+   * cannot grow the journal without bound.
+   */
+  private readonly publishDedupMaxEntries: number;
+  /**
    * Opt-in segment rotation triggers, `undefined` when rotation is
    * disabled (the default — one live file per topic, as before).
    */
@@ -753,24 +865,29 @@ export class DurableTopicLog {
     maxEntriesPerTopic: number,
     keyCompaction: boolean,
     segmentRotation?: SegmentRotationOptions,
+    publishDedupMaxEntries = 10000,
   ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
     this.keyCompaction = keyCompaction;
     this.segmentRotation = segmentRotation;
+    this.publishDedupMaxEntries = publishDedupMaxEntries;
     this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
     this.dedupFile = join(dir, DEDUP_JOURNAL_NAME);
+    this.publishDedupFile = join(dir, PUBLISH_DEDUP_JOURNAL_NAME);
     this.archiveIndexFile = join(dir, ARCHIVE_INDEX_NAME);
     mkdirSync(dir, { recursive: true });
     this.recover();
     this.recoverArchiveIndex();
     this.recoverOffsets();
     this.recoverDedup();
+    this.recoverPublishDedup();
   }
 
   /**
    * Opens (or creates) the durable log at `dir`. Throws `RangeError` for an
-   * empty `dir`, a non-positive-integer `maxEntriesPerTopic`, or invalid
+   * empty `dir`, a non-positive-integer `maxEntriesPerTopic`, a
+   * non-positive-integer `publishDedupMaxEntries`, or invalid
    * `segmentRotation` triggers.
    */
   static open(options: DurableLogOptions): DurableTopicLog {
@@ -782,11 +899,16 @@ export class DurableTopicLog {
     if (!Number.isInteger(maxEntriesPerTopic) || maxEntriesPerTopic < 1) {
       throw new RangeError('durableLogMaxEntriesPerTopic must be a positive integer');
     }
+    const publishDedupMaxEntries = options.publishDedupMaxEntries ?? 10000;
+    if (!Number.isInteger(publishDedupMaxEntries) || publishDedupMaxEntries < 1) {
+      throw new RangeError('publishDedupMaxEntries must be a positive integer');
+    }
     return new DurableTopicLog(
       dir,
       maxEntriesPerTopic,
       options.keyCompaction ?? false,
       resolveSegmentRotationOptions(options.segmentRotation),
+      publishDedupMaxEntries,
     );
   }
 
@@ -1670,6 +1792,104 @@ export class DurableTopicLog {
     return this.dedupEntries;
   }
 
+  private recoverPublishDedup(): void {
+    let text: string;
+    try {
+      text = readFileSync(this.publishDedupFile, 'utf8');
+    } catch {
+      return;
+    }
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      this.publishDedupEntries += 1;
+      const entry = parsePublishDedupLine(line);
+      if (entry == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const key = publishDedupKey(entry.topic, entry.messageId);
+      const prev = this.publishDedupSeen.get(key);
+      // A re-claimed identity restarts its window: the fold keeps the
+      // latest claim and refreshes its position, exactly like the bus's
+      // in-memory delete+set — so the fold's order tracks last-claim
+      // order, which the bounded compaction relies on.
+      if (prev == null || entry.at >= prev.at) {
+        this.publishDedupSeen.delete(key);
+        this.publishDedupSeen.set(key, entry);
+      }
+    }
+  }
+
+  /**
+   * Persists one publish-side idempotent-dedup claim to the append-only
+   * publish-dedup journal. Returns `true` when the claim was persisted,
+   * `false` when it could not be serialized or the write failed — the
+   * caller keeps the in-memory window entry regardless, so a full disk
+   * must not fail the publish path. Never throws.
+   *
+   * When the journal grows past twice `publishDedupMaxEntries` lines it is
+   * compacted down to the newest `publishDedupMaxEntries` claims: an
+   * idempotent-heavy producer must not grow the journal without bound.
+   */
+  appendPublishDedup(entry: PublishDedupEntry): boolean {
+    let line: string;
+    try {
+      line = `${JSON.stringify(publishDedupLineOf(entry))}\n`;
+    } catch {
+      return false;
+    }
+    try {
+      appendFileSync(this.publishDedupFile, line, 'utf8');
+    } catch {
+      return false;
+    }
+    const key = publishDedupKey(entry.topic, entry.messageId);
+    const prev = this.publishDedupSeen.get(key);
+    // Same fold as recovery: latest claim wins, position refreshed.
+    if (prev == null || entry.at >= prev.at) {
+      this.publishDedupSeen.delete(key);
+      this.publishDedupSeen.set(key, entry);
+    }
+    this.publishDedupEntries += 1;
+    if (this.publishDedupEntries > this.publishDedupMaxEntries * 2) {
+      this.compactPublishDedup();
+    }
+    return true;
+  }
+
+  private compactPublishDedup(): void {
+    // Bounded like the in-memory window it persists (EB-66): keep the
+    // most recently claimed `publishDedupMaxEntries` identities, in claim
+    // order — the exact analog of the bus's insertion-ordered eviction,
+    // which also evicts by claim order rather than by timestamp (a
+    // timestamp sort would misorder same-tick claims).
+    const kept = [...this.publishDedupSeen.values()].slice(-this.publishDedupMaxEntries);
+    const text = kept.map((e) => `${JSON.stringify(publishDedupLineOf(e))}\n`).join('');
+    try {
+      writeFileSync(this.publishDedupFile, text, 'utf8');
+    } catch {
+      return;
+    }
+    this.publishDedupSeen.clear();
+    for (const e of kept) this.publishDedupSeen.set(publishDedupKey(e.topic, e.messageId), e);
+    this.publishDedupEntries = kept.length;
+  }
+
+  /**
+   * Every publish-dedup claim recovered from the journal, folded to the
+   * latest claim per (topic, messageId). The caller (the bus, at
+   * construction) prunes claims that aged out of the idempotency window:
+   * an expired identity is "unknown" and must not suppress a re-arrival.
+   */
+  recoveredPublishDedup(): PublishDedupEntry[] {
+    return [...this.publishDedupSeen.values()];
+  }
+
+  /** Lines currently in the publish-dedup journal, 0 when no claim was ever journaled. */
+  publishDedupEntryCount(): number {
+    return this.publishDedupEntries;
+  }
+
   /** Highest seq logged for a topic, 0 when the topic is unknown. */
   lastSeq(topic: string): number {
     return this.lastSeqs.get(topic) ?? 0;
@@ -1715,6 +1935,8 @@ export class DurableTopicLog {
     offsetEntries: number;
     /** Lines in the subscriber-dedup journal (`__dedup.jsonl`). */
     dedupEntries: number;
+    /** Lines in the publish-dedup journal (`__publish_dedup.jsonl`). */
+    publishDedupEntries: number;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
     /** Total entries across all archived segments. */
@@ -1749,6 +1971,7 @@ export class DurableTopicLog {
       keyCompaction: this.keyCompaction,
       offsetEntries: this.offsetEntries,
       dedupEntries: this.dedupEntries,
+      publishDedupEntries: this.publishDedupEntries,
       corruptArchives: this.corruptArchives,
       archived,
       segments,

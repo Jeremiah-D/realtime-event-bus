@@ -882,6 +882,28 @@ library.
   message. A throwing validator propagates to the caller, always during
   admission, so a throw can never leave a half-committed batch. An empty
   batch is a no-op.
+- **Publish-side idempotent dedup window** (in `src/bus.ts`, via
+  `publishIdempotent(topic, payload, { messageId })`): within
+  `EventBusOptions.idempotencyWindowMs` (default 60 s), a `(topic,
+  messageId)` pair is admitted at most once — a retry carrying the same
+  `messageId` returns `{ duplicate: true, accepted: 0 }` instead of
+  publishing again, so the downstream sees the message exactly once (the
+  payment/fintech retry pattern: a client retrying after a timeout can
+  never double-execute). The dedup gate runs before admission: a duplicate
+  consumes no sequence number (subscribers see no phantom gap), is never
+  written to the durable log, and burns no rate-limit budget. Only an
+  *admitted* publish claims a window slot — a schema rejection or
+  rate-limit shed leaves the retry free. The window is bounded by
+  `EventBusOptions.idempotencyMaxEntries` (oldest evicted) and measured on
+  the bus clock, so it is deterministic in tests. With
+  `EventBusOptions.durableLogDir` the window survives restarts: every
+  admitted claim is journaled to `__publish_dedup.jsonl` (best-effort — the
+  in-memory table stays the source of truth, so a failed journal write
+  never fails the publish), and a bus opened over the same directory
+  rehydrates the unexpired claims at construction; the journal compacts
+  itself to the most recently claimed `idempotencyMaxEntries` identities
+  when it grows past twice that many lines. `getStats().durableLog`
+  exposes the journal line count as `publishDedupEntries`.
 - **Subscriber-side exactly-once dedup window** (in `src/bus.ts`, opt-in via
   `subscribe(pattern, handler, { deduplicateMessages })`): the complement of
   `publishIdempotent`'s publish-side dedup. Every publish may carry an

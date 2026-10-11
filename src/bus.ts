@@ -5183,6 +5183,9 @@ export class EventBus {
         maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
         keyCompaction: options.durableLogKeyCompaction,
         segmentRotation: options.durableLogSegmentRotation,
+        // The publish-dedup journal's size guard tracks the publish-side
+        // idempotency window it persists (EB-66).
+        publishDedupMaxEntries: this.idempotencyMaxEntries,
       });
       this.durableLog = log;
       // Remembered for namespace child logs (EB-52): children open with
@@ -5191,6 +5194,25 @@ export class EventBus {
       this.durableLogMaxEntriesPerTopic = options.durableLogMaxEntriesPerTopic;
       this.durableLogKeyCompaction = options.durableLogKeyCompaction ?? false;
       this.durableLogSegmentRotation = options.durableLogSegmentRotation;
+      // Reseed the publish-side idempotent-dedup window from the journal
+      // (EB-66): a restarted bus keeps suppressing within-window retries.
+      // Claims that aged out of the window are "unknown" — dropped here,
+      // never rehydrated. Bounded to `idempotencyMaxEntries`: the journal
+      // yields claims in claim order, so taking the tail keeps the most
+      // recently claimed identities — the exact analog of the live
+      // table's insertion-ordered eviction.
+      {
+        const nowMs = this.now();
+        const live: Array<{ key: string; at: number }> = [];
+        for (const entry of log.recoveredPublishDedup()) {
+          if (nowMs - entry.at < this.idempotencyWindowMs) {
+            live.push({ key: `${entry.topic}\0${entry.messageId}`, at: entry.at });
+          }
+        }
+        for (const { key, at } of live.slice(-this.idempotencyMaxEntries)) {
+          this.dedup.set(key, at);
+        }
+      }
       // Recover numbering continuity and per-key cursors from the log —
       // shared with namespace child logs (see `recoverLogState`).
       this.recoverLogState(log);
@@ -8657,6 +8679,11 @@ export class EventBus {
    *   per-key lookup re-checks expiry so it can never suppress wrongly.
    * - The window is measured on the bus clock (`EventBusOptions.now`), so
    *   dedup is deterministic in tests.
+   * - With `EventBusOptions.durableLogDir` the window survives restarts:
+   *   every admitted claim is journaled to `__publish_dedup.jsonl` in the
+   *   log directory (best-effort — the in-memory table stays the source of
+   *   truth), and a bus opened over the same directory rehydrates the
+   *   unexpired claims at construction (see EB-66).
    *
    * Without a `messageId` (absent or empty) this behaves exactly like
    * `publish`, returning `{ duplicate: false, accepted }`. Suppressed
@@ -8766,6 +8793,13 @@ export class EventBus {
         if (oldest.done) break;
         this.dedup.delete(oldest.value);
       }
+      // Publish-side dedup journal (EB-66): persist the claim so a restart
+      // keeps suppressing within-window retries. Best-effort — the
+      // in-memory table is the source of truth, so a failed journal write
+      // never fails the publish. The identity is already namespaced to the
+      // concrete topic above, so the single root journal covers every
+      // namespace.
+      this.durableLog?.appendPublishDedup({ topic, messageId, at: nowMs });
     }
     return { duplicate: false, accepted };
   }
