@@ -73,6 +73,16 @@ export interface AckTrackerOptions<T> {
    * stamp shares the bus's time base.
    */
   now?: () => number;
+  /**
+   * Called exactly once per tracked delivery when it settles — from
+   * `ack()`, `nack()`, or the ack-timeout timer — after the tracker
+   * forgets the delivery and before `onRedeliver` runs for requeueing
+   * settles. The single convergence point of the three settle paths, so
+   * per-subscriber in-flight accounting (see
+   * `SubscribeOptions.maxInflight`) hooks here instead of in three
+   * places. Not called by `clear()`.
+   */
+  onSettle?: () => void;
 }
 
 interface PendingDelivery<T> {
@@ -89,6 +99,7 @@ interface PendingDelivery<T> {
 export class AckTracker<T> {
   private readonly ackTimeoutMs: number;
   private readonly onRedeliver: (msg: T, reason: RedeliveryReason) => void;
+  private readonly onSettle?: () => void;
   private readonly now: () => number;
   private readonly pending = new Map<number, PendingDelivery<T>>();
   private nextSeq = 0;
@@ -99,6 +110,7 @@ export class AckTracker<T> {
     }
     this.ackTimeoutMs = options.ackTimeoutMs;
     this.onRedeliver = options.onRedeliver;
+    this.onSettle = options.onSettle;
     this.now = options.now ?? Date.now;
   }
 
@@ -120,6 +132,10 @@ export class AckTracker<T> {
       record.settled = true;
       if (record.timer !== undefined) clearTimeout(record.timer);
       this.pending.delete(seq);
+      // The uniform settle hook: ack(), nack(), and the ack-timeout path
+      // all converge here, so one call covers every way a delivery can
+      // settle — before any requeue work runs.
+      this.onSettle?.();
       if (requeue) this.onRedeliver(msg, reason ?? 'nack');
     };
     record.timer = setTimeout(() => settle(true, 'ack-timeout'), this.ackTimeoutMs);

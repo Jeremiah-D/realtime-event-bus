@@ -670,6 +670,19 @@ library.
   must be an integer >= 1 and `perWindowMs` a positive finite number of
   milliseconds — invalid values throw `RangeError` from `subscribe`.
   Disabled by default.
+- **Per-subscriber max in-flight deliveries** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { maxInflight: N })`): caps how many handler invocations
+  may be unsettled at once per subscriber. At the cap the drain stops
+  pulling new messages — they wait queued in FIFO order, never dropped —
+  and pulls more once a handler settles. For reliable subscriptions a
+  delivery settles on `ack()`, `nack()`, or the ack timeout (all three
+  release through the tracker's single settle path); for plain
+  subscriptions the invocation settles when the handler returns, or when a
+  returned promise settles. Composes orthogonally with delivery-side
+  shaping (shaping paces the round, the cap bounds unsettled invocations).
+  `getStats()` exposes per-subscriber usage via `inFlightUsage`. Must be an
+  integer >= 1 — anything else throws `RangeError` from `subscribe`, as do
+  combinations with `batch` or `shadow`. Disabled by default.
 - **Per-subscriber delivery-latency sampling** (in `src/latency.ts`, opt-in
   via `subscribe(..., { deliveryLatency: true })`): measures each delivered
   message's queue dwell — from enqueue into the subscriber's queue to the

@@ -339,6 +339,31 @@ export interface SubscribeOptions {
    */
   deliveryShaping?: boolean | DeliveryShapingOptions;
   /**
+   * Opt-in per-subscriber cap on simultaneously unsettled handler
+   * invocations during drain (EB-67). When the number of handler
+   * invocations that have not settled reaches `maxInflight`, the drain
+   * stops pulling new messages for this subscriber — messages stay queued
+   * in FIFO order, never dropped — and pulls more once a handler settles.
+   *
+   * Composes orthogonally with `deliveryShaping`: shaping paces each flush
+   * round (how many messages may leave the queue), the cap bounds how many
+   * handler invocations may be unsettled at once — a message is delivered
+   * only when both allow it.
+   *
+   * What "settles" an invocation depends on the subscription: for reliable
+   * subscriptions (`subscribeReliable`) a delivery settles on `ack()`,
+   * `nack()`, or the ack timeout — the slot is released on the tracker's
+   * single settle path, so all three release uniformly. For plain
+   * subscriptions the invocation settles when the handler returns; a
+   * returned promise holds its slot until the promise settles.
+   * `getStats()` exposes the per-subscriber usage (`inFlightUsage`).
+   *
+   * Must be an integer >= 1 — anything else throws `RangeError` from
+   * `subscribe`. Cannot be combined with `batch` or `shadow` (both throw
+   * `RangeError`). Disabled by default.
+   */
+  maxInflight?: number;
+  /**
    * Opt-in per-subscriber sliding-window delivery rate limit: at most
    * `maxMessages` deliveries per rolling `perWindowMs` window. Unlike
    * `deliveryShaping` (a token bucket that smooths bursts), the window is
@@ -1947,6 +1972,23 @@ export interface BusStats {
     waiting: number;
   }>;
   /**
+   * Per-subscriber in-flight delivery usage (see
+   * `SubscribeOptions.maxInflight`): one row per subscriber with the cap
+   * enabled, in subscription order, carrying the configured cap
+   * (`maxInflight`) and how many handler invocations are currently
+   * unsettled (`inFlight`). Empty when no subscriber opts in.
+   */
+  inFlightUsage: Array<{
+    /** The subscriber's id (see `Subscription.id`). */
+    subscriberId: string;
+    /** The topic pattern the subscription was registered with. */
+    pattern: string;
+    /** The configured cap on unsettled handler invocations. */
+    maxInflight: number;
+    /** Handler invocations currently unsettled. */
+    inFlight: number;
+  }>;
+  /**
    * Delayed messages currently scheduled (see `publishDelayed`): accepted,
    * not yet due, fanned out, cancelled, or expired. Each one holds a slot
    * in the timer heap until its due time.
@@ -2347,6 +2389,11 @@ interface Subscriber {
    * Absent when shaping is disabled for this subscriber.
    */
   deliveryShaping?: DeliveryShapingState;
+  /**
+   * Max in-flight delivery cap state (see `SubscribeOptions.maxInflight`).
+   * Absent when the cap is disabled for this subscriber.
+   */
+  maxInflight?: MaxInflightState;
   /**
    * Sliding-window delivery rate limit state (see
    * `SubscribeOptions.rateLimit`). Absent when the limit is disabled for
@@ -2905,6 +2952,17 @@ interface DeliveryShapingState {
 }
 
 /**
+ * Per-subscriber max in-flight delivery state (see
+ * `SubscribeOptions.maxInflight`). `max` is the configured cap on
+ * simultaneously unsettled handler invocations; `inFlight` is how many
+ * handler invocations are currently unsettled.
+ */
+interface MaxInflightState {
+  max: number;
+  inFlight: number;
+}
+
+/**
  * Validates `SubscribeOptions.deliveryShaping` and builds the initial
  * per-subscriber shaping state. Returns `undefined` when shaping is
  * disabled. Throws `RangeError` for invalid rates.
@@ -2930,6 +2988,32 @@ function resolveDeliveryShapingOptions(
     burst,
     timer: undefined,
   };
+}
+
+/**
+ * Validates `SubscribeOptions.maxInflight` and returns the configured cap.
+ * Returns `undefined` when the cap is disabled. Throws `RangeError` for
+ * non-integer or < 1 values.
+ */
+function resolveMaxInflightOptions(opt: number | undefined): number | undefined {
+  if (opt == null) return undefined;
+  if (!Number.isInteger(opt) || opt < 1) {
+    throw new RangeError('subscribe: maxInflight must be an integer >= 1');
+  }
+  return opt;
+}
+
+/**
+ * Returns true when `value` is a thenable (has a callable `then`).
+ * Used to detect async plain handlers, whose returned promise holds an
+ * in-flight slot until it settles (see `SubscribeOptions.maxInflight`).
+ */
+function isThenable(value: unknown): value is Promise<unknown> {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
 }
 
 /**
@@ -6648,6 +6732,7 @@ export class EventBus {
         ['deduplicateMessages', opts?.deduplicateMessages],
         ['keyHotspot', opts?.keyHotspot],
         ['ackLatency', opts?.ackLatency],
+        ['maxInflight', opts?.maxInflight],
       ];
       for (const [name, value] of incompatible) {
         if (value !== undefined && value !== false) {
@@ -6669,6 +6754,9 @@ export class EventBus {
     // half-registered subscriber behind.
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const maxInflight = resolveMaxInflightOptions(opts?.maxInflight);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const rateLimit = resolveRateLimitOptions(opts?.rateLimit);
@@ -6700,6 +6788,12 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
+    // The in-flight cap counts single handler invocations; a batch hands
+    // many messages to one call, so the two cannot share a coherent
+    // accounting — fail fast instead of pretending the cap applies.
+    if (batch != null && maxInflight !== undefined) {
+      throw new RangeError('subscribe: maxInflight cannot be combined with batch');
+    }
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const dedup = resolveDeduplicateMessagesOptions(
@@ -6779,6 +6873,7 @@ export class EventBus {
       throttle,
       onThrottled,
       deliveryShaping,
+      maxInflight: maxInflight == null ? undefined : { max: maxInflight, inFlight: 0 },
       rateLimit,
       latency: deliveryLatency,
       ackLatency,
@@ -6957,6 +7052,17 @@ export class EventBus {
     const tracker = new AckTracker<BusMessage>({
       ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
       now: this.now,
+      // EB-67: the tracker's single settle path (ack/nack/ack-timeout)
+      // releases one in-flight slot and re-flushes so queued messages are
+      // pulled into it. A no-op unless the subscriber opted into
+      // maxInflight — with the cap disabled the tracker behaves exactly
+      // as before.
+      onSettle: () => {
+        const cap = subscriber.maxInflight;
+        if (cap == null) return;
+        cap.inFlight = Math.max(0, cap.inFlight - 1);
+        this.scheduleFlush();
+      },
       onRedeliver: (msg, reason) => {
         // EB-45: the outstanding delivery's `bus.ack` span never
         // completes — abandon it. The requeue below emits a fresh
@@ -9779,15 +9885,15 @@ export class EventBus {
    * messages — including every message when tracing is disabled — pay a
    * single branch: no allocation, no clock read.
    */
-  private deliverTraced(subscriber: Subscriber, msg: BusMessage, invoke: () => void): void {
+  private deliverTraced<T>(subscriber: Subscriber, msg: BusMessage, invoke: () => T): T {
     const tracer = this.trace;
     if (tracer === undefined || !tracer.hasTrace(msg)) {
-      invoke();
-      return;
+      return invoke();
     }
     const at = this.now();
-    invoke();
+    const result = invoke();
     tracer.deliverSpan(subscriber, msg, at, this.now() - at);
+    return result;
   }
 
   /**
@@ -11273,6 +11379,7 @@ export class EventBus {
     const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
+    const inFlightUsage: BusStats['inFlightUsage'] = [];
     const shadows: BusStats['shadows'] = [];
     const hotKeys: HotKeyStat[] = [];
     let causalBufferDepth = 0;
@@ -11306,6 +11413,18 @@ export class EventBus {
           waiting: rateLimit.rateLimiting
             ? subscriber.queue.size + (subscriber.batch?.pending.length ?? 0)
             : 0,
+        });
+      }
+      // In-flight cap usage (see `SubscribeOptions.maxInflight`): only
+      // subscribers that opted in appear — a pure read of the live
+      // counter, so the accounting is never disturbed.
+      const inflight = subscriber.maxInflight;
+      if (inflight != null) {
+        inFlightUsage.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          maxInflight: inflight.max,
+          inFlight: inflight.inFlight,
         });
       }
       const latency = subscriber.latency;
@@ -11472,6 +11591,7 @@ export class EventBus {
       degradedSubscribers,
       shapedSubscribers,
       rateLimitedWaiting,
+      inFlightUsage,
       pendingDelayed: this.delayedById.size,
       deliveryLatency,
       ackLatency,
@@ -12008,14 +12128,20 @@ export class EventBus {
     } else {
       const shaping = subscriber.deliveryShaping;
       const rateLimit = subscriber.rateLimit;
+      const maxInflight = subscriber.maxInflight;
       // Shaping paces the round first (smoothing bursts); the sliding
-      // window then enforces the hard cap — a message is delivered only
-      // when both allow it.
+      // window then enforces the hard cap; the in-flight cap bounds how
+      // many unsettled handler invocations one round may open — a message
+      // is delivered only when all three allow it. At the in-flight cap the
+      // drain pulls nothing new: queued messages wait in FIFO order, never
+      // dropped, until a handler settles and frees a slot.
       const shapingMaxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
       const rateLimitMaxLive = rateLimit == null ? Infinity : rateLimit.limiter.budget(nowMs);
+      const inflightMaxLive =
+        maxInflight == null ? Infinity : Math.max(0, maxInflight.max - maxInflight.inFlight);
       const { live, expired } = subscriber.queue.drainLiveUpTo(
         nowMs,
-        Math.min(shapingMaxLive, rateLimitMaxLive),
+        Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive),
       );
       for (const msg of expired) {
         this.recordExpired(msg.topic);
@@ -12049,23 +12175,29 @@ export class EventBus {
           // invocation occupied the consumer that long — and the throw
           // propagates exactly as before.
           const invocationSlo = this.invocationLatencySlo(subscriber);
-          if (invocationSlo == null) {
-            this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
-          } else {
+          // EB-67: one in-flight slot per handler invocation; the slot is
+          // released when the invocation settles (see
+          // invokeWithInflightSlot).
+          this.invokeWithInflightSlot(subscriber, (): unknown => {
+            if (invocationSlo == null) {
+              return this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+            }
             const processingStartedAtMs = this.now();
             try {
-              this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+              return this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
             } finally {
               this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
             }
-          }
+          });
         }
       } else {
         for (let i = 0; i < live.length; i += 1) {
           shaping?.bucket.take();
           rateLimit?.limiter.record(nowMs);
           this.inflateMessagePayload(live[i]);
-          this.deliverWithHealth(subscriber, live[i], nowMs);
+          this.invokeWithInflightSlot(subscriber, (): unknown =>
+            this.deliverWithHealth(subscriber, live[i], nowMs),
+          );
           if (!health.degraded) continue;
           // The threshold tripped mid-drain: everything not yet attempted
           // goes back to the queue, in FIFO order (see requeueUndelivered).
@@ -12452,9 +12584,9 @@ export class EventBus {
    * redelivery — use `subscribeReliable` when a failed message must be
    * requeued); the pause protects everything that follows it.
    */
-  private deliverWithHealth(subscriber: Subscriber, msg: BusMessage, nowMs: number): void {
+  private deliverWithHealth(subscriber: Subscriber, msg: BusMessage, nowMs: number): unknown {
     const health = subscriber.health;
-    if (health == null) return;
+    if (health == null) return undefined;
     this.detectGap(subscriber, msg);
     const budgetMs = health.processingTimeoutMs;
     // The health probe reads the clock only when it enforces a processing
@@ -12471,9 +12603,14 @@ export class EventBus {
     // Sampled before the handler runs: queue dwell, not processing time.
     this.recordDeliveryLatency(subscriber, msg, nowMs);
     this.recordLagSample(subscriber, msg, nowMs);
+    // The handler's return value is captured so the in-flight cap (see
+    // `SubscribeOptions.maxInflight`) can hold the slot until a returned
+    // promise settles; a throw is still swallowed into the failure
+    // accounting exactly as before.
+    let result: unknown;
     this.deliverTraced(subscriber, msg, () => {
       try {
-        subscriber.handler(msg);
+        result = subscriber.handler(msg);
       } catch {
         failed = true;
       }
@@ -12487,12 +12624,73 @@ export class EventBus {
     }
     if (!failed) {
       health.consecutiveFailures = 0;
-      return;
+      return result;
     }
     health.consecutiveFailures += 1;
     if (!health.degraded && health.consecutiveFailures >= health.maxConsecutiveFailures) {
       this.pauseForHealth(subscriber, reason);
     }
+    return result;
+  }
+
+  /**
+   * EB-67: invokes the handler for one single-message delivery while
+   * holding one in-flight slot when `SubscribeOptions.maxInflight` is
+   * enabled. The slot is acquired before the handler runs and released
+   * when the invocation settles:
+   * - reliable subscriptions settle through the tracker's single settle
+   *   path (`ack()` / `nack()` / ack-timeout), which releases the slot via
+   *   the tracker's `onSettle` hook (see `subscribeReliable`) — the drain
+   *   must not release it here, or a slow consumer's slot would be freed
+   *   while its delivery is still outstanding;
+   * - plain subscriptions settle when the handler returns: a returned
+   *   thenable holds the slot until it settles (fulfilled or rejected), a
+   *   synchronous return releases it immediately, and a throwing handler
+   *   releases its slot with the error propagating exactly as before.
+   * With the cap disabled the handler runs untouched — zero overhead,
+   * zero behavior change.
+   */
+  private invokeWithInflightSlot(subscriber: Subscriber, invoke: () => unknown): void {
+    const cap = subscriber.maxInflight;
+    if (cap == null) {
+      invoke();
+      return;
+    }
+    cap.inFlight += 1;
+    if (subscriber.reliable != null) {
+      // The tracker's onSettle hook owns the release.
+      invoke();
+      return;
+    }
+    // Hoisted before the try (never declared inside it): a Node v24/V8
+    // ReferenceError awaits bindings declared in `try` and read in
+    // `finally`.
+    let result: unknown;
+    try {
+      result = invoke();
+    } catch (err) {
+      cap.inFlight -= 1;
+      throw err;
+    }
+    if (isThenable(result)) {
+      const release = (): void => this.releaseInflightSlot(subscriber);
+      result.then(release, release);
+    } else {
+      cap.inFlight -= 1;
+    }
+  }
+
+  /**
+   * EB-67: releases one in-flight slot and schedules a flush so queued
+   * messages are pulled into the freed slot. Called from the tracker's
+   * `onSettle` hook (reliable: ack/nack/ack-timeout) and when a plain
+   * handler's returned promise settles.
+   */
+  private releaseInflightSlot(subscriber: Subscriber): void {
+    const cap = subscriber.maxInflight;
+    if (cap == null) return;
+    cap.inFlight = Math.max(0, cap.inFlight - 1);
+    this.scheduleFlush();
   }
 
   /**
