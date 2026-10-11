@@ -83,6 +83,17 @@ export interface AckTrackerOptions<T> {
    * places. Not called by `clear()`.
    */
   onSettle?: () => void;
+  /**
+   * Called exactly once when `ack()` settles a live delivery — after the
+   * tracker forgets the delivery, alongside `onSettle`. Not called for
+   * `nack()`, ack timeouts, or no-op acks on already-settled or stale
+   * handles, and not called by `clear()`. The single choke point for
+   * "the consumer confirmed this delivery", so idle-reclamation activity
+   * (`SubscribeOptions.maxIdleMs` with `idleActivity: 'ack' | 'any'`,
+   * EB-72) hooks here instead of in the bus's ack wrapper — the wrapper
+   * is bypassed when no ack-latency/trace/SLO tracking is enabled.
+   */
+  onAck?: () => void;
 }
 
 interface PendingDelivery<T> {
@@ -100,6 +111,7 @@ export class AckTracker<T> {
   private readonly ackTimeoutMs: number;
   private readonly onRedeliver: (msg: T, reason: RedeliveryReason) => void;
   private readonly onSettle?: () => void;
+  private readonly onAck?: () => void;
   private readonly now: () => number;
   private readonly pending = new Map<number, PendingDelivery<T>>();
   private nextSeq = 0;
@@ -111,6 +123,7 @@ export class AckTracker<T> {
     this.ackTimeoutMs = options.ackTimeoutMs;
     this.onRedeliver = options.onRedeliver;
     this.onSettle = options.onSettle;
+    this.onAck = options.onAck;
     this.now = options.now ?? Date.now;
   }
 
@@ -135,6 +148,12 @@ export class AckTracker<T> {
       // The uniform settle hook: ack(), nack(), and the ack-timeout path
       // all converge here, so one call covers every way a delivery can
       // settle — before any requeue work runs.
+      //
+      // `onAck` is narrower: only an `ack()` reaching a live delivery
+      // settles without requeueing, so `!requeue` after the settled guard
+      // is exactly "ack() settled" — no-ops on settled/stale handles
+      // returned above, nacks and timeouts requeue. (EB-72 idle activity.)
+      if (!requeue) this.onAck?.();
       this.onSettle?.();
       if (requeue) this.onRedeliver(msg, reason ?? 'nack');
     };

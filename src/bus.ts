@@ -1,5 +1,11 @@
 import { BoundedQueue, type DropPolicy } from './backpressure.ts';
 import { LeaseManager, type LeaseExpiredCallback, type LeaseExpiredEvent } from './lease.ts';
+import {
+  IdleReclaimer,
+  type IdleActivityMode,
+  type IdleExpiredCallback,
+  type IdleExpiredEvent,
+} from './idle.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
@@ -105,6 +111,7 @@ export type {
 } from './acklatency.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
 export type { LeaseExpiredCallback, LeaseExpiredEvent } from './lease.ts';
+export type { IdleActivityMode, IdleExpiredCallback, IdleExpiredEvent } from './idle.ts';
 export type { LateMessageCallback, LateMessageEvent } from './watermark.ts';
 export type {
   TraceOptions,
@@ -334,6 +341,41 @@ export interface SubscribeOptions {
    * given — anything else throws `RangeError` at subscribe time.
    */
   leaseMs?: number;
+  /**
+   * Opt-in idle-subscriber auto-reclamation, in milliseconds (see
+   * `src/idle.ts`, EB-72): the complement of the fixed-duration lease
+   * above. The subscription automatically unsubscribes once the time
+   * since its last qualifying activity exceeds `maxIdleMs` — every
+   * activity re-arms the window from the activity moment, so a busy
+   * subscriber never expires while it is active. Expiry runs the exact
+   * same unsubscribe path a manual `unsubscribe()` takes (consumer-group
+   * leave handling, reliable-delivery ack-tracker teardown and queue
+   * disposal all run identically; messages still queued at expiry are
+   * discarded with the queue, per the subscriber's own `dropPolicy`
+   * semantics). `EventBusOptions.onIdleExpired` fires once per expiry
+   * (error-isolated), and `getStats().idleExpired` counts expiries.
+   * `unsubscribe()` clears the timer, so no phantom expiry can fire
+   * afterwards. The timer is `unref()`'d, so a pending idle window never
+   * keeps the process alive. Disabled by default (absent). Must be a
+   * positive integer when given — anything else throws `RangeError` at
+   * subscribe time.
+   *
+   * A subscriber may hold both `leaseMs` and `maxIdleMs`: the two are
+   * independent opt-ins and whichever fires first wins; the other is
+   * cleared by the shared unsubscribe path.
+   */
+  maxIdleMs?: number;
+  /**
+   * Which subscriber events count as activity for idle reclamation (see
+   * `maxIdleMs`, EB-72): `'deliver'` = the handler returned without
+   * throwing (dropped/expired/shed messages never reach the handler, and
+   * a throwing handler is a failed delivery — neither counts);
+   * `'ack'` = `ack()` settled a live delivery (reliable subscriptions
+   * only — `nack()`, ack timeouts and no-op acks do not count);
+   * `'any'` = either (the default). Requires `maxIdleMs`; anything else
+   * throws `RangeError` at subscribe time.
+   */
+  idleActivity?: IdleActivityMode;
   /**
    * Called when the subscriber falls behind: its queue reached the high-water
    * mark (80% of capacity). Fires once per excursion and re-arms after the
@@ -1714,6 +1756,17 @@ export interface EventBusOptions {
    */
   onLeaseExpired?: LeaseExpiredCallback;
   /**
+   * Fires once per idle-expired subscription (see
+   * `SubscribeOptions.maxIdleMs`, EB-72): the bus has already
+   * unsubscribed the subscriber through its normal unsubscribe path
+   * when this fires, so the subscription is gone and
+   * `getStats().idleExpired` has already been incremented. The callback
+   * is error-isolated: a throwing hook is swallowed so a broken observer
+   * can never disturb the unsubscribe path. Default: unset (no hook —
+   * fully backward compatible).
+   */
+  onIdleExpired?: IdleExpiredCallback;
+  /**
    * Opt-in delivery-pipeline trace spans (see `src/trace.ts`). When
    * enabled, the bus emits one trace per sampled publish, threading the
    * message through `bus.publish` → `bus.admission` → `bus.fanout` →
@@ -2011,6 +2064,14 @@ export interface BusStats {
    * readers never need a fallback.
    */
   expiredLeases: number;
+  /**
+   * Total subscriptions that idle-expired and auto-unsubscribed (see
+   * `SubscribeOptions.maxIdleMs`, EB-72). Counts each expiry once,
+   * after the unsubscribe ran and `onIdleExpired` fired. 0 when no idle
+   * window was ever armed — the field is always present, so readers
+   * never need a fallback.
+   */
+  idleExpired: number;
   /**
    * Deliveries currently outstanding — handed to reliable subscribers but
    * not yet acked or nacked — across all subscriptions.
@@ -2660,6 +2721,15 @@ interface Subscriber {
    * Absent when the cap is disabled for this subscriber.
    */
   maxInflight?: MaxInflightState;
+  /**
+   * Idle-reclamation activity mode (see `SubscribeOptions.maxIdleMs` /
+   * `idleActivity`, EB-72). Present exactly when the subscriber opted
+   * into an idle window — `recordIdleActivity` gates on it, so
+   * non-opt-in subscribers pay a single property check per delivery, no
+   * allocation and no map lookup. The live timer itself lives in the
+   * bus's `IdleReclaimer`, keyed by subscription id.
+   */
+  idleActivity?: IdleActivityMode;
   /**
    * Sliding-window delivery rate limit state (see
    * `SubscribeOptions.rateLimit`). Absent when the limit is disabled for
@@ -5268,6 +5338,19 @@ export class EventBus {
   /** Observer hook for expired leases (`EventBusOptions.onLeaseExpired`). */
   private readonly onLeaseExpired?: LeaseExpiredCallback;
   /**
+   * Idle windows that expired and auto-unsubscribed their subscriber
+   * (see `src/idle.ts`, EB-72). Surfaced as `getStats().idleExpired`.
+   */
+  private totalIdleExpired = 0;
+  /**
+   * Active idle-reclamation timers (see `src/idle.ts`, EB-72), keyed by
+   * subscription id. Armed at subscribe time, re-armed on qualifying
+   * activity, cleared from every unsubscribe path.
+   */
+  private readonly idleReclaimer: IdleReclaimer;
+  /** Observer hook for idle-expired subscriptions (`EventBusOptions.onIdleExpired`). */
+  private readonly onIdleExpired?: IdleExpiredCallback;
+  /**
    * Messages handed to subscriber handlers (global total). Counts each
    * handler invocation, so at-least-once redeliveries count again; a
    * handler that throws still received the message, and still counts.
@@ -5891,6 +5974,12 @@ export class EventBus {
     }
     this.onLeaseExpired = onLeaseExpired;
     this.leases = new LeaseManager((expired) => this.handleLeaseExpiry(expired));
+    const onIdleExpired = options?.onIdleExpired;
+    if (onIdleExpired !== undefined && typeof onIdleExpired !== 'function') {
+      throw new RangeError('onIdleExpired must be a function');
+    }
+    this.onIdleExpired = onIdleExpired;
+    this.idleReclaimer = new IdleReclaimer((expired) => this.handleIdleExpiry(expired));
     const allowedLatenessMs = options?.allowedLatenessMs ?? 0;
     validateAllowedLatenessMs(allowedLatenessMs, 'EventBus');
     this.allowedLatenessMs = allowedLatenessMs;
@@ -7494,6 +7583,26 @@ export class EventBus {
     if (leaseMs !== undefined && (!Number.isInteger(leaseMs) || leaseMs <= 0)) {
       throw new RangeError('subscribe: leaseMs must be a positive integer number of milliseconds');
     }
+    // Idle subscriber auto-reclamation (EB-72): validated before
+    // anything registers, so a throw leaves no half-registered
+    // subscriber behind.
+    const maxIdleMs = opts?.maxIdleMs;
+    if (maxIdleMs !== undefined && (!Number.isInteger(maxIdleMs) || maxIdleMs <= 0)) {
+      throw new RangeError('subscribe: maxIdleMs must be a positive integer number of milliseconds');
+    }
+    const idleActivity = opts?.idleActivity;
+    if (maxIdleMs === undefined && idleActivity !== undefined) {
+      throw new RangeError('subscribe: idleActivity requires maxIdleMs');
+    }
+    if (
+      idleActivity !== undefined &&
+      idleActivity !== 'deliver' &&
+      idleActivity !== 'ack' &&
+      idleActivity !== 'any'
+    ) {
+      throw new RangeError("subscribe: idleActivity must be 'deliver', 'ack' or 'any'");
+    }
+    const idleMode: IdleActivityMode = idleActivity ?? 'any';
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
     const onThrottled = opts?.onThrottled;
@@ -7638,6 +7747,10 @@ export class EventBus {
       onThrottled,
       deliveryShaping,
       maxInflight: maxInflight == null ? undefined : { max: maxInflight, inFlight: 0 },
+      // Idle auto-reclamation (EB-72): the mode marker doubles as the
+      // opt-in flag — recordIdleActivity gates on it, so non-opt-in
+      // subscribers pay a single property check per delivery.
+      idleActivity: maxIdleMs === undefined ? undefined : idleMode,
       rateLimit,
       latency: deliveryLatency,
       ackLatency,
@@ -7722,6 +7835,9 @@ export class EventBus {
         // A lease must not outlive its subscriber: no phantom expiry
         // after unsubscribe (EB-69).
         this.leases.clear(id);
+        // An idle window must not outlive its subscriber either: no
+        // phantom expiry after unsubscribe (EB-72).
+        this.idleReclaimer.clear(id);
         // Pending timers must not outlive the subscriber: no phantom
         // resume or re-flush after unsubscribe.
         const health = subscriber.health;
@@ -7763,6 +7879,16 @@ export class EventBus {
     if (leaseMs !== undefined) {
       this.leases.arm(id, leaseMs, topicPattern, subscription.unsubscribe);
     }
+    // Idle auto-reclamation (EB-72): opt-in only. Armed after the
+    // subscription object exists so expiry can unsubscribe through the
+    // outermost wrapper (see `subscribeReliable` / `subscribeToGroup`,
+    // which adopt their outer closure below) — exactly like the lease
+    // path. A subscriber may hold both a lease and an idle window; they
+    // are independent opt-ins and whichever fires first wins, the other
+    // being cleared by the shared unsubscribe path.
+    if (maxIdleMs !== undefined) {
+      this.idleReclaimer.arm(id, maxIdleMs, idleMode, topicPattern, subscription.unsubscribe);
+    }
     return subscription;
   }
 
@@ -7779,6 +7905,50 @@ export class EventBus {
       throw new RangeError('renewLease: ms must be a positive integer number of milliseconds');
     }
     return this.leases.renew(subId, ms);
+  }
+
+  /**
+   * Records one qualifying activity event for idle reclamation (EB-72):
+   * `'deliver'` from a successful handler invocation, `'ack'` from the
+   * ack tracker's ack-settle hook. Zero overhead for non-opt-in
+   * subscribers — a single property check, no allocation, no map
+   * lookup. Events that do not match the subscriber's configured
+   * `idleActivity` mode are ignored here; the rest re-arm the idle
+   * window from the activity moment.
+   */
+  private recordIdleActivity(subscriber: Subscriber, kind: 'deliver' | 'ack'): void {
+    const mode = subscriber.idleActivity;
+    if (mode === undefined || (mode !== 'any' && mode !== kind)) return;
+    this.idleReclaimer.activity(subscriber.id);
+  }
+
+  /**
+   * Runs once per idle expiry, after `IdleReclaimer` disarmed the entry
+   * and ran the subscription's outermost unsubscribe closure. Counts the
+   * expiry, then fires `EventBusOptions.onIdleExpired` (error-isolated:
+   * a throwing hook is swallowed so a broken observer can never disturb
+   * the unsubscribe path, the same rule as `onLeaseExpired`).
+   */
+  private handleIdleExpiry(expired: {
+    subId: string;
+    maxIdleMs: number;
+    pattern: string;
+    idleActivity: IdleActivityMode;
+  }): void {
+    this.totalIdleExpired += 1;
+    const onIdleExpired = this.onIdleExpired;
+    if (onIdleExpired === undefined) return;
+    const event: IdleExpiredEvent = {
+      subscriberId: expired.subId,
+      pattern: expired.pattern,
+      maxIdleMs: expired.maxIdleMs,
+      idleActivity: expired.idleActivity,
+    };
+    try {
+      onIdleExpired(event);
+    } catch {
+      // Swallowed: a user callback must never break the bus.
+    }
   }
 
   /**
@@ -7891,6 +8061,14 @@ export class EventBus {
         cap.inFlight = Math.max(0, cap.inFlight - 1);
         this.scheduleFlush();
       },
+      // EB-72: ack-settle activity for idle reclamation. Allocated only
+      // when the subscriber opted into maxIdleMs — otherwise the tracker
+      // behaves exactly as before, zero overhead.
+      ...(opts?.maxIdleMs === undefined
+        ? {}
+        : {
+            onAck: () => this.recordIdleActivity(subscriber, 'ack'),
+          }),
       onRedeliver: (msg, reason) => {
         // EB-45: the outstanding delivery's `bus.ack` span never
         // completes — abandon it. The requeue below emits a fresh
@@ -7980,6 +8158,11 @@ export class EventBus {
         const deliveries = msgOrBatch.map((m) => trackDelivery(m));
         if (dlq == null) {
           batchHandler(deliveries);
+          // EB-72: the batch handler returned without throwing — idle
+          // activity. The drain-level hooks skip reliable subscribers
+          // (their wrapper can swallow throws via the DLQ nack path), so
+          // this is the single recording point for reliable batches.
+          this.recordIdleActivity(subscriber, 'deliver');
           return;
         }
         // With a DLQ configured, a synchronously throwing batch handler
@@ -7988,6 +8171,9 @@ export class EventBus {
         // the batch analogue of the single-message nack path below.
         try {
           batchHandler(deliveries);
+          // A nacked batch is a failed delivery, not activity — only the
+          // clean return counts.
+          this.recordIdleActivity(subscriber, 'deliver');
         } catch (err) {
           const message = thrownErrorMessage(err);
           for (const m of msgOrBatch) lastFailure.set(m, message);
@@ -8000,6 +8186,9 @@ export class EventBus {
       const delivery = trackDelivery(msg);
       if (dlq == null) {
         singleHandler(delivery);
+        // EB-72: the handler returned without throwing — idle activity
+        // (see the batch path above for why this lives in the wrapper).
+        this.recordIdleActivity(subscriber, 'deliver');
         return;
       }
       // With a DLQ configured, a synchronously throwing handler is an
@@ -8011,6 +8200,9 @@ export class EventBus {
       // message in the DLQ instead of crashing the bus.
       try {
         singleHandler(delivery);
+        // A nacked delivery is a failed delivery, not activity — only
+        // the clean return counts.
+        this.recordIdleActivity(subscriber, 'deliver');
       } catch (err) {
         lastFailure.set(msg, thrownErrorMessage(err));
         delivery.nack();
@@ -8027,6 +8219,8 @@ export class EventBus {
     // Lease expiry must run the outermost teardown (ack-tracker clear
     // above); the inner closure alone would skip it (EB-69).
     this.leases.adoptUnsubscribe(sub.id, reliableSubscription.unsubscribe);
+    // Idle expiry must run the outermost teardown too (EB-72).
+    this.idleReclaimer.adoptUnsubscribe(sub.id, reliableSubscription.unsubscribe);
     return reliableSubscription;
   }
 
@@ -8197,6 +8391,10 @@ export class EventBus {
     // Lease expiry must run the outermost teardown (group leave above);
     // the inner closure alone would leak the roster entry (EB-69).
     this.leases.adoptUnsubscribe(sub.id, groupSubscription.unsubscribe);
+    // Idle expiry must run the outermost teardown too, so a group
+    // member that goes idle leaves the competing set and triggers the
+    // normal rebalance (EB-72).
+    this.idleReclaimer.adoptUnsubscribe(sub.id, groupSubscription.unsubscribe);
     return groupSubscription;
   }
 
@@ -12670,6 +12868,7 @@ export class EventBus {
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
       expiredLeases: this.totalExpiredLeases,
+      idleExpired: this.totalIdleExpired,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       compositeSubscriptions: this.compositeSubscriptionCount,
@@ -13233,14 +13432,21 @@ export class EventBus {
    * throwing handler's message.
    */
   private invokeShadowHandler(subscriber: Subscriber, msg: BusMessage): void {
+    let delivered = false;
     this.deliverTraced(subscriber, msg, () => {
       try {
         subscriber.handler(msg);
+        delivered = true;
       } catch {
         // Swallowed: shadow validation code must never disturb
         // production delivery or the flush loop.
       }
     });
+    // EB-72: a mirror copy handed to the shadow handler without a throw
+    // is idle activity too — a shadow that keeps receiving mirrors is
+    // not idle. (Shadow subscriptions can never be reliable, so no
+    // wrapper carve-out is needed here.)
+    if (delivered) this.recordIdleActivity(subscriber, 'deliver');
   }
 
   /**
@@ -13322,15 +13528,25 @@ export class EventBus {
           // released when the invocation settles (see
           // invokeWithInflightSlot).
           this.invokeWithInflightSlot(subscriber, (): unknown => {
+            let result: unknown;
             if (invocationSlo == null) {
-              return this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+              result = this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+            } else {
+              const processingStartedAtMs = this.now();
+              try {
+                result = this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+              } finally {
+                this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
+              }
             }
-            const processingStartedAtMs = this.now();
-            try {
-              return this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
-            } finally {
-              this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
-            }
+            // EB-72: the handler returned without throwing — a successful
+            // delivery counts as idle activity. Not for reliable
+            // subscribers: their at-least-once wrapper can swallow a
+            // throwing handler (the DLQ nack path), so reliable deliveries
+            // record at the user handler's own success point inside the
+            // wrapper instead.
+            if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
+            return result;
           });
         }
       } else {
@@ -13501,11 +13717,15 @@ export class EventBus {
       this.recordLagSample(subscriber, msg, nowMs);
     }
     if (subscriber.health == null) {
-      this.invokeBatchWithProcessingLatency(subscriber, () =>
+      this.invokeBatchWithProcessingLatency(subscriber, () => {
         this.deliverBatchTraced(subscriber, live, () =>
           subscriber.handler(live as unknown as BusMessage),
-        ),
-      );
+        );
+        // EB-72: the batch handler returned without throwing — idle
+        // activity. Reliable batches record inside their at-least-once
+        // wrapper instead (see drainSubscriber).
+        if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
+      });
     } else {
       this.invokeBatchWithProcessingLatency(subscriber, () =>
         this.deliverBatchTraced(subscriber, live, () =>
@@ -13565,6 +13785,9 @@ export class EventBus {
     }
     if (!failed) {
       health.consecutiveFailures = 0;
+      // EB-72: a clean batch-handler return is idle activity (reliable
+      // batches record inside their at-least-once wrapper instead).
+      if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
       return;
     }
     health.consecutiveFailures += 1;
@@ -13767,6 +13990,10 @@ export class EventBus {
     }
     if (!failed) {
       health.consecutiveFailures = 0;
+      // EB-72: a clean handler return is idle activity (reliable
+      // deliveries record inside their at-least-once wrapper instead —
+      // see drainSubscriber).
+      if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
       return result;
     }
     health.consecutiveFailures += 1;

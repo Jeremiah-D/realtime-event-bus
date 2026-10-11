@@ -406,6 +406,36 @@ library.
   the option through). Non-positive-integer `leaseMs` (including `NaN`)
   throws `RangeError` at subscribe time. Disabled by default — fully
   backward compatible.
+- **Idle subscriber auto-reclamation** (in `src/idle.ts`, opt-in via
+  `subscribe(..., { maxIdleMs, idleActivity })`): the complement of the
+  fixed-duration lease — an inactivity bound instead of a lifetime bound.
+  Every qualifying activity re-arms the window from the activity moment,
+  so a busy subscriber never expires while it is active; when the time
+  since the last qualifying activity exceeds `maxIdleMs`, the bus
+  unsubscribes the subscriber automatically, through the exact same
+  unsubscribe path a manual `unsubscribe()` takes (consumer-group leave
+  handling — including the rebalance a member's departure triggers —,
+  reliable-delivery ack-tracker teardown and queue disposal all run
+  identically; messages still queued at expiry are discarded with the
+  queue, per the subscriber's own `dropPolicy` semantics). Which events
+  count is configurable per subscription via `idleActivity` (default
+  `'any'`): `'deliver'` = the handler returned without throwing
+  (dropped/expired/shed messages never reach the handler, and a throwing
+  handler is a failed delivery — neither counts); `'ack'` = `ack()`
+  settled a live delivery (reliable subscriptions only — `nack()`, ack
+  timeouts and no-op acks do not count). The timer is wall-clock and
+  `unref()`'d, so a pending idle window fires even while the bus is idle
+  and never keeps the process alive; `unsubscribe()` clears it, so no
+  phantom expiry can fire afterwards. `EventBusOptions.onIdleExpired`
+  fires once per expiry (error-isolated — a throwing hook is swallowed)
+  and `getStats().idleExpired` counts expiries. A subscriber may hold
+  both `leaseMs` and `maxIdleMs`: the two are independent opt-ins and
+  whichever fires first wins, the other being cleared by the shared
+  unsubscribe path. Works per member for consumer-group members
+  (`subscribeToGroup` passes the option through). Non-positive-integer
+  `maxIdleMs` (including `NaN`), an `idleActivity` without `maxIdleMs`,
+  or an unknown activity mode throws `RangeError` at subscribe time.
+  Disabled by default — fully backward compatible.
 - **Per-topic publish rate limiting** (in `src/bus.ts`, via
   `setTopicRateLimit(pattern, messagesPerSec, { burst })`): a token bucket
   per concrete topic (refilled from the bus clock, so tests stay
