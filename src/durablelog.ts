@@ -95,6 +95,14 @@ export interface DurableLogRecord {
    * re-registers the same dictionary by re-setting the rule.
    */
   dictId?: string;
+  /**
+   * Causal clock carried by the message (see `PublishOptions.causal`):
+   * `{ source, clock }` — the Lamport timestamp that orders this message
+   * within its source's causal stream. Persisted so replay (live or from
+   * an archived segment) restores the clock and a causal subscriber keeps
+   * happens-before order across restarts.
+   */
+  causal?: { source: string; clock: number };
   /** The published payload, JSON-serialized. */
   payload: unknown;
 }
@@ -185,6 +193,11 @@ interface LogLine {
    * `DurableLogRecord.eventTime`).
    */
   eventTime?: number;
+  /**
+   * Causal clock (see `DurableLogRecord.causal`): the source stream and
+   * Lamport timestamp, present exactly when the publish carried one.
+   */
+  causal?: { source: string; clock: number };
   payload: unknown;
 }
 
@@ -1779,6 +1792,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.dictId !== undefined) line.dictId = record.dictId;
   if (record.messageId !== undefined) line.messageId = record.messageId;
   if (record.eventTime !== undefined) line.eventTime = record.eventTime;
+  if (record.causal !== undefined) line.causal = { source: record.causal.source, clock: record.causal.clock };
   return line;
 }
 
@@ -1876,6 +1890,23 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     if (typeof eventTime === 'number' && Number.isFinite(eventTime) && eventTime >= 0) {
       record.eventTime = eventTime;
     }
+  }
+  if (o['causal'] !== undefined) {
+    // The causal clock is structural ordering metadata: a malformed
+    // value makes the line corrupt — replay must never invent or drop a
+    // happens-before edge.
+    const causal = o['causal'] as Record<string, unknown>;
+    if (
+      typeof causal !== 'object' ||
+      causal === null ||
+      typeof causal['source'] !== 'string' ||
+      (causal['source'] as string).length === 0 ||
+      !Number.isInteger(causal['clock']) ||
+      (causal['clock'] as number) < 0
+    ) {
+      return null;
+    }
+    record.causal = { source: causal['source'] as string, clock: causal['clock'] as number };
   }
   // A non-tombstone schedule record must say when it is due.
   if (isScheduleRecord && record.cancelled !== true && record.deliverAt === undefined) return null;

@@ -212,6 +212,22 @@ export interface DeduplicateMessagesOptions {
 }
 
 /**
+ * Tuning for opt-in causal (happens-before) delivery (see
+ * `SubscribeOptions.causal`).
+ */
+export interface CausalSubscribeOptions {
+  /**
+   * Maximum out-of-order messages buffered per causal source while
+   * their dependencies are missing. When a new arrival would exceed
+   * it, the oldest buffered message is dropped (drop-oldest) and the
+   * source's expectation advances past it — the anti-deadlock rule that
+   * keeps the stream moving when a dependency never arrives. Must be a
+   * positive integer. Default 1000.
+   */
+  maxBufferPerSource?: number;
+}
+
+/**
  * Handler for reliable (at-least-once) subscriptions: receives a `Delivery`
  * envelope with `ack()`/`nack()` instead of a bare message.
  */
@@ -610,6 +626,47 @@ export interface SubscribeOptions {
    * `subscribe`. Disabled by default.
    */
   deduplicateMessages?: boolean | DeduplicateMessagesOptions;
+  /**
+   * Opt-in causal (happens-before) delivery. When enabled, the
+   * subscriber receives messages carrying a causal clock (see
+   * `PublishOptions.causal`) in happens-before order per source: a
+   * message is delivered if and only if its clock equals the source's
+   * next expected clock (starting at 0); an early arrival waits in a
+   * per-source reorder buffer — pre-queue, consuming no backpressure
+   * budget, with no filter or throttle evaluated yet — until its
+   * dependencies are admitted, and each admission advances the
+   * expectation and releases buffered successors in clock order. A
+   * regressed clock (below the expectation — a duplicate or a late
+   * arrival from before the subscriber's horizon) is delivered
+   * immediately without moving the expectation backwards, and counted
+   * in `getStats().causalBuffer.regressedMessages`. Messages without a
+   * causal clock bypass the gate entirely: they are delivered directly
+   * and never disturb any source's expectation.
+   *
+   * Composes with per-key publish-order delivery (`PublishOptions.key`):
+   * for a keyed causal message the causal gate runs first — happens-before
+   * order takes precedence over publish (keySeq) order — and an admitted
+   * message then goes through the keyed gate as usual. Keyed messages
+   * without a causal clock keep the exact keyed behavior they had before.
+   *
+   * Every wait terminates: the per-source buffer is bounded
+   * (`maxBufferPerSource`, default 1000) — when a new arrival would
+   * exceed it, the oldest buffered message is dropped (drop-oldest) and
+   * the expectation advances past it, so a dependency that never arrives
+   * cannot wedge the stream (dropped this way are counted in
+   * `getStats().causalBuffer.droppedMessages`). Buffered messages keep
+   * their TTL deadline: one that expires while waiting is dropped as
+   * expired at release — never resurrected — and the stream advances past
+   * it. `getStats().causalBuffer.depth` reports the total buffered
+   * messages across subscribers; `causalBufferDepth(subId)` reads one
+   * subscriber's depth.
+   *
+   * Pass `true` for the defaults, or a `CausalSubscribeOptions` object
+   * to tune the buffer bound. Invalid values throw `RangeError` from
+   * `subscribe`. Disabled by default — without it the subscriber builds
+   * no buffers and tracks no clocks: zero overhead, zero behavior change.
+   */
+  causal?: boolean | CausalSubscribeOptions;
   /**
    * Opt-in subscriber-side batch delivery. When enabled, the drain
    * collects up to `maxSize` queued messages and invokes the handler once
@@ -1852,6 +1909,33 @@ export interface BusStats {
    */
   keyedReorderedMessages: number;
   /**
+   * Causal (happens-before) reorder-buffer state (see
+   * `SubscribeOptions.causal`). Always present — zeros when no
+   * subscriber opted into causal delivery.
+   */
+  causalBuffer: {
+    /**
+     * Messages currently held in per-(subscriber, source) causal
+     * reorder buffers, waiting on their dependencies — the live
+     * happens-before backlog across all causal subscribers.
+     */
+    depth: number;
+    /**
+     * Messages dropped from full causal buffers (drop-oldest
+     * anti-deadlock): a dependency that never arrived could not wedge
+     * the stream, so the oldest wait was abandoned and the expectation
+     * advanced past it.
+     */
+    droppedMessages: number;
+    /**
+     * Messages delivered immediately on clock regression: their clock
+     * was below the source's expectation (a duplicate, or a late arrival
+     * from before the subscriber's horizon), so the gate delivered them
+     * without moving the expectation backwards.
+     */
+    regressedMessages: number;
+  };
+  /**
    * The hottest per-(subscriber, key) ordering streams by current
    * reorder-buffer depth (see `SubscribeOptions.keyHotspot` and
    * `src/keyhotspot.ts`), hottest first — at most `HOT_KEYS_LIMIT` (10)
@@ -1997,6 +2081,49 @@ interface KeyOrderState {
 }
 
 /**
+ * One causal message moving through the per-(subscriber, source)
+ * happens-before gate (see `SubscribeOptions.causal`): either delivered
+ * in clock order or held in the reorder buffer until its dependencies are
+ * admitted. `keyed` carries the message's per-key sequence number when
+ * the publish was also keyed — the causal gate runs first and the keyed
+ * gate second (see `admitCausal`).
+ */
+interface CausalDelivery {
+  msg: BusMessage;
+  expiresAt: number | undefined;
+  rawPayload: unknown;
+  /**
+   * True for durable-log replay: the content filter and handoff-linger
+   * checks already ran in `replayLog`, so admission goes straight to the
+   * queue — replay never burned throttle budget and must not start now.
+   */
+  replay: boolean;
+  keyed?: { key: string; keySeq: number };
+}
+
+/**
+ * Per-subscriber causal (happens-before) delivery state (see
+ * `SubscribeOptions.causal`). Created at subscribe time when the
+ * subscriber opts in — a subscriber without it pays nothing: no buffer,
+ * no clock tracking.
+ *
+ * `expected` is the next clock this subscriber's stream needs per source
+ * (starts at 0 — the producer numbers each source's clocks from 0);
+ * `skipped` holds clocks at or above `expected` that will never be fanned
+ * out to this subscriber (published to non-matching topics, assigned to a
+ * different group member, filtered replay) so the stream advances past
+ * them instead of hanging; `buffers` holds early arrivals (clock >
+ * expected, not skipped) per source until their dependencies are
+ * admitted. Each per-source buffer is bounded by `maxBufferPerSource`.
+ */
+interface CausalGateState {
+  maxBufferPerSource: number;
+  expected: Map<string, number>;
+  skipped: Map<string, Set<number>>;
+  buffers: Map<string, Map<number, CausalDelivery>>;
+}
+
+/**
  * Key for one per-(subscriber, key) ordering stream, namespaced by
  * sequence epoch: the node's own publish stream ('') and each hub's
  * forwarded stream (`hub:<hubEpoch>`) order independently, so a keyed
@@ -2128,6 +2255,13 @@ interface Subscriber {
    * keys actually fanned out to this subscriber.
    */
   keyOrder?: Map<string, KeyOrderState>;
+  /**
+   * Per-subscriber causal (happens-before) delivery state (see
+   * `SubscribeOptions.causal`). Present only when the subscriber opted
+   * in — without it the subscriber builds no buffers and tracks no
+   * clocks: zero overhead, zero behavior change.
+   */
+  causal?: CausalGateState;
   /**
    * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
    * Absent when the probe is disabled for this subscriber.
@@ -2300,6 +2434,21 @@ function validateMessageKey(key: string | undefined, caller: string): void {
   if (key === undefined) return;
   if (typeof key !== 'string' || key.length === 0) {
     throw new RangeError(`${caller}: key must be a non-empty string`);
+  }
+}
+
+/** Fail-fast validation for `PublishOptions.causal`. */
+function validateCausal(causal: { source?: string; clock: number } | undefined, caller: string): void {
+  if (causal === undefined) return;
+  if (typeof causal !== 'object' || causal === null) {
+    throw new RangeError(`${caller}: causal must be an object`);
+  }
+  const { source, clock } = causal;
+  if (source !== undefined && (typeof source !== 'string' || source.length === 0)) {
+    throw new RangeError(`${caller}: causal.source must be a non-empty string`);
+  }
+  if (!Number.isInteger(clock) || clock < 0) {
+    throw new RangeError(`${caller}: causal.clock must be a non-negative integer`);
   }
 }
 
@@ -2638,6 +2787,36 @@ function resolveRateLimitOptions(opt: RateLimitOptions | undefined): RateWindowS
     limiter: new SlidingWindowLimiter(maxMessages, perWindowMs),
     rateLimiting: false,
     timer: undefined,
+  };
+}
+
+/**
+ * Resolves `SubscribeOptions.causal` into the subscriber's gate state.
+ * `undefined`/`false` disables the gate (no buffers, no clock tracking —
+ * zero overhead); `true` takes the defaults; an object tunes the
+ * per-source buffer bound. Anything else throws `RangeError`.
+ */
+function resolveCausalOptions(
+  causal: boolean | CausalSubscribeOptions | undefined,
+): CausalGateState | undefined {
+  if (causal === undefined || causal === false) return undefined;
+  let maxBufferPerSource = 1000;
+  if (causal !== true) {
+    if (typeof causal !== 'object' || causal === null) {
+      throw new RangeError('subscribe: causal must be a boolean or a CausalSubscribeOptions object');
+    }
+    if (causal.maxBufferPerSource !== undefined) {
+      if (!Number.isInteger(causal.maxBufferPerSource) || causal.maxBufferPerSource < 1) {
+        throw new RangeError('subscribe: causal.maxBufferPerSource must be a positive integer');
+      }
+      maxBufferPerSource = causal.maxBufferPerSource;
+    }
+  }
+  return {
+    maxBufferPerSource,
+    expected: new Map(),
+    skipped: new Map(),
+    buffers: new Map(),
   };
 }
 
@@ -3285,6 +3464,24 @@ export interface PublishOptions {
    * compaction effect (ordering always applies).
    */
   key?: string;
+  /**
+   * Causal clock for happens-before delivery (see
+   * `SubscribeOptions.causal`). `clock` is the message's Lamport
+   * timestamp within its source's causal stream: the producer numbers
+   * each source's messages with monotonically increasing integers
+   * starting at 0, and a causal subscriber delivers them in that order —
+   * a message whose dependencies have not arrived yet waits in the
+   * subscriber's reorder buffer instead of being delivered out of order.
+   * `source` names the causal stream and defaults to the (alias-resolved)
+   * topic; use an explicit source to order messages across topics (a
+   * saga's steps, a multi-topic transaction). `clock` must be an integer
+   * `>= 0`; anything else throws `RangeError` from `publish`. The clock
+   * rides the durable-log record, so replay restores happens-before
+   * order across restarts. Subscribers that did not opt into
+   * `SubscribeOptions.causal` receive the message normally — the clock
+   * is inert for them.
+   */
+  causal?: { source?: string; clock: number };
   /**
    * Upstream W3C `traceparent` header value (`00-<32hex trace
    * id>-<16hex span id>-<flags>`) for delivery tracing (see
@@ -4033,6 +4230,7 @@ interface ReplayRecord {
   dictId?: string;
   messageId?: string;
   eventTime?: number;
+  causal?: { source: string; clock: number };
 }
 
 /**
@@ -4137,6 +4335,18 @@ export class EventBus {
    * publishes). Monotonic.
    */
   private totalKeyedReordered = 0;
+  /**
+   * Causal messages dropped from full per-source reorder buffers
+   * (drop-oldest anti-deadlock) — the observable count of causal waits
+   * that were abandoned instead of hanging. Monotonic.
+   */
+  private totalCausalDropped = 0;
+  /**
+   * Causal messages delivered immediately on clock regression (clock
+   * below the source's expectation — a duplicate or a late arrival from
+   * before the subscriber's horizon). Monotonic.
+   */
+  private totalCausalRegressed = 0;
   /**
    * Per-topic sliding-window publish rate table (see `src/rates.ts`).
    * Sampled once per accepted publish in `fanOut` — after the admission
@@ -6069,6 +6279,9 @@ export class EventBus {
     const keyHotspot = resolveKeyHotspotOptions(opts?.keyHotspot);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const causal = resolveCausalOptions(opts?.causal);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -6152,6 +6365,7 @@ export class EventBus {
       latencySlo,
       lag: lagMonitor,
       keyHotspot,
+      causal,
       batch,
       health:
         healthProbe == null
@@ -7808,6 +8022,23 @@ export class EventBus {
         order.expected = rec.keySeq;
       }
     }
+    // Causal-ordering replay baseline: seed each replayed source's
+    // expectation at its smallest replayed clock, so replayed messages
+    // are released in clock order even when the log's at-order differs
+    // from clock order. Records without a clock — logs written before
+    // causal clocks, or non-causal messages — replay exactly as before.
+    // Only seeds sources the subscriber has no live state for: a
+    // resubscribing consumer's live expectation stays authoritative.
+    const causalGate = subscriber.causal;
+    if (causalGate !== undefined) {
+      for (const rec of records) {
+        if (rec.causal === undefined) continue;
+        const prev = causalGate.expected.get(rec.causal.source);
+        if (prev === undefined || rec.causal.clock < prev) {
+          causalGate.expected.set(rec.causal.source, rec.causal.clock);
+        }
+      }
+    }
     const filter = subscriber.filter;
     for (const rec of records) {
       // A subscriber content filter applies to replay exactly as it does
@@ -7830,6 +8061,12 @@ export class EventBus {
           if (rec.key !== undefined && rec.keySeq !== undefined) {
             this.skipKeySeq(subscriber, rec.key, rec.keySeq);
           }
+          // Same for a filtered causal message: its clock will never be
+          // fanned out to this subscriber, so the source's expectation
+          // advances past it instead of hanging on a missing dependency.
+          if (rec.causal !== undefined) {
+            this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+          }
           continue;
         }
       }
@@ -7847,6 +8084,12 @@ export class EventBus {
         this.advanceBaseline(subscriber, rec.topic, rec.seq);
         if (rec.key !== undefined && rec.keySeq !== undefined) {
           this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+        }
+        // A lingered causal message replays after the window expires: the
+        // skip advances the expectation now, and the later replay arrives
+        // as a (harmless, immediately delivered) regression.
+        if (rec.causal !== undefined) {
+          this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
         }
         continue;
       }
@@ -7880,7 +8123,26 @@ export class EventBus {
         if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
       }
       if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
-      if (rec.key !== undefined && rec.keySeq !== undefined) {
+      if (rec.causal !== undefined && subscriber.causal !== undefined) {
+        // Causal replay: the filter and linger checks above already ran,
+        // so the gate admits straight into the queue — replay never burned
+        // throttle budget and must not start now. Keyed causal messages
+        // run the keyed gate second, exactly like the live path.
+        this.deliverCausal(
+          subscriber,
+          {
+            msg,
+            expiresAt: rec.expiresAt,
+            rawPayload: rec.payload,
+            replay: true,
+            ...(rec.key !== undefined && rec.keySeq !== undefined
+              ? { keyed: { key: rec.key, keySeq: rec.keySeq } }
+              : {}),
+          },
+          rec.causal.source,
+          rec.causal.clock,
+        );
+      } else if (rec.key !== undefined && rec.keySeq !== undefined) {
         // Keyed replay: the filter and linger checks above already ran, so
         // the ordering gate admits straight into the queue — replay never
         // burned throttle budget and must not start now.
@@ -7912,6 +8174,7 @@ export class EventBus {
     validateMessageKey(opts?.key, 'publish');
     validateTraceparent(opts?.traceparent, 'publish');
     validateEventTime(opts?.eventTime, 'publish');
+    validateCausal(opts?.causal, 'publish');
     // Multi-tenant namespace (EB-52): resolve to the concrete
     // `<namespace>/<topic>` before admission — the full pipeline below
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
@@ -7931,6 +8194,7 @@ export class EventBus {
       false,
       false,
       opts?.eventTime,
+      opts?.causal,
     );
     this.scheduleFlush();
     return accepted;
@@ -7988,6 +8252,7 @@ export class EventBus {
     validateMessageKey(opts?.key, 'publishIdempotent');
     validateTraceparent(opts?.traceparent, 'publishIdempotent');
     validateEventTime(opts?.eventTime, 'publishIdempotent');
+    validateCausal(opts?.causal, 'publishIdempotent');
     const messageId = opts?.messageId;
     // Multi-tenant namespace (EB-52): the `(topic, messageId)` dedup
     // identity below is scoped to the concrete `<namespace>/<topic>`, so
@@ -8058,6 +8323,7 @@ export class EventBus {
       false,
       false,
       opts?.eventTime,
+      opts?.causal,
     );
     this.scheduleFlush();
     if (admitted) {
@@ -9227,6 +9493,13 @@ export class EventBus {
    * `PublishOptions.key`): when present, delivery goes through the
    * per-(subscriber, key) ordering gate (`deliverKeyed`) instead of
    * straight to the queue.
+   *
+   * `causal` carries the message's causal clock (see
+   * `PublishOptions.causal`): when the subscriber opted into
+   * `SubscribeOptions.causal`, delivery goes through the per-(subscriber,
+   * source) happens-before gate (`deliverCausal`) first — causal order
+   * takes precedence over keyed publish order — and an admitted message
+   * then continues through the keyed gate when keyed.
    */
   private deliverToSubscriber(
     subscriber: Subscriber,
@@ -9234,7 +9507,16 @@ export class EventBus {
     expiresAt: number | undefined,
     rawPayload: unknown,
     keyed?: { key: string; keySeq: number },
+    causal?: { source: string; clock: number },
   ): boolean {
+    if (causal !== undefined && subscriber.causal !== undefined) {
+      return this.deliverCausal(
+        subscriber,
+        { msg, expiresAt, rawPayload, replay: false, keyed },
+        causal.source,
+        causal.clock,
+      );
+    }
     if (keyed !== undefined) {
       return this.deliverKeyed(
         subscriber,
@@ -9466,6 +9748,181 @@ export class EventBus {
   }
 
   /**
+   * Per-(subscriber, source) happens-before delivery gate (see
+   * `SubscribeOptions.causal` and `PublishOptions.causal`). A message is
+   * deliverable if and only if its clock equals the source's next
+   * expected clock (starting at 0 — producers number each source's
+   * clocks from 0); an early arrival waits in the per-source reorder
+   * buffer (pre-queue: no backpressure budget consumed, no filter or
+   * throttle evaluated yet) until its dependencies are admitted.
+   *
+   * Clock regression (clock below the expectation — a duplicate, or a
+   * late arrival from before the subscriber's horizon) is delivered
+   * immediately without moving the expectation backwards, and counted.
+   *
+   * Every wait terminates: each per-source buffer is bounded by
+   * `maxBufferPerSource` — when a new arrival would exceed it, the
+   * oldest buffered message is dropped (drop-oldest) and the expectation
+   * advances past it, so a dependency that never arrives cannot wedge
+   * the stream. Clocks that will never be fanned out to this subscriber
+   * are marked skipped (`skipCausalClock`) — published to non-matching
+   * topics, assigned to a different group member, filtered replay — and
+   * the expectation cascades past them instead of hanging.
+   */
+  private deliverCausal(
+    subscriber: Subscriber,
+    delivery: CausalDelivery,
+    source: string,
+    clock: number,
+  ): boolean {
+    // The caller (`deliverToSubscriber`) guarantees the gate exists.
+    const gate = subscriber.causal as CausalGateState;
+    const skipped = gate.skipped.get(source);
+    if (skipped !== undefined && skipped.delete(clock)) {
+      // Defensive: a clock marked as never-arriving showed up anyway —
+      // deliver it rather than hang the source on a stale mark.
+      if (skipped.size === 0) gate.skipped.delete(source);
+      this.admitCausal(subscriber, delivery);
+      return true;
+    }
+    const expected = gate.expected.get(source) ?? 0;
+    if (clock < expected) {
+      // Clock regression: the dependency already passed — deliver
+      // immediately, never move the expectation backwards.
+      this.totalCausalRegressed += 1;
+      this.admitCausal(subscriber, delivery);
+      return true;
+    }
+    if (clock > expected) {
+      let buffer = gate.buffers.get(source);
+      if (buffer === undefined) {
+        buffer = new Map();
+        gate.buffers.set(source, buffer);
+      }
+      buffer.set(clock, delivery);
+      // Bounded buffer (anti-deadlock): drop the oldest buffered clock
+      // and advance the expectation past it, releasing whatever the
+      // advance unblocks. At most one drop per arrival — the buffer was
+      // within budget before this insert — but the loop is defensive.
+      let nextExpected = expected;
+      while (buffer.size > gate.maxBufferPerSource) {
+        let oldest = Infinity;
+        for (const c of buffer.keys()) {
+          if (c < oldest) oldest = c;
+        }
+        buffer.delete(oldest);
+        this.totalCausalDropped += 1;
+        nextExpected = oldest + 1;
+      }
+      gate.expected.set(source, nextExpected);
+      this.cascadeCausal(subscriber, gate, source);
+      // Admitted into the ordering layer — it will reach the queue once
+      // its dependencies are admitted, so it counts as accepted for the
+      // fan-out width, exactly like a queued message.
+      return true;
+    }
+    this.admitCausal(subscriber, delivery);
+    gate.expected.set(source, expected + 1);
+    this.cascadeCausal(subscriber, gate, source);
+    return true;
+  }
+
+  /**
+   * Admits one causal delivery whose turn has come: keyed messages run
+   * the per-(subscriber, key) ordering gate next — happens-before order
+   * takes precedence over publish (keySeq) order — and everything else
+   * goes through the unordered path (live) or straight to the queue
+   * (replay: the filter and linger checks already ran in `replayLog`,
+   * and replay never burned throttle budget).
+   */
+  private admitCausal(subscriber: Subscriber, delivery: CausalDelivery): boolean {
+    const keyed = delivery.keyed;
+    if (keyed !== undefined) {
+      return this.deliverKeyed(
+        subscriber,
+        { msg: delivery.msg, expiresAt: delivery.expiresAt, rawPayload: delivery.rawPayload, replay: delivery.replay },
+        keyed.key,
+        keyed.keySeq,
+      );
+    }
+    if (delivery.replay) {
+      return this.enqueueMessage(subscriber, delivery.msg, delivery.expiresAt) === 'accepted';
+    }
+    return this.deliverUnkeyed(subscriber, delivery.msg, delivery.expiresAt, delivery.rawPayload);
+  }
+
+  /**
+   * Advances a source's expectation past everything now deliverable:
+   * contiguous skipped clocks are dropped, then contiguous buffered
+   * messages are admitted in clock order. Each iteration strictly moves
+   * `expected` forward, so the loop always terminates. A buffered message
+   * whose TTL expired while waiting is dropped as expired at release —
+   * never resurrected — and the stream advances past it instead of
+   * deadlocking on a dependency that can never arrive in time.
+   */
+  private cascadeCausal(subscriber: Subscriber, gate: CausalGateState, source: string): void {
+    const buffer = gate.buffers.get(source);
+    const skipped = gate.skipped.get(source);
+    let expected = gate.expected.get(source) ?? 0;
+    if (buffer === undefined || buffer.size === 0) {
+      // No buffer: still advance past contiguous skips, or a skipped
+      // clock below the next arrival would wedge the stream.
+      if (skipped !== undefined) {
+        while (skipped.delete(expected)) expected += 1;
+        if (skipped.size === 0) gate.skipped.delete(source);
+        gate.expected.set(source, expected);
+      }
+      return;
+    }
+    const nowMs = this.now();
+    for (;;) {
+      if (skipped !== undefined && skipped.delete(expected)) {
+        expected += 1;
+        continue;
+      }
+      const next = buffer.get(expected);
+      if (next === undefined) break;
+      buffer.delete(expected);
+      if (next.expiresAt !== undefined && nowMs >= next.expiresAt) {
+        this.recordExpired(next.msg.topic);
+      } else {
+        this.admitCausal(subscriber, next);
+      }
+      expected += 1;
+    }
+    gate.expected.set(source, expected);
+    if (skipped !== undefined && skipped.size === 0) gate.skipped.delete(source);
+    if (buffer.size === 0) gate.buffers.delete(source);
+  }
+
+  /**
+   * Marks one causal clock as never-to-be-fanned-out for this subscriber
+   * and cascades the source's expectation past it. Called when a causal
+   * message is published to a topic the subscriber's pattern does not
+   * match, when it is assigned to a different group member, and when a
+   * replayed causal message is filtered out — otherwise a subscriber
+   * buffering a later clock for the same source would wait for a
+   * dependency it will never see.
+   *
+   * No gate (the subscriber did not opt into `SubscribeOptions.causal`)
+   * needs no mark: non-causal subscribers never consult clocks.
+   */
+  private skipCausalClock(subscriber: Subscriber, source: string, clock: number): void {
+    const gate = subscriber.causal;
+    if (gate === undefined) return;
+    const expected = gate.expected.get(source) ?? 0;
+    if (clock < expected) return;
+    let skipped = gate.skipped.get(source);
+    if (skipped === undefined) {
+      skipped = new Set();
+      gate.skipped.set(source, skipped);
+    }
+    if (skipped.has(clock)) return;
+    skipped.add(clock);
+    this.cascadeCausal(subscriber, gate, source);
+  }
+
+  /**
    * Advances a subscriber's per-topic gap baseline over a deliberately
    * skipped message (content filter, handoff linger): the skip must not
    * churn backpressure or count as a sequence gap. Epoch-aware like
@@ -9572,6 +10029,7 @@ export class EventBus {
     fromBridge = false,
     diagnostic = false,
     eventTime?: number,
+    causal?: { source?: string; clock: number },
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -9595,6 +10053,11 @@ export class EventBus {
       return { matched: 0, accepted: 0, admitted: false };
     }
     topic = aliasResolution.topic;
+    // Causal clock (see `PublishOptions.causal`): validated by the
+    // publishing entry point; the source defaults to the resolved topic,
+    // so alias resolution keeps the stream identity stable.
+    const causalStamp =
+      causal === undefined ? undefined : { source: causal.source ?? topic, clock: causal.clock };
     // Publish-side schema validation runs before admission: a rejected
     // payload never becomes a message — no sequence number is consumed
     // (subscribers see no gap), the durable log never sees it, and it
@@ -9845,6 +10308,10 @@ export class EventBus {
       // watermark itself is not persisted — a restarted bus rebuilds it
       // from new publishes.
       ...(eventTime === undefined ? {} : { eventTime }),
+      // The causal clock rides the log record so replay restores it —
+      // a causal subscriber keeps happens-before order across restarts
+      // and archived-segment reads.
+      ...(causalStamp === undefined ? {} : { causal: causalStamp }),
     });
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the
@@ -9876,7 +10343,7 @@ export class EventBus {
     // regex stays the final authority, and the no-miss invariant in
     // `candidateIds` keeps matching semantics identical to the old full
     // scan. Iteration order (insertion order) is unchanged.
-    const { matched, accepted } = this.deliverMatched(msg, expiresAt, payload, keyed);
+    const { matched, accepted } = this.deliverMatched(msg, expiresAt, payload, keyed, causalStamp);
     stats.subscriberCount = matched;
     if (openTrace !== undefined) {
       // Spans emit in completion order — fanout, then the publish root —
@@ -9993,6 +10460,7 @@ export class EventBus {
     expiresAt: number | undefined,
     rawPayload: unknown,
     keyed: { key: string; keySeq: number } | undefined,
+    causal?: { source: string; clock: number },
   ): { matched: number; accepted: number } {
     const topic = msg.topic;
     const epoch = msg.epoch ?? '';
@@ -10033,6 +10501,10 @@ export class EventBus {
         // keyed message advances the subscriber's per-key baseline past
         // its keySeq, exactly like the matcher-tested non-match below.
         if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq, epoch);
+        // A causal message on a topic this subscriber never sees will
+        // never arrive: advance its per-source expectation past the clock
+        // the same way, or a buffered later clock would wait forever.
+        if (causal !== undefined) this.skipCausalClock(subscriber, causal.source, causal.clock);
         continue;
       }
       if (!this.topicMatchesWithAliases(subscriber.matcher, topic, effectiveTopic)) {
@@ -10041,11 +10513,15 @@ export class EventBus {
         // subscriber buffering a later keySeq for the same key would wait
         // for a predecessor that will never be fanned out to it.
         if (keyed !== undefined) this.skipKeySeq(subscriber, keyed.key, keyed.keySeq, epoch);
+        // Same for a causal message: its clock will never be fanned out
+        // to this subscriber, so the source's expectation advances past
+        // it instead of hanging on a dependency that cannot arrive.
+        if (causal !== undefined) this.skipCausalClock(subscriber, causal.source, causal.clock);
         continue;
       }
       if (subscriber.groupId == null) {
         matched += 1;
-        if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed)) accepted += 1;
+        if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed, causal)) accepted += 1;
         continue;
       }
       const key = EventBus.groupKey(subscriber.groupId, subscriber.pattern);
@@ -10074,7 +10550,17 @@ export class EventBus {
             if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
           }
         }
-        if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed)) accepted += 1;
+        // A causal message assigned to one member will never be fanned
+        // out to the others: their per-source expectations advance past
+        // its clock, exactly like the keyed baseline above — otherwise a
+        // member buffering a later clock for the same source would wait
+        // for a dependency assigned to a different member.
+        if (causal !== undefined) {
+          for (const member of hit.members) {
+            if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
+          }
+        }
+        if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal)) accepted += 1;
         this.recordPartitionOffset(key, partition, topic, msg.seq);
         this.recordGroupOffset(hit.groupId, topic, msg.seq);
         continue;
@@ -10092,7 +10578,14 @@ export class EventBus {
           if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
         }
       }
-      if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed)) accepted += 1;
+      // Same for causal clocks: per member, each member observes a
+      // causally ordered subsequence of the source's stream.
+      if (causal !== undefined) {
+        for (const member of hit.members) {
+          if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
+        }
+      }
+      if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal)) accepted += 1;
       this.recordGroupOffset(hit.groupId, topic, msg.seq);
     }
     return { matched, accepted };
@@ -10118,11 +10611,16 @@ export class EventBus {
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const hotKeys: HotKeyStat[] = [];
+    let causalBufferDepth = 0;
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
+      const causalGate = subscriber.causal;
+      if (causalGate !== undefined) {
+        for (const buffer of causalGate.buffers.values()) causalBufferDepth += buffer.size;
+      }
       const rateLimit = subscriber.rateLimit;
       if (rateLimit != null) {
         rateLimitedWaiting.push({
@@ -10293,6 +10791,11 @@ export class EventBus {
       lag,
       laggingSubscribers,
       keyedReorderedMessages: this.totalKeyedReordered,
+      causalBuffer: {
+        depth: causalBufferDepth,
+        droppedMessages: this.totalCausalDropped,
+        regressedMessages: this.totalCausalRegressed,
+      },
       hotKeys: hottestKeys,
       traceSpans: this.trace?.snapshot() ?? [],
       hotTopics: this.publishRates.hotTopics(ratesNow),
@@ -10401,6 +10904,22 @@ export class EventBus {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     return subscriber.queue.droppedCount;
+  }
+
+  /**
+   * Messages currently held in a subscriber's causal reorder buffers
+   * (see `SubscribeOptions.causal`), waiting on their dependencies —
+   * 0 for subscribers that did not opt into causal delivery. Throws
+   * for an unknown subscriber, like `pendingCount`.
+   */
+  causalBufferDepth(subId: string): number {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const gate = subscriber.causal;
+    if (gate === undefined) return 0;
+    let depth = 0;
+    for (const buffer of gate.buffers.values()) depth += buffer.size;
+    return depth;
   }
 
   /**

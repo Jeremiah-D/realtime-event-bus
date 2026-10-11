@@ -32,6 +32,12 @@
  *   per-(subscriber, key) reorder buffers because an earlier keySeq had not
  *   been fanned out yet — the observable count of per-key publish-order
  *   enforcement (see `PublishOptions.key`).
+ * - `eventbus_causal_buffer_dropped_messages_total`: causal messages
+ *   dropped from full per-source reorder buffers (drop-oldest
+ *   anti-deadlock; see `SubscribeOptions.causal`).
+ * - `eventbus_causal_buffer_regressed_messages_total`: causal messages
+ *   delivered immediately on clock regression (see
+ *   `SubscribeOptions.causal`).
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
  * - `eventbus_topic_late_messages_total{topic}`: messages per topic whose
  *   business event time was older than the topic's event-time watermark
@@ -58,6 +64,9 @@
  *   delivery-side rate shaping.
  * - `eventbus_pending_delayed`: delayed messages scheduled but not yet
  *   due.
+ * - `eventbus_causal_buffer_depth`: messages currently held in
+ *   per-(subscriber, source) causal reorder buffers, waiting on their
+ *   dependencies.
  * - `eventbus_topic_subscribers{topic}`: subscribers matched by the most
  *   recent publish to the topic — the current fan-out width, so hot
  *   topics are visible at a glance. A matching consumer group counts once
@@ -258,6 +267,16 @@ export function renderPrometheus(stats: BusStats): string {
     'Total keyed messages held in per-(subscriber, key) reorder buffers because an earlier keySeq had not been fanned out yet.',
     stats.keyedReorderedMessages,
   );
+  counter(
+    'eventbus_causal_buffer_dropped_messages_total',
+    'Total causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock).',
+    stats.causalBuffer?.droppedMessages ?? 0,
+  );
+  counter(
+    'eventbus_causal_buffer_regressed_messages_total',
+    'Total causal messages delivered immediately on clock regression.',
+    stats.causalBuffer?.regressedMessages ?? 0,
+  );
 
   gauge('eventbus_subscribers', 'Currently active subscriptions.', stats.totalSubscribers);
   gauge(
@@ -289,6 +308,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_queue_bytes',
     'Estimated buffered payload bytes across all live subscriber backpressure queues.',
     stats.queueBytes ?? 0,
+  );
+  gauge(
+    'eventbus_causal_buffer_depth',
+    'Messages currently held in per-(subscriber, source) causal reorder buffers, waiting on their dependencies.',
+    stats.causalBuffer?.depth ?? 0,
   );
 
   // Per-subscriber delivery-latency series (only subscriptions with

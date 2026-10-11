@@ -913,6 +913,44 @@ library.
   with batch delivery, reliable ACK, health probing, and delivery shaping —
   the gate runs before the queue, so downstream features see messages in
   order.
+- **Causal (happens-before) delivery** (in `src/bus.ts`, via
+  `publish(topic, payload, { causal: { source?, clock } })` and opt-in
+  `subscribe(pattern, handler, { causal: true | { maxBufferPerSource? } })`):
+  the producer numbers each causal source with monotonically increasing
+  integer clocks starting at 0 (`source` defaults to the alias-resolved
+  topic; an explicit source orders messages across topics — a saga's
+  steps, a multi-topic transaction), and a causal subscriber delivers them
+  in happens-before order per source: a message is delivered if and only
+  if its clock equals the source's next expected clock; an early arrival
+  waits in a per-source reorder buffer — pre-queue, no backpressure budget
+  consumed, no filter or throttle evaluated yet — until its dependencies
+  are admitted, and each admission advances the expectation and releases
+  buffered successors in clock order. A regressed clock (below the
+  expectation — a duplicate or a late arrival from before the horizon) is
+  delivered immediately without moving the expectation backwards. Messages
+  without a causal clock bypass the gate entirely and never disturb any
+  source's expectation. Composes with per-key publish-order delivery: for
+  a keyed causal message the causal gate runs first — happens-before order
+  takes precedence over publish (keySeq) order — and an admitted message
+  then goes through the keyed gate as usual; keyed messages without a
+  clock keep their exact keyed behavior. Every wait terminates: each
+  per-source buffer is bounded (`maxBufferPerSource`, default 1000) — on
+  overflow the oldest buffered message is dropped (drop-oldest) and the
+  expectation advances past it, so a dependency that never arrives cannot
+  wedge the stream; clocks that will never be fanned out (non-matching
+  topics, group assignment to another member, filtered replay) are marked
+  skipped so the expectation cascades past them; buffered messages keep
+  their TTL deadline and one that expires while waiting is dropped as
+  expired at release — never resurrected. The clock rides the durable-log
+  record, so replay restores happens-before order across restarts.
+  `getStats().causalBuffer` reports `{ depth, droppedMessages,
+  regressedMessages }` (plus per-subscriber `causalBufferDepth(subId)`),
+  and `src/metrics.ts` renders `eventbus_causal_buffer_depth`,
+  `eventbus_causal_buffer_dropped_messages_total`, and
+  `eventbus_causal_buffer_regressed_messages_total`. Disabled by default —
+  without the opt-in the subscriber builds no buffers and tracks no
+  clocks: zero overhead, zero behavior change. Invalid clocks
+  (non-integer, negative) and buffer bounds throw `RangeError`.
 - **Delayed delivery** (in `src/bus.ts` + `src/delayed.ts`, via
   `publishDelayed(topic, payload, { delayMs } | { deliverAt })`): the message
   waits in a timer min-heap and fans out once the bus clock reaches its due
@@ -1248,6 +1286,20 @@ npm test
   batch/atomic publishes, `RangeError` on invalid keys with zero state
   change, delayed messages carrying their key through restart, and keys
   working without a durable log.
+- `test/causal.test.ts` — causal (happens-before) delivery: out-of-order
+  arrivals delivered in clock order, independent per-source streams (one
+  stalled source never blocks another), source defaulting to the topic
+  name, regressed clocks delivered immediately without moving the
+  expectation back, non-causal messages bypassing the gate, zero behavior
+  change when the opt-in is off, composition with keyed ordering
+  (happens-before wins over publish order), keyed-without-clock behavior
+  unchanged, buffer depth in `getStats().causalBuffer` and per subscriber,
+  over-full buffers dropping the oldest wait and advancing past it
+  (anti-deadlock), TTL-expired buffered messages dropped as expired
+  without wedging the stream, group members each observing an ordered
+  subsequence, `RangeError` on invalid clocks/buffer bounds, the clock
+  persisting on the durable log with replay restoring happens-before
+  order, and the Prometheus exposition.
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output
@@ -1427,6 +1479,8 @@ Exported series:
 | `eventbus_diagnostic_events_total` | counter | `diagnosticEvents` — admitted DLQ diagnostic events |
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
 | `eventbus_keyed_reordered_messages_total` | counter | `keyedReorderedMessages` — keyed messages held in per-(subscriber, key) reorder buffers |
+| `eventbus_causal_buffer_dropped_messages_total` | counter | `causalBuffer.droppedMessages` — causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock) |
+| `eventbus_causal_buffer_regressed_messages_total` | counter | `causalBuffer.regressedMessages` — causal messages delivered immediately on clock regression |
 | `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
 | `eventbus_topic_late_messages_total{topic}` | counter | per-topic `lateMessages` (EB-59) |
 | `eventbus_topic_event_time_watermark{topic}` | gauge | per-topic event-time watermark in epoch ms (EB-59); only emitted for topics with at least one event-time publish |
@@ -1437,6 +1491,7 @@ Exported series:
 | `eventbus_shaped_subscribers` | gauge | `shapedSubscribers` |
 | `eventbus_pending_delayed` | gauge | `pendingDelayed` |
 | `eventbus_queue_bytes` | gauge | `queueBytes` — buffered payload bytes across subscriber queues |
+| `eventbus_causal_buffer_depth` | gauge | `causalBuffer.depth` — messages currently held in per-(subscriber, source) causal reorder buffers |
 | `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
 | `eventbus_delivery_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→delivery queue-dwell p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `deliveryLatency`-tracked subscriptions |
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
