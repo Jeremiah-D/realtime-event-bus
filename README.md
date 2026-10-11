@@ -403,6 +403,32 @@ library.
   `publishAtomic` runs the cap in shadow admission (an oversized entry aborts
   the batch with reason `'message-too-big'`), and `publishDelayed`
   fail-fasts on it at schedule time, exactly like schema validation.
+- **Per-topic sensitive-field redaction** (in `src/bus.ts`, via
+  `setTopicRedaction(pattern, fields)`): admission-time masking of
+  sensitive payload fields for PII/secret hygiene (backend/real-time
+  systems). Each registered field path is a dot-separated object path
+  (e.g. `"user.email"`, `"payment.card.number"`); every admitted publish
+  to a matching topic has those fields replaced with `"***"` **before**
+  schema validation — so validators, the size cap, the rate limiter,
+  compression, the bridge mirror, the durable log, and fan-out all see
+  only the redacted bytes. The original values are never persisted and
+  can never be resurrected by replay; the caller's payload object is never
+  mutated. Redaction is idempotent: a field already holding `"***"` is
+  left untouched and uncounted, so a payload crossing a route/bridge hop
+  is never double-counted. Array element paths are not supported (arrays
+  are opaque to redaction), and non-object payloads pass through untouched
+  and uncounted. `getStats()` exposes per-topic and global
+  `redactedFields` (fields actually masked). Rule matching mirrors
+  `setTopicTtl`: an exact-topic rule wins over patterns, the
+  earliest-registered matching pattern wins, and re-setting a rule replaces
+  it; `clearTopicRedaction` removes a rule. Unset by default (fully backward
+  compatible). Empty patterns, non-array `fields`, and illegal paths (empty,
+  non-string, empty segments, or `__proto__`/`constructor`/`prototype`
+  segments) throw `RangeError` at registration. `publishAtomic` redacts in
+  shadow admission (the schema gate and the commit phase see redacted
+  bytes), and `publishDelayed` redacts at schedule time — the persisted
+  schedule record is already redacted, so the due-time fan-out does not
+  redact again.
 - **Unified admission-rejection hook** (in `src/bus.ts`, via
   `EventBusOptions.onAdmissionRejected`): every publish-side admission
   rejection — schema-validation rejections, per-topic message-size

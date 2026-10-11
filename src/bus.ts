@@ -1693,6 +1693,17 @@ export interface TopicStats {
    */
   aliasRetiredMessages: number;
   /**
+   * Sensitive fields replaced with the redaction sentinel on this topic
+   * (see `setTopicRedaction`, EB-68): the number of field paths actually
+   * masked across admitted publishes. Counted at admission — a field
+   * replaced on a publish that a later gate then rejects still counts,
+   * and a field already holding the sentinel is left untouched and
+   * uncounted (redaction is idempotent across route/bridge hops).
+   * Non-object payloads never count. 0 when no redaction rule matches
+   * the topic.
+   */
+  redactedFields: number;
+  /**
    * Messages on this topic delivered with a compressed payload (see
    * `setTopicCompression`): the payload's serialized size exceeded the
    * topic's `thresholdBytes` and deflate produced a smaller encoding.
@@ -1936,6 +1947,12 @@ export interface BusStats {
    * with the bus clock. 0 when nothing has been compressed yet.
    */
   meanCompressionMs: number;
+  /**
+   * Total sensitive fields replaced with the redaction sentinel — the sum
+   * of every topic's `redactedFields`. See `TopicStats.redactedFields`
+   * for the exact counting rules.
+   */
+  redactedFields: number;
   /**
    * Subscriptions currently under adaptive publish-side throttling (see
    * `SubscribeOptions.throttle`): their queues crossed the high-water mark
@@ -2600,6 +2617,7 @@ function zeroedTopicStats(): {
   filteredMessages: number;
   dedupDropped: number;
   aliasRetiredMessages: number;
+  redactedFields: number;
   compressedMessages: number;
   compressedBytesBefore: number;
   compressedBytesAfter: number;
@@ -2618,6 +2636,7 @@ function zeroedTopicStats(): {
     filteredMessages: 0,
     dedupDropped: 0,
     aliasRetiredMessages: 0,
+    redactedFields: 0,
     compressedMessages: 0,
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,
@@ -4526,6 +4545,105 @@ function payloadByteSize(payload: unknown): number {
 }
 
 /**
+ * The placeholder written into every redacted sensitive field (see
+ * `EventBus.setTopicRedaction`, EB-68). Exported so downstream consumers
+ * and tests can match on it. A field that already holds the sentinel is
+ * left untouched and uncounted — redaction is idempotent, so a payload
+ * that crossed a route/bridge hop is never double-counted.
+ */
+export const REDACTION_SENTINEL = '***';
+
+/**
+ * Field-path segments that must never be traversed or written: honoring
+ * them would mutate object prototypes instead of data. Rejected at
+ * registration time (fail-fast `RangeError`).
+ */
+const FORBIDDEN_REDACTION_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Parses and validates one redaction field path (dot-separated object
+ * path, e.g. `"user.email"`). Throws `RangeError` for empty or
+ * non-string paths, empty segments, and prototype-polluting segments.
+ */
+function parseRedactionFieldPath(field: string, caller: string): string[] {
+  if (typeof field !== 'string' || field.length === 0) {
+    throw new RangeError(`${caller}: redaction field paths must be non-empty strings`);
+  }
+  const segments = field.split('.');
+  for (const segment of segments) {
+    if (segment.length === 0) {
+      throw new RangeError(`${caller}: redaction field path "${field}" contains an empty segment`);
+    }
+    if (FORBIDDEN_REDACTION_SEGMENTS.has(segment)) {
+      throw new RangeError(
+        `${caller}: redaction field path "${field}" uses the forbidden segment "${segment}"`,
+      );
+    }
+  }
+  return segments;
+}
+
+/**
+ * Replaces one field path inside an object with the redaction sentinel,
+ * cloning on the write path only. Returns the (possibly new) node and
+ * whether a replacement happened. Arrays are opaque — their elements are
+ * never indexed — and a missing intermediate or leaf is a no-op. The
+ * input object is never mutated.
+ */
+function redactPath(
+  node: unknown,
+  segments: string[],
+  index: number,
+): { node: unknown; changed: boolean } {
+  if (node === null || typeof node !== 'object' || Array.isArray(node)) {
+    return { node, changed: false };
+  }
+  const record = node as Record<string, unknown>;
+  if (index === segments.length - 1) {
+    const key = segments[index];
+    if (!Object.prototype.hasOwnProperty.call(record, key)) return { node, changed: false };
+    // Idempotent: a field already holding the sentinel keeps it and is
+    // not counted again.
+    if (record[key] === REDACTION_SENTINEL) return { node, changed: false };
+    const copy = { ...record };
+    copy[key] = REDACTION_SENTINEL;
+    return { node: copy, changed: true };
+  }
+  const descended = redactPath(record[segments[index]], segments, index + 1);
+  if (!descended.changed) return { node, changed: false };
+  const copy = { ...record };
+  copy[segments[index]] = descended.node;
+  return { node: copy, changed: true };
+}
+
+/**
+ * Applies redaction field paths to a publish payload (EB-68). Only object
+ * payloads are touched: a non-object payload is returned untouched with a
+ * zero count, and array element paths are unsupported (arrays are opaque).
+ * The input is never mutated — each replaced branch is cloned with
+ * structural sharing, so untouched subtrees keep their identity. Returns
+ * the (possibly new) payload and the number of fields actually replaced.
+ */
+function redactFieldPaths(
+  payload: unknown,
+  paths: string[][],
+): { value: unknown; redacted: number } {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { value: payload, redacted: 0 };
+  }
+  let value: unknown = payload;
+  let redacted = 0;
+  for (const segments of paths) {
+    const result = redactPath(value, segments, 0);
+    if (result.changed) {
+      value = result.node;
+      redacted += 1;
+    }
+  }
+  return { value, redacted };
+}
+
+/**
  * Options for `EventBus.publishIdempotent`: `PublishOptions` plus the
  * idempotency key.
  *
@@ -4829,6 +4947,28 @@ export class EventBus {
    * never inflates `patternCacheSize`.
    */
   private maxMessageBytesMatcherCache = new Map<string, RegExp>();
+  /**
+   * Per-topic sensitive-field redaction rules (EB-68), keyed by the exact
+   * string passed to `setTopicRedaction` — either a concrete topic name or
+   * a wildcard pattern. Each rule is the list of parsed dot-paths whose
+   * values are replaced with the redaction sentinel at admission, before
+   * schema validation. Match resolution mirrors the schema rules: an
+   * exact-topic rule wins over any pattern; between patterns the
+   * earliest-registered rule wins.
+   */
+  private redactionRules = new Map<string, string[][]>();
+  /**
+   * Compiled matchers for the wildcard entries in `redactionRules`, kept
+   * apart from the subscriber pattern cache so redaction configuration
+   * never inflates `patternCacheSize`.
+   */
+  private redactionMatcherCache = new Map<string, RegExp>();
+  /**
+   * Total sensitive fields replaced by redaction across all topics (global
+   * total). Counted at admission: a field replaced on a publish that a
+   * later gate then rejects still counts — the replacement happened.
+   */
+  private totalRedactedFields = 0;
   /**
    * Messages rejected by schema validation (global total). A rejection
    * happens before admission: the payload never becomes a message, so it
@@ -6042,6 +6182,92 @@ export class EventBus {
   }
 
   /**
+   * Registers per-topic sensitive-field redaction (EB-68): every publish
+   * admitted to a matching topic has the listed field paths replaced with
+   * `"***"` before anything else can observe the payload. `topicPattern`
+   * accepts the same wildcard syntax as `subscribe` (or an exact topic
+   * name); `fields` lists dot-separated object paths (e.g.
+   * `"user.email"`, `"payment.card.number"`). Array element paths are not
+   * supported — arrays are opaque to redaction — and non-object payloads
+   * pass through untouched.
+   *
+   * Redaction runs at admission, before the schema validator (see
+   * `setTopicSchema`): the schema sees the redacted payload, so a
+   * validator cannot depend on a field that redaction masks. The size
+   * cap, rate limiter, compression, the bridge mirror, the durable log,
+   * and fan-out likewise all see only the redacted bytes — the original
+   * values are never persisted and can never be resurrected by replay.
+   * The caller's payload object is never mutated. Unset by default
+   * (fully backward compatible).
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * patterns, the earliest-registered matching pattern wins. Re-setting a
+   * rule replaces it. `clearTopicRedaction` removes a rule. Throws
+   * `RangeError` when `topicPattern` is empty, `fields` is not an array,
+   * or any field path is empty, not a string, has an empty segment, or
+   * uses a forbidden segment (`__proto__`, `constructor`, `prototype`).
+   */
+  setTopicRedaction(topicPattern: string, fields: string[]): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Array.isArray(fields)) {
+      throw new RangeError('fields must be an array of field paths');
+    }
+    const parsed = fields.map((field) => parseRedactionFieldPath(field, 'setTopicRedaction'));
+    this.redactionRules.set(topicPattern, parsed);
+  }
+
+  /**
+   * Removes the sensitive-field redaction rule previously registered for
+   * `topicPattern`. Messages already queued or logged keep whatever form
+   * they were published with; only new publishes are affected. Returns
+   * true when a rule existed and was removed.
+   */
+  clearTopicRedaction(topicPattern: string): boolean {
+    return this.redactionRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the redaction field paths that apply to `topic`, or `undefined`
+   * when no rule matches. Same precedence as `schemaForTopic`.
+   */
+  private redactionForTopic(topic: string): string[][] | undefined {
+    const exact = this.redactionRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, paths] of this.redactionRules) {
+      let matcher = this.redactionMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.redactionMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return paths;
+    }
+    return undefined;
+  }
+
+  /**
+   * Applies the topic's sensitive-field redaction rules to a publish
+   * payload at admission time (see `setTopicRedaction`, EB-68). Returns
+   * the payload with every matching field replaced by the redaction
+   * sentinel — the input is never mutated — and counts each replaced
+   * field on the topic's stats entry and the global total
+   * (`TopicStats.redactedFields` / `BusStats.redactedFields`). A no-op
+   * when no rule matches the topic; non-object payloads pass through
+   * untouched and uncounted.
+   */
+  private redactAdmissionPayload(topic: string, payload: unknown): unknown {
+    const paths = this.redactionForTopic(topic);
+    if (paths === undefined) return payload;
+    const { value, redacted } = redactFieldPaths(payload, paths);
+    if (redacted > 0) {
+      this.statsFor(topic).redactedFields += redacted;
+      this.totalRedactedFields += redacted;
+    }
+    return value;
+  }
+
+  /**
    * Returns the per-message byte cap that applies to `topic`, or `undefined`
    * when no rule matches. Same precedence as `ttlForTopic`.
    */
@@ -6643,6 +6869,7 @@ export class EventBus {
         lateMessages: 0,
         duplicateMessages: 0,
         aliasRetiredMessages: 0,
+        redactedFields: 0,
         filteredMessages: 0,
         dedupDropped: 0,
         compressedMessages: 0,
@@ -8961,10 +9188,12 @@ export class EventBus {
    * none is. The batch goes through two phases, both synchronous, so no
    * subscriber ever observes a partial batch:
    *
-   * 1. Admission: every entry is checked against the same admission gates
-   *    `publish` applies — the broker-level ACL, then schema validation,
-   *    then the per-topic message-size cap, then the per-topic rate-limit
-   *    budget — without mutating any bus
+   * 1. Admission: every entry is redacted first (`setTopicRedaction`,
+   *    EB-68 — the schema validator and every later gate see the redacted
+   *    bytes), then checked against the same admission gates `publish`
+   *    applies — the broker-level ACL, then schema validation, then the
+   *    per-topic message-size cap, then the per-topic rate-limit budget —
+   *    without mutating any bus
    *    state. Rate-limit
    *    tokens are charged against a per-batch shadow balance, so a batch
    *    cannot overdraft the bucket with its own entries. The first entry
@@ -9019,8 +9248,14 @@ export class EventBus {
     // Alias-resolved topics, one per entry: the commit phase publishes the
     // resolved topics, never the raw entry topics.
     const resolvedTopics: string[] = new Array(entries.length);
+    // Redacted payloads, one per entry: shadow admission redacts on the
+    // resolved topic before the schema gate (EB-68); the commit phase
+    // fans out these redacted bytes through pre-admitted fanOut, so the
+    // redaction count moves exactly once per entry.
+    const redactedPayloads: unknown[] = new Array(entries.length);
     for (let index = 0; index < entries.length; index++) {
-      const { topic, payload, key } = entries[index];
+      const { topic, key } = entries[index];
+      let payload: unknown = entries[index].payload;
       // Topic aliases (EB-44) resolve before every admission gate: the
       // resolved topic is what the shadow admission checks (ACL, schema,
       // rate-limit) and what the commit phase publishes. A retired old
@@ -9032,6 +9267,11 @@ export class EventBus {
       }
       const resolvedTopic = aliasResolution.topic;
       resolvedTopics[index] = resolvedTopic;
+      // Sensitive-field redaction (EB-68) runs in shadow admission, on
+      // the resolved topic, before the schema gate: the schema verdict,
+      // the size cap, and the commit phase all see the redacted bytes.
+      payload = this.redactAdmissionPayload(resolvedTopic, payload);
+      redactedPayloads[index] = payload;
       const reason = this.admissionVerdict(resolvedTopic, payload, shadowBudget);
       if (reason !== undefined) {
         // The batch is rejected on the failing entry: count it once against
@@ -9058,10 +9298,12 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { payload, key, traceparent, messageId, eventTime, publisherId } = entries[index];
+      const { key, traceparent, messageId, eventTime, publisherId } = entries[index];
       this.fanOut(
         resolvedTopics[index],
-        payload,
+        // The shadow-admission redacted bytes: the commit phase is
+        // pre-admitted and must not redact again (EB-68).
+        redactedPayloads[index],
         true,
         undefined,
         key,
@@ -9149,6 +9391,12 @@ export class EventBus {
    *   is filed under the resolved topic, and a retired old topic is
    *   refused with admission reason `'alias-retired'` before anything is
    *   scheduled.
+   * - Sensitive-field redaction (`setTopicRedaction`, EB-68) runs NOW, on
+   *   the resolved topic, before the fail-fast gates: the schema
+   *   validator, the size cap, the in-memory schedule, and the persisted
+   *   schedule record all see the redacted payload — the original values
+   *   never reach the durable log, so replay can never resurrect them.
+   *   The due-time fan-out (pre-admitted) does not redact again.
    * - Schema validation runs NOW, fail-fast: a rejected payload never
    *   becomes a scheduled delivery. A throwing validator propagates,
    *   exactly as in `publish`. Validation is not re-run at fan-out
@@ -9217,6 +9465,13 @@ export class EventBus {
       return undefined;
     }
     topic = aliasResolution.topic;
+    // Sensitive-field redaction (EB-68) at schedule time: the fail-fast
+    // gates below, the in-memory schedule, and the persisted schedule
+    // record all see the redacted payload — the original values never
+    // reach the durable log, and the due-time fan-out (pre-admitted) does
+    // not redact again. Redacting at schedule time (rather than at
+    // fan-out) is what keeps the persisted bytes redacted.
+    payload = this.redactAdmissionPayload(topic, payload);
     // Fail fast on ACL: an unauthorized publish never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
@@ -10778,6 +11033,18 @@ export class EventBus {
       return { matched: 0, accepted: 0, admitted: false };
     }
     topic = aliasResolution.topic;
+    // Sensitive-field redaction (EB-68): admission-time, before every
+    // gate. The schema validator, the size cap, the rate limiter,
+    // compression, the bridge mirror, the durable log, and fan-out all
+    // see the redacted payload only — nothing downstream can ever observe
+    // or persist the original field values, and replay reads
+    // already-redacted bytes from the log (the original is never
+    // resurrected). Skipped on pre-admitted paths (`publishAtomic`
+    // commit, delayed fan-out): those already redacted at their own
+    // admission — re-running here would double-count.
+    if (!preAdmitted) {
+      payload = this.redactAdmissionPayload(topic, payload);
+    }
     // Causal clock (see `PublishOptions.causal`): validated by the
     // publishing entry point; the source defaults to the resolved topic,
     // so alias resolution keeps the stream identity stable.
@@ -11587,6 +11854,7 @@ export class EventBus {
           : 0,
       meanCompressionMs:
         this.totalCompressed > 0 ? this.totalCompressionTimeMs / this.totalCompressed : 0,
+      redactedFields: this.totalRedactedFields,
       throttledSubscribers,
       degradedSubscribers,
       shapedSubscribers,
@@ -11655,6 +11923,7 @@ export class EventBus {
         watermark: this.eventWatermarks.get(topic)?.watermarkFor(this.allowedLatenessForTopic(topic)),
         duplicateMessages: stats.duplicateMessages,
         aliasRetiredMessages: stats.aliasRetiredMessages,
+        redactedFields: stats.redactedFields,
         filteredMessages: stats.filteredMessages,
         dedupDropped: stats.dedupDropped,
         compressedMessages: stats.compressedMessages,
