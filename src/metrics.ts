@@ -58,6 +58,10 @@
  * - `eventbus_namespace_subscribers{namespace}`: live namespaced
  *   subscriptions per namespace (EB-52; only emitted when namespaces
  *   are registered).
+ * - `eventbus_publisher_published_messages_total{publisher}`: admitted
+ *   publishes per publisher identity (EB-65; only emitted when at least
+ *   one publisher has admitted a publish — anonymous publishes move no
+ *   per-publisher counter).
  *
  * Gauges (point-in-time):
  * - `eventbus_subscribers`: currently active subscriptions.
@@ -474,6 +478,24 @@ export function renderPrometheus(stats: BusStats): string {
       const label = `namespace="${escapeLabelValue(ns.namespace)}"`;
       lines.push(`eventbus_namespace_published_messages_total{${label}} ${ns.publishedMessages}`);
       lines.push(`eventbus_namespace_subscribers{${label}} ${ns.subscribers}`);
+    }
+  }
+
+  // Per-publisher admitted publishes (EB-65), in getStats().publishers
+  // order (most-published first, ties on the identity). Emitted only when
+  // at least one publisher has admitted a publish — a publisher-free bus
+  // renders byte-identical exposition to before. The `?? []` keeps the
+  // renderer tolerant of a stats object that predates the field
+  // (hand-built fixtures included).
+  const publishers = stats.publishers ?? [];
+  if (publishers.length > 0) {
+    lines.push(
+      '# HELP eventbus_publisher_published_messages_total Total admitted publishes per publisher identity (see PublishOptions.publisherId); anonymous publishes move no per-publisher counter.',
+    );
+    lines.push('# TYPE eventbus_publisher_published_messages_total counter');
+    for (const p of publishers) {
+      const label = `publisher="${escapeLabelValue(p.publisher)}"`;
+      lines.push(`eventbus_publisher_published_messages_total{${label}} ${p.publishedMessages}`);
     }
   }
 

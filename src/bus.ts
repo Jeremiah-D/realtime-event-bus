@@ -145,6 +145,16 @@ export interface BusMessage {
    */
   messageId?: string;
   /**
+   * Publisher identity, set when the publish carried one
+   * (`PublishOptions.publisherId`). A producer-side label — service name,
+   * client id, tenant — aggregated into per-publisher publish counters
+   * (`getStats().publishers`, `eventbus_publisher_published_messages_total`).
+   * It rides the envelope end to end (durable log, replay, delayed
+   * schedules, cross-bus forwards) so a message admitted once keeps its
+   * attribution across restarts and hops. Absent for anonymous publishes.
+   */
+  publisherId?: string;
+  /**
    * Business event time of the message in epoch milliseconds, set when the
    * publish carried one (`PublishOptions.eventTime`). Unlike `seq` — the
    * bus-assigned publish-order number (EB-13) — this is the application's
@@ -1823,6 +1833,14 @@ export interface BusStats {
    */
   dedupDropped: number;
   /**
+   * Per-publisher admitted-publish totals (see
+   * `PublishOptions.publisherId`): every identity that has admitted at
+   * least one publish, with its total — most-published first, ties broken
+   * on the identity for a deterministic snapshot. Anonymous publishes
+   * move no per-publisher counter; their total is `totalPublished`.
+   */
+  publishers: Array<{ publisher: string; publishedMessages: number }>;
+  /**
    * Total publishes rejected because the target topic's migration alias
    * expired (the old topic is read-only) — the sum of every topic's
    * `aliasRetiredMessages`. See `TopicStats.aliasRetiredMessages` for the
@@ -2588,6 +2606,34 @@ function validateCausal(causal: { source?: string; clock: number } | undefined, 
   }
 }
 
+/**
+ * Publisher identity alphabet: 1–64 ASCII alphanumerics, `_` or `-`.
+ * A `publisherId` rides the publish path as an opaque producer label —
+ * never interpreted, never a security principal — so the validation is a
+ * shape check, not an authorization decision.
+ */
+const PUBLISHER_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Returns the value when it is a valid publisher identity, else `undefined`. */
+function cleanPublisherId(value: unknown): string | undefined {
+  return typeof value === 'string' && PUBLISHER_ID_PATTERN.test(value) ? value : undefined;
+}
+
+/**
+ * Validates `PublishOptions.publisherId` (and its batch/delayed twins).
+ * Absent (`undefined`) means an anonymous publish; anything else must be
+ * 1–64 ASCII alphanumeric/`_`/`-` characters — anything invalid throws
+ * `RangeError` before the publish mutates any state.
+ */
+function validatePublisherId(publisherId: string | undefined, caller: string): void {
+  if (publisherId === undefined) return;
+  if (cleanPublisherId(publisherId) === undefined) {
+    throw new RangeError(
+      `${caller}: publisherId must be 1-64 ASCII alphanumeric, '_' or '-' characters`,
+    );
+  }
+}
+
 /** An `AclRule` with its pattern pre-compiled for the hot path. */
 interface CompiledAclRule {
   pattern: string;
@@ -3310,6 +3356,13 @@ export interface AdmissionRejectionEvent {
   payloadBytes: number;
   /** Bus-clock timestamp of the rejection (`EventBusOptions.now`). */
   at: number;
+  /**
+   * Publisher identity the rejected publish carried
+   * (`PublishOptions.publisherId`), when it carried one — so an admission
+   * rejection stays attributable to its producer. Absent for anonymous
+   * publishes.
+   */
+  publisher?: string;
 }
 
 /**
@@ -3463,6 +3516,14 @@ export interface ForwardFrame {
   traceparent?: string;
   /** Application message identity, carried end to end. */
   messageId?: string;
+  /**
+   * Publisher identity (see `PublishOptions.publisherId`): the forwarded
+   * message is the same logical publish, so it keeps its producer
+   * attribution on the destination bus. Sanitized on receipt — a frame
+   * carrying an invalid identity forwards as anonymous rather than
+   * failing the forward.
+   */
+  publisherId?: string;
   /**
    * The source message's TTL deadline, verbatim — a forward never resets
    * it. Absent when the source message had no deadline, in which case the
@@ -3687,6 +3748,22 @@ export interface PublishOptions {
    */
   messageId?: string;
   /**
+   * Publisher identity for this publish (EB-65). A producer-side label —
+   * service name, client id, tenant — aggregated into per-publisher
+   * publish counters (`getStats().publishers` and the
+   * `eventbus_publisher_published_messages_total` exposition series), and
+   * carried on admission-rejection events (`onAdmissionRejected`) so a
+   * rejected publish is attributable to its producer. The identity is
+   * persisted on the durable-log record and restored on replay, so
+   * attribution survives restarts (delayed schedules included). It is a
+   * label, not a credential: the bus never authenticates it. Must be 1–64
+   * ASCII alphanumeric, `_` or `-` characters; anything else throws
+   * `RangeError` from the publish entry point before anything is
+   * mutated. Absent (`undefined`) means an anonymous publish — no
+   * per-publisher counting, no label on the log record.
+   */
+  publisherId?: string;
+  /**
    * Marks this publish as already-routed (see `EventBus.setTopicRoute`):
    * a routed message never triggers topic routing again, so a route
    * chain (`a → b → c`) forwards one hop per message and a publish can
@@ -3778,6 +3855,13 @@ export interface PublishDelayedOptions {
    * as absent.
    */
   messageId?: string;
+  /**
+   * Publisher identity, carried on the schedule record and stamped onto
+   * the envelope when the schedule fans out (see
+   * `PublishOptions.publisherId`): a delayed publish keeps its producer
+   * attribution across restarts. Same validation as `publish`.
+   */
+  publisherId?: string;
 }
 
 /**
@@ -4471,6 +4555,13 @@ export class EventBus {
     }
   >();
   private totalPublished = 0;
+  /**
+   * Per-publisher admitted-publish totals (see `PublishOptions.publisherId`).
+   * Only publishes that clear admission count; a schema rejection or
+   * rate-limit shed never reaches the counting line. Anonymous publishes
+   * move no per-publisher counter — the total is in `totalPublished`.
+   */
+  private readonly publisherCounts = new Map<string, number>();
   private totalExpired = 0;
   /**
    * Messages handed to subscriber handlers (global total). Counts each
@@ -5621,6 +5712,10 @@ export class EventBus {
       false, // fromBridge
       false, // diagnostic
       frame.eventTime, // same logical event: business event time rides along verbatim
+      undefined, // causal: the frame re-stamps nothing causal
+      // A frame carrying an invalid identity forwards as anonymous — a
+      // malformed label never fails the forward, it just drops the label.
+      cleanPublisherId(frame.publisherId),
     );
     this.scheduleFlush();
   }
@@ -5736,10 +5831,10 @@ export class EventBus {
    * admission: no sequence number consumed (subscribers see no gap), the
    * durable log never sees it, no rate-limit budget burned.
    */
-  private countAliasRetired(topic: string, payload: unknown): void {
+  private countAliasRetired(topic: string, payload: unknown, publisherId?: string): void {
     this.statsFor(topic).aliasRetiredMessages += 1;
     this.totalAliasRetired += 1;
-    this.emitAdmissionRejected(topic, 'alias-retired', payload);
+    this.emitAdmissionRejected(topic, 'alias-retired', payload, publisherId);
   }
 
   /**
@@ -8429,6 +8524,12 @@ export class EventBus {
         ...(typeof rec.eventTime === 'number' && Number.isFinite(rec.eventTime) && rec.eventTime >= 0
           ? { eventTime: rec.eventTime }
           : {}),
+        // Restores the publisher identity logged at publish time, so a
+        // resumed subscriber sees the same producer attribution the live
+        // delivery carried (see `PublishOptions.publisherId`).
+        ...(typeof rec.publisherId === 'string' && rec.publisherId.length > 0
+          ? { publisherId: rec.publisherId }
+          : {}),
       };
       // The log stores the wire payload: a record written while a
       // compression rule was active carries the deflated envelope, so
@@ -8495,6 +8596,7 @@ export class EventBus {
     validateTraceparent(opts?.traceparent, 'publish');
     validateEventTime(opts?.eventTime, 'publish');
     validateCausal(opts?.causal, 'publish');
+    validatePublisherId(opts?.publisherId, 'publish');
     // Multi-tenant namespace (EB-52): resolve to the concrete
     // `<namespace>/<topic>` before admission — the full pipeline below
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
@@ -8515,6 +8617,7 @@ export class EventBus {
       false,
       opts?.eventTime,
       opts?.causal,
+      opts?.publisherId,
     );
     this.scheduleFlush();
     return accepted;
@@ -8573,7 +8676,9 @@ export class EventBus {
     validateTraceparent(opts?.traceparent, 'publishIdempotent');
     validateEventTime(opts?.eventTime, 'publishIdempotent');
     validateCausal(opts?.causal, 'publishIdempotent');
+    validatePublisherId(opts?.publisherId, 'publishIdempotent');
     const messageId = opts?.messageId;
+    const publisherId = opts?.publisherId;
     // Multi-tenant namespace (EB-52): the `(topic, messageId)` dedup
     // identity below is scoped to the concrete `<namespace>/<topic>`, so
     // the same messageId in two namespaces never collides.
@@ -8586,7 +8691,7 @@ export class EventBus {
     // deduplicated, and its retry stays a fresh publish.
     const aliasResolution = this.resolvePublishTopic(topic);
     if (aliasResolution.retired) {
-      this.countAliasRetired(topic, payload);
+      this.countAliasRetired(topic, payload, publisherId);
       return { duplicate: false, accepted: 0 };
     }
     topic = aliasResolution.topic;
@@ -8607,6 +8712,8 @@ export class EventBus {
         false,
         false,
         opts?.eventTime,
+        opts?.causal,
+        publisherId,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -8615,7 +8722,7 @@ export class EventBus {
     // slot and reports `{ duplicate: false, accepted: 0 }` — it was
     // denied, not deduplicated, and its retry stays a fresh publish.
     if (!this.aclAllowsPublish(topic)) {
-      this.countAclDenied(topic, payload);
+      this.countAclDenied(topic, payload, publisherId);
       return { duplicate: false, accepted: 0 };
     }
     const nowMs = this.now();
@@ -8626,7 +8733,7 @@ export class EventBus {
       // Suppressed duplicate: dropped before admission — no sequence
       // number, no durable-log write, no rate-limit budget. Counted for
       // observability only, and surfaced on the admission-rejection hook.
-      this.countDuplicate(topic, payload);
+      this.countDuplicate(topic, payload, publisherId);
       return { duplicate: true, accepted: 0 };
     }
     const { accepted, admitted } = this.fanOut(
@@ -8644,6 +8751,7 @@ export class EventBus {
       false,
       opts?.eventTime,
       opts?.causal,
+      publisherId,
     );
     this.scheduleFlush();
     if (admitted) {
@@ -8682,6 +8790,7 @@ export class EventBus {
       validateMessageKey(msg.key, 'publishBatch');
       validateTraceparent(msg.traceparent, 'publishBatch');
       validateEventTime(msg.eventTime, 'publishBatch');
+      validatePublisherId(msg.publisherId, 'publishBatch');
     }
     let accepted = 0;
     for (const msg of messages) {
@@ -8699,6 +8808,8 @@ export class EventBus {
         false,
         false,
         msg.eventTime,
+        undefined, // causal: batch messages carry no causal clock
+        msg.publisherId,
       ).accepted;
     }
     this.scheduleFlush();
@@ -8756,6 +8867,7 @@ export class EventBus {
       validateMessageKey(entry.key, 'publishAtomic');
       validateTraceparent(entry.traceparent, 'publishAtomic');
       validateEventTime(entry.eventTime, 'publishAtomic');
+      validatePublisherId(entry.publisherId, 'publishAtomic');
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
@@ -8788,11 +8900,12 @@ export class EventBus {
         // with stats like any other admission rejection. Everything else
         // stays untouched: no sequence numbers, no rate-limit tokens, no
         // durable-log writes.
-        if (reason === 'schema') this.countSchemaRejection(topic, payload);
-        else if (reason === 'acl') this.countAclDenied(topic, payload);
-        else if (reason === 'alias-retired') this.countAliasRetired(topic, payload);
-        else if (reason === 'message-too-big') this.countMessageTooBig(topic, payload);
-        else this.countRateLimited(topic, payload);
+        const publisherId = entries[index].publisherId;
+        if (reason === 'schema') this.countSchemaRejection(topic, payload, publisherId);
+        else if (reason === 'acl') this.countAclDenied(topic, payload, publisherId);
+        else if (reason === 'alias-retired') this.countAliasRetired(topic, payload, publisherId);
+        else if (reason === 'message-too-big') this.countMessageTooBig(topic, payload, publisherId);
+        else this.countRateLimited(topic, payload, publisherId);
         return { published: 0, rejected: { index, topic, reason } };
       }
       if (key !== undefined) {
@@ -8805,7 +8918,7 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { payload, key, traceparent, messageId, eventTime } = entries[index];
+      const { payload, key, traceparent, messageId, eventTime, publisherId } = entries[index];
       this.fanOut(
         resolvedTopics[index],
         payload,
@@ -8820,6 +8933,8 @@ export class EventBus {
         false,
         false,
         eventTime,
+        undefined, // causal: atomic entries carry no causal clock
+        publisherId,
       );
     }
     this.scheduleFlush();
@@ -8948,13 +9063,17 @@ export class EventBus {
         throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
       }
     }
+    // The producer label is validated before any fail-fast gate: a throw
+    // must leave zero state behind — no schedule, no counted rejection.
+    validatePublisherId(opts?.publisherId, 'publishDelayed');
+    const publisherId = opts?.publisherId;
     // Topic aliases (EB-44) resolve before every other gate: the schedule
     // is filed under the resolved topic — the fail-fast ACL/schema checks
     // below, the stamped TTL, and the fan-out at due time all see it. A
     // publish to a retired old topic never becomes a scheduled delivery.
     const aliasResolution = this.resolvePublishTopic(topic);
     if (aliasResolution.retired) {
-      this.countAliasRetired(topic, payload);
+      this.countAliasRetired(topic, payload, publisherId);
       return undefined;
     }
     topic = aliasResolution.topic;
@@ -8962,7 +9081,7 @@ export class EventBus {
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
     if (!this.aclAllowsPublish(topic)) {
-      this.countAclDenied(topic, payload);
+      this.countAclDenied(topic, payload, publisherId);
       return undefined;
     }
     // Fail fast on schema: a rejected payload never becomes a scheduled
@@ -8970,7 +9089,7 @@ export class EventBus {
     // same way a `publish` rejection is.
     const validator = this.schemaForTopic(topic);
     if (validator !== undefined && !validator(payload, topic)) {
-      this.countSchemaRejection(topic, payload);
+      this.countSchemaRejection(topic, payload, publisherId);
       return undefined;
     }
     // Fail fast on the per-topic message-size cap: an oversized payload
@@ -8978,7 +9097,7 @@ export class EventBus {
     // as the schema fail-fast above.
     const maxBytes = this.maxMessageBytesForTopic(topic);
     if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
-      this.countMessageTooBig(topic, payload);
+      this.countMessageTooBig(topic, payload, publisherId);
       return undefined;
     }
     const ttlMs = this.ttlForTopic(topic);
@@ -9005,6 +9124,9 @@ export class EventBus {
       // Normalized at fan-out (see `fanOut`); stored raw on the schedule
       // so the record round-trips byte-identically.
       messageId: opts.messageId,
+      // The producer label rides the schedule record so a restart rebuilds
+      // the timer with the attribution intact.
+      publisherId,
     };
     // Persist the schedule before it is visible anywhere: a crash between
     // here and the due time must still deliver the message after restart.
@@ -9028,6 +9150,10 @@ export class EventBus {
         ...(typeof opts.messageId === 'string' && opts.messageId.length > 0
           ? { messageId: opts.messageId }
           : {}),
+        // The producer label rides the schedule record so the rebuilt
+        // timer fans out with the original attribution (see
+        // `DelayedEntry.publisherId`).
+        ...(publisherId === undefined ? {} : { publisherId }),
       });
       if (!persisted) {
         // The schedule died before it existed: its keySeq will never fan
@@ -9159,6 +9285,13 @@ export class EventBus {
         undefined,
         top.traceparent,
         top.messageId,
+        false, // routed: a delayed fan-out re-enters the routing table like a fresh publish
+        undefined, // routedExpiresAt
+        false, // fromBridge
+        false, // diagnostic
+        undefined, // eventTime: delayed schedules carry no event-time stamp
+        undefined, // causal: delayed schedules carry no causal clock
+        top.publisherId, // the schedule's producer attribution survives the timer
       );
       this.appendDelayTombstone(top.id, top.topic);
       fannedOut = true;
@@ -9228,7 +9361,7 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const nowMs = this.now();
-    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string; keySeq?: number }>();
+    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string; keySeq?: number; messageId?: string; publisherId?: string }>();
     const closed = new Set<string>();
     // `readSince(topic, -1)`: the exclusive bound sits below every real
     // seq, so seq-0 schedule records and tombstones come along too.
@@ -9249,6 +9382,12 @@ export class EventBus {
             payload: rec.payload,
             key: rec.key,
             keySeq: rec.keySeq,
+            // The identity and the publisher label ride the schedule
+            // record so the rebuilt timer fans out with both intact
+            // (EB-65; the fold previously dropped `messageId` here — the
+            // entry below always intended to carry it).
+            messageId: rec.messageId,
+            publisherId: rec.publisherId,
           });
         }
       }
@@ -9273,6 +9412,9 @@ export class EventBus {
         // with its original number — never renumbered, never colliding.
         keySeq: rec.keySeq,
         messageId: rec.messageId,
+        // The producer attribution rides the rebuilt timer so the
+        // fan-out counts the publish under the original publisher.
+        publisherId: rec.publisherId,
       };
       this.delayedById.set(delayId, entry);
       this.delayHeap.push(entry);
@@ -9330,10 +9472,10 @@ export class EventBus {
    * sequence number is consumed (subscribers see no gap), the durable log
    * never sees it, and it does not burn rate-limit budget.
    */
-  private countSchemaRejection(topic: string, payload: unknown): void {
+  private countSchemaRejection(topic: string, payload: unknown, publisherId?: string): void {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
-    this.emitAdmissionRejected(topic, 'schema', payload);
+    this.emitAdmissionRejected(topic, 'schema', payload, publisherId);
   }
 
   /**
@@ -9346,10 +9488,10 @@ export class EventBus {
    * counter with schema rejections, distinguished by the `'message-too-big'`
    * hook reason.
    */
-  private countMessageTooBig(topic: string, payload: unknown): void {
+  private countMessageTooBig(topic: string, payload: unknown, publisherId?: string): void {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
-    this.emitAdmissionRejected(topic, 'message-too-big', payload);
+    this.emitAdmissionRejected(topic, 'message-too-big', payload, publisherId);
   }
 
   /**
@@ -9359,10 +9501,10 @@ export class EventBus {
    * caller stamps it before this runs, so the stats entry must already
    * exist here.
    */
-  private countRateLimited(topic: string, payload: unknown): void {
+  private countRateLimited(topic: string, payload: unknown, publisherId?: string): void {
     this.statsFor(topic).rateLimitedMessages += 1;
     this.totalRateLimited += 1;
-    this.emitAdmissionRejected(topic, 'rate-limit', payload);
+    this.emitAdmissionRejected(topic, 'rate-limit', payload, publisherId);
   }
 
   /**
@@ -9372,10 +9514,10 @@ export class EventBus {
    * — it creates the topic's stats entry when the topic has never
    * published anything yet.
    */
-  private countDuplicate(topic: string, payload: unknown): void {
+  private countDuplicate(topic: string, payload: unknown, publisherId?: string): void {
     this.statsFor(topic).duplicateMessages += 1;
     this.totalDuplicates += 1;
-    this.emitAdmissionRejected(topic, 'duplicate', payload);
+    this.emitAdmissionRejected(topic, 'duplicate', payload, publisherId);
   }
 
   /**
@@ -9387,10 +9529,10 @@ export class EventBus {
    * the admission-rejection hook with reason `'acl'`, and additionally
    * fires the authz audit hook.
    */
-  private countAclDenied(topic: string, payload: unknown): void {
+  private countAclDenied(topic: string, payload: unknown, publisherId?: string): void {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
-    this.emitAdmissionRejected(topic, 'acl', payload);
+    this.emitAdmissionRejected(topic, 'acl', payload, publisherId);
     this.emitAuthzDenied('publish', topic, undefined);
   }
 
@@ -9427,13 +9569,22 @@ export class EventBus {
     topic: string,
     reason: AdmissionRejectReason,
     payload: unknown,
+    publisherId?: string,
   ): void {
     const hook = this.onAdmissionRejected;
     if (hook === undefined) return;
     const serialized = serializeToJson(payload);
     const payloadBytes = serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
     try {
-      hook({ topic, reason, payloadBytes, at: this.now() });
+      hook({
+        topic,
+        reason,
+        payloadBytes,
+        at: this.now(),
+        // The rejected publish's producer label, when the publish carried
+        // one — so admission rejections stay attributable to their source.
+        ...(publisherId === undefined ? {} : { publisher: publisherId }),
+      });
     } catch {
       // Swallowed: the hook is an observer, not part of the publish path.
     }
@@ -10460,6 +10611,10 @@ export class EventBus {
     diagnostic = false,
     eventTime?: number,
     causal?: { source?: string; clock: number },
+    // Already-validated publisher identity (see `validatePublisherId`):
+    // the publish entry points validate, `fanOut` never does. Anonymous
+    // inbound (bridge, cluster) and internal replays pass `undefined`.
+    publisherId?: string,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -10479,7 +10634,7 @@ export class EventBus {
     // an alias that retired in between still refuses the publish.
     const aliasResolution = this.resolvePublishTopic(topic);
     if (aliasResolution.retired) {
-      this.countAliasRetired(topic, payload);
+      this.countAliasRetired(topic, payload, publisherId);
       return { matched: 0, accepted: 0, admitted: false };
     }
     topic = aliasResolution.topic;
@@ -10502,12 +10657,12 @@ export class EventBus {
       // the durable log, and burns no rate-limit budget. Counted as a
       // rejection with reason 'acl' (see countAclDenied).
       if (!this.aclAllowsPublish(topic)) {
-        this.countAclDenied(topic, payload);
+        this.countAclDenied(topic, payload, publisherId);
         return { matched: 0, accepted: 0, admitted: false };
       }
       const validator = this.schemaForTopic(topic);
       if (validator !== undefined && !validator(payload, topic)) {
-        this.countSchemaRejection(topic, payload);
+        this.countSchemaRejection(topic, payload, publisherId);
         return { matched: 0, accepted: 0, admitted: false };
       }
       // Per-topic maximum message size runs after schema validation and
@@ -10519,7 +10674,7 @@ export class EventBus {
       // reason 'message-too-big'.
       const maxBytes = this.maxMessageBytesForTopic(topic);
       if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
-        this.countMessageTooBig(topic, payload);
+        this.countMessageTooBig(topic, payload, publisherId);
         return { matched: 0, accepted: 0, admitted: false };
       }
     }
@@ -10533,6 +10688,9 @@ export class EventBus {
       payload,
       seq: this.nextSeq(topic),
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+      // The producer label rides the envelope so attribution survives
+      // durable-log replay, delayed schedules and cross-bus forwards.
+      ...(publisherId === undefined ? {} : { publisherId }),
       // Business event time rides the envelope (see `PublishOptions.eventTime`):
       // undefined stays absent, so messages without one never participate in
       // the watermark.
@@ -10546,6 +10704,12 @@ export class EventBus {
     stats.publishedMessages += 1;
     stats.lastSeq = msg.seq;
     this.totalPublished += 1;
+    // Per-publisher publish counting (EB-65): only admitted publishes
+    // count — a schema rejection or rate-limit shed above never reaches
+    // this line. Anonymous publishes move no per-publisher counter.
+    if (publisherId !== undefined) {
+      this.publisherCounts.set(publisherId, (this.publisherCounts.get(publisherId) ?? 0) + 1);
+    }
     // A delayed fan-out carries the per-key sequence number assigned at
     // schedule time (publish order) — it is used verbatim below, and it is
     // what the release hook needs when the rate limiter sheds the message.
@@ -10567,7 +10731,7 @@ export class EventBus {
         this.rateLimitBuckets.set(topic, bucket);
       }
       if (!bucket.take()) {
-        this.countRateLimited(topic, payload);
+        this.countRateLimited(topic, payload, publisherId);
         // The keySeq was consumed at schedule time but the message never
         // fans out: release every subscriber's expectation past it, or a
         // subscriber buffering a later keySeq for the same key would wait
@@ -10754,6 +10918,10 @@ export class EventBus {
       // a causal subscriber keeps happens-before order across restarts
       // and archived-segment reads.
       ...(causalStamp === undefined ? {} : { causal: causalStamp }),
+      // The publisher identity rides the log record so replay (and the
+      // delayed-schedule rebuild) restores the message's producer
+      // attribution instead of losing it across restarts.
+      ...(publisherId === undefined ? {} : { publisherId }),
     });
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the
@@ -10838,7 +11006,12 @@ export class EventBus {
             // The forwarded message is the same logical event on the
             // destination topic: its business event time rides along so the
             // destination's event-time watermark sees the same stream.
+            // The publisher identity rides along too — the forward is a
+            // new admission on the destination, attributable to the same
+            // producer.
             eventTime,
+            undefined, // causal: the route forward re-stamps nothing causal
+            publisherId,
           );
         }
       }
@@ -10875,6 +11048,9 @@ export class EventBus {
             ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
             ...(expiresAt === undefined ? {} : { expiresAt }),
             ...(eventTime === undefined ? {} : { eventTime }),
+            // Same logical publish, new bus: the producer attribution
+            // crosses with the frame.
+            ...(publisherId === undefined ? {} : { publisherId }),
           });
         }
       }
@@ -11212,6 +11388,15 @@ export class EventBus {
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
       dedupDropped: this.totalDedupDropped,
+      // Per-publisher publish totals (EB-65), most-published first; ties
+      // break on the identity so the ranking is deterministic across
+      // snapshots.
+      publishers: [...this.publisherCounts.entries()]
+        .map(([publisher, publishedMessages]) => ({ publisher, publishedMessages }))
+        .sort((a, b) => {
+          if (b.publishedMessages !== a.publishedMessages) return b.publishedMessages - a.publishedMessages;
+          return a.publisher < b.publisher ? -1 : 1;
+        }),
       aliasRetiredMessages: this.totalAliasRetired,
       bridge: {
         inbound: this.bridgeInbound,

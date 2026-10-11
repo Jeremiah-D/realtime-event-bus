@@ -53,6 +53,14 @@ export interface DelayedEntry {
    * message like any live publish.
    */
   messageId?: string;
+  /**
+   * Publisher identity carried from `PublishDelayedOptions` into the
+   * fan-out (see `PublishOptions.publisherId`): stamped onto the envelope
+   * and counted toward the publisher's published total when the schedule
+   * fans out, so a delayed publish keeps its producer attribution across
+   * restarts.
+   */
+  publisherId?: string;
 }
 
 interface HeapNode {

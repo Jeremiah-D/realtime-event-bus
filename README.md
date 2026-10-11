@@ -1517,6 +1517,50 @@ Rerun the script to reproduce.
 node bench/batch.bench.ts
 ```
 
+## Publisher identity
+
+Every publish entry point accepts an optional `publisherId` — a
+producer-side label (service name, client id, tenant) that makes publish
+traffic attributable:
+
+```ts
+bus.publish('orders.created', order, { publisherId: 'checkout-svc' });
+bus.publishIdempotent('payments.settled', payment, {
+  messageId: payment.id,
+  publisherId: 'payments-svc',
+});
+// per-entry on batch/atomic, and on publishDelayed too
+bus.publishBatch([{ topic: 't', payload: x, publisherId: 'etl' }]);
+```
+
+The identity is 1–64 ASCII alphanumeric, `_` or `-` characters; anything
+else throws `RangeError` before the publish mutates any state. It is a
+label, not a credential — the bus never authenticates it.
+
+What it buys:
+
+- **Per-publisher counters** — only publishes that clear admission count
+  (a schema rejection or rate-limit shed never claims a slot, and a
+  suppressed idempotent duplicate is not a publish). `getStats().publishers`
+  lists every identity with its total, most-published first; anonymous
+  publishes move no per-publisher counter.
+- **Attribution on rejections** — every `onAdmissionRejected` event carries
+  `publisher` when the rejected publish carried one, so a poison producer
+  is visible at the same place its rejects are counted.
+- **End-to-end attribution** — the identity rides the message envelope and
+  the durable-log record: `resumeFromSeq` replays restore it, delayed
+  schedules keep it across restarts (a rebuilt timer fans out under the
+  original publisher), topic routes and cross-bus forwards carry it to the
+  destination's admission. Bridge and cluster inbound are the deliberate
+  exception: a receiving node treats remote traffic as anonymous inbound —
+  the origin node already counted the publish under its publisher.
+
+The identity also renders as
+`eventbus_publisher_published_messages_total{publisher}` in the
+Prometheus exposition (see above) — emitted only when at least one
+publisher has admitted a publish, so a publisher-free bus renders
+byte-identical exposition to before.
+
 ## Prometheus metrics
 
 `src/metrics.ts` renders a `getStats()` snapshot as Prometheus text
@@ -1577,6 +1621,13 @@ Exported series:
 | `eventbus_topic_rate_msg_per_sec{topic,window}` | gauge | per-topic publish rate in messages/sec over the trailing window (`window` = "1s"/"1m"/"5m"), load-average style; hot topics only (top 10 by 1m rate) |
 | `eventbus_group_lag_messages{group,topic}` | gauge | consumer-group lag per (group, topic): assigned seq minus consumer checkpoint, excluding live handoff-linger holds |
 | `eventbus_group_partition_lag_messages{group,topic,partition}` | gauge | per-partition consumer-group lag for partitioned groups |
+| `eventbus_publisher_published_messages_total{publisher}` | counter | admitted publishes per publisher identity (`PublishOptions.publisherId`); only emitted when at least one publisher has admitted a publish |
+
+The per-publisher series grow with the distinct publisher identities ever
+admitted — the same bound as `BusStats.publishers` — so a bus admitting
+millions of ad-hoc identities grows the series count. Identities come from
+the producer, so this is bounded by the application's own producer space;
+anonymous publishes add no series at all.
 
 The per-topic series grow with the distinct topics ever published to — the
 same bound as `BusStats.topics` — so a bus fanning out over millions of

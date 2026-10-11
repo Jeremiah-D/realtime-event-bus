@@ -32,6 +32,14 @@ export interface DurableLogRecord {
    * intact.
    */
   messageId?: string;
+  /**
+   * Publisher identity (see `PublishOptions.publisherId`), present when
+   * the publish carried one. Replay and the delayed-schedule rebuild
+   * restore it onto the envelope, so producer attribution survives
+   * restarts. Also carried on seq-0 delayed-delivery schedule records so
+   * a restart rebuilds the timer with the attribution intact.
+   */
+  publisherId?: string;
   /** Concrete topic name, as published. */
   topic: string;
   /**
@@ -1793,6 +1801,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.messageId !== undefined) line.messageId = record.messageId;
   if (record.eventTime !== undefined) line.eventTime = record.eventTime;
   if (record.causal !== undefined) line.causal = { source: record.causal.source, clock: record.causal.clock };
+  if (record.publisherId !== undefined) line.publisherId = record.publisherId;
   return line;
 }
 
@@ -1907,6 +1916,16 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       return null;
     }
     record.causal = { source: causal['source'] as string, clock: causal['clock'] as number };
+  }
+  if (o['publisherId'] !== undefined) {
+    // The publisher identity is an attribution label, not ordering
+    // metadata — but a malformed value still makes the line corrupt: the
+    // bus only ever writes valid identities, so a bad one means the line
+    // was tampered with or miswritten.
+    if (typeof o['publisherId'] !== 'string' || (o['publisherId'] as string).length === 0) {
+      return null;
+    }
+    record.publisherId = o['publisherId'] as string;
   }
   // A non-tombstone schedule record must say when it is due.
   if (isScheduleRecord && record.cancelled !== true && record.deliverAt === undefined) return null;
