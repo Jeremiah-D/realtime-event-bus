@@ -774,6 +774,23 @@ library.
   draining the backlog when no new publishes arrive; `getStats()` reports
   actively-shaped subscribers via `shapedSubscribers`. Invalid options throw
   `RangeError` from `subscribe`. Disabled by default.
+- **Subscriber slow-start** (in `src/slowstart.ts`, opt-in via
+  `subscribe(..., { slowStart: true })`): cold-start protection for a fresh
+  subscription. After the subscription is created, delivery is paced by a
+  ramping gate — the allowed rate climbs from `initialPerSec` (default 10)
+  up to the subscriber's full speed over `rampMs` (default 1000ms),
+  `'linear'` interpolating the rate and `'exponential'` growing it
+  geometrically, so a new downstream is never flooded before it has warmed
+  up. When `deliveryShaping` is configured the ramp targets its cap;
+  without shaping the ramp has no finite ceiling and opens fully when the
+  window elapses. Once the ramp completes the gate is dropped — zero
+  overhead afterwards. Composes orthogonally with `deliveryShaping` and
+  `maxInflight` (a message is delivered only when every enabled gate allows
+  it); messages held back stay queued in FIFO order, never dropped, and a
+  re-flush timer (unref'd, derived from the bus clock) keeps draining the
+  backlog when no new publishes arrive. `getStats().rampingSubscribers`
+  counts subscriptions still ramping. Invalid options throw `RangeError`
+  from `subscribe`; cannot be combined with `shadow`. Disabled by default.
 - **Per-subscriber sliding-window delivery rate limit** (in
   `src/ratewindow.ts`, opt-in via
   `subscribe(..., { rateLimit: { maxMessages, perWindowMs } })`): a hard

@@ -145,6 +145,7 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     throttledSubscribers: 0,
     degradedSubscribers: 0,
     shapedSubscribers: 0,
+    rampingSubscribers: 0,
     pendingDelayed: 0,
     deliveryLatency: [],
     slowestSubscribers: [],

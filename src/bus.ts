@@ -10,6 +10,11 @@ import { AckTracker, type Delivery } from './ack.ts';
 import { TokenBucket } from './throttle.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
+  createSlowStartGate,
+  type SlowStartGate,
+  type SlowStartOptions,
+} from './slowstart.ts';
+import {
   DeliveryLatencyTracker,
   type DeliveryLatencyOptions,
   type DeliveryLatencySummaryStats,
@@ -110,6 +115,7 @@ export type {
   AckSloMissEvent,
 } from './acklatency.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
+export type { SlowStartOptions, SlowStartStrategy } from './slowstart.ts';
 export type { LeaseExpiredCallback, LeaseExpiredEvent } from './lease.ts';
 export type { IdleActivityMode, IdleExpiredCallback, IdleExpiredEvent } from './idle.ts';
 export type { LateMessageCallback, LateMessageEvent } from './watermark.ts';
@@ -443,6 +449,29 @@ export interface SubscribeOptions {
    * throw `RangeError` from `subscribe`.
    */
   deliveryShaping?: boolean | DeliveryShapingOptions;
+  /**
+   * Opt-in subscriber slow-start: cold-start protection for a fresh
+   * subscription (EB-75). After the subscription is created, delivery is
+   * paced by a ramping gate — the allowed rate climbs from `initialPerSec`
+   * up to the subscriber's full speed over `rampMs` (`'linear'` interpolates
+   * the rate, `'exponential'` grows it geometrically), so a new downstream
+   * is never flooded before it has warmed up. When `deliveryShaping` is
+   * configured the ramp targets its cap; without shaping the ramp has no
+   * finite ceiling and opens fully when the window elapses. Once the ramp
+   * completes the gate is dropped — zero overhead afterwards.
+   *
+   * Composes orthogonally with `deliveryShaping` and `maxInflight`: a
+   * message is delivered only when every enabled gate allows it (the
+   * effective budget is the minimum). Messages held back stay queued in
+   * FIFO order, never dropped — TTL expiry still applies while they wait.
+   * `getStats().rampingSubscribers` counts subscriptions still ramping.
+   *
+   * Pass `true` for the defaults (10 messages/sec initial, 1s linear
+   * ramp), or a `SlowStartOptions` object to tune. Invalid values throw
+   * `RangeError` from `subscribe`. Cannot be combined with `shadow`.
+   * Disabled by default.
+   */
+  slowStart?: boolean | SlowStartOptions;
   /**
    * Opt-in per-subscriber cap on simultaneously unsettled handler
    * invocations during drain (EB-67). When the number of handler
@@ -2305,6 +2334,14 @@ export interface BusStats {
    */
   shapedSubscribers: number;
   /**
+   * Subscriptions currently in their slow-start ramp (see
+   * `SubscribeOptions.slowStart`): the ramp window has not elapsed yet,
+   * so delivery is still paced below the subscriber's full speed. Once
+   * the ramp completes the gate is dropped and the subscriber leaves
+   * this count.
+   */
+  rampingSubscribers: number;
+  /**
    * Per-subscriber sliding-window rate-limit backlog (see
    * `SubscribeOptions.rateLimit`): one row per subscriber with the limit
    * enabled, carrying the messages currently held back for lack of window
@@ -2767,6 +2804,12 @@ interface Subscriber {
    * Absent when shaping is disabled for this subscriber.
    */
   deliveryShaping?: DeliveryShapingState;
+  /**
+   * Slow-start ramp gate (see `SubscribeOptions.slowStart`). Present only
+   * while the ramp window has not elapsed — once the ramp completes the
+   * gate is dropped, so a warmed-up subscriber pays nothing for it.
+   */
+  slowStart?: SlowStartGate;
   /**
    * Max in-flight delivery cap state (see `SubscribeOptions.maxInflight`).
    * Absent when the cap is disabled for this subscriber.
@@ -7825,6 +7868,7 @@ export class EventBus {
       const incompatible: Array<[string, unknown]> = [
         ['throttle', opts?.throttle],
         ['deliveryShaping', opts?.deliveryShaping],
+        ['slowStart', opts?.slowStart],
         ['rateLimit', opts?.rateLimit],
         ['healthProbe', opts?.healthProbe],
         ['batch', opts?.batch],
@@ -7881,6 +7925,14 @@ export class EventBus {
     // half-registered subscriber behind.
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind. The ramp targets the shaping
+    // cap when shaping is configured, full speed otherwise.
+    const slowStart = createSlowStartGate(
+      opts?.slowStart,
+      deliveryShaping?.messagesPerSec,
+      this.now,
+    );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const maxInflight = resolveMaxInflightOptions(opts?.maxInflight);
@@ -8024,6 +8076,7 @@ export class EventBus {
       throttle,
       onThrottled,
       deliveryShaping,
+      slowStart,
       maxInflight: maxInflight == null ? undefined : { max: maxInflight, inFlight: 0 },
       // Idle auto-reclamation (EB-72): the mode marker doubles as the
       // opt-in flag — recordIdleActivity gates on it, so non-opt-in
@@ -8125,6 +8178,7 @@ export class EventBus {
           health.autoResumeTimer = undefined;
         }
         this.clearShapingTimer(subscriber);
+        this.clearSlowStartTimer(subscriber);
         this.clearRateLimitTimer(subscriber);
         this.clearBatchTimer(subscriber);
         this.clearWindowTimer(subscriber);
@@ -13175,6 +13229,7 @@ export class EventBus {
     let throttledSubscribers = 0;
     let degradedSubscribers = 0;
     let shapedSubscribers = 0;
+    let rampingSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
     const ackLatency: BusStats['ackLatency'] = [];
     const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
@@ -13190,6 +13245,8 @@ export class EventBus {
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
+      const slowStart = subscriber.slowStart;
+      if (slowStart !== undefined && !slowStart.isComplete(ratesNow)) rampingSubscribers += 1;
       // Shadow mirror counters (see `SubscribeOptions.shadow`): the
       // independent stats surface for shadow traffic, in subscription
       // order — one row per live shadow subscription.
@@ -13413,6 +13470,7 @@ export class EventBus {
       throttledSubscribers,
       degradedSubscribers,
       shapedSubscribers,
+      rampingSubscribers,
       rateLimitedWaiting,
       inFlightUsage,
       pendingDelayed: this.delayedById.size,
@@ -13961,19 +14019,24 @@ export class EventBus {
       const shaping = subscriber.deliveryShaping;
       const rateLimit = subscriber.rateLimit;
       const maxInflight = subscriber.maxInflight;
+      const slowStart = subscriber.slowStart;
       // Shaping paces the round first (smoothing bursts); the sliding
       // window then enforces the hard cap; the in-flight cap bounds how
-      // many unsettled handler invocations one round may open — a message
-      // is delivered only when all three allow it. At the in-flight cap the
-      // drain pulls nothing new: queued messages wait in FIFO order, never
-      // dropped, until a handler settles and frees a slot.
+      // many unsettled handler invocations one round may open; the
+      // slow-start gate (EB-75) paces a fresh subscription's ramp — a
+      // message is delivered only when all four allow it. At the
+      // in-flight cap the drain pulls nothing new: queued messages wait
+      // in FIFO order, never dropped, until a handler settles and frees
+      // a slot.
       const shapingMaxLive = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
       const rateLimitMaxLive = rateLimit == null ? Infinity : rateLimit.limiter.budget(nowMs);
       const inflightMaxLive =
         maxInflight == null ? Infinity : Math.max(0, maxInflight.max - maxInflight.inFlight);
+      const slowStartMaxLive =
+        slowStart == null ? Infinity : Math.floor(slowStart.availableTokens(nowMs));
       const { live, expired } = subscriber.queue.drainLiveUpTo(
         nowMs,
-        Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive),
+        Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive, slowStartMaxLive),
       );
       for (const msg of expired) {
         this.recordExpired(msg.topic);
@@ -13985,6 +14048,9 @@ export class EventBus {
           // floor(availableTokens), and nothing else consumes this
           // subscriber's bucket in between.
           shaping?.bucket.take();
+          // The slow-start gate consumes one token per delivered message,
+          // mirroring the shaping take — same guarantee, same reasoning.
+          slowStart?.take(nowMs);
           // The window counts actual deliveries, mirroring the shaping
           // take: dequeued-but-expired messages never reach this loop, so
           // TTL expiry consumes no window budget.
@@ -14035,6 +14101,7 @@ export class EventBus {
       } else {
         for (let i = 0; i < live.length; i += 1) {
           shaping?.bucket.take();
+          slowStart?.take(nowMs);
           rateLimit?.limiter.record(nowMs);
           this.inflateMessagePayload(live[i]);
           this.invokeWithInflightSlot(subscriber, (): unknown =>
@@ -14074,6 +14141,9 @@ export class EventBus {
           this.clearRateLimitTimer(subscriber);
         }
       }
+      if (slowStart != null) {
+        this.updateSlowStart(subscriber, slowStart, nowMs, subscriber.queue.size > 0);
+      }
     }
     // Re-evaluate the lag watermark after the drain: the head may have
     // moved (re-arming a fired alert) or the remaining backlog may still
@@ -14100,6 +14170,7 @@ export class EventBus {
     if (batch == null) return;
     const shaping = subscriber.deliveryShaping;
     const rateLimit = subscriber.rateLimit;
+    const slowStart = subscriber.slowStart;
     const shapingBudget = shaping == null ? Infinity : Math.floor(shaping.bucket.availableTokens);
     // Pending messages already reserve window budget (recorded at hand-off
     // in deliverBatch), so collection must not exceed what is still free —
@@ -14107,7 +14178,9 @@ export class EventBus {
     // window before any delivery is recorded.
     const rateLimitBudget =
       rateLimit == null ? Infinity : Math.max(0, rateLimit.limiter.budget(nowMs) - batch.pending.length);
-    const budget = Math.min(shapingBudget, rateLimitBudget);
+    const slowStartBudget =
+      slowStart == null ? Infinity : Math.floor(slowStart.availableTokens(nowMs));
+    const budget = Math.min(shapingBudget, rateLimitBudget, slowStartBudget);
     if (budget >= 1) {
       const room = batch.maxSize - batch.pending.length;
       if (room > 0) {
@@ -14137,6 +14210,14 @@ export class EventBus {
           this.clearRateLimitTimer(subscriber);
         }
       }
+      if (slowStart != null) {
+        this.updateSlowStart(
+          subscriber,
+          slowStart,
+          nowMs,
+          subscriber.queue.size > 0 || batch.pending.length > 0,
+        );
+      }
       return;
     }
     if (batch.pending.length >= batch.maxSize) {
@@ -14145,6 +14226,14 @@ export class EventBus {
       this.armBatchTimer(subscriber);
     } else {
       this.clearBatchTimer(subscriber);
+    }
+    if (slowStart != null) {
+      this.updateSlowStart(
+        subscriber,
+        slowStart,
+        nowMs,
+        subscriber.queue.size > 0 || batch.pending.length > 0,
+      );
     }
   }
 
@@ -14182,6 +14271,12 @@ export class EventBus {
     const shaping = subscriber.deliveryShaping;
     if (shaping != null) {
       for (let i = 0; i < live.length; i += 1) shaping.bucket.take();
+    }
+    // The whole batch occupies slow-start budget the same way: one token
+    // per message, mirroring the plain path.
+    const slowStart = subscriber.slowStart;
+    if (slowStart != null) {
+      for (let i = 0; i < live.length; i += 1) slowStart.take(nowMs);
     }
     // The whole batch occupies window budget the same way: one recorded
     // delivery per message, stamped at hand-off — a message that expired
@@ -14559,6 +14654,93 @@ export class EventBus {
     if (shaping?.timer !== undefined) {
       clearTimeout(shaping.timer);
       shaping.timer = undefined;
+    }
+  }
+
+  /**
+   * Post-drain slow-start bookkeeping (EB-75): drops the gate once the
+   * ramp window has elapsed (the subscriber runs at full speed from here
+   * on); otherwise arms the re-flush timer exactly when the gate is the
+   * binding constraint — backlog present AND no budget left. A backlog
+   * held back by shaping, the window or the in-flight cap while the gate
+   * still has room is not slow-start's doing, so no timer spins there
+   * (the same precision the rate-limit timer uses).
+   */
+  private updateSlowStart(
+    subscriber: Subscriber,
+    slowStart: SlowStartGate,
+    nowMs: number,
+    hasBacklog: boolean,
+  ): void {
+    if (slowStart.isComplete(nowMs)) {
+      this.clearSlowStartTimer(subscriber);
+      subscriber.slowStart = undefined;
+      return;
+    }
+    if (hasBacklog && slowStart.availableTokens(nowMs) < 1) {
+      this.armSlowStartTimer(subscriber);
+    } else {
+      this.clearSlowStartTimer(subscriber);
+    }
+  }
+
+  /**
+   * Arms the re-flush timer for a slow-starting subscriber that is holding
+   * messages back: when the ramp accrues budget, the timer triggers
+   * another flush so the backlog drains even when no new publishes arrive.
+   * The delay is derived from the bus clock (consistent with the gate);
+   * the timer itself is a real wall-clock timeout — like the shaping
+   * re-flush timer — and never keeps the process alive on its own. Firing
+   * only schedules a flush when the gate is still ramping and actually has
+   * budget; otherwise it re-arms, so a clock that has not advanced cannot
+   * spin the flush loop. When the ramp completes mid-wait the gate is
+   * dropped and one flush runs the backlog at full speed.
+   */
+  private armSlowStartTimer(subscriber: Subscriber): void {
+    const slowStart = subscriber.slowStart;
+    if (slowStart == null || slowStart.timer !== undefined) return;
+    const nowMs = this.now();
+    if (slowStart.isComplete(nowMs)) {
+      this.clearSlowStartTimer(subscriber);
+      subscriber.slowStart = undefined;
+      this.scheduleFlush();
+      return;
+    }
+    const delayMs = Math.max(0, Math.ceil(slowStart.msUntilNextToken(nowMs)));
+    const timer = setTimeout(() => {
+      slowStart.timer = undefined;
+      // The subscriber may have unsubscribed while the timer was armed —
+      // only a still-registered subscriber holding the same gate proceeds.
+      if (this.subscribers.get(subscriber.id) !== subscriber) return;
+      const gate = subscriber.slowStart;
+      if (gate == null) return;
+      const at = this.now();
+      if (gate.isComplete(at)) {
+        this.clearSlowStartTimer(subscriber);
+        subscriber.slowStart = undefined;
+        this.scheduleFlush();
+        return;
+      }
+      if (gate.availableTokens(at) < 1) {
+        this.armSlowStartTimer(subscriber);
+        return;
+      }
+      this.scheduleFlush();
+    }, delayMs);
+    // A ramping backlog must not keep the process alive on its own.
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    slowStart.timer = timer;
+  }
+
+  /**
+   * Cancels a slow-starting subscriber's pending re-flush timer, if any.
+   */
+  private clearSlowStartTimer(subscriber: Subscriber): void {
+    const slowStart = subscriber.slowStart;
+    if (slowStart?.timer !== undefined) {
+      clearTimeout(slowStart.timer);
+      slowStart.timer = undefined;
     }
   }
 
