@@ -488,6 +488,29 @@ library.
   rule wins over patterns, the earliest-registered matching pattern wins, and
   re-setting a rule resets the topic's budget. `clearTopicRateLimit` removes
   a rule. Invalid configurations throw `RangeError`.
+- **Per-publisher publish rate limiting** (in `src/bus.ts`, via
+  `setPublisherRateLimit(publisherId, { messagesPerSec, burst })`): a token
+  bucket per publisher identity (refilled from the bus clock, so tests stay
+  deterministic) caps how many messages per second one producer may publish —
+  so a single hot publisher cannot saturate the bus.
+  The first `burst` messages (default: one second of budget) publish
+  instantly. A publish that finds the publisher's bucket empty is shed in the
+  admission phase, ahead of every other admission gate: it consumes no
+  sequence number (subscribers see no gap), is never fanned out, never
+  written to the durable log, never queued, and burns no topic rate-limit
+  budget; `publish` returns 0 for it. The shed is counted in
+  `TopicStats.publisherRateLimited` (and the global total, also rendered as
+  `eventbus_publisher_rate_limited_messages_total`) and surfaces on
+  `onAdmissionRejected` with reason `'publisher-rate-limit'`. Publishes
+  without a `publisherId` — and publishers with no configured limit — are
+  unaffected. `publishBatch` sheds over-budget entries one by one;
+  `publishAtomic` checks the batch in shadow admission (an over-budget entry
+  aborts the whole batch with reason `'publisher-rate-limit'`);
+  `publishDelayed` fails fast at schedule time; a suppressed idempotent
+  duplicate never reaches the gate, so retries burn no publisher budget.
+  `clearPublisherRateLimit` removes a rule (unknown id is a no-op returning
+  `false`). Invalid publisher identities and invalid rate values throw
+  `RangeError`.
 - **Publish-side schema validation** (in `src/bus.ts`, via
   `setTopicSchema(pattern, validator)`): an admission gate for malformed
   payloads. A publish whose payload makes the validator return `false` is
@@ -1770,6 +1793,17 @@ What it buys:
 - **Attribution on rejections** — every `onAdmissionRejected` event carries
   `publisher` when the rejected publish carried one, so a poison producer
   is visible at the same place its rejects are counted.
+- **Per-publisher rate limiting** (real-time systems / backend engineering)
+  — `setPublisherRateLimit(publisherId, { messagesPerSec, burst })` puts a
+  token bucket on one producer: an over-budget publish is shed in the
+  admission phase, ahead of every other gate — no sequence number consumed
+  (subscribers see no gap), never fanned out, never logged, no topic
+  rate-limit budget burned. Counted in `getStats().publisherRateLimited`
+  (also `eventbus_publisher_rate_limited_messages_total` in the Prometheus
+  exposition) and surfaced on `onAdmissionRejected` with reason
+  `'publisher-rate-limit'`; `clearPublisherRateLimit` removes the rule.
+  Anonymous publishes and unconfigured publishers stay unlimited, so the
+  limit is opt-in per producer.
 - **End-to-end attribution** — the identity rides the message envelope and
   the durable-log record: `resumeFromSeq` replays restore it, delayed
   schedules keep it across restarts (a rebuilt timer fans out under the

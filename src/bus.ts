@@ -1811,15 +1811,18 @@ export interface EventBusOptions {
    * Unified publish-side admission-rejection hook: called once for every
    * publish the admission gates drop — ACL denials (`'acl'`, see
    * `setAclRules`), schema-validation rejections
-   * (`'schema'`, see `setTopicSchema`), rate-limit sheds (`'rate-limit'`,
-   * see `setTopicRateLimit`), idempotency-duplicate suppressions
+   * (`'schema'`, see `setTopicSchema`), per-topic rate-limit sheds
+   * (`'rate-limit'`, see `setTopicRateLimit`), per-publisher rate-limit
+   * sheds (`'publisher-rate-limit'`, see `setPublisherRateLimit`),
+   * idempotency-duplicate suppressions
    * (`'duplicate'`, see `publishIdempotent`), retired-alias rejections
    * (`'alias-retired'`, see `setTopicAlias`), and `publishAtomic` batch
    * rejections (surfaced with the failing entry's gate reason).
    *
    * `reason` maps 1:1 onto the stats counters
    * (`TopicStats.rejectedMessages` / `.rateLimitedMessages` /
-   * `.duplicateMessages` / `.aliasRetiredMessages`, and the `BusStats` totals), so hook events
+   * `.publisherRateLimited` / `.duplicateMessages` / `.aliasRetiredMessages`,
+   * and the `BusStats` totals), so hook events
    * reconcile exactly against `getStats()` — every counted rejection
    * fires exactly one event, and vice versa.
    *
@@ -2002,6 +2005,15 @@ export interface TopicStats {
    * expirations get.
    */
   rateLimitedMessages: number;
+  /**
+   * Messages on this topic shed by per-publisher publish-side rate
+   * limiting (see `setPublisherRateLimit`): the publisher's token bucket
+   * was empty when the message was published, so it was never fanned out
+   * to any subscriber. The shed happens in the admission phase — before
+   * sequence-number assignment — so unlike a topic rate-limit shed it
+   * consumes no sequence number and subscribers see no gap.
+   */
+  publisherRateLimited: number;
   /**
    * Publishes to this topic rejected by admission gates that fire before
    * admission — schema validation (see `setTopicSchema`), the broker-level
@@ -2241,6 +2253,12 @@ export interface BusStats {
    * `TopicStats.rateLimitedMessages` for the exact counting rules.
    */
   rateLimitedMessages: number;
+  /**
+   * Total messages shed by per-publisher publish-side rate limiting — the
+   * sum of every topic's `publisherRateLimited`. See
+   * `TopicStats.publisherRateLimited` for the exact counting rules.
+   */
+  publisherRateLimited: number;
   /**
    * Total publishes rejected by admission gates before admission — schema
    * validation, the broker-level ACL, the per-topic message-size cap, and
@@ -3118,6 +3136,7 @@ function zeroedTopicStats(): {
   lastSeq: number;
   sequenceGaps: number;
   rateLimitedMessages: number;
+  publisherRateLimited: number;
   rejectedMessages: number;
   lateMessages: number;
   duplicateMessages: number;
@@ -3137,6 +3156,7 @@ function zeroedTopicStats(): {
     lastSeq: 0,
     sequenceGaps: 0,
     rateLimitedMessages: 0,
+    publisherRateLimited: 0,
     rejectedMessages: 0,
     lateMessages: 0,
     duplicateMessages: 0,
@@ -4303,18 +4323,20 @@ function resolveDeduplicateMessagesOptions(
 export type SchemaValidator = (payload: unknown, topic: string) => boolean;
 
 /**
- * Why one entry of an atomic batch was rejected: the ACL denied the publish
- * (`'acl'`), its payload failed the topic's schema validator (`'schema'`),
- * its payload exceeded the topic's per-message size cap
- * (`'message-too-big'`), or the topic's rate-limit bucket had no token left
- * for it (`'rate-limit'`). TTL expiry is drain-time and never rejects a
- * publish, so it cannot appear here.
+ * Why one entry of an atomic batch was rejected: the publisher's
+ * rate-limit budget had no token left for it (`'publisher-rate-limit'`),
+ * the ACL denied the publish (`'acl'`), its payload failed the topic's
+ * schema validator (`'schema'`), its payload exceeded the topic's
+ * per-message size cap (`'message-too-big'`), or the topic's rate-limit
+ * bucket had no token left for it (`'rate-limit'`). TTL expiry is
+ * drain-time and never rejects a publish, so it cannot appear here.
  */
 export type AtomicRejectReason =
   | 'acl'
   | 'schema'
   | 'message-too-big'
   | 'rate-limit'
+  | 'publisher-rate-limit'
   | 'alias-retired';
 
 /**
@@ -4333,6 +4355,10 @@ export type AtomicRejectReason =
  *   `'schema'`, distinguished by the reason)
  * - `'rate-limit'` → `TopicStats.rateLimitedMessages` /
  *   `BusStats.rateLimitedMessages` (topic token bucket empty, EB-19)
+ * - `'publisher-rate-limit'` → `TopicStats.publisherRateLimited` /
+ *   `BusStats.publisherRateLimited` (per-publisher token bucket empty,
+ *   EB-79; shed in the admission phase — no sequence number consumed, so
+ *   unlike a `'rate-limit'` shed it is invisible to gap detection)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
  * - `'alias-retired'` → `TopicStats.aliasRetiredMessages` /
@@ -4341,7 +4367,7 @@ export type AtomicRejectReason =
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
- * `'rate-limit'` | `'alias-retired'`); the batch rejection
+ * `'rate-limit'` | `'publisher-rate-limit'` | `'alias-retired'`); the batch rejection
  * is counted once against that entry's topic, so it stays reconcilable
  * too.
  */
@@ -4350,6 +4376,7 @@ export type AdmissionRejectReason =
   | 'schema'
   | 'message-too-big'
   | 'rate-limit'
+  | 'publisher-rate-limit'
   | 'duplicate'
   | 'alias-retired';
 
@@ -5702,6 +5729,7 @@ export class EventBus {
       lastSeq: number;
       sequenceGaps: number;
       rateLimitedMessages: number;
+      publisherRateLimited: number;
       rejectedMessages: number;
       duplicateMessages: number;
       filteredMessages: number;
@@ -5865,6 +5893,29 @@ export class EventBus {
    */
   private rateLimitBuckets = new Map<string, TokenBucket>();
   private totalRateLimited = 0;
+  /**
+   * Per-publisher publish rate limits (EB-79), keyed by the cleaned
+   * publisher identity (`cleanPublisherId`). Unlike the per-topic rules
+   * there are no wildcards: a publisher either has a configured budget or
+   * is unlimited.
+   */
+  private publisherRateLimitRules = new Map<string, { messagesPerSec: number; burst: number }>();
+  /**
+   * Token buckets per publisher identity, created lazily on the first
+   * publish carrying that identity that reaches the gate and refilled
+   * from the injected clock (`EventBusOptions.now`), so publisher rate
+   * limiting is deterministic in tests. Re-setting a publisher's rule
+   * resets only that publisher's bucket — other publishers keep their
+   * remaining budget.
+   */
+  private publisherRateLimitBuckets = new Map<string, TokenBucket>();
+  /**
+   * Messages shed by per-publisher publish-side rate limiting (global
+   * total). A shed happens in the admission phase — before sequence-number
+   * assignment — so unlike a topic rate-limit shed it consumes no
+   * sequence number and subscribers see no gap.
+   */
+  private totalPublisherRateLimited = 0;
   /**
    * Bus-wide default allowed lateness in milliseconds for event-time
    * watermark tracking (see `EventBusOptions.allowedLatenessMs`).
@@ -6634,6 +6685,72 @@ export class EventBus {
   clearTopicRateLimit(topicPattern: string): boolean {
     const removed = this.rateLimitRules.delete(topicPattern);
     if (removed) this.rateLimitBuckets.clear();
+    return removed;
+  }
+
+  /**
+   * Caps how many messages per second one publisher may publish (EB-79),
+   * enforced by a per-publisher token bucket at the publish side.
+   * `publisherId` is a producer identity (`PublishOptions.publisherId` —
+   * the same 1–64 ASCII alphanumeric/`_`/`-` shape as
+   * `validatePublisherId`); an invalid identity throws `RangeError`
+   * before any rule is touched. The first `burst` messages (default: one
+   * second of budget) publish instantly; afterwards the bucket refills at
+   * `messagesPerSec` per second. Publishes without a `publisherId` — and
+   * publishers with no configured limit — are unaffected.
+   *
+   * A publish that finds the publisher's bucket empty is shed in the
+   * admission phase, ahead of every other admission gate: it consumes no
+   * sequence number (subscribers see no gap), is never fanned out, never
+   * written to the durable log, never queued, and burns no topic
+   * rate-limit budget; `publish` returns 0 for it. The shed is counted in
+   * `TopicStats.publisherRateLimited` (and the global total) and
+   * surfaced on the admission-rejection hook with reason
+   * `'publisher-rate-limit'`. Re-setting a publisher's rule replaces it
+   * and resets only that publisher's budget.
+   *
+   * `publishBatch` sheds over-budget entries one by one while the rest
+   * still publish; `publishAtomic` checks the batch in shadow admission —
+   * an over-budget entry aborts the whole batch with reason
+   * `'publisher-rate-limit'`; `publishDelayed` fails fast at schedule
+   * time; a suppressed idempotent duplicate never reaches the gate, so
+   * retries of duplicates burn no publisher budget. Throws when
+   * `publisherId` is invalid, when `messagesPerSec` is not a positive
+   * finite number, or when `burst` is not a positive finite number.
+   */
+  setPublisherRateLimit(publisherId: string, opts: { messagesPerSec: number; burst?: number }): void {
+    const clean = cleanPublisherId(publisherId);
+    if (clean === undefined) {
+      throw new RangeError(
+        "setPublisherRateLimit: publisherId must be 1-64 ASCII alphanumeric, '_' or '-' characters",
+      );
+    }
+    if (!Number.isFinite(opts.messagesPerSec) || opts.messagesPerSec <= 0) {
+      throw new RangeError(
+        'setPublisherRateLimit: messagesPerSec must be a positive finite number of messages per second',
+      );
+    }
+    const burst = opts.burst ?? Math.max(1, Math.ceil(opts.messagesPerSec));
+    if (!Number.isFinite(burst) || burst <= 0) {
+      throw new RangeError('setPublisherRateLimit: burst must be a positive finite number of messages');
+    }
+    this.publisherRateLimitRules.set(clean, { messagesPerSec: opts.messagesPerSec, burst });
+    // Reset only this publisher's budget: other publishers keep the
+    // tokens they have left.
+    this.publisherRateLimitBuckets.delete(clean);
+  }
+
+  /**
+   * Removes the rate-limit rule previously registered for `publisherId`.
+   * Returns true when a rule existed and was removed; an unknown (or
+   * invalid — it could never have matched a rule) publisher id is a
+   * no-op returning false.
+   */
+  clearPublisherRateLimit(publisherId: string): boolean {
+    const clean = cleanPublisherId(publisherId);
+    if (clean === undefined) return false;
+    const removed = this.publisherRateLimitRules.delete(clean);
+    if (removed) this.publisherRateLimitBuckets.delete(clean);
     return removed;
   }
 
@@ -7923,6 +8040,7 @@ export class EventBus {
         lastSeq,
         sequenceGaps: 0,
         rateLimitedMessages: 0,
+        publisherRateLimited: 0,
         rejectedMessages: 0,
         lateMessages: 0,
         duplicateMessages: 0,
@@ -10834,8 +10952,8 @@ export class EventBus {
    *
    * Window and lifetime semantics:
    * - The window starts when a message is ADMITTED (past schema validation
-   *   and the rate-limit budget). A first attempt that the schema
-   *   validator rejected or the rate limiter shed claims no dedup slot —
+   *   and the rate-limit budgets). A first attempt that the schema
+   *   validator rejected or either rate limiter shed claims no dedup slot —
    *   its retry is a fresh publish, never suppressed. Suppressing the
    *   retry of a message that never reached anyone would silently lose it;
    *   idempotency must not do that.
@@ -10949,6 +11067,14 @@ export class EventBus {
       opts?.causal,
       publisherId,
     );
+    // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
+    // and the per-publisher rate-limit gate lives inside `fanOut` — so a
+    // suppressed duplicate is a zero-side-effect suppression that never
+    // reaches the gate, and retries burn no publisher budget: the budget
+    // is spent only by messages that will actually be published. A
+    // publisher-shed first attempt is not admitted, so it claims no dedup
+    // slot (see the `admitted` check below) — its retry stays a fresh
+    // publish.
     this.scheduleFlush();
     if (admitted) {
       // Only an admitted message claims a dedup slot: the window starts at
@@ -10986,6 +11112,10 @@ export class EventBus {
    *
    * Each entry may carry a `key` opting it into durable-log keyed
    * compaction (see `BatchMessage`).
+   *
+   * Admission gates apply per entry, exactly as for `publish`: an entry
+   * whose publisher is over its per-publisher rate limit (EB-79) is shed
+   * on its own — the rest of the batch still publishes.
    */
   publishBatch(messages: Array<BatchMessage>): number {
     if (messages.length === 0) return 0;
@@ -11027,7 +11157,8 @@ export class EventBus {
    * 1. Admission: every entry is redacted first (`setTopicRedaction`,
    *    EB-68 — the schema validator and every later gate see the redacted
    *    bytes), then checked against the same admission gates `publish`
-   *    applies — the broker-level ACL, then schema validation, then the
+   *    applies — the per-publisher rate-limit budget, then the
+   *    broker-level ACL, then schema validation, then the
    *    per-topic message-size cap, then the per-topic rate-limit budget —
    *    without mutating any bus
    *    state. Rate-limit
@@ -11045,7 +11176,8 @@ export class EventBus {
    * exactly as before the call for everything delivery-side: no sequence
    * numbers consumed, no rate-limit tokens taken, no durable-log writes —
    * but the rejection IS counted once against the failing entry's
-   * admission-gate counters (`rejectedMessages` / `rateLimitedMessages`)
+   * admission-gate counters (`rejectedMessages` / `rateLimitedMessages` /
+   * `publisherRateLimited`)
    * and surfaced on `EventBusOptions.onAdmissionRejected`, so an atomic
    * batch rejection stays reconcilable with stats like any other admission
    * rejection.
@@ -11076,6 +11208,9 @@ export class EventBus {
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
+    // Per-publisher rate-limit reservations for this batch (EB-79): a
+    // batch cannot overdraft one publisher's bucket with its own entries.
+    const publisherShadowBudget = new Map<string, number>();
     // Per-key sequence numbers are drawn in entry order (publish order)
     // against a shadow cursor: a rejected batch leaves the live cursors —
     // and every subscriber's key baseline — exactly untouched.
@@ -11108,7 +11243,13 @@ export class EventBus {
       // the size cap, and the commit phase all see the redacted bytes.
       payload = this.redactAdmissionPayload(resolvedTopic, payload);
       redactedPayloads[index] = payload;
-      const reason = this.admissionVerdict(resolvedTopic, payload, shadowBudget);
+      const reason = this.admissionVerdict(
+        resolvedTopic,
+        payload,
+        shadowBudget,
+        entries[index].publisherId,
+        publisherShadowBudget,
+      );
       if (reason !== undefined) {
         // The batch is rejected on the failing entry: count it once against
         // that entry's admission-gate counters and surface it on the unified
@@ -11121,6 +11262,8 @@ export class EventBus {
         else if (reason === 'acl') this.countAclDenied(topic, payload, publisherId);
         else if (reason === 'alias-retired') this.countAliasRetired(topic, payload, publisherId);
         else if (reason === 'message-too-big') this.countMessageTooBig(topic, payload, publisherId);
+        else if (reason === 'publisher-rate-limit')
+          this.countPublisherRateLimited(topic, payload, publisherId);
         else this.countRateLimited(topic, payload, publisherId);
         return { published: 0, rejected: { index, topic, reason } };
       }
@@ -11160,8 +11303,9 @@ export class EventBus {
   }
 
   /**
-   * Runs the admission gate of the publish pipeline — schema validation
-   * first (rejections happen before admission: no seq, no rate-limit
+   * Runs the admission gate of the publish pipeline — the per-publisher
+   * rate-limit budget first (EB-79), then schema validation
+   * (rejections happen before admission: no seq, no rate-limit
    * budget), then the per-topic message-size cap, then the per-topic
    * rate-limit budget — WITHOUT mutating any
    * bus state, so `publishAtomic` can pre-validate a batch before
@@ -11175,6 +11319,9 @@ export class EventBus {
    * with no live bucket yet is checked against a locally constructed full
    * bucket, mirroring what `fanOut` would create at commit — the shadow
    * bucket is never stored, so even a rejected batch creates no state.
+   * `publisherShadowBudget` does the same per publisher identity, so a
+   * batch cannot overdraft one publisher's bucket with its own entries;
+   * publishers without a configured limit are skipped.
    *
    * Rule resolution is identical to `publish`: the same `schemaForTopic`
    * / `rateLimitForTopic` resolvers run, so exact-topic rules win over
@@ -11186,8 +11333,26 @@ export class EventBus {
     topic: string,
     payload: unknown,
     shadowBudget: Map<string, number>,
+    publisherId: string | undefined,
+    publisherShadowBudget: Map<string, number>,
   ): AtomicRejectReason | undefined {
-    // The ACL is the first admission gate everywhere (after topic-alias
+    // Per-publisher rate limiting (EB-79) is the first shadow gate, as in
+    // `fanOut`: the peek/reserve mirrors `takePublisherToken` without
+    // mutating the live bucket, and the shadow bucket is never stored —
+    // a rejected batch creates no publisher budget state either.
+    if (publisherId !== undefined) {
+      const publisherLimit = this.publisherRateLimitRules.get(publisherId);
+      if (publisherLimit !== undefined) {
+        let bucket = this.publisherRateLimitBuckets.get(publisherId);
+        if (bucket == null) {
+          bucket = new TokenBucket(publisherLimit.burst, publisherLimit.messagesPerSec, this.now);
+        }
+        const reserved = publisherShadowBudget.get(publisherId) ?? 0;
+        if (bucket.availableTokens - reserved < 1) return 'publisher-rate-limit';
+        publisherShadowBudget.set(publisherId, reserved + 1);
+      }
+    }
+    // The ACL is the second admission gate everywhere (after topic-alias
     // resolution, which rewrites the topic before the gates), including
     // the atomic batch's shadow admission: an unauthorized entry aborts
     // the batch.
@@ -11308,6 +11473,16 @@ export class EventBus {
     // not redact again. Redacting at schedule time (rather than at
     // fan-out) is what keeps the persisted bytes redacted.
     payload = this.redactAdmissionPayload(topic, payload);
+    // Fail fast on the per-publisher rate limit (EB-79): an over-budget
+    // publisher never becomes a scheduled delivery — no id, nothing in
+    // the heap, nothing on disk. The token is spent at schedule time, so
+    // the due-time fan-out (pre-admitted) neither re-checks nor burns
+    // budget again. Counted the same way a `publish` publisher-rate-limit
+    // shed is, with reason 'publisher-rate-limit'.
+    if (this.takePublisherToken(publisherId) !== undefined) {
+      this.countPublisherRateLimited(topic, payload, publisherId);
+      return undefined;
+    }
     // Fail fast on ACL: an unauthorized publish never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
@@ -11736,6 +11911,46 @@ export class EventBus {
     this.statsFor(topic).rateLimitedMessages += 1;
     this.totalRateLimited += 1;
     this.emitAdmissionRejected(topic, 'rate-limit', payload, publisherId);
+  }
+
+  /**
+   * Counts one publish shed by per-publisher rate limiting (EB-79)
+   * against the topic and the global total, then fires the
+   * admission-rejection hook. The shed happens before admission: the
+   * payload never becomes a message — no sequence number is consumed
+   * (subscribers see no gap), the durable log never sees it, and it burns
+   * no topic rate-limit budget. The per-topic stats entry is created here
+   * when the topic has never published anything yet (see
+   * `countSchemaRejection`).
+   */
+  private countPublisherRateLimited(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).publisherRateLimited += 1;
+    this.totalPublisherRateLimited += 1;
+    this.emitAdmissionRejected(topic, 'publisher-rate-limit', payload, publisherId);
+  }
+
+  /**
+   * Takes one token from the publisher's rate-limit bucket (EB-79),
+   * creating the bucket lazily from the configured rule on first use —
+   * refilled from the injected clock (`EventBusOptions.now`), so the gate
+   * stays deterministic in tests. Returns `'publisher-rate-limit'` when
+   * the publisher has a configured limit and the bucket was empty (no
+   * token taken), `undefined` when the publish may proceed — either a
+   * token was taken or no limit is configured for this publisher. This
+   * never counts and never fires the hook: the caller decides how to
+   * surface the shed, so the fail-fast `publishDelayed` path and the
+   * `fanOut` admission gate share the same budget semantics.
+   */
+  private takePublisherToken(publisherId: string | undefined): 'publisher-rate-limit' | undefined {
+    if (publisherId === undefined) return undefined;
+    const limit = this.publisherRateLimitRules.get(publisherId);
+    if (limit === undefined) return undefined;
+    let bucket = this.publisherRateLimitBuckets.get(publisherId);
+    if (bucket == null) {
+      bucket = new TokenBucket(limit.burst, limit.messagesPerSec, this.now);
+      this.publisherRateLimitBuckets.set(publisherId, bucket);
+    }
+    return bucket.take() ? undefined : 'publisher-rate-limit';
   }
 
   /**
@@ -13045,8 +13260,23 @@ export class EventBus {
     // topic's stats entry, which is created here when the topic has never
     // published anything valid yet.
     if (!preAdmitted) {
-      // Broker-level ACL runs before every other admission gate (topic
-      // aliases already resolved above): an
+      // Per-publisher rate limiting (EB-79) is the first admission gate:
+      // a cheap pre-filter that protects the bus from a single hot
+      // publisher, so an over-budget publish is shed before the ACL, the
+      // schema validator and the size cap even see it. Only publishes
+      // carrying a configured publisher identity are subject to it —
+      // anonymous publishes and unconfigured publishers are unlimited.
+      // Like every other pre-admission gate this consumes no sequence
+      // number (subscribers see no gap), writes nothing to the durable
+      // log, and burns no topic rate-limit budget. Surfaced on the
+      // admission-rejection hook with reason 'publisher-rate-limit'.
+      if (this.takePublisherToken(publisherId) !== undefined) {
+        this.countPublisherRateLimited(topic, payload, publisherId);
+        return { matched: 0, accepted: 0, admitted: false };
+      }
+      // Broker-level ACL runs before every other admission gate except
+      // the per-publisher rate limiter above it (EB-79); topic aliases
+      // were already resolved above. An
       // unauthorized publish is rejected before schema validation — it
       // consumes no sequence number (subscribers see no gap), never touches
       // the durable log, and burns no rate-limit budget. Counted as a
@@ -13815,6 +14045,7 @@ export class EventBus {
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
+      publisherRateLimited: this.totalPublisherRateLimited,
       rejectedMessages: this.totalRejected,
       unregisteredTopicPublishes: this.unregisteredTopicPublishes,
       lateMessages: this.totalLateMessages,
@@ -13930,6 +14161,7 @@ export class EventBus {
         lastSeq: stats.lastSeq,
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
+        publisherRateLimited: stats.publisherRateLimited,
         rejectedMessages: stats.rejectedMessages,
         lateMessages: stats.lateMessages,
         // Resolved with the currently configured allowed lateness, so a

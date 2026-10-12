@@ -259,6 +259,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.rateLimitedMessages,
   );
   counter(
+    'eventbus_publisher_rate_limited_messages_total',
+    'Total messages shed by per-publisher publish-side rate limiting (EB-79).',
+    stats.publisherRateLimited,
+  );
+  counter(
     'eventbus_duplicate_messages_total',
     'Total idempotent publishes suppressed as duplicates.',
     stats.duplicateMessages,
