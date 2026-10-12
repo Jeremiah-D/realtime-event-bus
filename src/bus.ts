@@ -2666,6 +2666,13 @@ export interface BusStats {
    */
   consumerGroups: Array<{ groupId: string; pattern: string; members: number; partitions?: number }>;
   /**
+   * Per-topic subscriber caps (EB-81): one entry per registered
+   * `setTopicMaxSubscribers` rule, in registration order — the rule key,
+   * its cap, and the live subscriber count currently resolved against
+   * it. Empty when no cap is configured.
+   */
+  topicSubscriberLimits: Array<{ rule: string; maxSubscribers: number; currentSubscribers: number }>;
+  /**
    * Consumer-group consumption lag (see `src/grouplag.ts`): one row per
    * (group, topic) for classic round-robin groups and one per (group,
    * partition, topic) for partitioned groups, sorted by (groupId,
@@ -4720,6 +4727,33 @@ export class AclDeniedError extends Error {
 }
 
 /**
+ * Thrown by `subscribe` (and the subscribe-family wrappers) when the
+ * subscription pattern falls under a per-topic subscriber cap
+ * (`setTopicMaxSubscribers`) that is already full. The check runs before
+ * registration, so the call never returns a subscription and no
+ * half-registered state is left behind. Lowering a cap never kicks
+ * existing subscribers — only new registrations are rejected.
+ */
+export class SubscriptionLimitError extends Error {
+  /** The subscription pattern that was rejected. */
+  readonly pattern: string;
+  /** The cap that was already reached. */
+  readonly limit: number;
+  /** Live subscribers counted against the cap at rejection time. */
+  readonly current: number;
+
+  constructor(pattern: string, limit: number, current: number) {
+    super(
+      `subscriber limit reached for pattern "${pattern}": ${current}/${limit} subscribers`,
+    );
+    this.name = 'SubscriptionLimitError';
+    this.pattern = pattern;
+    this.limit = limit;
+    this.current = current;
+  }
+}
+
+/**
  * Authorization-denial audit event (`EventBusOptions.onAuthzDenied`): one
  * per denied publish or subscribe. Carries the action and the concrete
  * topic (publish) or subscription pattern (subscribe) — never the
@@ -5896,6 +5930,22 @@ export class EventBus {
    */
   private rateLimitRules = new Map<string, { messagesPerSec: number; burst: number }>();
   /**
+   * Per-topic subscriber caps (EB-81), keyed by the exact string passed
+   * to `setTopicMaxSubscribers` — either a concrete topic name or a
+   * wildcard pattern. Match resolution mirrors `setTopicTtl`: an
+   * exact-topic rule wins over any pattern; between patterns the
+   * earliest-registered rule wins. Counted per registering subscription
+   * (group members and shadow mirrors each count one) against the
+   * subscription's live pattern.
+   */
+  private subscriberLimitRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in `subscriberLimitRules`,
+   * kept apart from the subscriber pattern cache and the other rule
+   * caches so limit configuration never inflates `patternCacheSize`.
+   */
+  private subscriberLimitMatcherCache = new Map<string, RegExp>();
+  /**
    * Compiled matchers for the wildcard entries in `rateLimitRules`, kept
    * apart from the subscriber pattern cache and the TTL cache so rate-limit
    * configuration never inflates `patternCacheSize`.
@@ -6713,6 +6763,85 @@ export class EventBus {
     const removed = this.rateLimitRules.delete(topicPattern);
     if (removed) this.rateLimitBuckets.clear();
     return removed;
+  }
+
+  /**
+   * Caps how many live subscriptions may register under topics matching
+   * `topicPattern` (EB-81) — a fail-fast guard against subscription
+   * storms (a runaway service subscribing in a loop, a misconfigured
+   * fan-out). Once the cap is reached, `subscribe` (and the
+   * subscribe-family wrappers: `subscribeReliable`, `subscribeToGroup`,
+   * shadow mirrors) throws `SubscriptionLimitError` before registering —
+   * the caller sees the rejection instead of silently piling on.
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or
+   * an exact topic name). Match resolution mirrors `setTopicTtl`: an
+   * exact-topic rule wins over patterns, the earliest-registered
+   * matching pattern wins. The count is per subscription, keyed on the
+   * subscription's live pattern as resolved to the same rule —
+   * consumer-group members each count one, shadow mirrors count one.
+   *
+   * Lowering a cap never kicks existing subscribers (only new
+   * registrations are rejected); clearing a cap lifts it entirely.
+   * Throws `RangeError` when `topicPattern` is empty or
+   * `maxSubscribers` is not a positive integer.
+   */
+  setTopicMaxSubscribers(topicPattern: string, maxSubscribers: number): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isInteger(maxSubscribers) || maxSubscribers < 1) {
+      throw new RangeError('maxSubscribers must be a positive integer');
+    }
+    this.subscriberLimitRules.set(topicPattern, maxSubscribers);
+  }
+
+  /**
+   * Removes the subscriber cap previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed.
+   */
+  clearTopicMaxSubscribers(topicPattern: string): boolean {
+    return this.subscriberLimitRules.delete(topicPattern);
+  }
+
+  /**
+   * The subscriber-cap rule key that applies to a subscription `pattern`,
+   * or `undefined` when no rule matches. Mirrors `ttlForTopic`: an
+   * exact-topic rule wins over patterns; between patterns the
+   * earliest-registered matching rule wins.
+   */
+  private subscriberLimitRuleFor(pattern: string): string | undefined {
+    if (this.subscriberLimitRules.has(pattern)) return pattern;
+    for (const ruleKey of this.subscriberLimitRules.keys()) {
+      let matcher = this.subscriberLimitMatcherCache.get(ruleKey);
+      if (matcher == null) {
+        matcher = compilePattern(ruleKey);
+        this.subscriberLimitMatcherCache.set(ruleKey, matcher);
+      }
+      if (matcher.test(pattern)) return ruleKey;
+    }
+    return undefined;
+  }
+
+  /**
+   * Enforces the subscriber cap for one registering subscription pattern
+   * (EB-81). Runs after every other subscribe-time validation and before
+   * anything registers — a throw leaves no half-registered subscriber
+   * behind (in particular, before the composite refcounts are acquired).
+   * Unsubscribing frees a slot automatically since the count is derived
+   * from the live subscriber table.
+   */
+  private checkSubscriberLimit(pattern: string): void {
+    const ruleKey = this.subscriberLimitRuleFor(pattern);
+    if (ruleKey === undefined) return;
+    const max = this.subscriberLimitRules.get(ruleKey) as number;
+    let current = 0;
+    for (const sub of this.subscribers.values()) {
+      if (this.subscriberLimitRuleFor(sub.pattern) === ruleKey) current += 1;
+    }
+    if (current >= max) {
+      throw new SubscriptionLimitError(pattern, max, current);
+    }
   }
 
   /**
@@ -8352,6 +8481,11 @@ export class EventBus {
             },
           }),
     });
+    // Per-topic subscriber caps (EB-81): enforced after every other
+    // subscribe-time validation and before anything registers — a throw
+    // leaves no half-registered subscriber behind, and in particular
+    // runs before the composite refcounts below are acquired.
+    this.checkSubscriberLimit(topicPattern);
     // Composite patterns (EB-70): translated under the namespace exactly
     // like the base pattern, then compiled through the dedicated
     // composite cache (reference-counted; released on unsubscribe). Like
@@ -14181,6 +14315,13 @@ export class EventBus {
       }),
       groupLag: this.groupLagRowsFor(undefined),
       replayProgress,
+      topicSubscriberLimits: [...this.subscriberLimitRules.entries()].map(([rule, maxSubscribers]) => {
+        let currentSubscribers = 0;
+        for (const sub of this.subscribers.values()) {
+          if (this.subscriberLimitRuleFor(sub.pattern) === rule) currentSubscribers += 1;
+        }
+        return { rule, maxSubscribers, currentSubscribers };
+      }),
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,

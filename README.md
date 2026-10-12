@@ -528,6 +528,24 @@ library.
   `clearPublisherRateLimit` removes a rule (unknown id is a no-op returning
   `false`). Invalid publisher identities and invalid rate values throw
   `RangeError`.
+- **Per-topic subscriber caps** (in `src/bus.ts`, via
+  `setTopicMaxSubscribers(pattern, maxSubscribers)`): a fail-fast guard
+  against subscription storms — a runaway service subscribing in a loop, a
+  misconfigured fan-out. Once the cap is reached, `subscribe` (and the
+  subscribe-family wrappers: `subscribeReliable`, `subscribeToGroup`, shadow
+  mirrors) throws `SubscriptionLimitError` (carrying `pattern`, `limit`,
+  `current`) before anything registers — the caller sees the rejection
+  instead of silently piling on. The count is per live subscription against
+  the subscription's live pattern: consumer-group members each count one,
+  shadow mirrors count one, and unsubscribing frees a slot. Rule matching
+  mirrors `setTopicTtl`: an exact-topic rule wins over patterns, the
+  earliest-registered matching pattern wins, and resolution is live — adding
+  an exact rule re-homes existing matching subscribers onto it (like the
+  TTL/rate-limit rules). Lowering a cap never kicks existing subscribers;
+  only new registrations are rejected. `getStats().topicSubscriberLimits`
+  reports every rule's `{ rule, maxSubscribers, currentSubscribers }`.
+  `clearTopicMaxSubscribers` removes a rule. Empty patterns and
+  non-positive-integer caps throw `RangeError`.
 - **Publish-side schema validation** (in `src/bus.ts`, via
   `setTopicSchema(pattern, validator)`): an admission gate for malformed
   payloads. A publish whose payload makes the validator return `false` is
