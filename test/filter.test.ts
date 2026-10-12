@@ -80,6 +80,9 @@ test('filter: a genuinely dropped message still counts as a gap', async () => {
   const { received } = collect(bus, 't', {
     queueSize: 1,
     filter: (payload) => (payload as { n: number }).n % 2 === 1,
+    // Pins the legacy shed-always behavior: this test is about gap
+    // accounting (dropped vs filtered), not the default 'block' tier.
+    backpressure: 'drop-oldest',
   });
   bus.publish('t', { n: 1 });
   bus.publish('t', { n: 2 });

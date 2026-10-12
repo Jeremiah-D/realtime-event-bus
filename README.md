@@ -364,6 +364,23 @@ library.
   `onDrained` callback fires once when the queue recedes below the mark after
   an excursion — or immediately if the mark is lowered below the current size
   mid-excursion.
+  **Slow-consumer backpressure tiers** (`SubscribeOptions.backpressure`,
+  default `'block'`): what the bus does when a subscriber's queue is full at
+  enqueue time. `'drop-oldest'` sheds the oldest entry to admit the newcomer;
+  `'drop-newest'` refuses the newcomer; `'block'` admits-with-shed on first
+  saturation (exactly the historical default) then refuses further arrivals
+  while the subscriber stays saturated — the already-queued backlog is
+  preserved instead of churned, like a closed TCP receive window — until the
+  queue recedes below the high-water mark. The tier composes orthogonally
+  with `maxInflight` (delivery-side cap, still enforced on the preserved
+  backlog) and publish-side admission sheds (which never reach the queue).
+  Every queue-level drop is recorded as a `backpressure_dropped` audit event
+  (queryable via `getSubscriptionAudit({ action: 'backpressure_dropped' })`);
+  `getStats()` exposes `blockedMessages` (refusals under the `'block'` tier,
+  included in `droppedMessages`) and `blockedSubscribers`, plus
+  `blockedCount(subId)` per subscriber. Anything else throws `RangeError` at
+  subscribe time; an explicit `dropPolicy` contradicting an explicit drop tier
+  also throws.
 - **`src/throttle.ts` — `TokenBucket` + adaptive publish-side throttling**:
   opt-in per subscriber via `subscribe(..., { throttle: true })`. When the
   subscriber's queue crosses the high-water mark, the bus rate-limits how many

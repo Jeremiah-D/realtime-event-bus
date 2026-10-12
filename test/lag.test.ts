@@ -195,7 +195,9 @@ test('laggingSubscribers ranks monitored subscribers by p99', async () => {
 test('dropped messages are never sampled and the watermark tracks survivors', async () => {
   const clock = controllableClock();
   const bus = new EventBus({ now: clock.now });
-  bus.subscribe('t', () => {}, { lagMonitor: true, queueSize: 2 });
+  // Pins the legacy shed-always behavior: this test is about lag sampling
+  // of survivors, not about the default 'block' tier.
+  bus.subscribe('t', () => {}, { lagMonitor: true, queueSize: 2, backpressure: 'drop-oldest' });
   for (let i = 0; i < 5; i += 1) {
     bus.publish('t', i);
     clock.nowMs += 10; // i=0@1000, i=1@1010, ..., i=4@1040

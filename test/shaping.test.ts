@@ -122,6 +122,9 @@ test('shaping protects downstream rate, not memory: a full queue still drops per
   const sub = bus.subscribe('t', (msg) => received.push(msg.payload), {
     queueSize: 3,
     deliveryShaping: { messagesPerSec: 10, burst: 1 },
+    // Pins the legacy shed-always behavior: this test is about shaping
+    // not extending memory, not about the default 'block' tier.
+    backpressure: 'drop-oldest',
   });
   for (let i = 0; i < 6; i++) bus.publish('t', i);
   await flush();

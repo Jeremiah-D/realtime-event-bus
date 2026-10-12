@@ -1,6 +1,33 @@
 export type DropPolicy = 'drop-oldest' | 'drop-newest';
 
 /**
+ * Slow-consumer backpressure tier (EB-83): what the bus does when a
+ * subscriber's bounded queue is full at enqueue time.
+ *
+ * - `'drop-oldest'`: shed the oldest queued entry to admit the newcomer —
+ *   the newcomer is always accepted, the shed is counted.
+ * - `'drop-newest'`: refuse the newcomer; the queued backlog is untouched.
+ * - `'block'` (default): admit-with-shed on first saturation (exactly the
+ *   historical default behavior), then *refuse* further arrivals while the
+ *   subscriber stays saturated — the already-queued backlog is preserved
+ *   instead of churned, like a closed TCP receive window. The subscriber
+ *   unblocks when its queue recedes below the high-water mark.
+ */
+export type BackpressurePolicy = 'drop-oldest' | 'drop-newest' | 'block';
+
+/** Validates a backpressure tier; throws `RangeError` on illegal values. */
+export function assertValidBackpressurePolicy(
+  value: unknown,
+  where: string,
+): asserts value is BackpressurePolicy {
+  if (value !== 'drop-oldest' && value !== 'drop-newest' && value !== 'block') {
+    throw new RangeError(
+      `${where}: backpressure must be 'drop-oldest', 'drop-newest' or 'block'`,
+    );
+  }
+}
+
+/**
  * Message priority for shed decisions. Higher values are shed later:
  * when the queue is full under `drop-oldest`, the oldest entry with the
  * lowest priority is dropped first. The default priority is 0.

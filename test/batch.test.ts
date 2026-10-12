@@ -169,6 +169,9 @@ test('sequence gap detection counts per message inside batches', async () => {
   bus.subscribe('t', (msgs) => batches.push(msgs.map((m) => m.seq)), {
     batch: { maxSize: 10, maxWaitMs: 0 },
     queueSize: 4,
+    // Pins the legacy shed-always behavior: this test is about per-message
+    // gap accounting under churn, not about the default 'block' tier.
+    backpressure: 'drop-oldest',
   });
   bus.publish('t', 1);
   bus.publish('t', 2);

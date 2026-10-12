@@ -20,7 +20,11 @@ function sampleLine(text: string, name: string): string | undefined {
 test('delivered/dropped counters track fan-out and backpressure sheds', async () => {
   const bus = new EventBus();
   const received: unknown[] = [];
-  const sub = bus.subscribe('t', (msg) => received.push(msg.payload), { queueSize: 2 });
+  const sub = bus.subscribe('t', (msg) => received.push(msg.payload), {
+    queueSize: 2,
+    // Pins the legacy shed-always behavior for the counter assertions below.
+    backpressure: 'drop-oldest',
+  });
   // 5 publishes into a capacity-2 queue before the first flush:
   // drop-oldest sheds the first 3, the last 2 are delivered.
   for (let i = 0; i < 5; i += 1) bus.publish('t', i);

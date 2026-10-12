@@ -1,4 +1,9 @@
-import { BoundedQueue, type DropPolicy } from './backpressure.ts';
+import {
+  BoundedQueue,
+  assertValidBackpressurePolicy,
+  type BackpressurePolicy,
+  type DropPolicy,
+} from './backpressure.ts';
 import { LeaseManager, type LeaseExpiredCallback, type LeaseExpiredEvent } from './lease.ts';
 import {
   IdleReclaimer,
@@ -332,7 +337,36 @@ export interface CompositeSubscribeOptions {
 export interface SubscribeOptions {
   /** Per-subscriber bounded queue capacity (default 100). */
   queueSize?: number;
-  /** Drop policy when the queue is full (default 'drop-oldest'). */
+  /**
+   * Slow-consumer backpressure tier (EB-83): what happens when the
+   * subscriber's queue is full at enqueue time.
+   *
+   * - `'drop-oldest'`: shed the oldest queued entry to admit the newcomer.
+   * - `'drop-newest'`: refuse the newcomer; the backlog is untouched.
+   * - `'block'` (default): admit-with-shed on first saturation — exactly
+   *   the historical default behavior — then refuse further arrivals
+   *   while the subscriber stays saturated, preserving the already-queued
+   *   backlog instead of churning it (like a closed TCP receive window).
+   *   The subscriber unblocks when its queue recedes below the
+   *   high-water mark. Refusals count into `droppedMessages` (and the
+   *   dedicated `blockedMessages` counter) and are recorded as
+   *   `backpressure_dropped` audit events.
+   *
+   * The tier composes orthogonally with `maxInflight` (EB-67, delivery-side
+   * cap — still enforced on the preserved backlog) and with publish-side
+   * admission sheds (EB-79 publisher rate limit — those never reach the
+   * queue). Anything else throws `RangeError` at subscribe time; an
+   * explicit `dropPolicy` that contradicts an explicit drop tier also
+   * throws.
+   */
+  backpressure?: BackpressurePolicy;
+  /**
+   * Drop policy when the queue is full (default 'drop-oldest'). This is the
+   * queue-level shed policy used inside the `'block'` tier's
+   * admit-with-shed step and by the two drop tiers when they are selected
+   * via `backpressure`; setting `backpressure` to `'drop-oldest'` /
+   * `'drop-newest'` selects the same policy directly.
+   */
   dropPolicy?: DropPolicy;
   /**
    * Opt-in byte budget for the subscriber's backpressure queue, in bytes.
@@ -2396,6 +2430,15 @@ export interface BusStats {
    */
   droppedMessages: number;
   /**
+   * Total messages refused by saturated subscribers under the `'block'`
+   * backpressure tier (see `SubscribeOptions.backpressure`, EB-83) — the
+   * backlog-preserving alternative to shedding. Included in
+   * `droppedMessages`; tracked separately for backpressure forensics.
+   */
+  blockedMessages: number;
+  /** Subscribers currently refusing new arrivals under the `'block'` tier. */
+  blockedSubscribers: number;
+  /**
    * Total messages handed to shadow-subscriber handlers (see
    * `SubscribeOptions.shadow`) — the mirror deliveries. Tracked
    * independently: never counted in `deliveredMessages`, so validating a
@@ -3090,6 +3133,26 @@ interface Subscriber {
   durableLog?: DurableTopicLog;
   handler: MessageHandler;
   queue: BoundedQueue<BusMessage>;
+  /**
+   * Slow-consumer backpressure tier (see `SubscribeOptions.backpressure`,
+   * EB-83): what the bus does when `queue` is full at enqueue time.
+   */
+  backpressure: BackpressurePolicy;
+  /**
+   * Set while the `'block'` tier refuses new arrivals: the subscriber
+   * saturated and its backlog is being preserved instead of churned.
+   * Cleared when the queue recedes below the high-water mark. Only the
+   * `'block'` tier ever sets this; the drop tiers never block.
+   */
+  blocked: boolean;
+  /**
+   * Messages refused while `blocked` (the `'block'` tier only). Counted
+   * into the bus-wide `droppedMessages` and the dedicated
+   * `blockedMessages` stat, and included in `droppedCount(subId)`.
+   */
+  blockedCount: number;
+  /** The queue's count capacity, for saturation checks at enqueue time. */
+  queueCapacity: number;
   /**
    * Present for reliable subscriptions: at-least-once delivery state.
    * `redeliveries` counts, per message, how many times this subscriber has
@@ -4397,6 +4460,32 @@ function resolveShadowOptions(
     throw new RangeError("subscribe: shadow.dropPolicy must be 'drop-oldest' or 'drop-newest'");
   }
   return { queueSize, dropPolicy };
+}
+
+/**
+ * Resolves the slow-consumer backpressure tier (EB-83). Defaults to
+ * `'block'` — backward compatible: a single saturation still sheds
+ * exactly like the historical default, and the tier only changes behavior
+ * under sustained saturation (refuse-new instead of churning the backlog).
+ * An explicit `dropPolicy` that contradicts an explicitly chosen drop tier
+ * is a configuration error — fail fast instead of silently picking one.
+ */
+function resolveBackpressurePolicy(
+  backpressure: unknown,
+  dropPolicy: unknown,
+): BackpressurePolicy {
+  if (backpressure === undefined) return 'block';
+  assertValidBackpressurePolicy(backpressure, 'subscribe');
+  if (
+    dropPolicy !== undefined &&
+    backpressure !== 'block' &&
+    dropPolicy !== backpressure
+  ) {
+    throw new RangeError(
+      `subscribe: backpressure '${backpressure}' conflicts with dropPolicy '${dropPolicy}'`,
+    );
+  }
+  return backpressure;
 }
 
 /**
@@ -6122,6 +6211,13 @@ export class EventBus {
    * sum of the per-subscriber `droppedCount` values for live subscribers.
    */
   private totalDropped = 0;
+  /**
+   * Messages refused by saturated subscribers under the `'block'`
+   * backpressure tier (global total, EB-83) — the backlog-preserving
+   * alternative to shedding. Included in `totalDropped`; tracked
+   * separately for backpressure forensics.
+   */
+  private totalBlocked = 0;
   /**
    * Messages handed to shadow-subscriber handlers (global total). A
    * shadow handler that throws still received the message, and still
@@ -8704,12 +8800,23 @@ export class EventBus {
     // anything registers, so a throw leaves no half-registered subscriber
     // behind.
     const compositeOpts = resolveCompositeOptions(opts?.patterns);
+    // Slow-consumer backpressure tier (EB-83): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const backpressure = resolveBackpressurePolicy(opts?.backpressure, opts?.dropPolicy);
+    // The queue-level shed policy: an explicit drop tier selects it
+    // directly; the 'block' tier sheds per the subscriber's own
+    // `dropPolicy` on first saturation (the historical default behavior).
+    // The shadow queue mirrors the production shed policy unless the
+    // shadow overrides it independently.
+    const queuePolicy: DropPolicy =
+      shadowOpts?.dropPolicy ??
+      (backpressure === 'block' ? (opts?.dropPolicy ?? 'drop-oldest') : backpressure);
     const queue = new BoundedQueue<BusMessage>({
       capacity,
       // The shadow queue's backpressure policy is independently tunable
       // via `ShadowSubscribeOptions`; otherwise the subscription's own
       // `dropPolicy` applies, exactly as for a production subscriber.
-      policy: shadowOpts?.dropPolicy ?? opts?.dropPolicy ?? 'drop-oldest',
+      policy: queuePolicy,
       highWaterMarkRatio: opts?.highWaterMarkRatio,
       ...(queueMaxBytes === undefined
         ? {}
@@ -8740,10 +8847,17 @@ export class EventBus {
               });
             },
           }),
-      ...(onDrained == null && throttle == null
+      ...(onDrained == null && throttle == null && backpressure !== 'block'
         ? {}
         : {
             onDrained: (size: number) => {
+              // EB-83: the 'block' tier unblocks here — the queue receded
+              // below the high-water mark, so the subscriber may accept
+              // new arrivals again. Cleared before the throttle/user hooks
+              // so observers see the already-unblocked state.
+              if (backpressure === 'block' && subscriber.blocked) {
+                subscriber.blocked = false;
+              }
               if (throttle != null) {
                 this.releaseThrottle(subscriber, size);
               }
@@ -8790,6 +8904,12 @@ export class EventBus {
       // drainSubscriber only ever passes an array to batched subscribers.
       handler: handler as MessageHandler,
       queue,
+      // Slow-consumer backpressure tier (EB-83): the 'block' tier starts
+      // unblocked; saturation arms it in `enqueueMessage`.
+      backpressure,
+      blocked: false,
+      blockedCount: 0,
+      queueCapacity: capacity,
       lastDeliveredSeq: new Map(),
       lastEpoch: new Map(),
       throttle,
@@ -12778,9 +12898,32 @@ export class EventBus {
   }
 
   /**
+   * Records one `backpressure_dropped` audit event (EB-83): a message shed
+   * or refused because a subscriber's queue was saturated — under any of
+   * the three backpressure tiers. Fully error-isolated like all audit
+   * emission: the enqueue path never throws for observability.
+   */
+  private auditBackpressureDrop(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    policy: BackpressurePolicy,
+    dropped: number,
+  ): void {
+    this.auditSubscription({
+      action: 'backpressure_dropped',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      topic: msg.topic,
+      detail: { policy, dropped, queueSize: subscriber.queue.size },
+    });
+  }
+
+  /**
    * Queries the subscription lifecycle audit log (EB-78): the bounded
    * in-memory index of every subscribe / unsubscribe / pattern
-   * hot-update / group join-leave / rebalance / topic-registry change,
+   * hot-update / group join-leave / rebalance / topic-registry change /
+   * backpressure drop (EB-83),
    * optionally persisted to `subscriptionAuditDir` daily JSONL files.
    * Filters by time window and action; `limit` keeps the most recent
    * matches. Entries come back oldest-first. The index is bounded
@@ -13022,9 +13165,38 @@ export class EventBus {
       return 'duplicate';
     }
     const queue = subscriber.queue;
+    // EB-83 'block' tier: a saturated subscriber refuses new arrivals —
+    // the already-queued backlog is preserved instead of churned. The
+    // refusal counts as a backpressure drop (the message never reaches a
+    // handler) and is audited like any other drop.
+    if (subscriber.blocked) {
+      this.totalDropped += 1;
+      this.totalBlocked += 1;
+      subscriber.blockedCount += 1;
+      this.auditBackpressureDrop(subscriber, msg, 'block', 1);
+      return 'dropped';
+    }
+    // Count-saturation check BEFORE the push: the 'block' tier arms only
+    // when the push faces a count-full queue. A byte-budget shed with
+    // count headroom does not arm it — memory pressure always sheds per
+    // policy, independently of the tier.
+    const wasFull = queue.size >= subscriber.queueCapacity;
     const droppedBefore = queue.droppedCount;
     const result = queue.push(msg, 0, deadline);
-    this.totalDropped += queue.droppedCount - droppedBefore;
+    const shed = queue.droppedCount - droppedBefore;
+    this.totalDropped += shed;
+    if (shed > 0 || result === 'dropped') {
+      // Every queue-level drop is audited (EB-83): shed evictions and
+      // refused newcomers alike, with the tier that was in force.
+      this.auditBackpressureDrop(subscriber, msg, subscriber.backpressure, shed > 0 ? shed : 1);
+    }
+    if (subscriber.backpressure === 'block' && wasFull) {
+      // First count-saturation under the 'block' tier: the admit-with-shed
+      // step behaved exactly like the historical default; from here the
+      // subscriber blocks new arrivals until the queue recedes below the
+      // high-water mark (`onDrained` clears the flag).
+      subscriber.blocked = true;
+    }
     const latency = subscriber.latency;
     if (latency != null && result === 'accepted') {
       // Stamp the enqueue time for the delivery-latency tracker (see
@@ -14790,6 +14962,8 @@ export class EventBus {
       totalPublished: this.totalPublished,
       deliveredMessages: this.totalDelivered,
       droppedMessages: this.totalDropped,
+      blockedMessages: this.totalBlocked,
+      blockedSubscribers: [...this.subscribers.values()].filter((s) => s.blocked).length,
       shadowedMessages: this.totalShadowed,
       shadowDroppedMessages: this.totalShadowDropped,
       shadows,
@@ -14996,11 +15170,25 @@ export class EventBus {
     return subscriber.queue.size;
   }
 
-  /** Messages dropped for a subscriber due to backpressure. */
+  /**
+   * Messages dropped for a subscriber due to backpressure: queue sheds
+   * plus messages refused while blocked under the `'block'` tier (EB-83).
+   */
   droppedCount(subId: string): number {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
-    return subscriber.queue.droppedCount;
+    return subscriber.queue.droppedCount + subscriber.blockedCount;
+  }
+
+  /**
+   * Messages refused for a subscriber while blocked under the `'block'`
+   * backpressure tier (EB-83) — the backlog-preserving alternative to
+   * shedding. Throws for an unknown subscriber, like `droppedCount`.
+   */
+  blockedCount(subId: string): number {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    return subscriber.blockedCount;
   }
 
   /**
