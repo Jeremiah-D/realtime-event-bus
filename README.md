@@ -1784,6 +1784,53 @@ Prometheus exposition (see above) — emitted only when at least one
 publisher has admitted a publish, so a publisher-free bus renders
 byte-identical exposition to before.
 
+## Topic registry
+
+The operator-side catalog of known topics. Register the concrete topics
+your producers publish to, with ownership metadata:
+
+```ts
+bus.registerTopic({
+  topic: 'orders.created',
+  owner: 'payments-svc',
+  description: 'new orders, schema v3',
+  schemaVersion: 3,
+  tags: ['payments'],
+});
+bus.deregisterTopic('legacy.events'); // retired, but not forgotten
+bus.getTopicInfo('orders.created'); // full record, incl. registeredAt/updatedAt
+bus.topicCatalog(); // live registrations, in registration order
+bus.topicCatalog({ includeDeregistered: true }); // tombstones appended
+```
+
+The registry is advisory, never a gate. Publishing to an unregistered
+topic is not blocked — it is counted in
+`getStats().unregisteredTopicPublishes` (also rendered as
+`eventbus_unregistered_topic_publishes_total` in the Prometheus
+exposition) and surfaced per occurrence on the opt-in
+`EventBusOptions.onUnregisteredTopic` hook, so a typo'd topic name or a
+producer that forgot to register shows up in monitoring instead of
+silently flowing. The hook is error-isolated like `onAdmissionRejected`:
+a throwing observer is swallowed and can never disturb the publish path.
+
+Details:
+
+- **Exact topics, not patterns** — the check runs on the concrete topic
+  after namespace resolution; a publish to `orders.created` consults the
+  registration for exactly `orders.created`.
+- **Upsert semantics** — re-registering a live topic updates its metadata
+  in place (returns `false`); a deregistered topic re-registers fresh
+  (returns `true`), keeping its original `registeredAt`.
+- **Tombstones** — deregistration keeps the last-known metadata marked
+  `registered: false`, so `getTopicInfo` can still tell "never existed"
+  apart from "used to exist".
+- **Validation** — empty topics, empty owner/description/tags, and
+  negative/non-finite `schemaVersion` throw `RangeError` before anything
+  mutates.
+- **Audit** — every registration change is recorded in the subscription
+  lifecycle audit log (below) as `topic_register` / `topic_deregister`,
+  with the caller-supplied actor (default `'system'`).
+
 ## Subscription lifecycle audit log
 
 Every subscription change is recorded in an append-only audit log —
@@ -1855,6 +1902,7 @@ Exported series:
 | `eventbus_late_messages_total` | counter | `lateMessages` — admitted messages older than their topic's event-time watermark (EB-59; still delivered) |
 | `eventbus_rate_limited_messages_total` | counter | `rateLimitedMessages` — per-topic rate-limit sheds |
 | `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |
+| `eventbus_unregistered_topic_publishes_total` | counter | `unregisteredTopicPublishes` — publishes to topics with no live catalog registration (advisory; delivered normally) |
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
 | `eventbus_dedup_dropped_messages_total` | counter | `dedupDropped` — subscriber exactly-once dedup suppressions |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |

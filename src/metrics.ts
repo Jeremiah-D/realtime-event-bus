@@ -244,6 +244,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.rejectedMessages,
   );
   counter(
+    'eventbus_unregistered_topic_publishes_total',
+    'Total publishes to topics with no live registration in the topic catalog (advisory only; these publishes were delivered normally).',
+    stats.unregisteredTopicPublishes ?? 0,
+  );
+  counter(
     'eventbus_late_messages_total',
     'Total messages admitted with a business event time older than their topic event-time watermark (EB-59).',
     stats.lateMessages ?? 0,

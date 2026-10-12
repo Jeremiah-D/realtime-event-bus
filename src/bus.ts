@@ -55,6 +55,12 @@ import {
   type SubscriptionAuditQuery,
 } from './subaudit.ts';
 import {
+  TopicRegistry,
+  assertValidTopicRegistration,
+  type TopicInfo,
+  type TopicRegistration,
+} from './topics.ts';
+import {
   NamespaceDeniedError,
   NamespaceHandle,
   NamespaceNotEmptyError,
@@ -1826,6 +1832,17 @@ export interface EventBusOptions {
    */
   onAdmissionRejected?: AdmissionRejectionCallback;
   /**
+   * Opt-in hook fired when a message is published to a topic with no live
+   * registration in the topic catalog (EB-77). The publish is never
+   * blocked — the hook is an observability channel for typo'd topic names
+   * and producers that forgot to register. Every such publish is also
+   * counted in `getStats().unregisteredTopicPublishes`, with or without
+   * the hook. Error-isolated like `onAdmissionRejected`: a throwing hook
+   * is swallowed so a broken observer can never disturb the publish path.
+   * Default: unset (counting only — fully backward compatible).
+   */
+  onUnregisteredTopic?: UnregisteredTopicCallback;
+  /**
    * Broker-level topic ACL (see `AclRule` and `setAclRules`): per-topic
    * publish/subscribe permissions with allow/deny decisions on wildcard
    * patterns. Rules are evaluated in order; the first matching rule with
@@ -2232,6 +2249,15 @@ export interface BusStats {
    * counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total publishes to topics with no live registration in the topic
+   * catalog (EB-77). Advisory only — these publishes were delivered
+   * normally (and counted in `totalPublished` too); this is the
+   * typo'd-topic / forgot-to-register signal, also surfaced per occurrence
+   * on `EventBusOptions.onUnregisteredTopic`. Always present, so readers
+   * never need a fallback.
+   */
+  unregisteredTopicPublishes: number;
   /**
    * Total messages admitted with a business event time older than their
    * topic's event-time watermark — the sum of every topic's
@@ -4368,6 +4394,32 @@ export interface AdmissionRejectionEvent {
 export type AdmissionRejectionCallback = (event: AdmissionRejectionEvent) => void;
 
 /**
+ * Snapshot delivered to `EventBusOptions.onUnregisteredTopic` when a
+ * message is published to a topic with no live registration (EB-77). The
+ * publish is not blocked — this is the observability channel for typo'd
+ * topic names and producers that forgot to register.
+ */
+export interface UnregisteredTopicEvent {
+  /** The concrete topic the publish targeted (post-namespace resolution). */
+  topic: string;
+  /** Bus-clock timestamp of the publish (`EventBusOptions.now`). */
+  at: number;
+  /**
+   * Running total of publishes to unregistered topics, including this
+   * one — always in sync with `getStats().unregisteredTopicPublishes`.
+   */
+  unregisteredPublishes: number;
+}
+
+/**
+ * Unregistered-topic publish hook (see
+ * `EventBusOptions.onUnregisteredTopic`). Error-isolated like
+ * `onAdmissionRejected`: a throwing callback is swallowed so a broken
+ * observer can never disturb the publish path.
+ */
+export type UnregisteredTopicCallback = (event: UnregisteredTopicEvent) => void;
+
+/**
  * Options for `EventBus.setTopicAlias`: how long the migration alias stays
  * live.
  */
@@ -6244,6 +6296,24 @@ export class EventBus {
    */
   private readonly subAudit: SubscriptionAuditLog;
   /**
+   * Topic metadata registry (EB-77): the operator-side catalog of known
+   * topics. Advisory only — publishing to an unregistered topic is
+   * counted and surfaced on `onUnregisteredTopic`, never blocked.
+   */
+  private readonly topicRegistry = new TopicRegistry();
+  /**
+   * Unregistered-topic publish hook (`EventBusOptions.onUnregisteredTopic`),
+   * or `undefined` when unset — the bus is then exactly as before (stats
+   * counting only).
+   */
+  private readonly onUnregisteredTopic: UnregisteredTopicCallback | undefined;
+  /**
+   * Total publishes to topics with no live registration
+   * (`getStats().unregisteredTopicPublishes`). Counted with or without
+   * the hook, so the counter and the hook events reconcile exactly.
+   */
+  private unregisteredTopicPublishes = 0;
+  /**
    * Registered multi-tenant namespaces (EB-52): prefix → effective
    * flags. Concrete namespaced topics are `<prefix>/<topic>`; the `/`
    * separator is matched literally by the wildcard engine, so one
@@ -6332,6 +6402,11 @@ export class EventBus {
       throw new RangeError('onAuthzDenied must be a function');
     }
     this.onAuthzDenied = onAuthzDenied;
+    const onUnregisteredTopic = options?.onUnregisteredTopic;
+    if (onUnregisteredTopic !== undefined && typeof onUnregisteredTopic !== 'function') {
+      throw new RangeError('onUnregisteredTopic must be a function');
+    }
+    this.onUnregisteredTopic = onUnregisteredTopic;
     const onLeaseExpired = options?.onLeaseExpired;
     if (onLeaseExpired !== undefined && typeof onLeaseExpired !== 'function') {
       throw new RangeError('onLeaseExpired must be a function');
@@ -10715,6 +10790,9 @@ export class EventBus {
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
     // operates on the concrete topic, exactly as for a global publish.
     topic = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    // Topic registry (EB-77): advisory only — an unregistered topic is
+    // counted and surfaced on the opt-in hook, never blocked.
+    this.checkTopicRegistered(topic);
     const { accepted } = this.fanOut(
       topic,
       payload,
@@ -11738,6 +11816,102 @@ export class EventBus {
    */
   getSubscriptionAudit(query?: SubscriptionAuditQuery): SubscriptionAuditEvent[] {
     return this.subAudit.query(query ?? {});
+  }
+
+  /**
+   * Registers a topic in the operator-side catalog (EB-77): the concrete
+   * topic name plus optional ownership metadata (`owner`, `description`,
+   * `schemaVersion`, `tags`). Registering an already-registered topic
+   * updates its metadata in place; a deregistered topic re-registers
+   * fresh (keeping its original `registeredAt`).
+   *
+   * Returns `true` when the topic was newly registered, `false` when an
+   * existing registration was updated. The change is recorded in the
+   * subscription audit log as `topic_register` (with the metadata and an
+   * `updated` flag in `detail`). Throws `RangeError` on illegal
+   * registration values or a bad actor.
+   */
+  registerTopic(reg: TopicRegistration, actor = 'system'): boolean {
+    assertValidActor(actor, 'registerTopic');
+    const created = this.topicRegistry.register(reg, this.now());
+    this.auditSubscription({
+      action: 'topic_register',
+      topic: reg.topic,
+      actor,
+      detail: {
+        owner: reg.owner,
+        description: reg.description,
+        schemaVersion: reg.schemaVersion,
+        tags: reg.tags,
+        updated: !created,
+      },
+    });
+    return created;
+  }
+
+  /**
+   * Deregisters a topic (EB-77): the registration is removed but its
+   * last-known metadata is kept as a tombstone, so `getTopicInfo` still
+   * answers for a retired topic (marked `registered: false`).
+   *
+   * Returns `true` when a live registration was removed, `false` when
+   * the topic was never registered or already deregistered. The change
+   * is recorded in the subscription audit log as `topic_deregister`.
+   */
+  deregisterTopic(topic: string, actor = 'system'): boolean {
+    assertValidActor(actor, 'deregisterTopic');
+    const removed = this.topicRegistry.deregister(topic, this.now());
+    if (removed) {
+      const info = this.topicRegistry.get(topic);
+      this.auditSubscription({
+        action: 'topic_deregister',
+        topic,
+        actor,
+        detail: {
+          owner: info?.owner,
+          description: info?.description,
+        },
+      });
+    }
+    return removed;
+  }
+
+  /**
+   * Full record for a topic (EB-77), tombstones included — `undefined`
+   * when the topic was never registered.
+   */
+  getTopicInfo(topic: string): TopicInfo | undefined {
+    return this.topicRegistry.get(topic);
+  }
+
+  /**
+   * The operator catalog (EB-77): every live registration in registration
+   * order. With `includeDeregistered: true`, tombstones are appended after
+   * the live entries, each marked `registered: false`.
+   */
+  topicCatalog(options?: { includeDeregistered?: boolean }): TopicInfo[] {
+    return this.topicRegistry.catalog(options?.includeDeregistered ?? false);
+  }
+
+  /**
+   * Counts one publish to an unregistered topic and fires the opt-in
+   * hook (EB-77). Advisory only — never blocks the publish. The hook is
+   * error-isolated: a throwing observer is swallowed.
+   */
+  private checkTopicRegistered(topic: string): void {
+    if (this.topicRegistry.has(topic)) return;
+    this.unregisteredTopicPublishes += 1;
+    const hook = this.onUnregisteredTopic;
+    if (hook === undefined) return;
+    try {
+      hook({
+        topic,
+        at: this.now(),
+        unregisteredPublishes: this.unregisteredTopicPublishes,
+      });
+    } catch {
+      // Swallowed: the hook is an observer, not part of the publish path.
+    }
   }
 
   /**
@@ -13642,6 +13816,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       rejectedMessages: this.totalRejected,
+      unregisteredTopicPublishes: this.unregisteredTopicPublishes,
       lateMessages: this.totalLateMessages,
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
