@@ -48,6 +48,7 @@ import {
   type GroupLagStat,
 } from './grouplag.ts';
 import { DurableTopicLog, type SegmentRotationOptions } from './durablelog.ts';
+import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import {
   SubscriptionAuditLog,
   assertValidActor,
@@ -137,6 +138,8 @@ export type {
   TraceSamplingDecision,
   TraceSpan,
 } from './trace.ts';
+export type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
+export { AesGcmEncryptor, NoopEncryptor, isEncryptedPayload, randomAes256Key } from './encrypt.ts';
 
 export interface BusMessage {
   topic: string;
@@ -1765,6 +1768,18 @@ export interface EventBusOptions {
    */
   durableLogSegmentRotation?: SegmentRotationOptions;
   /**
+   * Opt-in at-rest encryption for the durable log (EB-80): when set,
+   * every per-topic JSONL data line, every archived segment's record
+   * payload, and the publish-dedup journal are sealed with this
+   * encryptor before they touch disk (see `DurableTopicLog` for the
+   * exact scope). Requires `durableLogDir` — setting it without a log
+   * directory throws `RangeError` at construction. The same encryptor
+   * (same key) must open the directory again; opening a sealed
+   * directory without it throws loudly at recovery. `NoopEncryptor`
+   * (from `src/encrypt.ts`) is for tests only — it protects nothing.
+   */
+  durableLogEncryptor?: PayloadEncryptor;
+  /**
    * Enables publish-side idempotent dedup for `publishIdempotent`: within
    * this many milliseconds of an admitted publish, a retry carrying the
    * same `messageId` on the same topic is suppressed as a duplicate — it
@@ -2688,6 +2703,8 @@ export interface BusStats {
     corruptLines: number;
     /** Whether keyed log compaction is enabled (`durableLogKeyCompaction`). */
     keyCompaction: boolean;
+    /** Whether at-rest encryption is enabled (`durableLogEncryptor`, EB-80). */
+    encrypted: boolean;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
     /** Total entries across all archived segments. */
@@ -6339,6 +6356,11 @@ export class EventBus {
    */
   private readonly durableLogSegmentRotation?: SegmentRotationOptions;
   /**
+   * `durableLogEncryptor` as configured — namespace child logs (EB-52)
+   * seal with the same encryptor as the root log.
+   */
+  private readonly durableLogEncryptor?: PayloadEncryptor;
+  /**
    * Subscription lifecycle audit log (EB-78): always present, always
    * records into its bounded in-memory index; persists to daily JSONL
    * files only when `EventBusOptions.subscriptionAuditDir` was given.
@@ -6488,23 +6510,28 @@ export class EventBus {
     }
     this.aclDefault = aclDefault;
     this.aclRules = normalizeAclRules(options?.acl?.rules, 'EventBus');
+    if (options?.durableLogDir == null && options?.durableLogEncryptor !== undefined) {
+      throw new RangeError('durableLogEncryptor requires EventBusOptions.durableLogDir to be set');
+    }
     if (options?.durableLogDir != null) {
       const log = DurableTopicLog.open({
         dir: options.durableLogDir,
         maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
         keyCompaction: options.durableLogKeyCompaction,
         segmentRotation: options.durableLogSegmentRotation,
+        encryptor: options.durableLogEncryptor,
         // The publish-dedup journal's size guard tracks the publish-side
         // idempotency window it persists (EB-66).
         publishDedupMaxEntries: this.idempotencyMaxEntries,
       });
       this.durableLog = log;
       // Remembered for namespace child logs (EB-52): children open with
-      // the same per-topic budget, compaction mode and rotation triggers
-      // as the root log.
+      // the same per-topic budget, compaction mode, rotation triggers
+      // and encryptor as the root log.
       this.durableLogMaxEntriesPerTopic = options.durableLogMaxEntriesPerTopic;
       this.durableLogKeyCompaction = options.durableLogKeyCompaction ?? false;
       this.durableLogSegmentRotation = options.durableLogSegmentRotation;
+      this.durableLogEncryptor = options.durableLogEncryptor;
       // Reseed the publish-side idempotent-dedup window from the journal
       // (EB-66): a restarted bus keeps suppressing within-window retries.
       // Claims that aged out of the window are "unknown" — dropped here,
@@ -7828,6 +7855,7 @@ export class EventBus {
         maxEntriesPerTopic: this.durableLogMaxEntriesPerTopic,
         keyCompaction: this.durableLogKeyCompaction,
         segmentRotation: this.durableLogSegmentRotation,
+        encryptor: this.durableLogEncryptor,
       });
       this.namespaceLogs.set(prefix, child);
       // A restarted bus reopens the namespace's on-disk history: reseed

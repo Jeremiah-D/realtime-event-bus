@@ -9,6 +9,8 @@ import {
 } from 'node:fs';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { join } from 'node:path';
+import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
+import { isEncryptedPayload } from './encrypt.ts';
 
 /**
  * One persisted message in the durable topic log.
@@ -157,6 +159,22 @@ export interface DurableLogOptions {
    * per topic exactly as before.
    */
   segmentRotation?: SegmentRotationOptions;
+  /**
+   * Opt-in at-rest encryption for the durable log (EB-80): when set,
+   * every per-topic JSONL data line, every archived segment's record
+   * payload, and the publish-dedup journal (`__publish_dedup.jsonl`) are
+   * sealed with this encryptor (AES-256-GCM, the WR-11 convention:
+   * random IV per line, auth tag, tampering fails loudly) before they
+   * touch disk. Replay and recovery decrypt transparently; a sealed line
+   * that cannot be decrypted is skipped and counted in `corruptLines`.
+   * Plaintext lines written before the encryptor was configured are still
+   * read (backward compatible). Opening a directory that holds sealed
+   * lines WITHOUT an encryptor throws loudly — a sealed journal must
+   * never be silently treated as empty or corrupt. Only meaningful with
+   * `dir`; the group-offset and subscriber-dedup journals carry no
+   * message content and stay plaintext.
+   */
+  encryptor?: PayloadEncryptor;
 }
 
 /**
@@ -179,6 +197,22 @@ export interface SegmentRotationOptions {
    * number.
    */
   maxSegmentAgeMs?: number;
+}
+
+/** On-disk envelope for one sealed log line (EB-80). `v: 2` pins the sealed format. */
+interface SealedLine {
+  v: 2;
+  enc: EncryptedPayload;
+}
+
+/**
+ * True when `o` is a sealed-line envelope — a parsed JSON object with
+ * `v: 2` and a well-formed encrypted payload. Plaintext v1 lines return
+ * false; malformed sealed envelopes are not sealed lines at all (they are
+ * corrupt, never silently plaintext).
+ */
+function isSealedLine(o: Record<string, unknown>): o is { v: 2; enc: EncryptedPayload } {
+  return o['v'] === 2 && isEncryptedPayload(o['enc']);
 }
 
 /** On-disk envelope for one log line. `v` pins the format for future readers. */
@@ -859,6 +893,11 @@ export class DurableTopicLog {
   private readonly archiveIndexFile: string;
   /** Set while a background archive pass is scheduled. */
   private archiveScheduled = false;
+  /**
+   * At-rest encryptor (EB-80), `undefined` when the log stores plaintext
+   * (the default — fully backward compatible).
+   */
+  private readonly encryptor?: PayloadEncryptor;
 
   private constructor(
     dir: string,
@@ -866,12 +905,14 @@ export class DurableTopicLog {
     keyCompaction: boolean,
     segmentRotation?: SegmentRotationOptions,
     publishDedupMaxEntries = 10000,
+    encryptor?: PayloadEncryptor,
   ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
     this.keyCompaction = keyCompaction;
     this.segmentRotation = segmentRotation;
     this.publishDedupMaxEntries = publishDedupMaxEntries;
+    this.encryptor = encryptor;
     this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
     this.dedupFile = join(dir, DEDUP_JOURNAL_NAME);
     this.publishDedupFile = join(dir, PUBLISH_DEDUP_JOURNAL_NAME);
@@ -887,8 +928,9 @@ export class DurableTopicLog {
   /**
    * Opens (or creates) the durable log at `dir`. Throws `RangeError` for an
    * empty `dir`, a non-positive-integer `maxEntriesPerTopic`, a
-   * non-positive-integer `publishDedupMaxEntries`, or invalid
-   * `segmentRotation` triggers.
+   * non-positive-integer `publishDedupMaxEntries`, invalid
+   * `segmentRotation` triggers, or an `encryptor` that is not a usable
+   * `PayloadEncryptor`.
    */
   static open(options: DurableLogOptions): DurableTopicLog {
     const dir = options.dir;
@@ -903,12 +945,23 @@ export class DurableTopicLog {
     if (!Number.isInteger(publishDedupMaxEntries) || publishDedupMaxEntries < 1) {
       throw new RangeError('publishDedupMaxEntries must be a positive integer');
     }
+    const encryptor = options.encryptor;
+    if (
+      encryptor !== undefined &&
+      (typeof encryptor !== 'object' ||
+        encryptor === null ||
+        typeof (encryptor as PayloadEncryptor).encrypt !== 'function' ||
+        typeof (encryptor as PayloadEncryptor).decrypt !== 'function')
+    ) {
+      throw new RangeError('durableLogEncryptor must be a PayloadEncryptor with encrypt/decrypt methods');
+    }
     return new DurableTopicLog(
       dir,
       maxEntriesPerTopic,
       options.keyCompaction ?? false,
       resolveSegmentRotationOptions(options.segmentRotation),
       publishDedupMaxEntries,
+      encryptor,
     );
   }
 
@@ -920,6 +973,59 @@ export class DurableTopicLog {
   /** File name for a topic: URL-encoded so any topic string is a safe name. */
   private fileFor(topic: string): string {
     return join(this.logDir, `${encodeURIComponent(topic)}.log`);
+  }
+
+  /**
+   * Seals one plaintext JSONL line (including its trailing newline) into
+   * a sealed envelope line (v2) when an encryptor is configured; a no-op
+   * passthrough otherwise, so plaintext logs are byte-identical to
+   * before. Every line gets its own fresh IV, so identical records seal
+   * to different bytes.
+   */
+  private sealLine(plaintextLine: string): string {
+    if (this.encryptor === undefined) return plaintextLine;
+    const enc = this.encryptor.encrypt(Buffer.from(plaintextLine, 'utf8'));
+    const sealed: SealedLine = { v: 2, enc };
+    return `${JSON.stringify(sealed)}\n`;
+  }
+
+  /**
+   * Opens one on-disk line back into its plaintext JSONL form (without
+   * the trailing newline). Plaintext v1 lines pass through untouched —
+   * a log that predates encryption stays readable.
+   *
+   * Returns `null` when the line is corrupt: unparseable JSON, a
+   * malformed sealed envelope, or a sealed payload this encryptor
+   * cannot open (wrong key or tampered bytes — the WR-11 loud-decrypt
+   * convention, surfaced as a skipped line, never garbage).
+   *
+   * Throws loudly when the line IS a sealed envelope but this log has
+   * no encryptor configured: a sealed journal recovered without its key
+   * must never be silently treated as empty or corrupt — that is the
+   * WR-11 dead-letter loud-failure convention, fail-closed. Callers let
+   * this propagate (recovery fails at open) rather than swallowing it.
+   */
+  private openLine(line: string): string | null {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return null;
+    }
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    const o = parsed as Record<string, unknown>;
+    if (!isSealedLine(o)) return line;
+    if (this.encryptor === undefined) {
+      throw new Error(
+        'DurableTopicLog: sealed log line found but no encryptor is configured — ' +
+          'refusing to read an encrypted journal without its key',
+      );
+    }
+    try {
+      return this.encryptor.decrypt(o.enc).toString('utf8');
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1050,7 +1156,12 @@ export class DurableTopicLog {
     const records: DurableLogRecord[] = [];
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
-      const rec = parseLogLine(line, topic);
+      const inner = this.openLine(line);
+      if (inner == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const rec = parseLogLine(inner, topic);
       if (rec == null) {
         this.corruptLines += 1;
         continue;
@@ -1121,7 +1232,14 @@ export class DurableTopicLog {
     const records: DurableLogRecord[] = [];
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
-      const rec = parseLogLine(line, topic);
+      // EB-80: sealed lines are opened transparently; a sealed line with
+      // no encryptor throws loudly here (fail-closed at recovery).
+      const inner = this.openLine(line);
+      if (inner == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const rec = parseLogLine(inner, topic);
       if (rec == null) {
         this.corruptLines += 1;
         continue;
@@ -1143,7 +1261,8 @@ export class DurableTopicLog {
   append(record: DurableLogRecord): boolean {
     let line: string;
     try {
-      line = `${JSON.stringify(logLineOf(record))}\n`;
+      // EB-80: sealed per line when an encryptor is configured.
+      line = this.sealLine(`${JSON.stringify(logLineOf(record))}\n`);
     } catch {
       return false;
     }
@@ -1338,7 +1457,14 @@ export class DurableTopicLog {
     const records: DurableLogRecord[] = [];
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
-      const rec = parseLogLine(line, topic);
+      // The pending file holds sealed lines when encryption is on (it is
+      // the renamed live file) — open each line before parsing.
+      const inner = this.openLine(line);
+      if (inner == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const rec = parseLogLine(inner, topic);
       if (rec == null) {
         this.corruptLines += 1;
         continue;
@@ -1372,7 +1498,9 @@ export class DurableTopicLog {
     }
     const gzPath = join(this.logDir, entry.path);
     try {
-      const canonical = records.map((rec) => `${JSON.stringify(logLineOf(rec))}\n`).join('');
+      // EB-80: the archived record bytes are sealed per line before
+      // compression, so the archive at rest is encrypted end to end.
+      const canonical = records.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
       writeFileSync(gzPath, gzipSync(canonical), { flag: 'wx' });
     } catch {
       // Either the gzip/write failed or the archive already exists (a
@@ -1400,7 +1528,7 @@ export class DurableTopicLog {
   private compact(topic: string): void {
     const records = this.readFileRecords(topic);
     const kept = this.keyCompaction ? compactKeyed(records, this.maxEntriesPerTopic) : records.slice(-this.maxEntriesPerTopic);
-    const text = kept.map((rec) => `${JSON.stringify(logLineOf(rec))}\n`).join('');
+    const text = kept.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
     try {
       writeFileSync(this.fileFor(topic), text, 'utf8');
     } catch {
@@ -1498,7 +1626,14 @@ export class DurableTopicLog {
       }
       for (const line of text.split('\n')) {
         if (line.length === 0) continue;
-        const rec = parseLogLine(line, topic);
+        // EB-80: archived record bytes are sealed per line; opened
+        // transparently, undecryptable lines skipped as corrupt.
+        const inner = this.openLine(line);
+        if (inner == null) {
+          this.corruptLines += 1;
+          continue;
+        }
+        const rec = parseLogLine(inner, topic);
         if (rec == null) {
           this.corruptLines += 1;
           continue;
@@ -1525,7 +1660,12 @@ export class DurableTopicLog {
       }
       for (const line of text.split('\n')) {
         if (line.length === 0) continue;
-        const rec = parseLogLine(line, topic);
+        const inner = this.openLine(line);
+        if (inner == null) {
+          this.corruptLines += 1;
+          continue;
+        }
+        const rec = parseLogLine(inner, topic);
         if (rec == null) {
           this.corruptLines += 1;
           continue;
@@ -1802,7 +1942,14 @@ export class DurableTopicLog {
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
       this.publishDedupEntries += 1;
-      const entry = parsePublishDedupLine(line);
+      // EB-80: the publish-dedup journal is sealed at rest when an
+      // encryptor is configured — opened transparently here.
+      const inner = this.openLine(line);
+      if (inner == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const entry = parsePublishDedupLine(inner);
       if (entry == null) {
         this.corruptLines += 1;
         continue;
@@ -1834,7 +1981,8 @@ export class DurableTopicLog {
   appendPublishDedup(entry: PublishDedupEntry): boolean {
     let line: string;
     try {
-      line = `${JSON.stringify(publishDedupLineOf(entry))}\n`;
+      // EB-80: sealed at rest when an encryptor is configured.
+      line = this.sealLine(`${JSON.stringify(publishDedupLineOf(entry))}\n`);
     } catch {
       return false;
     }
@@ -1864,7 +2012,7 @@ export class DurableTopicLog {
     // which also evicts by claim order rather than by timestamp (a
     // timestamp sort would misorder same-tick claims).
     const kept = [...this.publishDedupSeen.values()].slice(-this.publishDedupMaxEntries);
-    const text = kept.map((e) => `${JSON.stringify(publishDedupLineOf(e))}\n`).join('');
+    const text = kept.map((e) => this.sealLine(`${JSON.stringify(publishDedupLineOf(e))}\n`)).join('');
     try {
       writeFileSync(this.publishDedupFile, text, 'utf8');
     } catch {
@@ -1937,6 +2085,8 @@ export class DurableTopicLog {
     dedupEntries: number;
     /** Lines in the publish-dedup journal (`__publish_dedup.jsonl`). */
     publishDedupEntries: number;
+    /** Whether at-rest encryption is enabled (EB-80). */
+    encrypted: boolean;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
     /** Total entries across all archived segments. */
@@ -1972,6 +2122,7 @@ export class DurableTopicLog {
       offsetEntries: this.offsetEntries,
       dedupEntries: this.dedupEntries,
       publishDedupEntries: this.publishDedupEntries,
+      encrypted: this.encryptor !== undefined,
       corruptArchives: this.corruptArchives,
       archived,
       segments,

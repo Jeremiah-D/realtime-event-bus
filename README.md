@@ -333,7 +333,24 @@ library.
   numbering never reuses an archived number.
   `getStats().durableLog` additionally reports `archived` (total archived
   entries), `corruptArchives`, and per-topic `segments`
-  (`{ live, segments, archived }`).
+  (`{ live, segments, archived }`). Opt-in at-rest encryption
+  (`new EventBus({ durableLogDir, durableLogEncryptor })`, `src/encrypt.ts`):
+  every per-topic JSONL data line, every archived segment's record payload,
+  and the publish-dedup journal (`__publish_dedup.jsonl`) are sealed with a
+  `PayloadEncryptor` before they touch disk — AES-256-GCM via `node:crypto`
+  (`AesGcmEncryptor`, the WR-11 convention: fresh random 12-byte IV per
+  line, 16-byte auth tag, tampering fails decryption loudly), zero new
+  dependencies. Each line is its own sealed envelope (`{v: 2, enc}`), so
+  replay and recovery decrypt transparently; a sealed line that cannot be
+  decrypted (wrong key, tampered bytes) is skipped and counted in
+  `corruptLines`, never returned as garbage. Plaintext lines written before
+  the encryptor was configured still read — mixed old/new files recover
+  fine — but opening a sealed directory WITHOUT an encryptor throws loudly
+  at recovery (fail-closed: a sealed journal is never silently treated as
+  empty or corrupt). `durableLogEncryptor` without `durableLogDir` is a
+  `RangeError`; namespace child logs seal with the same encryptor as the
+  root log. `getStats().durableLog.encrypted` reports whether the log seals
+  at rest.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after
