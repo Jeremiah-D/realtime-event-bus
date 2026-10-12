@@ -1376,6 +1376,80 @@ namespace-aware rules against concrete `t1/<topic>` forms. Cluster
 advertisement of a leading-`**` namespaced pattern (`t1/**`) likewise
 carries hub-native scope; namespace-aware federation is out of scope.
 
+## Subscription migration
+
+`exportSubscription` / `importSubscription` / `completeMigration` /
+`cancelMigration` move one subscription — backlog, options, ack position
+and lease — from one `EventBus` instance to another without losing or
+duplicating messages (EB-82). The flow is:
+
+```ts
+// 1. Source: pause delivery and take the snapshot.
+const snapshot = source.exportSubscription(sub.id);
+if (snapshot === null) throw new Error('nothing to export');
+// 2. Target: rebuild the subscription. The handler cannot travel in the
+//    snapshot (functions don't cross instances) — you supply it here:
+//    a reliable (Delivery) handler for reliable snapshots, a batch
+//    handler for batched ones.
+const { subId } = target.importSubscription(snapshot, (msg) => { /* ... */ });
+// 3a. Source: the target has taken over — unsubscribe the source copy.
+source.completeMigration(snapshot.handoffToken);
+// ...or 3b. Source: abort the migration — resume delivery where it paused.
+source.cancelMigration(snapshot.handoffToken);
+```
+
+The snapshot carries: the pattern as registered (pre-namespace
+translation) plus the namespace name; the serializable subscribe options;
+the committed ack position (`ackCommittedSeq`); the remaining lease time;
+a backlog stats reading; and every undelivered message in delivery order —
+in-flight reliable deliveries first (ascending delivery seq), then the
+queued backlog (FIFO). The message envelopes travel by reference (no deep
+clone); moving a snapshot across processes (e.g. as JSON) needs JSON-safe
+payloads and option values, which is the caller's responsibility.
+
+Guarantees: acked messages are absent from the snapshot by construction
+and are never re-delivered; unacked messages are taken out of the source
+ack tracker *without* requeueing, so the source never redelivers them and
+the target delivers each exactly once; the handoff token is single-use
+per importing instance, so one snapshot can never double-subscribe the
+target; the target's `Delivery.seq` numbering continues the source's
+committed position. Export pauses delivery on the source (the drain skips
+the migrating subscriber; the backlog stays queued, nothing is dropped by
+the pause) while the subscription keeps counting as live in `getStats()`
+(`migratingSubscribers`). Import re-runs the normal subscribe path, so
+unknown namespaces, ACL denials and invalid options fail fast exactly like
+a fresh subscribe; a failed import consumes no token, so you can fix the
+cause and retry.
+
+Honest boundaries — read before relying on them:
+
+- **Non-serializable options don't migrate.** Content filters and
+  lifecycle callbacks (`filter`, `onBackpressure`, …) are functions; they
+  are listed openly in `snapshot.unsupportedOptions`, never dropped
+  silently. The target must re-attach its own.
+- **In-flight handler executions at export time are the caller's
+  responsibility.** A source handler still running when its delivery is
+  taken into the snapshot may process the message; the target will deliver
+  it again — at-least-once, so consumers must be idempotent. Stale source
+  `Delivery` handles settle to silent no-ops (no phantom requeues).
+- **Per-message TTL deadlines don't travel** (migrated messages are
+  admitted without a deadline), nor do dead-letter-queue contents, open
+  tumbling-window aggregates, per-key reorder-buffer holdings, or
+  per-message redelivery counters (they restart on the target).
+- **Publishes between export and complete are not in the snapshot.**
+  They queue on the (paused) source; `completeMigration` reports them as
+  `stragglers` and discards them with the source queue — quiesce producers
+  first, or accept the count.
+- **Durable-log resume cursors don't transfer** (`resumeFromSeq` /
+  `resumeFromTime`): the snapshot already carries the full undelivered
+  backlog, and replaying from the cursor would re-deliver acked messages.
+- **Consumer-group members can't migrate** (`exportSubscription` returns
+  `null`): the competing-consumer roster is bus-local. Unknown
+  subscription ids, already-migrating subscriptions and unknown handoff
+  tokens likewise return `null` / `false` instead of throwing (the
+  `renewLease` convention); malformed snapshots and double imports throw
+  `RangeError`.
+
 ## Run
 
 Requires Node.js ≥ 22 (uses native TypeScript type stripping — no build step,
@@ -1692,6 +1766,21 @@ npm test
   shadowed/shadow-dropped Prometheus counters, shadow sheds never
   surfacing as production sequence gaps, and unsubscribe stopping the
   mirror.
+- `test/migration.test.ts` — cross-instance subscription migration
+  (EB-82): plain-subscription export/import round-trip (backlog moves in
+  order with per-topic seqs preserved, source delivery pauses while
+  migrating, `completeMigration` unsubscribes the source and reports
+  stragglers), reliable migration (acked messages never redeliver,
+  unacked in-flight deliveries redeliver exactly once on the target with
+  `Delivery.seq` continuing the committed position; queued-only backlog
+  restarts numbering), `null`/`false` on unknown ids, group members and
+  double exports/completions, `cancelMigration` resuming delivery without
+  loss (in-flight backlog restored ahead of the queue, at-least-once),
+  double import rejected by the single-use handoff token, snapshot/handler
+  `RangeError` validation with no half-registered state, fail-fast import
+  when the target lacks the namespace, composite-pattern migration,
+  non-serializable options reported in `unsupportedOptions`, and lease
+  migration restoring the remaining time rather than the full duration.
 
 ## Benchmark
 

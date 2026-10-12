@@ -57,6 +57,13 @@ interface LeaseEntry {
   leaseMs: number;
   /** Topic pattern, surfaced on the expiry event. */
   pattern: string;
+  /**
+   * Wall-clock reading (`Date.now()`) of when the current timer was
+   * armed — by `arm` or the latest `renew`. Backs `remainingMs`; leases
+   * run on wall-clock time, not the bus's injected clock (see the module
+   * doc).
+   */
+  armedAtMs: number;
 }
 
 export class LeaseManager {
@@ -82,7 +89,7 @@ export class LeaseManager {
     // A lease must never keep the process alive on its own — mirrors the
     // health-probe auto-resume timer's unref convention.
     unrefTimer(timer);
-    this.entries.set(subId, { timer, unsubscribe, leaseMs, pattern });
+    this.entries.set(subId, { timer, unsubscribe, leaseMs, pattern, armedAtMs: Date.now() });
   }
 
   /**
@@ -98,6 +105,7 @@ export class LeaseManager {
     unrefTimer(timer);
     entry.timer = timer;
     entry.leaseMs = leaseMs;
+    entry.armedAtMs = Date.now();
     return true;
   }
 
@@ -132,6 +140,18 @@ export class LeaseManager {
   /** Whether `subId` currently holds an active lease. */
   has(subId: string): boolean {
     return this.entries.has(subId);
+  }
+
+  /**
+   * Subscription-migration support (EB-82): remaining lease time in
+   * milliseconds for `subId`, measured on the same wall clock the lease
+   * timers run on. Returns 0 when `subId` holds no active lease (unknown
+   * id, or a subscription that never opted into a lease).
+   */
+  remainingMs(subId: string): number {
+    const entry = this.entries.get(subId);
+    if (entry === undefined) return 0;
+    return Math.max(0, entry.leaseMs - (Date.now() - entry.armedAtMs));
   }
 
   private fire(subId: string): void {

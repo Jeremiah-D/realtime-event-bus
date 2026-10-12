@@ -81,6 +81,7 @@ import {
   TraceRecorder,
   formatTraceparent,
   newSpanId,
+  newTraceId,
   resolveTraceOptions,
   validateTraceparent,
   type TraceOptions,
@@ -1104,6 +1105,105 @@ export interface ShadowSubscriberStat {
  */
 const REPLAY_PROGRESS_INTERVAL_DEFAULT = 100;
 
+/** Format marker carried by every `SubscriptionSnapshot` (EB-82). */
+const SUBSCRIPTION_SNAPSHOT_KIND = 'realtime-event-bus/subscription-snapshot' as const;
+
+/**
+ * Subscription migration (EB-82): splits a subscribe-options bag into
+ * the serializable subset that can travel in a `SubscriptionSnapshot`
+ * and the names of the function-valued options that cannot. Only own
+ * enumerable top-level properties are considered; nested option objects
+ * are kept by reference (option bags are small plain data — the snapshot
+ * documents the no-deep-clone rule). `undefined` values are dropped so
+ * the snapshot only carries meaningful settings; a null/undefined bag
+ * yields an empty options object and no unsupported names.
+ */
+function serializableSubscribeOptions(opts: SubscribeOptions | undefined): {
+  options: Record<string, unknown>;
+  unsupported: string[];
+} {
+  const options: Record<string, unknown> = {};
+  const unsupported: string[] = [];
+  if (opts == null) return { options, unsupported };
+  for (const key of Object.keys(opts)) {
+    const value = (opts as Record<string, unknown>)[key];
+    if (typeof value === 'function') {
+      unsupported.push(key);
+      continue;
+    }
+    if (value !== undefined) options[key] = value;
+  }
+  return { options, unsupported };
+}
+
+/**
+ * Subscription migration (EB-82): validates an inbound snapshot before
+ * `importSubscription` touches it. Anything malformed — wrong kind or
+ * version, bad handoff token, missing pattern, non-object options —
+ * throws `RangeError`, fail-fast, before anything registers.
+ */
+function assertValidSubscriptionSnapshot(snap: unknown): asserts snap is SubscriptionSnapshot {
+  const fail = (why: string): never => {
+    throw new RangeError(`importSubscription: invalid snapshot (${why})`);
+  };
+  if (snap === null || typeof snap !== 'object' || Array.isArray(snap)) fail('not an object');
+  const s = snap as Record<string, unknown>;
+  if (s.kind !== SUBSCRIPTION_SNAPSHOT_KIND) fail('bad kind');
+  if (s.version !== 1) fail('unsupported version');
+  if (typeof s.handoffToken !== 'string' || !/^[0-9a-f]{32}$/.test(s.handoffToken)) {
+    fail('bad handoffToken');
+  }
+  if (typeof s.pattern !== 'string' || s.pattern.length === 0) fail('bad pattern');
+  if (s.namespace !== undefined && (typeof s.namespace !== 'string' || s.namespace.length === 0)) {
+    fail('bad namespace');
+  }
+  if (typeof s.reliable !== 'boolean') fail('bad reliable flag');
+  if (s.options === null || typeof s.options !== 'object' || Array.isArray(s.options)) {
+    fail('bad options');
+  }
+  if (
+    !Array.isArray(s.unsupportedOptions) ||
+    !s.unsupportedOptions.every((n) => typeof n === 'string')
+  ) {
+    fail('bad unsupportedOptions');
+  }
+  if (
+    s.ackCommittedSeq !== undefined &&
+    (!Number.isInteger(s.ackCommittedSeq) || (s.ackCommittedSeq as number) < 0)
+  ) {
+    fail('bad ackCommittedSeq');
+  }
+  if (typeof s.leaseRemainingMs !== 'number' || !Number.isFinite(s.leaseRemainingMs) || s.leaseRemainingMs < 0) {
+    fail('bad leaseRemainingMs');
+  }
+  if (!Array.isArray(s.pendingMessages)) fail('bad pendingMessages');
+  for (const msg of s.pendingMessages as unknown[]) {
+    if (msg === null || typeof msg !== 'object') fail('bad pendingMessages entry');
+  }
+}
+
+/**
+ * Subscription migration (EB-82): one outstanding export on the source
+ * instance, keyed by handoff token until `completeMigration` or
+ * `cancelMigration` runs.
+ */
+interface MigrationRecord {
+  /** Source subscription id the snapshot was exported from. */
+  subId: string;
+  /** Bus-clock reading at export. */
+  exportedAtMs: number;
+  /** Queue depth at export — anything above it at complete time arrived mid-migration. */
+  exportedQueueDepth: number;
+  /**
+   * In-flight backlog taken at export, in delivery order: outstanding
+   * reliable deliveries (ascending delivery seq) followed by dequeued-
+   * but-undelivered batch accumulator messages. Travels in
+   * `snapshot.pendingMessages`; re-enqueued on the source queue when the
+   * migration is cancelled, so cancelling loses nothing.
+   */
+  takenInFlight: BusMessage[];
+}
+
 /**
  * One subscriber's durable-log replay progress (see
  * `SubscribeOptions.onReplayProgress`, EB-71): `total` records were
@@ -1697,6 +1797,135 @@ export interface Subscription {
 }
 
 /**
+ * Point-in-time backlog reading for one subscriber, shared by
+ * `SubscriptionSnapshot.stats` and `CompletedSubscriptionMigration.stats`
+ * (EB-82).
+ */
+export interface MigrationBacklogStats {
+  /** Messages sitting in the subscriber's backpressure queue. */
+  queueDepth: number;
+  /** Cumulative messages shed by the queue's drop policy. */
+  droppedCount: number;
+  /** Cumulative messages discarded by TTL expiry. */
+  expiredCount: number;
+  /**
+   * Deliveries outstanding (handed to a reliable handler, not yet
+   * acked/nacked) at the reading. Always 0 on an export snapshot — the
+   * outstanding deliveries travel inside `pendingMessages` instead.
+   */
+  unackedCount: number;
+  /** Estimated buffered payload bytes in the queue. */
+  queueBytes: number;
+}
+
+/**
+ * A portable snapshot of one subscription, produced by
+ * `EventBus.exportSubscription` and consumed by
+ * `EventBus.importSubscription` on another instance (EB-82).
+ *
+ * The snapshot is a plain data bag: `options` holds the serializable
+ * subscribe options, `pendingMessages` holds the live `BusMessage`
+ * envelopes by reference (no deep clone). Transporting a snapshot
+ * across processes (e.g. as JSON) requires JSON-safe payloads and
+ * option values — that is the caller's responsibility; inside one
+ * process the references are used as-is.
+ */
+export interface SubscriptionSnapshot {
+  /** Format marker: `'realtime-event-bus/subscription-snapshot'`. */
+  kind: 'realtime-event-bus/subscription-snapshot';
+  /** Snapshot format version; currently 1. */
+  version: 1;
+  /**
+   * Freshly minted 32-hex handoff token (same format as trace ids).
+   * Single-use per importing instance: importing the same snapshot
+   * twice on one instance throws, so a snapshot can never
+   * double-subscribe the target.
+   */
+  handoffToken: string;
+  /**
+   * The topic pattern as registered (before namespace translation), so
+   * the target re-registers it through the same namespace rules.
+   */
+  pattern: string;
+  /** Namespace name when the source subscription was namespaced. */
+  namespace?: string;
+  /** True when the source subscription was reliable (`subscribeReliable`). */
+  reliable: boolean;
+  /**
+   * The serializable subscribe options the source subscription was
+   * created with. The target re-subscribes with these (plus `namespace`
+   * above), so every validation the normal subscribe path runs —
+   * unknown namespaces, ACL denials, bad option values — fails fast on
+   * import exactly like a fresh subscribe.
+   */
+  options: Record<string, unknown>;
+  /**
+   * Names of function-valued subscribe options that were set on the
+   * source subscription (content filters, lifecycle callbacks) and did
+   * NOT migrate — functions cannot cross instances. Listed openly here,
+   * never dropped silently; the target must re-attach its own.
+   */
+  unsupportedOptions: string[];
+  /**
+   * Committed ack position for reliable subscriptions: the highest
+   * per-subscriber delivery sequence ever assigned on the source.
+   * Messages acked at or below it are gone — never re-delivered — and
+   * the target seeds its delivery counter from it, so `Delivery.seq`
+   * continues where the source left off. Absent for plain subscriptions.
+   */
+  ackCommittedSeq?: number;
+  /**
+   * Remaining lease time in milliseconds at export, for subscriptions
+   * created with `leaseMs`. The target re-arms the lease with this
+   * remaining time, not the source's original full duration. 0 when the
+   * source subscription had no lease.
+   */
+  leaseRemainingMs: number;
+  /** Per-subscriber backlog reading at export time. */
+  stats: MigrationBacklogStats;
+  /**
+   * Undelivered messages in delivery order: in-flight reliable
+   * deliveries first (ascending delivery seq — they were dequeued
+   * earliest), then the queued backlog (FIFO). Acked messages are
+   * absent by construction: they were settled on the source and are
+   * never re-delivered. Per-message TTL deadlines do NOT travel (see
+   * `exportSubscription`); neither do dead-letter-queue contents,
+   * open window aggregates, or per-key reorder-buffer holdings.
+   */
+  pendingMessages: BusMessage[];
+  /** Bus-clock reading (`EventBusOptions.now`) at export. */
+  exportedAtMs: number;
+}
+
+/** Result of `EventBus.importSubscription` (EB-82). */
+export interface SubscriptionImportResult {
+  /** Id of the recreated subscription on the target instance. */
+  subId: string;
+  /** The snapshot's handoff token, now consumed on this instance. */
+  handoffToken: string;
+}
+
+/**
+ * Result of `EventBus.completeMigration` (EB-82): the source
+ * subscription has been unsubscribed through the normal teardown path.
+ */
+export interface CompletedSubscriptionMigration {
+  /** Id of the source subscription that was unsubscribed. */
+  subId: string;
+  /** The handoff token whose migration just completed. */
+  handoffToken: string;
+  /** Final backlog reading, taken just before teardown. */
+  stats: MigrationBacklogStats;
+  /**
+   * Messages that arrived on the source AFTER the export snapshot was
+   * taken and were discarded with the source queue: they were never
+   * part of the snapshot. Quiesce producers (or accept the loss) between
+   * export and complete — this count makes the choice visible.
+   */
+  stragglers: number;
+}
+
+/**
  * Options for the {@link EventBus} constructor. Every field is optional;
  * a bus created with no options behaves exactly like before.
  */
@@ -2247,6 +2476,12 @@ export interface BusStats {
    * subscriptions surface in the cache stats.
    */
   compositeSubscriptions: number;
+  /**
+   * Currently active subscriptions paused for cross-instance migration
+   * (see `exportSubscription`, EB-82): delivery is paused but the
+   * subscription still counts as live everywhere else.
+   */
+  migratingSubscribers: number;
   /**
    * Number of distinct literal-prefix keys currently held in the
    * publish-side prefix index — one entry per prefix with at least one
@@ -3052,6 +3287,38 @@ interface Subscriber {
    * flush loop.
    */
   shadow?: ShadowState;
+  /**
+   * Subscription migration (EB-82): set while an `exportSubscription`
+   * snapshot is outstanding for this subscriber. Delivery is paused —
+   * `drainSubscriber` skips the subscriber, leaving its backlog queued
+   * under the normal backpressure policy — until `completeMigration`
+   * unsubscribes it or `cancelMigration` resumes it. The subscriber
+   * keeps counting as live in `getStats()` (see `migratingSubscribers`).
+   */
+  migrating?: boolean;
+  /**
+   * Subscription migration (EB-82): the outermost unsubscribe closure
+   * for this subscription — the plain `subscribe` closure, replaced by
+   * the subscribe-family wrappers (`subscribeReliable`) with their
+   * outermost teardown. Lets `completeMigration` run the normal
+   * unsubscribe path without reimplementing it.
+   */
+  teardown?: () => void;
+  /**
+   * Subscription migration (EB-82): the serializable subset of the
+   * options this subscription was created with, captured at subscribe
+   * time. Function-valued options are excluded (their names are kept in
+   * `unsupportedMigrationOptions`); nested option objects are shared by
+   * reference with the caller's options bag, not deep-cloned.
+   */
+  migrationOptions?: Record<string, unknown>;
+  /**
+   * Subscription migration (EB-82): names of function-valued subscribe
+   * options that were set on this subscription (filters, callbacks) and
+   * therefore cannot travel in a migration snapshot. Surfaced on the
+   * snapshot as `unsupportedOptions` — dropped openly, never silently.
+   */
+  unsupportedMigrationOptions?: string[];
 }
 
 /**
@@ -5740,6 +6007,18 @@ interface NamespaceSubscriptionScope {
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
+  /**
+   * Outstanding subscription migrations (EB-82), keyed by handoff token:
+   * one entry per `exportSubscription` whose `completeMigration` or
+   * `cancelMigration` has not run yet.
+   */
+  private readonly migrations = new Map<string, MigrationRecord>();
+  /**
+   * Handoff tokens already imported by THIS instance (EB-82). A token is
+   * single-use per instance, so one snapshot can never double-subscribe
+   * the target, however many times it is presented.
+   */
+  private readonly importedHandoffTokens = new Set<string>();
   /**
    * Compiled topic patterns, keyed by the exact pattern string. Each distinct
    * pattern is compiled once and the RegExp is shared by every subscriber on
@@ -8493,6 +8772,12 @@ export class EventBus {
     // nothing between here and `subscribers.set` throws.
     const composite =
       compositeOpts === undefined ? undefined : this.acquireComposite(compositeOpts, ns?.prefix);
+    // Subscription migration (EB-82): capture the serializable subset of
+    // the subscribe options now — after every validation above ran, so a
+    // rejected subscribe never captures anything. Function-valued options
+    // (filters, callbacks) are reported separately, never silently dropped.
+    const { options: migrationOptions, unsupported: unsupportedMigrationOptions } =
+      serializableSubscribeOptions(opts);
     const subscriber: Subscriber = {
       id,
       pattern: topicPattern,
@@ -8544,6 +8829,10 @@ export class EventBus {
       // counters start at zero; the queue above is already the shadow's
       // own, sized by its independent backpressure policy.
       shadow: shadowOpts === undefined ? undefined : { delivered: 0, dropped: 0 },
+      // Subscription migration (EB-82): the serializable options this
+      // subscription was created with, for `exportSubscription`.
+      migrationOptions,
+      unsupportedMigrationOptions,
     };
     this.subscribers.set(id, subscriber);
     if (composite !== undefined) this.compositeSubscriptionCount += 1;
@@ -8649,6 +8938,11 @@ export class EventBus {
         this.advertiseClusterPatterns();
       },
     };
+    // Subscription migration (EB-82): the plain teardown, replaced with
+    // the outermost wrapper by the subscribe family below
+    // (`subscribeReliable`). `completeMigration` runs this closure so the
+    // source subscription always unsubscribes through the normal path.
+    subscriber.teardown = subscription.unsubscribe;
     // Subscription lease (EB-69): opt-in only. Armed after the
     // subscription object exists so expiry can unsubscribe through the
     // outermost wrapper (see `subscribeReliable` / `subscribeToGroup`,
@@ -8686,6 +8980,305 @@ export class EventBus {
       throw new RangeError('renewLease: ms must be a positive integer number of milliseconds');
     }
     return this.leases.renew(subId, ms);
+  }
+
+  /**
+   * Exports one subscription into a portable `SubscriptionSnapshot` for
+   * cross-instance migration (EB-82) — step 1 of the flow:
+   *
+   * 1. `exportSubscription(subId)` on the source — pauses delivery, takes
+   *    the snapshot.
+   * 2. `importSubscription(snapshot, handler)` on the target — rebuilds
+   *    the subscription and replays the backlog.
+   * 3. `completeMigration(token)` on the source — unsubscribes the source
+   *    subscription (or `cancelMigration(token)` to resume it instead).
+   *
+   * The snapshot captures the pattern (pre-namespace-translation),
+   * namespace, serializable subscribe options, committed ack position,
+   * remaining lease time, backlog stats, and every undelivered message
+   * in delivery order. Function-valued options (content filters,
+   * lifecycle callbacks) cannot cross instances: they are listed openly
+   * in `snapshot.unsupportedOptions`, never dropped silently.
+   *
+   * Export puts the source subscription into "migrating" state: the
+   * drain skips it, so delivery pauses while the backlog stays queued —
+   * nothing is dropped by the pause itself. For reliable subscriptions
+   * the outstanding (unacked) deliveries are taken out of the ack
+   * tracker WITHOUT requeueing, so the source never redelivers them;
+   * they travel in `snapshot.pendingMessages` and the target delivers
+   * each exactly once. Acked messages are absent by construction and
+   * are never re-delivered.
+   *
+   * Returns `null` (paralleling `renewLease`) when there is nothing to
+   * export: an unknown subscription id, a consumer-group member (group
+   * membership cannot migrate — the roster is bus-local), or a
+   * subscription that already has an export in flight.
+   *
+   * Honest boundaries (see the README's "Subscription migration"
+   * section): per-message TTL deadlines do not travel; dead-letter-queue
+   * contents, open window aggregates, per-key reorder-buffer holdings and
+   * per-message redelivery counters do not migrate; in-flight handler
+   * executions at export time are the caller's responsibility; publishes
+   * arriving between export and complete are queued on the source but are
+   * NOT in the snapshot — quiesce producers or accept the reported
+   * straggler count at complete time.
+   */
+  exportSubscription(subId: string): SubscriptionSnapshot | null {
+    const subscriber = this.subscribers.get(subId);
+    // Parallels `renewLease`: an unknown id is not an error — there is
+    // simply nothing to export.
+    if (subscriber === undefined) return null;
+    // Consumer-group memberships cannot migrate: the competing-consumer
+    // roster, assignment watermarks and rebalance protocol are bus-local
+    // (see `subscribeToGroup`).
+    if (subscriber.groupId !== undefined) return null;
+    // An export is already in flight for this subscription — the first
+    // snapshot is the valid one. Exporting twice would fork the backlog
+    // (two snapshots, one queue), so the second export reports null.
+    if (subscriber.migrating === true) return null;
+
+    // A batched subscriber's linger timer delivers outside the drain
+    // loop — disarm it so the pause below is total; the drain re-arms it
+    // on resume (see drainBatchedSubscriber).
+    this.clearBatchTimer(subscriber);
+    const reliable = subscriber.reliable;
+    // Take outstanding reliable deliveries out of the tracker: timers
+    // cancelled, forgotten WITHOUT requeueing, so the source never
+    // redelivers them. They travel in the snapshot; the target delivers
+    // each exactly once. Their open ack trace spans are abandoned — the
+    // source will never close them.
+    const takenTracker = reliable?.tracker.takePending() ?? [];
+    for (const msg of takenTracker) this.trace?.abandonAckSpan(msg);
+    // A batched subscriber may hold dequeued-but-undelivered messages in
+    // its batch accumulator — move them into the snapshot too, ahead of
+    // the queued backlog (they were dequeued earliest).
+    const batch = subscriber.batch;
+    const takenBatched = batch === undefined ? [] : batch.pending.splice(0);
+    const takenInFlight = [...takenTracker, ...takenBatched];
+    const queued = subscriber.queue.snapshot();
+    const namespace = subscriber.namespacePrefix;
+    const prefix = namespace === undefined ? undefined : `${namespace}/`;
+    const handoffToken = newTraceId();
+    const exportedAtMs = this.now();
+    subscriber.migrating = true;
+    this.migrations.set(handoffToken, {
+      subId,
+      exportedAtMs,
+      exportedQueueDepth: queued.length,
+      takenInFlight,
+    });
+    return {
+      kind: SUBSCRIPTION_SNAPSHOT_KIND,
+      version: 1,
+      handoffToken,
+      // The registration-time pattern: strip the namespace translation
+      // so the target re-registers through the same namespace rules.
+      pattern:
+        prefix === undefined || !subscriber.pattern.startsWith(prefix)
+          ? subscriber.pattern
+          : subscriber.pattern.slice(prefix.length),
+      ...(namespace === undefined ? {} : { namespace }),
+      reliable: reliable !== undefined,
+      options: { ...(subscriber.migrationOptions ?? {}) },
+      unsupportedOptions: [...(subscriber.unsupportedMigrationOptions ?? [])],
+      ...(reliable === undefined ? {} : { ackCommittedSeq: reliable.tracker.highestSeq }),
+      leaseRemainingMs: this.leases.remainingMs(subId),
+      stats: this.migrationBacklogStats(subscriber, takenTracker.length),
+      pendingMessages: [...takenInFlight, ...queued],
+      exportedAtMs,
+    };
+  }
+
+  /**
+   * Rebuilds a subscription on the target instance from an
+   * `exportSubscription` snapshot (EB-82) — step 2 of the flow.
+   *
+   * The handler cannot travel in the snapshot (functions do not cross
+   * instances) and must be supplied here: a reliable (`Delivery`)
+   * handler for reliable snapshots, a batch handler for batched ones.
+   * The target re-subscribes with the snapshot's serializable options,
+   * so every validation the normal subscribe path runs — unknown
+   * namespaces, ACL denials, invalid option values — fails fast exactly
+   * like a fresh subscribe, before anything registers. The lease is
+   * re-armed with its REMAINING time, not the source's original full
+   * duration; durable-log resume cursors do not transfer (the snapshot
+   * already carries the complete undelivered backlog — replaying from
+   * the cursor would re-deliver acked messages).
+   *
+   * The committed ack position is restored: acked messages are absent
+   * from the snapshot (never re-delivered) and the target's delivery
+   * counter continues the source's numbering. The backlog replays in
+   * snapshot order through the normal admission path.
+   *
+   * The handoff token is single-use per instance: importing the same
+   * snapshot twice throws `RangeError` without creating a second
+   * subscription. A malformed snapshot throws `RangeError`; a non-
+   * function handler throws `RangeError`.
+   */
+  importSubscription(
+    snapshot: SubscriptionSnapshot,
+    handler:
+      | MessageHandler
+      | ReliableMessageHandler
+      | BatchMessageHandler
+      | ReliableBatchMessageHandler,
+  ): SubscriptionImportResult {
+    assertValidSubscriptionSnapshot(snapshot);
+    if (typeof handler !== 'function') {
+      throw new RangeError('importSubscription: handler must be a function');
+    }
+    // Single-use per instance: a snapshot that already built a
+    // subscription here can never build a second one.
+    if (this.importedHandoffTokens.has(snapshot.handoffToken)) {
+      throw new RangeError('importSubscription: handoff token was already imported by this instance');
+    }
+    const importOpts: Record<string, unknown> = { ...snapshot.options };
+    if (snapshot.namespace !== undefined) importOpts.namespace = snapshot.namespace;
+    // The lease resumes with its REMAINING time, not the source's
+    // original full duration. A fully-elapsed remaining time means the
+    // lease is effectively over — import without one rather than arming
+    // a zero-length lease.
+    if (snapshot.leaseRemainingMs > 0) {
+      importOpts.leaseMs = Math.max(1, Math.floor(snapshot.leaseRemainingMs));
+    } else {
+      delete importOpts.leaseMs;
+    }
+    // Durable-log resume cursors do not transfer: the snapshot already
+    // carries the complete undelivered backlog, and replaying from the
+    // cursor would re-deliver messages the source already acked.
+    delete importOpts.resumeFromSeq;
+    delete importOpts.resumeFromTime;
+    // Fail-fast exactly like a fresh subscribe: unknown namespaces, ACL
+    // denials and invalid option values throw before anything registers —
+    // a throw leaves no half-imported subscription behind, and the token
+    // stays unconsumed so the caller can fix the cause and retry.
+    const subscription = snapshot.reliable
+      ? this.subscribeReliable(
+          snapshot.pattern,
+          handler as ReliableMessageHandler,
+          importOpts as ReliableSubscribeOptions,
+        )
+      : this.subscribe(snapshot.pattern, handler as MessageHandler, importOpts as SubscribeOptions);
+    const subscriber = this.subscribers.get(subscription.id);
+    if (subscriber === undefined) {
+      throw new Error(`importSubscription: subscription ${subscription.id} vanished after subscribe`);
+    }
+    // Resume from the committed ack position: acked messages are absent
+    // from the snapshot by construction (never re-delivered), and the
+    // target's delivery counter continues the source's numbering.
+    const reliable = subscriber.reliable;
+    if (reliable !== undefined && snapshot.ackCommittedSeq !== undefined) {
+      reliable.tracker.seedHighestSeq(snapshot.ackCommittedSeq);
+    }
+    // Re-enqueue the migrated backlog in snapshot order through the
+    // normal admission path. The dedup check is bypassed — these
+    // envelopes were already admitted on the source (mirrors
+    // `requeueUndelivered`); a full target queue applies the
+    // subscriber's own drop policy, exactly like any other admission.
+    // Per-message TTL deadlines do not survive migration (documented).
+    for (const msg of snapshot.pendingMessages) {
+      this.enqueueMessage(subscriber, msg, undefined, true);
+    }
+    this.importedHandoffTokens.add(snapshot.handoffToken);
+    this.scheduleFlush();
+    return { subId: subscription.id, handoffToken: snapshot.handoffToken };
+  }
+
+  /**
+   * Completes a migration on the SOURCE instance (EB-82) — step 3a of
+   * the flow, run after the target has taken over. Verifies the handoff
+   * token, then unsubscribes the source subscription through the normal
+   * teardown path (outermost wrapper: ack-tracker clear, lease/idle
+   * clears, queue disposal — exactly like a manual `unsubscribe()`),
+   * and returns the final stats.
+   *
+   * Messages that arrived on the source AFTER the export snapshot are
+   * reported as `stragglers`: they were never part of the snapshot and
+   * are discarded with the source queue. Quiesce producers between
+   * export and complete, or accept the count.
+   *
+   * Returns `false` (never throws) when the token is unknown — or when
+   * the source subscription is already gone (a lease/idle expiry or a
+   * manual unsubscribe won the race; the end state the caller asked for
+   * already holds).
+   */
+  completeMigration(handoffToken: string): CompletedSubscriptionMigration | false {
+    const record = this.migrations.get(handoffToken);
+    if (record === undefined) return false;
+    this.migrations.delete(handoffToken);
+    const subscriber = this.subscribers.get(record.subId);
+    // The source subscription is already gone — a lease/idle expiry or a
+    // manual unsubscribe won the race with the migration. The end state
+    // the caller asked for (the source no longer delivers) already holds.
+    if (subscriber === undefined || subscriber.migrating !== true) return false;
+    const stats = this.migrationBacklogStats(
+      subscriber,
+      subscriber.reliable?.tracker.unackedCount ?? 0,
+    );
+    // Anything queued above the export-time depth arrived mid-migration:
+    // never part of the snapshot, discarded with the source queue.
+    const stragglers = Math.max(0, subscriber.queue.size - record.exportedQueueDepth);
+    const teardown = subscriber.teardown;
+    if (teardown === undefined) {
+      throw new Error(`completeMigration: no teardown recorded for ${record.subId}`);
+    }
+    teardown();
+    return { subId: record.subId, handoffToken, stats, stragglers };
+  }
+
+  /**
+   * Aborts a migration on the SOURCE instance (EB-82) — step 3b of the
+   * flow, the alternative to `completeMigration`. The in-flight backlog
+   * taken at export is restored ahead of the never-delivered queue (in
+   * original relative order) and delivery resumes; the snapshot's
+   * handoff token is forgotten. Nothing is lost by cancelling.
+   *
+   * At-least-once caveat: a source handler execution that was already
+   * in flight at export time may have processed its message — the
+   * restored copy is then a redelivery, exactly like any ack-timeout
+   * redelivery. Consumers must be idempotent.
+   *
+   * Returns `false` (never throws) when the token is unknown or the
+   * source subscription is already gone.
+   */
+  cancelMigration(handoffToken: string): boolean {
+    const record = this.migrations.get(handoffToken);
+    if (record === undefined) return false;
+    this.migrations.delete(handoffToken);
+    const subscriber = this.subscribers.get(record.subId);
+    if (subscriber === undefined || subscriber.migrating !== true) return false;
+    // Restore the taken in-flight backlog ahead of the never-delivered
+    // queue, in original relative order (the taken messages were dequeued
+    // earliest). Re-admission bypasses the dedup check — these envelopes
+    // were already admitted on this instance (mirrors
+    // `requeueUndelivered`); per-message TTL deadlines are not restored.
+    if (record.takenInFlight.length > 0) {
+      const queued = subscriber.queue.drain();
+      for (const msg of record.takenInFlight) this.enqueueMessage(subscriber, msg, undefined, true);
+      for (const msg of queued) this.enqueueMessage(subscriber, msg, undefined, true);
+    }
+    subscriber.migrating = false;
+    this.scheduleFlush();
+    return true;
+  }
+
+  /**
+   * Subscription migration (EB-82): point-in-time backlog reading for
+   * one subscriber. `unackedCount` is passed in because an export
+   * snapshot reports the pre-take outstanding count while the tracker
+   * itself has already been emptied into the snapshot.
+   */
+  private migrationBacklogStats(
+    subscriber: Subscriber,
+    unackedCount: number,
+  ): MigrationBacklogStats {
+    return {
+      queueDepth: subscriber.queue.size,
+      droppedCount: subscriber.queue.droppedCount,
+      expiredCount: subscriber.queue.expiredCount,
+      unackedCount,
+      queueBytes: subscriber.queue.queueBytes,
+    };
   }
 
   /**
@@ -9270,6 +9863,10 @@ export class EventBus {
     this.leases.adoptUnsubscribe(sub.id, reliableSubscription.unsubscribe);
     // Idle expiry must run the outermost teardown too (EB-72).
     this.idleReclaimer.adoptUnsubscribe(sub.id, reliableSubscription.unsubscribe);
+    // Subscription migration (EB-82): `completeMigration` must run the
+    // outermost teardown — the inner closure alone would skip the
+    // ack-tracker clear above.
+    subscriber.teardown = reliableSubscription.unsubscribe;
     return reliableSubscription;
   }
 
@@ -14022,6 +14619,7 @@ export class EventBus {
     let degradedSubscribers = 0;
     let shapedSubscribers = 0;
     let rampingSubscribers = 0;
+    let migratingSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
     const ackLatency: BusStats['ackLatency'] = [];
     const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
@@ -14034,6 +14632,9 @@ export class EventBus {
     let causalBufferDepth = 0;
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
+      // Subscription migration (EB-82): a paused-for-export subscription
+      // still counts as live everywhere else.
+      if (subscriber.migrating === true) migratingSubscribers += 1;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
@@ -14204,6 +14805,7 @@ export class EventBus {
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       compositeSubscriptions: this.compositeSubscriptionCount,
+      migratingSubscribers,
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
@@ -14802,6 +15404,14 @@ export class EventBus {
    * backlog drains even when no new publishes arrive.
    */
   private drainSubscriber(subscriber: Subscriber, nowMs: number): void {
+    // Subscription migration (EB-82): an exported subscription pauses
+    // delivery — its backlog stays queued under the normal backpressure
+    // policy, untouched by the drain, so the target instance picks up
+    // exactly where the source paused. Nothing is dropped by the pause
+    // itself; queued messages wait for `completeMigration` (teardown) or
+    // `cancelMigration` (resume). Mirrors the degraded health-probe pause
+    // below.
+    if (subscriber.migrating === true) return;
     // Shadow subscribers drain through their own isolated path: their
     // deliveries never touch production counters, and a throwing shadow
     // handler never escapes into this flush loop.

@@ -227,4 +227,47 @@ export class AckTracker<T> {
     this.pending.clear();
     return outstanding;
   }
+
+  /**
+   * Subscription-migration support (EB-82): takes every outstanding
+   * delivery out of the tracker and returns their messages in ascending
+   * delivery-seq order (the pending map preserves insertion order, and
+   * sequences ascend monotonically). Timers are cancelled and the
+   * deliveries forgotten WITHOUT requeueing — the caller moves the
+   * messages into the migration snapshot, so the source instance never
+   * redelivers them.
+   *
+   * Each taken delivery counts as settled for `onSettle` (in-flight slot
+   * accounting must observe the settle, exactly as for `ack()`), but it
+   * was NOT acked: `onAck` (idle `'ack'` activity, ack-latency sampling)
+   * does not fire, and `onRedeliver` does not run. Stale `Delivery`
+   * handles kept by the source consumer settle to silent no-ops through
+   * the usual settled guard.
+   */
+  takePending(): T[] {
+    const msgs: T[] = [];
+    for (const [seq, record] of this.pending) {
+      record.settled = true;
+      if (record.timer !== undefined) clearTimeout(record.timer);
+      this.pending.delete(seq);
+      this.onSettle?.();
+      msgs.push(record.msg);
+    }
+    return msgs;
+  }
+
+  /**
+   * Subscription-migration support (EB-82): seeds the delivery-sequence
+   * counter with the source instance's committed position, so a freshly
+   * imported subscription continues the source's `Delivery.seq`
+   * numbering instead of restarting at 1. Only ever raises the counter —
+   * a value at or below the current one is a no-op — and non-integer or
+   * negative input throws `RangeError`.
+   */
+  seedHighestSeq(seq: number): void {
+    if (!Number.isInteger(seq) || seq < 0) {
+      throw new RangeError('seedHighestSeq: seq must be a non-negative integer');
+    }
+    if (seq > this.nextSeq) this.nextSeq = seq;
+  }
 }

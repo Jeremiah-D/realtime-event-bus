@@ -247,6 +247,17 @@ export class BoundedQueue<T> {
   }
 
   /**
+   * Subscription-migration support (EB-82): returns the queued items in
+   * FIFO order WITHOUT removing them — no drops, no expiry sweep, no
+   * high-water-mark side effects. Per-entry TTL deadlines and priorities
+   * are not included; see `EventBus.exportSubscription` for the
+   * documented TTL boundary.
+   */
+  snapshot(): T[] {
+    return this.entries.map((entry) => entry.item);
+  }
+
+  /**
    * Returns the oldest queued item without removing it, or `undefined`
    * when the queue is empty. Entries are kept in push order (append-only
    * with splice removals), so the head is the oldest surviving entry —
