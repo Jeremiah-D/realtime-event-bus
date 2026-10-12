@@ -2275,6 +2275,12 @@ export interface BusStats {
    */
   deadLetteredMessages: number;
   /**
+   * Total cumulative-ack calls (`ackUpTo`, EB-76) on known reliable
+   * subscribers — one per call, regardless of how many deliveries the
+   * range actually acked.
+   */
+  ackedRanges: number;
+  /**
    * Total DLQ diagnostic events admitted to their diagnostic topic (see
    * `DeadLetterOptions.diagnosticTopic`). Counted on admission, not
    * delivery — the event exists even when nothing subscribes to the
@@ -6007,6 +6013,12 @@ export class EventBus {
    */
   private totalDeadLettered = 0;
   /**
+   * Cumulative-ack calls (`ackUpTo`, EB-76): one per call on a known
+   * reliable subscriber, regardless of how many deliveries the range
+   * actually acked.
+   */
+  private totalAckedRanges = 0;
+  /**
    * Messages flagged as DLQ diagnostics at creation (see
    * `DeadLetterOptions.diagnosticTopic`). A dead-lettered diagnostic
    * message never emits a second diagnostic — the recursion cut. The mark
@@ -8239,6 +8251,71 @@ export class EventBus {
       throw new RangeError('renewLease: ms must be a positive integer number of milliseconds');
     }
     return this.leases.renew(subId, ms);
+  }
+
+  /**
+   * Cumulatively acknowledges a reliable subscriber's outstanding
+   * deliveries up to a delivery sequence (EB-76): every outstanding
+   * delivery with `seq <= seq` is acked at once — the high-throughput
+   * alternative to acking each `Delivery` handle individually when the
+   * consumer processes messages in order.
+   *
+   * Returns the number of deliveries actually acked. Delivery seqs that
+   * are not outstanding — never delivered, already acked/nacked, timed
+   * out and redelivered under a new seq, or moved to the dead-letter
+   * queue after exhausting their redelivery budget (EB-28) — are
+   * skipped silently, so gaps in the range never error. A `seq` outside
+   * the subscriber's delivery history (not a positive integer, or beyond
+   * the highest delivery seq ever tracked) is a `RangeError`; calling it
+   * on a non-reliable subscription is a `RangeError` too. An unknown
+   * subscriber id returns 0 (paralleling `renewLease`).
+   *
+   * Composition:
+   * - ack-latency (EB-40): the range contributes a single sample — the
+   *   last acked message's accepted→ack latency, sampled once at the
+   *   range-ack moment — instead of one sample per delivery;
+   * - trace spans (EB-45): each completed delivery's open ack span is
+   *   closed, like an individual `ack()` would;
+   * - the tracker's settle path runs per delivery, so `maxInflight`
+   *   (EB-67) slots release and idle-ack activity (EB-72) records
+   *   exactly as with individual acks. The per-message processing
+   *   latency SLO (EB-53) is intentionally not sampled: a range ack is
+   *   not a per-message processing event.
+   *
+   * `getStats().ackedRanges` counts the calls.
+   */
+  ackUpTo(subId: string, seq: number): number {
+    if (!Number.isInteger(seq) || seq <= 0) {
+      throw new RangeError('ackUpTo: seq must be a positive integer delivery sequence');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) return 0;
+    const reliable = subscriber.reliable;
+    if (reliable == null) {
+      throw new RangeError('ackUpTo: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    const tracker = reliable.tracker;
+    if (seq > tracker.highestSeq) {
+      throw new RangeError(
+        `ackUpTo: seq ${seq} is beyond the highest delivery seq ${tracker.highestSeq} tracked for this subscriber`,
+      );
+    }
+    this.totalAckedRanges += 1;
+    const acked = tracker.ackUpTo(seq);
+    const ackState = subscriber.ackLatency;
+    const last = acked.length - 1;
+    for (let i = 0; i < acked.length; i++) {
+      const msg = acked[i].msg;
+      if (this.trace !== undefined && this.trace.hasTrace(msg)) {
+        this.trace.closeAckSpan(subscriber, msg, this.now());
+      }
+      // EB-40: single sample for the whole range — the last acked
+      // message's accepted→ack latency at this moment.
+      if (i === last && ackState != null) {
+        ackState.tracker.sampleOnAck(msg);
+      }
+    }
+    return acked.length;
   }
 
   /**
@@ -13456,6 +13533,7 @@ export class EventBus {
       ),
       filteredMessages: this.totalFiltered,
       deadLetteredMessages: this.totalDeadLettered,
+      ackedRanges: this.totalAckedRanges,
       diagnosticEvents: this.totalDiagnosticEvents,
       compressedMessages: this.totalCompressed,
       compressedBytesBefore: this.totalCompressedBytesBefore,

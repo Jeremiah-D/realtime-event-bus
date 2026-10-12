@@ -77,7 +77,19 @@ library.
   original payload plus `{ subscriberId, pattern, seq, lastError,
   redeliveries, traceId, deadLetteredAt }` metadata — so operators consume
   and alert on every poison message from a single topic instead of polling
-  per-subscriber DLQs. The diagnostic goes through the normal publish
+  per-subscriber DLQs. High-throughput in-order consumers can call
+  `ackUpTo(subId, seq)` (EB-76) to cumulatively acknowledge every
+  outstanding delivery with `seq <= seq` in one call instead of acking
+  each `Delivery` handle: it returns the number actually acked, skips
+  non-outstanding seqs silently (never delivered, already settled, or
+  dead-lettered), and throws `RangeError` for a `seq` outside the
+  subscriber's delivery history or a non-reliable subscriber (an unknown
+  subscriber id returns 0). A range contributes a single ack-latency
+  sample — the last acked message's accepted→ack latency — while each
+  delivery still runs the tracker's uniform settle path (so
+  `maxInflight` slots release and idle-ack activity records exactly as
+  with individual acks). `getStats().ackedRanges` counts the calls. The
+  diagnostic goes through the normal publish
   pipeline (ACL, schema validation, rate limiting); an admission rejection
   suppresses it without affecting the DLQ move, and a dead-lettered
   diagnostic message never emits a second diagnostic (no recursion).
@@ -1416,6 +1428,12 @@ npm test
   auto-requeues, double/late settles are no-ops, unsubscribe cancels pending
   timers, redelivered messages keep their original TTL deadline, and
   `ackTimeoutMs` validation.
+- `test/ackupto.test.ts` — cumulative ack (`ackUpTo`, EB-76): whole-range
+  acking with the per-call count, silent skipping of non-outstanding seqs,
+  `RangeError` on out-of-history seqs and non-reliable subscribers, 0 on
+  unknown subscriber ids, fresh seqs on nacked redeliveries, DLQ-skipping
+  (EB-28), single ack-latency sample at the last ack moment (EB-40), and
+  `maxInflight` slot release through the uniform settle path (EB-67).
 - `test/deadletter.test.ts` — subscriber dead-letter queues: nack/ack-timeout
   exhaustion and repeatedly throwing handlers move poison messages to the DLQ,
   DLQ-local seqs and arrival order, snapshot reads, replay with original seq

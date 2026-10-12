@@ -133,6 +133,39 @@ export class AckTracker<T> {
   }
 
   /**
+   * The highest delivery sequence ever assigned (by `track`), including
+   * deliveries that already settled. Cumulative acks (`ackUpTo`) beyond
+   * this are out of range.
+   */
+  get highestSeq(): number {
+    return this.nextSeq;
+  }
+
+  /**
+   * The single settle path shared by `ack()`, `nack()`, the ack-timeout
+   * timer, and `ackUpTo`: forgets the delivery, fires `onAck` (ack
+   * settles only) and `onSettle` (every settle), then requeues when
+   * asked. Idempotent per delivery — a second settle is a no-op.
+   */
+  private settleOne(seq: number, record: PendingDelivery<T>, requeue: boolean, reason?: RedeliveryReason): void {
+    if (record.settled) return;
+    record.settled = true;
+    if (record.timer !== undefined) clearTimeout(record.timer);
+    this.pending.delete(seq);
+    // The uniform settle hook: ack(), nack(), and the ack-timeout path
+    // all converge here, so one call covers every way a delivery can
+    // settle — before any requeue work runs.
+    //
+    // `onAck` is narrower: only an `ack()` reaching a live delivery
+    // settles without requeueing, so `!requeue` after the settled guard
+    // is exactly "ack() settled" — no-ops on settled/stale handles
+    // returned above, nacks and timeouts requeue. (EB-72 idle activity.)
+    if (!requeue) this.onAck?.();
+    this.onSettle?.();
+    if (requeue) this.onRedeliver(record.msg, reason ?? 'nack');
+  }
+
+  /**
    * Registers a new outstanding delivery and returns its handle, starting
    * the ack-timeout timer. `redeliveries` is reported back on the handle so
    * callers can surface how many times the message was requeued before.
@@ -140,24 +173,7 @@ export class AckTracker<T> {
   track(msg: T, redeliveries: number): Delivery<T> {
     const seq = ++this.nextSeq;
     const record: PendingDelivery<T> = { msg, settled: false };
-    const settle = (requeue: boolean, reason?: RedeliveryReason): void => {
-      if (record.settled) return;
-      record.settled = true;
-      if (record.timer !== undefined) clearTimeout(record.timer);
-      this.pending.delete(seq);
-      // The uniform settle hook: ack(), nack(), and the ack-timeout path
-      // all converge here, so one call covers every way a delivery can
-      // settle — before any requeue work runs.
-      //
-      // `onAck` is narrower: only an `ack()` reaching a live delivery
-      // settles without requeueing, so `!requeue` after the settled guard
-      // is exactly "ack() settled" — no-ops on settled/stale handles
-      // returned above, nacks and timeouts requeue. (EB-72 idle activity.)
-      if (!requeue) this.onAck?.();
-      this.onSettle?.();
-      if (requeue) this.onRedeliver(msg, reason ?? 'nack');
-    };
-    record.timer = setTimeout(() => settle(true, 'ack-timeout'), this.ackTimeoutMs);
+    record.timer = setTimeout(() => this.settleOne(seq, record, true, 'ack-timeout'), this.ackTimeoutMs);
     // An unacked delivery must not keep the process alive on its own.
     const handle = record.timer as unknown as { unref?: () => unknown };
     if (typeof handle.unref === 'function') handle.unref();
@@ -167,9 +183,35 @@ export class AckTracker<T> {
       seq,
       redeliveries,
       acceptedAtMs: this.now(),
-      ack: () => settle(false),
-      nack: () => settle(true),
+      ack: () => this.settleOne(seq, record, false),
+      nack: () => this.settleOne(seq, record, true),
     };
+  }
+
+  /**
+   * Cumulatively acknowledges every outstanding delivery with sequence
+   * `<= seq`, in ascending sequence order (EB-76): the high-throughput
+   * alternative to acking each `Delivery` handle when the consumer
+   * processes messages in order.
+   *
+   * Each acked delivery settles exactly like an individual `ack()` —
+   * same timer cleanup, same `onAck`/`onSettle` hooks, no requeue.
+   * Deliveries that are not outstanding (never delivered, already
+   * settled, or dead-lettered after exhausting their redelivery budget)
+   * are simply absent from the pending map and skipped silently.
+   * Returns the acked deliveries in sequence order, so the caller can
+   * run per-delivery side effects (trace spans, ack-latency sampling).
+   */
+  ackUpTo(seq: number): Array<{ seq: number; msg: T }> {
+    const acked: Array<{ seq: number; msg: T }> = [];
+    // The pending map preserves insertion order and sequences ascend
+    // monotonically, so the first entry past `seq` ends the range.
+    for (const [s, record] of this.pending) {
+      if (s > seq) break;
+      this.settleOne(s, record, false);
+      acked.push({ seq: s, msg: record.msg });
+    }
+    return acked;
   }
 
   /**
