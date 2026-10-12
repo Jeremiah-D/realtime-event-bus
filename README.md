@@ -1784,6 +1784,49 @@ Prometheus exposition (see above) — emitted only when at least one
 publisher has admitted a publish, so a publisher-free bus renders
 byte-identical exposition to before.
 
+## Subscription lifecycle audit log
+
+Every subscription change is recorded in an append-only audit log —
+`subscribe` / `unsubscribe` / pattern hot-updates (`updateSubscriptionPattern`)
+/ consumer-group join-leave / group rebalances / topic-registry changes:
+
+```ts
+const sub = bus.subscribe('orders.*', handler, { actor: 'checkout-svc' });
+bus.updateSubscriptionPattern(sub.id, 'orders.v2.*');
+sub.unsubscribe();
+
+bus.getSubscriptionAudit({ action: ['subscribe', 'unsubscribe'] });
+// [{ v:1, at:…, action:'subscribe', subId:'sub-1', pattern:'orders.*', actor:'checkout-svc' },
+//  { v:1, at:…, action:'unsubscribe', subId:'sub-1', pattern:'orders.v2.*', actor:'system' }]
+```
+
+This is the complement of `onAuthzDenied`, which only fires for
+*rejected* authorization decisions: the audit log records the normal,
+successful lifecycle the denial hook deliberately ignores.
+
+Details:
+
+- **Actor** — `SubscribeOptions.actor` names who made the change
+  (service, operator); defaults to `'system'` (lease/idle expiry, pattern
+  updates, group leave). An empty/non-string actor throws `RangeError`
+  before anything registers.
+- **Query** — `getSubscriptionAudit({ since, until, action, limit })`
+  filters the bounded in-memory index (default 1000 entries, oldest
+  evicted; `subscriptionAuditMaxEntries` tunes it). `since` is inclusive,
+  `until` exclusive, `limit` keeps the most recent matches, oldest first.
+- **Persistence** — `EventBusOptions.subscriptionAuditDir` opts into daily
+  `audit-YYYY-MM-DD.jsonl` files (one per UTC day, created when missing);
+  without it the in-memory index still records everything, but a restart
+  loses the history. On startup the index back-fills from existing files,
+  skipping corrupt lines — a damaged audit directory never prevents the
+  bus from starting.
+- **Error isolation** — a failed disk append is counted, never thrown
+  into the subscribe/unsubscribe path; a throwing audit hook cannot
+  exist, because there is no hook — only the log.
+- **Detail payloads** — `update_pattern` carries `{ from }`;
+  `rebalance` carries `{ trigger, memberId, members }`;
+  topic-registry changes carry the registration metadata.
+
 ## Prometheus metrics
 
 `src/metrics.ts` renders a `getStats()` snapshot as Prometheus text

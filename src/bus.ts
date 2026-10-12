@@ -49,6 +49,12 @@ import {
 } from './grouplag.ts';
 import { DurableTopicLog, type SegmentRotationOptions } from './durablelog.ts';
 import {
+  SubscriptionAuditLog,
+  assertValidActor,
+  type SubscriptionAuditEvent,
+  type SubscriptionAuditQuery,
+} from './subaudit.ts';
+import {
   NamespaceDeniedError,
   NamespaceHandle,
   NamespaceNotEmptyError,
@@ -1032,6 +1038,13 @@ export interface SubscribeOptions {
    * shadow queue independently. Disabled by default.
    */
   shadow?: boolean | ShadowSubscribeOptions;
+  /**
+   * Actor recorded in the subscription lifecycle audit log (EB-78) for
+   * this subscription's `subscribe` event — e.g. the service or operator
+   * that created it. Defaults to `'system'` when omitted. Must be a
+   * non-empty string when provided.
+   */
+  actor?: string;
 }
 
 /**
@@ -1696,6 +1709,26 @@ export interface EventBusOptions {
    * every `publish` pays one synchronous file append.
    */
   durableLogDir?: string;
+  /**
+   * Enables disk persistence for the subscription lifecycle audit log
+   * (EB-78): every subscribe / unsubscribe / pattern hot-update /
+   * group join-leave / rebalance / topic-registry change is appended to
+   * `audit-YYYY-MM-DD.jsonl` (one file per UTC day, created when
+   * missing) under this directory. Without it the audit log still
+   * records into its bounded in-memory index — `getSubscriptionAudit()`
+   * works either way — but a restart loses the history. Disabled by
+   * default; when enabled, every audited change pays one synchronous
+   * file append (error-isolated: a failed write is counted, never
+   * thrown into the subscribe path).
+   */
+  subscriptionAuditDir?: string;
+  /**
+   * Bounded in-memory index size for the subscription audit log
+   * (default 1000): the oldest entries are evicted past this size.
+   * Applies whether or not `subscriptionAuditDir` persists to disk.
+   * Must be a positive integer.
+   */
+  subscriptionAuditMaxEntries?: number;
   /**
    * Maximum retained log entries per topic before the log compacts away the
    * oldest entries (default 10000). Only meaningful with `durableLogDir`.
@@ -6203,6 +6236,14 @@ export class EventBus {
    */
   private readonly durableLogSegmentRotation?: SegmentRotationOptions;
   /**
+   * Subscription lifecycle audit log (EB-78): always present, always
+   * records into its bounded in-memory index; persists to daily JSONL
+   * files only when `EventBusOptions.subscriptionAuditDir` was given.
+   * Every audit site funnels through `auditSubscription`, which is
+   * error-isolated so a broken log can never disturb the subscribe path.
+   */
+  private readonly subAudit: SubscriptionAuditLog;
+  /**
    * Registered multi-tenant namespaces (EB-52): prefix → effective
    * flags. Concrete namespaced topics are `<prefix>/<topic>`; the `/`
    * separator is matched literally by the wildcard engine, so one
@@ -6401,6 +6442,28 @@ export class EventBus {
         committed.set(topic, seq);
       }
     }
+    // Subscription lifecycle audit log (EB-78): always constructed — the
+    // in-memory index records every change even without a disk directory.
+    // Validated before construction, so a throw leaves no half-built bus.
+    const subscriptionAuditDir = options?.subscriptionAuditDir;
+    if (subscriptionAuditDir !== undefined && typeof subscriptionAuditDir !== 'string') {
+      throw new RangeError('subscriptionAuditDir must be a non-empty string');
+    }
+    if (subscriptionAuditDir === '') {
+      throw new RangeError('subscriptionAuditDir must be a non-empty string');
+    }
+    const subscriptionAuditMaxEntries = options?.subscriptionAuditMaxEntries;
+    if (
+      subscriptionAuditMaxEntries !== undefined &&
+      (!Number.isInteger(subscriptionAuditMaxEntries) || subscriptionAuditMaxEntries < 1)
+    ) {
+      throw new RangeError('subscriptionAuditMaxEntries must be a positive integer');
+    }
+    this.subAudit = new SubscriptionAuditLog({
+      dir: subscriptionAuditDir,
+      maxEntries: subscriptionAuditMaxEntries,
+      now: this.now,
+    });
   }
 
   /**
@@ -7928,6 +7991,10 @@ export class EventBus {
       throw new RangeError("subscribe: idleActivity must be 'deliver', 'ack' or 'any'");
     }
     const idleMode: IdleActivityMode = idleActivity ?? 'any';
+    // Subscription audit actor (EB-78): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'subscribe');
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
     const onThrottled = opts?.onThrottled;
@@ -8176,6 +8243,15 @@ export class EventBus {
       id,
       unsubscribe: () => {
         if (!this.subscribers.delete(id)) return;
+        // Subscription lifecycle audit (EB-78): name the live pattern —
+        // `updateSubscriptionPattern` rewrites it in place, and the audit
+        // must reflect what the subscription actually matched on.
+        this.auditSubscription({
+          action: 'unsubscribe',
+          subId: id,
+          pattern: subscriber.pattern,
+          actor: 'system',
+        });
         // A lease must not outlive its subscriber: no phantom expiry
         // after unsubscribe (EB-69).
         this.leases.clear(id);
@@ -8235,6 +8311,10 @@ export class EventBus {
     if (maxIdleMs !== undefined) {
       this.idleReclaimer.arm(id, maxIdleMs, idleMode, topicPattern, subscription.unsubscribe);
     }
+    // Subscription lifecycle audit (EB-78): the subscriber is fully
+    // registered — record the (translated) pattern the matcher actually
+    // uses, so a namespaced subscription audits under its concrete form.
+    this.auditSubscription({ action: 'subscribe', subId: id, pattern: topicPattern, actor });
     return subscription;
   }
 
@@ -8440,6 +8520,16 @@ export class EventBus {
     this.idleReclaimer.relabelPattern(subId, registered);
     // 6. The advertised pattern set may have changed.
     this.advertiseClusterPatterns();
+    // Subscription lifecycle audit (EB-78): group moves (step 4) already
+    // audited their leave/join rebalances inside `fireRebalance`; this
+    // entry names the pattern change itself.
+    this.auditSubscription({
+      action: 'update_pattern',
+      subId,
+      pattern: registered,
+      actor: 'system',
+      detail: { from: oldPattern },
+    });
     return true;
   }
 
@@ -8964,6 +9054,17 @@ export class EventBus {
       if (partitioned) this.replayLogForPartitionedMember(subscriber, key, resumeFromSeq);
       else this.replayLog(subscriber, resumeFromSeq);
     }
+    // Subscription lifecycle audit (EB-78): the group membership on top
+    // of the 'subscribe' the inner call recorded. Audited before the
+    // rebalance fires, so the join entry precedes the 'rebalance' entry
+    // the rebalance records.
+    this.auditSubscription({
+      action: 'group_join',
+      subId: sub.id,
+      groupId,
+      pattern: topicPattern,
+      actor: opts?.actor ?? 'system',
+    });
     this.fireRebalance(groupId, topicPattern, key, 'join', sub.id, undefined, partitionRebalance);
     const groupSubscription: Subscription = {
       id: sub.id,
@@ -8989,6 +9090,16 @@ export class EventBus {
         }
         const linger = this.beginLingerHandoff(groupId, subscriber);
         sub.unsubscribe();
+        // Subscription lifecycle audit (EB-78): the leave itself, on top
+        // of the 'unsubscribe' the inner closure recorded. Audited before
+        // the rebalance fires, so the leave entry precedes it.
+        this.auditSubscription({
+          action: 'group_leave',
+          subId: sub.id,
+          groupId,
+          pattern: topicPattern,
+          actor: 'system',
+        });
         this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id, linger, pr);
       },
     };
@@ -9069,6 +9180,15 @@ export class EventBus {
         ...(partitionRebalance == null ? {} : { partitionRebalance }),
       });
     }
+    // Subscription lifecycle audit (EB-78): one entry per rebalance, not
+    // per notified member — the group roster change is a single fact.
+    this.auditSubscription({
+      action: 'rebalance',
+      groupId,
+      pattern,
+      actor: 'system',
+      detail: { trigger, memberId, members: members.length },
+    });
     // Membership changed: the assignment-to-commitment balance for the
     // group just shifted (a member's uncommitted backlog may now be
     // redelivered by someone else), so re-evaluate lag alerts. A
@@ -11589,6 +11709,35 @@ export class EventBus {
     } catch {
       // Swallowed: the hook is an observer, not part of the path.
     }
+  }
+
+  /**
+   * Records one subscription lifecycle audit event (EB-78). Fully
+   * error-isolated: `SubscriptionAuditLog.append` never throws by
+   * construction, and this wrapper swallows defensively anyway, so a
+   * broken audit log can never disturb the subscribe/unsubscribe path.
+   */
+  private auditSubscription(event: Omit<SubscriptionAuditEvent, 'v' | 'at'>): void {
+    try {
+      this.subAudit.append(event);
+    } catch {
+      // Swallowed: the audit log is an observer, not part of the path.
+    }
+  }
+
+  /**
+   * Queries the subscription lifecycle audit log (EB-78): the bounded
+   * in-memory index of every subscribe / unsubscribe / pattern
+   * hot-update / group join-leave / rebalance / topic-registry change,
+   * optionally persisted to `subscriptionAuditDir` daily JSONL files.
+   * Filters by time window and action; `limit` keeps the most recent
+   * matches. Entries come back oldest-first. The index is bounded
+   * (`subscriptionAuditMaxEntries`, default 1000) — deep history lives in
+   * the on-disk files when persistence is enabled. Throws `RangeError`
+   * on illegal query values.
+   */
+  getSubscriptionAudit(query?: SubscriptionAuditQuery): SubscriptionAuditEvent[] {
+    return this.subAudit.query(query ?? {});
   }
 
   /**
