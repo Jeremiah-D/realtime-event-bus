@@ -899,6 +899,49 @@ export interface SubscribeOptions {
    */
   batch?: boolean | BatchDeliveryOptions;
   /**
+   * Opt-in subscriber-side tumbling-window aggregation (EB-73): downstream
+   * QPS smoothing for hot topics. The first admitted message opens a
+   * window `[windowStart, windowStart + windowMs)` on the bus clock
+   * (`EventBusOptions.now`); every admitted message folds into the
+   * window's accumulators instead of being queued; when the window
+   * closes the subscriber receives a single aggregate message whose
+   * payload is a `WindowAggregateResult`
+   * (`{ windowStart, windowEnd, count, value }`). A window with no
+   * messages never delivers. The aggregate then travels the subscriber's
+   * normal delivery path — backpressure queue, reliable delivery,
+   * drain-time shaping — exactly like a published message.
+   *
+   * Aggregation happens at fan-out, before the queue: the content
+   * `filter` still applies to each raw message (a rejected message never
+   * enters the window), publish-side compression and the durable log see
+   * the raw publishes untouched, and the aggregate itself is synthetic —
+   * it is not re-filtered, carries no `messageId`, and takes no TTL
+   * deadline. A message already past its TTL at admission is counted as
+   * expired and never enters the window (a message that outlives its TTL
+   * inside the short window still contributes — expiry is evaluated at
+   * admission, not at close). The aggregate's `seq` is the window's last
+   * raw message `seq`, so sequence-gap detection keeps working across
+   * windows; its `topic` is that message's topic.
+   *
+   * Composes with the other delivery features:
+   * - `filter`: applies to raw messages before aggregation (orthogonal).
+   * - `throttle`: publish-side shedding still protects the subscriber —
+   *   shed messages never enter the window and surface as sequence gaps.
+   * - reliable (`subscribeReliable`): the aggregate arrives as one
+   *   `Delivery` — ack it to confirm the whole window.
+   * - `batch`: aggregates are batched at drain like any queued message.
+   * - `deliveryShaping` / `rateLimit` / `maxInflight`: apply to the
+   *   aggregate delivery (one invocation per window).
+   *
+   * Unsubscribing clears the window timer and discards the open window's
+   * buffered state, exactly like discarding a queued backlog. The
+   * window-close timer is `unref()`'d, so an open window never keeps the
+   * process alive. `getStats().aggregatedWindows` counts completed
+   * (non-empty) windows. Invalid values throw `RangeError` from
+   * `subscribe`. Disabled by default.
+   */
+  window?: WindowAggregateOptions;
+  /**
    * Multi-tenant namespace (EB-52, see `EventBus.createNamespace`): the
    * subscription is scoped to the namespace — `topicPattern` is matched
    * against the sub-topic after the `<namespace>/` prefix, so `**`
@@ -2073,6 +2116,14 @@ export interface BusStats {
    */
   idleExpired: number;
   /**
+   * Completed (non-empty) tumbling windows across all windowed
+   * subscribers (see `SubscribeOptions.window`, EB-73). Counts each
+   * window once when it closes and produces its aggregate — 0 when no
+   * subscriber ever opted into window aggregation. The field is always
+   * present, so readers never need a fallback.
+   */
+  aggregatedWindows: number;
+  /**
    * Deliveries currently outstanding — handed to reliable subscribers but
    * not yet acked or nacked — across all subscriptions.
    */
@@ -2832,6 +2883,11 @@ interface Subscriber {
    * batching is disabled for this subscriber.
    */
   batch?: BatchDeliveryState;
+  /**
+   * Tumbling-window aggregation state (see `SubscribeOptions.window`,
+   * EB-73). Absent when the subscriber did not opt in.
+   */
+  window?: SubscriberWindowState;
   /**
    * Subscriber-side exactly-once dedup window (see
    * `SubscribeOptions.deduplicateMessages`). Absent when dedup is
@@ -3685,6 +3741,216 @@ function resolveBatchDeliveryOptions(
     throw new RangeError('batch.maxWaitMs must be a finite number of milliseconds >= 0');
   }
   return { maxSize, maxWaitMs, pending: [], timer: undefined };
+}
+
+/**
+ * Aggregation functions for subscriber-side tumbling windows (see
+ * `SubscribeOptions.window`, EB-73). `count` counts the window's
+ * messages; the numeric four fold the extracted numeric values;
+ * `last` takes the last message's extracted value; `concat`
+ * string-concatenates every extracted value.
+ */
+export type WindowAggregateKind =
+  | 'count'
+  | 'sum'
+  | 'avg'
+  | 'min'
+  | 'max'
+  | 'last'
+  | 'concat';
+
+const WINDOW_AGGREGATES: ReadonlySet<string> = new Set([
+  'count',
+  'sum',
+  'avg',
+  'min',
+  'max',
+  'last',
+  'concat',
+]);
+
+/**
+ * Opt-in subscriber-side tumbling-window aggregation (see
+ * `SubscribeOptions.window`, EB-73).
+ */
+export interface WindowAggregateOptions {
+  /**
+   * Window length in milliseconds on the bus clock
+   * (`EventBusOptions.now`). The first admitted message opens a window
+   * `[windowStart, windowStart + windowMs)`; when the window closes the
+   * subscriber receives a single aggregate message
+   * (`WindowAggregateResult`) instead of the raw messages. Must be a
+   * positive finite number.
+   */
+  windowMs: number;
+  /**
+   * How the window's messages fold into `WindowAggregateResult.value`.
+   * Must be one of `'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' |
+   * 'concat'`.
+   */
+  aggregate: WindowAggregateKind;
+  /**
+   * Dot-separated payload field the aggregation reads (e.g.
+   * `"metrics.price"`); when absent the whole payload is the value.
+   * For the numeric aggregates (`sum`/`avg`/`min`/`max`) a message
+   * whose extracted value is not a finite number is ignored entirely
+   * (not counted); for `concat` a message whose extracted value is
+   * `undefined` is ignored; `count` and `last` count every admitted
+   * message. `__proto__`/`constructor`/`prototype` segments are
+   * rejected with `RangeError` at subscribe time.
+   */
+  field?: string;
+}
+
+/**
+ * The single message a tumbling window delivers when it closes (see
+ * `SubscribeOptions.window`, EB-73). It travels the subscriber's normal
+ * delivery path — backpressure queue, reliable delivery, drain-time
+ * shaping — exactly like a published message.
+ */
+export interface WindowAggregateResult {
+  /** Bus-clock (`EventBusOptions.now`) start of the closed window. */
+  windowStart: number;
+  /** `windowStart + windowMs`: the window's exclusive end. */
+  windowEnd: number;
+  /** Messages that contributed to this aggregate. */
+  count: number;
+  /**
+   * The folded value: the count itself for `'count'`; the
+   * sum/mean/min/max of the extracted finite numbers for the numeric
+   * aggregates (`null` when no message carried a finite number); the
+   * last message's extracted value for `'last'`; the concatenated
+   * string forms for `'concat'`.
+   */
+  value: unknown;
+}
+
+/**
+ * Field-path segments that must never be traversed when extracting a
+ * window aggregation field: honoring them would read object prototypes
+ * instead of data. Rejected at subscribe time (fail-fast `RangeError`).
+ */
+const FORBIDDEN_WINDOW_FIELD_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Parses and validates a `WindowAggregateOptions.field` dot path.
+ * Returns the segments, or `undefined` when no field was given. Throws
+ * `RangeError` for empty paths, empty segments, and forbidden
+ * prototype-polluting segments.
+ */
+function parseWindowFieldPath(field: string | undefined): string[] | undefined {
+  if (field === undefined) return undefined;
+  if (typeof field !== 'string' || field.length === 0) {
+    throw new RangeError('subscribe: window.field must be a non-empty string');
+  }
+  const segments = field.split('.');
+  for (const segment of segments) {
+    if (segment.length === 0) {
+      throw new RangeError(`subscribe: window.field "${field}" contains an empty segment`);
+    }
+    if (FORBIDDEN_WINDOW_FIELD_SEGMENTS.has(segment)) {
+      throw new RangeError(
+        `subscribe: window.field "${field}" uses the forbidden segment "${segment}"`,
+      );
+    }
+  }
+  return segments;
+}
+
+/**
+ * Reads the aggregation value out of a raw payload along a parsed field
+ * path. Returns the whole payload when no field was given; `undefined`
+ * when any segment is missing (arrays are opaque — never indexed).
+ */
+function extractWindowValue(payload: unknown, fieldPath: string[] | undefined): unknown {
+  if (fieldPath === undefined) return payload;
+  let node: unknown = payload;
+  for (const segment of fieldPath) {
+    if (typeof node !== 'object' || node === null) return undefined;
+    node = (node as Record<string, unknown>)[segment];
+  }
+  return node;
+}
+
+/**
+ * Per-subscriber tumbling-window aggregation state (see
+ * `SubscribeOptions.window`, EB-73). Absent when the subscriber did not
+ * opt in — non-opt-in subscribers pay a single property check per
+ * delivery, no allocation and no timer.
+ *
+ * The accumulators are O(1) per message (`concat` additionally keeps
+ * the stringified parts): a hot topic fills no per-message queue, which
+ * is the point — downstream QPS collapses to ~1/windowMs.
+ */
+interface SubscriberWindowState {
+  windowMs: number;
+  aggregate: WindowAggregateKind;
+  fieldPath: string[] | undefined;
+  /** Bus-clock start of the open window; 0 when no window is open. */
+  windowStart: number;
+  /** `windowStart + windowMs`: the open window's exclusive end. */
+  windowEnd: number;
+  /** Messages that contributed to the open window. */
+  count: number;
+  /** Numeric fold accumulators (only for sum/avg/min/max). */
+  sum: number;
+  numericCount: number;
+  min: number;
+  max: number;
+  /** Last extracted value (only for `last`). */
+  last: unknown;
+  /** Stringified parts (only for `concat`). */
+  parts: string[];
+  /** Topic/seq/epoch of the last admitted message: the aggregate's envelope. */
+  lastTopic: string;
+  lastSeq: number;
+  lastEpoch: string;
+  /** Window-close timer, armed while a window is open. Unref'd. */
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Validates `SubscribeOptions.window` and builds the initial window
+ * state. Returns `undefined` when window aggregation is disabled.
+ * Throws `TypeError` for a non-object value and `RangeError` for an
+ * invalid `windowMs`, `aggregate`, or `field`.
+ */
+function resolveWindowOptions(
+  opt: WindowAggregateOptions | undefined,
+): SubscriberWindowState | undefined {
+  if (opt === undefined) return undefined;
+  if (typeof opt !== 'object' || opt === null) {
+    throw new TypeError('subscribe: window must be a WindowAggregateOptions object');
+  }
+  const windowMs = opt.windowMs;
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new RangeError('subscribe: window.windowMs must be a positive finite number of milliseconds');
+  }
+  const aggregate = opt.aggregate;
+  if (typeof aggregate !== 'string' || !WINDOW_AGGREGATES.has(aggregate)) {
+    throw new RangeError(
+      "subscribe: window.aggregate must be one of 'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' | 'concat'",
+    );
+  }
+  const fieldPath = parseWindowFieldPath(opt.field);
+  return {
+    windowMs,
+    aggregate: aggregate as WindowAggregateKind,
+    fieldPath,
+    windowStart: 0,
+    windowEnd: 0,
+    count: 0,
+    sum: 0,
+    numericCount: 0,
+    min: Infinity,
+    max: -Infinity,
+    last: undefined,
+    parts: [],
+    lastTopic: '',
+    lastSeq: 0,
+    lastEpoch: '',
+    timer: undefined,
+  };
 }
 
 /**
@@ -5342,6 +5608,8 @@ export class EventBus {
    * (see `src/idle.ts`, EB-72). Surfaced as `getStats().idleExpired`.
    */
   private totalIdleExpired = 0;
+  /** Completed non-empty tumbling windows (see `SubscribeOptions.window`, EB-73). */
+  private totalAggregatedWindows = 0;
   /**
    * Active idle-reclamation timers (see `src/idle.ts`, EB-72), keyed by
    * subscription id. Armed at subscribe time, re-armed on qualifying
@@ -7560,6 +7828,7 @@ export class EventBus {
         ['rateLimit', opts?.rateLimit],
         ['healthProbe', opts?.healthProbe],
         ['batch', opts?.batch],
+        ['window', opts?.window],
         ['causal', opts?.causal],
         ['deduplicateMessages', opts?.deduplicateMessages],
         ['keyHotspot', opts?.keyHotspot],
@@ -7646,6 +7915,9 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
+    // Tumbling-window aggregation (EB-73): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const window = resolveWindowOptions(opts?.window);
     // The in-flight cap counts single handler invocations; a batch hands
     // many messages to one call, so the two cannot share a coherent
     // accounting — fail fast instead of pretending the cap applies.
@@ -7759,6 +8031,7 @@ export class EventBus {
       keyHotspot,
       causal,
       batch,
+      window,
       health:
         healthProbe == null
           ? undefined
@@ -7848,6 +8121,7 @@ export class EventBus {
         this.clearShapingTimer(subscriber);
         this.clearRateLimitTimer(subscriber);
         this.clearBatchTimer(subscriber);
+        this.clearWindowTimer(subscriber);
         const bucket = this.prefixIndex.get(indexKey);
         if (bucket != null) {
           bucket.delete(id);
@@ -11504,6 +11778,15 @@ export class EventBus {
       this.totalThrottled += 1;
       return false;
     }
+    const window = subscriber.window;
+    if (window !== undefined) {
+      // Tumbling-window aggregation (EB-73): the message folds into the
+      // subscriber's open window instead of being queued — the aggregate
+      // is enqueued when the window closes. Filter, composite matching
+      // and publish-side throttling above already ran on the raw message,
+      // so windowing composes orthogonally with all three.
+      return this.accumulateWindowed(subscriber, window, msg, expiresAt, rawPayload);
+    }
     return this.enqueueMessage(subscriber, msg, expiresAt) === 'accepted';
   }
 
@@ -12869,6 +13152,7 @@ export class EventBus {
       expiredMessages: this.totalExpired,
       expiredLeases: this.totalExpiredLeases,
       idleExpired: this.totalIdleExpired,
+      aggregatedWindows: this.totalAggregatedWindows,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       compositeSubscriptions: this.compositeSubscriptionCount,
@@ -13827,6 +14111,189 @@ export class EventBus {
     if (batch?.timer !== undefined) {
       clearTimeout(batch.timer);
       batch.timer = undefined;
+    }
+  }
+
+  /**
+   * Folds one admitted message into a windowed subscriber's open
+   * tumbling window (see `SubscribeOptions.window`, EB-73). Opens the
+   * window on the first message; a message arriving at or past the
+   * open window's end closes it first (tumbling, never overlapping —
+   * this is what makes the window boundary follow the injected bus
+   * clock even when the real-time close timer has not fired yet).
+   * Returns `true`: the message was admitted to the subscriber's
+   * window, like a queue admission.
+   */
+  private accumulateWindowed(
+    subscriber: Subscriber,
+    window: SubscriberWindowState,
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+  ): boolean {
+    const nowMs = this.now();
+    // Admission-time expiry: a message already past its TTL never enters
+    // the window — counted as expired, like a queue drop at drain. A
+    // message that outlives its TTL inside the short window still
+    // contributes (expiry is not re-evaluated at close).
+    if (expiresAt !== undefined && nowMs >= expiresAt) {
+      this.recordExpired(msg.topic);
+      return true;
+    }
+    if (window.count > 0 && nowMs >= window.windowEnd) {
+      this.closeWindow(subscriber, window);
+    }
+    if (window.count === 0) {
+      window.windowStart = nowMs;
+      window.windowEnd = nowMs + window.windowMs;
+      this.armWindowTimer(subscriber, window);
+    }
+    const value = extractWindowValue(rawPayload, window.fieldPath);
+    switch (window.aggregate) {
+      case 'count':
+        window.count += 1;
+        break;
+      case 'sum':
+      case 'avg':
+      case 'min':
+      case 'max':
+        // Only finite numbers fold: a non-numeric message is ignored
+        // entirely (not counted), so a numeric aggregate always describes
+        // its numeric substream.
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          window.count += 1;
+          window.numericCount += 1;
+          window.sum += value;
+          if (value < window.min) window.min = value;
+          if (value > window.max) window.max = value;
+        }
+        break;
+      case 'last':
+        window.count += 1;
+        window.last = value;
+        break;
+      case 'concat':
+        // An undefined extraction contributes nothing printable: skip it
+        // rather than concatenating the string "undefined".
+        if (value !== undefined) {
+          window.count += 1;
+          window.parts.push(String(value));
+        }
+        break;
+    }
+    window.lastTopic = msg.topic;
+    window.lastSeq = msg.seq;
+    window.lastEpoch = msg.epoch ?? '';
+    return true;
+  }
+
+  /**
+   * Folds the open window's accumulators into the aggregate value for
+   * `WindowAggregateResult.value`.
+   */
+  private windowValue(window: SubscriberWindowState): unknown {
+    switch (window.aggregate) {
+      case 'count':
+        return window.count;
+      case 'sum':
+        return window.numericCount === 0 ? null : window.sum;
+      case 'avg':
+        return window.numericCount === 0 ? null : window.sum / window.numericCount;
+      case 'min':
+        return window.numericCount === 0 ? null : window.min;
+      case 'max':
+        return window.numericCount === 0 ? null : window.max;
+      case 'last':
+        return window.last;
+      case 'concat':
+        return window.parts.join('');
+    }
+  }
+
+  /**
+   * Closes a subscriber's open tumbling window: builds the aggregate
+   * message and enqueues it through the subscriber's normal delivery
+   * path (backpressure queue, reliable delivery, drain-time shaping —
+   * the aggregate is one ordinary queued message). An empty window
+   * delivers nothing and counts nothing. Increments
+   * `getStats().aggregatedWindows` for every completed non-empty
+   * window.
+   */
+  private closeWindow(subscriber: Subscriber, window: SubscriberWindowState): void {
+    this.clearWindowTimer(subscriber);
+    const count = window.count;
+    const windowStart = window.windowStart;
+    const windowEnd = window.windowEnd;
+    const value = this.windowValue(window);
+    const topic = window.lastTopic;
+    const seq = window.lastSeq;
+    const epoch = window.lastEpoch;
+    this.resetWindowState(window);
+    if (count === 0) return;
+    // The subscriber may have unsubscribed between the timer firing and
+    // this close (or re-entrantly during close): only a still-registered
+    // subscriber enqueues the aggregate.
+    if (this.subscribers.get(subscriber.id) !== subscriber) return;
+    const aggregate: BusMessage = {
+      topic,
+      payload: { windowStart, windowEnd, count, value } satisfies WindowAggregateResult,
+      seq,
+      ...(epoch === '' ? {} : { epoch }),
+    };
+    this.totalAggregatedWindows += 1;
+    this.enqueueMessage(subscriber, aggregate, undefined);
+    // The aggregate was enqueued outside any publish fan-out — no flush
+    // is scheduled yet. Without this the aggregate would sit in the
+    // queue until unrelated traffic arrived.
+    this.scheduleFlush();
+  }
+
+  /**
+   * Resets a window's accumulators after close (or when its subscriber
+   * goes away): no window is open afterwards.
+   */
+  private resetWindowState(window: SubscriberWindowState): void {
+    window.windowStart = 0;
+    window.windowEnd = 0;
+    window.count = 0;
+    window.sum = 0;
+    window.numericCount = 0;
+    window.min = Infinity;
+    window.max = -Infinity;
+    window.last = undefined;
+    window.parts = [];
+    window.lastTopic = '';
+    window.lastSeq = 0;
+    window.lastEpoch = '';
+  }
+
+  /**
+   * Arms the window-close timer for a newly opened window. The timer is
+   * `unref()`'d, so an open window never keeps the process alive; on
+   * fire it closes the window only if the subscriber is still
+   * registered.
+   */
+  private armWindowTimer(subscriber: Subscriber, window: SubscriberWindowState): void {
+    if (window.timer !== undefined) return;
+    const timer = setTimeout(() => {
+      window.timer = undefined;
+      // The subscriber may have unsubscribed while the timer was armed —
+      // closeWindow re-checks registration before enqueuing.
+      this.closeWindow(subscriber, window);
+    }, window.windowMs);
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    window.timer = timer;
+  }
+
+  /**
+   * Cancels a windowed subscriber's pending close timer, if any.
+   */
+  private clearWindowTimer(subscriber: Subscriber): void {
+    const window = subscriber.window;
+    if (window?.timer !== undefined) {
+      clearTimeout(window.timer);
+      window.timer = undefined;
     }
   }
 

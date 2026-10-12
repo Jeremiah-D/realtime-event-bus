@@ -982,6 +982,29 @@ library.
   resurrected. Invalid options throw `RangeError` from `subscribe`.
   Disabled by default. `bench/batch.bench.ts` measures the before/after
   throughput — see [Benchmark](#benchmark).
+- **Subscriber tumbling-window aggregation** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { window: { windowMs, aggregate, field? } })`, EB-73):
+  downstream QPS smoothing for hot topics. The first admitted message
+  opens a window `[windowStart, windowStart + windowMs)` on the bus
+  clock; every admitted message folds into the window's O(1)
+  accumulators instead of being queued; when the window closes the
+  subscriber receives a single aggregate message whose payload is
+  `{ windowStart, windowEnd, count, value }`. `aggregate` is one of
+  `'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' | 'concat'`, with an
+  optional dot-path `field` selecting the folded value (non-finite
+  values are ignored by the numeric aggregates; a window with no
+  contributing messages never delivers). Aggregation happens at fan-out,
+  before the queue — the content `filter` still applies to each raw
+  message, publish-side compression and the durable log see the raw
+  publishes untouched, and the aggregate itself is synthetic (not
+  re-filtered, no `messageId`, no TTL). The aggregate then travels the
+  subscriber's normal delivery path: backpressure queue, reliable
+  `Delivery` (one ack per window), drain-time shaping; its `seq` is the
+  window's last raw message `seq`, so sequence-gap detection keeps
+  working across windows. The close timer is `unref()`'d; unsubscribing
+  discards the open window. `getStats().aggregatedWindows` counts
+  completed windows. Invalid options throw `RangeError` from
+  `subscribe`. Disabled by default.
 - **Atomic cross-topic batch publish** (in `src/bus.ts`, via
   `publishAtomic(entries)`): all-or-nothing fan-out for multi-message
   batches — subscribers either see every message or none. Admission runs in
