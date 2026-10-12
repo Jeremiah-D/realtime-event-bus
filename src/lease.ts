@@ -110,6 +110,17 @@ export class LeaseManager {
     if (entry !== undefined) entry.unsubscribe = unsubscribe;
   }
 
+  /**
+   * Updates the stored pattern label for `subId` after a hot pattern
+   * update (EB-74), so the expiry event names the subscription's current
+   * pattern. The timer itself is untouched: the lease is preserved, not
+   * re-armed. No-op when `subId` holds no lease.
+   */
+  relabelPattern(subId: string, pattern: string): void {
+    const entry = this.entries.get(subId);
+    if (entry !== undefined) entry.pattern = pattern;
+  }
+
   /** Cancels the lease timer for `subId`, if any. Idempotent. */
   clear(subId: string): void {
     const entry = this.entries.get(subId);

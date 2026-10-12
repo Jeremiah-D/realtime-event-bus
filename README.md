@@ -436,6 +436,31 @@ library.
   `maxIdleMs` (including `NaN`), an `idleActivity` without `maxIdleMs`,
   or an unknown activity mode throws `RangeError` at subscribe time.
   Disabled by default — fully backward compatible.
+- **Subscription pattern hot update** (`bus.updateSubscriptionPattern(subId, newPattern)`):
+  atomically replaces a live subscription's topic pattern — from the next
+  publish on, the subscriber matches the new pattern instead of its
+  registration pattern, with no unsubscribe/resubscribe round-trip and no
+  delivery gap. The subscription is *not* rebuilt: its queue (queued
+  messages intact), per-topic sequence baselines, lease, idle window,
+  health-probe state, reliable ACK state and every other opt-in survive the
+  swap; only the match surface changes — the compiled matcher is re-fetched
+  from the shared `patternCache` (a pattern whose last subscriber moved
+  away is evicted, the same lifecycle as unsubscribe), the subscriber is
+  re-filed in the publish-side prefix index, and the cluster pattern
+  advertisement is refreshed. Consumer-group members keep their identity
+  and move competing sets — `(groupId, oldPattern)` → `(groupId,
+  newPattern)` — with a `'leave'` rebalance on the old set (partition
+  redistribution and linger handoff included) and a `'join'` rebalance on
+  the new one; composite subscriptions keep their include/exclude rules
+  (only the base pattern swaps); namespaced subscriptions take the new
+  pattern in their namespace scope and can never cross the namespace
+  boundary (`/` in a namespaced pattern throws `NamespaceDeniedError`).
+  Like `subscribe`, the new pattern passes the broker-level ACL on its
+  registered form (`AclDeniedError`, audited via `onAuthzDenied`), so a hot
+  update cannot bypass subscribe-time authorization. All validation runs
+  before anything is mutated: an invalid new pattern throws `RangeError`
+  and the old pattern stays in force. Returns `false` for an unknown
+  subscription id (before validation, so it never throws for one).
 - **Per-topic publish rate limiting** (in `src/bus.ts`, via
   `setTopicRateLimit(pattern, messagesPerSec, { burst })`): a token bucket
   per concrete topic (refilled from the bus clock, so tests stay

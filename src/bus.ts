@@ -7968,8 +7968,12 @@ export class EventBus {
                 this.engageThrottle(subscriber, size, capacity);
               }
               onBackpressure?.({
+                // The subscriber's live pattern, not the registration-time
+                // capture: `updateSubscriptionPattern` (EB-74) rewrites it
+                // in place, and events must name the pattern the
+                // subscription actually matches on.
                 subscriberId: id,
-                pattern: topicPattern,
+                pattern: subscriber.pattern,
                 queueSize: size,
                 capacity,
                 dropped: queue.droppedCount,
@@ -7984,8 +7988,10 @@ export class EventBus {
                 this.releaseThrottle(subscriber, size);
               }
               onDrained?.({
+                // Live pattern (see onBackpressure above): a hot pattern
+                // update must not leave events naming a stale pattern.
                 subscriberId: id,
-                pattern: topicPattern,
+                pattern: subscriber.pattern,
                 queueSize: size,
                 capacity,
                 dropped: queue.droppedCount,
@@ -8179,6 +8185,199 @@ export class EventBus {
       throw new RangeError('renewLease: ms must be a positive integer number of milliseconds');
     }
     return this.leases.renew(subId, ms);
+  }
+
+  /**
+   * Atomically replaces a live subscription's topic pattern (EB-74): from
+   * the next publish on, the subscriber matches `newPattern` instead of
+   * its registration pattern — no unsubscribe/resubscribe round-trip, no
+   * delivery gap in between.
+   *
+   * The subscription is NOT rebuilt: its queue (queued messages intact),
+   * per-topic sequence baselines, lease, idle window, health-probe state,
+   * reliable ACK state and every other opt-in survive the swap untouched.
+   * Only the match surface changes:
+   * - the compiled matcher comes from the shared `patternCache`, so
+   *   subscribers converging on the same pattern keep sharing one RegExp
+   *   instance (a pattern whose last subscriber moved away is evicted,
+   *   the same lifecycle as unsubscribe);
+   * - the subscriber is re-filed in the publish-side prefix index under
+   *   the new pattern's literal prefix;
+   * - the cluster pattern advertisement is refreshed.
+   *
+   * Group members (`subscribeToGroup`) keep their identity and move
+   * competing sets: the member leaves `(groupId, oldPattern)` and joins
+   * `(groupId, newPattern)`, and both sets get their rebalance event
+   * (`'leave'` on the old set — with partition redistribution and linger
+   * handoff — `'join'` on the new one). Composite subscriptions (EB-70)
+   * keep their include/exclude rules; only the base pattern is swapped.
+   * Namespaced subscriptions (EB-52) take `newPattern` in their namespace
+   * scope: the pattern is re-translated under the subscription's stored
+   * prefix, so a hot update can never cross a namespace boundary.
+   *
+   * Like `subscribe`, the new pattern passes the broker-level ACL on its
+   * registered (translated) form — `AclDeniedError`, audited via
+   * `onAuthzDenied` — so a hot update cannot bypass subscribe-time
+   * authorization. All validation runs before anything is mutated: an
+   * invalid `newPattern` throws `RangeError` (non-string or empty; a `/`
+   * inside a namespaced pattern) and the old pattern stays in force.
+   *
+   * Returns `true` on success — including a no-op when `newPattern`
+   * equals the current pattern — and `false` when `subId` names no live
+   * subscription.
+   */
+  updateSubscriptionPattern(subId: string, newPattern: string): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber === undefined) return false;
+    if (typeof newPattern !== 'string' || newPattern.length === 0) {
+      throw new RangeError('updateSubscriptionPattern: newPattern must be a non-empty string');
+    }
+    const prefix = subscriber.namespacePrefix;
+    // Resolve the registered form, the matcher and the prefix-index key
+    // exactly the way `subscribe` registers them — a namespaced
+    // subscription's relative pattern is re-translated under its prefix.
+    let registered: string;
+    let matcher: RegExp;
+    let newIndexKey: string;
+    if (prefix !== undefined) {
+      if (newPattern.includes('/')) {
+        throw new NamespaceDeniedError('subscribe', prefix, { pattern: newPattern });
+      }
+      registered = `${prefix}/${newPattern}`;
+      matcher = this.compileNamespacedMatcher(prefix, newPattern);
+      const literal = EventBus.patternPrefixKey(newPattern);
+      newIndexKey = literal === '' ? '' : `${prefix}/${literal}`;
+    } else {
+      registered = newPattern;
+      matcher = this.compiledMatcher(newPattern);
+      newIndexKey = EventBus.patternPrefixKey(newPattern);
+    }
+    const oldPattern = subscriber.pattern;
+    if (registered === oldPattern) return true;
+    // Broker-level ACL on the registered (translated) form, mirroring
+    // `subscribe`: a hot update must not bypass subscribe-time
+    // authorization. Audited before the throw, like `subscribe`.
+    if (!this.aclAllowsSubscribe(registered)) {
+      this.emitAuthzDenied('subscribe', undefined, registered);
+      throw new AclDeniedError('subscribe', registered);
+    }
+    // --- All validation done; mutate below. ---
+    // 1. Prefix index: move the id from the old bucket to the new one,
+    //    evicting emptied keys (same invariant as unsubscribe).
+    let oldIndexKey: string;
+    if (prefix !== undefined) {
+      const oldRelative = oldPattern.slice(prefix.length + 1);
+      const literal = EventBus.patternPrefixKey(oldRelative);
+      oldIndexKey = literal === '' ? '' : `${prefix}/${literal}`;
+    } else {
+      oldIndexKey = EventBus.patternPrefixKey(oldPattern);
+    }
+    const oldBucket = this.prefixIndex.get(oldIndexKey);
+    if (oldBucket != null) {
+      oldBucket.delete(subId);
+      if (oldBucket.size === 0) this.prefixIndex.delete(oldIndexKey);
+    }
+    let newBucket = this.prefixIndex.get(newIndexKey);
+    if (newBucket == null) {
+      newBucket = new Set<string>();
+      this.prefixIndex.set(newIndexKey, newBucket);
+    }
+    newBucket.add(subId);
+    // 2. Pattern counts + compile cache (unsubscribe's lifecycle).
+    const remaining = (this.subscribersByPattern.get(oldPattern) ?? 1) - 1;
+    if (remaining <= 0) {
+      this.subscribersByPattern.delete(oldPattern);
+      this.patternCache.delete(oldPattern);
+    } else {
+      this.subscribersByPattern.set(oldPattern, remaining);
+    }
+    this.subscribersByPattern.set(registered, (this.subscribersByPattern.get(registered) ?? 0) + 1);
+    // 3. The subscriber itself: pattern + matcher swap in place. The
+    //    queue, sequence baselines, lease, idle window, health probe,
+    //    reliable ACK state and every opt-in survive untouched.
+    subscriber.pattern = registered;
+    subscriber.matcher = matcher;
+    // 4. Group members move competing sets: leave `(groupId, oldPattern)`
+    //    and join `(groupId, newPattern)`, each with its rebalance event.
+    const groupId = subscriber.groupId;
+    if (groupId !== undefined) {
+      this.moveGroupMember(subId, subscriber, groupId, oldPattern, registered);
+    }
+    // 5. Lease / idle expiry events name the live pattern; the timers
+    //    themselves are preserved (relabelled, not re-armed).
+    this.leases.relabelPattern(subId, registered);
+    this.idleReclaimer.relabelPattern(subId, registered);
+    // 6. The advertised pattern set may have changed.
+    this.advertiseClusterPatterns();
+    return true;
+  }
+
+  /**
+   * Moves a consumer-group member from `(groupId, oldPattern)` to
+   * `(groupId, newPattern)` without touching the subscriber object
+   * itself (EB-74). The leave side mirrors the group unsubscribe path —
+   * roster removal, partition redistribution with backlog replay to the
+   * new owners, linger handoff, `'leave'` rebalance event — and the join
+   * side mirrors `subscribeToGroup`'s join: roster add, assignment
+   * invalidation, backlog replay for partitions migrating to the mover,
+   * `'join'` rebalance event. A moved member cannot dictate the target
+   * set's partition/strategy configuration, so both checks run with
+   * `undefined` options: they pass for an existing set and leave a new
+   * set non-partitioned with the default strategy.
+   */
+  private moveGroupMember(
+    subId: string,
+    subscriber: Subscriber,
+    groupId: string,
+    oldPattern: string,
+    newPattern: string,
+  ): void {
+    const oldKey = EventBus.groupKey(groupId, oldPattern);
+    const wasPartitioned = this.groupPartitions.get(oldKey) !== undefined;
+    const beforeLeave = wasPartitioned ? new Map(this.partitionAssignment(oldKey)) : undefined;
+    this.removeGroupMember(oldKey, subId);
+    let leaveRebalance: PartitionRebalanceInfo | undefined;
+    if (wasPartitioned) {
+      const after = this.partitionAssignment(oldKey);
+      const migrated = this.diffPartitionAssignment(oldKey, beforeLeave!, after);
+      leaveRebalance = {
+        assignment: Object.fromEntries(after),
+        migrated,
+        strategy: this.groupAssignmentStrategy.get(oldKey) ?? 'rendezvous',
+      };
+      for (const m of migrated) {
+        const owner = this.subscribers.get(m.to);
+        if (owner !== undefined) this.replayPartitionBacklog(owner, oldKey, m.partition);
+      }
+    }
+    const linger = this.beginLingerHandoff(groupId, subscriber);
+    this.fireRebalance(groupId, oldPattern, oldKey, 'leave', subId, linger, leaveRebalance);
+    const newKey = EventBus.groupKey(groupId, newPattern);
+    this.checkPartitionConfig(newKey, undefined);
+    this.checkAssignmentConfig(newKey, undefined);
+    let members = this.groupMembers.get(newKey);
+    if (members == null) {
+      members = [];
+      this.groupMembers.set(newKey, members);
+    }
+    const partitioned = this.groupPartitions.get(newKey) !== undefined;
+    const beforeJoin = partitioned ? new Map(this.partitionAssignment(newKey)) : undefined;
+    members.push(subId);
+    this.invalidatePartitionAssignment(newKey);
+    let joinRebalance: PartitionRebalanceInfo | undefined;
+    if (partitioned) {
+      const after = this.partitionAssignment(newKey);
+      const migrated = this.diffPartitionAssignment(newKey, beforeJoin!, after);
+      joinRebalance = {
+        assignment: Object.fromEntries(after),
+        migrated,
+        strategy: this.groupAssignmentStrategy.get(newKey) ?? 'rendezvous',
+      };
+      for (const m of migrated) {
+        if (m.to === subId) this.replayPartitionBacklog(subscriber, newKey, m.partition);
+      }
+    }
+    this.fireRebalance(groupId, newPattern, newKey, 'join', subId, undefined, joinRebalance);
   }
 
   /**
