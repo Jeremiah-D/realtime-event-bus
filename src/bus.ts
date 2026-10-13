@@ -1857,6 +1857,16 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * (`hash(key) % partitions`), so one key always lands on one partition;
    * a keyless message's partition derives from `(topic, seq)`.
    *
+   * Publish-side alignment (EB-93): a message published with an explicit
+   * publish-side partition (EB-90) keeps that partition through group
+   * consumption instead of being re-hashed — the producer's partition is
+   * authoritative. When the group's partition count differs from the
+   * topic's, the publish partition folds into the group's space with a
+   * stable modulo (`publishPartition % partitions`), so the group's
+   * per-partition watermarks line up with the publish-side sequence
+   * space. Messages with no publish-side partition (legacy records,
+   * single-partition topics) keep the hash routing described above.
+   *
    * Assignment is deterministic over the member roster (rendezvous hashing
    * by default, or the sticky balanced assignor with
    * `assignment: 'sticky'` — see below): members joining or leaving only
@@ -12072,6 +12082,35 @@ export class EventBus {
   }
 
   /**
+   * EB-93: the partition a message belongs to in a partitioned group,
+   * publish-side aligned. A message carrying an explicit publish-side
+   * partition (EB-90) — i.e. published to a topic with more than one
+   * partition — is consumed on that partition instead of being re-hashed
+   * on the consume side: modulo the group's partition count, so group
+   * and topic partition counts may differ. Alignment preserves the
+   * producer's partition-local ordering end to end and keys every
+   * partition-dependent group state (keyed baseline skips, causal clock
+   * skips, per-partition watermarks, replay filters) off the partition
+   * the producer chose. Messages with no publish-side partition — a
+   * single-partition topic (where 0 is the default, not an assignment)
+   * or a record written before partition routing — keep the existing
+   * hash routing (`partitionForMessage`), so unpartitioned traffic still
+   * spreads deterministically across the group.
+   */
+  private alignedGroupPartition(
+    n: number,
+    topic: string,
+    seq: number,
+    publishPartition: number | undefined,
+    key: string | undefined,
+  ): number {
+    if (publishPartition !== undefined && this.partitionsForTopic(topic) > 1) {
+      return publishPartition % n;
+    }
+    return this.partitionForMessage(n, topic, seq, key);
+  }
+
+  /**
    * Advances a partition's per-topic assignment watermark. Assignment
    * follows publish order which follows `seq` order, so the newest
    * assignment per (partition, topic) is always the maximum.
@@ -12940,7 +12979,7 @@ export class EventBus {
       // window for history. See `replayLog`.
       if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
       for (const rec of log.readSince(topic, fromSeq)) {
-        if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
+        if (mine.has(this.alignedGroupPartition(n, rec.topic, rec.seq, rec.partition, rec.key))) records.push(rec);
       }
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
@@ -13025,7 +13064,7 @@ export class EventBus {
         // Retained-message state (EB-87) never replays — see
         // `replayLogSinceTime`.
         if (rec.seq === 0 && rec.retained === true) continue;
-        if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
+        if (mine.has(this.alignedGroupPartition(n, rec.topic, rec.seq, rec.partition, rec.key))) records.push(rec);
       }
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
@@ -13064,7 +13103,7 @@ export class EventBus {
       // readSince yields ascending seq: stop at the watermark.
       for (const rec of log.readSince(topic, committed)) {
         if (rec.seq > watermark) break;
-        if (this.partitionForMessage(n, rec.topic, rec.seq, rec.key) === partition) records.push(rec);
+        if (this.alignedGroupPartition(n, rec.topic, rec.seq, rec.partition, rec.key) === partition) records.push(rec);
       }
     }
     if (records.length === 0) return;
@@ -17565,7 +17604,7 @@ export class EventBus {
         // balanced when the group opted in — see
         // `GroupSubscribeOptions.assignment`), so every node agrees on the
         // owner without coordination.
-        const partition = this.partitionForMessage(partitionCount, topic, msg.seq, keyed?.key);
+        const partition = this.alignedGroupPartition(partitionCount, topic, msg.seq, msg.partition, keyed?.key);
         const ownerId = this.partitionAssignment(key).get(partition);
         const assignee = hit.members.find((m) => m.id === ownerId) ?? hit.members[0];
         if (keyed !== undefined) {

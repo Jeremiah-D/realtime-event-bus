@@ -116,7 +116,17 @@ library.
   exclusively by one member. A keyed message's partition is
   `sha256("k\0" + key) mod N` (one key always lands on one partition, so
   per-key order is preserved within its exclusive consumer); a keyless
-  message hashes `(topic, seq)` for a deterministic spread. Assignment is
+  message hashes `(topic, seq)` for a deterministic spread.
+  Publish-side alignment (EB-93): a message published with an explicit
+  publish-side partition (EB-90 — i.e. on a topic with more than one
+  partition) is consumed on that partition instead of being re-hashed, so
+  the producer's partition-local ordering survives end to end. When the
+  group's partition count differs from the topic's, the publish partition
+  folds into the group's space with a stable modulo (`publishPartition %
+  N`); keyed-baseline skips, causal-clock skips and per-partition
+  watermarks are all recorded against the aligned partition. Messages
+  with no publish-side partition (single-partition topics, pre-partition
+  log records) keep the hash routing above. Assignment is
   rendezvous (highest-random-weight) hashing over the member roster —
   deterministic from the roster alone, so joins/leaves only migrate the
   partitions whose winner actually changed — or, with opt-in
