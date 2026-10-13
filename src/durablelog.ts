@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { gunzipSync, gzipSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import { isEncryptedPayload } from './encrypt.ts';
@@ -290,6 +291,26 @@ export interface DurableLogOptions {
    * message content and stay plaintext.
    */
   encryptor?: PayloadEncryptor;
+  /**
+   * EB-94: hook fired when an archived segment fails its checksum
+   * verification (or its bytes cannot be read for verification). The
+   * segment is isolated — skipped, never fatal — and counted in
+   * `stats().corruptSegments`. The bus wires this to the subscription
+   * audit log (`segment_checksum_failed`).
+   */
+  onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void;
+}
+
+/**
+ * EB-94: one archived segment that failed checksum verification.
+ */
+export interface SegmentChecksumFailure {
+  /** Concrete topic the segment belongs to. */
+  topic: string;
+  /** Archive file name (`<topic>.seg-<start>-<end>.jsonl.gz`). */
+  path: string;
+  /** Segment identity (`<seqStart>-<seqEnd>`). */
+  segmentId: string;
 }
 
 /**
@@ -1089,6 +1110,20 @@ export class DurableTopicLog {
    * Skipped, never fatal.
    */
   private corruptArchives = 0;
+  /**
+   * EB-94: archived segments isolated by checksum verification — a
+   * mismatch (or unreadable bytes with a sidecar present) skips the
+   * segment, never fatal. Surfaced in `stats().corruptSegments`.
+   */
+  private corruptSegments = 0;
+  /**
+   * EB-94: archive paths rejected by checksum verification during the
+   * index pass of recovery — the orphan-adoption scan skips them instead
+   * of re-verifying and re-counting.
+   */
+  private readonly checksumRejected = new Set<string>();
+  /** EB-94: observer hook for checksum failures; never throws into the read path. */
+  private readonly onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void;
   /** Path of the archive index (`__archive_index.jsonl`) in the log dir. */
   private readonly archiveIndexFile: string;
   /** Set while a background archive pass is scheduled. */
@@ -1119,6 +1154,7 @@ export class DurableTopicLog {
     encryptor?: PayloadEncryptor,
     maxAgeMs?: number,
     now: () => number = Date.now,
+    onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void,
   ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
@@ -1128,6 +1164,7 @@ export class DurableTopicLog {
     this.encryptor = encryptor;
     this.maxAgeMs = maxAgeMs;
     this.now = now;
+    this.onSegmentChecksumFailed = onSegmentChecksumFailed;
     this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
     this.dedupFile = join(dir, DEDUP_JOURNAL_NAME);
     this.publishDedupFile = join(dir, PUBLISH_DEDUP_JOURNAL_NAME);
@@ -1188,6 +1225,7 @@ export class DurableTopicLog {
       encryptor,
       maxAgeMs,
       now,
+      options.onSegmentChecksumFailed,
     );
   }
 
@@ -1346,6 +1384,17 @@ export class DurableTopicLog {
           this.corruptLines += 1;
           continue;
         }
+        // EB-94: every indexed segment is checksum-verified at recovery.
+        // A mismatch isolates the segment — it never enters the
+        // in-memory view, so no read can ever touch it — and counts it in
+        // `corruptSegments`, never fatal. Rejected paths are remembered
+        // so the orphan-adoption scan below does not re-verify (and
+        // re-count) them.
+        if (!this.verifySegmentChecksum(entry.path)) {
+          this.noteChecksumFailure(entry.topic, entry.path, entry.segmentId);
+          this.checksumRejected.add(entry.path);
+          continue;
+        }
         this.addArchiveEntry(entry);
       }
     }
@@ -1363,6 +1412,9 @@ export class DurableTopicLog {
       }
       const parsed = parseSegmentFileName(name);
       if (parsed == null) continue;
+      // EB-94: already rejected by the index pass — not an orphan, an
+      // isolated segment. Skipping avoids a second verification count.
+      if (this.checksumRejected.has(name)) continue;
       if (this.archives.some((e) => e.path === name)) continue;
       const adopted = this.readAdoptedSegment(name, parsed.topic);
       if (adopted == null) continue;
@@ -1386,14 +1438,29 @@ export class DurableTopicLog {
    * Reads an on-disk archive that the index does not know about (orphan
    * adoption during recovery). Returns `null` — and counts one corrupt
    * archive — when the file cannot be decompressed or holds no records.
+   * EB-94: adopted orphans are checksum-verified exactly like indexed
+   * segments — a mismatch isolates the segment (`corruptSegments`) and
+   * the file is left for the operator, never adopted.
    */
   private readAdoptedSegment(
     name: string,
     topic: string,
   ): ArchiveEntry | null {
+    let raw: Buffer;
+    try {
+      raw = readFileSync(join(this.logDir, name));
+    } catch {
+      this.corruptArchives += 1;
+      return null;
+    }
+    const parsed = parseSegmentFileName(name);
+    if (!this.verifySegmentChecksum(name)) {
+      this.noteChecksumFailure(topic, name, parsed == null ? name : `${parsed.seqStart}-${parsed.seqEnd}`);
+      return null;
+    }
     let text: string;
     try {
-      text = gunzipSync(readFileSync(join(this.logDir, name))).toString('utf8');
+      text = gunzipSync(raw).toString('utf8');
     } catch {
       this.corruptArchives += 1;
       return null;
@@ -1601,6 +1668,58 @@ export class DurableTopicLog {
   }
 
   /**
+   * EB-94: checksum sidecar for an archived segment — `<archive
+   * name>.sha256` holding the hex SHA-256 of the segment's gzipped bytes
+   * (`node:crypto`, zero new dependencies). Written right after the
+   * `.gz`, before the index line.
+   */
+  private checksumPath(archiveName: string): string {
+    return join(this.logDir, `${archiveName}.sha256`);
+  }
+
+  /**
+   * EB-94: verifies an archived segment against its checksum sidecar.
+   * Returns `true` when the bytes match, and also when no sidecar
+   * exists — segments archived before checksums, or a crash between the
+   * `.gz` write and the sidecar write, are unverifiable and read exactly
+   * as before. Returns `false` when a sidecar exists but the bytes are
+   * missing, unreadable, or mismatched: the segment is corrupt and must
+   * be isolated, never read.
+   */
+  private verifySegmentChecksum(archiveName: string): boolean {
+    let expected: string | undefined;
+    try {
+      expected = readFileSync(this.checksumPath(archiveName), 'utf8').trim();
+    } catch {
+      expected = undefined;
+    }
+    if (expected === undefined) return true;
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(join(this.logDir, archiveName));
+    } catch {
+      return false;
+    }
+    return createHash('sha256').update(bytes).digest('hex') === expected;
+  }
+
+  /**
+   * EB-94: isolates one checksum-failed segment — counted in
+   * `corruptSegments` and reported to the observer hook. Never throws:
+   * a broken hook must not disturb the read/recovery path.
+   */
+  private noteChecksumFailure(topic: string, path: string, segmentId: string): void {
+    this.corruptSegments += 1;
+    const hook = this.onSegmentChecksumFailed;
+    if (hook === undefined) return;
+    try {
+      hook({ topic, path, segmentId });
+    } catch {
+      // The hook is an observer, not part of the read path.
+    }
+  }
+
+  /**
    * Segment-rotation bookkeeping for one append (rotation enabled only).
    * The publish path does nothing heavier than integer comparisons here:
    * closing a segment is an atomic file rename and the gzip + index
@@ -1694,13 +1813,14 @@ export class DurableTopicLog {
 
   /**
    * Archives one pending segment: parses its records, gzips them to the
-   * deterministic archive name, appends the index line, and deletes the
-   * pending file. Crash-safe ordering — `.gz` first, index second,
-   * pending delete last — so a crash either leaves an orphan `.gz`
-   * (adopted on the next open) or a leftover pending file (re-archived
-   * idempotently: the same content addresses the same archive name, and
-   * an already-indexed segment just drops its pending file). Never
-   * throws: a failure leaves the pending file for the next pass.
+   * deterministic archive name, writes the checksum sidecar (EB-94),
+   * appends the index line, and deletes the pending file. Crash-safe
+   * ordering — `.gz` first, sidecar second, index third, pending delete
+   * last — so a crash either leaves an orphan `.gz` (adopted on the next
+   * open) or a leftover pending file (re-archived idempotently: the same
+   * content addresses the same archive name, and an already-indexed
+   * segment just drops its pending file). Never throws: a failure leaves
+   * the pending file for the next pass.
    */
   private archiveOne(pendingName: string): void {
     const pendingPath = join(this.logDir, pendingName);
@@ -1763,16 +1883,32 @@ export class DurableTopicLog {
       return;
     }
     const gzPath = join(this.logDir, entry.path);
+    const canonical = records.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
+    let gzBytes: Buffer;
+    try {
+      gzBytes = gzipSync(canonical);
+    } catch {
+      // Compression failed: leave the pending file for the next pass.
+      return;
+    }
     try {
       // EB-80: the archived record bytes are sealed per line before
       // compression, so the archive at rest is encrypted end to end.
-      const canonical = records.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
-      writeFileSync(gzPath, gzipSync(canonical), { flag: 'wx' });
+      writeFileSync(gzPath, gzBytes, { flag: 'wx' });
     } catch {
-      // Either the gzip/write failed or the archive already exists (a
+      // Either the write failed or the archive already exists (a
       // concurrent pass won the race): leave the pending file for the
       // next pass, which dedupes against the index.
       return;
+    }
+    // EB-94: checksum sidecar — after the `.gz`, before the index line,
+    // extending the crash-safe ordering (.gz -> sidecar -> index ->
+    // pending delete). Best-effort: a failed sidecar write leaves the
+    // segment unverifiable but fully readable, never lost.
+    try {
+      writeFileSync(`${gzPath}.sha256`, createHash('sha256').update(gzBytes).digest('hex'), 'utf8');
+    } catch {
+      // The archive itself is intact; it just reads without verification.
     }
     try {
       appendFileSync(this.archiveIndexFile, `${JSON.stringify(archiveIndexLineOf(entry))}\n`, 'utf8');
@@ -1916,6 +2052,13 @@ export class DurableTopicLog {
     const segments = this.archivesByTopic.get(topic) ?? [];
     for (const segment of segments) {
       if (segment.seqEnd <= fromSeqExclusive) continue;
+      // EB-94: a checksum mismatch isolates the segment — skipped and
+      // counted (`corruptSegments`), never fatal, exactly like a failed
+      // decompress below.
+      if (!this.verifySegmentChecksum(segment.path)) {
+        this.noteChecksumFailure(segment.topic, segment.path, segment.segmentId);
+        continue;
+      }
       let text: string;
       try {
         text = gunzipSync(readFileSync(join(this.logDir, segment.path))).toString('utf8');
@@ -2422,6 +2565,12 @@ export class DurableTopicLog {
     retentionEvicted: number;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
+    /**
+     * EB-94: archived segments isolated by checksum verification — a
+     * sidecar mismatch (or unreadable bytes with a sidecar present),
+     * during recovery or archived reads. Skipped, never fatal.
+     */
+    corruptSegments: number;
     /** Total entries across all archived segments. */
     archived: number;
     /**
@@ -2458,6 +2607,7 @@ export class DurableTopicLog {
       encrypted: this.encryptor !== undefined,
       retentionEvicted: this.retentionEvicted,
       corruptArchives: this.corruptArchives,
+      corruptSegments: this.corruptSegments,
       archived,
       segments,
     };

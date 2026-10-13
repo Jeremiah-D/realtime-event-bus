@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus, type BusMessage } from '../src/bus.ts';
@@ -136,11 +136,30 @@ test('archive: corrupt gzip is skipped and counted, never fatal', async () => {
   log.append({ seq: 2, topic: 't', at: 1002, payload: 'b' });
   const gzName = await waitForArchived(dir, 't');
   writeFileSync(join(dir, gzName), 'this is not gzip data');
+  // EB-94: with a checksum sidecar present, the overwrite is a checksum
+  // mismatch — isolated and counted in corruptSegments, never fatal, and
+  // decompression is never attempted (corruptArchives stays 0).
   assert.deepEqual(log.readSince('t', 0, { includeArchived: true }), []);
-  assert.equal(log.stats().corruptArchives, 1);
+  assert.equal(log.stats().corruptSegments, 1);
+  assert.equal(log.stats().corruptArchives, 0);
   // A second read counts again — the skip is per read, the archive stays.
   log.readSince('t', 0, { includeArchived: true });
-  assert.equal(log.stats().corruptArchives, 2);
+  assert.equal(log.stats().corruptSegments, 2);
+});
+
+test('archive: corrupt gzip without a sidecar still counts corruptArchives', async () => {
+  const dir = freshDir();
+  const log = DurableTopicLog.open({ dir, segmentRotation: { maxEntriesPerSegment: 2 } });
+  log.append({ seq: 1, topic: 't', at: 1001, payload: 'a' });
+  log.append({ seq: 2, topic: 't', at: 1002, payload: 'b' });
+  const gzName = await waitForArchived(dir, 't');
+  // No sidecar (pre-checksum archive): unverifiable, so the failed
+  // decompress is what skips and counts it — the legacy behavior.
+  unlinkSync(join(dir, `${gzName}.sha256`));
+  writeFileSync(join(dir, gzName), 'this is not gzip data');
+  assert.deepEqual(log.readSince('t', 0, { includeArchived: true }), []);
+  assert.equal(log.stats().corruptArchives, 1);
+  assert.equal(log.stats().corruptSegments, 0);
 });
 
 test('archive: corrupt index lines are skipped on recovery, valid entries load', async () => {

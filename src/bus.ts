@@ -3223,6 +3223,12 @@ export interface BusStats {
     retentionEvicted: number;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
+    /**
+     * Archived segments isolated by checksum verification (EB-94): a
+     * sidecar mismatch, during recovery or archived reads. Skipped,
+     * never fatal.
+     */
+    corruptSegments: number;
     /** Total entries across all archived segments. */
     archived: number;
     /**
@@ -7758,6 +7764,18 @@ export class EventBus {
         // The publish-dedup journal's size guard tracks the publish-side
         // idempotency window it persists (EB-66).
         publishDedupMaxEntries: this.idempotencyMaxEntries,
+        // EB-94: a checksum-failed archived segment is isolated by the
+        // log and reported here — one audit event per segment, so an
+        // operator can see exactly which history was quarantined.
+        // Construction-time recoveries run before the audit log exists;
+        // those segments are still counted in stats().corruptSegments.
+        onSegmentChecksumFailed: (info) =>
+          this.auditSubscription({
+            action: 'segment_checksum_failed',
+            actor: 'system',
+            topic: info.topic,
+            detail: { path: info.path, segmentId: info.segmentId },
+          }),
       });
       this.durableLog = log;
       // Remembered for namespace child logs (EB-52): children open with
@@ -9858,6 +9876,15 @@ export class EventBus {
         keyCompaction: this.durableLogKeyCompaction,
         segmentRotation: this.durableLogSegmentRotation,
         encryptor: this.durableLogEncryptor,
+        // EB-94: namespace child logs report checksum failures to the
+        // same audit trail as the root log.
+        onSegmentChecksumFailed: (info) =>
+          this.auditSubscription({
+            action: 'segment_checksum_failed',
+            actor: 'system',
+            topic: info.topic,
+            detail: { path: info.path, segmentId: info.segmentId },
+          }),
       });
       this.namespaceLogs.set(prefix, child);
       // A restarted bus reopens the namespace's on-disk history: reseed

@@ -58,7 +58,8 @@ export type SubscriptionAuditAction =
   | 'partition_rule_set'
   | 'partition_rule_cleared'
   | 'config_applied'
-  | 'config_rolled_back';
+  | 'config_rolled_back'
+  | 'segment_checksum_failed';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -83,6 +84,9 @@ export type SubscriptionAuditAction =
  * - `config_rolled_back`: `{ failedPath: <string>, applied: <string[]>,
  *   rolledBack: <boolean> }` — a failed `applyConfig` (EB-91) restored
  *   the pre-apply state after `failedPath` threw
+ * - `segment_checksum_failed`: `{ path: <archive file>, segmentId }` —
+ *   an archived segment failed checksum verification (EB-94) and was
+ *   isolated: skipped, never fatal (the `topic` field carries the topic)
  */
 export interface SubscriptionAuditEvent {
   v: 1;

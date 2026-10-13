@@ -350,7 +350,16 @@ library.
   skipped and counted (`getStats().durableLog.corruptArchives`), never
   fatal; restart recovery rebuilds the archive view from the index, adopts
   orphan archives, and folds archived seq/keySeq bounds into the cursors —
-  numbering never reuses an archived number.
+  numbering never reuses an archived number. Segment checksums (EB-94):
+  every archived segment gets a `<name>.sha256` sidecar (SHA-256 of the
+  gzipped bytes, `node:crypto`, zero new dependencies) written after the
+  `.gz` and before the index line; recovery verifies every indexed segment
+  and every adopted orphan, and archived reads re-verify on demand. A
+  mismatch isolates the segment — skipped, never fatal, counted in
+  `getStats().durableLog.corruptSegments` — and fires one
+  `segment_checksum_failed` subscription-audit event
+  (`getSubscriptionAudit()`). Segments archived before checksums (no
+  sidecar) read exactly as before.
   `getStats().durableLog` additionally reports `archived` (total archived
   entries), `corruptArchives`, and per-topic `segments`
   (`{ live, segments, archived }`). Opt-in at-rest encryption
