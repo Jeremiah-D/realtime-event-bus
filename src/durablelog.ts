@@ -74,8 +74,33 @@ export interface DurableLogRecord {
    * Tombstone for a delayed-delivery schedule: `true` on a seq-0 record
    * means the schedule with this `delayId` is closed (cancelled, expired
    * while delayed, or shed at fan-out) and must not be rebuilt on restart.
+   * Also the tombstone marker for an MQTT-style retained message (see
+   * `retained`): `true` on a seq-0 retained record means the topic's
+   * retained message was cleared and must not be rebuilt on restart.
    */
   cancelled?: boolean;
+  /**
+   * MQTT-style retained-message marker (EB-87): `true` on a seq-0 record
+   * means this line is retained state for the topic, not a message and
+   * not a delayed-delivery schedule. A retained set record carries the
+   * retained message's wire payload and its original sequence number
+   * (`retainedSeq`); a retained tombstone (`cancelled: true`) carries no
+   * payload and closes the retained state. Retained records are invisible
+   * to `readSince` replay (which only returns `seq >= 1`) and never move
+   * the per-topic sequence counter — like the delayed-delivery seq-0
+   * records, they are state, not messages. Never age-evicted by
+   * time-based retention: dropping retained state by age would lose the
+   * snapshot on restart.
+   */
+  retained?: boolean;
+  /**
+   * The retained message's original per-topic sequence number, present
+   * exactly on a non-tombstone seq-0 retained record (`retained: true`,
+   * `cancelled` absent). Restart recovery rebuilds the retained table
+   * with this seq so snapshot deliveries keep the message's publish-order
+   * identity for gap detection.
+   */
+  retainedSeq?: number;
   /**
    * Compaction key for keyed log compaction (see
    * `DurableLogOptions.keyCompaction`): records sharing a (topic, key)
@@ -256,6 +281,10 @@ interface LogLine {
   deliverAt?: number;
   delayId?: string;
   cancelled?: boolean;
+  /** Retained-state marker (see `DurableLogRecord.retained`). */
+  retained?: boolean;
+  /** The retained message's original per-topic seq (see `DurableLogRecord.retainedSeq`). */
+  retainedSeq?: number;
   key?: string;
   /** Per-key publish-order sequence number, present exactly when `key` is. */
   keySeq?: number;
@@ -2288,6 +2317,8 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.deliverAt !== undefined) line.deliverAt = record.deliverAt;
   if (record.delayId !== undefined) line.delayId = record.delayId;
   if (record.cancelled !== undefined) line.cancelled = record.cancelled;
+  if (record.retained !== undefined) line.retained = record.retained;
+  if (record.retainedSeq !== undefined) line.retainedSeq = record.retainedSeq;
   if (record.key !== undefined) line.key = record.key;
   if (record.keySeq !== undefined) line.keySeq = record.keySeq;
   if (record.dictId !== undefined) line.dictId = record.dictId;
@@ -2311,6 +2342,15 @@ function logLineOf(record: DurableLogRecord): LogLine {
  * tombstone — a finite `deliverAt`. A tombstone (`cancelled: true`) is only
  * valid with `seq` 0.
  *
+ * `seq` 0 is also reserved for MQTT-style retained-message records
+ * (`retained: true`, EB-87): a retained set record carries the retained
+ * message's original per-topic sequence number in `retainedSeq` (a
+ * positive integer — required, since recovery rebuilds the table with
+ * it); a retained tombstone (`cancelled: true`) carries no `retainedSeq`
+ * and closes the retained state. `retained` is only valid with `seq` 0,
+ * and a retained record never carries a `delayId` — the two seq-0
+ * families are disjoint by construction.
+ *
  * A `key`, when present, must be a non-empty string; anything else makes
  * the line corrupt. A `keySeq`, when present, must be a positive integer
  * and requires `key` — the bus always writes both together.
@@ -2328,8 +2368,20 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   if (typeof o['topic'] !== 'string' || o['topic'] !== expectedTopic) return null;
   const seq = o['seq'];
   const isScheduleRecord = seq === 0;
+  const isRetainedRecord = o['retained'] === true;
+  if (isRetainedRecord && !isScheduleRecord) return null;
   if (isScheduleRecord) {
-    if (typeof o['delayId'] !== 'string' || (o['delayId'] as string).length === 0) return null;
+    if (isRetainedRecord) {
+      // Retained set records carry the retained message's original seq;
+      // retained tombstones carry no message identity.
+      if (o['cancelled'] === true) {
+        if (o['retainedSeq'] !== undefined) return null;
+      } else if (!Number.isInteger(o['retainedSeq']) || (o['retainedSeq'] as number) < 1) {
+        return null;
+      }
+    } else if (typeof o['delayId'] !== 'string' || (o['delayId'] as string).length === 0) {
+      return null;
+    }
   } else if (!Number.isInteger(seq) || (seq as number) < 1) {
     return null;
   }
@@ -2357,6 +2409,15 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     // real message and rejected there.
     if (o['cancelled'] !== true || !isScheduleRecord) return null;
     record.cancelled = true;
+  }
+  if (isRetainedRecord) {
+    record.retained = true;
+    // Validated above: present exactly on non-tombstone retained records.
+    if (o['retainedSeq'] !== undefined) record.retainedSeq = o['retainedSeq'] as number;
+  } else if (o['retained'] !== undefined) {
+    // The bus only ever writes `retained: true`; any other value means
+    // the line was tampered with or miswritten.
+    return null;
   }
   if (o['key'] !== undefined) {
     if (typeof o['key'] !== 'string' || (o['key'] as string).length === 0) return null;
@@ -2443,7 +2504,11 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       sig: signature['sig'] as string,
     };
   }
-  // A non-tombstone schedule record must say when it is due.
-  if (isScheduleRecord && record.cancelled !== true && record.deliverAt === undefined) return null;
+  // A non-tombstone delayed-delivery schedule record must say when it is
+  // due. Retained-message records (EB-87) are the other seq-0 family and
+  // carry no due time — only their own `retainedSeq`, validated above.
+  if (isScheduleRecord && !isRetainedRecord && record.cancelled !== true && record.deliverAt === undefined) {
+    return null;
+  }
   return record;
 }

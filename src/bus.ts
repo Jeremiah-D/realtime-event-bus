@@ -52,7 +52,7 @@ import {
   resolveGroupLagOptions,
   type GroupLagStat,
 } from './grouplag.ts';
-import { DurableTopicLog, type SegmentRotationOptions } from './durablelog.ts';
+import { DurableTopicLog, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import {
   SubscriptionAuditLog,
@@ -229,6 +229,14 @@ export interface BusMessage {
    * secret — only the key id and the hex digest.
    */
   signature?: MessageSignature;
+  /**
+   * MQTT-style retained-message marker (see `EventBus.setTopicRetained`,
+   * EB-87): `true` exactly when this delivery is the topic's retained
+   * snapshot handed to a late-joining subscriber at subscribe time —
+   * never on live publishes, replays, or redeliveries. Absent
+   * (`undefined`) otherwise, so existing consumers see no shape change.
+   */
+  retained?: boolean;
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
@@ -3099,6 +3107,15 @@ export interface BusStats {
    */
   replayProgress: ReplayProgressStat[];
   /**
+   * MQTT-style retained messages (EB-87): one row per concrete topic
+   * currently holding a retained message — the topic, the retained
+   * message's per-topic `seq`, and its publish timestamp (`at`, bus
+   * clock) — sorted by topic. Empty when no topic holds a retained
+   * message. A retained message whose TTL deadline has passed is
+   * filtered out of this view (the snapshot never resurrects it).
+   */
+  retainedTopics: Array<{ topic: string; seq: number; at: number }>;
+  /**
    * Durable topic log state (`EventBusOptions.durableLogDir`). Absent when
    * the durable log is disabled.
    */
@@ -3130,6 +3147,42 @@ export interface BusStats {
      */
     segments: Record<string, { live: number; segments: number; archived: number }>;
   };
+}
+
+/**
+ * One entry of the MQTT-style retained-message table (EB-87): the latest
+ * retained message for a concrete topic. Stored is the wire form — the
+ * compressed envelope when a compression rule applied, plus the publish
+ * timestamp, TTL deadline, dictionary id and signature — so a snapshot
+ * delivery is byte-identical to the live delivery (transparent inflation
+ * and signature verification apply at snapshot time, exactly like
+ * replay).
+ */
+interface RetainedEntry {
+  /** Concrete (alias-resolved) topic. */
+  topic: string;
+  /** Wire payload: the compressed envelope when compression applied, else the raw payload. */
+  payload: unknown;
+  /** The original publish's per-topic sequence number. */
+  seq: number;
+  /** Bus-clock publish timestamp, in milliseconds. */
+  at: number;
+  /**
+   * TTL deadline stamped at publish time, when a TTL rule matched. A
+   * retained message past its deadline is pruned and never snapshotted —
+   * the snapshot must not resurrect an expired message.
+   */
+  expiresAt?: number;
+  /** SHA-256 id of the preset dictionary that compressed `payload`. */
+  dictId?: string;
+  /** Publish-time HMAC signature, when a signing rule matched. */
+  signature?: { kid: string; sig: string };
+  /** Application-level message identity, when the publish carried one. */
+  messageId?: string;
+  /** Publisher identity, when the publish carried one. */
+  publisherId?: string;
+  /** Business event time, when the publish carried one. */
+  eventTime?: number;
 }
 
 /**
@@ -3518,6 +3571,15 @@ interface Subscriber {
    * snapshot as `unsupportedOptions` — dropped openly, never silently.
    */
   unsupportedMigrationOptions?: string[];
+  /**
+   * MQTT-style retained snapshot (EB-87): per-topic `seq` of the retained
+   * messages already handed to this subscriber's handler synchronously at
+   * subscribe time. A durable-log replay (`resumeFromSeq` /
+   * `resumeFromTime`) skips these exact records — the snapshot came
+   * first, so replay must never deliver them twice. Absent when the
+   * subscription received no retained snapshot.
+   */
+  retainedDelivered?: Map<string, number>;
 }
 
 /**
@@ -5450,6 +5512,25 @@ export interface PublishOptions {
    */
   schemaVersion?: number;
   /**
+   * MQTT-style retained message (see `EventBus.setTopicRetained`,
+   * EB-87): when `true`, this admitted publish additionally becomes the
+   * topic's retained message — the latest value a late-joining
+   * subscriber receives as a snapshot at subscribe time, replacing any
+   * previous retained value for the exact (alias-resolved) topic.
+   * Publishing an empty payload with `retain: true` clears the topic's
+   * retained message instead ("empty" is measured in JSON-serialized
+   * bytes: `undefined` and values `JSON.stringify` cannot represent
+   * serialize to zero bytes; `null` serializes to `null` and is not
+   * empty). The retain flag is honored only when a retained rule
+   * resolves to enabled for the topic (`setTopicRetained`); otherwise
+   * the publish is an ordinary publish and the flag is ignored. The
+   * message itself always goes through the normal publish pipeline
+   * (admission, fan-out, durable log) — a rejected or shed publish
+   * never touches the retained store. Only `publish` carries this
+   * option; batch/atomic/delayed publishes do not retain.
+   */
+  retain?: boolean;
+  /**
    * Marks this publish as already-routed (see `EventBus.setTopicRoute`):
    * a routed message never triggers topic routing again, so a route
    * chain (`a → b → c`) forwards one hop per message and a publish can
@@ -6518,6 +6599,36 @@ export class EventBus {
    */
   private ttlMatcherCache = new Map<string, RegExp>();
   /**
+   * MQTT-style retained-message rules (EB-87), keyed by the exact string
+   * passed to `setTopicRetained` — either a concrete topic name or a
+   * wildcard pattern. `true` enables retained publishes for matching
+   * topics, `false` disables them (overriding a broader `true` pattern).
+   * Match resolution mirrors the TTL rules: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins. No
+   * rule means retained publishes are ignored (the publish itself is an
+   * ordinary publish).
+   */
+  private retainedRules = new Map<string, boolean>();
+  /**
+   * Compiled matchers for the wildcard entries in `retainedRules`, kept
+   * apart from the subscriber pattern cache and the other rule caches so
+   * retained configuration never inflates `patternCacheSize`.
+   */
+  private retainedMatcherCache = new Map<string, RegExp>();
+  /**
+   * The live retained-message table (EB-87): the latest retained message
+   * per concrete (alias-resolved) topic. Rebuilt from the durable log on
+   * restart (seq-0 retained records + tombstones).
+   */
+  private retainedMessages = new Map<string, RetainedEntry>();
+  /**
+   * Set while `subscribeReliable` runs its inner `subscribe`: the
+   * retained snapshot is deferred until the at-least-once wrapper is
+   * installed, so the snapshot is delivered as tracked deliveries through
+   * the ready wrapper instead of crashing on the not-yet-assigned one.
+   */
+  private retainedSnapshotDeferred = false;
+  /**
    * Per-topic HMAC signing rules (EB-84), keyed by the exact string passed
    * to `setTopicSigningKey` — either a concrete topic name or a wildcard
    * pattern. Match resolution mirrors the TTL rules: an exact-topic rule
@@ -7260,6 +7371,10 @@ export class EventBus {
       // that never fanned out (and were not cancelled) survive the
       // restart. Already-due entries fan out immediately.
       this.recoverDelayed();
+      // Rebuild the retained-message table from the log (EB-87): the
+      // latest retained record per topic wins; tombstones and
+      // TTL-expired entries rebuild nothing.
+      this.recoverRetained();
       // Reseed consumer-group checkpoints from the offset journal: the
       // highest committed seq per checkpoint wins, so a restarted bus
       // resumes committed offsets instead of forgetting them — a rejoining
@@ -7350,6 +7465,89 @@ export class EventBus {
    */
   clearTopicTtl(topicPattern: string): boolean {
     return this.ttlRules.delete(topicPattern);
+  }
+
+  /**
+   * Opts topics matching `topicPattern` into (or out of) MQTT-style
+   * retained messages (EB-87, real-time systems): a `publish` carrying
+   * `retain: true` on a matching topic additionally stores the message
+   * as that topic's retained message — the latest value a late-joining
+   * subscriber receives as a snapshot at subscribe time, before any live
+   * message. Publishing an empty payload with `retain: true` clears the
+   * topic's retained message (see `PublishOptions.retain` for the exact
+   * "empty" definition).
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or
+   * an exact topic name); the rule key is the exact string passed here.
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins
+   * (independent matcher cache — never inflates `patternCacheSize`).
+   * With no matching rule a `retain: true` publish is an ordinary
+   * publish — the flag is silently ignored — so retained storage is
+   * strictly opt-in. Re-setting a rule replaces it.
+   *
+   * Removing a rule does NOT delete already-stored retained messages:
+   * it only stops future retained publishes from updating the table.
+   * Retained state survives restarts via the durable log (seq-0
+   * retained records + tombstones, like the delayed-delivery
+   * convention) when `durableLogDir` is configured.
+   *
+   * Throws `RangeError` when `topicPattern` is empty or `enabled` is
+   * not a boolean. Audited as `retained_rule_set`.
+   */
+  setTopicRetained(topicPattern: string, enabled: boolean): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (typeof enabled !== 'boolean') {
+      throw new RangeError('enabled must be a boolean');
+    }
+    this.retainedRules.set(topicPattern, enabled);
+    this.auditSubscription({
+      action: 'retained_rule_set',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { enabled },
+    });
+  }
+
+  /**
+   * Removes the retained-message rule previously registered for
+   * `topicPattern`. Returns true when a rule existed and was removed.
+   * Already-stored retained messages are left untouched — only future
+   * retained publishes stop updating the table. Audited as
+   * `retained_rule_cleared` when a rule existed.
+   */
+  clearTopicRetained(topicPattern: string): boolean {
+    const removed = this.retainedRules.delete(topicPattern);
+    if (removed) {
+      this.auditSubscription({
+        action: 'retained_rule_cleared',
+        actor: 'system',
+        pattern: topicPattern,
+      });
+    }
+    return removed;
+  }
+
+  /**
+   * Returns whether retained publishes are enabled for `topic`: the
+   * resolved rule value, or `undefined` when no rule matches. An
+   * exact-topic rule wins over patterns; between patterns the
+   * earliest-registered matching rule wins.
+   */
+  private retainedForTopic(topic: string): boolean | undefined {
+    const exact = this.retainedRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, enabled] of this.retainedRules) {
+      let matcher = this.retainedMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.retainedMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return enabled;
+    }
+    return undefined;
   }
 
   /**
@@ -8914,6 +9112,9 @@ export class EventBus {
       // construction-time recovery, so numbering continues instead of
       // restarting at 1.
       this.recoverLogState(child);
+      // Rebuild the namespace's retained-message table from its child
+      // log (EB-87), like the root log's construction-time recovery.
+      this.recoverRetainedFromLog(child);
     }
     return new NamespaceHandle(this, prefix);
   }
@@ -9549,6 +9750,15 @@ export class EventBus {
     indexBucket.add(id);
     // A new pattern changes what this node advertises to the cluster hub.
     this.advertiseClusterPatterns();
+
+    // MQTT-style retained messages (EB-87): a late joiner first receives
+    // the latest retained message of every matching topic — synchronously,
+    // bypassing the backpressure queue — before any replay below and
+    // before any live message, so the snapshot-then-live order is
+    // guaranteed by construction. (Deferred for reliable subscribers:
+    // `subscribeReliable` performs it through the at-least-once wrapper
+    // once installed.)
+    this.deliverRetainedSnapshot(subscriber);
 
     // Durable-log resume: pre-fill the queue with logged messages the
     // subscriber missed (seq > resumeFromSeq on matching topics, or —
@@ -10351,7 +10561,19 @@ export class EventBus {
     }
     const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable');
     let deliver!: (msg: BusMessage | BusMessage[]) => void;
-    const sub = this.subscribe(topicPattern, (msg: BusMessage | BusMessage[]) => deliver(msg), opts);
+    // The retained snapshot (EB-87) is deferred until the at-least-once
+    // wrapper below is installed: delivering through the not-yet-assigned
+    // wrapper inside `subscribe` would throw. The snapshot runs after the
+    // wrapper is ready — still synchronously inside this call, so it lands
+    // before any replay or live delivery — as tracked deliveries the
+    // subscriber must ack.
+    this.retainedSnapshotDeferred = true;
+    let sub: Subscription;
+    try {
+      sub = this.subscribe(topicPattern, (msg: BusMessage | BusMessage[]) => deliver(msg), opts);
+    } finally {
+      this.retainedSnapshotDeferred = false;
+    }
     const subscriber = this.subscribers.get(sub.id);
     if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
     const redeliveries = new WeakMap<BusMessage, number>();
@@ -10529,6 +10751,11 @@ export class EventBus {
         delivery.nack();
       }
     };
+    // MQTT-style retained snapshot (EB-87), deferred from `subscribe`
+    // above: the wrapper is installed now, so the snapshot is delivered
+    // as tracked at-least-once deliveries — still synchronously, before
+    // any replay or live message reaches the handler.
+    this.deliverRetainedSnapshot(subscriber);
     const reliableSubscription: Subscription = {
       id: sub.id,
       unsubscribe: () => {
@@ -11981,7 +12208,16 @@ export class EventBus {
       // alias-resolved topic, mirroring the live fan-out's dual-write
       // window for history. See `replayLog`.
       if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
-      for (const rec of log.readSinceTime(topic, fromTime)) records.push(rec);
+      for (const rec of log.readSinceTime(topic, fromTime)) {
+        // Retained-message state (EB-87) is not a message: the seq-0
+        // retained record never replays — its message already fanned out
+        // as an ordinary publish (deduped against the snapshot in
+        // `admitReplayRecords`), and late joiners get the snapshot.
+        // Delayed-delivery schedule records keep their existing
+        // pass-through behavior.
+        if (rec.seq === 0 && rec.retained === true) continue;
+        records.push(rec);
+      }
     }
     records.sort((a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
     this.admitReplayRecords(subscriber, records, { trackProgress: true });
@@ -12020,6 +12256,9 @@ export class EventBus {
       // window for history. See `replayLog`.
       if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
       for (const rec of log.readSinceTime(topic, fromTime)) {
+        // Retained-message state (EB-87) never replays — see
+        // `replayLogSinceTime`.
+        if (rec.seq === 0 && rec.retained === true) continue;
         if (mine.has(this.partitionForMessage(n, rec.topic, rec.seq, rec.key))) records.push(rec);
       }
     }
@@ -12149,6 +12388,11 @@ export class EventBus {
     // logs written before keyed ordering, or unkeyed messages — replay
     // exactly as before.
     for (const rec of records) {
+      // MQTT-style retained snapshot (EB-87): this exact record was
+      // already handed to the subscriber synchronously at subscribe
+      // time — exclude it from the replay baselines as well as the
+      // delivery below, so it is never delivered twice.
+      if (subscriber.retainedDelivered?.get(rec.topic) === rec.seq) continue;
       if (rec.key === undefined || rec.keySeq === undefined) continue;
       // Replayed records come from this node's own log: the local stream.
       const mapKey = keyOrderKey('', rec.key);
@@ -12171,6 +12415,8 @@ export class EventBus {
     const causalGate = subscriber.causal;
     if (causalGate !== undefined) {
       for (const rec of records) {
+        // Retained-snapshot dedup (EB-87): see the key-order seed above.
+        if (subscriber.retainedDelivered?.get(rec.topic) === rec.seq) continue;
         if (rec.causal === undefined) continue;
         const prev = causalGate.expected.get(rec.causal.source);
         if (prev === undefined || rec.causal.clock < prev) {
@@ -12246,6 +12492,24 @@ export class EventBus {
           // A lingered causal message replays after the window expires: the
           // skip advances the expectation now, and the later replay arrives
           // as a (harmless, immediately delivered) regression.
+          if (rec.causal !== undefined) {
+            this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+          }
+          countReplaySkipped();
+          continue;
+        }
+        // MQTT-style retained snapshot (EB-87): the subscriber already
+        // received this exact record synchronously at subscribe time,
+        // before replay started — never deliver it twice. Like a content
+        // filter skip, the per-topic baseline advances over it (it was
+        // seen, not lost) and the key/causal baselines advance past it
+        // so ordering gates never hang on a message that will never be
+        // queued.
+        if (subscriber.retainedDelivered?.get(rec.topic) === rec.seq) {
+          this.advanceBaseline(subscriber, rec.topic, rec.seq);
+          if (rec.key !== undefined && rec.keySeq !== undefined) {
+            this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+          }
           if (rec.causal !== undefined) {
             this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
           }
@@ -12428,6 +12692,9 @@ export class EventBus {
       opts?.causal,
       opts?.publisherId,
       opts?.schemaVersion,
+      // MQTT-style retained message (EB-87): honored only when a
+      // retained rule resolves to enabled for the topic.
+      opts?.retain,
     );
     this.scheduleFlush();
     return accepted;
@@ -13271,6 +13538,291 @@ export class EventBus {
    */
   private appendDelayTombstone(delayId: string, topic: string): void {
     this.durableLogForTopic(topic)?.append({ seq: 0, topic, at: this.now(), delayId, cancelled: true, payload: null });
+  }
+
+  /**
+   * Records an admitted `retain: true` publish as the concrete topic's
+   * retained message (EB-87). Called from `fanOut` after the message is
+   * fully admitted and stamped — a rejected or shed publish never
+   * reaches here, so it can never touch the retained store.
+   *
+   * The rule gate runs first: without a rule resolving to `true` the
+   * retain flag is ignored and the publish stays an ordinary publish.
+   * An empty payload clears the retained message instead of storing it
+   * (see `PublishOptions.retain` for the "empty" definition). Otherwise
+   * the latest value wins — the previous retained message for the topic
+   * is replaced.
+   *
+   * The stored envelope is the wire form (compressed bytes when a
+   * compression rule applied, plus the HMAC signature when a signing
+   * rule matched): snapshot delivery re-registers it for transparent
+   * inflation and verifies the signature against the same bytes the
+   * publisher signed, exactly like durable-log replay. The state is
+   * journaled as a seq-0 retained record (the delayed-delivery
+   * convention) so a restart rebuilds the table; best-effort like all
+   * durable-log writes.
+   */
+  private updateRetained(
+    topic: string,
+    msg: BusMessage,
+    rawPayload: unknown,
+    nowMs: number,
+    expiresAt: number | undefined,
+    dictId: string | undefined,
+  ): void {
+    if (this.retainedForTopic(topic) !== true) return;
+    if (payloadByteSize(rawPayload) === 0) {
+      this.clearRetained(topic, nowMs);
+      return;
+    }
+    const signature =
+      msg.signature === undefined
+        ? undefined
+        : { kid: msg.signature.kid, sig: msg.signature.sig };
+    const entry: RetainedEntry = {
+      topic,
+      payload: msg.payload,
+      seq: msg.seq,
+      at: nowMs,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(dictId === undefined ? {} : { dictId }),
+      ...(signature === undefined ? {} : { signature }),
+      ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
+      ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
+      ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
+    };
+    this.retainedMessages.set(topic, entry);
+    this.durableLogForTopic(topic)?.append({
+      seq: 0,
+      topic,
+      at: nowMs,
+      retained: true,
+      retainedSeq: msg.seq,
+      payload: msg.payload,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(dictId === undefined ? {} : { dictId }),
+      ...(signature === undefined ? {} : { signature }),
+      ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
+      ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
+      ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
+    });
+  }
+
+  /**
+   * Clears the concrete topic's retained message (EB-87): drops it from
+   * the live table and journals a seq-0 tombstone so a restart does not
+   * resurrect the cleared value (the delayed-delivery tombstone
+   * convention). The tombstone is written even when the live table held
+   * no entry — after a restart the table is rebuilt from disk, and a
+   * clear must still close the on-disk record. Audited as
+   * `retained_cleared` when an entry actually existed.
+   */
+  private clearRetained(topic: string, nowMs: number): void {
+    const existed = this.retainedMessages.delete(topic);
+    this.durableLogForTopic(topic)?.append({
+      seq: 0,
+      topic,
+      at: nowMs,
+      retained: true,
+      cancelled: true,
+      payload: null,
+    });
+    if (existed) {
+      this.auditSubscription({
+        action: 'retained_cleared',
+        actor: 'system',
+        topic,
+        detail: { via: 'publish' },
+      });
+    }
+  }
+
+  /**
+   * Hands a late-joining subscriber its retained snapshot (EB-87): the
+   * latest retained message of every matching concrete topic, delivered
+   * synchronously at subscribe time — before any replay
+   * (`resumeFromSeq` / `resumeFromTime`) and before any live message —
+   * so ordering is guaranteed by construction.
+   *
+   * Snapshot deliveries bypass the backpressure queue entirely: they
+   * burn no backpressure budget and occupy no queue capacity — the
+   * handler is invoked directly. Content filters, composite
+   * include/exclude patterns, and `verifySignature` apply exactly as on
+   * the live path (verified against the wire bytes, before inflation);
+   * keyed/causal ordering gates are intentionally bypassed — the
+   * snapshot is a point-in-time catch-up, and the first live keyed or
+   * causal message seeds those gates fresh, so nothing can hang on an
+   * unseen predecessor. Each delivered message carries
+   * `retained: true`, establishes the per-topic gap baseline like a
+   * first delivery (a late joiner never counts pre-subscription messages
+   * as gaps), and counts into `deliveredMessages` like replayed
+   * messages do. A throwing handler is isolated — the flush loop never
+   * lets a handler throw escape either.
+   *
+   * Shadow mirrors are skipped: like replay (which shadows reject), a
+   * retained snapshot is history, not live traffic. Group members each
+   * receive their own snapshot — mirroring per-member replay — so every
+   * competing set still sees each retained message exactly once per
+   * joining member.
+   *
+   * The delivered (topic, seq) pairs are recorded on the subscriber so
+   * the replay pass skips those exact records — the snapshot came first,
+   * it must never be delivered twice.
+   */
+  private deliverRetainedSnapshot(subscriber: Subscriber): void {
+    // Deferred for reliable subscribers: `subscribeReliable` installs
+    // the at-least-once wrapper after `subscribe` returns; it performs
+    // the snapshot itself through the ready wrapper (tracked
+    // deliveries).
+    if (this.retainedSnapshotDeferred) return;
+    if (this.retainedMessages.size === 0) return;
+    if (subscriber.shadow !== undefined) return;
+    const nowMs = this.now();
+    // Lazy TTL prune: a retained message past its deadline is gone — the
+    // live drain would drop it as expired, so the snapshot never
+    // resurrects it. Restart recovery applies the same rule.
+    for (const [topic, entry] of this.retainedMessages) {
+      if (entry.expiresAt !== undefined && entry.expiresAt <= nowMs) {
+        this.retainedMessages.delete(topic);
+      }
+    }
+    const matched: RetainedEntry[] = [];
+    for (const entry of this.retainedMessages.values()) {
+      if (!this.topicMatchesWithAliases(subscriber.matcher, entry.topic, entry.topic)) continue;
+      const composite = subscriber.composite;
+      if (composite !== undefined && !this.matchesComposite(composite, entry.topic)) continue;
+      matched.push(entry);
+    }
+    if (matched.length === 0) return;
+    // Deterministic snapshot order: publish time, then topic.
+    matched.sort((a, b) => a.at - b.at || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0));
+    const outgoing: BusMessage[] = [];
+    const delivered = new Map<string, number>();
+    for (const entry of matched) {
+      const msg: BusMessage = {
+        topic: entry.topic,
+        payload: entry.payload,
+        seq: entry.seq,
+        retained: true,
+        ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
+        ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
+        ...(entry.eventTime === undefined ? {} : { eventTime: entry.eventTime }),
+        ...(entry.signature === undefined
+          ? {}
+          : { signature: { kid: entry.signature.kid, sig: entry.signature.sig } }),
+      };
+      // The table stores the wire payload: re-register a compressed
+      // envelope for transparent inflation at delivery, exactly like
+      // replay. A missing preset dictionary fails closed here, like
+      // replay — never silently raw.
+      if (isCompressedPayload(entry.payload)) {
+        this.compressedPayloads.add(msg);
+        if (entry.dictId !== undefined) {
+          const dictionary = this.compressionDictionaryRegistry.get(entry.dictId);
+          if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
+        }
+      }
+      // Envelope signature verification (EB-84) applies to the snapshot
+      // exactly as to live fan-out and replay: checked on the wire bytes
+      // before inflation — a failed check drops the snapshot copy,
+      // counted and audited.
+      if (subscriber.verifySignature && !this.deliverySignatureValid(msg)) {
+        this.countSignatureFailure(subscriber, msg, msg.signature?.kid);
+        continue;
+      }
+      this.inflateMessagePayload(msg);
+      const filter = subscriber.filter;
+      if (filter !== undefined && !filter(msg.payload, msg.topic)) {
+        // Content-filtered: seen and deliberately skipped — never queued
+        // (no backpressure budget), never a sequence gap.
+        this.countFiltered(subscriber, msg.topic, msg.seq);
+        continue;
+      }
+      this.detectGap(subscriber, msg);
+      this.totalDelivered += 1;
+      delivered.set(entry.topic, entry.seq);
+      outgoing.push(msg);
+    }
+    if (outgoing.length === 0) return;
+    subscriber.retainedDelivered = delivered;
+    // Direct handler invocation — never the backpressure queue.
+    // Synchronous, so every later live message lands after the snapshot.
+    // A throwing handler is isolated exactly like the flush loop
+    // isolates a throwing live handler; only a clean return counts as
+    // idle activity (reliable subscribers record inside their
+    // at-least-once wrapper instead).
+    const invokeQuietly = (invoke: () => void): boolean => {
+      try {
+        invoke();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const noteActivity = (): void => {
+      if (subscriber.reliable === undefined) this.recordIdleActivity(subscriber, 'deliver');
+    };
+    if (subscriber.batch !== undefined) {
+      if (
+        invokeQuietly(() => (subscriber.handler as unknown as (msgs: BusMessage[]) => void)(outgoing))
+      ) {
+        noteActivity();
+      }
+    } else {
+      for (const msg of outgoing) {
+        if (invokeQuietly(() => subscriber.handler(msg))) noteActivity();
+      }
+    }
+  }
+
+  /**
+   * Rebuilds the retained-message table from one durable log after a
+   * restart (EB-87). Per topic the latest retained record wins; a
+   * tombstone (`cancelled: true`) or an entry whose TTL deadline passed
+   * while the process was down rebuilds nothing. Delayed-delivery
+   * schedule records are ignored here (they carry no `retained` marker).
+   */
+  private recoverRetainedFromLog(log: DurableTopicLog): void {
+    const nowMs = this.now();
+    for (const topic of log.topics()) {
+      let latest: DurableLogRecord | undefined;
+      // `readSince(topic, -1)`: the exclusive bound sits below every
+      // real seq, so the seq-0 retained records and tombstones come along
+      // too. File order means the last retained record wins.
+      for (const rec of log.readSince(topic, -1)) {
+        if (rec.retained !== true) continue;
+        latest = rec;
+      }
+      if (latest === undefined || latest.cancelled === true) continue;
+      if (latest.expiresAt !== undefined && latest.expiresAt <= nowMs) continue;
+      // The parser guarantees `retainedSeq` on a non-tombstone retained
+      // record; guard anyway — a rebuilt table must never carry seq 0.
+      if (latest.retainedSeq === undefined) continue;
+      this.retainedMessages.set(topic, {
+        topic,
+        payload: latest.payload,
+        seq: latest.retainedSeq,
+        at: latest.at,
+        ...(latest.expiresAt === undefined ? {} : { expiresAt: latest.expiresAt }),
+        ...(latest.dictId === undefined ? {} : { dictId: latest.dictId }),
+        ...(latest.signature === undefined ? {} : { signature: { ...latest.signature } }),
+        ...(latest.messageId === undefined ? {} : { messageId: latest.messageId }),
+        ...(latest.publisherId === undefined ? {} : { publisherId: latest.publisherId }),
+        ...(latest.eventTime === undefined ? {} : { eventTime: latest.eventTime }),
+      });
+    }
+  }
+
+  /**
+   * Rebuilds the retained-message table from the durable log after a
+   * restart (EB-87). Runs at construction, after the delayed-delivery
+   * rebuild; namespace child logs rebuild through
+   * `recoverRetainedFromLog` at `createNamespace`.
+   */
+  private recoverRetained(): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    this.recoverRetainedFromLog(log);
   }
 
   /**
@@ -14943,6 +15495,10 @@ export class EventBus {
     // paths (bridge, forward, route, diagnostic, delayed fan-out) pass
     // `undefined` — admission runs against the latest registered version.
     schemaVersion?: number,
+    // MQTT-style retained message (see `PublishOptions.retain`, EB-87):
+    // only `publish` passes this — every other path leaves it undefined
+    // and never touches the retained store.
+    retain?: boolean,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -15218,6 +15774,14 @@ export class EventBus {
             ? undefined
             : nowMs + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
+    // MQTT-style retained messages (EB-87): the message above cleared
+    // every admission gate and is fully stamped (wire payload, signature,
+    // TTL deadline) — a `retain: true` publish now becomes (or clears)
+    // the topic's retained message. The message itself was already an
+    // ordinary publish; only the retained-store update is conditional.
+    if (retain === true) {
+      this.updateRetained(topic, msg, payload, nowMs, expiresAt, compressedDictId);
+    }
     // Cross-process bridge (EB-51): an admitted local publish is mirrored
     // to the configured transport so other nodes can fan it out. The RAW
     // application payload is mirrored — never the compressed envelope —
@@ -15942,6 +16506,14 @@ export class EventBus {
       }),
       groupLag: this.groupLagRowsFor(undefined),
       replayProgress,
+      // MQTT-style retained messages (EB-87): one row per concrete
+      // topic currently holding a retained message, sorted by topic. A
+      // retained message past its TTL deadline is filtered out — the
+      // snapshot never resurrects it.
+      retainedTopics: [...this.retainedMessages.values()]
+        .filter((entry) => entry.expiresAt === undefined || entry.expiresAt > ratesNow)
+        .sort((a, b) => (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0))
+        .map((entry) => ({ topic: entry.topic, seq: entry.seq, at: entry.at })),
       topicSubscriberLimits: [...this.subscriberLimitRules.entries()].map(([rule, maxSubscribers]) => {
         let currentSubscribers = 0;
         for (const sub of this.subscribers.values()) {

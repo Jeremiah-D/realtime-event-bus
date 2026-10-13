@@ -68,6 +68,8 @@
  *
  * Gauges (point-in-time):
  * - `eventbus_subscribers`: currently active subscriptions.
+ * - `eventbus_retained_topics`: topics currently holding an MQTT-style
+ *   retained message (EB-87).
  * - `eventbus_unacked_deliveries`: reliable deliveries handed out but not
  *   yet acked or nacked.
  * - `eventbus_throttled_subscribers`: subscriptions under adaptive
@@ -323,6 +325,11 @@ export function renderPrometheus(stats: BusStats): string {
   );
 
   gauge('eventbus_subscribers', 'Currently active subscriptions.', stats.totalSubscribers);
+  gauge(
+    'eventbus_retained_topics',
+    'Topics currently holding an MQTT-style retained message (EB-87).',
+    stats.retainedTopics?.length ?? 0,
+  );
   gauge(
     'eventbus_unacked_deliveries',
     'Reliable deliveries handed out but not yet acked or nacked.',

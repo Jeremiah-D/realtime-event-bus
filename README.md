@@ -2139,6 +2139,98 @@ How it works:
   the same destination admission and re-signing; a verifying subscriber
   on the destination always checks the destination bus's signature.
 
+## Retained messages (MQTT-style)
+
+Opt-in per-topic retained messages (`src/bus.ts`, EB-87 — real-time
+systems / messaging): a `publish` carrying `retain: true` on a topic with
+an enabled retained rule additionally stores the message as that topic's
+retained message — the latest value a late-joining subscriber receives as
+a snapshot at subscribe time, before any live message:
+
+```ts
+bus.setTopicRetained('config.*', true);
+bus.publish('config.pricing', { tier: 'pro' }, { retain: true });
+// …later, on another part of the system:
+bus.subscribe('config.*', (msg) => {
+  // First call: { topic: 'config.pricing', payload: { tier: 'pro' },
+  //   seq, retained: true } — then live messages follow.
+});
+bus.publish('config.pricing', undefined, { retain: true }); // clears it
+```
+
+How it works:
+
+- **Rules** — `setTopicRetained(topicPattern, enabled)` /
+  `clearTopicRetained(topicPattern)`. The rule key is the exact string
+  passed; match resolution mirrors `setTopicTtl`: an exact-topic rule
+  wins over patterns, the earliest-registered matching pattern wins
+  (independent matcher cache — never inflates `patternCacheSize`). With
+  no matching rule a `retain: true` publish is an ordinary publish — the
+  flag is silently ignored — so retained storage is strictly opt-in.
+  Removing a rule stops future retained publishes from updating the
+  table; already-stored retained messages stay deliverable. Empty
+  patterns and non-boolean flags throw `RangeError` at configuration
+  time.
+- **Store** — one entry per exact (alias-resolved) topic; the latest
+  retained publish wins, overwriting the previous value. A rejected or
+  shed publish never touches the store: the message goes through the
+  normal publish pipeline (admission, fan-out, durable log) and only an
+  admitted publish updates retained state.
+- **Clear** — publishing an empty payload with `retain: true` clears the
+  topic's retained message (MQTT convention). "Empty" is measured in
+  JSON-serialized bytes — the same yardstick the byte-budgeted queues
+  use: `undefined` and values `JSON.stringify` cannot represent
+  (functions, symbols, circular structures) serialize to zero bytes;
+  `null` serializes to `null` (4 bytes) and is **not** empty.
+- **Snapshot delivery** — a late subscriber first receives the latest
+  retained message of every matching concrete topic (a wildcard
+  subscription gets one per matching topic, in publish-time order),
+  each carrying `retained: true` (absent on live messages). The snapshot
+  is delivered synchronously inside `subscribe` — before any
+  `resumeFromSeq` / `resumeFromTime` replay and before any live message —
+  so snapshot-then-live order is guaranteed by construction, and a
+  replay never redelivers a snapshotted message (the exact record is
+  skipped in the replay pass). Snapshot deliveries bypass the
+  backpressure queue entirely: no backpressure budget burned, no queue
+  capacity occupied. Content filters, composite include/exclude
+  patterns, and `verifySignature` apply exactly as on the live path;
+  keyed/causal ordering gates are bypassed (the first live keyed/causal
+  message seeds those gates fresh). Shadow mirrors never receive the
+  snapshot (like replay, which shadows reject); consumer-group members
+  each receive their own snapshot, mirroring per-member replay;
+  reliable subscribers receive it as tracked at-least-once deliveries.
+  Each snapshot delivery establishes the per-topic gap baseline like a
+  first delivery — a late joiner never counts pre-subscription messages
+  as gaps — and counts into `deliveredMessages` like replayed messages.
+- **Envelope** — the stored envelope is the wire form: the compressed
+  bytes when a compression rule applied, plus the HMAC `{kid, sig}` when
+  a signing rule matched. Snapshot delivery re-registers the envelope
+  for transparent inflation and verifies the signature against the same
+  post-compression bytes the publisher signed — the existing
+  signature-covers-wire-bytes semantics is unchanged.
+- **Durability** — retained state is journaled as seq-0 retained records
+  (the delayed-delivery convention: state, not messages — invisible to
+  replay, never moving the sequence counter); a clear writes a tombstone
+  so a restart never resurrects a cleared value. Restart recovery
+  rebuilds the table from the log (latest record per topic wins;
+  tombstoned or TTL-expired entries rebuild nothing). Retained records
+  are never age-evicted by time-based retention — dropping them would
+  lose the snapshot on restart.
+- **TTL** — a retained message keeps the TTL deadline stamped at publish
+  time: past its deadline it is pruned and never snapshotted (nor shown
+  in stats) — the snapshot never resurrects an expired message.
+- **Observability** — `getStats().retainedTopics` lists
+  `{ topic, seq, at }` per topic holding a retained message (sorted by
+  topic; TTL-expired entries filtered out); Prometheus:
+  `eventbus_retained_topics` (gauge). Rule changes and publish-driven
+  clears are recorded in the subscription audit log as
+  `retained_rule_set` (`{ enabled }`), `retained_rule_cleared`, and
+  `retained_cleared` (`{ via: 'publish' }`).
+- **Scope notes** — retained state is node-local: bridge/cluster hops
+  re-admit as ordinary publishes and do not propagate the retain flag.
+  Only `publish` carries `retain`; batch/atomic/delayed publishes do
+  not retain.
+
 ## Subscription lifecycle audit log
 
 Every subscription change is recorded in an append-only audit log —
@@ -2182,7 +2274,9 @@ Details:
   `rebalance` carries `{ trigger, memberId, members }`;
   topic-registry changes carry the registration metadata;
   `signature_verification_failed` carries `{ seq, kid? }`;
-  `retention_updated` carries `{ from, to }` (null when unset).
+  `retention_updated` carries `{ from, to }` (null when unset);
+  `retained_rule_set` carries `{ enabled }`, `retained_cleared` carries
+  `{ via: 'publish' }`.
 
 ## Prometheus metrics
 
@@ -2217,6 +2311,7 @@ Exported series:
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
 | `eventbus_signature_failures_total` | counter | `signatureFailures` — messages discarded by `verifySignature` subscribers (missing/invalid HMAC signature, EB-84) |
 | `eventbus_signature_failures_total{topic}` | counter | per-topic `signatureFailures` (EB-84) |
+| `eventbus_retained_topics` | gauge | `retainedTopics.length` — topics currently holding an MQTT-style retained message (EB-87) |
 | `eventbus_dedup_dropped_messages_total` | counter | `dedupDropped` — subscriber exactly-once dedup suppressions |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
 | `eventbus_diagnostic_events_total` | counter | `diagnosticEvents` — admitted DLQ diagnostic events |

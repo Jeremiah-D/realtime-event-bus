@@ -5,7 +5,9 @@
  * registry changes (EB-77) / backpressure drops (EB-83,
  * `backpressure_dropped`) / signature-verification failures (EB-84,
  * `signature_verification_failed`) / durable-log retention policy changes
- * (EB-85, `retention_updated`).
+ * (EB-85, `retention_updated`) / retained-message rule and state changes
+ * (EB-87, `retained_rule_set` / `retained_rule_cleared` /
+ * `retained_cleared`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -43,7 +45,10 @@ export type SubscriptionAuditAction =
   | 'topic_deregister'
   | 'backpressure_dropped'
   | 'signature_verification_failed'
-  | 'retention_updated';
+  | 'retention_updated'
+  | 'retained_rule_set'
+  | 'retained_rule_cleared'
+  | 'retained_cleared';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -55,6 +60,9 @@ export type SubscriptionAuditAction =
  * - `backpressure_dropped`: `{ policy: <backpressure tier>, dropped: <count>, queueSize: <number> }`
  * - `signature_verification_failed`: `{ seq: <per-topic seq>, kid?: <key id that signed, when present> }`
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
+ * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
+ * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
+ * - `retained_cleared`: `{ via: 'publish' }` (the `topic` field carries the concrete topic)
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -106,6 +114,9 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'backpressure_dropped',
   'signature_verification_failed',
   'retention_updated',
+  'retained_rule_set',
+  'retained_rule_cleared',
+  'retained_cleared',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {
