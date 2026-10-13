@@ -2374,6 +2374,15 @@ export interface TopicStats {
    */
   rejectedMessages: number;
   /**
+   * Publishes to this topic admitted under a superseded-but-graced
+   * schema version (see `setTopicSchemaVersion`): the payload validated
+   * against an older validator inside its `graceMs` migration window.
+   * These are successful admissions — the message was published — so
+   * they move no other counter; the operator signal that some producers
+   * still speak an old schema and should migrate.
+   */
+  deprecatedSchemaVersions: number;
+  /**
    * Messages on this topic whose business event time was older than the
    * topic's event-time watermark when admitted (`PublishOptions.eventTime`
    * below `max(eventTime) - allowedLatenessMs`, EB-59). Late messages are
@@ -2648,6 +2657,13 @@ export interface BusStats {
    * counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total publishes admitted under a superseded-but-graced schema
+   * version — the sum of every topic's `deprecatedSchemaVersions` (see
+   * `setTopicSchemaVersion`). The bus-wide migrate-your-producers
+   * signal.
+   */
+  deprecatedSchemaVersions: number;
   /**
    * Total publishes to topics with no live registration in the topic
    * catalog (EB-77). Advisory only — these publishes were delivered
@@ -3045,6 +3061,20 @@ export interface BusStats {
    * it. Empty when no cap is configured.
    */
   topicSubscriberLimits: Array<{ rule: string; maxSubscribers: number; currentSubscribers: number }>;
+  /**
+   * Versioned schema registry (EB-86): one row per `setTopicSchemaVersion`
+   * registration key (concrete topic or pattern), in registration order —
+   * the rule key, the latest version, and every registered version
+   * ascending with its `registeredAt`, `graceMs`, and `supersededAt`
+   * (present only once a greater version superseded it). Validators are
+   * functions and are never exposed — metadata only. Empty when no
+   * versioned schema is registered.
+   */
+  topicSchemas: Array<{
+    rule: string;
+    latest: number;
+    versions: Array<{ version: number; registeredAt: number; graceMs: number; supersededAt?: number }>;
+  }>;
   /**
    * Consumer-group consumption lag (see `src/grouplag.ts`): one row per
    * (group, topic) for classic round-robin groups and one per (group,
@@ -3598,6 +3628,7 @@ function zeroedTopicStats(): {
   rateLimitedMessages: number;
   publisherRateLimited: number;
   rejectedMessages: number;
+  deprecatedSchemaVersions: number;
   lateMessages: number;
   duplicateMessages: number;
   filteredMessages: number;
@@ -3619,6 +3650,7 @@ function zeroedTopicStats(): {
     rateLimitedMessages: 0,
     publisherRateLimited: 0,
     rejectedMessages: 0,
+    deprecatedSchemaVersions: 0,
     lateMessages: 0,
     duplicateMessages: 0,
     filteredMessages: 0,
@@ -3686,6 +3718,19 @@ function validatePublisherId(publisherId: string | undefined, caller: string): v
     throw new RangeError(
       `${caller}: publisherId must be 1-64 ASCII alphanumeric, '_' or '-' characters`,
     );
+  }
+}
+
+/**
+ * Validates `PublishOptions.schemaVersion` (and its batch/delayed twins).
+ * Absent (`undefined`) means "the latest registered version"; anything
+ * else must be a non-negative integer — anything invalid throws
+ * `RangeError` before the publish mutates any state.
+ */
+function validateSchemaVersion(schemaVersion: number | undefined, caller: string): void {
+  if (schemaVersion === undefined) return;
+  if (!Number.isInteger(schemaVersion) || schemaVersion < 0) {
+    throw new RangeError(`${caller}: schemaVersion must be a non-negative integer`);
   }
 }
 
@@ -4811,6 +4856,42 @@ function resolveDeduplicateMessagesOptions(
 export type SchemaValidator = (payload: unknown, topic: string) => boolean;
 
 /**
+ * Options for one versioned schema registration (see
+ * `EventBus.setTopicSchemaVersion`).
+ */
+export interface TopicSchemaVersionOptions {
+  /**
+   * Migration window this registration grants to the versions it
+   * supersedes (bus-clock milliseconds): when a greater version
+   * registers, every older version in the same rule set remains
+   * admissible for this long — a publish carrying an old version is
+   * still validated and admitted inside the window (counted in
+   * `deprecatedSchemaVersions`), and rejected past it. The window
+   * boundary is inclusive. Must be a non-negative finite number.
+   * Default 0: superseded versions are rejected immediately — strict,
+   * fail-fast migration.
+   */
+  graceMs?: number;
+}
+
+/**
+ * One registered schema version inside a topic's (or topic pattern's)
+ * versioned rule set. `supersededAt` is stamped on the bus clock when the
+ * first strictly greater version registers (a backfilled lower version is
+ * born superseded); `graceMs` is the effective migration window — the
+ * grant from the superseding registration once superseded, the dormant
+ * grant this registration will give when it supersedes others while it
+ * is the latest.
+ */
+interface SchemaVersionRegistration {
+  version: number;
+  validator: SchemaValidator;
+  registeredAt: number;
+  supersededAt?: number;
+  graceMs: number;
+}
+
+/**
  * Why one entry of an atomic batch was rejected: the publisher's
  * rate-limit budget had no token left for it (`'publisher-rate-limit'`),
  * the ACL denied the publish (`'acl'`), its payload failed the topic's
@@ -5352,6 +5433,23 @@ export interface PublishOptions {
    */
   publisherId?: string;
   /**
+   * Schema version for versioned topic validators (see
+   * `setTopicSchemaVersion`). The publish is validated against this
+   * version's validator; absent means the latest registered version.
+   * An unknown version — or a superseded version past its grace window —
+   * is rejected exactly like a schema failure: counted in
+   * `rejectedMessages`, no sequence number consumed, nothing written to
+   * the durable log. A publish admitted under a superseded-but-graced
+   * version is counted in `deprecatedSchemaVersions` (per-topic and
+   * global) — the migrate-your-producers signal. Ignored when the topic
+   * has no versioned validators registered (the legacy
+   * `setTopicSchema` validator, if any, still applies). Must be a
+   * non-negative integer when provided; anything else throws
+   * `RangeError` from the publish entry point before anything is
+   * mutated.
+   */
+  schemaVersion?: number;
+  /**
    * Marks this publish as already-routed (see `EventBus.setTopicRoute`):
    * a routed message never triggers topic routing again, so a route
    * chain (`a → b → c`) forwards one hop per message and a publish can
@@ -5399,7 +5497,16 @@ export interface PublishOptions {
  * (see `PublishOptions.key`); `traceparent` continues an upstream trace
  * (see `PublishOptions.traceparent`).
  */
-export type BatchMessage = Omit<BusMessage, 'seq'> & { key?: string; traceparent?: string };
+export type BatchMessage = Omit<BusMessage, 'seq'> & {
+  key?: string;
+  traceparent?: string;
+  /**
+   * Schema version for versioned topic validators (see
+   * `PublishOptions.schemaVersion`): validated per entry at the publish
+   * entry point (`publishBatch`, `publishAtomic`).
+   */
+  schemaVersion?: number;
+};
 
 /**
  * When a `publishDelayed` message becomes due. Exactly one of the two
@@ -5450,6 +5557,12 @@ export interface PublishDelayedOptions {
    * attribution across restarts. Same validation as `publish`.
    */
   publisherId?: string;
+  /**
+   * Schema version for versioned topic validators (see
+   * `PublishOptions.schemaVersion`): validated fail-fast at schedule
+   * time, not re-run at fan-out. Same validation as `publish`.
+   */
+  schemaVersion?: number;
 }
 
 /**
@@ -6542,6 +6655,22 @@ export class EventBus {
    */
   private schemaMatcherCache = new Map<string, RegExp>();
   /**
+   * Versioned schema validators (see `setTopicSchemaVersion`), keyed by
+   * the exact string passed at registration — either a concrete topic
+   * name or a wildcard pattern — to that key's version map. Match
+   * resolution mirrors `schemaRules`: an exact-topic rule set wins over
+   * any pattern; between patterns the earliest-registered rule set wins.
+   * When a topic resolves to a versioned rule set it takes precedence
+   * over the legacy `schemaRules` validator; topics with no versioned
+   * registrations keep the legacy behavior untouched.
+   */
+  private schemaVersionRules = new Map<string, Map<number, SchemaVersionRegistration>>();
+  /**
+   * Compiled matchers for the wildcard entries in `schemaVersionRules`,
+   * kept apart from the other caches for the same reason.
+   */
+  private schemaVersionMatcherCache = new Map<string, RegExp>();
+  /**
    * Per-topic maximum single-message size caps (UTF-8 JSON bytes), keyed by
    * the exact string passed to `setTopicMaxMessageBytes` — either a
    * concrete topic name or a wildcard pattern. Match resolution mirrors the
@@ -6584,6 +6713,12 @@ export class EventBus {
    * never reaches a subscriber queue.
    */
   private totalRejected = 0;
+  /**
+   * Global total of publishes admitted under a superseded-but-graced
+   * schema version (EB-86) — the sum of every topic's
+   * `deprecatedSchemaVersions`.
+   */
+  private totalDeprecatedSchemaVersions = 0;
   /**
    * Idempotent publishes suppressed as duplicates (global total). A
    * duplicate is dropped before admission — no sequence number, no
@@ -8113,6 +8248,115 @@ export class EventBus {
   }
 
   /**
+   * Registers one versioned schema validator for `topicPattern` (EB-86):
+   * a concrete topic name or a wildcard pattern, with the same match
+   * resolution as `setTopicSchema` (exact-topic rule set wins over
+   * patterns; earliest-registered matching pattern wins). `version` must
+   * be a non-negative integer; registering the same version twice for
+   * the same pattern throws `RangeError` — versions are never silently
+   * replaced, re-register under a new version instead.
+   *
+   * A publish carrying `PublishOptions.schemaVersion` is validated
+   * against that version's validator; without it the latest registered
+   * version applies. When a strictly greater version registers, every
+   * older version in the same rule set is marked superseded on the bus
+   * clock and granted this registration's `graceMs` as its migration
+   * window (`opts.graceMs`, default 0): inside the window (boundary
+   * inclusive) the old version is still admitted (counted in
+   * `deprecatedSchemaVersions`), past it — or for a version that was
+   * never registered — the publish is rejected exactly like a schema
+   * failure (counted in `rejectedMessages`, no sequence number
+   * consumed). A throwing validator propagates to the publish caller,
+   * exactly like the legacy `setTopicSchema` validator.
+   *
+   * A topic that resolves to a versioned rule set ignores the legacy
+   * `setTopicSchema` validator; topics with no versioned registrations
+   * keep the legacy behavior. Throws `RangeError` when `topicPattern`
+   * is empty, `version` is not a non-negative integer, `validator` is
+   * not a function, `graceMs` is not a non-negative finite number, or
+   * the version is already registered for the pattern.
+   */
+  setTopicSchemaVersion(
+    topicPattern: string,
+    version: number,
+    validator: SchemaValidator,
+    opts?: TopicSchemaVersionOptions,
+  ): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isInteger(version) || version < 0) {
+      throw new RangeError('schema version must be a non-negative integer');
+    }
+    if (typeof validator !== 'function') {
+      throw new RangeError('validator must be a function');
+    }
+    const graceMs = opts?.graceMs ?? 0;
+    if (!Number.isFinite(graceMs) || graceMs < 0) {
+      throw new RangeError('graceMs must be a non-negative finite number');
+    }
+    let versions = this.schemaVersionRules.get(topicPattern);
+    if (versions === undefined) {
+      versions = new Map();
+      this.schemaVersionRules.set(topicPattern, versions);
+    }
+    if (versions.has(version)) {
+      throw new RangeError(
+        `schema version ${version} is already registered for "${topicPattern}"`,
+      );
+    }
+    const nowMs = this.now();
+    const registration: SchemaVersionRegistration = {
+      version,
+      validator,
+      registeredAt: nowMs,
+      graceMs,
+    };
+    let isLatest = true;
+    for (const [existingVersion, existing] of versions) {
+      if (existingVersion > version) {
+        // A backfilled lower version is born superseded: its migration
+        // window starts now, it never becomes latest.
+        isLatest = false;
+      } else if (existingVersion < version && existing.supersededAt === undefined) {
+        // This registration supersedes every older version in the set:
+        // stamp the supersede moment and grant this registration's
+        // `graceMs` as their migration window — the migration action
+        // declares the window, so the grant always reflects the latest
+        // operator intent.
+        existing.supersededAt = nowMs;
+        existing.graceMs = graceMs;
+      }
+    }
+    if (!isLatest) registration.supersededAt = nowMs;
+    versions.set(version, registration);
+  }
+
+  /**
+   * Removes versioned schema validators previously registered for
+   * `topicPattern`: with `version`, removes just that version (the next
+   * lower version does NOT become un-superseded — migration windows
+   * never reopen); without it, removes the whole rule set, restoring the
+   * legacy `setTopicSchema` behavior for matching topics. Returns true
+   * when anything was removed.
+   */
+  clearTopicSchemaVersion(topicPattern: string, version?: number): boolean {
+    const versions = this.schemaVersionRules.get(topicPattern);
+    if (versions === undefined) return false;
+    if (version === undefined) {
+      this.schemaVersionRules.delete(topicPattern);
+      this.schemaVersionMatcherCache.delete(topicPattern);
+      return true;
+    }
+    const removed = versions.delete(version);
+    if (versions.size === 0) {
+      this.schemaVersionRules.delete(topicPattern);
+      this.schemaVersionMatcherCache.delete(topicPattern);
+    }
+    return removed;
+  }
+
+  /**
    * Caps the JSON byte size of a single publish to topics matching
    * `topicPattern` — an admission gate for oversized payloads. `topicPattern`
    * accepts the same wildcard syntax as `subscribe` (or an exact topic
@@ -8336,6 +8580,39 @@ export class EventBus {
       if (matcher.test(topic)) return validator;
     }
     return undefined;
+  }
+
+  /**
+   * Returns the versioned rule set that applies to `topic`, or
+   * `undefined` when no versioned registration matches. Same precedence
+   * as `schemaForTopic`: an exact-topic rule set wins over patterns, the
+   * earliest-registered matching pattern wins.
+   */
+  private schemaVersionsForTopic(topic: string): Map<number, SchemaVersionRegistration> | undefined {
+    const exact = this.schemaVersionRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, versions] of this.schemaVersionRules) {
+      let matcher = this.schemaVersionMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.schemaVersionMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return versions;
+    }
+    return undefined;
+  }
+
+  /**
+   * Highest registered version in a versioned rule set. Rule sets are
+   * never empty (the last version's removal deletes the set), so this
+   * always finds one.
+   */
+  private latestSchemaVersion(versions: Map<number, SchemaVersionRegistration>): number {
+    let latest = -1;
+    for (const version of versions.keys()) {
+      if (version > latest) latest = version;
+    }
+    return latest;
   }
 
   /**
@@ -12125,6 +12402,7 @@ export class EventBus {
     validateEventTime(opts?.eventTime, 'publish');
     validateCausal(opts?.causal, 'publish');
     validatePublisherId(opts?.publisherId, 'publish');
+    validateSchemaVersion(opts?.schemaVersion, 'publish');
     // Multi-tenant namespace (EB-52): resolve to the concrete
     // `<namespace>/<topic>` before admission — the full pipeline below
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
@@ -12149,6 +12427,7 @@ export class EventBus {
       opts?.eventTime,
       opts?.causal,
       opts?.publisherId,
+      opts?.schemaVersion,
     );
     this.scheduleFlush();
     return accepted;
@@ -12213,6 +12492,7 @@ export class EventBus {
     validateEventTime(opts?.eventTime, 'publishIdempotent');
     validateCausal(opts?.causal, 'publishIdempotent');
     validatePublisherId(opts?.publisherId, 'publishIdempotent');
+    validateSchemaVersion(opts?.schemaVersion, 'publishIdempotent');
     const messageId = opts?.messageId;
     const publisherId = opts?.publisherId;
     // Multi-tenant namespace (EB-52): the `(topic, messageId)` dedup
@@ -12250,6 +12530,7 @@ export class EventBus {
         opts?.eventTime,
         opts?.causal,
         publisherId,
+        opts?.schemaVersion,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -12288,6 +12569,7 @@ export class EventBus {
       opts?.eventTime,
       opts?.causal,
       publisherId,
+      opts?.schemaVersion,
     );
     // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
     // and the per-publisher rate-limit gate lives inside `fanOut` — so a
@@ -12346,6 +12628,7 @@ export class EventBus {
       validateTraceparent(msg.traceparent, 'publishBatch');
       validateEventTime(msg.eventTime, 'publishBatch');
       validatePublisherId(msg.publisherId, 'publishBatch');
+      validateSchemaVersion(msg.schemaVersion, 'publishBatch');
     }
     let accepted = 0;
     for (const msg of messages) {
@@ -12365,6 +12648,7 @@ export class EventBus {
         msg.eventTime,
         undefined, // causal: batch messages carry no causal clock
         msg.publisherId,
+        msg.schemaVersion,
       ).accepted;
     }
     this.scheduleFlush();
@@ -12427,6 +12711,7 @@ export class EventBus {
       validateTraceparent(entry.traceparent, 'publishAtomic');
       validateEventTime(entry.eventTime, 'publishAtomic');
       validatePublisherId(entry.publisherId, 'publishAtomic');
+      validateSchemaVersion(entry.schemaVersion, 'publishAtomic');
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
@@ -12471,6 +12756,7 @@ export class EventBus {
         shadowBudget,
         entries[index].publisherId,
         publisherShadowBudget,
+        entries[index].schemaVersion,
       );
       if (reason !== undefined) {
         // The batch is rejected on the failing entry: count it once against
@@ -12499,7 +12785,14 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { key, traceparent, messageId, eventTime, publisherId } = entries[index];
+      const { key, traceparent, messageId, eventTime, publisherId, schemaVersion } = entries[index];
+      // Deprecated-schema accounting (EB-86): the shadow admission ran
+      // the validator, so the commit only re-resolves the version
+      // bookkeeping — an aborted batch never reaches here, so every
+      // committed deprecated admission is counted exactly once.
+      if (this.isDeprecatedSchemaAdmission(resolvedTopics[index], schemaVersion)) {
+        this.countDeprecatedSchema(resolvedTopics[index]);
+      }
       this.fanOut(
         resolvedTopics[index],
         // The shadow-admission redacted bytes: the commit phase is
@@ -12518,6 +12811,7 @@ export class EventBus {
         eventTime,
         undefined, // causal: atomic entries carry no causal clock
         publisherId,
+        schemaVersion,
       );
     }
     this.scheduleFlush();
@@ -12557,6 +12851,7 @@ export class EventBus {
     shadowBudget: Map<string, number>,
     publisherId: string | undefined,
     publisherShadowBudget: Map<string, number>,
+    schemaVersion: number | undefined,
   ): AtomicRejectReason | undefined {
     // Per-publisher rate limiting (EB-79) is the first shadow gate, as in
     // `fanOut`: the peek/reserve mirrors `takePublisherToken` without
@@ -12579,8 +12874,12 @@ export class EventBus {
     // the atomic batch's shadow admission: an unauthorized entry aborts
     // the batch.
     if (!this.aclAllowsPublish(topic)) return 'acl';
-    const validator = this.schemaForTopic(topic);
-    if (validator !== undefined && !validator(payload, topic)) return 'schema';
+    // Versioned schema validators (EB-86): the shadow admission runs the
+    // pure verdict — no counting here. A rejection is counted once by the
+    // caller; a deprecated admission is counted in the commit phase (see
+    // `isDeprecatedSchemaAdmission`), so an aborted batch never moves the
+    // counter for messages that were never published.
+    if (!this.schemaVerdict(topic, payload, schemaVersion).admitted) return 'schema';
     // Per-message size cap, same position as in `fanOut` (after schema, and
     // before any sequence number or rate-limit budget is touched): an
     // oversized entry aborts the batch like a schema rejection.
@@ -12677,6 +12976,7 @@ export class EventBus {
     // The producer label is validated before any fail-fast gate: a throw
     // must leave zero state behind — no schedule, no counted rejection.
     validatePublisherId(opts?.publisherId, 'publishDelayed');
+    validateSchemaVersion(opts?.schemaVersion, 'publishDelayed');
     const publisherId = opts?.publisherId;
     // Topic aliases (EB-44) resolve before every other gate: the schedule
     // is filed under the resolved topic — the fail-fast ACL/schema checks
@@ -12713,11 +13013,12 @@ export class EventBus {
       return undefined;
     }
     // Fail fast on schema: a rejected payload never becomes a scheduled
-    // delivery — no id, nothing in the heap, nothing on disk. Counted the
-    // same way a `publish` rejection is.
-    const validator = this.schemaForTopic(topic);
-    if (validator !== undefined && !validator(payload, topic)) {
-      this.countSchemaRejection(topic, payload, publisherId);
+    // delivery — no id, nothing in the heap, nothing on disk. Versioned
+    // validators (EB-86) resolve the requested version here; a
+    // deprecated-version admission is counted now (the due-time fan-out
+    // is pre-admitted and never recounts). Counted the same way a
+    // `publish` rejection is.
+    if (!this.applySchemaVerdict(topic, payload, opts?.schemaVersion, publisherId)) {
       return undefined;
     }
     // Fail fast on the per-topic message-size cap: an oversized payload
@@ -13104,6 +13405,98 @@ export class EventBus {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
     this.emitAdmissionRejected(topic, 'schema', payload, publisherId);
+  }
+
+  /**
+   * Pure schema verdict for one publish (EB-86): resolves the versioned
+   * rule set for `topic` (falling back to the legacy validator), selects
+   * the requested version (`schemaVersion`, default latest), and runs its
+   * validator. No counting here — callers count. A throwing validator
+   * propagates, exactly like the legacy path.
+   *
+   * Returns `{ admitted, deprecated }`: `deprecated` is true only when
+   * the publish was admitted under a superseded-but-graced version — the
+   * migrate-your-producers signal.
+   */
+  private schemaVerdict(
+    topic: string,
+    payload: unknown,
+    schemaVersion: number | undefined,
+  ): { admitted: boolean; deprecated: boolean } {
+    const versions = this.schemaVersionsForTopic(topic);
+    if (versions === undefined) {
+      const legacy = this.schemaForTopic(topic);
+      return { admitted: legacy === undefined || legacy(payload, topic), deprecated: false };
+    }
+    const latest = this.latestSchemaVersion(versions);
+    const requested = schemaVersion ?? latest;
+    const registration = versions.get(requested);
+    if (registration === undefined) return { admitted: false, deprecated: false };
+    if (requested === latest) {
+      return { admitted: registration.validator(payload, topic), deprecated: false };
+    }
+    // A superseded version: admissible only inside its grace window,
+    // anchored at the moment a greater version registered it away (the
+    // window boundary is inclusive, the WR-20 convention).
+    const supersededAt = registration.supersededAt ?? registration.registeredAt;
+    if (this.now() - supersededAt > registration.graceMs) {
+      return { admitted: false, deprecated: false };
+    }
+    return { admitted: registration.validator(payload, topic), deprecated: true };
+  }
+
+  /**
+   * Applies the schema verdict with counting: rejections go through
+   * `countSchemaRejection` (the `rejectedMessages` counter + the
+   * `onAdmissionRejected` hook with reason `'schema'`), admissions under
+   * a superseded-but-graced version additionally bump
+   * `deprecatedSchemaVersions`. Returns true when the publish is
+   * admitted.
+   */
+  private applySchemaVerdict(
+    topic: string,
+    payload: unknown,
+    schemaVersion: number | undefined,
+    publisherId?: string,
+  ): boolean {
+    const verdict = this.schemaVerdict(topic, payload, schemaVersion);
+    if (!verdict.admitted) {
+      this.countSchemaRejection(topic, payload, publisherId);
+      return false;
+    }
+    if (verdict.deprecated) this.countDeprecatedSchema(topic);
+    return true;
+  }
+
+  /**
+   * Pure deprecated-admission check for the `publishAtomic` commit phase:
+   * the shadow admission already ran the validator, so this re-resolves
+   * only the version bookkeeping (never re-runs the validator) to decide
+   * whether the committed entry deserves the `deprecatedSchemaVersions`
+   * count. Exactly-once with `applySchemaVerdict` — the commit phase is
+   * the only place an atomic entry is counted.
+   */
+  private isDeprecatedSchemaAdmission(topic: string, schemaVersion: number | undefined): boolean {
+    const versions = this.schemaVersionsForTopic(topic);
+    if (versions === undefined || schemaVersion === undefined) return false;
+    const latest = this.latestSchemaVersion(versions);
+    if (schemaVersion >= latest) return false;
+    const registration = versions.get(schemaVersion);
+    if (registration === undefined) return false;
+    const supersededAt = registration.supersededAt ?? registration.registeredAt;
+    return this.now() - supersededAt <= registration.graceMs;
+  }
+
+  /**
+   * Counts one publish admitted under a superseded-but-graced schema
+   * version (EB-86) against the topic and the global total. Unlike a
+   * rejection this is a successful admission — the message was validated
+   * and published — so it moves no other counter and fires no hook; it is
+   * the operator signal that some producers still speak an old schema.
+   */
+  private countDeprecatedSchema(topic: string): void {
+    this.statsFor(topic).deprecatedSchemaVersions += 1;
+    this.totalDeprecatedSchemaVersions += 1;
   }
 
   /**
@@ -14545,6 +14938,11 @@ export class EventBus {
     // the publish entry points validate, `fanOut` never does. Anonymous
     // inbound (bridge, cluster) and internal replays pass `undefined`.
     publisherId?: string,
+    // Already-validated schema version (see `validateSchemaVersion`):
+    // the publish entry points validate, `fanOut` never does. Internal
+    // paths (bridge, forward, route, diagnostic, delayed fan-out) pass
+    // `undefined` — admission runs against the latest registered version.
+    schemaVersion?: number,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -14617,9 +15015,14 @@ export class EventBus {
         this.countAclDenied(topic, payload, publisherId);
         return { matched: 0, accepted: 0, admitted: false };
       }
-      const validator = this.schemaForTopic(topic);
-      if (validator !== undefined && !validator(payload, topic)) {
-        this.countSchemaRejection(topic, payload, publisherId);
+      // Publish-side schema validation runs before admission: a rejected
+      // payload never becomes a message — no sequence number is consumed
+      // (subscribers see no gap), the durable log never sees it, and it
+      // does not burn rate-limit budget. Versioned validators (EB-86)
+      // resolve the requested version here; admissions under a
+      // superseded-but-graced version are counted in
+      // `deprecatedSchemaVersions`.
+      if (!this.applySchemaVerdict(topic, payload, schemaVersion, publisherId)) {
         return { matched: 0, accepted: 0, admitted: false };
       }
       // Per-topic maximum message size runs after schema validation and
@@ -15431,6 +15834,7 @@ export class EventBus {
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
       rejectedMessages: this.totalRejected,
+      deprecatedSchemaVersions: this.totalDeprecatedSchemaVersions,
       unregisteredTopicPublishes: this.unregisteredTopicPublishes,
       lateMessages: this.totalLateMessages,
       authzDenied: this.totalAuthzDenied,
@@ -15545,6 +15949,25 @@ export class EventBus {
         }
         return { rule, maxSubscribers, currentSubscribers };
       }),
+      // Versioned schema registry (EB-86): one row per registration key
+      // (concrete topic or pattern, in registration order), versions
+      // ascending, validators never exposed — only the metadata. Empty
+      // when no versioned schema is registered.
+      topicSchemas: [...this.schemaVersionRules.entries()].map(([rule, versions]) => {
+        const latest = this.latestSchemaVersion(versions);
+        return {
+          rule,
+          latest,
+          versions: [...versions.values()]
+            .sort((a, b) => a.version - b.version)
+            .map((r) => ({
+              version: r.version,
+              registeredAt: r.registeredAt,
+              graceMs: r.graceMs,
+              ...(r.supersededAt === undefined ? {} : { supersededAt: r.supersededAt }),
+            })),
+        };
+      }),
       topics: [...this.topicStats.entries()].map(([topic, stats]) => ({
         topic,
         subscriberCount: stats.subscriberCount,
@@ -15555,6 +15978,7 @@ export class EventBus {
         rateLimitedMessages: stats.rateLimitedMessages,
         publisherRateLimited: stats.publisherRateLimited,
         rejectedMessages: stats.rejectedMessages,
+        deprecatedSchemaVersions: stats.deprecatedSchemaVersions,
         lateMessages: stats.lateMessages,
         // Resolved with the currently configured allowed lateness, so a
         // reconfigured `setTopicAllowedLateness` is reflected here

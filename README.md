@@ -262,7 +262,17 @@ library.
   compacted away cannot be recovered by time. `resumeFromSeq` without
   `durableLogDir` throws instead of silently replaying nothing. Hot topics
   compact automatically (`durableLogMaxEntriesPerTopic`, default 10000,
-  amortized rewrite at 2x). Corrupt log lines are skipped and counted
+  amortized rewrite at 2x). Opt-in time-based retention
+  (`durableLogMaxAgeMs`, EB-85): records older than `now - maxAgeMs` (bus
+  clock) are evicted when their topic compacts, dual-bounded with the
+  count limit — a compact keeps records satisfying both. Delayed-delivery
+  schedule records (`seq: 0`) are timer intents and never age out, so
+  pending timers survive; evictions are counted in
+  `getStats().durableLog.retentionEvicted`. Change the bound at runtime
+  with `setDurableLogMaxAgeMs(ms, actor?)` (applies to the root log and
+  every namespace child log); the change is recorded in the subscription
+  audit log as `retention_updated` with `{ from, to }`. Corrupt log lines
+  are skipped and counted
   (`getStats().durableLog.corruptLines`), never fatal; payloads
   `JSON.stringify` cannot represent are delivered live but skipped by the
   log. Opt-in Kafka-style keyed compaction (`durableLogKeyCompaction`):
@@ -576,6 +586,25 @@ library.
   publish caller — validation runs before any state is mutated for that
   message. `clearTopicSchema` removes a rule. Empty patterns and
   non-function validators throw `RangeError`.
+  **Versioned schemas** (`setTopicSchemaVersion(pattern, version,
+  validator, { graceMs })`, EB-86): register multiple validators per
+  topic/pattern for schema evolution. `publish` (and batch/atomic/
+  delayed/idempotent publishes) may carry `PublishOptions.schemaVersion`;
+  absent means the latest registered version. When a greater version
+  registers, older versions are marked superseded and granted this
+  registration's `graceMs` as their migration window (default 0 — strict):
+  inside the window (boundary inclusive) an old-version publish is still
+  validated and admitted, counted in `deprecatedSchemaVersions`
+  (per-topic and global) — the migrate-your-producers signal; past the
+  window, or for a never-registered version, the publish is rejected
+  exactly like a schema failure (`rejectedMessages`, no seq consumed).
+  A topic with versioned registrations ignores the legacy
+  `setTopicSchema` validator; `clearTopicSchemaVersion(pattern,
+  version?)` removes one version or the whole set. `getStats().topicSchemas`
+  exposes the registry (rule, latest, per-version `registeredAt` /
+  `graceMs` / `supersededAt`) — validators are functions and never leave
+  the process. Duplicate versions, negative/non-integer versions, and
+  bad `graceMs` throw `RangeError`.
 - **Per-topic max message size** (in `src/bus.ts`, via
   `setTopicMaxMessageBytes(pattern, maxBytes)`): an admission gate for
   oversized payloads (backend/real-time systems). A publish whose payload
@@ -2152,7 +2181,8 @@ Details:
 - **Detail payloads** — `update_pattern` carries `{ from }`;
   `rebalance` carries `{ trigger, memberId, members }`;
   topic-registry changes carry the registration metadata;
-  `signature_verification_failed` carries `{ seq, kid? }`.
+  `signature_verification_failed` carries `{ seq, kid? }`;
+  `retention_updated` carries `{ from, to }` (null when unset).
 
 ## Prometheus metrics
 
@@ -2179,6 +2209,7 @@ Exported series:
 | `eventbus_expired_messages_total` | counter | `expiredMessages` — TTL discards |
 | `eventbus_throttled_messages_total` | counter | `throttledMessages` — publish-side adaptive throttle sheds |
 | `eventbus_rejected_messages_total` | counter | `rejectedMessages` — schema rejections |
+| `eventbus_deprecated_schema_messages_total` | counter | `deprecatedSchemaVersions` — publishes admitted under a superseded-but-graced schema version (EB-86) |
 | `eventbus_late_messages_total` | counter | `lateMessages` — admitted messages older than their topic's event-time watermark (EB-59; still delivered) |
 | `eventbus_rate_limited_messages_total` | counter | `rateLimitedMessages` — per-topic rate-limit sheds |
 | `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |

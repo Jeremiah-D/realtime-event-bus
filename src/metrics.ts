@@ -23,6 +23,9 @@
  * - `eventbus_rejected_messages_total`: publishes rejected by admission
  *   gates before admission (schema validation, broker ACL, per-topic
  *   message-size caps, expired migration aliases).
+ * - `eventbus_deprecated_schema_messages_total`: publishes admitted
+ *   under a superseded-but-graced schema version (EB-86) — successful
+ *   admissions, the migrate-your-producers signal.
  * - `eventbus_late_messages_total`: messages admitted with a business
  *   event time older than their topic's event-time watermark (EB-59).
  * - `eventbus_rate_limited_messages_total`: messages shed by publish-side
@@ -242,6 +245,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_rejected_messages_total',
     'Total publishes rejected by admission gates before admission (schema validation, broker ACL, per-topic message-size caps, expired migration aliases).',
     stats.rejectedMessages,
+  );
+  counter(
+    'eventbus_deprecated_schema_messages_total',
+    'Total publishes admitted under a superseded-but-graced schema version (EB-86).',
+    stats.deprecatedSchemaVersions ?? 0,
   );
   counter(
     'eventbus_unregistered_topic_publishes_total',
