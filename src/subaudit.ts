@@ -56,7 +56,9 @@ export type SubscriptionAuditAction =
   | 'topic_resumed'
   | 'delayed_cancelled'
   | 'partition_rule_set'
-  | 'partition_rule_cleared';
+  | 'partition_rule_cleared'
+  | 'config_applied'
+  | 'config_rolled_back';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -76,6 +78,11 @@ export type SubscriptionAuditAction =
  * - `topic_paused`: `{ mode: 'shed'|'queue' }` (the `pattern` field carries the rule key)
  * - `topic_resumed`: `{ mode: 'shed'|'queue', drainedMessages: <count> }` (the `pattern` field carries the rule key)
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
+ * - `config_applied`: `{ applied: <string[]> }` — paths applied by
+ *   `applyConfig` (EB-91), in application order; empty on a no-op
+ * - `config_rolled_back`: `{ failedPath: <string>, applied: <string[]>,
+ *   rolledBack: <boolean> }` — a failed `applyConfig` (EB-91) restored
+ *   the pre-apply state after `failedPath` threw
  */
 export interface SubscriptionAuditEvent {
   v: 1;

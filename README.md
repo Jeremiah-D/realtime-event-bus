@@ -2402,6 +2402,60 @@ How it works:
   decision: delayed schedules, pause-buffered messages, and bridge/cluster
   ingress fan out as ordinary (partition-0) publishes.
 
+## Declarative configuration snapshots
+
+`exportBusConfig()` / `applyConfig(snapshot, { dryRun? })` /
+`detectConfigDrift([baseline])` (`src/config.ts`, `src/bus.ts`, EB-91)
+treat the bus's configuration as data: ACL rules, namespace
+registrations, per-publisher rate limits, durable-log retention, and the
+per-topic rule tables (TTL, retained, publish rate limit, max
+subscribers, allowed lateness, compression, signing-key metadata, alias,
+route, partitions) export as one JSON-safe snapshot (`v: 1`).
+
+```ts
+const snapshot = bus.exportBusConfig();
+JSON.stringify(snapshot); // check into version control, ship to another process
+
+// Preview a desired state without touching anything:
+const { changes } = bus.applyConfig(desired, { dryRun: true });
+
+// Apply it: every change goes through the same setters the imperative
+// API uses, so all validation still applies.
+const { applied } = bus.applyConfig(desired);
+
+// Did the runtime drift since the last apply?
+const drift = bus.detectConfigDrift(); // [{ path, expected, actual }]
+```
+
+How it works:
+
+- **Diff, then apply** — the snapshot is validated fail-fast
+  (`TypeError`/`RangeError` on malformed input, before anything is
+  mutated), diffed against the live configuration, and each granular
+  change (`topicRules["market.**"].ttlMs`, `namespaces["t1"]`, `acl`, …)
+  is applied through the existing setters.
+- **Atomic rollback** — if any change throws mid-apply, every
+  already-applied change is rolled back to the pre-apply state and a
+  `ConfigApplyError` is thrown carrying the failed path, the applied
+  paths, and whether the rollback succeeded. The bus is never left
+  half-configured. Applies and rollbacks are audited as
+  `config_applied` / `config_rolled_back` in the subscription audit log.
+- **Fail-closed restores** — a snapshot never carries enough to rebuild
+  everything, so changing these via `applyConfig` is refused rather
+  than guessed: signing keys (snapshots carry key ids only, never
+  secrets — restore with `setTopicSigningKey`), compression dictionaries
+  (id only — re-register bytes with `setTopicCompression`), and routes
+  whose live registration carries a predicate. Exporting is always safe:
+  key material is never exported.
+- **Drift detection** — `applyConfig` stores the applied snapshot as
+  the baseline; `detectConfigDrift()` diffs live state against it
+  (pass an explicit snapshot to compare against any other baseline).
+  Without a baseline it throws — there is nothing to compare against.
+- **Scope note** — schema validators and route predicates are
+  functions and cannot be serialized; per-subscriber runtime state
+  (queues, health, offsets) is operational state, not configuration.
+  Neither is snapshotted.
+
 ## Subscription lifecycle audit log
 
 Every subscription change is recorded in an append-only audit log —

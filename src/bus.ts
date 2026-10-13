@@ -55,6 +55,23 @@ import {
 import { DurableTopicLog, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import {
+  BUS_CONFIG_SNAPSHOT_VERSION,
+  ConfigApplyError,
+  assertValidSnapshot,
+  cloneSnapshot,
+  configValueEqual,
+  diffConfigSnapshots,
+  type BusConfigSnapshot,
+  type ConfigApplyResult,
+  type ConfigChange,
+  type ConfigDrift,
+  type NamespaceConfig,
+  type TopicCompressionConfig,
+  type TopicRateLimitConfig,
+  type TopicRuleConfig,
+  type TopicSigningKeyConfig,
+} from './config.ts';
+import {
   SubscriptionAuditLog,
   assertValidActor,
   type SubscriptionAuditEvent,
@@ -156,6 +173,20 @@ export type {
 } from './trace.ts';
 export type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 export { AesGcmEncryptor, NoopEncryptor, isEncryptedPayload, randomAes256Key } from './encrypt.ts';
+export type {
+  BusConfigSnapshot,
+  ConfigApplyResult,
+  ConfigChange,
+  ConfigDrift,
+  NamespaceConfig,
+  TopicAliasConfig,
+  TopicCompressionConfig,
+  TopicRateLimitConfig,
+  TopicRouteConfig,
+  TopicRuleConfig,
+  TopicSigningKeyConfig,
+} from './config.ts';
+export { BUS_CONFIG_SNAPSHOT_VERSION, ConfigApplyError } from './config.ts';
 export type {
   MessageSignature,
   StoredSigningKey,
@@ -19256,4 +19287,385 @@ export class EventBus {
   private static gapKey(topic: string, partition: number): string {
     return `${topic}\0${partition}`;
   }
+
+  // ------------------------------------------------------------------
+  // Declarative configuration snapshots (EB-91)
+  // ------------------------------------------------------------------
+
+  /**
+   * The last snapshot successfully applied via `applyConfig` — the
+   * baseline `detectConfigDrift()` compares against when called without
+   * an explicit snapshot. A deep clone, so later caller-side mutation
+   * of the applied snapshot cannot move the baseline.
+   */
+  private lastAppliedConfig: BusConfigSnapshot | undefined;
+
+  /**
+   * Exports the bus's declarative configuration as a JSON-safe snapshot
+   * (EB-91): ACL rules, namespace registrations, per-publisher rate
+   * limits, durable-log retention, and the per-topic rule tables (TTL,
+   * retained, rate limit, max subscribers, allowed lateness, compression,
+   * signing-key *metadata*, alias, route, partitions).
+   *
+   * Security: the snapshot never contains key material — signing keys
+   * export as `{ keyIds, graceMs }` only, and compression dictionaries
+   * export as an id only. Route predicates and schema validators are
+   * functions and are not exported (see `applyConfig` for the
+   * fail-closed restore rules).
+   */
+  exportBusConfig(): BusConfigSnapshot {
+    const patterns = new Set<string>();
+    for (const table of [
+      this.ttlRules,
+      this.retainedRules,
+      this.partitionRules,
+      this.signingRules,
+      this.rateLimitRules,
+      this.subscriberLimitRules,
+      this.allowedLatenessRules,
+      this.topicAliases,
+      this.topicRoutes,
+      this.compressionRules,
+    ]) {
+      for (const key of table.keys()) patterns.add(key);
+    }
+    const topicRules: Record<string, TopicRuleConfig> = {};
+    for (const pattern of [...patterns].sort()) {
+      const rule: TopicRuleConfig = {};
+      const ttlMs = this.ttlRules.get(pattern);
+      if (ttlMs !== undefined) rule.ttlMs = ttlMs;
+      const retained = this.retainedRules.get(pattern);
+      if (retained !== undefined) rule.retained = retained;
+      const rateLimit = this.rateLimitRules.get(pattern);
+      if (rateLimit !== undefined) {
+        rule.rateLimit = { messagesPerSec: rateLimit.messagesPerSec, burst: rateLimit.burst };
+      }
+      const maxSubscribers = this.subscriberLimitRules.get(pattern);
+      if (maxSubscribers !== undefined) rule.maxSubscribers = maxSubscribers;
+      const allowedLatenessMs = this.allowedLatenessRules.get(pattern);
+      if (allowedLatenessMs !== undefined) rule.allowedLatenessMs = allowedLatenessMs;
+      const compression = this.compressionRules.get(pattern);
+      if (compression !== undefined) {
+        rule.compression = {
+          thresholdBytes: compression.thresholdBytes,
+          level: compression.level,
+          ...(compression.dictionaryId === undefined ? {} : { dictionaryId: compression.dictionaryId }),
+        };
+      }
+      const signing = this.signingRules.get(pattern);
+      if (signing !== undefined) {
+        // Metadata only — the secret bytes are never exported.
+        rule.signingKeys = {
+          keyIds: signing.keys.map((k) => k.kid),
+          graceMs: signing.graceMs,
+        };
+      }
+      const alias = this.topicAliases.get(pattern);
+      if (alias !== undefined) {
+        rule.alias = {
+          newTopic: alias.newTopic,
+          ...(alias.expiresAt === undefined ? {} : { expiresAt: alias.expiresAt }),
+        };
+      }
+      const route = this.topicRoutes.get(pattern);
+      if (route !== undefined) {
+        // A predicate-bearing route is config-opaque: the predicate is a
+        // function and cannot be serialized. The dst is still exported so
+        // drift detection sees dst changes; `applyConfig` refuses to
+        // touch such routes (fail-closed).
+        rule.route = { dst: route.dst };
+      }
+      const partitions = this.partitionRules.get(pattern);
+      if (partitions !== undefined) rule.partitions = partitions;
+      topicRules[pattern] = rule;
+    }
+    const namespaces: Record<string, NamespaceConfig> = {};
+    for (const [prefix, ns] of [...this.namespaces.entries()].sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    )) {
+      namespaces[prefix] = { allowPublish: ns.allowPublish, allowSubscribe: ns.allowSubscribe };
+    }
+    const publisherRateLimits: Record<string, TopicRateLimitConfig> = {};
+    for (const [id, rule] of [...this.publisherRateLimitRules.entries()].sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    )) {
+      publisherRateLimits[id] = { messagesPerSec: rule.messagesPerSec, burst: rule.burst };
+    }
+    return {
+      v: BUS_CONFIG_SNAPSHOT_VERSION,
+      exportedAt: this.now(),
+      acl: this.getAclRules(),
+      namespaces,
+      publisherRateLimits,
+      ...(this.durableLogMaxAgeMs === undefined ? {} : { durableLogMaxAgeMs: this.durableLogMaxAgeMs }),
+      topicRules,
+    };
+  }
+
+  /**
+   * Applies a declarative configuration snapshot (EB-91): diffs the
+   * snapshot against the live configuration and applies each change
+   * through the same setters the imperative API uses, so every
+   * validation rule (`RangeError` on bad values) applies unchanged.
+   *
+   * Semantics:
+   * - `{ dryRun: true }` computes the change list without mutating
+   *   anything and without auditing — a preview for operators.
+   * - On success the applied paths are returned in application order
+   *   and audited as `config_applied`; the snapshot becomes the new
+   *   drift-detection baseline.
+   * - On failure the first throwing change aborts the apply and every
+   *   already-applied change is rolled back to the pre-apply state
+   *   (audited as `config_rolled_back`); a `ConfigApplyError` is thrown
+   *   carrying the failed path, the applied paths, and whether the
+   *   rollback succeeded. The bus is never left half-configured.
+   *
+   * Fail-closed restores (a snapshot never carries enough to rebuild
+   * these, so changing them via `applyConfig` is refused rather than
+   * guessed):
+   * - signing keys: snapshots carry key ids only, never secrets —
+   *   restore keys with `setTopicSigningKey`;
+   * - compression dictionaries: snapshots carry the dictionary id only —
+   *   re-register bytes with `setTopicCompression`;
+   * - routes whose live registration carries a predicate.
+   */
+  applyConfig(snapshot: BusConfigSnapshot, opts?: { dryRun?: boolean }): ConfigApplyResult {
+    assertValidSnapshot(snapshot);
+    const before = this.exportBusConfig();
+    const changes = diffConfigSnapshots(before, snapshot);
+    if (opts?.dryRun === true) {
+      return { applied: [], dryRun: true, changes };
+    }
+    const applied: string[] = [];
+    let failedChange: ConfigChange | undefined;
+    try {
+      for (const change of changes) {
+        failedChange = change;
+        this.applyConfigChange(change);
+        applied.push(change.path);
+      }
+    } catch (cause) {
+      const failedPath = failedChange?.path ?? '<unknown>';
+      let rolledBack = false;
+      try {
+        const rollbackChanges = diffConfigSnapshots(this.exportBusConfig(), before);
+        for (const change of rollbackChanges) this.applyConfigChange(change);
+        rolledBack = true;
+      } catch {
+        rolledBack = false;
+      }
+      this.auditSubscription({
+        action: 'config_rolled_back',
+        actor: 'config-apply',
+        detail: { failedPath, applied, rolledBack },
+      });
+      throw new ConfigApplyError(failedPath, cause, applied, rolledBack);
+    }
+    this.lastAppliedConfig = cloneSnapshot(snapshot);
+    this.auditSubscription({
+      action: 'config_applied',
+      actor: 'config-apply',
+      detail: { applied },
+    });
+    return { applied, dryRun: false };
+  }
+
+  /**
+   * Detects configuration drift (EB-91): diffs the live configuration
+   * against a baseline snapshot and returns one entry per drifted
+   * setting (`expected` = baseline, `actual` = live). Without an
+   * explicit snapshot the baseline is the last successfully applied
+   * snapshot; when neither exists a plain `Error` is thrown — there is
+   * nothing to compare against.
+   */
+  detectConfigDrift(baseline?: BusConfigSnapshot): ConfigDrift[] {
+    const base = baseline ?? this.lastAppliedConfig;
+    if (base === undefined) {
+      throw new Error(
+        'detectConfigDrift: no baseline snapshot — pass one explicitly or run applyConfig() first',
+      );
+    }
+    assertValidSnapshot(base);
+    const current = this.exportBusConfig();
+    return diffConfigSnapshots(base, current).map((c) => ({
+      path: c.path,
+      expected: c.before,
+      actual: c.after,
+    }));
+  }
+
+  /**
+   * Applies one granular config change through the imperative setters.
+   * Used for both forward applies and rollbacks — the rollback path
+   * only ever sees changes diffed against a previously-live snapshot,
+   * so the fail-closed branches below cannot trigger on it.
+   */
+  private applyConfigChange(change: ConfigChange): void {
+    const { kind, path, after } = change;
+    switch (kind) {
+      case 'acl': {
+        this.setAclRules(after as BusConfigSnapshot['acl']);
+        return;
+      }
+      case 'retention': {
+        this.setDurableLogMaxAgeMs(after as number | undefined, 'config-apply');
+        return;
+      }
+      case 'namespace': {
+        const prefix = bracketKeyOf(path);
+        if (after === undefined) {
+          this.deleteNamespace(prefix);
+          return;
+        }
+        const cfg = after as NamespaceConfig;
+        // `createNamespace` rejects duplicates, so a modify is
+        // delete-then-create. `deleteNamespace` refuses to delete a
+        // namespace with live subscribers — that surfaces here as a
+        // failed change and triggers the apply-wide rollback.
+        if (this.namespaces.has(prefix)) this.deleteNamespace(prefix);
+        this.createNamespace(prefix, {
+          allowPublish: cfg.allowPublish,
+          allowSubscribe: cfg.allowSubscribe,
+        });
+        return;
+      }
+      case 'publisherRateLimit': {
+        const id = bracketKeyOf(path);
+        if (after === undefined) {
+          this.clearPublisherRateLimit(id);
+          return;
+        }
+        const rule = after as TopicRateLimitConfig;
+        this.setPublisherRateLimit(id, { messagesPerSec: rule.messagesPerSec, burst: rule.burst });
+        return;
+      }
+      case 'topicRule': {
+        const { pattern, ruleKey } = topicRulePathOf(path);
+        this.applyTopicRuleChange(pattern, ruleKey, change.before, after);
+        return;
+      }
+    }
+  }
+
+  /**
+   * Applies one per-topic rule change. The fail-closed branches
+   * (signing keys, compression dictionaries, predicate routes) refuse
+   * to reconstruct unrestorable state from a snapshot rather than
+   * guessing — the operator restores those imperatively.
+   */
+  private applyTopicRuleChange(
+    pattern: string,
+    ruleKey: string,
+    before: unknown,
+    after: unknown,
+  ): void {
+    switch (ruleKey) {
+      case 'ttlMs':
+        if (after === undefined) this.clearTopicTtl(pattern);
+        else this.setTopicTtl(pattern, after as number);
+        return;
+      case 'retained':
+        if (after === undefined) this.clearTopicRetained(pattern);
+        else this.setTopicRetained(pattern, after as boolean);
+        return;
+      case 'rateLimit':
+        if (after === undefined) this.clearTopicRateLimit(pattern);
+        else {
+          const rule = after as TopicRateLimitConfig;
+          this.setTopicRateLimit(pattern, rule.messagesPerSec, { burst: rule.burst });
+        }
+        return;
+      case 'maxSubscribers':
+        if (after === undefined) this.clearTopicMaxSubscribers(pattern);
+        else this.setTopicMaxSubscribers(pattern, after as number);
+        return;
+      case 'allowedLatenessMs':
+        if (after === undefined) this.clearTopicAllowedLateness(pattern);
+        else this.setTopicAllowedLateness(pattern, after as number);
+        return;
+      case 'partitions':
+        if (after === undefined) this.clearTopicPartitions(pattern);
+        else this.setTopicPartitions(pattern, after as number);
+        return;
+      case 'compression': {
+        const a = after as TopicCompressionConfig | undefined;
+        if (a === undefined) {
+          this.clearTopicCompression(pattern);
+          return;
+        }
+        if (a.dictionaryId !== undefined) {
+          throw new Error(
+            `cannot apply compression rule for pattern "${pattern}" from a snapshot: ` +
+              'snapshots carry the dictionary id only, never the dictionary bytes — ' +
+              're-register with setTopicCompression',
+          );
+        }
+        this.setTopicCompression(pattern, { thresholdBytes: a.thresholdBytes, level: a.level });
+        return;
+      }
+      case 'signingKeys': {
+        if (!configValueEqual(before, after)) {
+          throw new Error(
+            `cannot apply signing keys for pattern "${pattern}" from a snapshot: ` +
+              'snapshots never carry key material — restore keys with setTopicSigningKey',
+          );
+        }
+        return;
+      }
+      case 'alias': {
+        const a = after as TopicAliasConfig | undefined;
+        if (a === undefined) {
+          this.clearTopicAlias(pattern);
+          return;
+        }
+        // `expiresAt` is absolute bus-clock time; the setter takes a
+        // relative TTL. An already-expired alias is equivalent to no
+        // alias — clear it instead of registering a stillborn rule.
+        const ttlMs = a.expiresAt === undefined ? undefined : a.expiresAt - this.now();
+        if (ttlMs !== undefined && ttlMs <= 0) {
+          this.clearTopicAlias(pattern);
+          return;
+        }
+        this.setTopicAlias(pattern, a.newTopic, ttlMs === undefined ? undefined : { ttlMs });
+        return;
+      }
+      case 'route': {
+        const live = this.topicRoutes.get(pattern);
+        if (live?.predicate !== undefined) {
+          throw new Error(
+            `cannot apply route for "${pattern}" from a snapshot: ` +
+              'the live route carries a predicate, which snapshots cannot represent — ' +
+              'restore it with setTopicRoute',
+          );
+        }
+        const a = after as TopicRouteConfig | undefined;
+        if (a === undefined) {
+          this.clearTopicRoute(pattern);
+          return;
+        }
+        this.setTopicRoute(pattern, a.dst);
+        return;
+      }
+      default:
+        throw new Error(`unknown topic rule key in config path: ${ruleKey}`);
+    }
+  }
+}
+
+/**
+ * Extracts the quoted key from a `section["key"]` config path.
+ */
+function bracketKeyOf(path: string): string {
+  const match = /^[a-zA-Z]+\["((?:[^"\\]|\\.)*)"\]$/.exec(path);
+  if (match === null) throw new Error(`malformed config path: ${path}`);
+  return JSON.parse(`"${match[1]}"`) as string;
+}
+
+/**
+ * Splits a `topicRules["<pattern>"].<ruleKey>` config path.
+ */
+function topicRulePathOf(path: string): { pattern: string; ruleKey: string } {
+  const match = /^topicRules\["((?:[^"\\]|\\.)*)"\]\.([A-Za-z]+)$/.exec(path);
+  if (match === null) throw new Error(`malformed config path: ${path}`);
+  return { pattern: JSON.parse(`"${match[1]}"`) as string, ruleKey: match[2] };
 }
