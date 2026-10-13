@@ -13708,6 +13708,56 @@ export class EventBus {
   }
 
   /**
+   * Cancels every pending delayed delivery scheduled for one topic or
+   * topic pattern (EB-89): the messages will never fan out. Returns
+   * `{ cancelled, delayIds }` — the number of schedules cancelled and
+   * their ids in schedule order.
+   *
+   * Only pending, not-yet-fanned-out schedules are cancelled: entries
+   * that already fanned out, already expired, or were already cancelled
+   * are not counted. Topic matching takes an exact concrete topic for a
+   * direct match, or a wildcard pattern (the same syntax as `subscribe`)
+   * that expands to every concrete topic with pending schedules it
+   * matches.
+   *
+   * Each cancellation reuses `cancelDelayed`, so every cancelled schedule
+   * is tombstoned to the durable log (the EB-24 convention) — a restart
+   * never resurrects them — and keyed schedules release their subscribers'
+   * per-key expectations. An empty result returns `{ cancelled: 0,
+   * delayIds: [] }` — never a throw. Recorded in the subscription audit
+   * log as `delayed_cancelled` (`{ cancelled, delayIds, topicPattern }`).
+   *
+   * Throws `TypeError` when `topicPattern` is not a string, `RangeError`
+   * when it is empty.
+   */
+  cancelDelayedByTopic(topicPattern: string): { cancelled: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('cancelDelayedByTopic: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('cancelDelayedByTopic: topicPattern must be a non-empty string');
+    }
+    const matcher = compilePattern(topicPattern);
+    const delayIds: string[] = [];
+    // `delayedById` holds exactly the pending schedules, in schedule
+    // order; deleting during iteration is safe on a Map. `cancelDelayed`
+    // can only return false for an id that left the pending set, which
+    // cannot happen mid-iteration here — the guard is defensive.
+    for (const [delayId, entry] of this.delayedById) {
+      if (entry.topic === topicPattern || matcher.test(entry.topic)) {
+        if (this.cancelDelayed(delayId)) delayIds.push(delayId);
+      }
+    }
+    this.auditSubscription({
+      action: 'delayed_cancelled',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { cancelled: delayIds.length, delayIds, topicPattern },
+    });
+    return { cancelled: delayIds.length, delayIds };
+  }
+
+  /**
    * Fans out every delayed entry whose due time has arrived (bus clock),
    * in due-time order. Due entries go through the normal `fanOut` path —
    * sequence stamping, rate-limit budget, compression, durable log (whose

@@ -1868,6 +1868,12 @@ npm test
   `topic_paused`/`topic_resumed` subaudit events, Prometheus pause series,
   argument validation, and restart recovery of the pause buffer with
   tombstones.
+- `test/cancel-delayed-topic.test.ts` — bulk delayed-delivery
+  cancellation by topic (EB-89): exact-topic and wildcard-pattern
+  expansion, already-fanned-out/expired/cancelled exclusion, empty result
+  never throwing, tombstone persistence across restart, keyed-schedule
+  per-key release, `delayed_cancelled` subaudit details, and argument
+  validation.
 
 ## Benchmark
 
@@ -2311,6 +2317,38 @@ How it works:
   `eventbus_paused_topics` (gauge). Pauses and resumes are recorded in
   the subscription audit log as `topic_paused` (`{ mode }`) and
   `topic_resumed` (`{ mode, drainedMessages }`).
+
+## Cancelling delayed deliveries by topic
+
+`cancelDelayedByTopic(topicPattern)` (`src/bus.ts`, EB-89) cancels every
+pending delayed delivery scheduled for one topic — or for every concrete
+topic matching a wildcard pattern — in a single call:
+
+```ts
+const eu = bus.publishDelayed('orders.eu', order, { delayMs: 60_000 });
+const us = bus.publishDelayed('orders.us', order, { delayMs: 60_000 });
+bus.cancelDelayedByTopic('orders.*'); // -> { cancelled: 2, delayIds: [eu, us] }
+```
+
+How it works:
+
+- **Scope** — only pending, not-yet-fanned-out schedules are cancelled:
+  entries that already fanned out, expired, or were individually cancelled
+  are not counted. An exact topic matches directly; a pattern expands to
+  every concrete topic with pending schedules that it matches (the same
+  wildcard syntax as `subscribe`).
+- **Result** — `{ cancelled, delayIds }`: the count and the cancelled
+  schedule ids in schedule order. An empty result is `{ cancelled: 0,
+  delayIds: [] }` — never a throw. Non-string patterns throw `TypeError`,
+  empty patterns `RangeError`.
+- **Durability** — each cancellation reuses `cancelDelayed`, so every
+  cancelled schedule is tombstoned to the durable log (the delayed-delivery
+  convention): a restart never resurrects them. Keyed schedules release
+  their subscribers' per-key expectations, so a buffered successor is
+  enqueued instead of hanging on a keySeq that will never fan out.
+- **Observability** — recorded in the subscription audit log as
+  `delayed_cancelled` (`{ cancelled, delayIds, topicPattern }`), including
+  the empty case, so the operator action is always on record.
 
 ## Subscription lifecycle audit log
 
