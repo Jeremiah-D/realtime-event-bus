@@ -624,6 +624,17 @@ library.
   `graceMs` / `supersededAt`) — validators are functions and never leave
   the process. Duplicate versions, negative/non-integer versions, and
   bad `graceMs` throw `RangeError`.
+  **Compatibility regression gate** (opt-in, EB-95): pass
+  `{ compatibilityCorpus: [...] }` — the sample set of payloads older
+  versions accepted — and the new validator is run against every sample
+  at registration time (with the registration pattern as the `topic`
+  argument). Any rejected or throwing sample throws `RangeError` and
+  registers nothing: no version row appears and no existing version is
+  stamped superseded — zero side effects. A backfilled lower version is
+  gated identically. Each version's gate result surfaces in
+  `getStats().topicSchemas` as `compatGate` (`'passed' | 'not-tested'`)
+  with `compatCorpusSize`; omitting the corpus skips the gate
+  (`'not-tested'`).
 - **Per-topic max message size** (in `src/bus.ts`, via
   `setTopicMaxMessageBytes(pattern, maxBytes)`): an admission gate for
   oversized payloads (backend/real-time systems). A publish whose payload

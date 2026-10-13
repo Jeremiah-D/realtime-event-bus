@@ -3158,14 +3158,25 @@ export interface BusStats {
    * registration key (concrete topic or pattern), in registration order —
    * the rule key, the latest version, and every registered version
    * ascending with its `registeredAt`, `graceMs`, and `supersededAt`
-   * (present only once a greater version superseded it). Validators are
+   * (present only once a greater version superseded it), plus the EB-95
+   * compatibility gate result (`compatGate`: `'passed'` when the version
+   * registered with `compatibilityCorpus` and its validator accepted
+   * every sample, `'not-tested'` when no corpus was supplied;
+   * `compatCorpusSize` counts the gated samples). Validators are
    * functions and are never exposed — metadata only. Empty when no
    * versioned schema is registered.
    */
   topicSchemas: Array<{
     rule: string;
     latest: number;
-    versions: Array<{ version: number; registeredAt: number; graceMs: number; supersededAt?: number }>;
+    versions: Array<{
+      version: number;
+      registeredAt: number;
+      graceMs: number;
+      supersededAt?: number;
+      compatGate: 'passed' | 'not-tested';
+      compatCorpusSize: number;
+    }>;
   }>;
   /**
    * Consumer-group consumption lag (see `src/grouplag.ts`): one row per
@@ -5064,6 +5075,20 @@ export interface TopicSchemaVersionOptions {
    * fail-fast migration.
    */
   graceMs?: number;
+  /**
+   * Opt-in schema-compatibility regression gate (EB-95): the sample set of
+   * payloads that older versions of this topic's schema accepted (callers
+   * usually capture them from production traffic or a shared fixture).
+   * At registration time the new `validator` is run against every sample
+   * (with the registration `topicPattern` as the `topic` argument); if the
+   * validator rejects — or throws on — any sample, registration fails with
+   * `RangeError` and nothing is registered: existing versions keep their
+   * state untouched and the failing version never becomes visible. A
+   * backfilled lower version is gated the same way as a new latest one.
+   * Omit the field (or pass `undefined`) to skip the gate entirely —
+   * skipping is the default and is reported in stats as `'not-tested'`.
+   */
+  compatibilityCorpus?: unknown[];
 }
 
 /**
@@ -5081,6 +5106,16 @@ interface SchemaVersionRegistration {
   registeredAt: number;
   supersededAt?: number;
   graceMs: number;
+  /**
+   * Compatibility regression gate result (EB-95): `'passed'` when the
+   * version registered with `compatibilityCorpus` and its validator
+   * accepted every sample at registration time, `'not-tested'` when no
+   * corpus was supplied. A failed gate never registers, so no row ever
+   * persists a failed result.
+   */
+  compatGate: 'passed' | 'not-tested';
+  /** Number of corpus samples the gate ran (0 when `compatGate` is `'not-tested'`). */
+  compatCorpusSize: number;
 }
 
 /**
@@ -9062,12 +9097,24 @@ export class EventBus {
    * consumed). A throwing validator propagates to the publish caller,
    * exactly like the legacy `setTopicSchema` validator.
    *
+   * Opt-in compatibility regression gate (EB-95): pass
+   * `opts.compatibilityCorpus` — the sample set of payloads older versions
+   * accepted — and the new validator is run against every sample at
+   * registration time (with the registration `topicPattern` as the `topic`
+   * argument). Any rejected or throwing sample throws `RangeError` and
+   * registers nothing: the version never becomes visible and no existing
+   * version is stamped superseded — zero side effects. A backfilled lower
+   * version is gated identically to a new latest version.
+   *
    * A topic that resolves to a versioned rule set ignores the legacy
    * `setTopicSchema` validator; topics with no versioned registrations
    * keep the legacy behavior. Throws `RangeError` when `topicPattern`
    * is empty, `version` is not a non-negative integer, `validator` is
-   * not a function, `graceMs` is not a non-negative finite number, or
-   * the version is already registered for the pattern.
+   * not a function, `graceMs` is not a non-negative finite number, the
+   * version is already registered for the pattern, `compatibilityCorpus`
+   * is present but not an array, or the compatibility gate rejects (or
+   * throws on) any corpus sample — in the gate-failure case nothing is
+   * registered and no existing version is superseded.
    */
   setTopicSchemaVersion(
     topicPattern: string,
@@ -9088,15 +9135,25 @@ export class EventBus {
     if (!Number.isFinite(graceMs) || graceMs < 0) {
       throw new RangeError('graceMs must be a non-negative finite number');
     }
-    let versions = this.schemaVersionRules.get(topicPattern);
-    if (versions === undefined) {
-      versions = new Map();
-      this.schemaVersionRules.set(topicPattern, versions);
+    const corpus = opts?.compatibilityCorpus;
+    if (corpus !== undefined && !Array.isArray(corpus)) {
+      throw new RangeError('compatibilityCorpus must be an array of payloads');
     }
-    if (versions.has(version)) {
+    const existing = this.schemaVersionRules.get(topicPattern);
+    if (existing !== undefined && existing.has(version)) {
       throw new RangeError(
         `schema version ${version} is already registered for "${topicPattern}"`,
       );
+    }
+    // Compatibility regression gate (EB-95, opt-in): runs before any
+    // registration state is touched, so a failing gate leaves the rule
+    // set — including the `supersededAt` stamps of existing versions —
+    // exactly as it was. The gate failure throws RangeError.
+    const compat = this.checkSchemaCompatibility(topicPattern, version, validator, corpus);
+    let versions = existing;
+    if (versions === undefined) {
+      versions = new Map();
+      this.schemaVersionRules.set(topicPattern, versions);
     }
     const nowMs = this.now();
     const registration: SchemaVersionRegistration = {
@@ -9104,6 +9161,8 @@ export class EventBus {
       validator,
       registeredAt: nowMs,
       graceMs,
+      compatGate: compat.gate,
+      compatCorpusSize: compat.samples,
     };
     let isLatest = true;
     for (const [existingVersion, existing] of versions) {
@@ -9123,6 +9182,41 @@ export class EventBus {
     }
     if (!isLatest) registration.supersededAt = nowMs;
     versions.set(version, registration);
+  }
+
+  /**
+   * Opt-in schema-compatibility regression gate (EB-95): runs the
+   * registering `validator` against every payload in `corpus` — the sample
+   * set of payloads older versions accepted — with `topicPattern` as the
+   * `topic` argument. Any rejected sample or any throwing sample makes
+   * this throw `RangeError` identifying the failing sample index. Without
+   * a corpus the gate is skipped. Pure: touches no bus state, so the
+   * caller can run it before mutating the registry to guarantee zero
+   * side effects on failure.
+   */
+  private checkSchemaCompatibility(
+    topicPattern: string,
+    version: number,
+    validator: SchemaValidator,
+    corpus: unknown[] | undefined,
+  ): { gate: 'passed' | 'not-tested'; samples: number } {
+    if (corpus === undefined) return { gate: 'not-tested', samples: 0 };
+    for (let i = 0; i < corpus.length; i++) {
+      let accepted: boolean;
+      try {
+        accepted = validator(corpus[i], topicPattern);
+      } catch {
+        throw new RangeError(
+          `schema version ${version} compatibility gate failed: validator threw on corpus sample ${i} for "${topicPattern}" — version is not registered`,
+        );
+      }
+      if (!accepted) {
+        throw new RangeError(
+          `schema version ${version} compatibility gate failed: validator rejected corpus sample ${i} for "${topicPattern}" — version is not registered`,
+        );
+      }
+    }
+    return { gate: 'passed', samples: corpus.length };
   }
 
   /**
@@ -18035,6 +18129,11 @@ export class EventBus {
               registeredAt: r.registeredAt,
               graceMs: r.graceMs,
               ...(r.supersededAt === undefined ? {} : { supersededAt: r.supersededAt }),
+              // Compatibility gate result (EB-95): 'passed' means the
+              // version's validator accepted the full opt-in corpus at
+              // registration time; 'not-tested' means no corpus was given.
+              compatGate: r.compatGate,
+              compatCorpusSize: r.compatCorpusSize,
             })),
         };
       }),
