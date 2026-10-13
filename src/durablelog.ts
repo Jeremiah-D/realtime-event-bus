@@ -195,8 +195,18 @@ export interface DurableLogRecord {
    * publisher signed. Never a secret — only the key id and the digest.
    */
   signature?: { kid: string; sig: string };
-  /** The published payload, JSON-serialized. */
+  /**
+   * The published payload: the JSON value for ordinary messages, the raw
+   * bytes (`Uint8Array`) for binary messages (EB-92, persisted as a v2
+   * line), or the compression envelope when the publish was compressed.
+   */
   payload: unknown;
+  /**
+   * Binary-payload marker (EB-92): `true` when `payload` is raw bytes
+   * (`Uint8Array`) rather than a JSON value. Persisted as a v2 log line
+   * (`payload_b64`) so replay restores bytes, never a misparsed value.
+   */
+  binary?: boolean;
 }
 
 export interface DurableLogOptions {
@@ -322,7 +332,11 @@ function isSealedLine(o: Record<string, unknown>): o is { v: 2; enc: EncryptedPa
 
 /** On-disk envelope for one log line. `v` pins the format for future readers. */
 interface LogLine {
-  v: 1;
+  /**
+   * Line format version: `1` for JSON payloads, `2` for binary payloads
+   * (EB-92) whose wire bytes ride as base64 in `payload_b64`.
+   */
+  v: 1 | 2;
   seq: number;
   topic: string;
   at: number;
@@ -377,7 +391,20 @@ interface LogLine {
    * `{ kid, sig }`, present exactly when the publish was signed.
    */
   signature?: { kid: string; sig: string };
-  payload: unknown;
+  /**
+   * v1 only: the JSON application payload. Absent on v2 lines, which
+   * carry `payload_b64` instead.
+   */
+  payload?: unknown;
+  /**
+   * v2 only (binary messages, EB-92): base64 of the wire bytes — the raw
+   * payload bytes, or the UTF-8 JSON of the compression envelope when the
+   * message was compressed. The explicit version marker is what tells a
+   * JSON reader "these bytes are not JSON" — a JSON-side consumer that
+   * cannot handle binary sees `{ v: 2, payload_b64 }` rather than a
+   * silently misinterpreted payload. Never present on v1 lines.
+   */
+  payload_b64?: string;
 }
 
 /**
@@ -2470,8 +2497,31 @@ function compactKeyed(records: DurableLogRecord[], maxEntries: number): DurableL
 }
 
 /** Builds the on-disk envelope for a record. */
+/**
+ * Encodes a binary record's wire payload as base64 (EB-92): raw bytes
+ * pass through untouched (zero-copy view, no JSON detour); a compressed
+ * message's payload is the compression envelope, whose canonical JSON
+ * UTF-8 form is the wire representation — replay parses the envelope
+ * first, then inflates, exactly like the live path.
+ */
+function base64OfWireBytes(payload: unknown): string {
+  if (payload instanceof Uint8Array) {
+    return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('base64');
+  }
+  return Buffer.from(JSON.stringify(payload) ?? 'null', 'utf8').toString('base64');
+}
+
 function logLineOf(record: DurableLogRecord): LogLine {
-  const line: LogLine = { v: 1, seq: record.seq, topic: record.topic, at: record.at, payload: record.payload };
+  const binary = record.binary === true;
+  const line: LogLine = binary
+    ? {
+        v: 2,
+        seq: record.seq,
+        topic: record.topic,
+        at: record.at,
+        payload_b64: base64OfWireBytes(record.payload),
+      }
+    : { v: 1, seq: record.seq, topic: record.topic, at: record.at, payload: record.payload };
   if (record.expiresAt !== undefined) line.expiresAt = record.expiresAt;
   if (record.deliverAt !== undefined) line.deliverAt = record.deliverAt;
   if (record.delayId !== undefined) line.delayId = record.delayId;
@@ -2528,6 +2578,14 @@ function logLineOf(record: DurableLogRecord): LogLine {
  * the line corrupt. A `keySeq`, when present, must be a positive integer
  * and requires `key` — the bus always writes both together.
  */
+/**
+ * Strict base64 shape check for v2 `payload_b64` lines: canonical
+ * alphabet with correct padding. `Buffer.from(x, 'base64')` is lenient
+ * (it silently skips bad characters), so the shape is validated first —
+ * a tampered line must read as corrupt, not as truncated bytes.
+ */
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
 function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | null {
   let parsed: unknown;
   try {
@@ -2537,7 +2595,8 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
   const o = parsed as Record<string, unknown>;
-  if (o['v'] !== 1) return null;
+  const version = o['v'];
+  if (version !== 1 && version !== 2) return null;
   if (typeof o['topic'] !== 'string' || o['topic'] !== expectedTopic) return null;
   const seq = o['seq'];
   const isScheduleRecord = seq === 0;
@@ -2569,11 +2628,27 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     return null;
   }
   if (typeof o['at'] !== 'number' || !Number.isFinite(o['at'])) return null;
+  let payload: unknown;
+  let binary = false;
+  if (version === 2) {
+    // Binary record (EB-92): the wire bytes ride as base64 with an
+    // explicit version marker — a JSON reader never mistakes them for a
+    // JSON value. Malformed base64 is corruption, not a payload.
+    const b64 = o['payload_b64'];
+    if (typeof b64 !== 'string' || o['payload'] !== undefined || !BASE64_PATTERN.test(b64)) {
+      return null;
+    }
+    payload = new Uint8Array(Buffer.from(b64, 'base64'));
+    binary = true;
+  } else {
+    payload = o['payload'];
+  }
   const record: DurableLogRecord = {
     seq: seq as number,
     topic: o['topic'] as string,
     at: o['at'] as number,
-    payload: o['payload'],
+    payload,
+    ...(binary ? { binary: true } : {}),
   };
   if (o['expiresAt'] !== undefined) {
     if (typeof o['expiresAt'] !== 'number' || !Number.isFinite(o['expiresAt'])) return null;

@@ -3237,6 +3237,13 @@ interface RetainedEntry {
   topic: string;
   /** Wire payload: the compressed envelope when compression applied, else the raw payload. */
   payload: unknown;
+  /**
+   * Binary-payload marker (EB-92): `true` when `payload` is raw bytes
+   * (`Uint8Array`) rather than a JSON value. Restored from the v2 log
+   * line on restart; re-marks the snapshot envelope at delivery so
+   * inflation and signature verification stay byte-oriented.
+   */
+  binary?: boolean;
   /** The original publish's per-topic sequence number. */
   seq: number;
   /**
@@ -5138,6 +5145,12 @@ interface PauseBufferEntry {
   /** Payload as redacted at pause admission. */
   payload: unknown;
   /**
+   * Binary-payload marker (EB-92): `true` when `payload` is raw bytes.
+   * Carried through the buffer, the pause journal, and restart recovery
+   * so the resume fan-out stays byte-oriented.
+   */
+  binary?: boolean;
+  /**
    * TTL expiry deadline stamped at pause admission (bus clock), when a
    * TTL rule matched the topic. A message whose deadline passes while
    * buffered is dropped as expired at resume — counted in
@@ -5434,6 +5447,12 @@ export interface ForwardFrame {
    * observes it into its own per-topic event-time watermark (EB-59).
    */
   eventTime?: number;
+  /**
+   * Binary-payload marker (EB-92): `true` when `payload` is raw bytes.
+   * The destination bus re-marks the message so its admission stays
+   * byte-oriented.
+   */
+  binary?: boolean;
 }
 
 /**
@@ -5793,6 +5812,35 @@ export interface PublishOptions {
    */
   partitionKey?: string;
   partition?: number;
+  /**
+   * Binary payload passthrough (EB-92, opt-in): the payload is raw bytes
+   * (`Uint8Array`, or an `ArrayBuffer` which is wrapped in a zero-copy
+   * view) that travel the whole pipeline without JSON serialization —
+   * no `JSON.stringify` at admission, in compression, in signing, or in
+   * the durable log. Anything else as payload with `binary: true`
+   * throws `TypeError` from the publish entry point, before anything is
+   * mutated.
+   *
+   * Pipeline semantics for binary messages:
+   * - the schema validator (EB-20) receives the `Uint8Array` — a binary
+   *   topic's validator is a *byte* validator, written against bytes;
+   * - the max-message-bytes cap (EB-64) and the compression threshold
+   *   (EB-22) measure wire bytes, not JSON length;
+   * - the HMAC topic signature (EB-84) covers the wire bytes;
+   * - the durable log stores a v2 line (`payload_b64`, explicit type
+   *   marker) — a JSON reader never mistakes the bytes for a value;
+   * - redaction (EB-68) is skipped: bytes have no fields;
+   * - subscribers receive the message with `payload` as a `Uint8Array`
+   *   (compressed binary messages are inflated transparently, still as
+   *   bytes — never `JSON.parse`d).
+   *
+   * Only `publish` / `publishIdempotent` accept it; batch, atomic and
+   * delayed publishes do not carry per-message binary flags, and the
+   * bridge transport does not encode binary payloads (a JSON-based
+   * transport would need its own framing — binary messages are an
+   * in-process feature).
+   */
+  binary?: boolean;
 }
 
 /**
@@ -6207,9 +6255,14 @@ class CompressionAutoTrainer {
    * publish path, so it is deliberately cheap: one serialization plus
    * amortized-constant window maintenance — no deflate, no hashing, no
    * timer work beyond arming. Unserializable payloads (see
-   * `serializeToJson`) contribute nothing to the corpus.
+   * `serializeToJson`) contribute nothing to the corpus. Binary payloads
+   * (EB-92) are skipped: the corpus is a newline-joined UTF-8 text, and
+   * training a deflate dictionary from mis-encoded bytes would produce
+   * a useless dictionary — binary topics should use an explicit
+   * dictionary via `setTopicCompression` instead.
    */
-  sample(payload: unknown): void {
+  sample(payload: unknown, binary = false): void {
+    if (binary) return;
     const serialized = serializeToJson(payload);
     if (serialized === undefined) return;
     const bytes = Buffer.byteLength(serialized, 'utf8');
@@ -6444,15 +6497,52 @@ function serializeToJson(payload: unknown): string | undefined {
 }
 
 /**
- * Estimates a payload's buffered byte size as JSON UTF-8 bytes — the
- * estimator the bus hands to byte-budgeted backpressure queues (see
- * `SubscribeOptions.queueMaxBytes`). Unserializable payloads estimate as
- * 0 (see `serializeToJson`): the byte budget is a JSON-shape measure, and
- * pretending an unknown size is a real number would corrupt it.
+ * Estimates a payload's buffered byte size — the estimator the bus hands
+ * to byte-budgeted backpressure queues (see
+ * `SubscribeOptions.queueMaxBytes`) and to the max-message-bytes
+ * admission cap (EB-64). Binary payloads (EB-92, `Uint8Array`) measure
+ * as their wire bytes; everything else measures as JSON UTF-8 bytes.
+ * Unserializable payloads estimate as 0 (see `serializeToJson`): the
+ * byte budget is a JSON-shape measure, and pretending an unknown size
+ * is a real number would corrupt it.
  */
 function payloadByteSize(payload: unknown): number {
+  if (payload instanceof Uint8Array) return payload.byteLength;
   const serialized = serializeToJson(payload);
   return serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+}
+
+/**
+ * The canonical wire bytes of a payload (EB-92): a binary message's
+ * raw bytes (zero-copy view over the published buffer), or the UTF-8
+ * JSON encoding for ordinary messages. Returns `undefined` for
+ * payloads with no JSON encoding — exactly the `serializeToJson`
+ * contract. Compression, HMAC signing and the durable-log v2 encoding
+ * all hash/cover these same bytes, so "wire bytes" means one thing
+ * everywhere.
+ */
+function wireBytesOfPayload(payload: unknown, binary: boolean): Buffer | undefined {
+  if (binary) {
+    return payload instanceof Uint8Array
+      ? Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
+      : undefined;
+  }
+  const serialized = serializeToJson(payload);
+  return serialized === undefined ? undefined : Buffer.from(serialized, 'utf8');
+}
+
+/**
+ * Validates `PublishOptions.binary` at the publish entry points:
+ * `binary: true` requires a `Uint8Array` payload (`ArrayBuffer` is
+ * wrapped in a zero-copy view); anything else throws `TypeError` before
+ * anything is mutated. Returns the normalized payload bytes (or the
+ * original payload when `binary` is not set).
+ */
+function normalizeBinaryPayload(payload: unknown, binary: boolean | undefined, where: string): unknown {
+  if (binary !== true) return payload;
+  if (payload instanceof Uint8Array) return payload;
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  throw new TypeError(`${where}: binary publish requires a Uint8Array (or ArrayBuffer) payload`);
 }
 
 /**
@@ -6601,6 +6691,12 @@ interface ReplayRecord {
   at: number;
   expiresAt?: number;
   payload: unknown;
+  /**
+   * Binary-payload marker (EB-92): `true` when the record is a v2 log
+   * line and `payload` is raw bytes (`Uint8Array`) — possibly encoding
+   * a compression envelope for binary+compressed publishes.
+   */
+  binary?: boolean;
   key?: string;
   keySeq?: number;
   dictId?: string;
@@ -7337,6 +7433,17 @@ export class EventBus {
    * compressed one. Entries die with their message (WeakSet).
    */
   private compressedPayloads = new WeakSet<BusMessage>();
+  /**
+   * Messages carrying a binary (raw-bytes) payload (EB-92). Registered
+   * by the publish path when `PublishOptions.binary` is set, and by
+   * replay when the log record is a v2 line. Bus-side, like
+   * `compressedPayloads` — a user's payload can never collide with it.
+   * Drives every binary-aware branch downstream: byte-size measurement,
+   * compression input, signature wire bytes, durable-log v2 encoding,
+   * and delivery-time inflation (bytes stay bytes, never `JSON.parse`d).
+   * Entries die with their message (WeakSet).
+   */
+  private binaryMessages = new WeakSet<BusMessage>();
   /**
    * Preset dictionary used to compress each live message, for the
    * messages the publish path actually compressed with one. Inflating
@@ -8696,6 +8803,12 @@ export class EventBus {
       // A frame carrying an invalid identity forwards as anonymous — a
       // malformed label never fails the forward, it just drops the label.
       cleanPublisherId(frame.publisherId),
+      undefined, // schemaVersion: the destination admission resolves the version
+      undefined, // retain: forwards never retain
+      undefined, // pausedExpiresAt
+      undefined, // partitionKey
+      undefined, // partition
+      frame.binary ?? false,
     );
     this.scheduleFlush();
   }
@@ -9580,17 +9693,22 @@ export class EventBus {
     rule: ResolvedCompressionRule,
     stats: { compressedMessages: number; compressedBytesBefore: number; compressedBytesAfter: number; compressionTimeMs: number },
   ): unknown {
-    const serialized = serializeToJson(payload);
-    if (serialized === undefined) return payload;
-    const bytesBefore = Buffer.byteLength(serialized, 'utf8');
+    // The compression input is the wire bytes (EB-92): a binary message's
+    // raw bytes, or the UTF-8 JSON encoding for ordinary messages — so
+    // the threshold is always a byte count, never a JSON-length
+    // approximation. An unserializable non-binary payload passes through
+    // untouched, as before.
+    const wireBytes = wireBytesOfPayload(payload, this.binaryMessages.has(msg));
+    if (wireBytes === undefined) return payload;
+    const bytesBefore = wireBytes.length;
     // Small messages pass through: compression is opt-in per byte saved,
     // not a tax on every publish.
     if (bytesBefore <= rule.thresholdBytes) return payload;
     const startedAtMs = this.now();
     const deflated =
       rule.dictionary === undefined
-        ? deflateSync(serialized, { level: rule.level })
-        : deflateSync(serialized, { level: rule.level, dictionary: rule.dictionary });
+        ? deflateSync(wireBytes, { level: rule.level })
+        : deflateSync(wireBytes, { level: rule.level, dictionary: rule.dictionary });
     const elapsedMs = Math.max(0, this.now() - startedAtMs);
     // Never adopt an encoding that does not shrink the payload —
     // incompressible data (or level 0) would only add envelope overhead.
@@ -9613,6 +9731,46 @@ export class EventBus {
     this.totalCompressedBytesAfter += deflated.length;
     this.totalCompressionTimeMs += elapsedMs;
     return envelope;
+  }
+
+  /**
+   * Inflates a replayed compression envelope (EB-92): a binary record's
+   * envelope inflates back to raw bytes — never `JSON.parse`d — so a
+   * binary content filter sees the `Uint8Array` the publisher sent.
+   */
+  private inflateReplayEnvelope(
+    envelope: CompressedPayload,
+    rec: { topic: string; seq: number; dictId?: string; binary?: boolean },
+  ): unknown {
+    const dictionary = this.dictionaryForRecord(rec);
+    if (rec.binary === true) {
+      const raw = Buffer.from(envelope.data, 'base64');
+      return dictionary === undefined ? inflateSync(raw) : inflateSync(raw, { dictionary });
+    }
+    return inflateEnvelopePayload(envelope, dictionary);
+  }
+
+  /**
+   * Resolves a durable-log record's payload to its wire form (EB-92): a
+   * binary record's v2 bytes may encode a compression envelope
+   * (binary+compressed publishes persist the envelope's JSON as the v2
+   * bytes) — parse it back to the envelope so the compressed/inflate
+   * machinery works unchanged; uncompressed binary records stay raw
+   * bytes. Non-binary records pass through untouched.
+   */
+  private wirePayloadOfRecord(rec: { binary?: boolean; payload: unknown }): unknown {
+    if (rec.binary !== true || !(rec.payload instanceof Uint8Array)) return rec.payload;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(
+        Buffer.from(rec.payload.buffer, rec.payload.byteOffset, rec.payload.byteLength).toString(
+          'utf8',
+        ),
+      );
+    } catch {
+      return rec.payload;
+    }
+    return isCompressedPayload(parsed) ? parsed : rec.payload;
   }
 
   /**
@@ -9641,7 +9799,15 @@ export class EventBus {
     // `undefined`, exactly like the legacy path.
     const dictionary = this.compressedDictionaries.get(msg);
     this.compressedDictionaries.delete(msg);
-    msg.payload = inflateEnvelopePayload(payload, dictionary);
+    if (this.binaryMessages.has(msg)) {
+      // Binary messages (EB-92) inflate back to raw bytes — never
+      // `JSON.parse`d. The subscriber receives a `Uint8Array`, the same
+      // shape the publisher sent.
+      const raw = Buffer.from(payload.data, 'base64');
+      msg.payload = dictionary === undefined ? inflateSync(raw) : inflateSync(raw, { dictionary });
+    } else {
+      msg.payload = inflateEnvelopePayload(payload, dictionary);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -13036,9 +13202,15 @@ export class EventBus {
         // record resolves its bytes from the registry here; an unregistered
         // dictionary fails loudly rather than judging garbage.
         if (filter !== undefined) {
-          const rawPayload = isCompressedPayload(rec.payload)
-            ? inflateEnvelopePayload(rec.payload, this.dictionaryForRecord(rec))
-            : rec.payload;
+          // The log holds the wire payload — resolve a binary record's
+          // v2 bytes first (a binary+compressed record's bytes encode
+          // the envelope), then inflate a compressed envelope so the
+          // filter judges the raw application payload. A binary filter
+          // sees the `Uint8Array`, never a misparsed value.
+          const wirePayload = this.wirePayloadOfRecord(rec);
+          const rawPayload = isCompressedPayload(wirePayload)
+            ? this.inflateReplayEnvelope(wirePayload, rec)
+            : wirePayload;
           if (!filter(rawPayload, rec.topic)) {
             this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
             // A filtered replayed message is deliberately skipped: advance
@@ -13125,9 +13297,10 @@ export class EventBus {
         if (ttlExpired) {
           countReplaySkipped();
         }
+        const wirePayload = this.wirePayloadOfRecord(rec);
         const msg: BusMessage = {
           topic: rec.topic,
-          payload: rec.payload,
+          payload: wirePayload,
           seq: rec.seq,
           // Restores the partition logged at publish time (EB-90): the
           // replayed message keeps its publish-order identity per
@@ -13160,8 +13333,11 @@ export class EventBus {
         // like a live compressed message. Dictionary-compressed records
         // additionally re-register their dictionary from the registry; a
         // missing dictionary throws here (fail closed at replay) instead of
-        // corrupting data at delivery.
-        if (isCompressedPayload(rec.payload)) {
+        // corrupting data at delivery. A binary (v2) record re-marks the
+        // envelope so delivery inflates to bytes and verifies signatures
+        // against the raw bytes.
+        if (rec.binary === true) this.binaryMessages.add(msg);
+        if (isCompressedPayload(wirePayload)) {
           this.compressedPayloads.add(msg);
           const dictionary = this.dictionaryForRecord(rec);
           if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
@@ -13274,6 +13450,11 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'publish');
     validateSchemaVersion(opts?.schemaVersion, 'publish');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publish');
+    // Binary payload passthrough (EB-92): validated and normalized here
+    // — `binary: true` with a non-bytes payload throws `TypeError`
+    // before anything is mutated.
+    payload = normalizeBinaryPayload(payload, opts?.binary, 'publish');
+    const binary = opts?.binary === true;
     // Multi-tenant namespace (EB-52): resolve to the concrete
     // `<namespace>/<topic>` before admission — the full pipeline below
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
@@ -13308,6 +13489,7 @@ export class EventBus {
       // in `fanOut` against the alias-resolved topic.
       opts?.partitionKey,
       opts?.partition,
+      binary,
     );
     this.scheduleFlush();
     return accepted;
@@ -13374,6 +13556,9 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'publishIdempotent');
     validateSchemaVersion(opts?.schemaVersion, 'publishIdempotent');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishIdempotent');
+    // Binary payload passthrough (EB-92): same contract as `publish`.
+    payload = normalizeBinaryPayload(payload, opts?.binary, 'publishIdempotent');
+    const binary = opts?.binary === true;
     const messageId = opts?.messageId;
     const publisherId = opts?.publisherId;
     // Multi-tenant namespace (EB-52): the `(topic, messageId)` dedup
@@ -13416,6 +13601,7 @@ export class EventBus {
         undefined, // pausedExpiresAt: only the pause-buffer drain passes this
         opts?.partitionKey,
         opts?.partition,
+        binary,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -13459,6 +13645,7 @@ export class EventBus {
       undefined, // pausedExpiresAt: only the pause-buffer drain passes this
       opts?.partitionKey,
       opts?.partition,
+      binary,
     );
     // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
     // and the per-publisher rate-limit gate lives inside `fanOut` — so a
@@ -14348,6 +14535,8 @@ export class EventBus {
       fromBridge?: boolean;
       diagnostic?: boolean;
       expiresAtOverride?: number;
+      /** Binary-payload marker (EB-92), propagated to the buffer entry. */
+      binary?: boolean;
     },
   ): void {
     const nowMs = this.now();
@@ -14378,6 +14567,10 @@ export class EventBus {
       ...(opts.routed === undefined ? {} : { routed: opts.routed }),
       ...(opts.fromBridge === undefined ? {} : { fromBridge: opts.fromBridge }),
       ...(opts.diagnostic === undefined ? {} : { diagnostic: opts.diagnostic }),
+      // Binary payloads (EB-92): the marker rides the in-memory entry
+      // and the pause journal, so the resume fan-out — in this process
+      // or after a restart — stays byte-oriented.
+      ...(opts.binary === true ? { binary: true } : {}),
     };
     // Internal-only flags (`routed`, `fromBridge`, `diagnostic`) and the
     // traceparent are runtime state: they ride the in-memory entry but are
@@ -14392,6 +14585,9 @@ export class EventBus {
       pauseOrder: entry.pauseOrder,
       expiresAt: entry.expiresAt,
       payload,
+      // Binary payloads (EB-92) persist as v2 lines so restart recovery
+      // restores raw bytes.
+      ...(entry.binary === true ? { binary: true } : {}),
       ...(entry.key === undefined ? {} : { key: entry.key }),
       ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
       ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
@@ -14470,6 +14666,9 @@ export class EventBus {
           entry.schemaVersion,
           entry.retain,
           entry.expiresAt, // pausedExpiresAt: the original TTL deadline, verbatim
+          undefined, // partitionKey
+          undefined, // partition
+          entry.binary ?? false,
         );
         if (admitted && entry.messageId !== undefined) {
           // Claim the dedup slot exactly like `publishIdempotent`: only
@@ -14531,10 +14730,12 @@ export class EventBus {
       msg.signature === undefined
         ? undefined
         : { kid: msg.signature.kid, sig: msg.signature.sig };
+    const binary = this.binaryMessages.has(msg);
     const entry: RetainedEntry = {
       topic,
       payload: msg.payload,
       seq: msg.seq,
+      ...(binary ? { binary: true } : {}),
       // The assigned partition rides the retained entry (EB-90): the
       // snapshot keeps the message's publish-order identity per
       // partition for gap detection.
@@ -14555,6 +14756,9 @@ export class EventBus {
       retained: true,
       retainedSeq: msg.seq,
       payload: msg.payload,
+      // Binary payloads (EB-92) persist as v2 lines so restart recovery
+      // restores raw bytes.
+      ...(binary ? { binary: true } : {}),
       // The assigned partition rides the seq-0 retained record (EB-90)
       // so restart recovery rebuilds the table with the message's
       // partition identity intact.
@@ -14678,7 +14882,10 @@ export class EventBus {
       // The table stores the wire payload: re-register a compressed
       // envelope for transparent inflation at delivery, exactly like
       // replay. A missing preset dictionary fails closed here, like
-      // replay — never silently raw.
+      // replay — never silently raw. A binary entry re-marks the
+      // envelope so delivery inflates to bytes and verifies signatures
+      // against the raw bytes.
+      if (entry.binary === true) this.binaryMessages.add(msg);
       if (isCompressedPayload(entry.payload)) {
         this.compressedPayloads.add(msg);
         if (entry.dictId !== undefined) {
@@ -14764,9 +14971,14 @@ export class EventBus {
       if (latest.retainedSeq === undefined) continue;
       this.retainedMessages.set(topic, {
         topic,
-        payload: latest.payload,
+        // A binary record's v2 bytes may encode a compression envelope
+        // (binary+compressed publishes persist the envelope's JSON as
+        // the v2 bytes) — resolve back to the envelope so the
+        // compressed/inflate machinery works unchanged.
+        payload: this.wirePayloadOfRecord(latest),
         seq: latest.retainedSeq,
         at: latest.at,
+        ...(latest.binary === true ? { binary: true } : {}),
         ...(latest.partition === undefined ? {} : { partition: latest.partition }),
         ...(latest.expiresAt === undefined ? {} : { expiresAt: latest.expiresAt }),
         ...(latest.dictId === undefined ? {} : { dictId: latest.dictId }),
@@ -14939,7 +15151,7 @@ export class EventBus {
       // fans out as an ordinary publish (see `PauseBufferEntry`).
       this.fanOut(
         rec.topic,
-        rec.payload,
+        this.wirePayloadOfRecord(rec),
         false, // preAdmitted
         undefined, // delayed
         rec.key,
@@ -14956,6 +15168,9 @@ export class EventBus {
         rec.schemaVersion,
         undefined, // retain: runtime-only, not persisted
         rec.expiresAt, // pausedExpiresAt: the original TTL deadline, verbatim
+        undefined, // partitionKey
+        undefined, // partition
+        rec.binary ?? false,
       );
       this.appendPauseTombstone(pauseId, rec.topic);
       fannedOut = true;
@@ -16463,13 +16678,17 @@ export class EventBus {
     const rule = this.signingForTopic(msg.topic);
     const sig = msg.signature;
     if (rule === undefined || sig === undefined) return false;
-    const serialized = serializeToJson(msg.payload);
-    if (serialized === undefined) return false;
+    // Verifies against the same wire bytes the publisher signed (EB-92):
+    // a binary message's raw bytes (inflated first when compressed —
+    // inflation runs before delivery), or the post-compression wire form
+    // for ordinary messages.
+    const wireBytes = wireBytesOfPayload(msg.payload, this.binaryMessages.has(msg));
+    if (wireBytes === undefined) return false;
     return verifyTopicMessage(
       rule.keys,
       msg.topic,
       msg.seq,
-      Buffer.from(serialized, 'utf8'),
+      wireBytes,
       sig,
       this.now(),
       rule.graceMs,
@@ -16601,6 +16820,13 @@ export class EventBus {
     // undefined and land on partition 0.
     partitionKey?: string,
     partition?: number,
+    // Binary payload passthrough (see `PublishOptions.binary`, EB-92):
+    // already validated/normalized by the publish entry points —
+    // `fanOut` never validates. Internal re-fan-out paths (route,
+    // pause-buffer drain, cross-bus forward) propagate the source
+    // message's flag so a binary payload is never reinterpreted as
+    // JSON mid-pipeline.
+    binary = false,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -16643,8 +16869,9 @@ export class EventBus {
     // already-redacted bytes from the log (the original is never
     // resurrected). Skipped on pre-admitted paths (`publishAtomic`
     // commit, delayed fan-out): those already redacted at their own
-    // admission — re-running here would double-count.
-    if (!preAdmitted) {
+    // admission — re-running here would double-count. Skipped for
+    // binary payloads (EB-92): bytes have no fields to redact.
+    if (!preAdmitted && !binary) {
       payload = this.redactAdmissionPayload(topic, payload);
     }
     // Topic pause (EB-88): the FIRST admission gate — before the
@@ -16683,6 +16910,7 @@ export class EventBus {
           routed,
           fromBridge,
           diagnostic,
+          binary,
         });
         return { matched: 0, accepted: 0, admitted: false };
       }
@@ -16780,6 +17008,11 @@ export class EventBus {
     // is bus-side, so a user's payload can never collide with it) — a
     // dead-lettered diagnostic message must not emit a second diagnostic.
     if (diagnostic) this.diagnosticMessages.add(msg);
+    // Binary payload passthrough (EB-92): bus-side marker driving every
+    // binary-aware branch downstream — byte-size measurement, compression
+    // input, signature wire bytes, durable-log v2 encoding, and
+    // delivery-time inflation (bytes stay bytes, never `JSON.parse`d).
+    if (binary) this.binaryMessages.add(msg);
     const stats = this.statsFor(topic);
     stats.publishedMessages += 1;
     // Topic-level `lastSeq` stays the highest number handed out on any
@@ -16900,22 +17133,25 @@ export class EventBus {
       // background timer, and publishes always compress with the
       // dictionary in force when they were admitted.
       const autoTrainer = compressionRule.autoTrainState;
-      if (autoTrainer !== undefined) autoTrainer.sample(payload);
+      if (autoTrainer !== undefined) autoTrainer.sample(payload, this.binaryMessages.has(msg));
     }
     // Publish-side per-topic HMAC message signing (EB-84, opt-in via
     // `setTopicSigningKey`). The signature covers (topic, seq, wire
     // bytes): the wire bytes are the post-compression form, so a
     // compressed envelope's signature covers the ciphertext and a
-    // verifier checks those same bytes before inflating. Signed with the
-    // rule's newest key; the {kid, sig} rides the envelope, the durable
-    // log, and the bridge mirror. A payload with no JSON encoding cannot
-    // be signed — it travels unsigned and fails closed on
+    // verifier checks those same bytes before inflating; for a binary
+    // message (EB-92) the wire bytes are the raw payload bytes. Signed
+    // with the rule's newest key; the {kid, sig} rides the envelope, the
+    // durable log, and the bridge mirror. A payload with no JSON encoding
+    // cannot be signed — it travels unsigned and fails closed on
     // `verifySignature` subscribers.
     const signingRule = this.signingForTopic(topic);
     if (signingRule !== undefined) {
-      const serialized = serializeToJson(msg.payload);
-      if (serialized !== undefined) {
-        const wireBytes = Buffer.from(serialized, 'utf8');
+      // The signature covers the wire bytes (EB-92): a binary message's
+      // raw bytes, or the post-compression wire form for ordinary
+      // messages — a verifier checks those same bytes before inflating.
+      const wireBytes = wireBytesOfPayload(msg.payload, this.binaryMessages.has(msg));
+      if (wireBytes !== undefined) {
         msg.signature = signTopicMessage(signingRule.keys[0], topic, msg.seq, wireBytes);
       }
     }
@@ -17034,6 +17270,9 @@ export class EventBus {
       at: nowMs,
       expiresAt,
       payload: msg.payload,
+      // Binary payloads (EB-92) persist as v2 log lines (`payload_b64`,
+      // explicit type marker) so replay restores raw bytes.
+      ...(binary ? { binary: true } : {}),
       // The assigned partition rides the record (EB-90): replay restores
       // it onto the envelope and restart recovery rebuilds the
       // per-(topic, partition) sequence counters from it, so numbering
@@ -17158,6 +17397,12 @@ export class EventBus {
             eventTime,
             undefined, // causal: the route forward re-stamps nothing causal
             publisherId,
+            undefined, // schemaVersion: the destination admission resolves the version
+            undefined, // retain: routes never retain
+            undefined, // pausedExpiresAt
+            undefined, // partitionKey
+            undefined, // partition
+            binary,
           );
         }
       }
@@ -17197,6 +17442,9 @@ export class EventBus {
             // Same logical publish, new bus: the producer attribution
             // crosses with the frame.
             ...(publisherId === undefined ? {} : { publisherId }),
+            // Binary payloads (EB-92) cross as bytes with the marker, so
+            // the destination bus stays byte-oriented.
+            ...(binary ? { binary: true } : {}),
           });
         }
       }

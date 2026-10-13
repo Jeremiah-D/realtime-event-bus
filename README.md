@@ -2456,6 +2456,54 @@ How it works:
   (queues, health, offsets) is operational state, not configuration.
   Neither is snapshotted.
 
+## Binary payload passthrough
+
+`publish(topic, bytes, { binary: true })` (`src/bus.ts`, EB-92) sends
+raw bytes (`Uint8Array`, or an `ArrayBuffer` which is wrapped in a
+zero-copy view) through the whole pipeline with no JSON serialization —
+for protocols, codecs, and media frames that are already bytes. Anything
+else as payload with `binary: true` throws `TypeError` before anything
+is mutated.
+
+```ts
+const frame = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+bus.publish('camera.frame', frame, { binary: true });
+bus.subscribe('camera.**', (msg) => {
+  msg.payload instanceof Uint8Array; // true — the same bytes
+});
+```
+
+How it works:
+
+- **Zero-copy in process** — the subscriber receives the published
+  buffer itself (no copy, no `JSON.stringify`); subscribers that do not
+  opt in keep the classic JSON behavior, and a `Uint8Array` published
+  *without* `binary: true` still serializes as JSON exactly as before.
+- **Byte-true admission** — the max-message-bytes cap (EB-64) and the
+  compression threshold (EB-22) measure wire bytes, not JSON length;
+  the schema validator (EB-20) receives the `Uint8Array`, so a binary
+  topic's validator is written against bytes; redaction (EB-68) is
+  skipped (bytes have no fields).
+- **Signing covers wire bytes** — the HMAC topic signature (EB-84)
+  covers the raw bytes (post-compression when compressed), and
+  `verifySignature` subscribers check those same bytes; unsigned binary
+  messages fail closed like unsigned JSON ones.
+- **Durable log v2** — binary messages persist as `v: 2` lines carrying
+  `payload_b64` (base64 of the wire bytes, with an explicit version
+  marker), so a JSON reader never mistakes the bytes for a value.
+  Restart recovery and `resumeFromSeq` replay restore raw bytes; a
+  binary message compressed at publish inflates back to bytes, never
+  `JSON.parse`d. Corrupt base64 reads as a corrupt line, not as
+  truncated bytes.
+- **Scope note** — only `publish` / `publishIdempotent` accept
+  `binary`; batch, atomic, and delayed publishes do not carry
+  per-message binary flags. Binary messages survive topic routes,
+  cross-bus forwards, and the pause buffer as bytes. The bridge
+  transport does not encode binary payloads (a JSON-based transport
+  would need its own framing) — binary is an in-process feature.
+  Auto-trained compression dictionaries (EB-60) skip binary topics;
+  use an explicit dictionary via `setTopicCompression` instead.
+
 ## Subscription lifecycle audit log
 
 Every subscription change is recorded in an append-only audit log —
