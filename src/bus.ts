@@ -180,6 +180,16 @@ export interface BusMessage {
    */
   seq: number;
   /**
+   * Publish-side partition the message was assigned to (EB-90): the
+   * per-(topic, partition) sequence counter that stamped `seq`. `0` for
+   * every message on a topic with a single partition (the default) and
+   * for messages admitted through paths that do not route partitions
+   * (bridge/cluster ingress, window aggregates). Gap detection baselines
+   * are tracked per (topic, partition), so a subscriber sees a gap only
+   * when numbers skip inside one partition.
+   */
+  partition?: number;
+  /**
    * Sequence epoch for gap detection. Absent (or empty) for messages
    * published on this node; `hub:<hubEpoch>` for messages received from
    * the cluster hub (see `EventBus.connectToHub`). The bus resets a
@@ -2523,6 +2533,17 @@ export interface TopicStats {
    * values decay as traffic ages out of the windows.
    */
   rates: TopicRates;
+  /**
+   * Per-partition publish counters (EB-90), in ascending partition order.
+   * Present only when the topic resolves to more than one partition
+   * (`EventBus.setTopicPartitions`) — single-partition topics omit it so
+   * their stats snapshots are byte-identical to before. `publishedMessages`
+   * counts admitted publishes per partition (a publish-side shed consumes
+   * its partition's sequence number, so it counts here exactly like it
+   * counts in the topic total); `lastSeq` is the highest per-partition
+   * sequence number assigned so far.
+   */
+  partitions?: Array<{ partition: number; publishedMessages: number; lastSeq: number }>;
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -3187,6 +3208,14 @@ interface RetainedEntry {
   payload: unknown;
   /** The original publish's per-topic sequence number. */
   seq: number;
+  /**
+   * The original publish's partition (EB-90): the per-(topic, partition)
+   * sequence space `seq` was drawn from. Restored onto the snapshot
+   * envelope so gap detection keys the snapshot against the right
+   * partition baseline. Absent for retained messages written before
+   * partition routing — treated as partition 0.
+   */
+  partition?: number;
   /** Bus-clock publish timestamp, in milliseconds. */
   at: number;
   /**
@@ -3761,6 +3790,29 @@ function validateMessageKey(key: string | undefined, caller: string): void {
   if (key === undefined) return;
   if (typeof key !== 'string' || key.length === 0) {
     throw new RangeError(`${caller}: key must be a non-empty string`);
+  }
+}
+
+/**
+ * Fail-fast type validation for `PublishOptions.partitionKey` /
+ * `PublishOptions.partition` (EB-90). Absent is fine; a `partitionKey`
+ * must be a non-empty string and a `partition` must be an integer
+ * `>= 0`. The range check against the topic's partition count
+ * (`< partitionCount`) needs the alias-resolved topic, so it runs in
+ * `fanOut` right after alias resolution — still before anything is
+ * mutated. Throws `RangeError` before anything is mutated, matching the
+ * other publish-option validations.
+ */
+function validatePartitionOptions(
+  partitionKey: string | undefined,
+  partition: number | undefined,
+  caller: string,
+): void {
+  if (partitionKey !== undefined && (typeof partitionKey !== 'string' || partitionKey.length === 0)) {
+    throw new RangeError(`${caller}: partitionKey must be a non-empty string`);
+  }
+  if (partition !== undefined && (!Number.isInteger(partition) || partition < 0)) {
+    throw new RangeError(`${caller}: partition must be a non-negative integer`);
   }
 }
 
@@ -5679,6 +5731,37 @@ export interface PublishOptions {
    * provided; anything else throws `RangeError` from `publish`.
    */
   eventTime?: number;
+  /**
+   * Publish-side partition routing (EB-90, real-time systems): assigns
+   * this publish to one of the topic's partitions
+   * (`EventBus.setTopicPartitions`, default 1). Two opt-in selectors:
+   *
+   * - `partitionKey`: a consistent-hash selector — the partition is
+   *   `sha256(partitionKey) mod partitionCount`, so the same key always
+   *   lands on the same partition (the Kafka-style sticky routing a
+   *   sharded consumer tier needs). Must be a non-empty string when
+   *   provided; anything else throws `RangeError` from `publish`.
+   * - `partition`: an explicit partition number that wins over
+   *   `partitionKey` when both are set. Must be an integer `>= 0` and
+   *   `<` the topic's partition count; anything else throws `RangeError`
+   *   from the publish call before anything is mutated. On a topic with
+   *   the default single partition the only valid explicit value is `0`,
+   *   and a `partitionKey` always hashes to `0`.
+   *
+   * Each (topic, partition) pair has an independent sequence counter
+   * (the EB-13 per-topic seq, extended): `BusMessage.seq` is scoped to
+   * the message's partition, and subscriber gap detection baselines are
+   * tracked per (topic, partition). The partition is a seq/routing
+   * dimension only — it composes with per-key publish-order delivery
+   * (`PublishOptions.key`, EB-36): same-key ordering is enforced by the
+   * keySeq mechanism regardless of partition, so one key keeps its
+   * publish order even when its messages land on different partitions.
+   * The assigned partition is stamped on the envelope
+   * (`BusMessage.partition`) and persisted on the durable-log record, so
+   * replay restores it and numbering never restarts across restarts.
+   */
+  partitionKey?: string;
+  partition?: number;
 }
 
 /**
@@ -5691,6 +5774,14 @@ export interface PublishOptions {
 export type BatchMessage = Omit<BusMessage, 'seq'> & {
   key?: string;
   traceparent?: string;
+  /**
+   * Consistent-hash partition selector (see `PublishOptions.partitionKey`):
+   * validated per entry at the publish entry point (`publishBatch`,
+   * `publishAtomic`). The entry's `partition` field (inherited from
+   * `BusMessage`) carries an explicit partition request and wins over the
+   * key, exactly like `PublishOptions.partition`.
+   */
+  partitionKey?: string;
   /**
    * Schema version for versioned topic validators (see
    * `PublishOptions.schemaVersion`): validated per entry at the publish
@@ -6485,6 +6576,12 @@ interface ReplayRecord {
   messageId?: string;
   eventTime?: number;
   causal?: { source: string; clock: number };
+  /**
+   * Publish-side partition logged at publish time (EB-90); absent on
+   * records written before partition routing (replay treats those as
+   * partition 0).
+   */
+  partition?: number;
 }
 
 /**
@@ -6652,12 +6749,25 @@ export class EventBus {
   private totalThrottled = 0;
   private totalSequenceGaps = 0;
   /**
-   * Per-topic sequence counters. Each message published to a topic takes
-   * the next number, so every message carries a topic-scoped monotonic
-   * `seq` starting at 1. Grows with the distinct topics ever published to —
-   * the same bound as `topicStats`.
+   * Per-(topic, partition) sequence counters (EB-90 — the EB-13 per-topic
+   * seq, extended). Keyed by `partitionSeqKey(topic, partition)`: each
+   * message published to a (topic, partition) pair takes the next number,
+   * so every message carries a partition-scoped monotonic `seq` starting
+   * at 1. A topic with the default single partition keeps the historical
+   * behavior exactly (every message lands on partition 0). Grows with the
+   * distinct (topic, partition) pairs ever published to — the same bound
+   * as `partitionPublished`.
    */
   private topicSeq = new Map<string, number>();
+
+  /**
+   * Key for `topicSeq`: the per-(topic, partition) sequence counter
+   * identity. The NUL separator keeps the decimal partition suffix
+   * unambiguous against the topic name.
+   */
+  private static partitionSeqKey(topic: string, partition: number): string {
+    return `${topic}\0${partition}`;
+  }
   /**
    * Next per-key sequence number to assign, per key. KeySeqs are assigned
    * at admission — in publish order: direct publishes assign in `fanOut`
@@ -6726,6 +6836,30 @@ export class EventBus {
    * retained configuration never inflates `patternCacheSize`.
    */
   private retainedMatcherCache = new Map<string, RegExp>();
+  /**
+   * Publish-side partition counts (EB-90), keyed by the exact string
+   * passed to `setTopicPartitions` — either a concrete topic name or a
+   * wildcard pattern. Insertion order is the tie-break order when several
+   * rules match a topic. Match resolution mirrors `setTopicTtl`: an
+   * exact-topic rule wins over any pattern; between patterns the
+   * earliest-registered rule wins.
+   */
+  private partitionRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in `partitionRules`, kept
+   * apart from the subscriber pattern cache and the other rule caches so
+   * partition configuration never inflates `patternCacheSize`.
+   */
+  private partitionMatcherCache = new Map<string, RegExp>();
+  /**
+   * Per-(topic, partition) publish counters (EB-90): admitted publishes
+   * and the highest per-partition sequence number assigned. Keyed by
+   * concrete topic, then partition. Grows with the distinct (topic,
+   * partition) pairs ever published to — bounded by the partition counts
+   * in force. A publish-side shed consumes its partition's sequence
+   * number, so it counts here exactly like it counts in the topic total.
+   */
+  private partitionPublished = new Map<string, Map<number, { publishedMessages: number; lastSeq: number }>>();
   /**
    * The live retained-message table (EB-87): the latest retained message
    * per concrete (alias-resolved) topic. Rebuilt from the durable log on
@@ -7611,6 +7745,149 @@ export class EventBus {
    */
   clearTopicTtl(topicPattern: string): boolean {
     return this.ttlRules.delete(topicPattern);
+  }
+
+  /**
+   * Sets how many publish-side partitions a topic has (EB-90, real-time
+   * systems): the topic's publishes are spread over `n` partitions, each
+   * with an independent sequence counter (the EB-13 per-topic seq,
+   * extended). Producers opt into a partition per publish with
+   * `PublishOptions.partitionKey` (consistent hash) or
+   * `PublishOptions.partition` (explicit); without either, every publish
+   * lands on partition 0 — so a topic whose count stays at the default 1
+   * behaves exactly as before.
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or
+   * an exact topic name); the rule key is the exact string passed here.
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins
+   * (independent matcher cache — never inflates `patternCacheSize`).
+   * Re-setting a rule replaces it. Reducing the count does not renumber
+   * history: per-partition sequence counters never reset, so a later
+   * publish to a surviving partition continues its own numbering and a
+   * restarted bus never reuses a number (see `recoverLogState`).
+   *
+   * Throws `RangeError` when `topicPattern` is empty or `n` is not a
+   * positive integer. Audited as `partition_rule_set`.
+   */
+  setTopicPartitions(topicPattern: string, n: number): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isInteger(n) || n < 1) {
+      throw new RangeError('partition count must be a positive integer');
+    }
+    this.partitionRules.set(topicPattern, n);
+    this.auditSubscription({
+      action: 'partition_rule_set',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { partitions: n },
+    });
+  }
+
+  /**
+   * Removes the partition-count rule previously registered for
+   * `topicPattern`. Returns true when a rule existed and was removed.
+   * Already-published sequence numbers are untouched — only future
+   * publishes resolve against the remaining rules (default: 1 partition).
+   * Audited as `partition_rule_cleared` when a rule existed.
+   */
+  clearTopicPartitions(topicPattern: string): boolean {
+    const removed = this.partitionRules.delete(topicPattern);
+    if (removed) {
+      this.auditSubscription({
+        action: 'partition_rule_cleared',
+        actor: 'system',
+        pattern: topicPattern,
+      });
+    }
+    return removed;
+  }
+
+  /**
+   * Returns the publish-side partition count that applies to `topic`,
+   * or 1 when no rule matches. An exact-topic rule wins over patterns;
+   * between patterns the earliest-registered matching rule wins.
+   */
+  private partitionsForTopic(topic: string): number {
+    const exact = this.partitionRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, n] of this.partitionRules) {
+      let matcher = this.partitionMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.partitionMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return n;
+    }
+    return 1;
+  }
+
+  /**
+   * Resolves one publish's partition (EB-90): an explicit `partition`
+   * wins over the `partitionKey` consistent hash
+   * (`sha256(partitionKey) mod partitionCount`); with neither, the
+   * publish lands on partition 0. The types were already validated by
+   * the publish entry point (`validatePartitionOptions`); the range
+   * check needs the alias-resolved topic, so it runs here — still before
+   * anything is mutated — and throws `RangeError` when the explicit
+   * partition is negative or `>=` the topic's partition count.
+   */
+  private resolvePartition(
+    topic: string,
+    partitionKey: string | undefined,
+    partition: number | undefined,
+  ): number {
+    const count = this.partitionsForTopic(topic);
+    if (partition !== undefined) {
+      if (!Number.isInteger(partition) || partition < 0 || partition >= count) {
+        throw new RangeError(
+          `publish: partition ${partition} out of range for topic '${topic}' (${count} partition(s))`,
+        );
+      }
+      return partition;
+    }
+    if (partitionKey !== undefined) {
+      return Number(EventBus.hash64(partitionKey) % BigInt(count));
+    }
+    return 0;
+  }
+
+  /**
+   * Seeds one (topic, partition) publish counter during log recovery
+   * (EB-90). See `recoverLogState` for why the recovered sequence high
+   * doubles as the recovered publish count.
+   */
+  private seedPartitionPublished(topic: string, partition: number, seq: number): void {
+    let perTopic = this.partitionPublished.get(topic);
+    if (perTopic == null) {
+      perTopic = new Map();
+      this.partitionPublished.set(topic, perTopic);
+    }
+    perTopic.set(partition, { publishedMessages: seq, lastSeq: seq });
+  }
+
+  /**
+   * Counts one admitted publish against its (topic, partition) pair
+   * (EB-90): a publish-side shed consumes its partition's sequence
+   * number, so it counts here exactly like it counts in the topic total
+   * — the per-partition rows in `getStats()` reconcile with
+   * `TopicStats.publishedMessages`.
+   */
+  private countPartitionPublish(topic: string, partition: number, seq: number): void {
+    let perTopic = this.partitionPublished.get(topic);
+    if (perTopic == null) {
+      perTopic = new Map();
+      this.partitionPublished.set(topic, perTopic);
+    }
+    const row = perTopic.get(partition);
+    if (row === undefined) {
+      perTopic.set(partition, { publishedMessages: 1, lastSeq: seq });
+    } else {
+      row.publishedMessages += 1;
+      if (seq > row.lastSeq) row.lastSeq = seq;
+    }
   }
 
   /**
@@ -9578,7 +9855,29 @@ export class EventBus {
   private recoverLogState(log: DurableTopicLog): void {
     for (const topic of log.topics()) {
       const lastSeq = log.lastSeq(topic);
-      this.topicSeq.set(topic, lastSeq);
+      // Per-(topic, partition) sequence recovery (EB-90): seed each
+      // partition's counter from the log's per-partition highs, so
+      // numbering continues across restarts — never restarts, never
+      // reuses. Logs written before partition routing carry no
+      // per-partition data: their topic max seeds partition 0, the
+      // partition every pre-partitioning message belonged to.
+      const partitionSeqs = log.recoveredPartitionSeqs(topic);
+      if (partitionSeqs.size === 0) {
+        if (lastSeq > 0) {
+          this.topicSeq.set(EventBus.partitionSeqKey(topic, 0), lastSeq);
+          this.seedPartitionPublished(topic, 0, lastSeq);
+        }
+      } else {
+        for (const [partition, seq] of partitionSeqs) {
+          this.topicSeq.set(EventBus.partitionSeqKey(topic, partition), seq);
+          // Every sequence draw is paired with exactly one publish count
+          // (admitted publishes and publish-side sheds both draw), so the
+          // recovered per-partition high doubles as the recovered publish
+          // count — the per-partition rows reconcile with the topic total
+          // exactly like the live counters do.
+          this.seedPartitionPublished(topic, partition, seq);
+        }
+      }
       this.topicStats.set(topic, {
         subscriberCount: 0,
         // `messageCount` excludes the seq-0 delayed-delivery schedule
@@ -12710,7 +13009,7 @@ export class EventBus {
             ? inflateEnvelopePayload(rec.payload, this.dictionaryForRecord(rec))
             : rec.payload;
           if (!filter(rawPayload, rec.topic)) {
-            this.countFiltered(subscriber, rec.topic, rec.seq);
+            this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
             // A filtered replayed message is deliberately skipped: advance
             // the key baseline past it like the live path does, or a later
             // keySeq for the same key would buffer forever.
@@ -12734,7 +13033,7 @@ export class EventBus {
           // churn the backpressure budget on reconnect), never a sequence
           // gap, and the key/causal baselines advance past it like the live
           // path does.
-          this.countFiltered(subscriber, rec.topic, rec.seq);
+          this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
           if (rec.key !== undefined && rec.keySeq !== undefined) {
             this.skipKeySeq(subscriber, rec.key, rec.keySeq);
           }
@@ -12755,7 +13054,7 @@ export class EventBus {
         // resume, so it bypasses the linger.
         const groupId = subscriber.groupId;
         if (!opts?.ignoreLinger && groupId !== undefined && this.isLingering(groupId, rec.topic, rec.seq)) {
-          this.advanceBaseline(subscriber, rec.topic, rec.seq);
+          this.advanceBaseline(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
           if (rec.key !== undefined && rec.keySeq !== undefined) {
             this.skipKeySeq(subscriber, rec.key, rec.keySeq);
           }
@@ -12776,7 +13075,7 @@ export class EventBus {
         // so ordering gates never hang on a message that will never be
         // queued.
         if (subscriber.retainedDelivered?.get(rec.topic) === rec.seq) {
-          this.advanceBaseline(subscriber, rec.topic, rec.seq);
+          this.advanceBaseline(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
           if (rec.key !== undefined && rec.keySeq !== undefined) {
             this.skipKeySeq(subscriber, rec.key, rec.keySeq);
           }
@@ -12799,6 +13098,12 @@ export class EventBus {
           topic: rec.topic,
           payload: rec.payload,
           seq: rec.seq,
+          // Restores the partition logged at publish time (EB-90): the
+          // replayed message keeps its publish-order identity per
+          // partition, so gap detection and per-partition numbering stay
+          // consistent across restarts. Records written before partition
+          // routing carry no partition — they replay as partition 0.
+          ...(rec.partition === undefined ? {} : { partition: rec.partition }),
           // Restores the message identity logged at publish time, so a
           // resumed dedup window recognizes replays of already-delivered
           // messages (see `SubscribeOptions.deduplicateMessages`).
@@ -12937,6 +13242,7 @@ export class EventBus {
     validateCausal(opts?.causal, 'publish');
     validatePublisherId(opts?.publisherId, 'publish');
     validateSchemaVersion(opts?.schemaVersion, 'publish');
+    validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publish');
     // Multi-tenant namespace (EB-52): resolve to the concrete
     // `<namespace>/<topic>` before admission — the full pipeline below
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
@@ -12965,6 +13271,12 @@ export class EventBus {
       // MQTT-style retained message (EB-87): honored only when a
       // retained rule resolves to enabled for the topic.
       opts?.retain,
+      undefined, // pausedExpiresAt: only the pause-buffer drain passes this
+      // Publish-side partition routing (EB-90): the explicit partition
+      // wins over the partitionKey consistent hash; the range check runs
+      // in `fanOut` against the alias-resolved topic.
+      opts?.partitionKey,
+      opts?.partition,
     );
     this.scheduleFlush();
     return accepted;
@@ -13030,6 +13342,7 @@ export class EventBus {
     validateCausal(opts?.causal, 'publishIdempotent');
     validatePublisherId(opts?.publisherId, 'publishIdempotent');
     validateSchemaVersion(opts?.schemaVersion, 'publishIdempotent');
+    validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishIdempotent');
     const messageId = opts?.messageId;
     const publisherId = opts?.publisherId;
     // Multi-tenant namespace (EB-52): the `(topic, messageId)` dedup
@@ -13068,6 +13381,10 @@ export class EventBus {
         opts?.causal,
         publisherId,
         opts?.schemaVersion,
+        undefined, // retain: publishIdempotent carries no retain flag
+        undefined, // pausedExpiresAt: only the pause-buffer drain passes this
+        opts?.partitionKey,
+        opts?.partition,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -13107,6 +13424,10 @@ export class EventBus {
       opts?.causal,
       publisherId,
       opts?.schemaVersion,
+      undefined, // retain: publishIdempotent carries no retain flag
+      undefined, // pausedExpiresAt: only the pause-buffer drain passes this
+      opts?.partitionKey,
+      opts?.partition,
     );
     // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
     // and the per-publisher rate-limit gate lives inside `fanOut` — so a
@@ -13166,6 +13487,7 @@ export class EventBus {
       validateEventTime(msg.eventTime, 'publishBatch');
       validatePublisherId(msg.publisherId, 'publishBatch');
       validateSchemaVersion(msg.schemaVersion, 'publishBatch');
+      validatePartitionOptions(msg.partitionKey, msg.partition, 'publishBatch');
     }
     let accepted = 0;
     for (const msg of messages) {
@@ -13186,6 +13508,13 @@ export class EventBus {
         undefined, // causal: batch messages carry no causal clock
         msg.publisherId,
         msg.schemaVersion,
+        undefined, // retain: batch entries carry no retain flag
+        undefined, // pausedExpiresAt: only the pause-buffer drain passes this
+        // Publish-side partition routing (EB-90): the entry's `partition`
+        // (explicit) wins over `partitionKey` (consistent hash), exactly
+        // like `PublishOptions`.
+        msg.partitionKey,
+        msg.partition,
       ).accepted;
     }
     this.scheduleFlush();
@@ -13249,6 +13578,7 @@ export class EventBus {
       validateEventTime(entry.eventTime, 'publishAtomic');
       validatePublisherId(entry.publisherId, 'publishAtomic');
       validateSchemaVersion(entry.schemaVersion, 'publishAtomic');
+      validatePartitionOptions(entry.partitionKey, entry.partition, 'publishAtomic');
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
@@ -13282,6 +13612,13 @@ export class EventBus {
       }
       const resolvedTopic = aliasResolution.topic;
       resolvedTopics[index] = resolvedTopic;
+      // Publish-side partition routing (EB-90): the range check runs here,
+      // in admission — an out-of-range explicit partition aborts the batch
+      // before the commit phase, so a throw can never leave a
+      // half-committed batch behind. The commit phase re-resolves the
+      // same request against the same resolved topic (deterministic), so
+      // no per-entry partition needs storing.
+      this.resolvePartition(resolvedTopic, entries[index].partitionKey, entries[index].partition);
       // Sensitive-field redaction (EB-68) runs in shadow admission, on
       // the resolved topic, before the schema gate: the schema verdict,
       // the size cap, and the commit phase all see the redacted bytes.
@@ -13323,8 +13660,8 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { key, traceparent, messageId, eventTime, publisherId, schemaVersion } = entries[index];
-      // Deprecated-schema accounting (EB-86): the shadow admission ran
+      const { key, traceparent, messageId, eventTime, publisherId, schemaVersion, partitionKey, partition } =
+        entries[index];      // Deprecated-schema accounting (EB-86): the shadow admission ran
       // the validator, so the commit only re-resolves the version
       // bookkeeping — an aborted batch never reaches here, so every
       // committed deprecated admission is counted exactly once.
@@ -13350,6 +13687,13 @@ export class EventBus {
         undefined, // causal: atomic entries carry no causal clock
         publisherId,
         schemaVersion,
+        undefined, // retain: atomic entries carry no retain flag
+        undefined, // pausedExpiresAt: only the pause-buffer drain passes this
+        // Publish-side partition routing (EB-90): the request validated
+        // in admission re-resolves here deterministically — it cannot
+        // throw at commit.
+        partitionKey,
+        partition,
       );
     }
     this.scheduleFlush();
@@ -13821,8 +14165,13 @@ export class EventBus {
         if (pauseRule.mode === 'shed') {
           const stats = this.statsFor(top.topic);
           stats.publishedMessages += 1;
-          stats.lastSeq = this.nextSeq(top.topic);
+          // Delayed schedules carry no partition routing (EB-90): the
+          // shed consumes a partition-0 sequence number, like every
+          // other unpartitioned publish.
+          const shedSeq = this.nextSeq(top.topic, 0);
+          stats.lastSeq = Math.max(stats.lastSeq, shedSeq);
           this.totalPublished += 1;
+          this.countPartitionPublish(top.topic, 0, shedSeq);
           if (top.key !== undefined && top.keySeq !== undefined) {
             this.releaseKeySequence(top.key, top.keySeq);
             fannedOut = true;
@@ -14155,6 +14504,10 @@ export class EventBus {
       topic,
       payload: msg.payload,
       seq: msg.seq,
+      // The assigned partition rides the retained entry (EB-90): the
+      // snapshot keeps the message's publish-order identity per
+      // partition for gap detection.
+      ...(msg.partition === undefined ? {} : { partition: msg.partition }),
       at: nowMs,
       ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(dictId === undefined ? {} : { dictId }),
@@ -14171,6 +14524,10 @@ export class EventBus {
       retained: true,
       retainedSeq: msg.seq,
       payload: msg.payload,
+      // The assigned partition rides the seq-0 retained record (EB-90)
+      // so restart recovery rebuilds the table with the message's
+      // partition identity intact.
+      ...(msg.partition === undefined ? {} : { partition: msg.partition }),
       ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(dictId === undefined ? {} : { dictId }),
       ...(signature === undefined ? {} : { signature }),
@@ -14276,6 +14633,10 @@ export class EventBus {
         payload: entry.payload,
         seq: entry.seq,
         retained: true,
+        // The retained message's partition (EB-90): the snapshot keeps
+        // the publish-order identity its seq was drawn from, so gap
+        // detection keys the snapshot against the right partition.
+        ...(entry.partition === undefined ? {} : { partition: entry.partition }),
         ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
         ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
         ...(entry.eventTime === undefined ? {} : { eventTime: entry.eventTime }),
@@ -14307,7 +14668,7 @@ export class EventBus {
       if (filter !== undefined && !filter(msg.payload, msg.topic)) {
         // Content-filtered: seen and deliberately skipped — never queued
         // (no backpressure budget), never a sequence gap.
-        this.countFiltered(subscriber, msg.topic, msg.seq);
+        this.countFiltered(subscriber, msg.topic, msg.seq, '', msg.partition ?? 0);
         continue;
       }
       this.detectGap(subscriber, msg);
@@ -14375,6 +14736,7 @@ export class EventBus {
         payload: latest.payload,
         seq: latest.retainedSeq,
         at: latest.at,
+        ...(latest.partition === undefined ? {} : { partition: latest.partition }),
         ...(latest.expiresAt === undefined ? {} : { expiresAt: latest.expiresAt }),
         ...(latest.dictId === undefined ? {} : { dictId: latest.dictId }),
         ...(latest.signature === undefined ? {} : { signature: { ...latest.signature } }),
@@ -14571,15 +14933,17 @@ export class EventBus {
   }
 
   /**
-   * Hands out the next per-topic sequence number, starting at 1. The
-   * counter is per concrete topic and never resets, so every message ever
-   * published to a topic carries a unique, gap-free number at publish
-   * time — gaps only ever appear downstream, when a subscriber's queue
-   * drops or expires a message.
+   * Hands out the next per-(topic, partition) sequence number, starting at
+   * 1 (EB-90 — the EB-13 per-topic seq, extended). The counter is per
+   * concrete (topic, partition) pair and never resets, so every message
+   * ever published to the pair carries a unique, gap-free number at
+   * publish time — gaps only ever appear downstream, when a subscriber's
+   * queue drops or expires a message.
    */
-  private nextSeq(topic: string): number {
-    const seq = (this.topicSeq.get(topic) ?? 0) + 1;
-    this.topicSeq.set(topic, seq);
+  private nextSeq(topic: string, partition: number): number {
+    const key = EventBus.partitionSeqKey(topic, partition);
+    const seq = (this.topicSeq.get(key) ?? 0) + 1;
+    this.topicSeq.set(key, seq);
     return seq;
   }
 
@@ -15085,7 +15449,7 @@ export class EventBus {
       // phantom gap for a message it chose not to receive. A requeued or
       // replayed copy keeps the original seq, and `advanceBaseline` only
       // moves forward, so those stay no-ops.
-      this.advanceBaseline(subscriber, msg.topic, msg.seq, msg.epoch ?? '');
+      this.advanceBaseline(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
       this.statsFor(msg.topic).dedupDropped += 1;
       this.totalDedupDropped += 1;
       return true;
@@ -15531,7 +15895,7 @@ export class EventBus {
       // must not surface as a sequence gap, so the per-topic baseline
       // advances over it (seen, deliberately skipped). A throwing filter
       // propagates to the publish call, like a throwing schema validator.
-      this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '');
+      this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
       return false;
     }
     const composite = subscriber.composite;
@@ -15542,7 +15906,7 @@ export class EventBus {
       // baseline advances over it so the deliberate skip never counts as
       // a sequence gap. Counted like a filter rejection: both are
       // subscriber-side narrowing, invisible to gap detection.
-      this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '');
+      this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
       return false;
     }
     const throttle = subscriber.throttle;
@@ -16016,14 +16380,21 @@ export class EventBus {
    * `detectGap` — a skip from a different epoch re-establishes the
    * baseline instead of comparing across numbering spaces.
    */
-  private advanceBaseline(subscriber: Subscriber, topic: string, seq: number, epoch = ''): void {
-    const last = subscriber.lastDeliveredSeq.get(topic);
-    const lastEpoch = subscriber.lastEpoch.get(topic);
+  private advanceBaseline(
+    subscriber: Subscriber,
+    topic: string,
+    seq: number,
+    epoch = '',
+    partition = 0,
+  ): void {
+    const gapKey = EventBus.gapKey(topic, partition);
+    const last = subscriber.lastDeliveredSeq.get(gapKey);
+    const lastEpoch = subscriber.lastEpoch.get(gapKey);
     if (last === undefined || lastEpoch !== epoch) {
-      subscriber.lastDeliveredSeq.set(topic, seq);
-      subscriber.lastEpoch.set(topic, epoch);
+      subscriber.lastDeliveredSeq.set(gapKey, seq);
+      subscriber.lastEpoch.set(gapKey, epoch);
     } else if (seq > last) {
-      subscriber.lastDeliveredSeq.set(topic, seq);
+      subscriber.lastDeliveredSeq.set(gapKey, seq);
     }
   }
 
@@ -16038,8 +16409,14 @@ export class EventBus {
    * is filtered stays invisible, because the baseline can only move on
    * deliveries and filter decisions.
    */
-  private countFiltered(subscriber: Subscriber, topic: string, seq: number, epoch = ''): void {
-    this.advanceBaseline(subscriber, topic, seq, epoch);
+  private countFiltered(
+    subscriber: Subscriber,
+    topic: string,
+    seq: number,
+    epoch = '',
+    partition = 0,
+  ): void {
+    this.advanceBaseline(subscriber, topic, seq, epoch, partition);
     this.statsFor(topic).filteredMessages += 1;
     this.totalFiltered += 1;
   }
@@ -16183,6 +16560,16 @@ export class EventBus {
     // (a rule added in between does not retroactively extend the
     // message). Every other path leaves it undefined.
     pausedExpiresAt?: number,
+    // Publish-side partition routing (see `PublishOptions.partitionKey` /
+    // `PublishOptions.partition`, EB-90): the publish entry points
+    // validate the types (`validatePartitionOptions`); `fanOut` resolves
+    // the partition against the alias-resolved topic right after alias
+    // resolution (explicit partition wins over the `partitionKey`
+    // consistent hash; default 0). Internal paths (bridge, cluster,
+    // routes, forwards, delayed fan-out, pause-buffer drain) leave both
+    // undefined and land on partition 0.
+    partitionKey?: string,
+    partition?: number,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -16206,6 +16593,17 @@ export class EventBus {
       return { matched: 0, accepted: 0, admitted: false };
     }
     topic = aliasResolution.topic;
+    // Publish-side partition routing (EB-90): resolves the message's
+    // partition from the explicit `partition` (wins) or the consistent
+    // hash of `partitionKey` over the topic's configured partition count
+    // (`setTopicPartitions`, default 1). Throws `RangeError` on an
+    // out-of-range explicit partition — placed here, right after alias
+    // resolution and before the pause gate, so an invalid partition never
+    // buffers, never sheds, never logs, and never draws a sequence
+    // number. The resolved partition selects the per-(topic, partition)
+    // sequence counter below and rides the envelope, the durable log,
+    // and the per-partition stats.
+    const resolvedPartition = this.resolvePartition(topic, partitionKey, partition);
     // Sensitive-field redaction (EB-68): admission-time, before every
     // gate. The schema validator, the size cap, the rate limiter,
     // compression, the bridge mirror, the durable log, and fan-out all
@@ -16235,8 +16633,10 @@ export class EventBus {
         if (pauseRule.mode === 'shed') {
           const stats = this.statsFor(topic);
           stats.publishedMessages += 1;
-          stats.lastSeq = this.nextSeq(topic);
+          const shedSeq = this.nextSeq(topic, resolvedPartition);
+          stats.lastSeq = Math.max(stats.lastSeq, shedSeq);
           this.totalPublished += 1;
+          this.countPartitionPublish(topic, resolvedPartition, shedSeq);
           this.countTopicPaused(topic, payload, publisherId);
           return { matched: 0, accepted: 0, admitted: false };
         }
@@ -16331,7 +16731,11 @@ export class EventBus {
     const msg: BusMessage = {
       topic,
       payload,
-      seq: this.nextSeq(topic),
+      // Per-(topic, partition) sequence number (EB-90): the envelope's
+      // partition is always stamped — 0 for unpartitioned traffic — so
+      // gap detection, replay and the durable log key off one field.
+      seq: this.nextSeq(topic, resolvedPartition),
+      partition: resolvedPartition,
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
       // The producer label rides the envelope so attribution survives
       // durable-log replay, delayed schedules and cross-bus forwards.
@@ -16347,8 +16751,11 @@ export class EventBus {
     if (diagnostic) this.diagnosticMessages.add(msg);
     const stats = this.statsFor(topic);
     stats.publishedMessages += 1;
-    stats.lastSeq = msg.seq;
+    // Topic-level `lastSeq` stays the highest number handed out on any
+    // partition — the per-partition highs live in `partitionPublished`.
+    stats.lastSeq = Math.max(stats.lastSeq, msg.seq);
     this.totalPublished += 1;
+    this.countPartitionPublish(topic, resolvedPartition, msg.seq);
     // Per-publisher publish counting (EB-65): only admitted publishes
     // count — a schema rejection or rate-limit shed above never reaches
     // this line. Anonymous publishes move no per-publisher counter.
@@ -16596,6 +17003,11 @@ export class EventBus {
       at: nowMs,
       expiresAt,
       payload: msg.payload,
+      // The assigned partition rides the record (EB-90): replay restores
+      // it onto the envelope and restart recovery rebuilds the
+      // per-(topic, partition) sequence counters from it, so numbering
+      // never restarts and never reuses a number across restarts.
+      partition: resolvedPartition,
       ...(delayed == null ? {} : { deliverAt: delayed.deliverAt, delayId: delayed.delayId }),
       ...(keyed === undefined ? {} : { key: keyed.key, keySeq: keyed.keySeq }),
       // Only present when a preset dictionary compressed this message:
@@ -17334,6 +17746,28 @@ export class EventBus {
           return trainer === undefined ? {} : { autoTrain: trainer.snapshot() };
         })(),
         rates: this.publishRates.ratesFor(topic, ratesNow),
+        // Per-partition publish counters (EB-90): present only when the
+        // topic resolves to more than one partition — single-partition
+        // topics omit the field so their snapshots are byte-identical to
+        // before. Rows cover every configured partition in ascending
+        // order (zero when a partition has seen no publish yet), so the
+        // shape is stable for a given rule rather than sparse.
+        ...(() => {
+          const partitionCount = this.partitionsForTopic(topic);
+          if (partitionCount <= 1) return {};
+          const perTopic = this.partitionPublished.get(topic);
+          const partitions: Array<{ partition: number; publishedMessages: number; lastSeq: number }> =
+            [];
+          for (let p = 0; p < partitionCount; p++) {
+            const row = perTopic?.get(p);
+            partitions.push({
+              partition: p,
+              publishedMessages: row?.publishedMessages ?? 0,
+              lastSeq: row?.lastSeq ?? 0,
+            });
+          }
+          return { partitions };
+        })(),
       })),
       // Per-namespace aggregates (EB-52), in registration order — derived
       // from the per-topic stats above. Omitted when no namespace is
@@ -18774,15 +19208,18 @@ export class EventBus {
   }
 
   /**
-   * Compares a delivered message's topic sequence number against the last
-   * number delivered to the same subscriber on the same topic, and counts
-   * any skipped numbers into the topic's `sequenceGaps` stat (and the global
-   * total). The first delivery on a topic only establishes the baseline —
-   * a subscriber that joined after earlier publishes must not count
-   * pre-subscription messages as lost. A delivery at or below the last
-   * delivered number is a redelivery (at-least-once `nack()` / ack-timeout
-   * requeue): expected, never a gap, and it does not move the baseline
-   * backwards.
+   * Compares a delivered message's partition-scoped sequence number
+   * against the last number delivered to the same subscriber on the same
+   * (topic, partition), and counts any skipped numbers into the topic's
+   * `sequenceGaps` stat (and the global total). Baselines are tracked per
+   * (topic, partition) (EB-90): partitions number independently, so a
+   * subscriber interleaving partitions never counts one partition's
+   * numbers as another's gaps. The first delivery on a (topic, partition)
+   * only establishes the baseline — a subscriber that joined after earlier
+   * publishes must not count pre-subscription messages as lost. A delivery
+   * at or below the last delivered number is a redelivery (at-least-once
+   * `nack()` / ack-timeout requeue): expected, never a gap, and it does
+   * not move the baseline backwards.
    *
    * Sequence epochs: the node's own publishes and each hub's forwarded
    * traffic number the same topic independently. When a delivery arrives
@@ -18792,11 +19229,12 @@ export class EventBus {
    */
   private detectGap(subscriber: Subscriber, msg: BusMessage): void {
     const epoch = msg.epoch ?? '';
-    const lastEpoch = subscriber.lastEpoch.get(msg.topic);
-    const last = subscriber.lastDeliveredSeq.get(msg.topic);
+    const gapKey = EventBus.gapKey(msg.topic, msg.partition ?? 0);
+    const lastEpoch = subscriber.lastEpoch.get(gapKey);
+    const last = subscriber.lastDeliveredSeq.get(gapKey);
     if (last === undefined || lastEpoch !== epoch) {
-      subscriber.lastDeliveredSeq.set(msg.topic, msg.seq);
-      subscriber.lastEpoch.set(msg.topic, epoch);
+      subscriber.lastDeliveredSeq.set(gapKey, msg.seq);
+      subscriber.lastEpoch.set(gapKey, epoch);
       return;
     }
     if (msg.seq > last + 1) {
@@ -18805,6 +19243,17 @@ export class EventBus {
       const stats = this.topicStats.get(msg.topic);
       if (stats != null) stats.sequenceGaps += missing;
     }
-    if (msg.seq > last) subscriber.lastDeliveredSeq.set(msg.topic, msg.seq);
+    if (msg.seq > last) subscriber.lastDeliveredSeq.set(gapKey, msg.seq);
+  }
+
+  /**
+   * Key for the per-subscriber gap baselines (`lastDeliveredSeq` /
+   * `lastEpoch`): the (topic, partition) pair. A message without an
+   * assigned partition (bridge/cluster ingress, window aggregates) keys
+   * as partition 0 — the same partition `fanOut` assigns unpartitioned
+   * publishes.
+   */
+  private static gapKey(topic: string, partition: number): string {
+    return `${topic}\0${partition}`;
   }
 }

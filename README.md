@@ -2350,6 +2350,58 @@ How it works:
   `delayed_cancelled` (`{ cancelled, delayIds, topicPattern }`), including
   the empty case, so the operator action is always on record.
 
+## Publish-side partition routing
+
+`setTopicPartitions(topicPattern, n)` (`src/bus.ts`, EB-90) gives a topic
+`n` publish-side partitions (default 1) — the sharding dimension a
+partitioned consumer tier needs. Each `(topic, partition)` pair has an
+independent sequence counter (the EB-13 per-topic seq, extended), so
+`BusMessage.seq` is scoped to the message's partition and subscriber gap
+detection baselines are tracked per `(topic, partition)`: partitions never
+count each other's numbers as gaps.
+
+```ts
+bus.setTopicPartitions('orders', 8);
+bus.publish('orders', order, { partitionKey: order.userId }); // sha256(key) mod 8
+bus.publish('orders', order, { partition: 3 }); // explicit wins over partitionKey
+```
+
+How it works:
+
+- **Selectors** — `PublishOptions.partitionKey` is a consistent-hash
+  selector (`sha256(partitionKey) mod partitionCount`): the same key
+  always lands on the same partition. `PublishOptions.partition` is an
+  explicit partition number and wins when both are set. Both are opt-in;
+  without either, every publish lands on partition 0 — a topic whose
+  count stays at the default 1 behaves exactly as before.
+- **Validation** — `partitionKey` must be a non-empty string;
+  `partition` must be an integer `>= 0` and `<` the topic's partition
+  count (on a single-partition topic the only valid value is `0`).
+  `setTopicPartitions` rejects empty patterns and non-positive-integer
+  counts. Everything throws `RangeError` before anything is mutated.
+- **Rule matching** — mirrors the TTL convention: an exact-topic rule
+  wins over patterns; between patterns the earliest-registered rule wins.
+  `clearTopicPartitions(topicPattern)` removes a rule (already-published
+  sequence numbers are untouched).
+- **Keyed ordering** — partition is a seq/routing dimension only: the
+  per-key publish-order mechanism (EB-36) is untouched, so one key keeps
+  its publish order even when its messages land on different partitions.
+- **Durability** — the assigned partition is stamped on the envelope
+  (`BusMessage.partition`) and persisted on the durable-log record:
+  replay restores it, and restart recovery rebuilds the per-(topic,
+  partition) counters from the log — numbering never restarts and never
+  reuses a number across restarts (old logs without partition data seed
+  partition 0 from the topic max).
+- **Observability** — `getStats()` exposes per-partition
+  `publishedMessages`/`lastSeq` rows (only for topics with more than one
+  partition; single-partition snapshots are byte-identical to before),
+  Prometheus renders
+  `eventbus_topic_partition_published_total{topic,partition}`, and rule
+  changes are audited as `partition_rule_set` / `partition_rule_cleared`.
+- **Scope note** — partition routing is a publish-side admission
+  decision: delayed schedules, pause-buffered messages, and bridge/cluster
+  ingress fan out as ordinary (partition-0) publishes.
+
 ## Subscription lifecycle audit log
 
 Every subscription change is recorded in an append-only audit log —
@@ -2395,7 +2447,7 @@ Details:
   `signature_verification_failed` carries `{ seq, kid? }`;
   `retention_updated` carries `{ from, to }` (null when unset);
   `retained_rule_set` carries `{ enabled }`, `retained_cleared` carries
-  `{ via: 'publish' }`.
+  `{ via: 'publish' }`; `partition_rule_set` carries `{ partitions }`.
 
 ## Prometheus metrics
 
@@ -2439,6 +2491,7 @@ Exported series:
 | `eventbus_causal_buffer_dropped_messages_total` | counter | `causalBuffer.droppedMessages` — causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock) |
 | `eventbus_causal_buffer_regressed_messages_total` | counter | `causalBuffer.regressedMessages` — causal messages delivered immediately on clock regression |
 | `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
+| `eventbus_topic_partition_published_total{topic,partition}` | counter | per-partition `publishedMessages` (EB-90); only emitted for topics with more than one configured partition |
 | `eventbus_topic_late_messages_total{topic}` | counter | per-topic `lateMessages` (EB-59) |
 | `eventbus_topic_event_time_watermark{topic}` | gauge | per-topic event-time watermark in epoch ms (EB-59); only emitted for topics with at least one event-time publish |
 | `eventbus_subscribers` | gauge | `totalSubscribers` |

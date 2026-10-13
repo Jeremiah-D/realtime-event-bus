@@ -9,7 +9,8 @@
  * (EB-87, `retained_rule_set` / `retained_rule_cleared` /
  * `retained_cleared`) / topic pause/resume (EB-88, `topic_paused` /
  * `topic_resumed`) / bulk delayed-delivery cancellation (EB-89,
- * `delayed_cancelled`).
+ * `delayed_cancelled`) / publish-side partition-count rule changes (EB-90,
+ * `partition_rule_set` / `partition_rule_cleared`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -53,7 +54,9 @@ export type SubscriptionAuditAction =
   | 'retained_cleared'
   | 'topic_paused'
   | 'topic_resumed'
-  | 'delayed_cancelled';
+  | 'delayed_cancelled'
+  | 'partition_rule_set'
+  | 'partition_rule_cleared';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -68,6 +71,8 @@ export type SubscriptionAuditAction =
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
  * - `retained_cleared`: `{ via: 'publish' }` (the `topic` field carries the concrete topic)
+ * - `partition_rule_set`: `{ partitions: <count> }` (the `pattern` field carries the rule key)
+ * - `partition_rule_cleared`: no detail (the `pattern` field carries the rule key)
  * - `topic_paused`: `{ mode: 'shed'|'queue' }` (the `pattern` field carries the rule key)
  * - `topic_resumed`: `{ mode: 'shed'|'queue', drainedMessages: <count> }` (the `pattern` field carries the rule key)
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
@@ -128,6 +133,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'topic_paused',
   'topic_resumed',
   'delayed_cancelled',
+  'partition_rule_set',
+  'partition_rule_cleared',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

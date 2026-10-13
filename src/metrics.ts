@@ -51,6 +51,10 @@
  *   delivered immediately on clock regression (see
  *   `SubscribeOptions.causal`).
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
+ * - `eventbus_topic_partition_published_total{topic,partition}`: admitted
+ *   publishes per topic partition (EB-90; only emitted for topics with
+ *   more than one configured partition — single-partition topics render
+ *   byte-identical exposition to before).
  * - `eventbus_topic_paused_messages_total{topic}`: publishes per topic
  *   shed by topic pauses in shed mode (EB-88).
  * - `eventbus_topic_late_messages_total{topic}`: messages per topic whose
@@ -169,7 +173,10 @@
  * the busiest topics, not the full topic space. The
  * `eventbus_key_hotspot_buffer_depth` series are capped the same way at
  * `HOT_KEYS_LIMIT` (10) by `BusStats.hotKeys`, and only hotspot-monitored
- * subscriptions are sampled at all.
+ * subscriptions are sampled at all. The
+ * `eventbus_topic_partition_published_total` series are bounded by the
+ * topic's configured partition count — they are only emitted for topics
+ * with more than one partition, so unpartitioned topics add no series.
  *
  * `renderPrometheus` tolerates a stats object that predates the rate
  * fields (a missing `hotTopics` renders no rate series instead of
@@ -510,6 +517,30 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_signature_failures_total{${label}} ${t.signatureFailures ?? 0}`);
     if (t.watermark !== undefined) {
       lines.push(`eventbus_topic_event_time_watermark{${label}} ${t.watermark}`);
+    }
+  }
+
+  // Per-(topic, partition) admitted publishes (EB-90), in first-publish
+  // topic order and ascending partition order (same as
+  // BusStats.topics[].partitions). Only topics with more than one
+  // configured partition carry this series — a single-partition topic
+  // renders byte-identical exposition to before. The `?? []` keeps the
+  // renderer tolerant of a stats object that predates the field
+  // (hand-built fixtures included).
+  const partitionRows: Array<{ topic: string; partition: number; publishedMessages: number }> = [];
+  for (const t of stats.topics) {
+    for (const p of t.partitions ?? []) {
+      partitionRows.push({ topic: t.topic, partition: p.partition, publishedMessages: p.publishedMessages });
+    }
+  }
+  if (partitionRows.length > 0) {
+    lines.push(
+      '# HELP eventbus_topic_partition_published_total Total admitted publishes per topic partition (publish-side partition routing, EB-90).',
+    );
+    lines.push('# TYPE eventbus_topic_partition_published_total counter');
+    for (const r of partitionRows) {
+      const labels = `topic="${escapeLabelValue(r.topic)}",partition="${r.partition}"`;
+      lines.push(`eventbus_topic_partition_published_total{${labels}} ${r.publishedMessages}`);
     }
   }
 

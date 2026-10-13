@@ -140,6 +140,17 @@ export interface DurableLogRecord {
    */
   retainedSeq?: number;
   /**
+   * Publish-side partition the message was assigned to (see
+   * `PublishOptions.partitionKey` / `PublishOptions.partition`, EB-90):
+   * the per-(topic, partition) sequence space `seq` was drawn from.
+   * Present on message records (`seq >= 1`) and on seq-0 retained-message
+   * set records; absent on records written before partition routing
+   * (replay treats those as partition 0). Restart recovery rebuilds the
+   * per-(topic, partition) sequence counters from it, so numbering never
+   * restarts and never reuses a number across restarts.
+   */
+  partition?: number;
+  /**
    * Compaction key for keyed log compaction (see
    * `DurableLogOptions.keyCompaction`): records sharing a (topic, key)
    * keep only the latest — Kafka-style log compaction for state snapshots
@@ -333,6 +344,12 @@ interface LogLine {
   /** Per-key publish-order sequence number, present exactly when `key` is. */
   keySeq?: number;
   /**
+   * Publish-side partition the message was assigned to (see
+   * `DurableLogRecord.partition`). Absent on records written before
+   * partition routing.
+   */
+  partition?: number;
+  /**
    * SHA-256 id of the preset dictionary that compressed `payload`, when
    * the payload is a dictionary-compressed envelope. The bytes live in
    * the bus's registry; the id is all replay needs.
@@ -507,6 +524,14 @@ export interface ArchiveEntry {
   messages: number;
   /** Highest per-key sequence number per key observed in the segment. */
   keySeqs: Map<string, number>;
+  /**
+   * Highest sequence number per partition observed in the segment
+   * (EB-90). Archived seq bounds fold into the per-(topic, partition)
+   * cursors, so a restart never reuses a sequence number from an
+   * archived segment. Records without partition data count toward
+   * partition 0.
+   */
+  partitionSeqs: Map<number, number>;
 }
 
 /** On-disk envelope for one archive-index line. `v` pins the format. */
@@ -523,6 +548,13 @@ interface ArchiveIndexLine {
   messages: number;
   /** Highest per-key sequence number per key in the segment, when any. */
   keySeqs?: Record<string, number>;
+  /**
+   * Highest sequence number per partition in the segment (EB-90), when
+   * any — keys are the decimal partition numbers. Absent on index lines
+   * written before partition routing (their records all belonged to
+   * partition 0).
+   */
+  partitionSeqs?: Record<string, number>;
 }
 
 /** Builds the on-disk envelope for an archive index entry. */
@@ -544,6 +576,11 @@ function archiveIndexLineOf(entry: ArchiveEntry): ArchiveIndexLine {
     for (const [key, seq] of entry.keySeqs) keySeqs[key] = seq;
     line.keySeqs = keySeqs;
   }
+  if (entry.partitionSeqs.size > 0) {
+    const partitionSeqs: Record<string, number> = {};
+    for (const [partition, seq] of entry.partitionSeqs) partitionSeqs[String(partition)] = seq;
+    line.partitionSeqs = partitionSeqs;
+  }
   return line;
 }
 
@@ -551,8 +588,8 @@ function archiveIndexLineOf(entry: ArchiveEntry): ArchiveIndexLine {
  * Parses one archive-index line. Returns `null` for anything malformed —
  * wrong version, an empty topic/segmentId/path, non-integer seq bounds,
  * non-finite time bounds, a non-positive-integer entry count, a negative
- * message count, or a malformed keySeqs table. Corrupt lines are skipped,
- * never fatal.
+ * message count, a malformed keySeqs table, or a malformed partitionSeqs
+ * table. Corrupt lines are skipped, never fatal.
  */
 function parseArchiveIndexLine(line: string): ArchiveEntry | null {
   let parsed: unknown;
@@ -583,6 +620,19 @@ function parseArchiveIndexLine(line: string): ArchiveEntry | null {
       keySeqs.set(key, seq as number);
     }
   }
+  const partitionSeqs = new Map<number, number>();
+  if (o['partitionSeqs'] !== undefined) {
+    // Keys are decimal partition numbers; values are positive-integer
+    // seqs. Malformed tables make the line corrupt — the bus only ever
+    // writes well-formed ones.
+    if (typeof o['partitionSeqs'] !== 'object' || o['partitionSeqs'] === null) return null;
+    for (const [key, seq] of Object.entries(o['partitionSeqs'] as Record<string, unknown>)) {
+      if (!/^(0|[1-9][0-9]*)$/.test(key) || !Number.isInteger(seq) || (seq as number) < 1) {
+        return null;
+      }
+      partitionSeqs.set(parseInt(key, 10), seq as number);
+    }
+  }
   return {
     topic: o['topic'] as string,
     segmentId: o['segmentId'] as string,
@@ -594,6 +644,7 @@ function parseArchiveIndexLine(line: string): ArchiveEntry | null {
     entries: o['entries'] as number,
     messages: o['messages'] as number,
     keySeqs,
+    partitionSeqs,
   };
 }
 
@@ -899,6 +950,17 @@ export class DurableTopicLog {
   private readonly messageCounts = new Map<string, number>();
   /** Highest seq observed per topic (recovered + appended). */
   private readonly lastSeqs = new Map<string, number>();
+  /**
+   * Highest seq observed per (topic, partition) (EB-90; recovered +
+   * appended). Records written before partition routing carry no
+   * partition and count toward partition 0 — the partition every
+   * pre-partitioning message belonged to. The bus seeds its
+   * per-(topic, partition) sequence counters from this so numbering
+   * continues across restarts instead of restarting at 1 (which would
+   * collide with replayed seqs). Like `lastSeqs` this is a max-ever
+   * cursor: compaction never moves it backwards.
+   */
+  private readonly maxPartitionSeqs = new Map<string, Map<number, number>>();
   /**
    * Latest message seq per (topic, key), rebuilt on recovery and
    * maintained on append — the in-memory side of keyed compaction. Only
@@ -1214,6 +1276,7 @@ export class DurableTopicLog {
         // seq 0 schedule records and tombstones are log lines, not messages.
         if (rec.seq >= 1) messages += 1;
         this.noteKeySeq(rec.key, rec.keySeq);
+        this.notePartitionSeq(topic, rec.partition, rec.seq);
       }
       this.lastSeqs.set(topic, last);
       this.messageCounts.set(topic, messages);
@@ -1348,6 +1411,18 @@ export class DurableTopicLog {
     }
     this.messageCounts.set(entry.topic, (this.messageCounts.get(entry.topic) ?? 0) + entry.messages);
     for (const [key, seq] of entry.keySeqs) this.noteKeySeq(key, seq);
+    // Archived seq bounds fold into the per-(topic, partition) cursors
+    // (EB-90), so a restart never reuses a sequence number from an
+    // archived segment. Segments archived before partition routing carry
+    // no per-partition data: their seqEnd belongs to partition 0, like
+    // their records did.
+    if (entry.partitionSeqs.size === 0) {
+      this.notePartitionSeq(entry.topic, 0, entry.seqEnd);
+    } else {
+      for (const [partition, seq] of entry.partitionSeqs) {
+        this.notePartitionSeq(entry.topic, partition, seq);
+      }
+    }
   }
 
   /** Summarizes parsed records into an archive entry. */
@@ -1356,10 +1431,17 @@ export class DurableTopicLog {
     const last = records[records.length - 1];
     let messages = 0;
     const keySeqs = new Map<string, number>();
+    const partitionSeqs = new Map<number, number>();
     for (const rec of records) {
       if (rec.seq >= 1) messages += 1;
       if (rec.key !== undefined && rec.keySeq !== undefined && rec.keySeq > (keySeqs.get(rec.key) ?? 0)) {
         keySeqs.set(rec.key, rec.keySeq);
+      }
+      // Seq-0 schedule records carry no sequence number; records without
+      // partition data count toward partition 0.
+      if (rec.seq >= 1) {
+        const p = rec.partition ?? 0;
+        if (rec.seq > (partitionSeqs.get(p) ?? 0)) partitionSeqs.set(p, rec.seq);
       }
     }
     return {
@@ -1373,6 +1455,7 @@ export class DurableTopicLog {
       entries: records.length,
       messages,
       keySeqs,
+      partitionSeqs,
     };
   }
 
@@ -1436,6 +1519,7 @@ export class DurableTopicLog {
       this.lastSeqs.set(record.topic, record.seq);
     }
     this.noteKeySeq(record.key, record.keySeq);
+    this.notePartitionSeq(record.topic, record.partition, record.seq);
     if (this.keyCompaction && record.key !== undefined && record.seq >= 1) {
       let keys = this.keyIndex.get(record.topic);
       if (keys == null) {
@@ -2241,10 +2325,39 @@ export class DurableTopicLog {
     return new Map(this.maxKeySeqs);
   }
 
+  /**
+   * Highest sequence number observed per partition for a topic (EB-90),
+   * recovered from disk and maintained on append. The bus seeds its
+   * per-(topic, partition) sequence counters from this so numbering
+   * continues across restarts instead of restarting at 1 (which would
+   * collide with replayed seqs). Empty when the topic is unknown or when
+   * none of its records carried partition data (pre-partitioning logs —
+   * the bus falls back to seeding partition 0 from `lastSeq`).
+   */
+  recoveredPartitionSeqs(topic: string): Map<number, number> {
+    return new Map(this.maxPartitionSeqs.get(topic));
+  }
+
   /** Records the highest keySeq seen for a key; ignores keyless records. */
   private noteKeySeq(key: string | undefined, keySeq: number | undefined): void {
     if (key === undefined || keySeq === undefined) return;
     if (keySeq > (this.maxKeySeqs.get(key) ?? 0)) this.maxKeySeqs.set(key, keySeq);
+  }
+
+  /**
+   * Records the highest seq seen for a (topic, partition) pair; ignores
+   * seq-0 schedule records (they carry no sequence number). A record
+   * without a partition counts toward partition 0.
+   */
+  private notePartitionSeq(topic: string, partition: number | undefined, seq: number): void {
+    if (seq < 1) return;
+    const p = partition ?? 0;
+    let perTopic = this.maxPartitionSeqs.get(topic);
+    if (perTopic === undefined) {
+      perTopic = new Map();
+      this.maxPartitionSeqs.set(topic, perTopic);
+    }
+    if (seq > (perTopic.get(p) ?? 0)) perTopic.set(p, seq);
   }
 
   /** Entries retained for a topic, 0 when the topic is unknown. */
@@ -2371,6 +2484,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.schemaVersion !== undefined) line.schemaVersion = record.schemaVersion;
   if (record.key !== undefined) line.key = record.key;
   if (record.keySeq !== undefined) line.keySeq = record.keySeq;
+  if (record.partition !== undefined) line.partition = record.partition;
   if (record.dictId !== undefined) line.dictId = record.dictId;
   if (record.messageId !== undefined) line.messageId = record.messageId;
   if (record.eventTime !== undefined) line.eventTime = record.eventTime;
@@ -2518,6 +2632,14 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       return null;
     }
     record.keySeq = o['keySeq'] as number;
+  }
+  if (o['partition'] !== undefined) {
+    // The partition is routing metadata, not ordering metadata on its
+    // own — but a malformed value still makes the line corrupt: the bus
+    // only ever writes non-negative integers, so a bad one means the line
+    // was tampered with or miswritten.
+    if (!Number.isInteger(o['partition']) || (o['partition'] as number) < 0) return null;
+    record.partition = o['partition'] as number;
   }
   if (o['dictId'] !== undefined) {
     // A preset-dictionary id is the SHA-256 hex of the dictionary bytes:
