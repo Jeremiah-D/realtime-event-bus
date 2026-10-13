@@ -2065,6 +2065,18 @@ export interface EventBusOptions {
    */
   durableLogMaxEntriesPerTopic?: number;
   /**
+   * Opt-in time-based retention for the durable log (EB-85): records older
+   * than `now - durableLogMaxAgeMs` (bus clock, `EventBusOptions.now`) are
+   * evicted when their topic compacts, alongside the count bound above —
+   * a compact keeps records satisfying both. Delayed-delivery schedule
+   * records (`seq: 0`) never age out, so pending timers survive. Change it
+   * at runtime with `setDurableLogMaxAgeMs` (the change is recorded in the
+   * subscription audit log as `retention_updated`); evictions are counted
+   * in `getStats().durableLog.retentionEvicted`. Only meaningful with
+   * `durableLogDir`. Must be a positive finite number of milliseconds.
+   */
+  durableLogMaxAgeMs?: number;
+  /**
    * Opt-in Kafka-style keyed log compaction for the durable log (see
    * `DurableTopicLog`). A published message may then carry a `key` (see
    * `PublishOptions.key`): only the latest record per (topic, key) is
@@ -3073,6 +3085,11 @@ export interface BusStats {
     keyCompaction: boolean;
     /** Whether at-rest encryption is enabled (`durableLogEncryptor`, EB-80). */
     encrypted: boolean;
+    /**
+     * Records evicted by time-based retention (`durableLogMaxAgeMs`,
+     * EB-85), across compactions. 0 when no age bound is configured.
+     */
+    retentionEvicted: number;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
     /** Total entries across all archived segments. */
@@ -6882,6 +6899,12 @@ export class EventBus {
    */
   private readonly durableLogMaxEntriesPerTopic?: number;
   /**
+   * `durableLogMaxAgeMs` as configured — namespace child logs (EB-52)
+   * open with the same time-based retention bound as the root log; kept
+   * in sync by `setDurableLogMaxAgeMs`.
+   */
+  private durableLogMaxAgeMs?: number;
+  /**
    * `durableLogKeyCompaction` as configured — namespace child logs
    * (EB-52) open with the same compaction mode as the root log.
    */
@@ -7049,10 +7072,17 @@ export class EventBus {
     if (options?.durableLogDir == null && options?.durableLogEncryptor !== undefined) {
       throw new RangeError('durableLogEncryptor requires EventBusOptions.durableLogDir to be set');
     }
+    if (options?.durableLogDir == null && options?.durableLogMaxAgeMs !== undefined) {
+      throw new RangeError('durableLogMaxAgeMs requires EventBusOptions.durableLogDir to be set');
+    }
     if (options?.durableLogDir != null) {
       const log = DurableTopicLog.open({
         dir: options.durableLogDir,
         maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
+        // Time-based retention runs on the bus clock, so retention stays
+        // deterministic under an injected `EventBusOptions.now` (EB-85).
+        maxAgeMs: options.durableLogMaxAgeMs,
+        now: this.now,
         keyCompaction: options.durableLogKeyCompaction,
         segmentRotation: options.durableLogSegmentRotation,
         encryptor: options.durableLogEncryptor,
@@ -7062,9 +7092,10 @@ export class EventBus {
       });
       this.durableLog = log;
       // Remembered for namespace child logs (EB-52): children open with
-      // the same per-topic budget, compaction mode, rotation triggers
-      // and encryptor as the root log.
+      // the same per-topic budget, compaction mode, rotation triggers,
+      // retention bound and encryptor as the root log.
       this.durableLogMaxEntriesPerTopic = options.durableLogMaxEntriesPerTopic;
+      this.durableLogMaxAgeMs = options.durableLogMaxAgeMs;
       this.durableLogKeyCompaction = options.durableLogKeyCompaction ?? false;
       this.durableLogSegmentRotation = options.durableLogSegmentRotation;
       this.durableLogEncryptor = options.durableLogEncryptor;
@@ -8055,6 +8086,33 @@ export class EventBus {
   }
 
   /**
+   * Changes the durable log's time-based retention bound at runtime
+   * (EB-85): records older than `now - maxAgeMs` (bus clock) are evicted
+   * at the next compact of each topic. Pass `undefined` to clear the age
+   * bound and return to count-only retention. The change applies to the
+   * root log and every namespace child log, and is recorded in the
+   * subscription audit log as `retention_updated` (with the previous and
+   * new bound in `detail`), so retention policy changes stay attributable.
+   * Throws `RangeError` for a bad actor, for a non-positive-finite
+   * `maxAgeMs`, or when the bus has no `durableLogDir`.
+   */
+  setDurableLogMaxAgeMs(maxAgeMs: number | undefined, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogMaxAgeMs');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError('setDurableLogMaxAgeMs requires EventBusOptions.durableLogDir to be set');
+    }
+    const previous = log.setMaxAgeMs(maxAgeMs);
+    for (const child of this.namespaceLogs.values()) child.setMaxAgeMs(maxAgeMs);
+    this.durableLogMaxAgeMs = maxAgeMs;
+    this.auditSubscription({
+      action: 'retention_updated',
+      actor,
+      detail: { from: previous ?? null, to: maxAgeMs ?? null },
+    });
+  }
+
+  /**
    * Caps the JSON byte size of a single publish to topics matching
    * `topicPattern` — an admission gate for oversized payloads. `topicPattern`
    * accepts the same wildcard syntax as `subscribe` (or an exact topic
@@ -8567,6 +8625,8 @@ export class EventBus {
       const child = DurableTopicLog.open({
         dir: `${this.durableLog.dir}/namespaces/${encodeURIComponent(prefix)}`,
         maxEntriesPerTopic: this.durableLogMaxEntriesPerTopic,
+        maxAgeMs: this.durableLogMaxAgeMs,
+        now: this.now,
         keyCompaction: this.durableLogKeyCompaction,
         segmentRotation: this.durableLogSegmentRotation,
         encryptor: this.durableLogEncryptor,

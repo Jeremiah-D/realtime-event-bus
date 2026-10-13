@@ -4,7 +4,8 @@
  * hot-updates (EB-74) / consumer-group join-leave / group rebalances / topic
  * registry changes (EB-77) / backpressure drops (EB-83,
  * `backpressure_dropped`) / signature-verification failures (EB-84,
- * `signature_verification_failed`).
+ * `signature_verification_failed`) / durable-log retention policy changes
+ * (EB-85, `retention_updated`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -41,7 +42,8 @@ export type SubscriptionAuditAction =
   | 'topic_register'
   | 'topic_deregister'
   | 'backpressure_dropped'
-  | 'signature_verification_failed';
+  | 'signature_verification_failed'
+  | 'retention_updated';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -52,6 +54,7 @@ export type SubscriptionAuditAction =
  * - `topic_deregister`: `{ owner?, description? }` (last-known metadata)
  * - `backpressure_dropped`: `{ policy: <backpressure tier>, dropped: <count>, queueSize: <number> }`
  * - `signature_verification_failed`: `{ seq: <per-topic seq>, kid?: <key id that signed, when present> }`
+ * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -102,6 +105,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'topic_deregister',
   'backpressure_dropped',
   'signature_verification_failed',
+  'retention_updated',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

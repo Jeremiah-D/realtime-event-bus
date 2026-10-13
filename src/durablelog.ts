@@ -139,6 +139,29 @@ export interface DurableLogOptions {
    */
   maxEntriesPerTopic?: number;
   /**
+   * Opt-in time-based retention: records whose `at` timestamp is older
+   * than `now - maxAgeMs` are evicted when the topic compacts (see
+   * `maxEntriesPerTopic`), so a quiet topic's stale history does not sit
+   * on disk forever. The two bounds are dual constraints — a compact
+   * keeps the records that satisfy BOTH (newest `maxEntriesPerTopic`
+   * entries AND within the age window). Delayed-delivery schedule records
+   * (`seq: 0`, timer intents rather than messages) are never evicted by
+   * age: dropping a pending schedule would lose its timer on restart.
+   * Retention is enforced at compact time only — a topic with no new
+   * appends keeps its history until the next compact, the same
+   * amortized semantics as the count bound. Evicted records are counted
+   * in `stats().retentionEvicted`. Must be a positive finite number of
+   * milliseconds. Absent by default (no age bound).
+   */
+  maxAgeMs?: number;
+  /**
+   * Clock source for time-based retention (`maxAgeMs`): the eviction
+   * cutoff is `now() - maxAgeMs`, so an injectable clock keeps retention
+   * deterministic in tests. The bus passes its own
+   * `EventBusOptions.now`. Defaults to `Date.now`.
+   */
+  now?: () => number;
+  /**
    * Bound for the publish-dedup journal (`__publish_dedup.jsonl`, EB-66):
    * the journal compacts itself to the latest claim per (topic, messageId)
    * when it grows past twice this value. The bus passes its own
@@ -911,6 +934,17 @@ export class DurableTopicLog {
    * (the default — fully backward compatible).
    */
   private readonly encryptor?: PayloadEncryptor;
+  /**
+   * Time-based retention bound in milliseconds (`maxAgeMs`), `undefined`
+   * when no age bound is configured. Mutable at runtime via
+   * `setMaxAgeMs` — the bus exposes it as `setDurableLogMaxAgeMs` with a
+   * subscription-audit trail.
+   */
+  private maxAgeMs: number | undefined;
+  /** Clock source for the retention cutoff; defaults to `Date.now`. */
+  private readonly now: () => number;
+  /** Records evicted by time-based retention, across compactions. */
+  private retentionEvicted = 0;
 
   private constructor(
     dir: string,
@@ -919,6 +953,8 @@ export class DurableTopicLog {
     segmentRotation?: SegmentRotationOptions,
     publishDedupMaxEntries = 10000,
     encryptor?: PayloadEncryptor,
+    maxAgeMs?: number,
+    now: () => number = Date.now,
   ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
@@ -926,6 +962,8 @@ export class DurableTopicLog {
     this.segmentRotation = segmentRotation;
     this.publishDedupMaxEntries = publishDedupMaxEntries;
     this.encryptor = encryptor;
+    this.maxAgeMs = maxAgeMs;
+    this.now = now;
     this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
     this.dedupFile = join(dir, DEDUP_JOURNAL_NAME);
     this.publishDedupFile = join(dir, PUBLISH_DEDUP_JOURNAL_NAME);
@@ -942,7 +980,8 @@ export class DurableTopicLog {
    * Opens (or creates) the durable log at `dir`. Throws `RangeError` for an
    * empty `dir`, a non-positive-integer `maxEntriesPerTopic`, a
    * non-positive-integer `publishDedupMaxEntries`, invalid
-   * `segmentRotation` triggers, or an `encryptor` that is not a usable
+   * `segmentRotation` triggers, a non-positive-finite `maxAgeMs`, a
+   * non-function `now`, or an `encryptor` that is not a usable
    * `PayloadEncryptor`.
    */
   static open(options: DurableLogOptions): DurableTopicLog {
@@ -957,6 +996,14 @@ export class DurableTopicLog {
     const publishDedupMaxEntries = options.publishDedupMaxEntries ?? 10000;
     if (!Number.isInteger(publishDedupMaxEntries) || publishDedupMaxEntries < 1) {
       throw new RangeError('publishDedupMaxEntries must be a positive integer');
+    }
+    const maxAgeMs = options.maxAgeMs;
+    if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
+      throw new RangeError('durableLogMaxAgeMs must be a positive finite number of milliseconds');
+    }
+    const now = options.now ?? Date.now;
+    if (typeof now !== 'function') {
+      throw new RangeError('durableLog now must be a function');
     }
     const encryptor = options.encryptor;
     if (
@@ -975,7 +1022,27 @@ export class DurableTopicLog {
       resolveSegmentRotationOptions(options.segmentRotation),
       publishDedupMaxEntries,
       encryptor,
+      maxAgeMs,
+      now,
     );
+  }
+
+  /**
+   * Changes the time-based retention bound at runtime (`undefined`
+   * clears it, restoring count-only retention). Returns the previous
+   * bound. Throws `RangeError` for a non-positive-finite value. The
+   * change takes effect on the next compact — already-compacted history
+   * is not re-scanned. The bus wraps this as `setDurableLogMaxAgeMs`
+   * and records the change in the subscription audit log
+   * (`retention_updated`).
+   */
+  setMaxAgeMs(maxAgeMs: number | undefined): number | undefined {
+    if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
+      throw new RangeError('durableLogMaxAgeMs must be a positive finite number of milliseconds');
+    }
+    const previous = this.maxAgeMs;
+    this.maxAgeMs = maxAgeMs;
+    return previous;
   }
 
   /** The log directory, as configured. */
@@ -1537,10 +1604,19 @@ export class DurableTopicLog {
     this.addArchiveEntry(entry);
   }
 
-  /** Rewrites a topic's file keeping only the newest entries. */
+  /**
+   * Rewrites a topic's file keeping only the newest entries. Time-based
+   * retention (`maxAgeMs`) applies first — records older than
+   * `now - maxAgeMs` are evicted, except the seq-0 delayed-delivery
+   * schedule records, which are timer intents and never age out — then
+   * the count bound trims the survivors, so both constraints hold.
+   */
   private compact(topic: string): void {
     const records = this.readFileRecords(topic);
-    const kept = this.keyCompaction ? compactKeyed(records, this.maxEntriesPerTopic) : records.slice(-this.maxEntriesPerTopic);
+    const retained = this.applyRetention(records);
+    const kept = this.keyCompaction
+      ? compactKeyed(retained, this.maxEntriesPerTopic)
+      : retained.slice(-this.maxEntriesPerTopic);
     const text = kept.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
     try {
       writeFileSync(this.fileFor(topic), text, 'utf8');
@@ -1550,6 +1626,30 @@ export class DurableTopicLog {
     this.entryCounts.set(topic, kept.length);
     this.messageCounts.set(topic, kept.filter((rec) => rec.seq >= 1).length);
     if (this.keyCompaction) this.rebuildKeyIndex(topic, kept);
+  }
+
+  /**
+   * Evicts records older than the time-based retention window
+   * (`now - maxAgeMs`), counting them in `retentionEvicted`. Seq-0
+   * delayed-delivery schedule records (and their tombstones) are timer
+   * intents, not messages — they are never evicted by age, or a restart
+   * would lose pending timers. A record exactly on the cutoff
+   * (`at === now - maxAgeMs`) is kept; only strictly older records go.
+   * No-op when no age bound is configured.
+   */
+  private applyRetention(records: DurableLogRecord[]): DurableLogRecord[] {
+    const maxAgeMs = this.maxAgeMs;
+    if (maxAgeMs === undefined) return records;
+    const cutoff = this.now() - maxAgeMs;
+    const retained: DurableLogRecord[] = [];
+    for (const rec of records) {
+      if (rec.seq === 0 || rec.at >= cutoff) {
+        retained.push(rec);
+        continue;
+      }
+      this.retentionEvicted += 1;
+    }
+    return retained;
   }
 
   /**
@@ -2100,6 +2200,11 @@ export class DurableTopicLog {
     publishDedupEntries: number;
     /** Whether at-rest encryption is enabled (EB-80). */
     encrypted: boolean;
+    /**
+     * Records evicted by time-based retention (`maxAgeMs`) across
+     * compactions (EB-85). 0 when no age bound is configured.
+     */
+    retentionEvicted: number;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
     /** Total entries across all archived segments. */
@@ -2136,6 +2241,7 @@ export class DurableTopicLog {
       dedupEntries: this.dedupEntries,
       publishDedupEntries: this.publishDedupEntries,
       encrypted: this.encryptor !== undefined,
+      retentionEvicted: this.retentionEvicted,
       corruptArchives: this.corruptArchives,
       archived,
       segments,
