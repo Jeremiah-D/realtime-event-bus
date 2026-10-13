@@ -1854,6 +1854,20 @@ npm test
   when the target lacks the namespace, composite-pattern migration,
   non-serializable options reported in `unsupportedOptions`, and lease
   migration restoring the remaining time rather than the full duration.
+- `test/topic-pause.test.ts` — topic pause/resume (EB-88): shed-mode
+  rejection counting (`pausedMessages` per-topic + global, hook reason
+  `'topic-paused'`, sequence gap visible downstream), pause as the first
+  admission gate (schema never runs, publisher rate-limit budget untouched),
+  queue-mode buffering with no seq/budget burned and in-order resume fan-out,
+  TTL deadline preservation across the pause (expired-while-buffered counts
+  expired, never resurrected), exact-first/earliest-pattern rule matching
+  with an independent matcher cache, `publishBatch` per-entry sheds,
+  `publishAtomic` all-or-nothing rejection, `publishDelayed` interplay
+  (shed fail-fast at schedule, queue defer at due time, due-time shed),
+  `publishIdempotent` pause-before-dedup-claim plus resume-time dedup,
+  `topic_paused`/`topic_resumed` subaudit events, Prometheus pause series,
+  argument validation, and restart recovery of the pause buffer with
+  tombstones.
 
 ## Benchmark
 
@@ -2230,6 +2244,73 @@ How it works:
   re-admit as ordinary publishes and do not propagate the retain flag.
   Only `publish` carries `retain`; batch/atomic/delayed publishes do
   not retain.
+
+## Topic pause / resume (ops window)
+
+`pauseTopic` / `resumeTopic` (`src/bus.ts`, EB-88 — real-time systems /
+operability): an operator-level "stop" on a topic or topic pattern —
+pause publishing during a deploy or incident, then resume:
+
+```ts
+bus.pauseTopic('orders.*'); // shed mode (default): publishes rejected outright
+bus.publish('orders.eu', order); // -> 0, counted, subscribers see a gap
+bus.resumeTopic('orders.*'); // -> true; publishing flows again
+
+bus.pauseTopic('billing.*', { mode: 'queue' }); // needs durableLogDir
+bus.publish('billing.eu', invoice); // -> 0, held in the durable-side buffer
+bus.resumeTopic('billing.*'); // buffered messages fan out in original order
+```
+
+How it works:
+
+- **Rules** — `pauseTopic(topicPattern, { mode })` / `resumeTopic(topicPattern)`.
+  The rule key is the exact string passed; match resolution mirrors
+  `setTopicTtl`: an exact-topic rule wins over patterns, the
+  earliest-registered matching pattern wins (independent matcher cache —
+  never inflates `patternCacheSize`). Re-setting a rule replaces its mode
+  but keeps an already-held queue buffer (it drains on resume).
+  `resumeTopic` on an unknown pattern is a no-op returning `false`.
+  Empty patterns throw `RangeError`, non-string patterns `TypeError`,
+  an unknown mode `RangeError`, and queue mode without
+  `EventBusOptions.durableLogDir` `RangeError` — fail-fast at call time.
+- **Modes** — `'shed'` (default) rejects publishes outright: counted in
+  `TopicStats.pausedMessages` / `BusStats.pausedMessages`, surfaced on
+  `onAdmissionRejected` with reason `'topic-paused'`, and consuming a
+  sequence number so subscribers observe the loss as a gap (the
+  rate-limit shed semantics, not the schema-rejection semantics).
+  `'queue'` holds publishes in a durable-side buffer instead: no sequence
+  number consumed, no schema/rate-limit budget burned — the message gets
+  its full admission when it fans out at resume, in original publish
+  order, each keeping the TTL deadline stamped at pause admission. A
+  message whose deadline passed while buffered is counted expired at
+  resume, never resurrected.
+- **Gate order** — the pause check is the first gate in the publish
+  admission pipeline: before the per-publisher rate limiter (EB-79), so a
+  paused shed never burns a producer's budget, and before ACL / schema /
+  the size cap. It applies uniformly: `publish`, `publishBatch` (per
+  entry), `publishAtomic` (any paused entry — shed or queue — rejects the
+  whole batch with reason `'topic-paused'`, since a queued message cannot
+  be committed synchronously), `publishDelayed` (shed mode fails fast at
+  schedule time; queue mode accepts the schedule and defers the due-time
+  fan-out into the pause buffer while the pause is still active; a
+  schedule accepted before the pause is shed at its due time in shed
+  mode), and `publishIdempotent` (the pause check runs before the dedup
+  claim, so a paused attempt never occupies a dedup slot; a retry buffered
+  twice under queue mode still delivers once).
+- **Durability** — buffered messages are persisted as seq-0 pause records
+  (the delayed-delivery convention: state, not messages — invisible to
+  replay, never moving the sequence counter), tombstoned as each message
+  drains at resume or is dropped as expired. Restart recovery rebuilds
+  the buffer and fans it out through full admission — pause rules
+  themselves are runtime state and do not survive a restart, so the new
+  process starts unpaused (the delayed-delivery "already due" precedent).
+- **Observability** — `getStats().pausedTopics` lists the active rules
+  (`{ topicPattern, mode, bufferedMessages }`); Prometheus:
+  `eventbus_paused_messages_total` (counter),
+  `eventbus_topic_paused_messages_total{topic}` (counter),
+  `eventbus_paused_topics` (gauge). Pauses and resumes are recorded in
+  the subscription audit log as `topic_paused` (`{ mode }`) and
+  `topic_resumed` (`{ mode, drainedMessages }`).
 
 ## Subscription lifecycle audit log
 

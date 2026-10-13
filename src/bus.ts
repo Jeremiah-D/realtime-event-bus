@@ -2370,6 +2370,16 @@ export interface TopicStats {
    */
   publisherRateLimited: number;
   /**
+   * Publishes to this topic shed by a topic pause in shed mode (see
+   * `EventBus.pauseTopic`, EB-88): the topic was paused when the message
+   * was published, so it was rejected outright — never fanned out to any
+   * subscriber. The shed consumes a sequence number, so subscribers
+   * observe the loss as a sequence gap (the EB-19 rate-limit shed
+   * semantics, not the schema-rejection semantics). Surfaced on
+   * `onAdmissionRejected` with reason `'topic-paused'`.
+   */
+  pausedMessages: number;
+  /**
    * Publishes to this topic rejected by admission gates that fire before
    * admission — schema validation (see `setTopicSchema`), the broker-level
    * ACL (see `setAclRules`), the per-topic message-size cap (see
@@ -2657,6 +2667,18 @@ export interface BusStats {
    * `TopicStats.publisherRateLimited` for the exact counting rules.
    */
   publisherRateLimited: number;
+  /**
+   * Total publishes shed by topic pauses in shed mode — the sum of every
+   * topic's `pausedMessages`. See `TopicStats.pausedMessages` for the
+   * exact counting rules.
+   */
+  pausedMessages: number;
+  /**
+   * Currently active topic-pause rules (see `EventBus.pauseTopic`,
+   * EB-88), in registration order: the rule key, its mode, and how many
+   * messages its durable-side buffer currently holds (queue mode).
+   */
+  pausedTopics: PausedTopicRule[];
   /**
    * Total publishes rejected by admission gates before admission — schema
    * validation, the broker-level ACL, the per-topic message-size cap, and
@@ -3689,6 +3711,7 @@ function zeroedTopicStats(): {
   sequenceGaps: number;
   rateLimitedMessages: number;
   publisherRateLimited: number;
+  pausedMessages: number;
   rejectedMessages: number;
   deprecatedSchemaVersions: number;
   lateMessages: number;
@@ -3711,6 +3734,7 @@ function zeroedTopicStats(): {
     sequenceGaps: 0,
     rateLimitedMessages: 0,
     publisherRateLimited: 0,
+    pausedMessages: 0,
     rejectedMessages: 0,
     deprecatedSchemaVersions: 0,
     lateMessages: 0,
@@ -4968,7 +4992,87 @@ export type AtomicRejectReason =
   | 'message-too-big'
   | 'rate-limit'
   | 'publisher-rate-limit'
-  | 'alias-retired';
+  | 'alias-retired'
+  | 'topic-paused';
+
+/**
+ * Pause mode for `EventBus.pauseTopic` (EB-88, ops window):
+ * - `'shed'` (default): publishes to a matching topic are rejected
+ *   outright while the pause is active — counted in
+ *   `TopicStats.pausedMessages` / `BusStats.pausedMessages`, surfaced on
+ *   `onAdmissionRejected` with reason `'topic-paused'`, and consuming a
+ *   sequence number so subscribers observe the loss as a gap (the EB-19
+ *   shed semantics, not the schema-rejection semantics).
+ * - `'queue'`: publishes to a matching topic are held in a durable-side
+ *   buffer instead of being rejected — no sequence number, no
+ *   schema/rate-limit budget burned — and fan out in original order when
+ *   the topic resumes. Requires `EventBusOptions.durableLogDir`.
+ */
+export type TopicPauseMode = 'shed' | 'queue';
+
+/** Options for `EventBus.pauseTopic`. */
+export interface TopicPauseOptions {
+  /**
+   * Pause behavior while the rule is active: `'shed'` (default) rejects
+   * publishes outright; `'queue'` buffers them for the resume. Anything
+   * else throws `RangeError` at call time.
+   */
+  mode?: TopicPauseMode;
+}
+
+/**
+ * One active topic-pause rule, as exposed by
+ * `BusStats.pausedTopics` (`EventBus.getStats()`).
+ */
+export interface PausedTopicRule {
+  /** The exact rule key passed to `EventBus.pauseTopic` (topic or pattern). */
+  topicPattern: string;
+  /** The rule's pause mode (`'shed'` | `'queue'`). */
+  mode: TopicPauseMode;
+  /** Messages currently held in the rule's durable-side buffer (queue mode only; 0 for shed). */
+  bufferedMessages: number;
+}
+
+/**
+ * One message held by a queue-mode pause rule (EB-88). Carries everything
+ * the resume fan-out needs to re-run the full admission pipeline: the
+ * admission-redacted payload (redaction ran at pause time, like the
+ * delayed-delivery schedule path), the TTL deadline stamped at pause
+ * admission (`expiresAt` — never recomputed at resume), and the publish
+ * options that ride a normal `fanOut`. No sequence number and no
+ * rate-limit budget was burned at pause time; both are drawn at resume.
+ * Internal-only flags (`routed`, `fromBridge`, `diagnostic`) are runtime
+ * state: they do not survive restart — recovery fans the message out as
+ * an ordinary publish.
+ */
+interface PauseBufferEntry {
+  /** Opaque handle (`paused-1`, …), also the durable-log identity. */
+  pauseId: string;
+  /** Global FIFO ordinal: resume fans out in `pauseOrder` across topics. */
+  pauseOrder: number;
+  /** Concrete (alias-resolved) topic the message was published to. */
+  topic: string;
+  /** Payload as redacted at pause admission. */
+  payload: unknown;
+  /**
+   * TTL expiry deadline stamped at pause admission (bus clock), when a
+   * TTL rule matched the topic. A message whose deadline passes while
+   * buffered is dropped as expired at resume — counted in
+   * `expiredMessages`, never resurrected (the EB-32 precedent).
+   */
+  expiresAt?: number;
+  key?: string;
+  traceparent?: string;
+  messageId?: string;
+  eventTime?: number;
+  causal?: { source?: string; clock: number };
+  publisherId?: string;
+  schemaVersion?: number;
+  retain?: boolean;
+  routed?: boolean;
+  fromBridge?: boolean;
+  diagnostic?: boolean;
+}
 
 /**
  * Which publish-side admission gate dropped a publish — the unified reason
@@ -4995,10 +5099,15 @@ export type AtomicRejectReason =
  * - `'alias-retired'` → `TopicStats.aliasRetiredMessages` /
  *   `BusStats.aliasRetiredMessages` (publish to a topic whose migration
  *   alias expired — the old topic is read-only, EB-44)
+ * - `'topic-paused'` → `TopicStats.pausedMessages` /
+ *   `BusStats.pausedMessages` (publish to a topic paused in shed mode —
+ *   the shed consumes a sequence number like a `'rate-limit'` shed, so
+ *   subscribers see the loss as a gap, EB-88)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
- * `'rate-limit'` | `'publisher-rate-limit'` | `'alias-retired'`); the batch rejection
+ * `'rate-limit'` | `'publisher-rate-limit'` | `'alias-retired'` |
+ * `'topic-paused'`); the batch rejection
  * is counted once against that entry's topic, so it stays reconcilable
  * too.
  */
@@ -5009,7 +5118,8 @@ export type AdmissionRejectReason =
   | 'rate-limit'
   | 'publisher-rate-limit'
   | 'duplicate'
-  | 'alias-retired';
+  | 'alias-retired'
+  | 'topic-paused';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -6451,6 +6561,7 @@ export class EventBus {
       sequenceGaps: number;
       rateLimitedMessages: number;
       publisherRateLimited: number;
+      pausedMessages: number;
       rejectedMessages: number;
       duplicateMessages: number;
       filteredMessages: number;
@@ -6710,6 +6821,36 @@ export class EventBus {
    * sequence number and subscribers see no gap.
    */
   private totalPublisherRateLimited = 0;
+  /**
+   * Active topic-pause rules (EB-88), keyed by the exact string passed to
+   * `pauseTopic` — either a concrete topic name or a wildcard pattern.
+   * Match resolution mirrors the schema rules: an exact-topic rule wins
+   * over any pattern; between patterns the earliest-registered rule wins
+   * (the `Map` keeps registration order). Queue-mode rules additionally
+   * hold their buffered messages in FIFO publish order.
+   */
+  private pauseRules = new Map<string, { mode: TopicPauseMode; buffer: PauseBufferEntry[] }>();
+  /**
+   * Compiled matchers for the wildcard entries in `pauseRules`, kept
+   * apart from the subscriber pattern cache so pause configuration never
+   * inflates `patternCacheSize`.
+   */
+  private pauseMatcherCache = new Map<string, RegExp>();
+  /**
+   * Publishes shed by topic pauses in shed mode (global total). The shed
+   * consumes a sequence number (gap-visible, like the EB-19 rate-limit
+   * shed) — unlike the pre-admission rejections counted in
+   * `totalRejected`.
+   */
+  private totalPaused = 0;
+  /** Counter for pause-buffer message ids (`paused-1`, …). */
+  private nextPauseId = 0;
+  /**
+   * Global FIFO ordinal for pause-buffered messages: resume fans out in
+   * `pauseOrder`, preserving the original publish order across concrete
+   * topics under one pattern rule.
+   */
+  private nextPauseOrder = 0;
   /**
    * Bus-wide default allowed lateness in milliseconds for event-time
    * watermark tracking (see `EventBusOptions.allowedLatenessMs`).
@@ -7371,6 +7512,11 @@ export class EventBus {
       // that never fanned out (and were not cancelled) survive the
       // restart. Already-due entries fan out immediately.
       this.recoverDelayed();
+      // Rebuild queue-mode pause buffers from the log (EB-88): buffered
+      // messages that never drained survive the restart and fan out
+      // immediately — pause rules themselves are runtime state and do not
+      // survive, so the new process starts unpaused.
+      this.recoverPaused();
       // Rebuild the retained-message table from the log (EB-87): the
       // latest retained record per topic wins; tombstones and
       // TTL-expired entries rebuild nothing.
@@ -8598,6 +8744,129 @@ export class EventBus {
   }
 
   /**
+   * Pauses publishing to one topic or topic pattern (EB-88, real-time
+   * systems / ops): while the rule is active, publishes to a matching
+   * topic never reach subscribers.
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or an
+   * exact topic name); the rule key is the exact string passed here.
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered matching rule
+   * wins (independent matcher cache — never inflates `patternCacheSize`).
+   * Re-setting a rule replaces its mode; a queue-mode buffer already held
+   * under the key is kept (it drains on resume).
+   *
+   * Modes (`TopicPauseOptions.mode`, default `'shed'`):
+   * - `'shed'`: publishes are rejected outright — counted in
+   *   `TopicStats.pausedMessages` / `BusStats.pausedMessages`, surfaced on
+   *   `onAdmissionRejected` with reason `'topic-paused'`, `publish`
+   *   returns 0, and the shed consumes a sequence number so subscribers
+   *   observe the loss as a gap (the EB-19 rate-limit shed semantics).
+   * - `'queue'`: publishes are held in a durable-side buffer instead —
+   *   no sequence number consumed, no schema/rate-limit budget burned —
+   *   and fan out in original order when the topic resumes, each with
+   *   the TTL deadline stamped at pause admission (a message whose
+   *   deadline passed while buffered is counted expired at resume, never
+   *   resurrected — the EB-32 precedent). Queue mode requires
+   *   `EventBusOptions.durableLogDir`: the buffer is persisted as seq-0
+   *   pause records (tombstoned as each message drains), so a restart
+   *   rebuilds the buffer instead of losing it.
+   *
+   * The pause check is the first gate in the publish admission pipeline —
+   * before the per-publisher rate limiter (EB-79), so a paused shed never
+   * burns publisher budget — and applies uniformly: `publish`,
+   * `publishBatch` (per entry), `publishAtomic` (any paused entry rejects
+   * the whole batch — a queued message cannot be committed synchronously,
+   * so atomicity forces the batch to fail), `publishDelayed` (shed mode
+   * fails fast at schedule time; queue mode accepts the schedule and
+   * defers the due-time fan-out into the pause buffer while the pause is
+   * still active), and `publishIdempotent` (the pause check runs before
+   * the dedup claim, so a paused attempt never occupies a dedup slot).
+   *
+   * Audited as `topic_paused` (`{ mode }`). Throws `TypeError` when
+   * `topicPattern` is not a string; throws `RangeError` when it is empty,
+   * when `mode` is not `'shed'`/`'queue'`, or when queue mode is requested
+   * without a durable log.
+   */
+  pauseTopic(topicPattern: string, opts?: TopicPauseOptions): void {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('pauseTopic: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('pauseTopic: topicPattern must be a non-empty string');
+    }
+    const mode = opts?.mode ?? 'shed';
+    if (typeof mode !== 'string') {
+      throw new TypeError("pauseTopic: mode must be 'shed' or 'queue'");
+    }
+    if (mode !== 'shed' && mode !== 'queue') {
+      throw new RangeError("pauseTopic: mode must be 'shed' or 'queue'");
+    }
+    if (mode === 'queue' && this.durableLog == null) {
+      throw new RangeError('pauseTopic: queue mode requires EventBusOptions.durableLogDir');
+    }
+    const existing = this.pauseRules.get(topicPattern);
+    // Re-setting keeps a queue-mode buffer already held under the key:
+    // the mode is ops intent, the buffered messages are data — replacing
+    // the rule must not silently drop them. They drain on resume.
+    this.pauseRules.set(topicPattern, { mode, buffer: existing?.buffer ?? [] });
+    this.auditSubscription({
+      action: 'topic_paused',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { mode },
+    });
+  }
+
+  /**
+   * Resumes a paused topic or pattern: removes the rule registered by
+   * `pauseTopic` and — for queue-mode rules — fans the buffered messages
+   * out in original (publish) order through the full admission pipeline
+   * (schema, rate limit, TTL), each keeping the TTL deadline stamped at
+   * pause admission. A buffered message whose deadline passed while
+   * queued is counted expired, never delivered. Buffered idempotent
+   * messages re-run the dedup suppression gate, so a retry buffered
+   * twice still delivers once.
+   *
+   * Returns true when a rule existed and was removed. Audited as
+   * `topic_resumed` (`{ mode, drainedMessages }`). Never throws for an
+   * unknown pattern — it is a no-op returning false.
+   */
+  resumeTopic(topicPattern: string): boolean {
+    const rule = this.pauseRules.get(topicPattern);
+    if (rule === undefined) return false;
+    this.pauseRules.delete(topicPattern);
+    const drained = this.drainPauseBuffer(rule);
+    this.auditSubscription({
+      action: 'topic_resumed',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { mode: rule.mode, drainedMessages: drained },
+    });
+    return true;
+  }
+
+  /**
+   * Returns the pause rule that applies to `topic`, or `undefined` when
+   * the topic is not paused. Same precedence as `ttlForTopic`: an
+   * exact-topic rule wins over patterns; between patterns the
+   * earliest-registered matching rule wins.
+   */
+  private pauseForTopic(topic: string): { mode: TopicPauseMode; buffer: PauseBufferEntry[] } | undefined {
+    const exact = this.pauseRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, rule] of this.pauseRules) {
+      let matcher = this.pauseMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.pauseMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return rule;
+    }
+    return undefined;
+  }
+
+  /**
    * Registers per-topic sensitive-field redaction (EB-68): every publish
    * admitted to a matching topic has the listed field paths replaced with
    * `"***"` before anything else can observe the payload. `topicPattern`
@@ -9321,6 +9590,7 @@ export class EventBus {
         sequenceGaps: 0,
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
+        pausedMessages: 0,
         rejectedMessages: 0,
         lateMessages: 0,
         duplicateMessages: 0,
@@ -13039,6 +13309,7 @@ export class EventBus {
         else if (reason === 'message-too-big') this.countMessageTooBig(topic, payload, publisherId);
         else if (reason === 'publisher-rate-limit')
           this.countPublisherRateLimited(topic, payload, publisherId);
+        else if (reason === 'topic-paused') this.countTopicPaused(topic, payload, publisherId);
         else this.countRateLimited(topic, payload, publisherId);
         return { published: 0, rejected: { index, topic, reason } };
       }
@@ -13120,7 +13391,13 @@ export class EventBus {
     publisherShadowBudget: Map<string, number>,
     schemaVersion: number | undefined,
   ): AtomicRejectReason | undefined {
-    // Per-publisher rate limiting (EB-79) is the first shadow gate, as in
+    // Topic pause (EB-88) is the first shadow gate, mirroring `fanOut`:
+    // any paused entry — shed or queue mode — rejects the whole batch. A
+    // queued message cannot be committed synchronously, so atomicity
+    // forces the batch to fail rather than partially buffer; the entry's
+    // reason is 'topic-paused' either way.
+    if (this.pauseForTopic(topic) !== undefined) return 'topic-paused';
+    // Per-publisher rate limiting (EB-79) is the second shadow gate, as in
     // `fanOut`: the peek/reserve mirrors `takePublisherToken` without
     // mutating the live bucket, and the shadow bucket is never stored —
     // a rejected batch creates no publisher budget state either.
@@ -13262,12 +13539,28 @@ export class EventBus {
     // not redact again. Redacting at schedule time (rather than at
     // fan-out) is what keeps the persisted bytes redacted.
     payload = this.redactAdmissionPayload(topic, payload);
+    // Topic pause (EB-88): the first schedule-time gate, before the
+    // per-publisher rate limiter. In shed mode the schedule is refused
+    // fail-fast — no id, nothing in the heap, nothing on disk — counted
+    // like a shed with reason 'topic-paused' (no sequence number: delayed
+    // schedules never consume one before fan-out). In queue mode the
+    // schedule is accepted normally; the due-time sweep defers the
+    // fan-out into the pause buffer while the pause is still active.
+    const pauseRule = this.pauseForTopic(topic);
+    if (pauseRule !== undefined && pauseRule.mode === 'shed') {
+      this.countTopicPaused(topic, payload, publisherId);
+      return undefined;
+    }
     // Fail fast on the per-publisher rate limit (EB-79): an over-budget
     // publisher never becomes a scheduled delivery — no id, nothing in
     // the heap, nothing on disk. The token is spent at schedule time, so
     // the due-time fan-out (pre-admitted) neither re-checks nor burns
     // budget again. Counted the same way a `publish` publisher-rate-limit
     // shed is, with reason 'publisher-rate-limit'.
+    //
+    // Design intent (EB-88): the topic-pause check above runs before this
+    // gate — a schedule for a paused topic never takes a publisher token,
+    // the same ordering as the live publish path.
     if (this.takePublisherToken(publisherId) !== undefined) {
       this.countPublisherRateLimited(topic, payload, publisherId);
       return undefined;
@@ -13463,6 +13756,42 @@ export class EventBus {
         }
         continue;
       }
+      // Topic pause (EB-88) at due time: the pause gate is live admission
+      // state, so a schedule accepted before the pause still honors it
+      // when its due time arrives during the window. In shed mode the
+      // entry is shed here — consuming a sequence number (gap-visible,
+      // like the EB-19 fan-out shed) — counted with reason
+      // 'topic-paused' and tombstoned so a restart never resurrects it.
+      // In queue mode the fan-out is deferred: the entry moves into the
+      // pause buffer (keeping the TTL deadline stamped at schedule time)
+      // and drains in order at resume. Either way the delay schedule is
+      // closed — it never fans out twice.
+      const pauseRule = this.pauseForTopic(top.topic);
+      if (pauseRule !== undefined) {
+        if (pauseRule.mode === 'shed') {
+          const stats = this.statsFor(top.topic);
+          stats.publishedMessages += 1;
+          stats.lastSeq = this.nextSeq(top.topic);
+          this.totalPublished += 1;
+          if (top.key !== undefined && top.keySeq !== undefined) {
+            this.releaseKeySequence(top.key, top.keySeq);
+            fannedOut = true;
+          }
+          this.countTopicPaused(top.topic, top.payload, top.publisherId);
+        } else {
+          this.bufferPausedMessage(pauseRule, top.topic, top.payload, {
+            key: top.key,
+            traceparent: top.traceparent,
+            messageId: top.messageId,
+            publisherId: top.publisherId,
+            // The schedule-time deadline rides along verbatim — the
+            // message was "published" at schedule time, not at deferral.
+            expiresAtOverride: top.expiresAt,
+          });
+        }
+        this.appendDelayTombstone(top.id, top.topic);
+        continue;
+      }
       // `preAdmitted`: schema already ran once at schedule time
       // (fail-fast); validators are expected pure.
       this.fanOut(
@@ -13538,6 +13867,199 @@ export class EventBus {
    */
   private appendDelayTombstone(delayId: string, topic: string): void {
     this.durableLogForTopic(topic)?.append({ seq: 0, topic, at: this.now(), delayId, cancelled: true, payload: null });
+  }
+
+  /**
+   * Writes a tombstone closing a pause-buffered message (drained at
+   * resume or dropped as expired) to the durable log, when one is
+   * enabled. Restart recovery treats a tombstoned `pauseId` as resolved
+   * and never rebuilds it — the same convention as the delayed-delivery
+   * tombstones. Best-effort like all durable-log writes: a failed append
+   * never throws into the caller.
+   */
+  private appendPauseTombstone(pauseId: string, topic: string): void {
+    this.durableLogForTopic(topic)?.append({ seq: 0, topic, at: this.now(), paused: true, pauseId, cancelled: true, payload: null });
+  }
+
+  /**
+   * Holds one publish in a queue-mode pause rule's durable-side buffer
+   * (EB-88). The payload arrives admission-redacted (the caller redacts
+   * before this runs — `fanOut` redacts before its gates, `publishDelayed`
+   * at schedule time); nothing else about admission has run, so no
+   * sequence number, no schema verdict, no rate-limit budget is burned
+   * here — the message gets its full admission when it fans out at
+   * resume. The TTL deadline is stamped NOW (pause admission), and the
+   * buffer record carries it verbatim so resume preserves the original
+   * deadline instead of recomputing one.
+   *
+   * `expiresAtOverride` is for the delayed-delivery sweep transfer: a
+   * delayed message deferred into the pause buffer keeps the deadline
+   * stamped at its schedule time, not a fresh one.
+   *
+   * The buffer record is persisted before the entry is visible anywhere
+   * (queue mode requires the durable log for exactly this reason): a
+   * crash between pause and resume rebuilds the buffer instead of losing
+   * the messages.
+   */
+  private bufferPausedMessage(
+    rule: { mode: TopicPauseMode; buffer: PauseBufferEntry[] },
+    topic: string,
+    payload: unknown,
+    opts: {
+      key?: string;
+      traceparent?: string;
+      messageId?: string;
+      eventTime?: number;
+      causal?: { source?: string; clock: number };
+      publisherId?: string;
+      schemaVersion?: number;
+      retain?: boolean;
+      routed?: boolean;
+      fromBridge?: boolean;
+      diagnostic?: boolean;
+      expiresAtOverride?: number;
+    },
+  ): void {
+    const nowMs = this.now();
+    const ttlMs = this.ttlForTopic(topic);
+    // Only non-empty message ids participate in dedup, mirroring
+    // `fanOut`'s `cleanMessageId` normalization.
+    const messageId =
+      typeof opts.messageId === 'string' && opts.messageId.length > 0 ? opts.messageId : undefined;
+    const entry: PauseBufferEntry = {
+      pauseId: `paused-${++this.nextPauseId}`,
+      pauseOrder: ++this.nextPauseOrder,
+      topic,
+      payload,
+      expiresAt:
+        opts.expiresAtOverride !== undefined
+          ? opts.expiresAtOverride
+          : ttlMs === undefined
+            ? undefined
+            : nowMs + ttlMs,
+      ...(opts.key === undefined ? {} : { key: opts.key }),
+      ...(opts.traceparent === undefined ? {} : { traceparent: opts.traceparent }),
+      ...(messageId === undefined ? {} : { messageId }),
+      ...(opts.eventTime === undefined ? {} : { eventTime: opts.eventTime }),
+      ...(opts.causal === undefined ? {} : { causal: opts.causal }),
+      ...(opts.publisherId === undefined ? {} : { publisherId: opts.publisherId }),
+      ...(opts.schemaVersion === undefined ? {} : { schemaVersion: opts.schemaVersion }),
+      ...(opts.retain === undefined ? {} : { retain: opts.retain }),
+      ...(opts.routed === undefined ? {} : { routed: opts.routed }),
+      ...(opts.fromBridge === undefined ? {} : { fromBridge: opts.fromBridge }),
+      ...(opts.diagnostic === undefined ? {} : { diagnostic: opts.diagnostic }),
+    };
+    // Internal-only flags (`routed`, `fromBridge`, `diagnostic`) and the
+    // traceparent are runtime state: they ride the in-memory entry but are
+    // not persisted — recovery fans the message out as an ordinary
+    // publish (documented on `PauseBufferEntry`).
+    this.durableLogForTopic(topic)?.append({
+      seq: 0,
+      topic,
+      at: nowMs,
+      paused: true,
+      pauseId: entry.pauseId,
+      pauseOrder: entry.pauseOrder,
+      expiresAt: entry.expiresAt,
+      payload,
+      ...(entry.key === undefined ? {} : { key: entry.key }),
+      ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
+      ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
+      ...(entry.eventTime === undefined ? {} : { eventTime: entry.eventTime }),
+      ...(entry.causal === undefined ? {} : { causal: entry.causal }),
+      ...(entry.schemaVersion === undefined ? {} : { schemaVersion: entry.schemaVersion }),
+    });
+    rule.buffer.push(entry);
+  }
+
+  /**
+   * Fans out every message buffered under a pause rule in original
+   * (publish) order — called by `resumeTopic` after the rule is removed,
+   * so the entries re-enter the full admission pipeline (including the
+   * pause gate itself: a message whose topic still matches another active
+   * pause rule is shed or re-buffered under that rule). Each entry keeps
+   * the TTL deadline stamped at pause admission (`pausedExpiresAt`):
+   * an entry whose deadline passed while buffered is counted expired and
+   * never delivered (the EB-32 precedent — never resurrected). Buffered
+   * idempotent messages re-run the dedup suppression gate and claim
+   * their slot only when admitted, mirroring `publishIdempotent`.
+   *
+   * Every entry is tombstoned as it leaves the buffer, so a restart
+   * cannot rebuild — and re-deliver — it. Returns the number of entries
+   * fanned out (admitted or shed — both left the buffer; expired and
+   * duplicate-suppressed entries drained without fan-out).
+   */
+  private drainPauseBuffer(rule: { mode: TopicPauseMode; buffer: PauseBufferEntry[] }): number {
+    // Splice the buffer up front: re-entrant fan-out below can buffer
+    // into *another* rule's buffer, but never back into this one (the
+    // rule is already removed from `pauseRules`).
+    const entries = rule.buffer.splice(0);
+    if (entries.length === 0) return 0;
+    const nowMs = this.now();
+    let drained = 0;
+    for (const entry of entries) {
+      if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) {
+        // Expired while buffered: counted, never delivered, tombstoned.
+        this.recordExpired(entry.topic);
+        this.appendPauseTombstone(entry.pauseId, entry.topic);
+        continue;
+      }
+      // Idempotent suppression, mirroring `publishIdempotent`'s gate: a
+      // retry buffered twice still delivers once. The slot is claimed
+      // only by an admitted fan-out below.
+      let suppressed = false;
+      if (entry.messageId !== undefined) {
+        const dedupKey = `${entry.topic}\0${entry.messageId}`;
+        this.pruneDedup(nowMs);
+        const firstAt = this.dedup.get(dedupKey);
+        if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
+          this.countDuplicate(entry.topic, entry.payload, entry.publisherId);
+          suppressed = true;
+        }
+      }
+      if (!suppressed) {
+        // Full admission at resume: schema, rate-limit budget, and
+        // sequence numbers are all drawn here — none were burned at pause
+        // time. `pausedExpiresAt` preserves the pause-time TTL deadline.
+        const { admitted } = this.fanOut(
+          entry.topic,
+          entry.payload,
+          false, // preAdmitted
+          undefined, // delayed
+          entry.key,
+          undefined, // preassignedKeySeq: drawn at resume, in drain order
+          entry.traceparent,
+          entry.messageId,
+          entry.routed ?? false,
+          undefined, // routedExpiresAt
+          entry.fromBridge ?? false,
+          entry.diagnostic ?? false,
+          entry.eventTime,
+          entry.causal,
+          entry.publisherId,
+          entry.schemaVersion,
+          entry.retain,
+          entry.expiresAt, // pausedExpiresAt: the original TTL deadline, verbatim
+        );
+        if (admitted && entry.messageId !== undefined) {
+          // Claim the dedup slot exactly like `publishIdempotent`: only
+          // an admitted message suppresses its retry.
+          const dedupKey = `${entry.topic}\0${entry.messageId}`;
+          this.dedup.delete(dedupKey);
+          this.dedup.set(dedupKey, nowMs);
+          while (this.dedup.size > this.idempotencyMaxEntries) {
+            const oldest = this.dedup.keys().next();
+            if (oldest.done) break;
+            this.dedup.delete(oldest.value);
+          }
+          this.durableLog?.appendPublishDedup({ topic: entry.topic, messageId: entry.messageId, at: nowMs });
+        }
+        drained += 1;
+      }
+      this.appendPauseTombstone(entry.pauseId, entry.topic);
+    }
+    this.scheduleFlush();
+    return drained;
   }
 
   /**
@@ -13910,6 +14432,95 @@ export class EventBus {
   }
 
   /**
+   * Rebuilds queue-mode pause buffers from the durable log after a
+   * restart (EB-88). A pause-buffer record (seq 0, `paused: true`) becomes
+   * a live buffered entry unless a later tombstone closed it. Pause rules
+   * themselves are runtime ops state and do not survive a restart — so a
+   * recovered buffer cannot stay paused under a rule that no longer
+   * exists: the entries fan out immediately through the full admission
+   * pipeline, in global `pauseOrder` (the original publish order across
+   * topics), each keeping the TTL deadline stamped at pause admission.
+   * Entries whose deadline passed while the process was down are dropped
+   * as expired — counted once, tombstoned so a second restart does not
+   * recount — and never resurrected (the EB-32 precedent).
+   *
+   * Design intent: the pause was a gate on the old process; the new
+   * process starts unpaused. The alternative — rebuilding the rules too —
+   * would resurrect ops intent across restarts, surprising an operator
+   * who paused a topic, restarted for an unrelated deploy, and found the
+   * topic still paused with no record of why.
+   */
+  private recoverPaused(): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const nowMs = this.now();
+    const tombstoned = new Set<string>();
+    const buffered: DurableLogRecord[] = [];
+    // `readSince(topic, -1)`: the exclusive bound sits below every real
+    // seq, so the seq-0 pause records and tombstones come along too.
+    for (const topic of log.topics()) {
+      for (const rec of log.readSince(topic, -1)) {
+        if (rec.paused !== true || rec.pauseId == null) continue;
+        if (rec.cancelled === true) {
+          tombstoned.add(rec.pauseId);
+          continue;
+        }
+        buffered.push(rec);
+      }
+    }
+    // Oldest first: `pauseOrder` is the cross-topic publish order the
+    // resume drain would have used.
+    buffered.sort((a, b) => (a.pauseOrder ?? 0) - (b.pauseOrder ?? 0));
+    let fannedOut = false;
+    for (const rec of buffered) {
+      const pauseId = rec.pauseId as string;
+      if (tombstoned.has(pauseId)) continue;
+      // Keep generated ids ahead of recovered ones — `pauseTopic` must
+      // never reuse an id the previous process handed out.
+      const match = /^paused-(\d+)$/.exec(pauseId);
+      if (match != null) {
+        this.nextPauseId = Math.max(this.nextPauseId, parseInt(match[1], 10) + 1);
+      }
+      if (rec.pauseOrder !== undefined) {
+        this.nextPauseOrder = Math.max(this.nextPauseOrder, rec.pauseOrder + 1);
+      }
+      if (rec.expiresAt !== undefined && nowMs >= rec.expiresAt) {
+        this.recordExpired(rec.topic);
+        this.appendPauseTombstone(pauseId, rec.topic);
+        continue;
+      }
+      // Full admission on the new process: schema, rate-limit budget and
+      // sequence numbers are drawn here, against the rules in force now.
+      // Internal-only flags (`routed`, `fromBridge`, `diagnostic`) and the
+      // traceparent were runtime state and are not recovered — the message
+      // fans out as an ordinary publish (see `PauseBufferEntry`).
+      this.fanOut(
+        rec.topic,
+        rec.payload,
+        false, // preAdmitted
+        undefined, // delayed
+        rec.key,
+        undefined, // preassignedKeySeq
+        undefined, // traceparent: not persisted, like delayed schedules
+        rec.messageId,
+        false, // routed
+        undefined, // routedExpiresAt
+        false, // fromBridge
+        false, // diagnostic
+        rec.eventTime,
+        rec.causal,
+        rec.publisherId,
+        rec.schemaVersion,
+        undefined, // retain: runtime-only, not persisted
+        rec.expiresAt, // pausedExpiresAt: the original TTL deadline, verbatim
+      );
+      this.appendPauseTombstone(pauseId, rec.topic);
+      fannedOut = true;
+    }
+    if (fannedOut) this.scheduleFlush();
+  }
+
+  /**
    * Hands out the next per-topic sequence number, starting at 1. The
    * counter is per concrete topic and never resets, so every message ever
    * published to a topic carries a unique, gap-free number at publish
@@ -14094,6 +14705,22 @@ export class EventBus {
     this.statsFor(topic).publisherRateLimited += 1;
     this.totalPublisherRateLimited += 1;
     this.emitAdmissionRejected(topic, 'publisher-rate-limit', payload, publisherId);
+  }
+
+  /**
+   * Counts one publish shed by a topic pause in shed mode (EB-88)
+   * against the topic and the global total, then fires the
+   * admission-rejection hook with reason `'topic-paused'`. Like the
+   * EB-19 rate-limit shed this consumes a sequence number — the caller
+   * stamps it before this runs, so the stats entry must already exist
+   * here — and subscribers observe the loss as a gap. Unlike the
+   * pre-admission rejections it lands in the dedicated `pausedMessages`
+   * counter, not `rejectedMessages`.
+   */
+  private countTopicPaused(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).pausedMessages += 1;
+    this.totalPaused += 1;
+    this.emitAdmissionRejected(topic, 'topic-paused', payload, publisherId);
   }
 
   /**
@@ -15499,6 +16126,13 @@ export class EventBus {
     // only `publish` passes this — every other path leaves it undefined
     // and never touches the retained store.
     retain?: boolean,
+    // Pause-buffer TTL deadline (see `EventBus.pauseTopic`, EB-88): only
+    // the pause-buffer drain passes this — the message was "published" at
+    // pause time and only *delivered* at resume, so the deadline stamped
+    // at pause admission wins verbatim over the TTL rules in force now
+    // (a rule added in between does not retroactively extend the
+    // message). Every other path leaves it undefined.
+    pausedExpiresAt?: number,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -15534,6 +16168,44 @@ export class EventBus {
     if (!preAdmitted) {
       payload = this.redactAdmissionPayload(topic, payload);
     }
+    // Topic pause (EB-88): the FIRST admission gate — before the
+    // per-publisher rate limiter (EB-79), the ACL, the schema validator
+    // and the size cap. In shed mode the publish is rejected outright:
+    // counted in `pausedMessages`, surfaced on the admission-rejection
+    // hook with reason `'topic-paused'`, and consuming a sequence number
+    // so subscribers observe the loss as a gap (the EB-19 rate-limit
+    // shed semantics — the stats entry is updated here, exactly as the
+    // rate-limit shed does below). In queue mode the publish is held in
+    // the rule's durable-side buffer instead: no sequence number, no
+    // schema verdict, no rate-limit budget — the message gets its full
+    // admission when it fans out at resume.
+    if (!preAdmitted) {
+      const pauseRule = this.pauseForTopic(topic);
+      if (pauseRule !== undefined) {
+        if (pauseRule.mode === 'shed') {
+          const stats = this.statsFor(topic);
+          stats.publishedMessages += 1;
+          stats.lastSeq = this.nextSeq(topic);
+          this.totalPublished += 1;
+          this.countTopicPaused(topic, payload, publisherId);
+          return { matched: 0, accepted: 0, admitted: false };
+        }
+        this.bufferPausedMessage(pauseRule, topic, payload, {
+          key,
+          traceparent,
+          messageId,
+          eventTime,
+          causal,
+          publisherId,
+          schemaVersion,
+          retain,
+          routed,
+          fromBridge,
+          diagnostic,
+        });
+        return { matched: 0, accepted: 0, admitted: false };
+      }
+    }
     // Causal clock (see `PublishOptions.causal`): validated by the
     // publishing entry point; the source defaults to the resolved topic,
     // so alias resolution keeps the stream identity stable.
@@ -15556,6 +16228,13 @@ export class EventBus {
       // number (subscribers see no gap), writes nothing to the durable
       // log, and burns no topic rate-limit budget. Surfaced on the
       // admission-rejection hook with reason 'publisher-rate-limit'.
+      //
+      // Design intent (EB-88): the topic-pause gate above runs before
+      // this one — a publish to a paused topic never takes a publisher
+      // token. The pause is an operator-level "stop" on the topic; letting
+      // it burn a producer's budget would punish the producer for the
+      // operator's window, and would make the shed's attribution
+      // ambiguous (paused vs. over-budget).
       if (this.takePublisherToken(publisherId) !== undefined) {
         this.countPublisherRateLimited(topic, payload, publisherId);
         return { matched: 0, accepted: 0, admitted: false };
@@ -15764,15 +16443,20 @@ export class EventBus {
     // the message). A routed forward carries the source message's deadline
     // verbatim — routing never resets it — so it wins over the
     // destination's own TTL rules; when the source message had no
-    // deadline, the destination's rules apply normally.
+    // deadline, the destination's rules apply normally. A pause-buffer
+    // drain (EB-88) carries the deadline stamped at pause admission the
+    // same way — the message was "published" at pause time and only
+    // delivered at resume — so it wins over every other source.
     const expiresAt =
-      routedExpiresAt !== undefined
-        ? routedExpiresAt
-        : delayed !== undefined
-          ? delayed.expiresAt
-          : ttlMs === undefined
-            ? undefined
-            : nowMs + ttlMs;
+      pausedExpiresAt !== undefined
+        ? pausedExpiresAt
+        : routedExpiresAt !== undefined
+          ? routedExpiresAt
+          : delayed !== undefined
+            ? delayed.expiresAt
+            : ttlMs === undefined
+              ? undefined
+              : nowMs + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
     // MQTT-style retained messages (EB-87): the message above cleared
     // every admission gate and is fully stamped (wire payload, signature,
@@ -16397,6 +17081,13 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
+      pausedMessages: this.totalPaused,
+      // Active topic-pause rules (EB-88), in registration order.
+      pausedTopics: [...this.pauseRules.entries()].map(([topicPattern, rule]) => ({
+        topicPattern,
+        mode: rule.mode,
+        bufferedMessages: rule.buffer.length,
+      })),
       rejectedMessages: this.totalRejected,
       deprecatedSchemaVersions: this.totalDeprecatedSchemaVersions,
       unregisteredTopicPublishes: this.unregisteredTopicPublishes,
@@ -16549,6 +17240,7 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         publisherRateLimited: stats.publisherRateLimited,
+        pausedMessages: stats.pausedMessages,
         rejectedMessages: stats.rejectedMessages,
         deprecatedSchemaVersions: stats.deprecatedSchemaVersions,
         lateMessages: stats.lateMessages,

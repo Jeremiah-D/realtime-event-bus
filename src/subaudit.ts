@@ -7,7 +7,8 @@
  * `signature_verification_failed`) / durable-log retention policy changes
  * (EB-85, `retention_updated`) / retained-message rule and state changes
  * (EB-87, `retained_rule_set` / `retained_rule_cleared` /
- * `retained_cleared`).
+ * `retained_cleared`) / topic pause/resume (EB-88, `topic_paused` /
+ * `topic_resumed`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -48,7 +49,9 @@ export type SubscriptionAuditAction =
   | 'retention_updated'
   | 'retained_rule_set'
   | 'retained_rule_cleared'
-  | 'retained_cleared';
+  | 'retained_cleared'
+  | 'topic_paused'
+  | 'topic_resumed';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -63,6 +66,8 @@ export type SubscriptionAuditAction =
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
  * - `retained_cleared`: `{ via: 'publish' }` (the `topic` field carries the concrete topic)
+ * - `topic_paused`: `{ mode: 'shed'|'queue' }` (the `pattern` field carries the rule key)
+ * - `topic_resumed`: `{ mode: 'shed'|'queue', drainedMessages: <count> }` (the `pattern` field carries the rule key)
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -117,6 +122,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'retained_rule_set',
   'retained_rule_cleared',
   'retained_cleared',
+  'topic_paused',
+  'topic_resumed',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

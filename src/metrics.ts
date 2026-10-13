@@ -30,6 +30,8 @@
  *   event time older than their topic's event-time watermark (EB-59).
  * - `eventbus_rate_limited_messages_total`: messages shed by publish-side
  *   per-topic rate limiting.
+ * - `eventbus_paused_messages_total`: publishes shed by topic pauses in
+ *   shed mode (EB-88).
  * - `eventbus_duplicate_messages_total`: idempotent publishes suppressed
  *   as duplicates.
  * - `eventbus_filtered_messages_total`: messages skipped by subscriber
@@ -49,6 +51,8 @@
  *   delivered immediately on clock regression (see
  *   `SubscribeOptions.causal`).
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
+ * - `eventbus_topic_paused_messages_total{topic}`: publishes per topic
+ *   shed by topic pauses in shed mode (EB-88).
  * - `eventbus_topic_late_messages_total{topic}`: messages per topic whose
  *   business event time was older than the topic's event-time watermark
  *   (EB-59; still delivered — a data-quality counter, not a loss
@@ -80,6 +84,7 @@
  *   delivery-side rate shaping.
  * - `eventbus_pending_delayed`: delayed messages scheduled but not yet
  *   due.
+ * - `eventbus_paused_topics`: currently active topic-pause rules (EB-88).
  * - `eventbus_causal_buffer_depth`: messages currently held in
  *   per-(subscriber, source) causal reorder buffers, waiting on their
  *   dependencies.
@@ -274,6 +279,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.publisherRateLimited,
   );
   counter(
+    'eventbus_paused_messages_total',
+    'Total publishes shed by topic pauses in shed mode (EB-88).',
+    stats.pausedMessages ?? 0,
+  );
+  counter(
     'eventbus_duplicate_messages_total',
     'Total idempotent publishes suppressed as duplicates.',
     stats.duplicateMessages,
@@ -354,6 +364,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_pending_delayed',
     'Delayed messages scheduled but not yet due.',
     stats.pendingDelayed,
+  );
+  gauge(
+    'eventbus_paused_topics',
+    'Currently active topic-pause rules (EB-88).',
+    stats.pausedTopics?.length ?? 0,
   );
   gauge(
     'eventbus_queue_bytes',
@@ -465,6 +480,10 @@ export function renderPrometheus(stats: BusStats): string {
   );
   lines.push('# TYPE eventbus_topic_published_messages_total counter');
   lines.push(
+    '# HELP eventbus_topic_paused_messages_total Total publishes to the topic shed by topic pauses in shed mode (EB-88).',
+  );
+  lines.push('# TYPE eventbus_topic_paused_messages_total counter');
+  lines.push(
     '# HELP eventbus_topic_subscribers Subscribers matched by the most recent publish to the topic (fan-out width).',
   );
   lines.push('# TYPE eventbus_topic_subscribers gauge');
@@ -479,6 +498,7 @@ export function renderPrometheus(stats: BusStats): string {
   for (const t of stats.topics) {
     const label = `topic="${escapeLabelValue(t.topic)}"`;
     lines.push(`eventbus_topic_published_messages_total{${label}} ${t.publishedMessages}`);
+    lines.push(`eventbus_topic_paused_messages_total{${label}} ${t.pausedMessages ?? 0}`);
     lines.push(`eventbus_topic_subscribers{${label}} ${t.subscriberCount}`);
     // `?? 0` keeps the renderer tolerant of a stats object that predates
     // the field (hand-built fixtures included), mirroring the namespaces

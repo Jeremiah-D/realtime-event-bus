@@ -42,6 +42,13 @@ export interface DurableLogRecord {
    * a restart rebuilds the timer with the attribution intact.
    */
   publisherId?: string;
+  /**
+   * Requested schema version (see `PublishOptions.schemaVersion`),
+   * present when the publish carried one. Pause-buffered messages
+   * (EB-88) carry it so restart recovery re-validates against the
+   * requested version instead of silently falling back to latest.
+   */
+  schemaVersion?: number;
   /** Concrete topic name, as published. */
   topic: string;
   /**
@@ -77,8 +84,39 @@ export interface DurableLogRecord {
    * Also the tombstone marker for an MQTT-style retained message (see
    * `retained`): `true` on a seq-0 retained record means the topic's
    * retained message was cleared and must not be rebuilt on restart.
+   * Also the tombstone marker for a pause-buffered message (see `paused`):
+   * `true` on a seq-0 pause record means the buffered message with this
+   * `pauseId` was drained at resume or dropped as expired and must not be
+   * rebuilt on restart.
    */
   cancelled?: boolean;
+  /**
+   * Pause-buffer marker (EB-88): `true` on a seq-0 record means this line
+   * is a message held by a queue-mode topic pause (`EventBus.pauseTopic`
+   * with `mode: 'queue'`) — state, not a message: it carries no sequence
+   * number, is invisible to `readSince` replay (which only returns
+   * `seq >= 1`), and never moves the per-topic sequence counter.
+   * Identified by `pauseId`; ordered across topics by `pauseOrder`. A
+   * pause record never carries `delayId` or `retained` — the three seq-0
+   * families are disjoint by construction. Never age-evicted by
+   * time-based retention (all seq-0 records are kept): evicting a
+   * buffered message would lose it on restart.
+   */
+  paused?: boolean;
+  /**
+   * Identifies one pause-buffered message (`paused-1`, …). Present on the
+   * seq-0 buffer record and on its tombstone, so restart recovery can tell
+   * a still-buffered message from one already drained at resume or dropped
+   * as expired.
+   */
+  pauseId?: string;
+  /**
+   * Global FIFO ordinal of the pause-buffer record: buffered messages fan
+   * out at resume in `pauseOrder`, preserving the original publish order
+   * even across concrete topics under one pattern rule. Present on
+   * non-tombstone pause records (the bus always writes it).
+   */
+  pauseOrder?: number;
   /**
    * MQTT-style retained-message marker (EB-87): `true` on a seq-0 record
    * means this line is retained state for the topic, not a message and
@@ -285,6 +323,12 @@ interface LogLine {
   retained?: boolean;
   /** The retained message's original per-topic seq (see `DurableLogRecord.retainedSeq`). */
   retainedSeq?: number;
+  /** Pause-buffer marker (see `DurableLogRecord.paused`). */
+  paused?: boolean;
+  /** Pause-buffer message identity (see `DurableLogRecord.pauseId`). */
+  pauseId?: string;
+  /** Pause-buffer FIFO ordinal (see `DurableLogRecord.pauseOrder`). */
+  pauseOrder?: number;
   key?: string;
   /** Per-key publish-order sequence number, present exactly when `key` is. */
   keySeq?: number;
@@ -299,6 +343,8 @@ interface LogLine {
    * `DurableLogRecord.messageId`).
    */
   messageId?: string;
+  /** Requested schema version (see `DurableLogRecord.schemaVersion`). */
+  schemaVersion?: number;
   /**
    * Business event time in epoch milliseconds (see
    * `DurableLogRecord.eventTime`).
@@ -2319,6 +2365,10 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.cancelled !== undefined) line.cancelled = record.cancelled;
   if (record.retained !== undefined) line.retained = record.retained;
   if (record.retainedSeq !== undefined) line.retainedSeq = record.retainedSeq;
+  if (record.paused !== undefined) line.paused = record.paused;
+  if (record.pauseId !== undefined) line.pauseId = record.pauseId;
+  if (record.pauseOrder !== undefined) line.pauseOrder = record.pauseOrder;
+  if (record.schemaVersion !== undefined) line.schemaVersion = record.schemaVersion;
   if (record.key !== undefined) line.key = record.key;
   if (record.keySeq !== undefined) line.keySeq = record.keySeq;
   if (record.dictId !== undefined) line.dictId = record.dictId;
@@ -2351,6 +2401,15 @@ function logLineOf(record: DurableLogRecord): LogLine {
  * and a retained record never carries a `delayId` — the two seq-0
  * families are disjoint by construction.
  *
+ * `seq` 0 is also reserved for pause-buffer records (`paused: true`,
+ * EB-88): a buffered set record carries the buffered message's identity
+ * in `pauseId` (a non-empty string) and its global FIFO ordinal in
+ * `pauseOrder` (a positive integer — the bus always writes it); a pause
+ * tombstone (`cancelled: true`) carries `pauseId` and closes the buffered
+ * message without fanning it out. `paused` is only valid with `seq` 0,
+ * and a pause record never carries `delayId` or `retained` — the three
+ * seq-0 families are disjoint by construction.
+ *
  * A `key`, when present, must be a non-empty string; anything else makes
  * the line corrupt. A `keySeq`, when present, must be a positive integer
  * and requires `key` — the bus always writes both together.
@@ -2369,7 +2428,10 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   const seq = o['seq'];
   const isScheduleRecord = seq === 0;
   const isRetainedRecord = o['retained'] === true;
+  const isPauseRecord = o['paused'] === true;
   if (isRetainedRecord && !isScheduleRecord) return null;
+  if (isPauseRecord && !isScheduleRecord) return null;
+  if (isRetainedRecord && isPauseRecord) return null;
   if (isScheduleRecord) {
     if (isRetainedRecord) {
       // Retained set records carry the retained message's original seq;
@@ -2378,6 +2440,13 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
         if (o['retainedSeq'] !== undefined) return null;
       } else if (!Number.isInteger(o['retainedSeq']) || (o['retainedSeq'] as number) < 1) {
         return null;
+      }
+    } else if (isPauseRecord) {
+      // Pause-buffer set records carry the buffered message's identity
+      // and FIFO ordinal; pause tombstones carry only the identity.
+      if (typeof o['pauseId'] !== 'string' || (o['pauseId'] as string).length === 0) return null;
+      if (o['cancelled'] !== true) {
+        if (!Number.isInteger(o['pauseOrder']) || (o['pauseOrder'] as number) < 1) return null;
       }
     } else if (typeof o['delayId'] !== 'string' || (o['delayId'] as string).length === 0) {
       return null;
@@ -2418,6 +2487,24 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     // The bus only ever writes `retained: true`; any other value means
     // the line was tampered with or miswritten.
     return null;
+  }
+  if (isPauseRecord) {
+    record.paused = true;
+    // Validated above: `pauseId` always present, `pauseOrder` present on
+    // non-tombstone records.
+    record.pauseId = o['pauseId'] as string;
+    if (o['pauseOrder'] !== undefined) record.pauseOrder = o['pauseOrder'] as number;
+  } else {
+    // The bus only ever writes `paused: true`; any other value — or a
+    // stray `pauseId`/`pauseOrder` on a non-pause record — means the line
+    // was tampered with or miswritten.
+    if (o['paused'] !== undefined || o['pauseId'] !== undefined || o['pauseOrder'] !== undefined) {
+      return null;
+    }
+  }
+  if (o['schemaVersion'] !== undefined) {
+    if (!Number.isInteger(o['schemaVersion']) || (o['schemaVersion'] as number) < 1) return null;
+    record.schemaVersion = o['schemaVersion'] as number;
   }
   if (o['key'] !== undefined) {
     if (typeof o['key'] !== 'string' || (o['key'] as string).length === 0) return null;
@@ -2505,9 +2592,16 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     };
   }
   // A non-tombstone delayed-delivery schedule record must say when it is
-  // due. Retained-message records (EB-87) are the other seq-0 family and
-  // carry no due time — only their own `retainedSeq`, validated above.
-  if (isScheduleRecord && !isRetainedRecord && record.cancelled !== true && record.deliverAt === undefined) {
+  // due. Retained-message records (EB-87) and pause-buffer records
+  // (EB-88) are the other seq-0 families and carry no due time — only
+  // their own identity fields, validated above.
+  if (
+    isScheduleRecord &&
+    !isRetainedRecord &&
+    !isPauseRecord &&
+    record.cancelled !== true &&
+    record.deliverAt === undefined
+  ) {
     return null;
   }
   return record;
