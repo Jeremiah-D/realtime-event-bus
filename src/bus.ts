@@ -112,10 +112,20 @@ import {
   type LateMessageCallback,
   type LateMessageEvent,
 } from './watermark.ts';
+import {
+  assertValidSigningKeys,
+  normalizeSigningSecret,
+  signTopicMessage,
+  verifyTopicMessage,
+  type MessageSignature,
+  type StoredSigningKey,
+  type TopicSigningKeysConfig,
+} from './signing.ts';
 
 export type { Delivery, RedeliveryReason } from './ack.ts';
 export type {
   BridgeEnvelope,
+  BridgeMessageSignature,
   BridgeOptions,
   BridgeReceiveReason,
   BridgeReceiveResult,
@@ -146,6 +156,13 @@ export type {
 } from './trace.ts';
 export type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 export { AesGcmEncryptor, NoopEncryptor, isEncryptedPayload, randomAes256Key } from './encrypt.ts';
+export type {
+  MessageSignature,
+  StoredSigningKey,
+  TopicSigningKeyInput,
+  TopicSigningKeysConfig,
+} from './signing.ts';
+export { assertValidSigningKeys, SIGNING_KID_PATTERN, SIGNATURE_HEX_LENGTH } from './signing.ts';
 
 export interface BusMessage {
   topic: string;
@@ -201,6 +218,17 @@ export interface BusMessage {
    * late. Absent for publishes that did not carry an event time.
    */
   eventTime?: number;
+  /**
+   * Publish-side HMAC signature (see `EventBus.setTopicSigningKey`,
+   * EB-84): `{ kid, sig }` covering `(topic, seq, wire bytes)` — the
+   * wire bytes are the post-compression form, so a compressed envelope's
+   * signature covers the ciphertext. Present exactly when a signing rule
+   * matched the topic at publish time. It rides the envelope end to end
+   * (durable log, replay, bridge mirror) so a `verifySignature`
+   * subscriber checks the same bytes the publisher signed. Never a
+   * secret — only the key id and the hex digest.
+   */
+  signature?: MessageSignature;
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
@@ -840,6 +868,35 @@ export interface SubscribeOptions {
    * from `subscribe`. Disabled by default.
    */
   filter?: MessageFilter;
+  /**
+   * Opt-in envelope signature verification (EB-84, backend security).
+   * When true, every message fanned out to this subscriber is checked
+   * against the topic's HMAC signing rules (`setTopicSigningKey`)
+   * BEFORE any content processing: the envelope's `{kid, sig}` must
+   * verify over `(topic, seq, wire bytes)` — the wire bytes are the
+   * post-compression form, so a compressed message is verified against
+   * the ciphertext and only inflated after the check passes.
+   *
+   * A message that fails verification is dropped — never queued, never
+   * delivered — and counted in `TopicStats.signatureFailures` (plus the
+   * global total) with a `signature_verification_failed` subscription
+   * audit event. The loss also surfaces as a sequence gap: a failed
+   * verification is a genuine loss, not a deliberate skip.
+   *
+   * Fail-closed: a topic with no signing rule, or a message carrying no
+   * signature, never verifies — a misconfigured verifying subscription
+   * drops loudly instead of delivering unverified messages. Applies to
+   * live fan-out, durable-log replay (`resumeFromSeq`/`resumeFromTime`),
+   * and bridge/forward inbound (the destination bus re-admits and
+   * re-signs under its own rules; the subscriber verifies the
+   * destination bus's signature). Shadow mirrors (`SubscribeOptions.shadow`)
+   * never verify — they mirror production traffic byte-for-byte.
+   *
+   * Must be a boolean when provided; anything else throws `TypeError`
+   * from `subscribe`. Disabled by default: a non-verifying subscriber
+   * pays a single boolean check per delivery.
+   */
+  verifySignature?: boolean;
   /**
    * Opt-in multi-pattern composite subscription (EB-70). When set, every
    * message fanned out to this subscriber — after it passes the content
@@ -2343,6 +2400,25 @@ export interface TopicStats {
    */
   filteredMessages: number;
   /**
+   * Messages on this topic discarded by `verifySignature` subscribers
+   * (see `SubscribeOptions.verifySignature`, EB-84) because the
+   * envelope's HMAC signature was missing or invalid: the message never
+   * entered that subscriber's queue. Counts each discarded delivery
+   * once, so a message fanned out to N verifying subscribers that all
+   * reject it contributes N here. The loss also surfaces as a sequence
+   * gap on each rejecting subscriber: a failed verification is a genuine
+   * loss, not a deliberate skip.
+   */
+  signatureFailures: number;
+  /**
+   * Per-topic HMAC signing configuration (see `setTopicSigningKey`,
+   * EB-84): present only when a signing rule currently matches the
+   * topic. Carries the key ids and the grace window — never the secrets.
+   * Omitted otherwise, so stats snapshots without signing are
+   * byte-identical to before.
+   */
+  signing?: { keyIds: string[]; graceMs: number };
+  /**
    * Messages on this topic suppressed by subscriber-side exactly-once
    * dedup (see `SubscribeOptions.deduplicateMessages`): the same
    * `(topic, messageId)` arrived again within a subscriber's dedup
@@ -2638,6 +2714,13 @@ export interface BusStats {
    * counting rules.
    */
   filteredMessages: number;
+  /**
+   * Total messages discarded by `verifySignature` subscribers because the
+   * envelope's HMAC signature was missing or invalid — the sum of every
+   * topic's `signatureFailures`. See `TopicStats.signatureFailures` for
+   * the exact counting rules.
+   */
+  signatureFailures: number;
   /**
    * Total messages moved into subscriber dead-letter queues — every
    * reliable-subscription message that exhausted its redelivery budget
@@ -3303,6 +3386,12 @@ interface Subscriber {
    */
   filter?: MessageFilter;
   /**
+   * Opt-in envelope signature verification (see
+   * `SubscribeOptions.verifySignature`, EB-84). False by default — a
+   * non-verifying subscriber pays a single boolean check per delivery.
+   */
+  verifySignature: boolean;
+  /**
    * Opt-in durable-log replay progress observer (see
    * `SubscribeOptions.onReplayProgress`, EB-71). Absent unless the
    * subscriber opted in.
@@ -3495,6 +3584,7 @@ function zeroedTopicStats(): {
   lateMessages: number;
   duplicateMessages: number;
   filteredMessages: number;
+  signatureFailures: number;
   dedupDropped: number;
   aliasRetiredMessages: number;
   redactedFields: number;
@@ -3515,6 +3605,7 @@ function zeroedTopicStats(): {
     lateMessages: 0,
     duplicateMessages: 0,
     filteredMessages: 0,
+    signatureFailures: 0,
     dedupDropped: 0,
     aliasRetiredMessages: 0,
     redactedFields: 0,
@@ -6297,6 +6388,26 @@ export class EventBus {
    */
   private ttlMatcherCache = new Map<string, RegExp>();
   /**
+   * Per-topic HMAC signing rules (EB-84), keyed by the exact string passed
+   * to `setTopicSigningKey` — either a concrete topic name or a wildcard
+   * pattern. Match resolution mirrors the TTL rules: an exact-topic rule
+   * wins over any pattern; between patterns the earliest-registered rule
+   * wins. `keys[0]` is the live signing key; later keys are retired keys
+   * kept for their grace window (`retiredAtMs`, stamped at rotation).
+   */
+  private signingRules = new Map<string, { keys: StoredSigningKey[]; graceMs: number }>();
+  /**
+   * Compiled matchers for the wildcard entries in `signingRules`, kept
+   * apart from the subscriber pattern cache and the other rule caches so
+   * signing configuration never inflates `patternCacheSize`.
+   */
+  private signingMatcherCache = new Map<string, RegExp>();
+  /**
+   * Messages discarded by `verifySignature` subscribers because the
+   * envelope's HMAC signature was missing or invalid (global total).
+   */
+  private totalSignatureFailures = 0;
+  /**
    * Per-topic publish rate limits, keyed by the exact string passed to
    * `setTopicRateLimit` — either a concrete topic name or a wildcard
    * pattern. Match resolution is identical to the TTL rules: an exact-topic
@@ -7073,6 +7184,105 @@ export class EventBus {
    */
   clearTopicTtl(topicPattern: string): boolean {
     return this.ttlRules.delete(topicPattern);
+  }
+
+  /**
+   * Enables publish-side HMAC-SHA256 message signing for topics matching
+   * `topicPattern` (EB-84, backend security): every admitted publish to a
+   * matching topic is signed over `(topic, seq, wire bytes)` — the wire
+   * bytes are the post-compression form, so a compressed envelope's
+   * signature covers the ciphertext — and the `{kid, sig}` rides the
+   * `BusMessage` envelope, the durable log, and the bridge mirror.
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or an
+   * exact topic name). `config.keys` lists the signing keys newest-first:
+   * index 0 is the live signing key; every later key is a retired key
+   * that still verifies inside `graceMs` (default 0) from the moment it
+   * stopped being newest — key rotation without a verification outage.
+   * Re-setting a rule rotates: previously stored keys the new set drops
+   * are retired as of now (already-retired keys keep their original
+   * `retiredAtMs` — rotation is monotonic, re-setting never extends a
+   * grace window), and keys whose grace window already fully elapsed are
+   * pruned.
+   *
+   * A `verifySignature` subscriber checks the signature before any content
+   * processing; a failed check drops the message, counts it in
+   * `TopicStats.signatureFailures` (plus the global total), and files a
+   * `signature_verification_failed` audit event. Fail-closed: a topic
+   * with no signing rule, or a message carrying no signature, never
+   * verifies.
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * patterns, the earliest-registered matching pattern wins. Throws
+   * `RangeError` when `topicPattern` is empty, when `keys` is empty, when
+   * a `kid` is empty/duplicate/malformed, when a secret is empty, or when
+   * `graceMs` is negative — fail-fast at configuration time, never
+   * mid-publish.
+   */
+  setTopicSigningKey(topicPattern: string, config: TopicSigningKeysConfig): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    assertValidSigningKeys(config?.keys, `setTopicSigningKey("${topicPattern}")`);
+    const graceMs = config.graceMs ?? 0;
+    if (!Number.isFinite(graceMs) || graceMs < 0) {
+      throw new RangeError('graceMs must be a non-negative finite number of milliseconds');
+    }
+    const nowMs = this.now();
+    // Rotation stamping: the newest key (index 0) is the live signing
+    // key. Every other listed key — and every previously stored key the
+    // new set drops outright — is retired as of now, unless it was
+    // already retired earlier (rotation is monotonic: re-setting never
+    // extends a grace window). Keys whose grace window already fully
+    // elapsed are pruned — they can never verify again.
+    const previous = this.signingRules.get(topicPattern);
+    const prevByKid = new Map((previous?.keys ?? []).map((k) => [k.kid, k]));
+    const keys: StoredSigningKey[] = config.keys.map((input, index) => {
+      const prev = prevByKid.get(input.kid);
+      prevByKid.delete(input.kid);
+      return {
+        kid: input.kid,
+        secret: normalizeSigningSecret(
+          input.secret,
+          `setTopicSigningKey("${topicPattern}"): keys[${index}]`,
+        ),
+        ...(index === 0 ? {} : { retiredAtMs: prev?.retiredAtMs ?? nowMs }),
+      };
+    });
+    for (const old of prevByKid.values()) {
+      keys.push({ kid: old.kid, secret: old.secret, retiredAtMs: old.retiredAtMs ?? nowMs });
+    }
+    this.signingRules.set(topicPattern, {
+      keys: keys.filter((k) => k.retiredAtMs === undefined || nowMs - k.retiredAtMs <= graceMs),
+      graceMs,
+    });
+  }
+
+  /**
+   * Removes the signing rule previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed.
+   */
+  clearTopicSigningKey(topicPattern: string): boolean {
+    return this.signingRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the signing rule that applies to `topic`, or `undefined`
+   * when no rule matches. An exact-topic rule wins over patterns; between
+   * patterns the earliest-registered matching rule wins.
+   */
+  private signingForTopic(topic: string): { keys: StoredSigningKey[]; graceMs: number } | undefined {
+    const exact = this.signingRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, rule] of this.signingRules) {
+      let matcher = this.signingMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.signingMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return rule;
+    }
+    return undefined;
   }
 
   /**
@@ -8792,6 +9002,12 @@ export class EventBus {
     if (filter !== undefined && typeof filter !== 'function') {
       throw new TypeError('filter must be a function');
     }
+    // Envelope signature verification (EB-84): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const verifySignature = opts?.verifySignature ?? false;
+    if (typeof verifySignature !== 'boolean') {
+      throw new TypeError('verifySignature must be a boolean');
+    }
     // Durable-log replay progress (EB-71): the observer was validated
     // above; the interval falls back to the 100-entry default.
     const onReplayProgress = opts?.onReplayProgress;
@@ -8936,6 +9152,12 @@ export class EventBus {
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
       filter,
+      // Envelope signature verification (EB-84): opt-in integrity check
+      // at the publish side — a failed check drops the message before
+      // any content processing, counted and audited. False by default:
+      // a non-verifying subscriber pays a single boolean check per
+      // delivery.
+      verifySignature,
       // Durable-log replay progress observability (EB-71): the
       // per-subscriber progress state appears on the first resume
       // replay (see `admitReplayRecords`).
@@ -11072,8 +11294,10 @@ export class EventBus {
    *
    * Returns `{ accepted: false, reason }` when the envelope was not
    * queued: `'not-configured'` (no `EventBusOptions.bridge`),
-   * `'invalid-envelope'` (shape validation failed), or `'shed'`
-   * (ingress buffer full).
+   * `'invalid-envelope'` (shape validation failed),
+   * `'signature-verification-failed'` (the envelope carried a source
+   * signature that did not verify against this bus's signing rules for
+   * the topic), or `'shed'` (ingress buffer full).
    */
   receiveFromBridge(envelope: BridgeEnvelope): BridgeReceiveResult {
     const bridge = this.bridge;
@@ -11083,6 +11307,37 @@ export class EventBus {
     const validated = validateBridgeEnvelope(envelope);
     if (!validated.ok) {
       return { accepted: false, reason: 'invalid-envelope' };
+    }
+    // Cross-bus signature verification (EB-84): an inbound envelope
+    // carrying the source bus's signature is verified against this bus's
+    // signing rules for the (alias-resolved) destination topic — the
+    // signature proves a key holder published it, across an untrusted
+    // transport. The check recomputes the canonical raw payload bytes
+    // from the carried payload, so a tampered payload fails it. A failed
+    // check rejects the envelope outright. An envelope with no signature,
+    // or a topic with no local signing rule, skips this check: the
+    // destination's own publish-side signing still applies when the
+    // message is admitted below, so signatures stay per-bus and a bridge
+    // hop is a new admission.
+    const inboundSignature = validated.envelope.signature;
+    if (inboundSignature !== undefined) {
+      const resolvedTopic = this.resolvePublishTopic(validated.envelope.topic).topic;
+      const inboundRule = this.signingForTopic(resolvedTopic);
+      if (inboundRule !== undefined) {
+        const raw = serializeToJson(validated.envelope.payload);
+        const inboundOk =
+          raw !== undefined &&
+          verifyTopicMessage(
+            inboundRule.keys,
+            validated.envelope.topic,
+            inboundSignature.seq,
+            Buffer.from(raw, 'utf8'),
+            { kid: inboundSignature.kid, sig: inboundSignature.sig },
+            this.now(),
+            inboundRule.graceMs,
+          );
+        if (!inboundOk) return { accepted: false, reason: 'signature-verification-failed' };
+      }
     }
     if (this.bridgeInboundQueue.length >= bridge.maxInboundQueue) {
       this.bridgeDropped += 1;
@@ -11704,7 +11959,35 @@ export class EventBus {
           const dictionary = this.dictionaryForRecord(rec);
           if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
         }
+        // The publish-time HMAC signature rides the log record: restore it
+        // onto the envelope so a `verifySignature` subscriber checks the
+        // replayed message against the same (topic, seq, wire bytes) the
+        // publisher signed. `parseLogLine` already validated the shape.
+        if (rec.signature !== undefined) {
+          msg.signature = { kid: rec.signature.kid, sig: rec.signature.sig };
+        }
         if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
+        // Subscriber-side signature verification (EB-84) applies to replay
+        // exactly as to live fan-out: a replayed message that fails
+        // verification is dropped — never queued, never delivered —
+        // counted and audited. Like the other deliberate replay skips, the
+        // key/causal baselines advance past it so ordering gates never hang
+        // on a message that will never arrive; unlike a filter skip, the
+        // gap baseline does not advance — a failed verification is a
+        // genuine loss. Already-expired records skip verification: they
+        // were counted as skipped above and the drain drops them as
+        // expired — a dead message needs no integrity check.
+        if (!ttlExpired && subscriber.verifySignature && !this.deliverySignatureValid(msg)) {
+          this.countSignatureFailure(subscriber, msg, msg.signature?.kid);
+          if (rec.key !== undefined && rec.keySeq !== undefined) {
+            this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+          }
+          if (rec.causal !== undefined) {
+            this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+          }
+          countReplaySkipped();
+          continue;
+        }
         if (rec.causal !== undefined && subscriber.causal !== undefined) {
           // Causal replay: the filter and linger checks above already ran,
           // so the gate admits straight into the queue — replay never burned
@@ -13547,6 +13830,18 @@ export class EventBus {
     expiresAt: number | undefined,
     rawPayload: unknown,
   ): boolean {
+    // Envelope signature verification (EB-84): a verifying subscriber
+    // checks integrity before any content processing — a failed check
+    // drops the message before the queue, the filter, and the throttle.
+    // Counted (per-topic + global) and audited. The gap baseline does
+    // NOT advance: unlike a deliberate filter skip, a failed verification
+    // is a genuine loss, so the next delivery surfaces it as a sequence
+    // gap — the same visibility backpressure drops and TTL expirations
+    // get.
+    if (subscriber.verifySignature && !this.deliverySignatureValid(msg)) {
+      this.countSignatureFailure(subscriber, msg, msg.signature?.kid);
+      return false;
+    }
     const filter = subscriber.filter;
     if (filter !== undefined && !filter(rawPayload, msg.topic)) {
       // Content-filtered: the message never reaches the queue — no
@@ -14068,6 +14363,52 @@ export class EventBus {
   }
 
   /**
+   * Pure envelope signature check (EB-84): does `msg` carry a signature
+   * that verifies under the topic's current signing rules? Never counts
+   * — callers count on failure. A missing rule, a missing signature, or
+   * an unserializable payload all verify as false: a `verifySignature`
+   * subscriber is fail-closed.
+   */
+  private deliverySignatureValid(msg: BusMessage): boolean {
+    const rule = this.signingForTopic(msg.topic);
+    const sig = msg.signature;
+    if (rule === undefined || sig === undefined) return false;
+    const serialized = serializeToJson(msg.payload);
+    if (serialized === undefined) return false;
+    return verifyTopicMessage(
+      rule.keys,
+      msg.topic,
+      msg.seq,
+      Buffer.from(serialized, 'utf8'),
+      sig,
+      this.now(),
+      rule.graceMs,
+    );
+  }
+
+  /**
+   * Counts one signature-verification failure on the topic and the
+   * global total, and files the error-isolated
+   * `signature_verification_failed` subscription audit event.
+   */
+  private countSignatureFailure(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    kid: string | undefined,
+  ): void {
+    this.statsFor(msg.topic).signatureFailures += 1;
+    this.totalSignatureFailures += 1;
+    this.auditSubscription({
+      action: 'signature_verification_failed',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      topic: msg.topic,
+      detail: { seq: msg.seq, ...(kid === undefined ? {} : { kid }) },
+    });
+  }
+
+  /**
    * Pushes one message into every matching subscriber's queue and records
    * per-topic stats. Returns how many subscribers matched and how many
    * queues accepted the message (they differ when backpressure drops kick
@@ -14375,6 +14716,23 @@ export class EventBus {
       const autoTrainer = compressionRule.autoTrainState;
       if (autoTrainer !== undefined) autoTrainer.sample(payload);
     }
+    // Publish-side per-topic HMAC message signing (EB-84, opt-in via
+    // `setTopicSigningKey`). The signature covers (topic, seq, wire
+    // bytes): the wire bytes are the post-compression form, so a
+    // compressed envelope's signature covers the ciphertext and a
+    // verifier checks those same bytes before inflating. Signed with the
+    // rule's newest key; the {kid, sig} rides the envelope, the durable
+    // log, and the bridge mirror. A payload with no JSON encoding cannot
+    // be signed — it travels unsigned and fails closed on
+    // `verifySignature` subscribers.
+    const signingRule = this.signingForTopic(topic);
+    if (signingRule !== undefined) {
+      const serialized = serializeToJson(msg.payload);
+      if (serialized !== undefined) {
+        const wireBytes = Buffer.from(serialized, 'utf8');
+        msg.signature = signTopicMessage(signingRule.keys[0], topic, msg.seq, wireBytes);
+      }
+    }
     // One clock reading for the publish: TTL deadline and log timestamp stay
     // consistent even if the injected clock moves between the two.
     const nowMs = this.now();
@@ -14423,6 +14781,27 @@ export class EventBus {
         ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
         ...(traceId === undefined ? {} : { traceId }),
         ...(expiresAt === undefined ? {} : { expiresAt }),
+        // Cross-bus signature (EB-84): when a signing rule matched, the
+        // bridge envelope carries a signature over (topic, seq, canonical
+        // RAW payload bytes) — the wire bytes the envelope signature
+        // covers are post-compression and cannot be recomputed by the
+        // receiver, but the raw canonical bytes can, so the receiving bus
+        // verifies this signature against its own signing rules for the
+        // topic (see `receiveFromBridge`). The destination still re-admits
+        // and re-signs under its own rules — signatures are per-bus, and
+        // a bridge hop is a new admission.
+        ...(() => {
+          if (signingRule === undefined) return {};
+          const raw = serializeToJson(payload);
+          if (raw === undefined) return {};
+          const bridgeSig = signTopicMessage(
+            signingRule.keys[0],
+            topic,
+            msg.seq,
+            Buffer.from(raw, 'utf8'),
+          );
+          return { signature: { kid: bridgeSig.kid, sig: bridgeSig.sig, seq: msg.seq } };
+        })(),
       };
       try {
         const result = bridge.transport.publish(envelope);
@@ -14478,6 +14857,13 @@ export class EventBus {
       // delayed-schedule rebuild) restores the message's producer
       // attribution instead of losing it across restarts.
       ...(publisherId === undefined ? {} : { publisherId }),
+      // The publish-time HMAC signature rides the log record so replay
+      // restores it onto the envelope — a `verifySignature` subscriber
+      // checks a replayed message against the same (topic, seq, wire
+      // bytes) the publisher signed.
+      ...(msg.signature === undefined
+        ? {}
+        : { signature: { kid: msg.signature.kid, sig: msg.signature.sig } }),
     });
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the
@@ -15025,6 +15411,7 @@ export class EventBus {
         })),
       ),
       filteredMessages: this.totalFiltered,
+      signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
       ackedRanges: this.totalAckedRanges,
       diagnosticEvents: this.totalDiagnosticEvents,
@@ -15118,6 +15505,18 @@ export class EventBus {
         aliasRetiredMessages: stats.aliasRetiredMessages,
         redactedFields: stats.redactedFields,
         filteredMessages: stats.filteredMessages,
+        signatureFailures: stats.signatureFailures,
+        // Per-topic HMAC signing state (EB-84): present only when a
+        // signing rule currently matches the topic — secrets never leave
+        // the rule, only the key ids and the grace window. Omitted
+        // otherwise, so stats snapshots without signing are byte-identical
+        // to before.
+        ...(() => {
+          const rule = this.signingForTopic(topic);
+          return rule === undefined
+            ? {}
+            : { signing: { keyIds: rule.keys.map((k) => k.kid), graceMs: rule.graceMs } };
+        })(),
         dedupDropped: stats.dedupDropped,
         compressedMessages: stats.compressedMessages,
         compressedBytesBefore: stats.compressedBytesBefore,

@@ -41,12 +41,42 @@
  * recurse into the bus.
  */
 
+/**
+ * The source bus's cross-bus HMAC signature (EB-84), carried across the
+ * bridge so the receiving bus can verify it against its own signing
+ * rules for the topic (see `EventBus.receiveFromBridge`). It covers
+ * `(topic, seq, canonical raw payload bytes)` with the source bus's
+ * signing key for the topic: the raw canonical bytes — not the
+ * post-compression wire bytes the envelope signature covers — because
+ * the bridge mirrors the raw payload and the receiver recomputes those
+ * same bytes from the carried payload, so a tampered payload fails the
+ * check. Present only when the source bus had a signing rule for the
+ * topic.
+ */
+export interface BridgeMessageSignature {
+  /** Key id that signed the message on the source bus. */
+  kid: string;
+  /** Lowercase hex HMAC-SHA256 (64 chars). */
+  sig: string;
+  /** Source per-topic sequence number covered by the signature. */
+  seq: number;
+}
+
 /** One message crossing the bridge, in either direction. */
 export interface BridgeEnvelope {
   /** The topic, as published. 1–1024 chars. */
   topic: string;
   /** The application payload — never a compressed wire envelope. */
   payload: unknown;
+  /**
+   * The source bus's cross-bus signature (EB-84), when the source had a
+   * signing rule for the topic. The receiving bus verifies it against
+   * its own signing rules for the topic and rejects the envelope when
+   * the check fails; the destination still re-admits and re-signs under
+   * its own rules — signatures are per-bus, and a bridge hop is a new
+   * admission.
+   */
+  signature?: BridgeMessageSignature;
   /** Keyed-publish key (see `PublishOptions.key`). */
   key?: string;
   /**
@@ -118,6 +148,12 @@ export type BridgeReceiveReason =
   | 'not-configured'
   /** The envelope failed shape validation (never admitted, never counted). */
   | 'invalid-envelope'
+  /**
+   * The envelope carried a source signature (EB-84) that did not verify
+   * against this bus's signing rules for the topic (never admitted,
+   * never counted).
+   */
+  | 'signature-verification-failed'
   /** The ingress buffer was full; counted in `BridgeStats.dropped`. */
   | 'shed';
 
@@ -222,6 +258,22 @@ export function validateBridgeEnvelope(
   if (expiresAt !== undefined) {
     if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) return { ok: false };
     out.expiresAt = expiresAt;
+  }
+  const signature = env.signature;
+  if (signature !== undefined) {
+    // The source signature is integrity metadata: a malformed value is
+    // rejected like any other malformed envelope — the receiving bus
+    // only ever accepts well-formed signatures for verification.
+    if (typeof signature !== 'object' || signature === null) return { ok: false };
+    const s = signature as Record<string, unknown>;
+    if (typeof s.kid !== 'string' || s.kid.length === 0) return { ok: false };
+    if (typeof s.sig !== 'string' || !/^[0-9a-f]{64}$/.test(s.sig)) return { ok: false };
+    if (!Number.isInteger(s.seq) || (s.seq as number) < 1) return { ok: false };
+    out.signature = {
+      kid: s.kid as string,
+      sig: s.sig as string,
+      seq: s.seq as number,
+    };
   }
   return { ok: true, envelope: out };
 }

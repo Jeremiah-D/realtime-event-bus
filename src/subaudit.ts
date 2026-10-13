@@ -2,7 +2,9 @@
  * Subscription lifecycle audit log (EB-78): an append-only JSONL journal of
  * every subscription change on the bus — subscribe / unsubscribe / pattern
  * hot-updates (EB-74) / consumer-group join-leave / group rebalances / topic
- * registry changes (EB-77) / backpressure drops (EB-83, `backpressure_dropped`).
+ * registry changes (EB-77) / backpressure drops (EB-83,
+ * `backpressure_dropped`) / signature-verification failures (EB-84,
+ * `signature_verification_failed`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -38,7 +40,8 @@ export type SubscriptionAuditAction =
   | 'rebalance'
   | 'topic_register'
   | 'topic_deregister'
-  | 'backpressure_dropped';
+  | 'backpressure_dropped'
+  | 'signature_verification_failed';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -48,6 +51,7 @@ export type SubscriptionAuditAction =
  * - `topic_register`: `{ owner?, description?, schemaVersion?, tags?, updated: <bool> }`
  * - `topic_deregister`: `{ owner?, description? }` (last-known metadata)
  * - `backpressure_dropped`: `{ policy: <backpressure tier>, dropped: <count>, queueSize: <number> }`
+ * - `signature_verification_failed`: `{ seq: <per-topic seq>, kid?: <key id that signed, when present> }`
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -97,6 +101,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'topic_register',
   'topic_deregister',
   'backpressure_dropped',
+  'signature_verification_failed',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

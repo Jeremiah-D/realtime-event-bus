@@ -113,6 +113,14 @@ export interface DurableLogRecord {
    * happens-before order across restarts.
    */
   causal?: { source: string; clock: number };
+  /**
+   * Publish-time HMAC signature (see `EventBus.setTopicSigningKey`,
+   * EB-84): `{ kid, sig }` covering (topic, seq, wire bytes). Persisted
+   * so replay restores it onto the envelope and a `verifySignature`
+   * subscriber checks a replayed message against the same bytes the
+   * publisher signed. Never a secret — only the key id and the digest.
+   */
+  signature?: { kid: string; sig: string };
   /** The published payload, JSON-serialized. */
   payload: unknown;
 }
@@ -249,6 +257,11 @@ interface LogLine {
    * Lamport timestamp, present exactly when the publish carried one.
    */
   causal?: { source: string; clock: number };
+  /**
+   * Publish-time HMAC signature (see `DurableLogRecord.signature`):
+   * `{ kid, sig }`, present exactly when the publish was signed.
+   */
+  signature?: { kid: string; sig: string };
   payload: unknown;
 }
 
@@ -2176,6 +2189,8 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.eventTime !== undefined) line.eventTime = record.eventTime;
   if (record.causal !== undefined) line.causal = { source: record.causal.source, clock: record.causal.clock };
   if (record.publisherId !== undefined) line.publisherId = record.publisherId;
+  if (record.signature !== undefined)
+    line.signature = { kid: record.signature.kid, sig: record.signature.sig };
   return line;
 }
 
@@ -2300,6 +2315,27 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       return null;
     }
     record.publisherId = o['publisherId'] as string;
+  }
+  if (o['signature'] !== undefined) {
+    // The signature is integrity metadata: a malformed value means the
+    // line was tampered with or miswritten — the bus only ever writes
+    // well-formed signatures — so the line is corrupt, never silently
+    // unsigned.
+    const signature = o['signature'] as Record<string, unknown>;
+    if (
+      typeof signature !== 'object' ||
+      signature === null ||
+      typeof signature['kid'] !== 'string' ||
+      (signature['kid'] as string).length === 0 ||
+      typeof signature['sig'] !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(signature['sig'] as string)
+    ) {
+      return null;
+    }
+    record.signature = {
+      kid: signature['kid'] as string,
+      sig: signature['sig'] as string,
+    };
   }
   // A non-tombstone schedule record must say when it is due.
   if (isScheduleRecord && record.cancelled !== true && record.deliverAt === undefined) return null;

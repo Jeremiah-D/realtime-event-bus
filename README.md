@@ -845,6 +845,33 @@ library.
     family's recurring patterns as well as manual curation. Derivation
     itself took 0.11ms, one-time, off the publish path. Same CPU trade as
     above: dictionary deflate costs ~4x the p50 time.
+- **Per-topic HMAC message signing** (in `src/signing.ts`, opt-in via
+  `setTopicSigningKey(pattern, { keys: [{ kid, secret }], graceMs })`):
+  publish-side authenticity with zero new dependencies (`node:crypto`
+  only). Every admitted publish to a matching topic is signed with
+  HMAC-SHA256 over `(topic, seq, wire bytes)` — the wire bytes are the
+  post-compression form, so a compressed envelope's signature covers the
+  ciphertext — and the `{kid, sig}` rides the `BusMessage` envelope, the
+  durable log, and the bridge mirror. Subscribers opt into verification
+  with `subscribe(..., { verifySignature: true })`: the envelope is
+  checked before any content processing (before inflation for compressed
+  messages), and a failed check drops the message — never queued, never
+  delivered — counted in per-topic and global `signatureFailures` with a
+  `signature_verification_failed` audit event. Fail-closed: a topic with
+  no signing rule, or a message carrying no signature, never verifies.
+  Keys rotate without a verification outage: `keys` lists them
+  newest-first, the newest signs, and retired keys keep verifying inside
+  `graceMs` (inclusive, the WR-20 convention); re-setting the rule stamps
+  rotation automatically. Rule matching mirrors `setTopicTtl`: an
+  exact-topic rule wins over patterns, the earliest-registered matching
+  pattern wins; `clearTopicSigningKey` removes a rule. Invalid options
+  throw `RangeError`. Disabled by default: a non-verifying subscriber pays
+  a single boolean check per delivery. Cross-bus semantics: a bridge hop
+  is a new admission — the destination verifies the source signature
+  against its own signing rules for the topic (rejecting the envelope as
+  `signature-verification-failed` when the check fails) and re-signs under
+  its own rules; signatures are per-bus, never trusted across the hop.
+  See "Message signing (HMAC)" below.
 - **Subscriber output rate shaping** (in `src/bus.ts`, opt-in via
   `subscribe(..., { deliveryShaping: true })`): delivery-side pacing for a
   slow downstream consumer. A per-subscriber token bucket caps deliveries at
@@ -2006,6 +2033,83 @@ Details:
   lifecycle audit log (below) as `topic_register` / `topic_deregister`,
   with the caller-supplied actor (default `'system'`).
 
+## Message signing (HMAC)
+
+Opt-in publish-side authenticity for tamper-evident topics
+(`src/signing.ts`, zero new dependencies — `node:crypto` only):
+
+```ts
+bus.setTopicSigningKey('payments.*', {
+  keys: [{ kid: '2026-10-a', secret: '…' }],
+  graceMs: 60_000,
+});
+// Rotate: newest key first; the old key keeps verifying for graceMs.
+bus.setTopicSigningKey('payments.*', {
+  keys: [
+    { kid: '2026-10-b', secret: '…' },
+    { kid: '2026-10-a', secret: '…' },
+  ],
+  graceMs: 60_000,
+});
+
+bus.subscribe('payments.charges', handler, { verifySignature: true });
+```
+
+How it works:
+
+- **Signed base** — `topic + "\0" + seq + wireBytes`, HMAC-SHA256, hex
+  digest. The wire bytes are the post-compression form: a compressed
+  envelope's signature covers the ciphertext, and a verifying subscriber
+  checks those same bytes *before* inflating. A payload with no JSON
+  encoding cannot be signed — it travels unsigned and fails closed on
+  verifying subscribers.
+- **Envelope** — `{kid, sig}` rides the `BusMessage`; the durable log
+  persists it and replay restores it, so a `verifySignature` subscriber
+  with `resumeFromSeq` checks history against the same bytes the
+  publisher signed. Delayed messages are signed at fan-out (due time),
+  not at schedule time.
+- **Verification** — opt-in per subscription, checked before any content
+  processing (filter, throttle, queue). A failed check drops the message
+  (never queued, never delivered), counts it in per-topic and global
+  `signatureFailures`, and files a `signature_verification_failed`
+  subscription audit event (`{ seq, kid? }`). The loss also surfaces as a
+  sequence gap — a failed verification is a genuine loss, not a
+  deliberate skip. Fail-closed: no signing rule, or no signature on the
+  message, never verifies. A `kid` hint verifies against that single key
+  with no fallback; without a hint the active keys are tried newest-first.
+- **Rotation** — `keys` is newest-first; index 0 signs. Re-setting a rule
+  retires displaced keys automatically (`retiredAtMs` stamped at
+  rotation; already-retired keys keep their original timestamp —
+  rotation is monotonic). A retired key verifies while
+  `now - retiredAtMs <= graceMs` (inclusive). Keys whose grace window
+  fully elapsed are pruned.
+- **Rules** — match resolution mirrors `setTopicTtl`: an exact-topic rule
+  wins over patterns, the earliest-registered matching pattern wins
+  (independent matcher cache — never inflates `patternCacheSize`).
+  `clearTopicSigningKey` removes a rule. Empty patterns, empty key lists,
+  empty/duplicate/malformed kids (`1–64` chars of `[A-Za-z0-9_-]`), empty
+  secrets, and negative `graceMs` throw `RangeError` at configuration
+  time. Disabled by default.
+- **Observability** — `getStats()` exposes per-topic `signatureFailures`
+  and, when a rule matches, `signing: { keyIds, graceMs }` (key ids only —
+  secrets never leave the rule); the global total is
+  `BusStats.signatureFailures`. Prometheus:
+  `eventbus_signature_failures_total` (global counter) and
+  `eventbus_signature_failures_total{topic}` (per-topic).
+- **Cross-bus semantics** — a bridge hop is a new admission. The bridge
+  envelope carries a signature over `(topic, seq, canonical raw payload
+  bytes)` — the raw bytes, because the receiver recomputes them from the
+  carried payload (the envelope signature covers post-compression wire
+  bytes, which the receiver cannot recompute). `receiveFromBridge`
+  verifies it against the destination bus's own signing rules for the
+  topic and rejects the envelope as `signature-verification-failed` when
+  the check fails; a topic with no destination rule, or an envelope with
+  no signature, skips the check. The destination then re-admits and
+  re-signs under its own rules — signatures are per-bus and are never
+  trusted across the hop. Forwarded messages (`receiveForward`) go through
+  the same destination admission and re-signing; a verifying subscriber
+  on the destination always checks the destination bus's signature.
+
 ## Subscription lifecycle audit log
 
 Every subscription change is recorded in an append-only audit log —
@@ -2047,7 +2151,8 @@ Details:
   exist, because there is no hook — only the log.
 - **Detail payloads** — `update_pattern` carries `{ from }`;
   `rebalance` carries `{ trigger, memberId, members }`;
-  topic-registry changes carry the registration metadata.
+  topic-registry changes carry the registration metadata;
+  `signature_verification_failed` carries `{ seq, kid? }`.
 
 ## Prometheus metrics
 
@@ -2079,6 +2184,8 @@ Exported series:
 | `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |
 | `eventbus_unregistered_topic_publishes_total` | counter | `unregisteredTopicPublishes` — publishes to topics with no live catalog registration (advisory; delivered normally) |
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
+| `eventbus_signature_failures_total` | counter | `signatureFailures` — messages discarded by `verifySignature` subscribers (missing/invalid HMAC signature, EB-84) |
+| `eventbus_signature_failures_total{topic}` | counter | per-topic `signatureFailures` (EB-84) |
 | `eventbus_dedup_dropped_messages_total` | counter | `dedupDropped` — subscriber exactly-once dedup suppressions |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
 | `eventbus_diagnostic_events_total` | counter | `diagnosticEvents` — admitted DLQ diagnostic events |
