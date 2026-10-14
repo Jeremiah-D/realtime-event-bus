@@ -203,6 +203,15 @@ export interface DurableLogRecord {
    */
   signature?: { kid: string; sig: string };
   /**
+   * Publish-time publisher-identity HMAC signature (see
+   * `EventBus.setPublisherSigningKey`, EB-97): `{ kid, sig }` covering
+   * (topic, seq, publisherId, wire bytes). Persisted so replay restores
+   * it onto the envelope and a `verifyPublisher` subscriber checks a
+   * replayed message against the same bytes the publisher signed.
+   * Never a secret — only the key id and the digest.
+   */
+  publisherSignature?: { kid: string; sig: string };
+  /**
    * The published payload: the JSON value for ordinary messages, the raw
    * bytes (`Uint8Array`) for binary messages (EB-92, persisted as a v2
    * line), or the compression envelope when the publish was compressed.
@@ -431,6 +440,12 @@ interface LogLine {
    * `{ kid, sig }`, present exactly when the publish was signed.
    */
   signature?: { kid: string; sig: string };
+  /**
+   * Publish-time publisher-identity HMAC signature (see
+   * `DurableLogRecord.publisherSignature`): `{ kid, sig }`, present
+   * exactly when the publish carried a signed publisher identity.
+   */
+  publisherSignature?: { kid: string; sig: string };
   /**
    * v1 only: the JSON application payload. Absent on v2 lines, which
    * carry `payload_b64` instead.
@@ -2742,6 +2757,8 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.publisherId !== undefined) line.publisherId = record.publisherId;
   if (record.signature !== undefined)
     line.signature = { kid: record.signature.kid, sig: record.signature.sig };
+  if (record.publisherSignature !== undefined)
+    line.publisherSignature = { kid: record.publisherSignature.kid, sig: record.publisherSignature.sig };
   return line;
 }
 
@@ -2986,6 +3003,26 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     record.signature = {
       kid: signature['kid'] as string,
       sig: signature['sig'] as string,
+    };
+  }
+  if (o['publisherSignature'] !== undefined) {
+    // Same integrity-metadata rule as `signature`: a malformed value
+    // means tampering or miswriting — the line is corrupt, never
+    // silently unsigned.
+    const publisherSignature = o['publisherSignature'] as Record<string, unknown>;
+    if (
+      typeof publisherSignature !== 'object' ||
+      publisherSignature === null ||
+      typeof publisherSignature['kid'] !== 'string' ||
+      (publisherSignature['kid'] as string).length === 0 ||
+      typeof publisherSignature['sig'] !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(publisherSignature['sig'] as string)
+    ) {
+      return null;
+    }
+    record.publisherSignature = {
+      kid: publisherSignature['kid'] as string,
+      sig: publisherSignature['sig'] as string,
     };
   }
   // A non-tombstone delayed-delivery schedule record must say when it is

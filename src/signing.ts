@@ -160,6 +160,34 @@ export function signingBaseBytes(topic: string, seq: number, wireBytes: Buffer):
 }
 
 /**
+ * Builds the publisher-identity signed base (EB-97):
+ * `topic + "\0" + seq + "\0" + publisherId + "\0" + wireBytes`.
+ *
+ * Every variable-length field is NUL-terminated: `publisherId` admits
+ * digits (`[A-Za-z0-9_-]{1,64}`), so without the separators a
+ * `(seq, publisherId, wireBytes)` triple could collide — e.g.
+ * `(1, "ab1", 23)` vs `(12, "ab", 3)` share the same concatenation.
+ * The wire bytes come last; JSON text never contains a raw NUL byte
+ * (it escapes as `\u0000`), so the base is unambiguous.
+ */
+export function publisherSigningBaseBytes(
+  topic: string,
+  seq: number,
+  publisherId: string,
+  wireBytes: Buffer,
+): Buffer {
+  return Buffer.concat([
+    Buffer.from(topic, 'utf8'),
+    Buffer.from([0]),
+    Buffer.from(String(seq), 'utf8'),
+    Buffer.from([0]),
+    Buffer.from(publisherId, 'utf8'),
+    Buffer.from([0]),
+    wireBytes,
+  ]);
+}
+
+/**
  * Signs one message with a single key. The caller selects the key (the
  * bus always signs with the rule's newest key); the returned `kid`
  * identifies it for the verifier.
@@ -172,6 +200,26 @@ export function signTopicMessage(
 ): MessageSignature {
   const sig = createHmac('sha256', key.secret)
     .update(signingBaseBytes(topic, seq, wireBytes))
+    .digest('hex');
+  return { kid: key.kid, sig };
+}
+
+/**
+ * Signs one message with a single publisher key (EB-97). The caller
+ * selects the key (the bus always signs with the publisher's newest
+ * key); the returned `kid` identifies it for the verifier. Orthogonal
+ * to `signTopicMessage`: a message can carry both signatures, binding
+ * integrity (topic key) and identity (publisher key) independently.
+ */
+export function signPublisherMessage(
+  key: { kid: string; secret: Buffer },
+  topic: string,
+  seq: number,
+  publisherId: string,
+  wireBytes: Buffer,
+): MessageSignature {
+  const sig = createHmac('sha256', key.secret)
+    .update(publisherSigningBaseBytes(topic, seq, publisherId, wireBytes))
     .digest('hex');
   return { kid: key.kid, sig };
 }
@@ -221,6 +269,48 @@ export function verifyTopicMessage(
     const presented = Buffer.from(sig, 'hex');
     // `timingSafeEqual` throws on length mismatch — a well-formed hex
     // signature is always 32 bytes, but guard anyway.
+    return presented.length === digest.length && timingSafeEqual(digest, presented);
+  };
+  if (typeof kid === 'string' && kid.length > 0) {
+    const key = keys.find((k) => k.kid === kid);
+    if (key === undefined || !isSigningKeyActive(key, nowMs, graceMs)) return false;
+    return matches(key.secret);
+  }
+  for (const key of keys) {
+    if (!isSigningKeyActive(key, nowMs, graceMs)) continue;
+    if (matches(key.secret)) return true;
+  }
+  return false;
+}
+
+/**
+ * Verifies an envelope publisher signature against a publisher's keys
+ * (EB-97): the `verifyTopicMessage` selection rules over the
+ * publisher-identity base (`topic + "\0" + seq + "\0" + publisherId +
+ * "\0" + wireBytes`). A `kid` hint verifies against that single key
+ * only; no hint tries the active keys newest-first. Never throws:
+ * malformed input verifies as `false` — a remote peer is not trusted
+ * input.
+ */
+export function verifyPublisherMessage(
+  keys: StoredSigningKey[],
+  topic: string,
+  seq: number,
+  publisherId: string,
+  wireBytes: Buffer,
+  signature: { kid?: string; sig: string } | undefined,
+  nowMs: number,
+  graceMs: number,
+): boolean {
+  if (signature === undefined || signature === null) return false;
+  const { kid, sig } = signature;
+  if (!isWellFormedSignature(sig)) return false;
+  const base = publisherSigningBaseBytes(topic, seq, publisherId, wireBytes);
+  const expected = (secret: Buffer): Buffer =>
+    createHmac('sha256', secret).update(base).digest();
+  const matches = (secret: Buffer): boolean => {
+    const digest = expected(secret);
+    const presented = Buffer.from(sig, 'hex');
     return presented.length === digest.length && timingSafeEqual(digest, presented);
   };
   if (typeof kid === 'string' && kid.length > 0) {

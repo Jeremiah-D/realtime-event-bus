@@ -133,7 +133,9 @@ import {
 import {
   assertValidSigningKeys,
   normalizeSigningSecret,
+  signPublisherMessage,
   signTopicMessage,
+  verifyPublisherMessage,
   verifyTopicMessage,
   type MessageSignature,
   type StoredSigningKey,
@@ -271,6 +273,20 @@ export interface BusMessage {
    * secret — only the key id and the hex digest.
    */
   signature?: MessageSignature;
+  /**
+   * Publisher-identity HMAC signature (see
+   * `EventBus.setPublisherSigningKey`, EB-97): `{ kid, sig }` covering
+   * `(topic, seq, publisherId, wire bytes)` — orthogonal to `signature`:
+   * a message can carry both, binding integrity (the topic key) and
+   * identity (the publisher's key) independently. Present exactly when
+   * the message carried a `publisherId` with a registered signing key
+   * set at publish time. It rides the envelope end to end (durable log,
+   * replay, retained snapshot) so a `verifyPublisher` subscriber checks
+   * the same bytes the publisher signed; a bridge hop re-admits under
+   * the destination bus's rules and re-signs there. Never a
+   * secret — only the key id and the hex digest.
+   */
+  publisherSignature?: MessageSignature;
   /**
    * MQTT-style retained-message marker (see `EventBus.setTopicRetained`,
    * EB-87): `true` exactly when this delivery is the topic's retained
@@ -947,6 +963,38 @@ export interface SubscribeOptions {
    * pays a single boolean check per delivery.
    */
   verifySignature?: boolean;
+  /**
+   * Opt-in publisher-identity verification (EB-97, backend security).
+   * When true, every message fanned out to this subscriber is checked
+   * against the publisher's HMAC signing keys (`setPublisherSigningKey`)
+   * BEFORE any content processing: the envelope's `publisherSignature`
+   * must verify over `(topic, seq, publisherId, wire bytes)`.
+   * Orthogonal to `verifySignature` — a message can (and usually does)
+   * carry both signatures; each is checked independently when its
+   * option is on.
+   *
+   * A message that fails verification is dropped — never queued, never
+   * delivered — and counted in `TopicStats.signatureFailures` (plus the
+   * global total) with a `signature_verification_failed` subscription
+   * audit event (`detail.kind: 'publisher'`). The loss surfaces as a
+   * sequence gap, exactly like a failed topic-signature check.
+   *
+   * Fail-closed: a message with no `publisherId`, or from a publisher
+   * with no registered key set, never verifies — an impersonated
+   * identity (a `publisherId` whose signature does not verify) is
+   * dropped, not delivered. Applies to live fan-out, durable-log replay
+   * (`resumeFromSeq`/`resumeFromTime`), retained snapshots, and
+   * bridge/forward inbound. Shadow mirrors never verify.
+   *
+   * Ordering note: sensitive-field redaction (`setTopicRedaction`,
+   * EB-68) runs at admission, BEFORE signing at fan-out — both
+   * signatures cover the redacted wire bytes, and the subscriber
+   * verifies those same bytes, so redaction never breaks verification.
+   *
+   * Must be a boolean when provided; anything else throws `TypeError`
+   * from `subscribe`. Disabled by default.
+   */
+  verifyPublisher?: boolean;
   /**
    * Opt-in multi-pattern composite subscription (EB-70). When set, every
    * message fanned out to this subscriber — after it passes the content
@@ -3308,6 +3356,8 @@ interface RetainedEntry {
   dictId?: string;
   /** Publish-time HMAC signature, when a signing rule matched. */
   signature?: { kid: string; sig: string };
+  /** Publish-time publisher-identity HMAC signature, when a publisher key set matched. */
+  publisherSignature?: { kid: string; sig: string };
   /** Application-level message identity, when the publish carried one. */
   messageId?: string;
   /** Publisher identity, when the publish carried one. */
@@ -3622,6 +3672,12 @@ interface Subscriber {
    * non-verifying subscriber pays a single boolean check per delivery.
    */
   verifySignature: boolean;
+  /**
+   * Opt-in publisher-identity verification (see
+   * `SubscribeOptions.verifyPublisher`, EB-97). False by default — a
+   * non-verifying subscriber pays a single boolean check per delivery.
+   */
+  verifyPublisher: boolean;
   /**
    * Opt-in durable-log replay progress observer (see
    * `SubscribeOptions.onReplayProgress`, EB-71). Absent unless the
@@ -7076,6 +7132,14 @@ export class EventBus {
    */
   private signingRules = new Map<string, { keys: StoredSigningKey[]; graceMs: number }>();
   /**
+   * Per-publisher HMAC signing keys (EB-97), keyed by exact publisher id
+   * (validated like `PublishOptions.publisherId` — no patterns: an
+   * identity is a concrete string). `keys[0]` is the live signing key;
+   * later keys are retired keys kept for their grace window
+   * (`retiredAtMs`, stamped at rotation), the WR-20/EB-84 convention.
+   */
+  private publisherSigningKeys = new Map<string, { keys: StoredSigningKey[]; graceMs: number }>();
+  /**
    * Compiled matchers for the wildcard entries in `signingRules`, kept
    * apart from the subscriber pattern cache and the other rule caches so
    * signing configuration never inflates `patternCacheSize`.
@@ -8273,6 +8337,91 @@ export class EventBus {
    */
   clearTopicSigningKey(topicPattern: string): boolean {
     return this.signingRules.delete(topicPattern);
+  }
+
+  /**
+   * Registers (or rotates) the HMAC signing key set for one publisher
+   * identity (EB-97, backend security). Every message published with
+   * `PublishOptions.publisherId` equal to `publisherId` is then signed
+   * with the set's newest key over
+   * `(topic, seq, publisherId, wire bytes)` — orthogonal to the
+   * per-topic signature (`setTopicSigningKey`): a message can carry
+   * both, binding integrity and identity independently.
+   *
+   * The key-id alphabet, rotation stamping, and grace semantics are the
+   * `setTopicSigningKey` convention verbatim: `keys[0]` is the live
+   * signing key; re-setting rotates — previously stored keys the new
+   * set drops are retired as of now (already-retired keys keep their
+   * original `retiredAtMs`; re-setting never extends a grace window),
+   * and keys whose grace window fully elapsed are pruned.
+   *
+   * A `verifyPublisher` subscriber checks the signature before any
+   * content processing; a failed check drops the message, counts it in
+   * `TopicStats.signatureFailures` (plus the global total, audit
+   * `detail.kind: 'publisher'`), and files a
+   * `signature_verification_failed` audit event. Fail-closed: a
+   * publisher with no key set, or a message carrying no publisher
+   * signature, never verifies.
+   *
+   * Redaction ordering: `setTopicRedaction` (EB-68) runs at admission,
+   * BEFORE this signature is computed at fan-out — both signatures
+   * cover the redacted wire bytes, so redaction never breaks
+   * verification.
+   *
+   * Throws `RangeError` when `publisherId` is not a valid publisher
+   * identity (1–64 ASCII alphanumeric/`_`/`-`), when `keys` is empty,
+   * when a `kid` is empty/duplicate/malformed, when a secret is empty,
+   * or when `graceMs` is negative — fail-fast at configuration time,
+   * never mid-publish.
+   */
+  setPublisherSigningKey(publisherId: string, config: TopicSigningKeysConfig): void {
+    const clean = cleanPublisherId(publisherId);
+    if (clean === undefined) {
+      throw new RangeError(
+        'setPublisherSigningKey: publisherId must be 1-64 ASCII alphanumeric, \'_\' or \'-\' characters',
+      );
+    }
+    assertValidSigningKeys(config?.keys, `setPublisherSigningKey("${clean}")`);
+    const graceMs = config.graceMs ?? 0;
+    if (!Number.isFinite(graceMs) || graceMs < 0) {
+      throw new RangeError('graceMs must be a non-negative finite number of milliseconds');
+    }
+    const nowMs = this.now();
+    // Rotation stamping mirrors `setTopicSigningKey` exactly: the
+    // newest key (index 0) is live; every other listed key — and every
+    // previously stored key the new set drops — is retired as of now
+    // unless already retired earlier; fully-elapsed keys are pruned.
+    const previous = this.publisherSigningKeys.get(clean);
+    const prevByKid = new Map((previous?.keys ?? []).map((k) => [k.kid, k]));
+    const keys: StoredSigningKey[] = config.keys.map((input, index) => {
+      const prev = prevByKid.get(input.kid);
+      prevByKid.delete(input.kid);
+      return {
+        kid: input.kid,
+        secret: normalizeSigningSecret(
+          input.secret,
+          `setPublisherSigningKey("${clean}"): keys[${index}]`,
+        ),
+        ...(index === 0 ? {} : { retiredAtMs: prev?.retiredAtMs ?? nowMs }),
+      };
+    });
+    for (const old of prevByKid.values()) {
+      keys.push({ kid: old.kid, secret: old.secret, retiredAtMs: old.retiredAtMs ?? nowMs });
+    }
+    this.publisherSigningKeys.set(clean, {
+      keys: keys.filter((k) => k.retiredAtMs === undefined || nowMs - k.retiredAtMs <= graceMs),
+      graceMs,
+    });
+  }
+
+  /**
+   * Removes the signing key set previously registered for `publisherId`.
+   * Returns true when a key set existed and was removed.
+   */
+  clearPublisherSigningKey(publisherId: string): boolean {
+    const clean = cleanPublisherId(publisherId);
+    if (clean === undefined) return false;
+    return this.publisherSigningKeys.delete(clean);
   }
 
   /**
@@ -10468,6 +10617,11 @@ export class EventBus {
     if (typeof verifySignature !== 'boolean') {
       throw new TypeError('verifySignature must be a boolean');
     }
+    // Publisher-identity verification (EB-97): same fail-fast contract.
+    const verifyPublisher = opts?.verifyPublisher ?? false;
+    if (typeof verifyPublisher !== 'boolean') {
+      throw new TypeError('verifyPublisher must be a boolean');
+    }
     // Durable-log replay progress (EB-71): the observer was validated
     // above; the interval falls back to the 100-entry default.
     const onReplayProgress = opts?.onReplayProgress;
@@ -10618,6 +10772,10 @@ export class EventBus {
       // a non-verifying subscriber pays a single boolean check per
       // delivery.
       verifySignature,
+      // Publisher-identity verification (EB-97): opt-in check that the
+      // envelope's publisherSignature verifies under the publisher's
+      // registered keys — dropped, counted, and audited on failure.
+      verifyPublisher,
       // Durable-log replay progress observability (EB-71): the
       // per-subscriber progress state appears on the first resume
       // replay (see `admitReplayRecords`).
@@ -13534,6 +13692,16 @@ export class EventBus {
         if (rec.signature !== undefined) {
           msg.signature = { kid: rec.signature.kid, sig: rec.signature.sig };
         }
+        // The publisher-identity HMAC signature rides the log record:
+        // restore it onto the envelope so a `verifyPublisher`
+        // subscriber checks the replayed message against the same
+        // (topic, seq, publisherId, wire bytes) the publisher signed.
+        if (rec.publisherSignature !== undefined) {
+          msg.publisherSignature = {
+            kid: rec.publisherSignature.kid,
+            sig: rec.publisherSignature.sig,
+          };
+        }
         if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
         // Subscriber-side signature verification (EB-84) applies to replay
         // exactly as to live fan-out: a replayed message that fails
@@ -13547,6 +13715,20 @@ export class EventBus {
         // expired — a dead message needs no integrity check.
         if (!ttlExpired && subscriber.verifySignature && !this.deliverySignatureValid(msg)) {
           this.countSignatureFailure(subscriber, msg, msg.signature?.kid);
+          if (rec.key !== undefined && rec.keySeq !== undefined) {
+            this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+          }
+          if (rec.causal !== undefined) {
+            this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+          }
+          countReplaySkipped();
+          continue;
+        }
+        // Publisher-identity verification (EB-97) on replay: same skip
+        // semantics as the topic-signature check — key/causal baselines
+        // advance, the gap baseline does not (genuine loss).
+        if (!ttlExpired && subscriber.verifyPublisher && !this.deliveryPublisherSignatureValid(msg)) {
+          this.countSignatureFailure(subscriber, msg, msg.publisherSignature?.kid, 'publisher');
           if (rec.key !== undefined && rec.keySeq !== undefined) {
             this.skipKeySeq(subscriber, rec.key, rec.keySeq);
           }
@@ -14915,6 +15097,10 @@ export class EventBus {
       msg.signature === undefined
         ? undefined
         : { kid: msg.signature.kid, sig: msg.signature.sig };
+    const publisherSignature =
+      msg.publisherSignature === undefined
+        ? undefined
+        : { kid: msg.publisherSignature.kid, sig: msg.publisherSignature.sig };
     const binary = this.binaryMessages.has(msg);
     const entry: RetainedEntry = {
       topic,
@@ -14929,6 +15115,7 @@ export class EventBus {
       ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(dictId === undefined ? {} : { dictId }),
       ...(signature === undefined ? {} : { signature }),
+      ...(publisherSignature === undefined ? {} : { publisherSignature }),
       ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
       ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
       ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
@@ -14951,6 +15138,7 @@ export class EventBus {
       ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(dictId === undefined ? {} : { dictId }),
       ...(signature === undefined ? {} : { signature }),
+      ...(publisherSignature === undefined ? {} : { publisherSignature }),
       ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
       ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
       ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
@@ -15063,6 +15251,14 @@ export class EventBus {
         ...(entry.signature === undefined
           ? {}
           : { signature: { kid: entry.signature.kid, sig: entry.signature.sig } }),
+        ...(entry.publisherSignature === undefined
+          ? {}
+          : {
+              publisherSignature: {
+                kid: entry.publisherSignature.kid,
+                sig: entry.publisherSignature.sig,
+              },
+            }),
       };
       // The table stores the wire payload: re-register a compressed
       // envelope for transparent inflation at delivery, exactly like
@@ -15084,6 +15280,14 @@ export class EventBus {
       // counted and audited.
       if (subscriber.verifySignature && !this.deliverySignatureValid(msg)) {
         this.countSignatureFailure(subscriber, msg, msg.signature?.kid);
+        continue;
+      }
+      // Publisher-identity verification (EB-97) applies to the snapshot
+      // exactly as to live fan-out and replay: checked on the wire bytes
+      // before inflation — a failed check drops the snapshot copy,
+      // counted and audited (`detail.kind: 'publisher'`).
+      if (subscriber.verifyPublisher && !this.deliveryPublisherSignatureValid(msg)) {
+        this.countSignatureFailure(subscriber, msg, msg.publisherSignature?.kid, 'publisher');
         continue;
       }
       this.inflateMessagePayload(msg);
@@ -15168,6 +15372,9 @@ export class EventBus {
         ...(latest.expiresAt === undefined ? {} : { expiresAt: latest.expiresAt }),
         ...(latest.dictId === undefined ? {} : { dictId: latest.dictId }),
         ...(latest.signature === undefined ? {} : { signature: { ...latest.signature } }),
+        ...(latest.publisherSignature === undefined
+          ? {}
+          : { publisherSignature: { ...latest.publisherSignature } }),
         ...(latest.messageId === undefined ? {} : { messageId: latest.messageId }),
         ...(latest.publisherId === undefined ? {} : { publisherId: latest.publisherId }),
         ...(latest.eventTime === undefined ? {} : { eventTime: latest.eventTime }),
@@ -16319,6 +16526,14 @@ export class EventBus {
       this.countSignatureFailure(subscriber, msg, msg.signature?.kid);
       return false;
     }
+    // Publisher-identity verification (EB-97): a verifying subscriber
+    // checks identity before any content processing — same drop/count/
+    // audit semantics as the topic-signature check above, and the same
+    // genuine-loss gap visibility (the gap baseline does NOT advance).
+    if (subscriber.verifyPublisher && !this.deliveryPublisherSignatureValid(msg)) {
+      this.countSignatureFailure(subscriber, msg, msg.publisherSignature?.kid, 'publisher');
+      return false;
+    }
     const filter = subscriber.filter;
     if (filter !== undefined && !filter(rawPayload, msg.topic)) {
       // Content-filtered: the message never reaches the queue — no
@@ -16881,14 +17096,51 @@ export class EventBus {
   }
 
   /**
+   * Pure publisher-identity signature check (EB-97): does `msg` carry a
+   * publisher signature that verifies under the publisher's current key
+   * set? Never counts — callers count on failure. A missing
+   * `publisherId`, a missing key set, a missing signature, or an
+   * unserializable payload all verify as false: a `verifyPublisher`
+   * subscriber is fail-closed, so an impersonated identity is dropped,
+   * never delivered.
+   */
+  private deliveryPublisherSignatureValid(msg: BusMessage): boolean {
+    const publisherId = msg.publisherId;
+    if (publisherId === undefined) return false;
+    const rule = this.publisherSigningKeys.get(publisherId);
+    const sig = msg.publisherSignature;
+    if (rule === undefined || sig === undefined) return false;
+    // The same wire bytes the publisher signed (EB-92): a binary
+    // message's raw bytes (inflated first when compressed — inflation
+    // runs before delivery), or the post-compression wire form for
+    // ordinary messages.
+    const wireBytes = wireBytesOfPayload(msg.payload, this.binaryMessages.has(msg));
+    if (wireBytes === undefined) return false;
+    return verifyPublisherMessage(
+      rule.keys,
+      msg.topic,
+      msg.seq,
+      publisherId,
+      wireBytes,
+      sig,
+      this.now(),
+      rule.graceMs,
+    );
+  }
+
+  /**
    * Counts one signature-verification failure on the topic and the
    * global total, and files the error-isolated
    * `signature_verification_failed` subscription audit event.
+   * `kind: 'publisher'` marks a failed publisher-identity check
+   * (EB-97); the topic-signature check (EB-84) leaves it absent, so
+   * existing consumers see no shape change.
    */
   private countSignatureFailure(
     subscriber: Subscriber,
     msg: BusMessage,
     kid: string | undefined,
+    kind?: 'publisher',
   ): void {
     this.statsFor(msg.topic).signatureFailures += 1;
     this.totalSignatureFailures += 1;
@@ -16898,7 +17150,11 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       topic: msg.topic,
-      detail: { seq: msg.seq, ...(kid === undefined ? {} : { kid }) },
+      detail: {
+        seq: msg.seq,
+        ...(kid === undefined ? {} : { kid }),
+        ...(kind === undefined ? {} : { kind }),
+      },
     });
   }
 
@@ -17340,6 +17596,36 @@ export class EventBus {
         msg.signature = signTopicMessage(signingRule.keys[0], topic, msg.seq, wireBytes);
       }
     }
+    // Publish-side per-publisher HMAC identity signing (EB-97, opt-in
+    // via `setPublisherSigningKey`). Orthogonal to the topic signature
+    // above: a message can carry both. The signature covers
+    // (topic, seq, publisherId, wire bytes) — the same post-compression
+    // wire bytes the topic signature covers — and rides the envelope end
+    // to end (durable log, replay, retained snapshot). A bridge hop
+    // re-admits under the destination bus's rules, so the destination
+    // re-signs with its own publisher keys — signatures are per-bus.
+    // Runs AFTER redaction
+    // (EB-68, admission-time): the signature covers the redacted bytes
+    // and a `verifyPublisher` subscriber checks those same bytes, so
+    // redaction never breaks verification. A publisher with no
+    // registered key set, or a payload with no JSON encoding, travels
+    // unsigned and fails closed on `verifyPublisher` subscribers.
+    const signerPublisherId = msg.publisherId;
+    if (signerPublisherId !== undefined) {
+      const publisherRule = this.publisherSigningKeys.get(signerPublisherId);
+      if (publisherRule !== undefined) {
+        const wireBytes = wireBytesOfPayload(msg.payload, this.binaryMessages.has(msg));
+        if (wireBytes !== undefined) {
+          msg.publisherSignature = signPublisherMessage(
+            publisherRule.keys[0],
+            topic,
+            msg.seq,
+            signerPublisherId,
+            wireBytes,
+          );
+        }
+      }
+    }
     // One clock reading for the publish: TTL deadline and log timestamp stay
     // consistent even if the injected clock moves between the two.
     const nowMs = this.now();
@@ -17492,6 +17778,18 @@ export class EventBus {
       ...(msg.signature === undefined
         ? {}
         : { signature: { kid: msg.signature.kid, sig: msg.signature.sig } }),
+      // The publisher-identity HMAC signature rides the log record so
+      // replay restores it onto the envelope — a `verifyPublisher`
+      // subscriber checks a replayed message against the same
+      // (topic, seq, publisherId, wire bytes) the publisher signed.
+      ...(msg.publisherSignature === undefined
+        ? {}
+        : {
+            publisherSignature: {
+              kid: msg.publisherSignature.kid,
+              sig: msg.publisherSignature.sig,
+            },
+          }),
     });
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the

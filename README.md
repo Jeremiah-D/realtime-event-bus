@@ -953,6 +953,34 @@ library.
   `signature-verification-failed` when the check fails) and re-signs under
   its own rules; signatures are per-bus, never trusted across the hop.
   See "Message signing (HMAC)" below.
+- **Per-publisher identity signing** (in `src/signing.ts`, opt-in via
+  `setPublisherSigningKey(publisherId, { keys: [{ kid, secret }], graceMs })`,
+  EB-97): binds a message to the identity that published it. Every
+  admitted publish carrying a `publisherId` with a registered key set is
+  signed with HMAC-SHA256 over
+  `(topic, seq, publisherId, wire bytes)` — every field NUL-separated so
+  no two triples share a base — orthogonal to the per-topic signature
+  above: a message can carry both, integrity (topic key) and identity
+  (publisher key) independently. The `{kid, sig}` rides the `BusMessage`
+  envelope (`publisherSignature`), the durable log, replay, and the
+  retained snapshot. Subscribers opt into verification with
+  `subscribe(..., { verifyPublisher: true })`: the envelope is checked
+  before any content processing, and a failed check drops the message —
+  never queued, never delivered — counted in per-topic and global
+  `signatureFailures` with a `signature_verification_failed` audit event
+  (`detail.kind: 'publisher'`). Fail-closed: a message with no
+  `publisherId`, or from a publisher with no registered key set, never
+  verifies — an impersonated identity is dropped, not delivered. Key
+  rotation follows the WR-20/EB-84 convention verbatim (newest signs,
+  retired keys verify inside `graceMs`, re-setting stamps rotation
+  monotonically); `clearPublisherSigningKey` removes a key set. Ordering
+  note: sensitive-field redaction (`setTopicRedaction`, EB-68) runs at
+  admission, BEFORE signing at fan-out — both signatures cover the
+  redacted wire bytes, so redaction never breaks verification. Cross-bus
+  semantics: a bridge hop is a new admission — the destination re-admits
+  and re-signs under its own publisher keys; signatures are per-bus.
+  Disabled by default: a non-verifying subscriber pays a single boolean
+  check per delivery.
 - **Subscriber output rate shaping** (in `src/bus.ts`, opt-in via
   `subscribe(..., { deliveryShaping: true })`): delivery-side pacing for a
   slow downstream consumer. A per-subscriber token bucket caps deliveries at
@@ -2210,6 +2238,39 @@ How it works:
   trusted across the hop. Forwarded messages (`receiveForward`) go through
   the same destination admission and re-signing; a verifying subscriber
   on the destination always checks the destination bus's signature.
+
+### Publisher identity signing (EB-97)
+
+Binds a message to the identity that published it (`src/signing.ts`,
+same zero-dependency HMAC machinery):
+
+```ts
+bus.setPublisherSigningKey('billing-svc', {
+  keys: [{ kid: '2026-10-a', secret: '…' }],
+  graceMs: 60_000,
+});
+bus.subscribe('payments.charges', handler, { verifyPublisher: true });
+bus.publish('payments.charges', { amount: 100 }, { publisherId: 'billing-svc' });
+```
+
+- **Signed base** — `topic + "\0" + seq + "\0" + publisherId + "\0" +
+  wireBytes`: every variable-length field is NUL-terminated (the
+  publisher id admits digits, so the separators keep every
+  `(seq, publisherId, wireBytes)` triple unambiguous). Orthogonal to the
+  per-topic signature — a message can carry both, integrity and identity
+  independently.
+- **Envelope** — `{kid, sig}` rides `BusMessage.publisherSignature`;
+  the durable log persists it, replay and the retained snapshot restore
+  it. Fail-closed everywhere: no `publisherId`, no registered key set,
+  or no signature never verifies — an impersonated identity is dropped,
+  counted in `signatureFailures`, and audited as
+  `signature_verification_failed` with `detail.kind: 'publisher'`.
+- **Rotation** — the WR-20/EB-84 convention verbatim: newest key signs,
+  retired keys verify inside `graceMs` (inclusive), re-setting stamps
+  rotation monotonically, fully-elapsed keys are pruned.
+- **Redaction ordering** — `setTopicRedaction` (EB-68) runs at admission,
+  before signing at fan-out: both signatures cover the redacted wire
+  bytes, so redaction never breaks verification.
 
 ## Retained messages (MQTT-style)
 
