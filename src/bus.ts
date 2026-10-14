@@ -7080,6 +7080,32 @@ interface NamespaceSubscriptionScope {
   log?: DurableTopicLog;
 }
 
+/**
+ * One entry of a `subscribeMany` batch (EB-100): an independent
+ * subscription.
+ *
+ * Contrast with composite patterns (EB-70, `SubscribeOptions.patterns`):
+ * a composite is a *single* subscription matching several patterns with
+ * OR/AND/exclusion semantics and one handler; a `subscribeMany` entry is
+ * a *separate* subscription with its own handler, queue, backpressure
+ * policy and lifecycle — the batch is only an atomic registration
+ * mechanism.
+ */
+export interface SubscribeManyEntry {
+  /** Topic pattern, same syntax as `subscribe`. */
+  pattern: string;
+  /** Handler for this entry's subscription (batch handlers allowed). */
+  handler: MessageHandler | BatchMessageHandler;
+  /**
+   * Per-entry options, shallow-merged over `subscribeMany`'s
+   * `commonOpts` (entry wins). `group` is batch-local: when set, the
+   * entry joins that consumer group (EB-16) via `subscribeToGroup`
+   * instead of a plain `subscribe`. Shadow (EB-63) and namespace (EB-52)
+   * options behave exactly as in `subscribe`.
+   */
+  opts?: SubscribeOptions & { group?: string };
+}
+
 export class EventBus {
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
@@ -11842,6 +11868,100 @@ export class EventBus {
     } catch {
       // Swallowed: a user callback must never break the bus.
     }
+  }
+
+  /**
+   * Registers many independent subscriptions atomically (EB-100): either
+   * every entry registers or none does. On the first failure (invalid
+   * pattern, ACL denial, namespace violation, bad options, …) every
+   * already-registered entry is unsubscribed and the original error is
+   * rethrown — the bus is left exactly as before the call.
+   *
+   * Each entry is an independent subscription (own handler, queue and
+   * lifecycle), unlike composite patterns (EB-70) which are one
+   * subscription with multi-pattern matching. Per-entry `opts` are
+   * shallow-merged over `commonOpts` (entry wins); an entry `opts.group`
+   * joins that consumer group (EB-16) as an independent member.
+   *
+   * Returns the subscriptions in registration order.
+   */
+  subscribeMany(
+    entries: SubscribeManyEntry[],
+    commonOpts?: SubscribeOptions,
+  ): Subscription[] {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new RangeError('subscribeMany: entries must be a non-empty array');
+    }
+    if (
+      commonOpts !== undefined &&
+      (typeof commonOpts !== 'object' || commonOpts === null)
+    ) {
+      throw new TypeError('subscribeMany: commonOpts must be an object');
+    }
+    // All-or-nothing: register one by one; on the first failure roll back
+    // everything registered so far (reverse order) and rethrow. `subscribe`
+    // itself throws before registering on any validation failure, so the
+    // rollback only ever undoes fully-registered subscriptions.
+    const registered: Subscription[] = [];
+    try {
+      for (const entry of entries) {
+        if (typeof entry !== 'object' || entry === null) {
+          throw new TypeError('subscribeMany: each entry must be an object');
+        }
+        const { pattern, handler } = entry;
+        if (typeof pattern !== 'string' || pattern.length === 0) {
+          throw new RangeError('subscribeMany: entry pattern must be a non-empty string');
+        }
+        if (typeof handler !== 'function') {
+          throw new TypeError('subscribeMany: entry handler must be a function');
+        }
+        const entryOpts = entry.opts;
+        if (entryOpts !== undefined && (typeof entryOpts !== 'object' || entryOpts === null)) {
+          throw new TypeError('subscribeMany: entry opts must be an object');
+        }
+        // Per-entry opts win over commonOpts (shallow merge).
+        const merged = { ...(commonOpts ?? {}), ...(entryOpts ?? {}) } as SubscribeOptions & {
+          group?: unknown;
+          batch?: unknown;
+        };
+        const { group, ...rest } = merged;
+        if (group !== undefined) {
+          // Consumer-group batch join (EB-16): every entry with the same
+          // `group` joins that group as an independent member.
+          if (typeof group !== 'string' || group.length === 0) {
+            throw new RangeError('subscribeMany: group must be a non-empty string');
+          }
+          registered.push(
+            this.subscribeToGroup(
+              group,
+              pattern,
+              handler as MessageHandler,
+              rest as GroupSubscribeOptions,
+            ),
+          );
+        } else if (rest.batch !== undefined && rest.batch !== false) {
+          registered.push(
+            this.subscribe(
+              pattern,
+              handler as BatchMessageHandler,
+              rest as SubscribeOptions & { batch: true | BatchDeliveryOptions },
+            ),
+          );
+        } else {
+          registered.push(this.subscribe(pattern, handler as MessageHandler, rest));
+        }
+      }
+    } catch (err) {
+      for (let i = registered.length - 1; i >= 0; i--) {
+        try {
+          registered[i].unsubscribe();
+        } catch {
+          // Teardown never throws into the rollback path.
+        }
+      }
+      throw err;
+    }
+    return registered;
   }
 
   /**

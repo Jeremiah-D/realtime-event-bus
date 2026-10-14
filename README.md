@@ -2928,3 +2928,40 @@ than `maxFrameBytes` (default 1 MiB) close the connection with 1009;
 binary frames are rejected with 1003 (the protocol is JSON text frames
 only). Malformed JSON and unknown frame types get error frames without
 dropping the connection.
+
+## Atomic batch subscription (EB-100)
+
+`bus.subscribeMany(entries, commonOpts?)` registers many independent
+subscriptions atomically: either every entry registers or none does. On
+the first failure — invalid pattern, ACL denial (EB-41), namespace
+violation (EB-52), bad options — every already-registered entry is
+unsubscribed and the original error is rethrown, leaving the bus exactly
+as before the call.
+
+```ts
+const subs = bus.subscribeMany(
+  [
+    { pattern: 'orders.**', handler: onOrder },
+    { pattern: 'payments.**', handler: onPayment, opts: { queueSize: 500 } },
+    // Consumer-group batch join (EB-16): same group, competing member.
+    { pattern: 'jobs.**', handler: onJob, opts: { group: 'workers' } },
+  ],
+  { filter: (payload) => payload !== null }, // commonOpts, entry opts win
+);
+// subs: Subscription[] in registration order
+```
+
+Notes:
+
+- Each entry is an **independent** subscription (own handler, queue,
+  backpressure policy, lifecycle). Contrast with composite patterns
+  (EB-70, `SubscribeOptions.patterns`): a composite is one subscription
+  matching several patterns with OR/AND/exclusion semantics; a
+  `subscribeMany` entry is a separate subscription — the batch is only an
+  atomic registration mechanism.
+- Per-entry `opts` are shallow-merged over `commonOpts` (entry wins).
+  `opts.group` routes the entry through `subscribeToGroup`; `opts.batch`
+  entries use the batch-delivery overload. Shadow (EB-63) and namespace
+  (EB-52) combination rules apply per entry exactly as in `subscribe`.
+- An empty entries array throws `RangeError`; non-function handlers and
+  non-object opts throw `TypeError` — all before anything registers.
