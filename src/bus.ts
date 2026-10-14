@@ -1896,9 +1896,9 @@ export interface DeadLetterEvent {
 export interface PartitionMigration {
   /** The partition whose owner changed. */
   partition: number;
-  /** Previous owner's subscription id, null when it was unassigned. */
+  /** Previous owner's roster key (instanceId for static members), null when it was unassigned. */
   from: string | null;
-  /** New owner's subscription id. */
+  /** New owner's roster key (instanceId for static members). */
   to: string;
   /**
    * Per-topic assignment watermarks for the partition: the highest
@@ -1934,13 +1934,14 @@ export interface GroupRebalanceEvent {
   /** The topic pattern this competing set is scoped to. */
   pattern: string;
   /**
-   * Member subscription ids in the group after the change, in join order.
-   * A snapshot — mutating it does not affect the bus.
+   * Member roster keys in the group after the change, in join order —
+   * the instanceId for static members (EB-104), the subscription id
+   * otherwise. A snapshot — mutating it does not affect the bus.
    */
   members: string[];
   /** What triggered the rebalance. */
   trigger: 'join' | 'leave';
-  /** The subscription id of the member that joined or left. */
+  /** The roster key of the member that joined or left. */
   memberId: string;
   /**
    * Present on `leave` events when the leaving member configured
@@ -2074,6 +2075,36 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * `partitionRebalance` event (`PartitionRebalanceInfo.strategy`).
    */
   assignment?: 'rendezvous' | 'sticky';
+  /**
+   * Kafka-style static membership (EB-104): a stable identity for this
+   * member, independent of its subscription id. When a static member
+   * leaves (unsubscribe, lease/idle expiry), its roster slot is held for
+   * `sessionTimeoutMs` instead of triggering a rebalance: the partition
+   * assignment is frozen and no `onRebalance` fires. A rejoin with the
+   * same `instanceId` inside the window reclaims the slot — no rebalance,
+   * assignment retained. Only after the window expires without a rejoin
+   * is the slot released and the normal (cooperative) rebalance run.
+   *
+   * With `sticky` assignment the limbo member stays in the assignor's
+   * roster, so its partitions are never taken for balance while the
+   * session is held — static members keep their slots preferentially.
+   *
+   * Rules: non-empty, no NUL byte, and must not look like a generated
+   * subscription id (`sub-<n>`); an empty instanceId, or one that is
+   * already online in the same (groupId, pattern), throws `RangeError`
+   * and rolls the subscription back. A group may mix static and dynamic
+   * members.
+   */
+  instanceId?: string;
+  /**
+   * How long a departed static member's roster slot is held before the
+   * group rebalances without it (see `instanceId`). Wall-clock
+   * milliseconds on an unref'd timer — it is a liveness bound, not bus
+   * time, so it still fires under an injected `EventBusOptions.now`.
+   * Must be a finite number > 0. Default 30000. Only meaningful with
+   * `instanceId`; ignored otherwise.
+   */
+  sessionTimeoutMs?: number;
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -3895,6 +3926,14 @@ interface Subscriber {
    * message is delivered to exactly one of them (see `subscribeToGroup`).
    */
   groupId?: string;
+  /**
+   * Present for static consumer-group members (see
+   * `GroupSubscribeOptions.instanceId`, EB-104): the member's stable
+   * identity. The group's roster is keyed by this instead of the
+   * subscription id, so a rejoining member reclaims its slot and its
+   * assignment.
+   */
+  instanceId?: string;
   /** Fired on group membership changes (see `GroupSubscribeOptions`). */
   onRebalance?: (event: GroupRebalanceEvent) => void;
   /**
@@ -6571,6 +6610,15 @@ interface ResolvedCompressionRule {
  */
 const DEFAULT_AUTO_TRAIN_RETRAIN_MS = 60_000;
 
+/**
+ * Default static-membership session timeout (EB-104): how long a
+ * departed static member's roster slot is held before the group
+ * rebalances without it. Kafka's `session.timeout.ms` default is 10s;
+ * 30s here — generous enough for a process restart, short enough that
+ * a dead member does not pin the roster for long.
+ */
+const DEFAULT_STATIC_SESSION_TIMEOUT_MS = 30_000;
+
 /** Resolved (validated, defaulted) form of `CompressionAutoTrainOptions`. */
 interface ResolvedAutoTrainOptions {
   sampleCount: number;
@@ -8033,6 +8081,52 @@ export class EventBus {
    * partition was never committed.
    */
   private partitionCommittedOffsets = new Map<string, Map<number, Map<string, number>>>();
+  /**
+   * Static membership (EB-104): groupKey -> instanceId -> live
+   * subscription id. The roster (`groupMembers`) is keyed by instanceId
+   * for static members, so the assignment stays stable across rejoins;
+   * this map resolves the roster key to the currently-live subscription.
+   * Absent while the member is in its session-timeout limbo.
+   */
+  private groupStaticSubs = new Map<string, Map<string, string>>();
+  /**
+   * Static-membership limbo sessions (EB-104): groupKey -> instanceId ->
+   * the pending session-expiry timer. Present only between a static
+   * member's leave and its session timeout (or rejoin, which cancels
+   * it). While present, the roster slot is held: no rebalance fires and
+   * the partition assignment is frozen.
+   */
+  private groupStaticSessions = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; expiresAt: number }>>();
+  /**
+   * Per-static-member session timeouts (EB-104): groupKey -> instanceId
+   * -> sessionTimeoutMs, as configured at join (a rejoin may update it).
+   */
+  private groupStaticTimeouts = new Map<string, Map<string, number>>();
+  /**
+   * Per-member assignment watermarks (EB-104): groupId -> roster key
+   * (instanceId for static members, subscription id otherwise) ->
+   * concrete topic -> highest per-topic `seq` assigned to that member.
+   * Read via `getGroupOffsets(groupId, instanceId)` — the resume point
+   * for a rejoining static member. Bounded like `groupOffsets`.
+   */
+  private groupInstanceOffsets = new Map<string, Map<string, Map<string, number>>>();
+  /**
+   * Per-static-member consumer checkpoints (EB-104): groupId ->
+   * instanceId -> concrete topic -> last processed `seq` (see
+   * `commitOffset` with `{ instanceId }`). Journaled to the durable log
+   * like group-level checkpoints, so they survive restarts.
+   */
+  private instanceCommittedOffsets = new Map<string, Map<string, Map<string, number>>>();
+  /**
+   * Per-static-member per-partition checkpoints (EB-104): groupKey ->
+   * instanceId -> partition -> concrete topic -> last processed `seq`
+   * (see `commitOffset` with `{ partition, instanceId }`). Journaled
+   * like the other checkpoints.
+   */
+  private instancePartitionCommittedOffsets = new Map<
+    string,
+    Map<string, Map<number, Map<string, number>>>
+  >();
   private readonly now: () => number;
   /**
    * Deterministic fault-injection harness (EB-103), present only when
@@ -8341,6 +8435,41 @@ export class EventBus {
       // (4-part keys) reseed the per-partition checkpoints.
       for (const [key, seq] of this.durableLog.recoveredCommittedOffsets()) {
         const parts = key.split('\0');
+        // Per-static-member commit (EB-104): 3 parts, the 3rd carrying
+        // the `instance:` marker.
+        if (parts.length === 3 && parts[2].startsWith('instance:')) {
+          const [groupId, topic] = parts;
+          const instanceId = parts[2].slice('instance:'.length);
+          let byInstance = this.instanceCommittedOffsets.get(groupId);
+          if (byInstance == null) {
+            byInstance = new Map();
+            this.instanceCommittedOffsets.set(groupId, byInstance);
+          }
+          let byTopic = byInstance.get(instanceId);
+          if (byTopic == null) {
+            byTopic = new Map();
+            byInstance.set(instanceId, byTopic);
+          }
+          byTopic.set(topic, seq);
+          continue;
+        }
+        // Per-partition per-static-member commit (EB-104): 5 parts, the
+        // 5th carrying the `instance:` marker.
+        if (parts.length === 5 && parts[4].startsWith('instance:')) {
+          const [groupId, topic, partitionStr, pattern] = parts;
+          const instanceId = parts[4].slice('instance:'.length);
+          const partition = Number(partitionStr);
+          if (!Number.isInteger(partition) || partition < 0 || pattern.length === 0) continue;
+          const groupKey = `${groupId}\0${pattern}`;
+          const store = this.instancePartitionStore(groupKey, instanceId);
+          let byTopic = store.get(partition);
+          if (byTopic == null) {
+            byTopic = new Map();
+            store.set(partition, byTopic);
+          }
+          byTopic.set(topic, seq);
+          continue;
+        }
         if (parts.length === 4) {
           const [groupId, topic, partitionStr, pattern] = parts;
           const partition = Number(partitionStr);
@@ -11870,7 +11999,10 @@ export class EventBus {
     const oldKey = EventBus.groupKey(groupId, oldPattern);
     const wasPartitioned = this.groupPartitions.get(oldKey) !== undefined;
     const beforeLeave = wasPartitioned ? new Map(this.partitionAssignment(oldKey)) : undefined;
-    this.removeGroupMember(oldKey, subId);
+    // Static members (EB-104): the roster is keyed by instanceId, and the
+    // static bookkeeping moves with the member to the new competing set.
+    const rosterKey = subscriber.instanceId ?? subId;
+    this.removeGroupMember(oldKey, rosterKey);
     let leaveRebalance: PartitionRebalanceInfo | undefined;
     if (wasPartitioned) {
       const after = this.partitionAssignment(oldKey);
@@ -11880,13 +12012,14 @@ export class EventBus {
         migrated,
         strategy: this.groupAssignmentStrategy.get(oldKey) ?? 'rendezvous',
       };
+      const oldStaticSubs = this.groupStaticSubs.get(oldKey);
       for (const m of migrated) {
-        const owner = this.subscribers.get(m.to);
+        const owner = this.subscribers.get(oldStaticSubs?.get(m.to) ?? m.to);
         if (owner !== undefined) this.replayPartitionBacklog(owner, oldKey, m.partition);
       }
     }
     const linger = this.beginLingerHandoff(groupId, subscriber);
-    this.fireRebalance(groupId, oldPattern, oldKey, 'leave', subId, linger, leaveRebalance);
+    this.fireRebalance(groupId, oldPattern, oldKey, 'leave', rosterKey, linger, leaveRebalance);
     const newKey = EventBus.groupKey(groupId, newPattern);
     this.checkPartitionConfig(newKey, undefined);
     this.checkAssignmentConfig(newKey, undefined);
@@ -11897,7 +12030,10 @@ export class EventBus {
     }
     const partitioned = this.groupPartitions.get(newKey) !== undefined;
     const beforeJoin = partitioned ? new Map(this.partitionAssignment(newKey)) : undefined;
-    members.push(subId);
+    members.push(rosterKey);
+    if (subscriber.instanceId !== undefined) {
+      this.moveStaticRegistration(oldKey, newKey, subscriber.instanceId, subId);
+    }
     this.invalidatePartitionAssignment(newKey);
     let joinRebalance: PartitionRebalanceInfo | undefined;
     if (partitioned) {
@@ -11909,10 +12045,64 @@ export class EventBus {
         strategy: this.groupAssignmentStrategy.get(newKey) ?? 'rendezvous',
       };
       for (const m of migrated) {
-        if (m.to === subId) this.replayPartitionBacklog(subscriber, newKey, m.partition);
+        if (m.to === rosterKey) this.replayPartitionBacklog(subscriber, newKey, m.partition);
       }
     }
-    this.fireRebalance(groupId, newPattern, newKey, 'join', subId, undefined, joinRebalance);
+    this.fireRebalance(groupId, newPattern, newKey, 'join', rosterKey, undefined, joinRebalance);
+  }
+
+  /**
+   * Moves one static member's registration (EB-104) from one competing
+   * set to another: the live-subscription mapping, the session timeout,
+   * and any pending limbo session timer. The timer keeps its remaining
+   * semantics by re-arming with the full timeout — a pattern move during
+   * limbo is already an operator-level anomaly; re-arming is the safe,
+   * non-lossy choice.
+   */
+  private moveStaticRegistration(
+    oldKey: string,
+    newKey: string,
+    instanceId: string,
+    subId: string,
+  ): void {
+    const moveEntry = <K, V>(from: Map<string, Map<K, V>> | undefined, k: K): V | undefined => {
+      const v = from?.get(k);
+      if (v !== undefined) from!.delete(k);
+      return v;
+    };
+    let newSubs = this.groupStaticSubs.get(newKey);
+    if (newSubs == null) {
+      newSubs = new Map();
+      this.groupStaticSubs.set(newKey, newSubs);
+    }
+    const live = moveEntry(this.groupStaticSubs.get(oldKey), instanceId);
+    newSubs.set(instanceId, live ?? subId);
+    let newTimeouts = this.groupStaticTimeouts.get(newKey);
+    if (newTimeouts == null) {
+      newTimeouts = new Map();
+      this.groupStaticTimeouts.set(newKey, newTimeouts);
+    }
+    const timeout = moveEntry(this.groupStaticTimeouts.get(oldKey), instanceId);
+    if (timeout !== undefined) newTimeouts.set(instanceId, timeout);
+    const session = moveEntry(this.groupStaticSessions.get(oldKey), instanceId);
+    if (session !== undefined) {
+      clearTimeout(session.timer);
+      // Re-arm under the new key; the expiry closure names the new key.
+      const groupId = oldKey.slice(0, oldKey.indexOf('\0'));
+      const pattern = newKey.slice(newKey.indexOf('\0') + 1);
+      const remaining = Math.max(0, session.expiresAt - Date.now());
+      const timer = setTimeout(
+        () => this.expireStaticSession(newKey, groupId, pattern, instanceId),
+        Math.min(remaining, 2_147_483_647),
+      );
+      unrefTimer(timer);
+      let newSessions = this.groupStaticSessions.get(newKey);
+      if (newSessions == null) {
+        newSessions = new Map();
+        this.groupStaticSessions.set(newKey, newSessions);
+      }
+      newSessions.set(instanceId, { timer, expiresAt: session.expiresAt });
+    }
   }
 
   /**
@@ -12428,10 +12618,28 @@ export class EventBus {
     if (assignment !== undefined && assignment !== 'rendezvous' && assignment !== 'sticky') {
       throw new RangeError("assignment must be 'rendezvous' or 'sticky'");
     }
+    // Static membership (EB-104): validated before anything registers, so
+    // a throw leaves no half-registered subscriber behind.
+    const instanceId = opts?.instanceId;
+    if (instanceId !== undefined) {
+      if (typeof instanceId !== 'string' || instanceId.length === 0) {
+        throw new RangeError('instanceId must be a non-empty string');
+      }
+      if (instanceId.includes('\0')) {
+        throw new RangeError('instanceId must not contain NUL bytes');
+      }
+      if (/^sub-\d+$/.test(instanceId)) {
+        throw new RangeError('instanceId must not collide with generated subscription ids (sub-<n>)');
+      }
+    }
+    const sessionTimeoutMs = opts?.sessionTimeoutMs ?? DEFAULT_STATIC_SESSION_TIMEOUT_MS;
+    if (!Number.isFinite(sessionTimeoutMs) || sessionTimeoutMs <= 0) {
+      throw new RangeError('sessionTimeoutMs must be a finite number of milliseconds > 0');
+    }
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
-    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, onReplayProgress: replayObserver, progressInterval: replayInterval, ...restOpts } = opts ?? {};
+    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, instanceId: _instanceId, sessionTimeoutMs: _sessionTimeoutMs, onReplayProgress: replayObserver, progressInterval: replayInterval, ...restOpts } = opts ?? {};
     this.validateResumeFromSeq(resumeFromSeq);
     this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
     // Durable-log replay progress (EB-71): validated before anything
@@ -12454,6 +12662,7 @@ export class EventBus {
     const subscriber = this.subscribers.get(sub.id);
     if (subscriber == null) throw new Error(`unknown subscriber: ${sub.id}`);
     subscriber.groupId = groupId;
+    subscriber.instanceId = instanceId;
     subscriber.onRebalance = opts?.onRebalance;
     subscriber.handoffLingerMs = handoffLingerMs;
     // Durable-log replay progress observer (EB-71): stripped from
@@ -12466,26 +12675,72 @@ export class EventBus {
       members = [];
       this.groupMembers.set(key, members);
     }
+    // Static membership (EB-104): the roster is keyed by instanceId, so
+    // the assignment stays stable across rejoins. A rejoin inside the
+    // session window reclaims its slot with no rebalance and a frozen
+    // assignment; anything else joins normally.
+    const rosterKey = instanceId ?? sub.id;
+    let staticRejoin = false;
+    if (instanceId !== undefined) {
+      let staticSubs = this.groupStaticSubs.get(key);
+      if (staticSubs == null) {
+        staticSubs = new Map();
+        this.groupStaticSubs.set(key, staticSubs);
+      }
+      if (staticSubs.has(instanceId)) {
+        // A member with this instanceId is already online: roll back the
+        // just-registered subscriber and fail fast.
+        sub.unsubscribe();
+        throw new RangeError(`instanceId "${instanceId}" is already online in group "${groupId}"`);
+      }
+      let timeouts = this.groupStaticTimeouts.get(key);
+      if (timeouts == null) {
+        timeouts = new Map();
+        this.groupStaticTimeouts.set(key, timeouts);
+      }
+      timeouts.set(instanceId, sessionTimeoutMs);
+      staticSubs.set(instanceId, sub.id);
+      const sessions = this.groupStaticSessions.get(key);
+      const session = sessions?.get(instanceId);
+      if (session !== undefined) {
+        // Rejoin inside the session window: cancel the expiry and reclaim
+        // the slot — no roster change, no assignment invalidation, no
+        // rebalance. The frozen assignment still names this roster key.
+        clearTimeout(session.timer);
+        sessions!.delete(instanceId);
+        if (sessions!.size === 0) this.groupStaticSessions.delete(key);
+        staticRejoin = true;
+      } else if (!members.includes(instanceId)) {
+        members.push(instanceId);
+      }
+      // else: stale roster entry with no live session (defensive) —
+      // reclaim the slot in place, no rebalance.
+    } else {
+      members.push(sub.id);
+    }
     const partitioned = this.groupPartitions.get(key) !== undefined;
-    const beforeAssignment = partitioned ? new Map(this.partitionAssignment(key)) : undefined;
-    members.push(sub.id);
-    this.invalidatePartitionAssignment(key);
     let partitionRebalance: PartitionRebalanceInfo | undefined;
-    if (partitioned) {
-      const after = this.partitionAssignment(key);
-      const migrated = this.diffPartitionAssignment(key, beforeAssignment!, after);
-      partitionRebalance = {
-        assignment: Object.fromEntries(after),
-        migrated,
-        strategy: this.groupAssignmentStrategy.get(key) ?? 'rendezvous',
-      };
-      // Automatic watermark replay: partitions the newcomer just took over
-      // get their uncommitted backlog `(committed, watermark]` from the
-      // durable log. Skipped when the member chose its own resume point —
-      // its explicit window wins over the automatic one.
-      if (resumeFromSeq === undefined && resumeFromTime === undefined) {
-        for (const m of migrated) {
-          if (m.to === sub.id) this.replayPartitionBacklog(subscriber, key, m.partition);
+    if (!staticRejoin) {
+      const beforeAssignment = partitioned ? new Map(this.partitionAssignment(key)) : undefined;
+      this.invalidatePartitionAssignment(key);
+      if (partitioned) {
+        const after = this.partitionAssignment(key);
+        const migrated = this.diffPartitionAssignment(key, beforeAssignment!, after);
+        partitionRebalance = {
+          assignment: Object.fromEntries(after),
+          migrated,
+          strategy: this.groupAssignmentStrategy.get(key) ?? 'rendezvous',
+        };
+        // Automatic watermark replay: partitions the newcomer just took over
+        // get their uncommitted backlog `(committed, watermark]` from the
+        // durable log. Skipped when the member chose its own resume point —
+        // its explicit window wins over the automatic one. Compared by
+        // roster key: a static member's assignment names its instanceId,
+        // not the fresh subscription id.
+        if (resumeFromSeq === undefined && resumeFromTime === undefined) {
+          for (const m of migrated) {
+            if (m.to === rosterKey) this.replayPartitionBacklog(subscriber, key, m.partition);
+          }
         }
       }
     }
@@ -12499,20 +12754,37 @@ export class EventBus {
     // Subscription lifecycle audit (EB-78): the group membership on top
     // of the 'subscribe' the inner call recorded. Audited before the
     // rebalance fires, so the join entry precedes the 'rebalance' entry
-    // the rebalance records.
+    // the rebalance records. A static rejoin inside the session window
+    // fires no rebalance — the slot was never released.
     this.auditSubscription({
       action: 'group_join',
       subId: sub.id,
       groupId,
       pattern: topicPattern,
       actor: opts?.actor ?? 'system',
+      ...(instanceId === undefined
+        ? {}
+        : { detail: { instanceId, staticRejoin } }),
     });
-    this.fireRebalance(groupId, topicPattern, key, 'join', sub.id, undefined, partitionRebalance);
+    if (!staticRejoin) {
+      this.fireRebalance(groupId, topicPattern, key, 'join', rosterKey, undefined, partitionRebalance);
+    }
     const groupSubscription: Subscription = {
       id: sub.id,
       unsubscribe: () => {
         // Second call is a no-op: no double leave-event, no roster churn.
         if (!this.subscribers.has(sub.id)) return;
+        // Static membership (EB-104): the roster slot is held for the
+        // session window instead of leaving — no rebalance fires and the
+        // partition assignment stays frozen. The slot is released (with
+        // the normal cooperative rebalance) only if the window expires
+        // with no rejoin.
+        if (subscriber.instanceId !== undefined) {
+          this.enterStaticLimbo(key, groupId, topicPattern, subscriber, subscriber.instanceId, () =>
+            sub.unsubscribe(),
+          );
+          return;
+        }
         const wasPartitioned = this.groupPartitions.get(key) !== undefined;
         const before = wasPartitioned ? new Map(this.partitionAssignment(key)) : undefined;
         this.removeGroupMember(key, sub.id);
@@ -12587,6 +12859,128 @@ export class EventBus {
   }
 
   /**
+   * Holds a departed static member's roster slot for its session window
+   * (EB-104) instead of leaving the group: the live-subscription mapping
+   * is dropped, but the roster entry — and therefore the partition
+   * assignment — is untouched, and no rebalance fires. A rejoin with the
+   * same instanceId inside the window reclaims the slot (see
+   * `subscribeToGroup`); otherwise `expireStaticSession` releases it when
+   * the timer fires.
+   *
+   * The inner subscription is torn down normally (its queue is gone), so
+   * during the window the group's messages are assigned to the live
+   * members — the partitioned branch falls back to a live member when
+   * the owner has no live subscription, and round-robin rotates over the
+   * live roster. Nothing is queued for a member that is not there.
+   */
+  private enterStaticLimbo(
+    key: string,
+    groupId: string,
+    pattern: string,
+    subscriber: Subscriber,
+    instanceId: string,
+    teardown: () => void,
+  ): void {
+    this.groupStaticSubs.get(key)?.delete(instanceId);
+    // Computed before the teardown, like the normal leave path — the
+    // handoff window covers the leaver's uncommitted backlog for durable
+    // replay, orthogonal to the session hold.
+    this.beginLingerHandoff(groupId, subscriber);
+    // Tear down the inner subscription: its queue and all subscriber
+    // state go away — only the group-level roster slot is held.
+    teardown();
+    const timeoutMs = Math.min(
+      this.groupStaticTimeouts.get(key)?.get(instanceId) ?? DEFAULT_STATIC_SESSION_TIMEOUT_MS,
+      2_147_483_647,
+    );
+    const expiresAt = Date.now() + timeoutMs;
+    const timer = setTimeout(() => {
+      this.expireStaticSession(key, groupId, pattern, instanceId);
+    }, timeoutMs);
+    unrefTimer(timer);
+    let sessions = this.groupStaticSessions.get(key);
+    if (sessions == null) {
+      sessions = new Map();
+      this.groupStaticSessions.set(key, sessions);
+    }
+    sessions.set(instanceId, { timer, expiresAt });
+    this.auditSubscription({
+      action: 'group_leave',
+      subId: subscriber.id,
+      groupId,
+      pattern,
+      actor: 'system',
+      detail: { instanceId, staticSession: true, sessionExpiresAt: expiresAt },
+    });
+  }
+
+  /**
+   * Releases a static member's roster slot after its session window
+   * expired with no rejoin (EB-104): the normal leave path — roster
+   * removal, assignment invalidation, cooperative rebalance — runs now,
+   * as if the member had left without static membership. A no-op when
+   * the member already rejoined (the session was cancelled).
+   */
+  private expireStaticSession(
+    key: string,
+    groupId: string,
+    pattern: string,
+    instanceId: string,
+  ): void {
+    const sessions = this.groupStaticSessions.get(key);
+    if (sessions?.get(instanceId) === undefined) return;
+    sessions!.delete(instanceId);
+    if (sessions!.size === 0) this.groupStaticSessions.delete(key);
+    const wasPartitioned = this.groupPartitions.get(key) !== undefined;
+    const before = wasPartitioned ? new Map(this.partitionAssignment(key)) : undefined;
+    const members = this.groupMembers.get(key);
+    if (members != null) {
+      const idx = members.indexOf(instanceId);
+      if (idx >= 0) members.splice(idx, 1);
+    }
+    this.groupStaticTimeouts.get(key)?.delete(instanceId);
+    this.invalidatePartitionAssignment(key);
+    let pr: PartitionRebalanceInfo | undefined;
+    if (wasPartitioned) {
+      const after = this.partitionAssignment(key);
+      const migrated = this.diffPartitionAssignment(key, before!, after);
+      pr = {
+        assignment: Object.fromEntries(after),
+        migrated,
+        strategy: this.groupAssignmentStrategy.get(key) ?? 'rendezvous',
+      };
+      const staticSubs = this.groupStaticSubs.get(key);
+      for (const m of migrated) {
+        // Migration targets are roster keys — resolve static ones to
+        // their live subscription before replaying the backlog.
+        const owner = this.subscribers.get(staticSubs?.get(m.to) ?? m.to);
+        if (owner !== undefined) this.replayPartitionBacklog(owner, key, m.partition);
+      }
+    }
+    if (members != null && members.length === 0) {
+      // Dead generation: mirror removeGroupMember's cleanup so a
+      // rejoining group starts fresh; the partition count and the
+      // assignment strategy are retained like the normal leave path.
+      this.groupMembers.delete(key);
+      this.groupCursors.delete(key);
+      this.previousPartitionAssignment.delete(key);
+      this.groupStaticSubs.delete(key);
+      this.groupStaticTimeouts.delete(key);
+      this.groupStaticSessions.delete(key);
+    }
+    this.auditSubscription({
+      action: 'group_session_expired',
+      groupId,
+      pattern,
+      actor: 'system',
+      detail: { instanceId },
+    });
+    // The rebalance itself is audited inside fireRebalance, like the
+    // normal leave path.
+    this.fireRebalance(groupId, pattern, key, 'leave', instanceId, undefined, pr);
+  }
+
+  /**
    * Notifies every current member of a group about a membership change.
    * Each member receives its own snapshot of the post-change roster.
    * `linger` (leave events only) carries the handoff window opened for
@@ -12605,8 +12999,13 @@ export class EventBus {
   ): void {
     const members = this.groupMembers.get(key);
     if (members == null) return;
-    for (const id of members) {
-      const subscriber = this.subscribers.get(id);
+    // Roster keys are instanceIds for static members (EB-104): resolve
+    // to the live subscription before notifying. A member in its session
+    // limbo has no live subscription and is skipped — it will not observe
+    // a rebalance it did not cause.
+    const staticSubs = this.groupStaticSubs.get(key);
+    for (const rosterKey of members) {
+      const subscriber = this.subscribers.get(staticSubs?.get(rosterKey) ?? rosterKey);
       subscriber?.onRebalance?.({
         groupId,
         pattern,
@@ -12787,6 +13186,33 @@ export class EventBus {
     const assignee = members[cursor % members.length];
     this.groupCursors.set(key, cursor + 1);
     return assignee;
+  }
+
+  /**
+   * Records one group assignment against the member's roster key
+   * (EB-104): the instanceId for static members, the subscription id
+   * otherwise. Feeds `getGroupOffsets(groupId, instanceId)` — the resume
+   * point for a rejoining static member. Assignment order follows publish
+   * order, so the newest assignment is always the maximum, mirroring
+   * `recordGroupOffset`.
+   */
+  private recordInstanceGroupOffset(
+    groupId: string,
+    rosterKey: string,
+    topic: string,
+    seq: number,
+  ): void {
+    let byMember = this.groupInstanceOffsets.get(groupId);
+    if (byMember == null) {
+      byMember = new Map();
+      this.groupInstanceOffsets.set(groupId, byMember);
+    }
+    let byTopic = byMember.get(rosterKey);
+    if (byTopic == null) {
+      byTopic = new Map();
+      byMember.set(rosterKey, byTopic);
+    }
+    byTopic.set(topic, seq);
   }
 
   /**
@@ -13036,14 +13462,56 @@ export class EventBus {
   }
 
   /**
-   * Assignment watermark per concrete topic for a group: the highest
-   * per-topic `seq` handed to any member of the group so far. Empty when
-   * the group has received nothing (or does not exist). This is what a
+  /**
+   * Assignment watermarks per concrete topic for a group: the highest
+   * per-topic `seq` assigned to any member of the group. Empty when the
+   * group has received nothing (or does not exist). This is what a
    * rejoining member resumes from.
+   *
+   * With `instanceId` (EB-104): the highest per-topic `seq` assigned to
+   * that static member's roster slot — the resume point for a rejoining
+   * member (seed `resumeFromSeq` from here). Empty when nothing was ever
+   * assigned to the member.
    */
-  getGroupOffsets(groupId: string): Record<string, number> {
+  getGroupOffsets(groupId: string, instanceId?: string): Record<string, number> {
+    if (instanceId !== undefined) {
+      const offsets = this.groupInstanceOffsets.get(groupId)?.get(instanceId);
+      return offsets == null ? {} : Object.fromEntries(offsets);
+    }
     const offsets = this.groupOffsets.get(groupId);
     return offsets == null ? {} : Object.fromEntries(offsets);
+  }
+
+  /**
+   * Per-static-member consumer checkpoints for a group (see
+   * `commitOffset` with `{ instanceId }`, EB-104): concrete topic ->
+   * last processed `seq` reported by that member. Empty when the member
+   * never committed. Journaled to the durable log, so a restarted bus
+   * recovers them (see the constructor's offset reseed).
+   */
+  getInstanceCommittedOffsets(groupId: string, instanceId: string): Record<string, number> {
+    const offsets = this.instanceCommittedOffsets.get(groupId)?.get(instanceId);
+    return offsets == null ? {} : Object.fromEntries(offsets);
+  }
+
+  /**
+   * Per-static-member per-partition checkpoints for a competing set (see
+   * `commitOffset` with `{ partition, instanceId }`, EB-104): partition
+   * -> concrete topic -> last processed `seq`. Empty when the member
+   * never committed per partition.
+   */
+  getInstancePartitionCommittedOffsets(
+    groupId: string,
+    pattern: string,
+    instanceId: string,
+  ): Record<number, Record<string, number>> {
+    const key = EventBus.groupKey(groupId, pattern);
+    const byInstance = this.instancePartitionCommittedOffsets.get(key);
+    const byPartition = byInstance?.get(instanceId);
+    if (byPartition == null) return {};
+    const out: Record<number, Record<string, number>> = {};
+    for (const [p, byTopic] of byPartition) out[p] = Object.fromEntries(byTopic);
+    return out;
   }
 
   /**
@@ -13068,11 +13536,25 @@ export class EventBus {
    * A journal write failure never fails the in-memory commit — the live
    * process keeps serving from memory.
    *
+   * With `opts.instanceId` (EB-104), the checkpoint is recorded for one
+   * static member instead of the group: it feeds
+   * `getInstanceCommittedOffsets` (and the per-partition variant) and is
+   * journaled the same way, so a rejoining member resumes from its own
+   * checkpoint. Instance checkpoints do not move the group-level
+   * checkpoint — group lag (`getGroupOffsets` minus `getCommittedOffsets`)
+   * still tracks group-level commits.
+   *
    * Throws `RangeError` on an empty groupId/topic, a non-positive
-   * non-integer seq, a partition for a non-partitioned group, or a
-   * partition index outside the group's partition count.
+   * non-integer seq, a partition for a non-partitioned group, a
+   * partition index outside the group's partition count, or an empty
+   * instanceId.
    */
-  commitOffset(groupId: string, topic: string, seq: number, opts?: { partition?: number }): void {
+  commitOffset(
+    groupId: string,
+    topic: string,
+    seq: number,
+    opts?: { partition?: number; instanceId?: string },
+  ): void {
     if (groupId.length === 0) {
       throw new RangeError('groupId must be a non-empty string');
     }
@@ -13081,6 +13563,10 @@ export class EventBus {
     }
     if (!Number.isInteger(seq) || seq < 1) {
       throw new RangeError('seq must be a positive integer sequence number');
+    }
+    const instanceId = opts?.instanceId;
+    if (instanceId !== undefined && (typeof instanceId !== 'string' || instanceId.length === 0)) {
+      throw new RangeError('instanceId must be a non-empty string');
     }
     const partition = opts?.partition;
     if (partition !== undefined) {
@@ -13092,10 +13578,15 @@ export class EventBus {
       if (partition >= n) {
         throw new RangeError(`partition ${partition} out of range for a ${n}-partition group`);
       }
-      let byPartition = this.partitionCommittedOffsets.get(groupKey);
-      if (byPartition == null) {
-        byPartition = new Map();
-        this.partitionCommittedOffsets.set(groupKey, byPartition);
+      let byPartition: Map<number, Map<string, number>> | undefined;
+      if (instanceId === undefined) {
+        byPartition = this.partitionCommittedOffsets.get(groupKey);
+        if (byPartition == null) {
+          byPartition = new Map();
+          this.partitionCommittedOffsets.set(groupKey, byPartition);
+        }
+      } else {
+        byPartition = this.instancePartitionStore(groupKey, instanceId);
       }
       let byTopic = byPartition.get(partition);
       if (byTopic == null) {
@@ -13107,9 +13598,26 @@ export class EventBus {
       this.durableLog?.appendOffset(groupId, topic, seq, this.now(), {
         partition,
         pattern: groupKey.slice(sep + 1),
+        ...(instanceId === undefined ? {} : { instanceId }),
       });
       // A checkpoint moved: lag may have fallen back below the threshold
       // (rearming the alert latch), so re-evaluate.
+      this.checkGroupLagForGroup(groupId);
+      return;
+    }
+    if (instanceId !== undefined) {
+      let byInstance = this.instanceCommittedOffsets.get(groupId);
+      if (byInstance == null) {
+        byInstance = new Map();
+        this.instanceCommittedOffsets.set(groupId, byInstance);
+      }
+      let byTopic = byInstance.get(instanceId);
+      if (byTopic == null) {
+        byTopic = new Map();
+        byInstance.set(instanceId, byTopic);
+      }
+      byTopic.set(topic, seq);
+      this.durableLog?.appendOffset(groupId, topic, seq, this.now(), { instanceId });
       this.checkGroupLagForGroup(groupId);
       return;
     }
@@ -13122,6 +13630,28 @@ export class EventBus {
     this.durableLog?.appendOffset(groupId, topic, seq, this.now());
     // Same re-evaluation as the partitioned branch above.
     this.checkGroupLagForGroup(groupId);
+  }
+
+  /**
+   * Returns (creating) the per-partition checkpoint map for one static
+   * member of a competing set (EB-104): partition -> concrete topic ->
+   * last processed `seq`.
+   */
+  private instancePartitionStore(
+    groupKey: string,
+    instanceId: string,
+  ): Map<number, Map<string, number>> {
+    let byInstance = this.instancePartitionCommittedOffsets.get(groupKey);
+    if (byInstance == null) {
+      byInstance = new Map();
+      this.instancePartitionCommittedOffsets.set(groupKey, byInstance);
+    }
+    let store = byInstance.get(instanceId);
+    if (store == null) {
+      store = new Map();
+      byInstance.set(instanceId, store);
+    }
+    return store;
   }
 
   /**
@@ -13265,9 +13795,10 @@ export class EventBus {
   }
 
   /**
-   * Current partition -> member subscription id for a partitioned
-   * competing set (see `GroupSubscribeOptions.partitions`). Empty when
-   * the group is not partitioned or has no members.
+   * Current partition -> member identity for a partitioned competing set
+   * (see `GroupSubscribeOptions.partitions`): the roster key — the
+   * instanceId for static members (EB-104), the subscription id otherwise.
+   * Empty when the group is not partitioned or has no members.
    */
   getPartitionAssignment(groupId: string, pattern: string): Record<number, string> {
     const key = EventBus.groupKey(groupId, pattern);
@@ -13305,8 +13836,11 @@ export class EventBus {
   }
 
   /**
-   * Subscription ids of the current members of one competing set, in join
-   * order. Empty when the group/pattern has no live members.
+   * Roster keys of the current members of one competing set, in join
+   * order — the instanceId for static members (EB-104), the subscription
+   * id otherwise. A static member inside its session window still holds
+   * its slot, so it is listed even with no live subscription. Empty when
+   * the group/pattern has no members.
    */
   getGroupMembers(groupId: string, pattern: string): string[] {
     return [...(this.groupMembers.get(EventBus.groupKey(groupId, pattern)) ?? [])];
@@ -18806,7 +19340,18 @@ export class EventBus {
         // owner without coordination.
         const partition = this.alignedGroupPartition(partitionCount, topic, msg.seq, msg.partition, keyed?.key);
         const ownerId = this.partitionAssignment(key).get(partition);
-        const assignee = hit.members.find((m) => m.id === ownerId) ?? hit.members[0];
+        // Static members (EB-104): the assignment names the roster key
+        // (instanceId), not the subscription id — resolve it to the live
+        // subscription. A member in its session limbo has no live
+        // subscription, so the lookup misses and the previous no-owner
+        // fallback below delivers to a live member instead of losing the
+        // message.
+        const ownerSubId =
+          ownerId === undefined ? undefined : (this.groupStaticSubs.get(key)?.get(ownerId) ?? ownerId);
+        const assignee =
+          (ownerSubId === undefined
+            ? undefined
+            : hit.members.find((m) => m.id === ownerSubId)) ?? hit.members[0];
         if (keyed !== undefined) {
           for (const member of hit.members) {
             if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
@@ -18829,6 +19374,7 @@ export class EventBus {
         if (barrier === undefined) {
           this.recordPartitionOffset(key, partition, topic, msg.seq);
           this.recordGroupOffset(hit.groupId, topic, msg.seq);
+          this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
         }
         continue;
       }
@@ -18857,6 +19403,7 @@ export class EventBus {
       // partitioned branch above: they never move group offsets.
       if (barrier === undefined) {
         this.recordGroupOffset(hit.groupId, topic, msg.seq);
+        this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
       }
     }
     return { matched, accepted };

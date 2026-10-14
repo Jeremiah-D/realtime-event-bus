@@ -483,6 +483,11 @@ export interface DurableOffsetCommit {
   partition?: number;
   /** The competing set's pattern, present exactly when `partition` is. */
   pattern?: string;
+  /**
+   * Static member identity (EB-104) for per-instance checkpoints;
+   * absent for group-level commits.
+   */
+  instanceId?: string;
 }
 
 /** On-disk envelope for one offset-commit line. `v` pins the format. */
@@ -494,17 +499,31 @@ interface OffsetLine {
   at: number;
   partition?: number;
   pattern?: string;
+  /** Static member identity (EB-104) for per-instance checkpoints. */
+  instance?: string;
 }
 
 /**
  * Key for one checkpoint: groupId and topic joined by NUL, with the
- * partition and pattern appended for per-partition commits. Neither may
- * contain NUL in practice, so the pairing is unambiguous and reversible
- * (see `recoveredCommittedOffsets`).
+ * partition and pattern appended for per-partition commits, and an
+ * `instance:<id>` segment for per-static-member commits (EB-104).
+ * Neither may contain NUL in practice, so the pairing is unambiguous
+ * and reversible (see `recoveredCommittedOffsets`). The `instance:`
+ * marker can never collide with a partition key: partition segments are
+ * numeric, the marker never is.
  */
-function offsetKey(groupId: string, topic: string, partition?: number, pattern?: string): string {
+function offsetKey(
+  groupId: string,
+  topic: string,
+  partition?: number,
+  pattern?: string,
+  instanceId?: string,
+): string {
   const base = `${groupId}\0${topic}`;
-  return partition === undefined ? base : `${base}\0${partition}\0${pattern ?? ''}`;
+  const instanceSuffix = instanceId === undefined ? '' : `\0instance:${instanceId}`;
+  return partition === undefined
+    ? `${base}${instanceSuffix}`
+    : `${base}\0${partition}\0${pattern ?? ''}${instanceSuffix}`;
 }
 
 /** Builds the on-disk envelope for an offset commit. */
@@ -516,14 +535,16 @@ function offsetLineOf(commit: DurableOffsetCommit): OffsetLine {
     seq: commit.seq,
     at: commit.at,
     ...(commit.partition === undefined ? {} : { partition: commit.partition, pattern: commit.pattern }),
+    ...(commit.instanceId === undefined ? {} : { instance: commit.instanceId }),
   };
 }
 
 /**
  * Parses one offset-journal line. Returns `null` for anything malformed —
  * wrong version, empty group/topic, a non-positive-integer seq, a
- * non-finite timestamp, a malformed partition, or a partition without its
- * pattern. Corrupt lines are skipped, never fatal.
+ * non-finite timestamp, a malformed partition, a partition without its
+ * pattern, or a malformed static-member instance identity. Corrupt lines
+ * are skipped, never fatal.
  */
 function parseOffsetLine(line: string): DurableOffsetCommit | null {
   let parsed: unknown;
@@ -546,6 +567,11 @@ function parseOffsetLine(line: string): DurableOffsetCommit | null {
     if (!Number.isInteger(partition) || (partition as number) < 0) return null;
     if (typeof pattern !== 'string' || (pattern as string).length === 0) return null;
   }
+  // Static-member checkpoint (EB-104): a non-empty NUL-free identity.
+  const instance = o['instance'];
+  if (instance !== undefined) {
+    if (typeof instance !== 'string' || instance.length === 0 || instance.includes('\0')) return null;
+  }
   return {
     groupId: o['group'] as string,
     topic: o['topic'] as string,
@@ -554,6 +580,7 @@ function parseOffsetLine(line: string): DurableOffsetCommit | null {
     ...(partition === undefined
       ? {}
       : { partition: partition as number, pattern: pattern as string }),
+    ...(instance === undefined ? {} : { instanceId: instance as string }),
   };
 }
 
@@ -2258,7 +2285,13 @@ export class DurableTopicLog {
         this.corruptLines += 1;
         continue;
       }
-      const key = offsetKey(commit.groupId, commit.topic, commit.partition, commit.pattern);
+      const key = offsetKey(
+        commit.groupId,
+        commit.topic,
+        commit.partition,
+        commit.pattern,
+        commit.instanceId,
+      );
       const prev = this.offsetCommits.get(key);
       if (prev == null || commit.seq > prev.seq) {
         this.offsetCommits.set(key, {
@@ -2269,6 +2302,7 @@ export class DurableTopicLog {
           ...(commit.partition === undefined
             ? {}
             : { partition: commit.partition, pattern: commit.pattern as string }),
+          ...(commit.instanceId === undefined ? {} : { instanceId: commit.instanceId }),
         });
       }
     }
@@ -2296,7 +2330,7 @@ export class DurableTopicLog {
     topic: string,
     seq: number,
     at: number,
-    opts?: { partition?: number; pattern?: string },
+    opts?: { partition?: number; pattern?: string; instanceId?: string },
   ): boolean {
     const commit: DurableOffsetCommit = { groupId, topic, seq, at, ...opts };
     let line: string;
@@ -2311,7 +2345,7 @@ export class DurableTopicLog {
       return false;
     }
     this.offsetEntries += 1;
-    const key = offsetKey(groupId, topic, opts?.partition, opts?.pattern);
+    const key = offsetKey(groupId, topic, opts?.partition, opts?.pattern, opts?.instanceId);
     const prev = this.offsetCommits.get(key);
     if (prev == null || seq > prev.seq) {
       this.offsetCommits.set(key, { groupId, topic, seq, at, ...opts });
@@ -2342,9 +2376,12 @@ export class DurableTopicLog {
   /**
    * Committed offsets recovered from the offset journal: the highest
    * committed seq per checkpoint, keyed by the NUL-joined checkpoint key
-   * — `${groupId}\0${topic}` for group-level commits, or
+   * — `${groupId}\0${topic}` for group-level commits,
    * `${groupId}\0${topic}\0${partition}\0${pattern}` for per-partition
-   * commits (see `offsetKey`).
+   * commits, `${groupId}\0${topic}\0instance:${instanceId}` for
+   * per-static-member commits (EB-104), and
+   * `${groupId}\0${topic}\0${partition}\0${pattern}\0instance:${instanceId}`
+   * for per-partition per-member commits (see `offsetKey`).
    */
   recoveredCommittedOffsets(): Map<string, number> {
     const out = new Map<string, number>();

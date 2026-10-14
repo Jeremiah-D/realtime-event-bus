@@ -3081,6 +3081,50 @@ CREATE TABLE outbox_cursor (
 );
 ```
 
+## Static consumer-group membership (EB-104)
+
+Like Kafka's static group membership, a consumer can join a group under a
+stable identity. Pass `instanceId` in `GroupSubscribeOptions` (non-empty,
+must not collide with auto-generated `sub-N` ids) and the bus keys the
+roster by it instead of the ephemeral subscription id:
+
+```ts
+const member = bus.subscribeToGroup('orders', 'orders.events', onOrder, {
+  instanceId: 'order-processor-3',
+  sessionTimeoutMs: 30_000, // default 30s; must be a finite number > 0
+});
+```
+
+When a static member unsubscribes, its slot is not released immediately:
+it enters a **limbo** for `sessionTimeoutMs` — the roster still names it,
+no rebalance fires, and its partition assignment stays frozen. Messages
+published during the window route to the remaining live members (a limbo
+member is never drained to). If the same `instanceId` rejoins before the
+window expires, it reclaims its slot with **no rebalance** and the exact
+same assignment it had before; otherwise the session expires, a real
+`leave` rebalance fires, and the partitions are reassigned cooperatively
+(the expiry is recorded as `group_session_expired` in the subscription
+audit trail).
+
+Details worth knowing:
+
+- Joining twice with the same `instanceId` while it is online throws
+  `RangeError` (the failed join is rolled back). Rejoining after expiry
+  is a normal fresh join and does trigger a `join` rebalance.
+- The sticky assignor (EB-100) treats a limbo member as a member: when
+  others join mid-limbo, the limbo member's partitions stay on it.
+- `getGroupOffsets(groupId, instanceId)` returns that member's
+  per-topic assignment watermark; `commitOffset(groupId, topic, seq,
+  { instanceId })` records a per-member checkpoint (also per partition
+  with `{ partition, instanceId }`), so a rejoining member resumes from
+  its own checkpoint. Instance checkpoints are journaled with the same
+  append-only durability as group checkpoints (EB-94) and do not move
+  the group-level checkpoint or group lag.
+- Sessions run on unref'd wall-clock timers, so an idle process can still
+  exit. A static member in limbo is reported by `getGroupMembers` with
+  its `instanceId`; `subscription.instanceId` is readable from the
+  returned `Subscription`.
+
 ## Chaos testing (EB-103)
 
 **Test / pre-production use only.** The deterministic fault-injection

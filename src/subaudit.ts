@@ -44,6 +44,7 @@ export type SubscriptionAuditAction =
   | 'update_pattern'
   | 'group_join'
   | 'group_leave'
+  | 'group_session_expired'
   | 'rebalance'
   | 'topic_register'
   | 'topic_deregister'
@@ -68,6 +69,8 @@ export type SubscriptionAuditAction =
  * bloating the flat schema:
  * - `update_pattern`: `{ from: <old pattern> }`
  * - `rebalance`: `{ trigger: 'join'|'leave', memberId, members: <count> }`
+ * - `group_session_expired`: `{ instanceId }` (static membership, EB-104:
+ *   the held roster slot was released after the session window)
  * - `topic_register`: `{ owner?, description?, schemaVersion?, tags?, updated: <bool> }`
  * - `topic_deregister`: `{ owner?, description? }` (last-known metadata)
  * - `backpressure_dropped`: `{ policy: <backpressure tier>, dropped: <count>, queueSize: <number> }`
