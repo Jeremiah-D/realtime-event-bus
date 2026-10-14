@@ -59,6 +59,7 @@ import {
   type DoctorOptions,
 } from './doctor.ts';
 import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
+import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import {
@@ -3441,6 +3442,29 @@ export interface BusStats {
      */
     segments: Record<string, { live: number; segments: number; archived: number }>;
   };
+  /**
+   * Outbox records sitting in the attached outbox store, not yet relayed
+   * (`seq > cursor`). 0 when no outbox relay is attached (see
+   * `attachOutboxRelay`, EB-102). Always present, so readers never need
+   * a fallback.
+   */
+  outboxPending: number;
+  /**
+   * Age of the oldest unrelayed outbox record in ms. 0 when nothing is
+   * pending or no relay is attached. The stall signal: a climbing lag
+   * with a stuck cursor means the relay is wedged on a poison record.
+   */
+  outboxLagMs: number;
+  /**
+   * Last outbox cursor acked after a successful `publishAtomic` commit.
+   * 0 when no relay is attached or nothing has been relayed yet.
+   */
+  outboxCursor: number;
+  /**
+   * Total outbox records committed via `publishAtomic` since the relay
+   * was attached. 0 when no relay is attached.
+   */
+  outboxRelayed: number;
 }
 
 /**
@@ -7976,6 +8000,13 @@ export class EventBus {
    * restart never reuses a sequence number.
    */
   private readonly durableLog?: DurableTopicLog;
+  /**
+   * Attached outbox relay (EB-102), present only after
+   * `attachOutboxRelay`. Its lag feeds `getStats()` (`outboxPending` /
+   * `outboxLagMs` / `outboxCursor` / `outboxRelayed`) and the Prometheus
+   * exposition.
+   */
+  private outboxRelay?: OutboxRelay;
   /**
    * `durableLogMaxEntriesPerTopic` as configured — namespace child logs
    * (EB-52) open with the same per-topic budget as the root log.
@@ -19207,6 +19238,24 @@ export class EventBus {
               ...this.durableLog.stats(),
             },
           }),
+      // Outbox relay lag (EB-102): probed only when a relay is attached;
+      // a DB-backed store answers with one bounded scan.
+      ...(this.outboxRelay === undefined
+        ? {
+            outboxPending: 0,
+            outboxLagMs: 0,
+            outboxCursor: 0,
+            outboxRelayed: 0,
+          }
+        : (() => {
+            const lag = this.outboxRelay.getLag();
+            return {
+              outboxPending: lag.pending,
+              outboxLagMs: lag.oldestMs,
+              outboxCursor: lag.cursor,
+              outboxRelayed: lag.relayed,
+            };
+          })()),
     };
   }
 
@@ -20761,6 +20810,37 @@ export class EventBus {
    * functions and are not exported (see `applyConfig` for the
    * fail-closed restore rules).
    */
+  /**
+   * Attach a transactional outbox relay (EB-102): the relay drains
+   * `store` into this bus — one `publishAtomic` batch per drain cycle —
+   * and its lag flows into `getStats()` and the Prometheus exposition.
+   *
+   * The relay recovers the store's durable cursor on `start()` and
+   * starts draining immediately (then on the poll timer, unless
+   * `pollIntervalMs <= 0`). Attaching twice throws: stop and detach the
+   * old relay first with `detachOutboxRelay()`.
+   */
+  attachOutboxRelay(store: OutboxStore, opts: OutboxRelayOptions = {}): OutboxRelay {
+    if (this.outboxRelay !== undefined) {
+      throw new Error(
+        'attachOutboxRelay: a relay is already attached — detachOutboxRelay() first',
+      );
+    }
+    const relay = new OutboxRelay(this, store, { now: this.now, ...opts });
+    this.outboxRelay = relay;
+    return relay;
+  }
+
+  /**
+   * Detach the attached outbox relay, stopping its poll timer. The
+   * store's durable cursor is untouched — re-attaching later resumes
+   * from it.
+   */
+  detachOutboxRelay(): void {
+    this.outboxRelay?.stop();
+    this.outboxRelay = undefined;
+  }
+
   exportBusConfig(): BusConfigSnapshot {
     const patterns = new Set<string>();
     for (const table of [

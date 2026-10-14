@@ -3016,3 +3016,67 @@ Checks, in order:
 Tuning: `bus.exportBusHealth({ slowSubscriberP99Ms, lagWatermarkDefaultMs })`
 overrides the two doctor-owned defaults; every other threshold is
 reused from the module that owns it.
+
+## Transactional outbox relay (EB-102)
+
+The transactional outbox closes the dual-write gap between a business
+database and the bus: the application writes its domain rows **and** one
+outbox row in the same DB transaction, so a crash can never leave "the
+order was saved but the event was never published". A relay drains the
+outbox table into the bus.
+
+```ts
+import { EventBus } from './src/bus.ts';
+import { MemoryOutboxStore } from './src/outbox.ts';
+
+const bus = new EventBus();
+const store = new MemoryOutboxStore(); // or your DB-backed OutboxStore
+const relay = bus.attachOutboxRelay(store, { pollIntervalMs: 100 });
+relay.start();
+
+// ... in the business transaction:
+//   INSERT INTO orders ... ;
+//   INSERT INTO outbox (topic, payload) VALUES ('orders.created', '{"id": 7}');
+```
+
+One drain cycle is one `publishAtomic` batch: subscribers see a batch's
+messages across topics all at once or not at all — never a torn
+multi-topic write. The cursor advances only after the batch commits, so
+a crash between commit and ack replays the same records after
+`store.recover()`, and every record carries a stable dedup identity
+(`messageId = "outbox:<seq>"`, EB-27) that suppresses the replay for
+subscribers with `deduplicateMessages` enabled — with a `consumerId` and
+a durable log the window is rehydrated across restarts, so there is no
+double-delivery after a crash. Without `deduplicateMessages` the relay
+is at-least-once after an ack loss: consumers stay idempotent.
+
+A rejected batch (schema, rate-limit, ACL…) advances nothing: the
+cursor stays on the poison record, `onRelayError` fires, and the relay
+keeps the backlog until the operator fixes the store or advances the
+cursor manually — a poison record is never silently skipped.
+
+Lag is observable: `bus.getStats()` exposes `outboxPending`,
+`outboxLagMs` (age of the oldest unrelayed record), `outboxCursor` and
+`outboxRelayed`, and the Prometheus exposition carries
+`eventbus_outbox_pending`, `eventbus_outbox_lag_ms` and
+`eventbus_outbox_relayed_total` — alert on a climbing lag with a stuck
+cursor.
+
+SQL shape for a Postgres-backed store:
+
+```sql
+CREATE TABLE outbox (
+  seq       BIGSERIAL PRIMARY KEY,
+  topic     TEXT NOT NULL,
+  payload   JSONB NOT NULL,
+  key       TEXT,              -- optional: keyed ordering / compaction key
+  headers   JSONB,             -- optional: traceparent, audit labels
+  at_ms     BIGINT NOT NULL    -- wall-clock ms at append
+);
+-- The relay's durable cursor; ackCursor updates this in its own short
+-- transaction (and may DELETE FROM outbox WHERE seq <= cursor).
+CREATE TABLE outbox_cursor (
+  id     INT PRIMARY KEY CHECK (id = 1),
+  cursor BIGINT NOT NULL DEFAULT 0
+);
+```

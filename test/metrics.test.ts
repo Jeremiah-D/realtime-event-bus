@@ -161,6 +161,10 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     hotKeys: [],
     hotTopics: [],
     bridge: { inbound: 3, outbound: 7, dropped: 1 },
+    outboxPending: 0,
+    outboxLagMs: 0,
+    outboxCursor: 0,
+    outboxRelayed: 0,
     topics: [topicStats('we"ird\ntopic\\name')],
     consumerGroups: [],
   };

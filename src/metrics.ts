@@ -643,5 +643,26 @@ export function renderPrometheus(stats: BusStats): string {
     bridge.dropped,
   );
 
+  // Transactional outbox relay lag (EB-102). Always rendered — zeros when
+  // no relay is attached — so the alert rule `eventbus_outbox_lag_ms > X`
+  // exists from the first scrape. The `?? 0` keeps the renderer tolerant
+  // of a stats object that predates the field (hand-built fixtures
+  // included).
+  gauge(
+    'eventbus_outbox_pending',
+    'Outbox records sitting in the attached outbox store, not yet relayed (seq > cursor).',
+    stats.outboxPending ?? 0,
+  );
+  gauge(
+    'eventbus_outbox_lag_ms',
+    'Age of the oldest unrelayed outbox record in ms; a climbing lag with a stuck cursor means the relay is wedged on a poison record.',
+    stats.outboxLagMs ?? 0,
+  );
+  counter(
+    'eventbus_outbox_relayed_total',
+    'Total outbox records committed via publishAtomic since the relay was attached.',
+    stats.outboxRelayed ?? 0,
+  );
+
   return lines.join('\n') + '\n';
 }
