@@ -52,6 +52,12 @@ import {
   resolveGroupLagOptions,
   type GroupLagStat,
 } from './grouplag.ts';
+import {
+  diagnoseBusHealth,
+  type BusHealthReport,
+  type DoctorInput,
+  type DoctorOptions,
+} from './doctor.ts';
 import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
 import type { DurableStorageBackend } from './storage.ts';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
@@ -164,6 +170,14 @@ export type {
   AckSloMissEvent,
 } from './acklatency.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
+export type {
+  BusHealthReport,
+  CheckStatus,
+  DoctorInput,
+  DoctorOptions,
+  HealthCheck,
+  HealthStatus,
+} from './doctor.ts';
 export type { SlowStartOptions, SlowStartStrategy } from './slowstart.ts';
 export type { LeaseExpiredCallback, LeaseExpiredEvent } from './lease.ts';
 export type { IdleActivityMode, IdleExpiredCallback, IdleExpiredEvent } from './idle.ts';
@@ -19194,6 +19208,64 @@ export class EventBus {
             },
           }),
     };
+  }
+
+  /**
+   * One-shot structured health diagnosis (EB-101): folds the current
+   * bus state into a graded report `{ status, at, checks }` — `healthy`
+   * when every check passes, `degraded` when any check warns, `critical`
+   * when any check fails. Each check carries its evidence (`detail`) and
+   * an operator action (`suggestion`).
+   *
+   * Purely read-only: it assembles a snapshot from `getStats()` and a
+   * few read-only internal views (DLQ occupancy, per-subscriber lag
+   * thresholds) and hands it to `diagnoseBusHealth` in `src/doctor.ts`.
+   * It never publishes, never writes the durable log, never mutates
+   * state, and never fires callbacks.
+   */
+  exportBusHealth(options?: DoctorOptions): BusHealthReport {
+    const stats = this.getStats();
+    const dlqBacklog: DoctorInput['dlqBacklog'] = [];
+    const lagThresholdMs = new Map<string, number>();
+    for (const sub of this.subscribers.values()) {
+      if (sub.deadLetter !== undefined) {
+        dlqBacklog.push({
+          subscriberId: sub.id,
+          pattern: sub.pattern,
+          entries: sub.deadLetter.entries.length,
+          maxEntries: sub.deadLetter.maxEntries,
+        });
+      }
+      if (sub.lag?.thresholdMs !== undefined) {
+        lagThresholdMs.set(sub.id, sub.lag.thresholdMs);
+      }
+    }
+    const input: DoctorInput = {
+      at: this.now(),
+      aliases: stats.aliases,
+      slowestSubscribers: stats.slowestSubscribers,
+      lagWatermarks: stats.lag.map((row) => ({
+        subscriberId: row.subscriberId,
+        pattern: row.pattern,
+        watermarkMs: row.watermarkMs,
+      })),
+      breachingSubscribers: stats.subscriberLatencyP99
+        .filter((row) => row.breaching)
+        .map((row) => ({
+          subscriberId: row.subscriberId,
+          pattern: row.pattern,
+          p99Ms: row.p99Ms,
+          thresholdMs: row.thresholdMs,
+        })),
+      lagThresholdMs,
+      dlqBacklog,
+      groupLag: stats.groupLag,
+      groupLagThresholdFor: (groupId: string) => this.groupLagMonitor.thresholdFor(groupId),
+      consumerGroups: stats.consumerGroups,
+      namespaces: stats.namespaces,
+      durableLog: stats.durableLog,
+    };
+    return diagnoseBusHealth(input, options);
   }
 
   /** Number of active subscriptions. */

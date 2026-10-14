@@ -2965,3 +2965,54 @@ Notes:
   (EB-52) combination rules apply per entry exactly as in `subscribe`.
 - An empty entries array throws `RangeError`; non-function handlers and
   non-object opts throw `TypeError` — all before anything registers.
+
+## Health doctor (EB-101)
+
+`bus.exportBusHealth()` returns a one-shot structured diagnosis of the
+bus — the observability entry point for operators:
+
+```ts
+const report = bus.exportBusHealth();
+// { status: 'healthy' | 'degraded' | 'critical',
+//   at: <bus-clock ms>,
+//   checks: [{ name, status: 'pass'|'warn'|'fail', detail, suggestion }] }
+```
+
+The overall status is `healthy` when every check passes, `degraded` when
+any check warns, `critical` when any check fails. Each check carries its
+evidence (`detail`, with numbers) and an operator action (`suggestion`).
+The call is purely read-only: no publishes, no durable-log writes, no
+state changes, no callbacks fired.
+
+Checks, in order:
+
+- `slow-subscribers` — top slowest subscribers by p99 queue dwell
+  (EB-31) above `slowSubscriberP99Ms` (default 1000ms), plus handler
+  p99 breaching its own latency-SLO threshold (EB-53, reused
+  per-subscriber config).
+- `subscriber-lag` — live lag watermarks (EB-35) at or above the
+  subscriber's own `lagMonitor.thresholdMs` when configured, else the
+  doctor fallback `lagWatermarkDefaultMs` (default 30000ms; EB-35
+  leaves the threshold absent by design, so the doctor owns the
+  fallback).
+- `dead-letter-backlog` — messages held in subscriber DLQs (warn);
+  a DLQ at `maxEntries` is `fail` (oldest entries are being evicted).
+- `consumer-group-lag` — group-lag rows (EB-48) above the effective
+  threshold (per-group override via `setGroupLagThreshold`, else the
+  bus default of 100).
+- `topic-aliases` — re-verifies the alias table is acyclic
+  (defense-in-depth; EB-44 already prevents cycles at registration).
+- `namespaces` — warns on registered-but-unused namespaces (no
+  topics, subscribers, or published traffic).
+- `durable-log` — corrupt segments/archives isolated by checksum
+  (EB-94 sidecar) fail; malformed lines skipped during recovery warn.
+- `partition-coverage` — partitioned consumer groups (EB-90) with
+  fewer live members than configured partitions warn. Note: this bus
+  has no quorum concept (the word "quorum" appears nowhere in the
+  codebase), so EB-101's quorum item is honestly mapped to partition
+  coverage — partitions sharing consumers instead of dedicated owners —
+  rather than an invented consensus layer.
+
+Tuning: `bus.exportBusHealth({ slowSubscriberP99Ms, lagWatermarkDefaultMs })`
+overrides the two doctor-owned defaults; every other threshold is
+reused from the module that owns it.
