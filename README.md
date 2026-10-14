@@ -3080,3 +3080,60 @@ CREATE TABLE outbox_cursor (
   cursor BIGINT NOT NULL DEFAULT 0
 );
 ```
+
+## Chaos testing (EB-103)
+
+**Test / pre-production use only.** The deterministic fault-injection
+harness lets tests and staging drills reproduce the failure paths that
+are otherwise timing-dependent — degraded subscribers (EB-18), the
+dead-letter queue (EB-28), and backpressure — without real handler bugs
+or network faults. Never enable on a bus carrying real traffic:
+injected faults deliberately violate delivery guarantees.
+
+```ts
+import { EventBus } from './src/bus.ts';
+
+// Every handler invocation throws: the health probe counts consecutive
+// failures and auto-pauses the subscriber — a deterministic EB-18 drill.
+const bus = new EventBus({
+  chaos: {
+    scenarios: [
+      { type: 'error', target: 'handler', rate: 1, seed: 42 },
+    ],
+  },
+});
+```
+
+Each scenario owns a seeded RNG stream (mulberry32): the same seed in
+the same call order reproduces the identical fault sequence, so a
+failing drill is reproducible bit for bit. `rate` is the per-evaluation
+probability in `[0, 1]` (`1` always fires, `0` never fires).
+
+Supported (type, target) pairs — anything else throws `RangeError` at
+construction:
+
+| target      | error | drop | stall | latency |
+|-------------|-------|------|-------|---------|
+| `admission` | publish throws `ChaosInjectionError` | publish shed (returns its zero value; nothing sequenced, logged, or fanned out) | — | — |
+| `drain`     | — | subscriber's live queue discarded (loss stays visible as a sequence gap) | drain round skipped; the queue accumulates under the normal backpressure policy | drain round deferred by `latencyMs` |
+| `handler`   | handler throws `ChaosInjectionError` instead of running | handler never runs; the message is consumed as delivered | — | — |
+
+Semantics notes:
+
+- Admission faults are evaluated once per public publish call
+  (`publish`, `publishBatch`, `publishAtomic`, `publishIdempotent`,
+  `publishDelayed`), before validation — zero side effects either way.
+- A handler `error` is observed exactly like a real throwing handler:
+  the health probe counts it toward degradation, and the
+  reliable-delivery envelope nacks it (past the redelivery budget it
+  lands in the dead-letter queue) — the envelope evaluates the fault
+  itself, so the outer drain call is left alone for reliable
+  subscriptions.
+- A drain `stall` is the deterministic path to `onBackpressure` and
+  drop accounting: the queue fills while the drain never runs.
+- Chaos never touches shadow subscribers, migration-paused (EB-82)
+  subscriptions, or durable-log replay paths — live delivery only.
+- Injection counters are on `bus.getStats().chaos`
+  (`{ injected, byTarget }`), present only when scenarios were
+  configured. Without chaos the stats shape — and everything else — is
+  byte-for-byte identical to before.

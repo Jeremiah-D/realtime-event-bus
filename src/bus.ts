@@ -148,6 +148,25 @@ import {
   type StoredSigningKey,
   type TopicSigningKeysConfig,
 } from './signing.ts';
+import {
+  ChaosInjectionError,
+  resolveChaosOptions,
+  type ChaosFaultType,
+  type ChaosOptions,
+  type ChaosScenario,
+  type ChaosStats,
+  type ChaosTarget,
+  type FaultInjector,
+} from './chaos.ts';
+
+export { ChaosInjectionError } from './chaos.ts';
+export type {
+  ChaosFaultType,
+  ChaosOptions,
+  ChaosScenario,
+  ChaosStats,
+  ChaosTarget,
+} from './chaos.ts';
 
 export type { Delivery, RedeliveryReason } from './ack.ts';
 export type {
@@ -2524,6 +2543,21 @@ export interface EventBusOptions {
    * compatible).
    */
   onLate?: LateMessageCallback;
+  /**
+   * Deterministic fault-injection harness (see `src/chaos.ts`, EB-103):
+   * scripted faults at the `admission`, `drain`, and `handler` targets so
+   * tests and pre-production drills can deterministically reproduce
+   * degraded-subscriber (EB-18), dead-letter (EB-28), and backpressure
+   * paths. Each scenario carries its own seeded RNG stream — the same
+   * seed in the same call order reproduces the identical fault sequence.
+   *
+   * TEST / PRE-PRODUCTION USE ONLY. Never enable on a bus carrying real
+   * traffic: injected faults deliberately violate delivery guarantees.
+   * Disabled by default, and the disabled path is a single `undefined`
+   * check per hook site — zero behavioral difference, zero overhead.
+   * Invalid scenarios throw `RangeError` from the constructor.
+   */
+  chaos?: ChaosOptions;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -3465,6 +3499,13 @@ export interface BusStats {
    * was attached. 0 when no relay is attached.
    */
   outboxRelayed: number;
+  /**
+   * Fault-injection counters (EB-103): present only when
+   * `EventBusOptions.chaos` configured scenarios — absent otherwise, so
+   * buses without chaos see zero behavioral difference in the stats
+   * shape too.
+   */
+  chaos?: ChaosStats;
 }
 
 /**
@@ -7994,6 +8035,27 @@ export class EventBus {
   private partitionCommittedOffsets = new Map<string, Map<number, Map<string, number>>>();
   private readonly now: () => number;
   /**
+   * Deterministic fault-injection harness (EB-103), present only when
+   * `EventBusOptions.chaos` configured scenarios. `undefined` otherwise —
+   * every hook site checks this single field, so a chaos-free bus pays
+   * nothing and behaves exactly as before.
+   */
+  private readonly chaos?: FaultInjector;
+  /**
+   * Subscriber ids with a chaos drain-`latency` deferral currently armed.
+   * While armed, drain-target fault evaluation is skipped for that
+   * subscriber, so a latency fault defers the drain once per round
+   * instead of re-arming forever (no livelock at `rate: 1`).
+   */
+  private readonly chaosLatencyArmed = new Set<string>();
+  /**
+   * Subscriber ids whose deferred chaos drain is currently executing.
+   * The latency timer drains with drain-target evaluation bypassed for
+   * that one round: a `rate: 1` latency fault delays every drain by
+   * `latencyMs` instead of deferring forever.
+   */
+  private readonly chaosLatencyBypass = new Set<string>();
+  /**
    * Durable topic log, present only when `EventBusOptions.durableLogDir`
    * was given. Every `fanOut` appends the stamped message here; the
    * per-topic sequence counters are seeded from it at construction so a
@@ -8173,6 +8235,11 @@ export class EventBus {
       throw new TypeError('onLate must be a function');
     }
     this.onLate = onLate;
+    // Deterministic fault-injection harness (EB-103): validated here,
+    // fail-fast — an invalid scenario must never half-arm a bus. Absent
+    // or empty means no injector at all (zero overhead, zero behavior
+    // change). TEST / PRE-PRODUCTION USE ONLY.
+    this.chaos = resolveChaosOptions(options?.chaos, 'EventBus');
     const resolvedTrace = resolveTraceOptions(options?.trace, 'EventBus');
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
@@ -12204,7 +12271,11 @@ export class EventBus {
         const batchHandler = handler as ReliableBatchMessageHandler;
         const deliveries = msgOrBatch.map((m) => trackDelivery(m));
         if (dlq == null) {
-          batchHandler(deliveries);
+          // Chaos (EB-103): the fault hits the user handler inside the
+          // at-least-once envelope, so without a DLQ a fault 'error'
+          // behaves exactly like a throwing handler (it escapes, like a
+          // real throw would).
+          this.invokeChaosHandler(null, () => batchHandler(deliveries));
           // EB-72: the batch handler returned without throwing — idle
           // activity. The drain-level hooks skip reliable subscribers
           // (their wrapper can swallow throws via the DLQ nack path), so
@@ -12217,7 +12288,10 @@ export class EventBus {
         // is requeued in batch order, so the redelivery preserves FIFO —
         // the batch analogue of the single-message nack path below.
         try {
-          batchHandler(deliveries);
+          // Chaos (EB-103): see the dlq==null branch above — with a DLQ,
+          // a fault 'error' is caught here and nacks the whole batch,
+          // driving the deterministic redelivery-then-dead-letter path.
+          this.invokeChaosHandler(null, () => batchHandler(deliveries));
           // A nacked batch is a failed delivery, not activity — only the
           // clean return counts.
           this.recordIdleActivity(subscriber, 'deliver');
@@ -12232,7 +12306,10 @@ export class EventBus {
       const singleHandler = handler as ReliableMessageHandler;
       const delivery = trackDelivery(msg);
       if (dlq == null) {
-        singleHandler(delivery);
+        // Chaos (EB-103): the fault hits the user handler inside the
+        // at-least-once envelope — a fault 'error' without a DLQ escapes
+        // exactly like a real throwing handler would.
+        this.invokeChaosHandler(null, () => singleHandler(delivery));
         // EB-72: the handler returned without throwing — idle activity
         // (see the batch path above for why this lives in the wrapper).
         this.recordIdleActivity(subscriber, 'deliver');
@@ -12246,7 +12323,10 @@ export class EventBus {
       // and inside the redelivery budget — repeated throws land the
       // message in the DLQ instead of crashing the bus.
       try {
-        singleHandler(delivery);
+        // Chaos (EB-103): with a DLQ, a fault 'error' is caught here and
+        // nacks the delivery — the deterministic path to redelivery and,
+        // past the budget, the dead-letter queue (EB-28 reproduction).
+        this.invokeChaosHandler(null, () => singleHandler(delivery));
         // A nacked delivery is a failed delivery, not activity — only
         // the clean return counts.
         this.recordIdleActivity(subscriber, 'deliver');
@@ -14234,6 +14314,10 @@ export class EventBus {
    * `PublishOptions.key`).
    */
   publish(topic: string, payload: unknown, opts?: PublishOptions): number {
+    // Chaos (EB-103): an admission fault is evaluated before any
+    // validation — a 'drop' sheds the publish (returns 0), an 'error'
+    // throws ChaosInjectionError, both with zero side effects.
+    if (this.checkChaosAdmission()) return 0;
     validateMessageKey(opts?.key, 'publish');
     validateTraceparent(opts?.traceparent, 'publish');
     validateEventTime(opts?.eventTime, 'publish');
@@ -14351,6 +14435,9 @@ export class EventBus {
     payload: unknown,
     opts?: IdempotentPublishOptions,
   ): IdempotentPublishResult {
+    // Chaos (EB-103): see publish — a 'drop' reports a fresh (non-duplicate)
+    // zero-accept publish, exactly like an admission shed would.
+    if (this.checkChaosAdmission()) return { duplicate: false, accepted: 0 };
     validateMessageKey(opts?.key, 'publishIdempotent');
     validateTraceparent(opts?.traceparent, 'publishIdempotent');
     validateEventTime(opts?.eventTime, 'publishIdempotent');
@@ -14500,6 +14587,8 @@ export class EventBus {
    * on its own — the rest of the batch still publishes.
    */
   publishBatch(messages: Array<BatchMessage>): number {
+    // Chaos (EB-103): see publish — evaluated once per batch call.
+    if (this.checkChaosAdmission()) return 0;
     if (messages.length === 0) return 0;
     for (const msg of messages) {
       validateMessageKey(msg.key, 'publishBatch');
@@ -14589,6 +14678,8 @@ export class EventBus {
    * no-op returning `{ published: 0 }` without scheduling a flush.
    */
   publishAtomic(entries: Array<BatchMessage>): AtomicPublishResult {
+    // Chaos (EB-103): see publish — evaluated once per atomic batch.
+    if (this.checkChaosAdmission()) return { published: 0 };
     if (entries.length === 0) return { published: 0 };
     // Key validation first: a throw must leave zero state behind, and
     // validation mutates nothing.
@@ -14862,6 +14953,9 @@ export class EventBus {
    * given, or when the given value is not a valid timestamp/duration.
    */
   publishDelayed(topic: string, payload: unknown, opts: PublishDelayedOptions = {}): string | undefined {
+    // Chaos (EB-103): see publish — evaluated at schedule time; a fired
+    // delay timer fans out through the normal path, unfaulted.
+    if (this.checkChaosAdmission()) return undefined;
     const nowMs = this.now();
     const hasDelayMs = opts.delayMs !== undefined;
     const hasDeliverAt = opts.deliverAt !== undefined;
@@ -19256,6 +19350,10 @@ export class EventBus {
               outboxRelayed: lag.relayed,
             };
           })()),
+      // Deterministic fault injection (EB-103): present only when chaos
+      // scenarios were configured — absent otherwise, so a chaos-free
+      // bus reports exactly the stats shape it always did.
+      ...(this.chaos === undefined ? {} : { chaos: this.chaos.snapshot() }),
     };
   }
 
@@ -19743,6 +19841,105 @@ export class EventBus {
   }
 
   /**
+   * Evaluates `admission`-target chaos faults (EB-103) for one public
+   * publish call. Returns `true` when the publish must be shed as a
+   * `'drop'` fault (the caller returns its zero value — nothing is
+   * validated, sequenced, logged, or fanned out); throws
+   * `ChaosInjectionError` on an `'error'` fault. Called at the very top
+   * of every public publish entry point, before any validation, so a
+   * fault never leaves half-admitted state behind. A single `undefined`
+   * check when chaos is off.
+   */
+  private checkChaosAdmission(): boolean {
+    const chaos = this.chaos;
+    if (chaos === undefined) return false;
+    const fault = chaos.faultFor('admission');
+    if (fault === null) return false;
+    if (fault.type === 'error') {
+      throw new ChaosInjectionError('chaos: injected admission fault');
+    }
+    return true;
+  }
+
+  /**
+   * Evaluates `drain`-target chaos faults (EB-103) at the top of
+   * `drainSubscriber`. Returns `true` when the drain round is fully
+   * handled by the fault and the normal drain must be skipped:
+   * - `'stall'`: the round is skipped — the queue keeps accumulating
+   *   under the normal backpressure policy (the deterministic path to
+   *   `onBackpressure` and drop accounting).
+   * - `'drop'`: the subscriber's live queue is discarded (expired
+   *   messages are still recorded as expired). The loss stays visible
+   *   as a sequence gap, exactly like a backpressure shed.
+   * - `'latency'`: the round is deferred by `latencyMs` via an unref'd
+   *   timer that drains the subscriber directly afterwards, with
+   *   drain-target evaluation bypassed for that one round. While a
+   *   deferral is armed for the subscriber, drain-target evaluation is
+   *   skipped, so the fault delays the drain instead of re-arming
+   *   forever.
+   *
+   * Never applies to shadow subscribers or migration-paused (EB-82)
+   * subscriptions — chaos faults live delivery only.
+   */
+  private applyChaosDrain(subscriber: Subscriber, nowMs: number): boolean {
+    const chaos = this.chaos;
+    if (
+      chaos === undefined ||
+      this.chaosLatencyArmed.has(subscriber.id) ||
+      this.chaosLatencyBypass.has(subscriber.id)
+    ) {
+      return false;
+    }
+    const fault = chaos.faultFor('drain');
+    if (fault === null) return false;
+    if (fault.type === 'stall') return true;
+    if (fault.type === 'drop') {
+      // Only the expired records need accounting; the live backlog is
+      // deliberately discarded — the loss stays visible as a sequence
+      // gap, exactly like a backpressure shed.
+      const { expired } = subscriber.queue.drainLive(nowMs);
+      for (const msg of expired) this.recordExpired(msg.topic);
+      return true;
+    }
+    // 'latency': defer this round; the timer drains directly afterwards
+    // with drain-target evaluation bypassed for that one round, so the
+    // fault delays the drain instead of deferring forever.
+    this.chaosLatencyArmed.add(subscriber.id);
+    const timer = setTimeout(() => {
+      this.chaosLatencyArmed.delete(subscriber.id);
+      this.chaosLatencyBypass.add(subscriber.id);
+      try {
+        this.drainSubscriber(subscriber, this.now());
+      } finally {
+        this.chaosLatencyBypass.delete(subscriber.id);
+      }
+    }, fault.latencyMs);
+    unrefTimer(timer);
+    return true;
+  }
+
+  /**
+   * Runs one user-handler invocation under `handler`-target chaos faults
+   * (EB-103): an `'error'` fault throws `ChaosInjectionError` instead of
+   * invoking, a `'drop'` fault skips the invocation and reports it as
+   * delivered. The health probe, the reliable-delivery envelope, and the
+   * batch wrappers all observe the fault exactly like the real failure
+   * it simulates. A single `undefined` check when chaos is off.
+   *
+   * Pass the subscriber for drain-level calls: reliable subscriptions
+   * evaluate chaos inside their at-least-once envelope (see the `deliver`
+   * closure in `subscribeReliable`), so the outer drain-level call is left
+   * alone for them — faulting there would bypass the envelope's
+   * nack/redelivery accounting and crash where a real throw would be
+   * caught. Pass `null` for calls already inside the envelope.
+   */
+  private invokeChaosHandler<T>(subscriber: Subscriber | null, invoke: () => T): T | undefined {
+    const chaos = this.chaos;
+    if (chaos === undefined || subscriber?.reliable != null) return invoke();
+    return chaos.invokeHandler(invoke);
+  }
+
+  /**
    * Drains one subscriber's queue and delivers the dequeued messages,
    * honoring delivery-side rate shaping when enabled. A shaped subscriber
    * dequeues at most what its token budget allows this round (whole tokens
@@ -19767,6 +19964,11 @@ export class EventBus {
       this.drainShadowSubscriber(subscriber, shadow, nowMs);
       return;
     }
+    // Deterministic fault injection (EB-103): drain-target faults are
+    // evaluated here — after the migration/shadow carve-outs above, so
+    // chaos never disturbs an export-paused subscription or a shadow
+    // mirror — and before the health gate below.
+    if (this.applyChaosDrain(subscriber, nowMs)) return;
     // A degraded subscriber's deliveries are paused: its backlog stays
     // queued under the normal backpressure policy, untouched by the
     // drain, so resuming picks up exactly where delivery paused.
@@ -19839,11 +20041,15 @@ export class EventBus {
           this.invokeWithInflightSlot(subscriber, (): unknown => {
             let result: unknown;
             if (invocationSlo == null) {
-              result = this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+              result = this.deliverTraced(subscriber, msg, () =>
+                this.invokeChaosHandler(subscriber, () => subscriber.handler(msg)),
+              );
             } else {
               const processingStartedAtMs = this.now();
               try {
-                result = this.deliverTraced(subscriber, msg, () => subscriber.handler(msg));
+                result = this.deliverTraced(subscriber, msg, () =>
+                  this.invokeChaosHandler(subscriber, () => subscriber.handler(msg)),
+                );
               } finally {
                 this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
               }
@@ -20057,7 +20263,9 @@ export class EventBus {
     if (subscriber.health == null) {
       this.invokeBatchWithProcessingLatency(subscriber, () => {
         this.deliverBatchTraced(subscriber, live, () =>
-          subscriber.handler(live as unknown as BusMessage),
+          // Chaos (EB-103): one fault evaluation per batch invocation —
+          // a throwing batch counts once, mirroring the health accounting.
+          this.invokeChaosHandler(subscriber, () => subscriber.handler(live as unknown as BusMessage)),
         );
         // EB-72: the batch handler returned without throwing — idle
         // activity. Reliable batches record inside their at-least-once
@@ -20113,7 +20321,9 @@ export class EventBus {
     let failed = false;
     let reason: 'error' | 'timeout' = 'error';
     try {
-      subscriber.handler(batch as unknown as BusMessage);
+      // Chaos (EB-103): a handler-target fault throws here and is counted
+      // as one batch failure below — mirroring deliverWithHealth.
+      this.invokeChaosHandler(subscriber, () => subscriber.handler(batch as unknown as BusMessage));
     } catch {
       failed = true;
     }
@@ -20584,7 +20794,10 @@ export class EventBus {
     let result: unknown;
     this.deliverTraced(subscriber, msg, () => {
       try {
-        result = subscriber.handler(msg);
+        // Chaos (EB-103): a handler-target fault throws here and is
+        // counted as a handler failure by the accounting below —
+        // exactly like a real throwing handler.
+        result = this.invokeChaosHandler(subscriber, () => subscriber.handler(msg));
       } catch {
         failed = true;
       }
