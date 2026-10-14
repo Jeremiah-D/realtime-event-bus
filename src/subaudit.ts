@@ -10,7 +10,8 @@
  * `retained_cleared`) / topic pause/resume (EB-88, `topic_paused` /
  * `topic_resumed`) / bulk delayed-delivery cancellation (EB-89,
  * `delayed_cancelled`) / publish-side partition-count rule changes (EB-90,
- * `partition_rule_set` / `partition_rule_cleared`).
+ * `partition_rule_set` / `partition_rule_cleared`) / out-of-order barrier
+ * discards (EB-98, `barrier_dropped`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -59,7 +60,8 @@ export type SubscriptionAuditAction =
   | 'partition_rule_cleared'
   | 'config_applied'
   | 'config_rolled_back'
-  | 'segment_checksum_failed';
+  | 'segment_checksum_failed'
+  | 'barrier_dropped';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -87,6 +89,10 @@ export type SubscriptionAuditAction =
  * - `segment_checksum_failed`: `{ path: <archive file>, segmentId }` —
  *   an archived segment failed checksum verification (EB-94) and was
  *   isolated: skipped, never fatal (the `topic` field carries the topic)
+ * - `barrier_dropped`: `{ epoch: <discarded epoch>, lastEpoch: <highest
+ *   epoch seen> }` — an out-of-order barrier was discarded for epoch
+ *   monotonicity (EB-98): never delivered, never arming (the `topic`
+ *   field carries the barrier's topic, `subId` the subscriber)
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -146,6 +152,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_cancelled',
   'partition_rule_set',
   'partition_rule_cleared',
+  'barrier_dropped',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

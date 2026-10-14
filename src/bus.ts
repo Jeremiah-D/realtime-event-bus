@@ -295,6 +295,19 @@ export interface BusMessage {
    * (`undefined`) otherwise, so existing consumers see no shape change.
    */
   retained?: boolean;
+  /**
+   * Barrier cut marker (see `PublishOptions.barrier`, EB-98): present
+   * exactly on barrier control messages — `{ epoch }`, the cut's
+   * sequence number. A barrier is a control-plane signal, not business
+   * data: it carries no business sequence number (`seq` is 0 and the
+   * per-topic counter never advances for it), so it neither consumes a
+   * number nor creates a sequence gap — gap detection skips barrier
+   * messages entirely. The marker is bus-side (like the EB-57 diagnostic
+   * marker), so a user payload can never collide with it; handlers
+   * recognize a barrier control message by `msg.barrier !== undefined`
+   * and read the cut metadata from `msg.payload` verbatim.
+   */
+  barrier?: { epoch: number };
 }
 
 export type MessageHandler = (msg: BusMessage) => void;
@@ -365,6 +378,22 @@ export interface CausalSubscribeOptions {
    * positive integer. Default 1000.
    */
   maxBufferPerSource?: number;
+}
+
+/**
+ * Tuning for opt-in barrier (cut-marker) delivery (see
+ * `SubscribeOptions.barrier`, EB-98).
+ */
+export interface BarrierSubscribeOptions {
+  /**
+   * Maximum messages held behind one armed barrier per subscriber. When
+   * a new arrival would exceed it, the gate fails open: everything held
+   * so far is released at once, the barrier is disarmed, and the cut is
+   * abandoned (counted in `getStats().barrier.overflowedHolds`) — losing
+   * the cut is safer than losing the data or growing the hold without
+   * bound. Must be a positive integer. Default 1000.
+   */
+  maxHeldMessages?: number;
 }
 
 /**
@@ -1101,6 +1130,59 @@ export interface SubscribeOptions {
    * no buffers and tracks no clocks: zero overhead, zero behavior change.
    */
   causal?: boolean | CausalSubscribeOptions;
+  /**
+   * Opt-in barrier (cut-marker) delivery (EB-98): the subscriber honors
+   * barrier control messages (see `PublishOptions.barrier`) as
+   * consistency cut points across its whole delivery stream — the
+   * cross-topic barrier the causal clock's per-source ordering cannot
+   * express. Protocol:
+   *
+   * - A barrier with a higher epoch than any seen before arms the gate:
+   *   the barrier itself is delivered to the handler as a control message
+   *   (`msg.barrier.epoch`, `seq` 0, user cut metadata in `msg.payload`
+   *   verbatim), and every message arriving after it in delivery order is
+   *   held in a pre-queue side buffer instead of being enqueued.
+   * - When the barrier is handed to the handler (drained), everything
+   *   held behind it is released at once — re-injected through the normal
+   *   pipeline (causal gate, keyed gate, filter, throttle, queue), in
+   *   arrival order — and the gate disarms.
+   * - Barrier epochs must be monotonically increasing per subscriber: an
+   *   out-of-order barrier (epoch at or below the highest seen) is
+   *   discarded — never delivered, never arming — counted in
+   *   `getStats().barrier.droppedBarriers`, and recorded in the
+   *   subscription audit log as `barrier_dropped`.
+   *
+   * The cut orders the *delivery stream*, not publish time: a delayed
+   * message (EB-24) whose due time falls after the barrier armed arrives
+   * after the barrier in delivery order and is held behind it, even when
+   * it was scheduled earlier. Retained snapshots (EB-87) and durable-log
+   * replays (EB-17/EB-42) run at subscribe time — before any barrier can
+   * arm — and bypass the gate (see the README's barrier section for the
+   * full combination matrix).
+   *
+   * Composes with causal delivery (`SubscribeOptions.causal`): the
+   * barrier gate runs first, then the causal gate — a held message
+   * re-enters the pipeline after the barrier gate at release time, so
+   * happens-before order is preserved on both sides of the cut and the
+   * barrier marker itself is never reordered behind data. With per-key
+   * ordering the same layering applies (barrier, then causal, then
+   * keyed).
+   *
+   * Every hold terminates: the side buffer is bounded
+   * (`maxHeldMessages`, default 1000) — on overflow the gate fails open
+   * (everything held is released at once and the barrier disarmed,
+   * counted in `getStats().barrier.overflowedHolds`): abandoning the cut
+   * is safer than abandoning the data. A barrier dropped by backpressure
+   * before delivery also releases the hold fail-open. Barriers are never
+   * written to the durable log and never cross the bridge — they are
+   * live, node-local coordination signals.
+   *
+   * Pass `true` for the defaults, or a `BarrierSubscribeOptions` object
+   * to tune the hold bound. Invalid values throw `RangeError` from
+   * `subscribe`. Disabled by default — subscribers that did not opt in
+   * never see barrier control messages at all.
+   */
+  barrier?: boolean | BarrierSubscribeOptions;
   /**
    * Opt-in subscriber-side batch delivery. When enabled, the drain
    * collects up to `maxSize` queued messages and invokes the handler once
@@ -3138,6 +3220,40 @@ export interface BusStats {
     regressedMessages: number;
   };
   /**
+   * Barrier (cut-marker) gate state (see `SubscribeOptions.barrier`,
+   * EB-98). Always present — zeros when no subscriber opted into barrier
+   * delivery.
+   */
+  barrier: {
+    /**
+     * Barrier control messages published (fanned out to opted-in
+     * subscribers). Control-plane: never counted in `publishedMessages`,
+     * never advancing any per-topic seq.
+     */
+    publishedBarriers: number;
+    /**
+     * Out-of-order barriers discarded for epoch monotonicity — each one
+     * recorded in the subscription audit log as `barrier_dropped`.
+     */
+    droppedBarriers: number;
+    /**
+     * Messages currently held behind armed barriers, across all
+     * subscribers — the live cut backlog.
+     */
+    heldMessages: number;
+    /**
+     * Messages released from barrier holds (drained barriers plus
+     * fail-open releases), re-injected through the normal pipeline.
+     */
+    releasedMessages: number;
+    /**
+     * Holds abandoned by fail-open overflow: the hold buffer hit
+     * `maxHeldMessages`, so everything held was released at once and the
+     * barrier disarmed.
+     */
+    overflowedHolds: number;
+  };
+  /**
    * The hottest per-(subscriber, key) ordering streams by current
    * reorder-buffer depth (see `SubscribeOptions.keyHotspot` and
    * `src/keyhotspot.ts`), hottest first — at most `HOT_KEYS_LIMIT` (10)
@@ -3444,6 +3560,45 @@ interface CausalGateState {
 }
 
 /**
+ * One message held behind an armed barrier (see
+ * `SubscribeOptions.barrier`, EB-98): everything the pipeline needs to
+ * re-inject it after the barrier gate at release time — the barrier gate
+ * runs first, so a released message still passes through the causal
+ * gate, the keyed gate, the filter, the throttle and the queue exactly
+ * like a live arrival.
+ */
+interface BarrierHeld {
+  msg: BusMessage;
+  expiresAt: number | undefined;
+  rawPayload: unknown;
+  keyed?: { key: string; keySeq: number };
+  causal?: { source: string; clock: number };
+}
+
+/**
+ * Per-subscriber barrier (cut-marker) delivery state (see
+ * `SubscribeOptions.barrier`, EB-98). Created at subscribe time when the
+ * subscriber opts in — a subscriber without it pays nothing: no hold
+ * buffer, no epoch tracking, and barrier control messages are never even
+ * fanned out to it.
+ *
+ * `lastEpoch` is the highest barrier epoch ever armed on this
+ * subscriber's stream (starts at -1 — epoch 0 is a valid first barrier);
+ * `armedEpoch` is the epoch currently holding the stream (`null` when no
+ * hold is active); `held` buffers post-cut arrivals in delivery order
+ * until the armed barrier is handed to the handler. The cut is
+ * per-subscriber and spans topics: one epoch sequence orders the whole
+ * delivery stream, which is what makes the barrier the cross-topic cut
+ * the per-source causal clocks cannot express.
+ */
+interface BarrierGateState {
+  maxHeldMessages: number;
+  lastEpoch: number;
+  armedEpoch: number | null;
+  held: BarrierHeld[];
+}
+
+/**
  * Key for one per-(subscriber, key) ordering stream, namespaced by
  * sequence epoch: the node's own publish stream ('') and each hub's
  * forwarded stream (`hub:<hubEpoch>`) order independently, so a keyed
@@ -3640,6 +3795,14 @@ interface Subscriber {
    * clocks: zero overhead, zero behavior change.
    */
   causal?: CausalGateState;
+  /**
+   * Per-subscriber barrier (cut-marker) delivery state (see
+   * `SubscribeOptions.barrier`, EB-98). Present only when the subscriber
+   * opted in — without it the subscriber holds nothing, tracks no
+   * epochs, and barrier control messages are never fanned out to it:
+   * zero overhead, zero behavior change.
+   */
+  barrier?: BarrierGateState;
   /**
    * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
    * Absent when the probe is disabled for this subscriber.
@@ -3964,6 +4127,18 @@ function validateCausal(causal: { source?: string; clock: number } | undefined, 
   }
   if (!Number.isInteger(clock) || clock < 0) {
     throw new RangeError(`${caller}: causal.clock must be a non-negative integer`);
+  }
+}
+
+/** Fail-fast validation for `PublishOptions.barrier` (EB-98). */
+function validateBarrier(barrier: { epoch?: number } | undefined, caller: string): void {
+  if (barrier === undefined) return;
+  if (typeof barrier !== 'object' || barrier === null) {
+    throw new RangeError(`${caller}: barrier must be an object`);
+  }
+  const { epoch } = barrier;
+  if (!Number.isInteger(epoch) || (epoch as number) < 0) {
+    throw new RangeError(`${caller}: barrier.epoch must be a non-negative integer`);
   }
 }
 
@@ -4610,6 +4785,35 @@ function resolveCausalOptions(
     expected: new Map(),
     skipped: new Map(),
     buffers: new Map(),
+  };
+}
+
+/**
+ * Validates `SubscribeOptions.barrier` and builds the initial barrier
+ * gate state (EB-98). Returns `undefined` when the subscriber did not opt
+ * in. Throws `RangeError` for invalid values, before anything registers.
+ */
+function resolveBarrierOptions(
+  barrier: boolean | BarrierSubscribeOptions | undefined,
+): BarrierGateState | undefined {
+  if (barrier === undefined || barrier === false) return undefined;
+  let maxHeldMessages = 1000;
+  if (barrier !== true) {
+    if (typeof barrier !== 'object' || barrier === null) {
+      throw new RangeError('subscribe: barrier must be a boolean or a BarrierSubscribeOptions object');
+    }
+    if (barrier.maxHeldMessages !== undefined) {
+      if (!Number.isInteger(barrier.maxHeldMessages) || barrier.maxHeldMessages < 1) {
+        throw new RangeError('subscribe: barrier.maxHeldMessages must be a positive integer');
+      }
+      maxHeldMessages = barrier.maxHeldMessages;
+    }
+  }
+  return {
+    maxHeldMessages,
+    lastEpoch: -1,
+    armedEpoch: null,
+    held: [],
   };
 }
 
@@ -5963,6 +6167,31 @@ export interface PublishOptions {
    * in-process feature).
    */
   binary?: boolean;
+  /**
+   * Barrier cut marker (EB-98, opt-in): this publish is a barrier control
+   * message, not business data — a consistency cut point for
+   * barrier-opted-in subscribers (see `SubscribeOptions.barrier`), e.g.
+   * a config switch or a snapshot boundary. `epoch` is the cut's
+   * sequence number and must be a non-negative integer (anything else
+   * throws `RangeError` from `publish`, before anything is mutated);
+   * subscribers require strictly increasing epochs and discard
+   * out-of-order barriers (audited as `barrier_dropped`).
+   *
+   * A barrier publish is control-plane: it consumes no per-topic
+   * sequence number (subscribers see no gap), is never written to the
+   * durable log (replay restores data, not live coordination cuts),
+   * never becomes a retained message (`retain` is ignored), skips schema
+   * validation / compression / signing, and never crosses the bridge or
+   * the cluster link. It still passes the ACL — an unauthorized
+   * publisher cannot inject cut markers. The barrier is delivered to
+   * each opted-in subscriber as a control message (`msg.barrier.epoch`,
+   * `seq` 0) with `payload` carried verbatim as the cut metadata;
+   * subscribers that did not opt in never see it.
+   *
+   * Only `publish` honors it; `publishIdempotent`, batch, atomic and
+   * delayed publishes ignore the flag.
+   */
+  barrier?: { epoch: number };
 }
 
 /**
@@ -7045,6 +7274,31 @@ export class EventBus {
    * before the subscriber's horizon). Monotonic.
    */
   private totalCausalRegressed = 0;
+  /**
+   * Barrier control messages published (EB-98) — fanned out to
+   * barrier-opted-in subscribers. Monotonic. Barriers are control-plane:
+   * they never touch `totalPublished` or any per-topic seq counter.
+   */
+  private totalBarriersPublished = 0;
+  /**
+   * Out-of-order barriers discarded (EB-98, epoch at or below the
+   * subscriber's highest seen) — the observable count of monotonicity
+   * violations, each recorded in the subscription audit log as
+   * `barrier_dropped`. Monotonic.
+   */
+  private totalBarriersDropped = 0;
+  /**
+   * Messages released from barrier holds (EB-98) — re-injected through
+   * the pipeline when their barrier drained (or on a fail-open path).
+   * Monotonic.
+   */
+  private totalBarrierReleased = 0;
+  /**
+   * Barrier holds abandoned by fail-open overflow (EB-98): the hold
+   * buffer hit `maxHeldMessages`, so everything held was released at
+   * once and the barrier disarmed. Monotonic.
+   */
+  private totalBarrierOverflows = 0;
   /**
    * Per-topic sliding-window publish rate table (see `src/rates.ts`).
    * Sampled once per accepted publish in `fanOut` — after the admission
@@ -10589,6 +10843,9 @@ export class EventBus {
     const causal = resolveCausalOptions(opts?.causal);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const barrier = resolveBarrierOptions(opts?.barrier);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
     // Tumbling-window aggregation (EB-73): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
@@ -10758,6 +11015,8 @@ export class EventBus {
       lag: lagMonitor,
       keyHotspot,
       causal,
+      // Barrier cut-marker gate (EB-98): opt-in per subscriber.
+      barrier,
       batch,
       window,
       health:
@@ -13817,6 +14076,8 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'publish');
     validateSchemaVersion(opts?.schemaVersion, 'publish');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publish');
+    // Barrier cut marker (EB-98): fail-fast, before anything is mutated.
+    validateBarrier(opts?.barrier, 'publish');
     // Binary payload passthrough (EB-92): validated and normalized here
     // — `binary: true` with a non-bytes payload throws `TypeError`
     // before anything is mutated.
@@ -13830,6 +14091,15 @@ export class EventBus {
     // Topic registry (EB-77): advisory only — an unregistered topic is
     // counted and surfaced on the opt-in hook, never blocked.
     this.checkTopicRegistered(topic);
+    // Barrier control message (EB-98): control-plane, not business data —
+    // it takes a dedicated slim fan-out (no seq, no durable log, no
+    // retained update, no schema/rate-limit/compression/signing) instead
+    // of the full admission pipeline below.
+    if (opts?.barrier !== undefined) {
+      const accepted = this.fanOutBarrier(topic, payload, opts.barrier.epoch);
+      this.scheduleFlush();
+      return accepted;
+    }
     const { accepted } = this.fanOut(
       topic,
       payload,
@@ -15298,7 +15568,7 @@ export class EventBus {
         this.countFiltered(subscriber, msg.topic, msg.seq, '', msg.partition ?? 0);
         continue;
       }
-      this.detectGap(subscriber, msg);
+      this.noteMessageDelivered(subscriber, msg);
       this.totalDelivered += 1;
       delivered.set(entry.topic, entry.seq);
       outgoing.push(msg);
@@ -16483,7 +16753,37 @@ export class EventBus {
     rawPayload: unknown,
     keyed?: { key: string; keySeq: number },
     causal?: { source: string; clock: number },
+    barrier?: { epoch: number },
   ): boolean {
+    // Barrier gate (EB-98) runs FIRST — before the causal gate (EB-62)
+    // and the keyed gate. Design intent: the barrier cuts the
+    // subscriber's whole delivery stream (cross-topic, which per-source
+    // causal clocks cannot express), so it must see every message before
+    // any ordering gate does. A message held behind the barrier
+    // re-enters the pipeline AFTER this gate at release time (the gate
+    // is disarmed by then), so happens-before order is still enforced by
+    // the causal gate — causality is preserved on both sides of the cut,
+    // and the cut marker itself is never reordered behind data.
+    const barrierGate = subscriber.barrier;
+    if (barrier !== undefined) {
+      // Barrier control message: only barrier-opted-in subscribers ever
+      // see it — for everyone else it is invisible (never queued, never
+      // a gap, never counted).
+      if (barrierGate === undefined) return false;
+      return this.admitBarrier(subscriber, barrierGate, msg, barrier.epoch);
+    }
+    if (barrierGate !== undefined && barrierGate.armedEpoch !== null) {
+      // A barrier is armed: this message arrived after the cut in
+      // delivery order — hold it behind the barrier until the barrier
+      // itself is handed to the handler.
+      return this.holdBehindBarrier(subscriber, barrierGate, {
+        msg,
+        expiresAt,
+        rawPayload,
+        keyed,
+        causal,
+      });
+    }
     if (causal !== undefined && subscriber.causal !== undefined) {
       return this.deliverCausal(
         subscriber,
@@ -16501,6 +16801,151 @@ export class EventBus {
       );
     }
     return this.deliverUnkeyed(subscriber, msg, expiresAt, rawPayload);
+  }
+
+  /**
+   * Admits a barrier control message for a barrier-opted-in subscriber
+   * (EB-98): enforces epoch monotonicity, arms the hold, and enqueues
+   * the barrier itself as a control message.
+   *
+   * An out-of-order barrier (epoch at or below the highest epoch ever
+   * armed on this subscriber's stream) is discarded — never delivered,
+   * never arming — counted, and recorded in the subscription audit log
+   * as `barrier_dropped`. Monotonicity is per subscriber (like the
+   * causal gate's per-subscriber expectations): each subscriber tracks
+   * its own stream position, so a late joiner that first sees epoch 5
+   * treats a subsequent epoch 3 as out-of-order for its own stream.
+   *
+   * The barrier bypasses the content filter, composite matching and the
+   * publish-side throttle: it is a control signal the subscriber opted
+   * into, not business content — a filter must never be able to swallow
+   * the cut marker and wedge the hold behind it. It IS subject to the
+   * subscriber's backpressure queue: if the queue sheds the barrier, the
+   * hold releases fail-open immediately (abandoning the cut beats
+   * abandoning the data — the stream was already lossy).
+   */
+  private admitBarrier(
+    subscriber: Subscriber,
+    gate: BarrierGateState,
+    msg: BusMessage,
+    epoch: number,
+  ): boolean {
+    if (epoch <= gate.lastEpoch) {
+      this.auditBarrierDropped(subscriber, msg.topic, epoch, gate.lastEpoch);
+      return false;
+    }
+    gate.lastEpoch = epoch;
+    gate.armedEpoch = epoch;
+    // Straight to the queue: no filter, no throttle, no signature check
+    // (barriers are unsigned by design — authenticated at publish by the
+    // ACL, see `fanOutBarrier`).
+    if (this.enqueueMessage(subscriber, msg, undefined) !== 'accepted') {
+      // The barrier never reached the queue, so it can never drain —
+      // release the hold fail-open now instead of wedging it forever.
+      this.releaseBarrierHold(subscriber);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Holds one message behind an armed barrier (EB-98): buffered
+   * pre-queue in arrival order, consuming no backpressure budget, with
+   * no filter or throttle evaluated yet — exactly like the causal gate's
+   * reorder buffer. Counts as accepted for the fan-out width: it will
+   * reach the queue when the barrier drains.
+   *
+   * Every hold terminates: when the buffer would exceed
+   * `maxHeldMessages` the gate fails open — everything held so far is
+   * released at once, the barrier is disarmed (the cut is abandoned, a
+   * single counted event), and the current message flows through the
+   * normal pipeline.
+   */
+  private holdBehindBarrier(
+    subscriber: Subscriber,
+    gate: BarrierGateState,
+    held: BarrierHeld,
+  ): boolean {
+    if (gate.held.length >= gate.maxHeldMessages) {
+      this.totalBarrierOverflows += 1;
+      this.releaseBarrierHold(subscriber);
+      // Gate disarmed by the release: flow through the normal pipeline.
+      return this.deliverToSubscriber(
+        subscriber,
+        held.msg,
+        held.expiresAt,
+        held.rawPayload,
+        held.keyed,
+        held.causal,
+      );
+    }
+    gate.held.push(held);
+    return true;
+  }
+
+  /**
+   * Releases everything held behind the subscriber's armed barrier, at
+   * once, in arrival order (EB-98). Called when the barrier control
+   * message is handed to the handler (see `noteMessageDelivered`), and
+   * on the fail-open paths (barrier shed by backpressure, hold-buffer
+   * overflow). Each released message re-enters the pipeline AFTER the
+   * barrier gate — the gate is disarmed first, so there is no
+   * re-entrancy — and still passes through the causal gate, the keyed
+   * gate, the filter, the throttle and the queue: "released at once"
+   * describes the single release action, not a bypass of the pipeline.
+   * A no-op when no barrier is armed (e.g. the barrier was redelivered
+   * after a nack — arming happens once, at pipeline time).
+   */
+  private releaseBarrierHold(subscriber: Subscriber): void {
+    const gate = subscriber.barrier;
+    if (gate === undefined || gate.armedEpoch === null) return;
+    gate.armedEpoch = null;
+    const held = gate.held;
+    gate.held = [];
+    if (held.length === 0) return;
+    this.totalBarrierReleased += held.length;
+    for (const h of held) {
+      this.deliverToSubscriber(subscriber, h.msg, h.expiresAt, h.rawPayload, h.keyed, h.causal);
+    }
+    this.scheduleFlush();
+  }
+
+  /**
+   * Delivery-time bookkeeping for one message handed toward the handler:
+   * sequence-gap detection for business messages; barrier release for
+   * barrier control messages. A barrier carries no business seq, so gap
+   * detection never sees it — and the moment the barrier reaches the
+   * handler is the moment everything held behind it is released at once
+   * ("drained, then released"). Called at every drain path that invokes
+   * (or batches) the handler, next to where `detectGap` used to run.
+   */
+  private noteMessageDelivered(subscriber: Subscriber, msg: BusMessage): void {
+    if (msg.barrier !== undefined) {
+      this.releaseBarrierHold(subscriber);
+      return;
+    }
+    this.detectGap(subscriber, msg);
+  }
+
+  /**
+   * Records an out-of-order barrier discard in the subscription audit log
+   * (EB-98, `barrier_dropped`).
+   */
+  private auditBarrierDropped(
+    subscriber: Subscriber,
+    topic: string,
+    epoch: number,
+    lastEpoch: number,
+  ): void {
+    this.totalBarriersDropped += 1;
+    this.auditSubscription({
+      action: 'barrier_dropped',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      topic,
+      detail: { epoch, lastEpoch },
+    });
   }
 
   /**
@@ -17216,6 +17661,53 @@ export class EventBus {
    * message never emits a second diagnostic, cutting the recursion at the
    * source. Only the bus's own diagnostic emitter sets it.
    */
+  /**
+   * Slim fan-out for barrier control messages (EB-98): a barrier is
+   * control-plane, not business data, so it deliberately skips the full
+   * admission pipeline — no per-topic sequence number (the EB-13 counter
+   * never advances, subscribers see no gap), no durable-log write
+   * (replay restores data, not live coordination cuts), no retained
+   * update, no schema validation, no rate-limit budget, no compression,
+   * no signing, no TTL deadline, no bridge/cluster mirror. What it keeps:
+   * topic-alias resolution (a barrier to a live old topic cuts the new
+   * topic's stream) and the broker-level ACL (an unauthorized publisher
+   * cannot inject cut markers — denied barriers are counted exactly like
+   * denied publishes). The barrier rides `deliverMatched` so group
+   * routing, the prefix index and the shadow mirror behave exactly as for
+   * data; the subscriber-side barrier gate (`deliverToSubscriber`) arms
+   * the hold and delivers the control message.
+   *
+   * Returns the number of opted-in subscribers that accepted the barrier.
+   */
+  private fanOutBarrier(topic: string, payload: unknown, epoch: number): number {
+    // Topic aliases (EB-44) resolve before the ACL, exactly like the full
+    // pipeline: a barrier naming a retired old topic is refused and claims
+    // nothing — it must not cut a stream that no longer exists.
+    const aliasResolution = this.resolvePublishTopic(topic);
+    if (aliasResolution.retired) {
+      this.countAliasRetired(topic, payload, undefined);
+      return 0;
+    }
+    topic = aliasResolution.topic;
+    // Broker-level ACL: the one admission gate a control message keeps.
+    if (!this.aclAllowsPublish(topic)) {
+      this.countAclDenied(topic, payload, undefined);
+      return 0;
+    }
+    const msg: BusMessage = {
+      topic,
+      payload,
+      // No business seq: 0 is never a valid per-topic sequence number
+      // (they start at 1), so the counter is untouched and gap detection
+      // — which skips barrier messages — never sees a gap.
+      seq: 0,
+      barrier: { epoch },
+    };
+    this.totalBarriersPublished += 1;
+    const { accepted } = this.deliverMatched(msg, undefined, payload, undefined, undefined, { epoch });
+    return accepted;
+  }
+
   private fanOut(
     topic: string,
     payload: unknown,
@@ -17956,6 +18448,11 @@ export class EventBus {
     rawPayload: unknown,
     keyed: { key: string; keySeq: number } | undefined,
     causal?: { source: string; clock: number },
+    // Barrier cut marker (EB-98): present exactly when `msg` is a barrier
+    // control message — threaded through to `deliverToSubscriber`, where
+    // the subscriber-side barrier gate arms the hold. Data paths leave it
+    // undefined.
+    barrier?: { epoch: number },
   ): { matched: number; accepted: number } {
     const topic = msg.topic;
     const epoch = msg.epoch ?? '';
@@ -18027,7 +18524,7 @@ export class EventBus {
           continue;
         }
         matched += 1;
-        if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed, causal)) accepted += 1;
+        if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed, causal, barrier)) accepted += 1;
         continue;
       }
       const key = EventBus.groupKey(subscriber.groupId, subscriber.pattern);
@@ -18066,9 +18563,14 @@ export class EventBus {
             if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
           }
         }
-        if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal)) accepted += 1;
-        this.recordPartitionOffset(key, partition, topic, msg.seq);
-        this.recordGroupOffset(hit.groupId, topic, msg.seq);
+        if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier)) accepted += 1;
+        // A barrier control message (EB-98) carries no business seq — it
+        // must not move the group's data offsets: recording seq 0 would
+        // regress the committed offset below real deliveries.
+        if (barrier === undefined) {
+          this.recordPartitionOffset(key, partition, topic, msg.seq);
+          this.recordGroupOffset(hit.groupId, topic, msg.seq);
+        }
         continue;
       }
       const assignee = this.assignGroupMember(key, hit.members);
@@ -18091,8 +18593,12 @@ export class EventBus {
           if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
         }
       }
-      if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal)) accepted += 1;
-      this.recordGroupOffset(hit.groupId, topic, msg.seq);
+      if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier)) accepted += 1;
+      // Barrier control messages (EB-98) carry no business seq — see the
+      // partitioned branch above: they never move group offsets.
+      if (barrier === undefined) {
+        this.recordGroupOffset(hit.groupId, topic, msg.seq);
+      }
     }
     return { matched, accepted };
   }
@@ -18123,6 +18629,7 @@ export class EventBus {
     const replayProgress: BusStats['replayProgress'] = [];
     const hotKeys: HotKeyStat[] = [];
     let causalBufferDepth = 0;
+    let barrierHeldMessages = 0;
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       // Subscription migration (EB-82): a paused-for-export subscription
@@ -18165,6 +18672,12 @@ export class EventBus {
       const causalGate = subscriber.causal;
       if (causalGate !== undefined) {
         for (const buffer of causalGate.buffers.values()) causalBufferDepth += buffer.size;
+      }
+      // Barrier hold depth (EB-98): messages currently held behind armed
+      // barriers, per opted-in subscriber.
+      const barrierGate = subscriber.barrier;
+      if (barrierGate !== undefined) {
+        barrierHeldMessages += barrierGate.held.length;
       }
       const rateLimit = subscriber.rateLimit;
       if (rateLimit != null) {
@@ -18386,6 +18899,13 @@ export class EventBus {
         depth: causalBufferDepth,
         droppedMessages: this.totalCausalDropped,
         regressedMessages: this.totalCausalRegressed,
+      },
+      barrier: {
+        publishedBarriers: this.totalBarriersPublished,
+        droppedBarriers: this.totalBarriersDropped,
+        heldMessages: barrierHeldMessages,
+        releasedMessages: this.totalBarrierReleased,
+        overflowedHolds: this.totalBarrierOverflows,
       },
       hotKeys: hottestKeys,
       traceSpans: this.trace?.snapshot() ?? [],
@@ -19059,7 +19579,7 @@ export class EventBus {
           // the original payload. See `inflateMessagePayload` for the
           // idempotency and envelope-collision notes.
           this.inflateMessagePayload(msg);
-          this.detectGap(subscriber, msg);
+          this.noteMessageDelivered(subscriber, msg);
           this.totalDelivered += 1;
           // Sampled before the handler runs: queue dwell, not processing time.
           this.recordDeliveryLatency(subscriber, msg, nowMs);
@@ -19287,7 +19807,7 @@ export class EventBus {
     }
     for (const msg of live) {
       this.inflateMessagePayload(msg);
-      this.detectGap(subscriber, msg);
+      this.noteMessageDelivered(subscriber, msg);
       this.totalDelivered += 1;
       // Sampled before the handler runs: queue dwell, not processing time.
       this.recordDeliveryLatency(subscriber, msg, nowMs);
@@ -19800,7 +20320,7 @@ export class EventBus {
   private deliverWithHealth(subscriber: Subscriber, msg: BusMessage, nowMs: number): unknown {
     const health = subscriber.health;
     if (health == null) return undefined;
-    this.detectGap(subscriber, msg);
+    this.noteMessageDelivered(subscriber, msg);
     const budgetMs = health.processingTimeoutMs;
     // The health probe reads the clock only when it enforces a processing
     // budget; the SLO tracker needs the same reading on every invocation.

@@ -1398,6 +1398,34 @@ library.
   without the opt-in the subscriber builds no buffers and tracks no
   clocks: zero overhead, zero behavior change. Invalid clocks
   (non-integer, negative) and buffer bounds throw `RangeError`.
+- **Barrier cut markers** (EB-98, in `src/bus.ts`, via
+  `publish(topic, payload, { barrier: { epoch } })` and opt-in
+  `subscribe(pattern, handler, { barrier: true | { maxHeldMessages? } })`):
+  a consistency cut point across the subscriber's whole delivery stream —
+  the cross-topic barrier per-source causal clocks cannot express
+  (config switches, snapshot boundaries). A barrier publish is
+  control-plane: it consumes no per-topic sequence number (`seq` 0, the
+  EB-13 counter never advances, no gap), is never written to the durable
+  log, never becomes a retained message, and skips schema / rate-limit /
+  compression / signing — but still passes the ACL, so unauthorized
+  publishers cannot inject cut markers. Each opted-in subscriber arms on
+  the first barrier with a higher epoch than any seen (epochs must be
+  strictly increasing per subscriber; an out-of-order barrier is
+  discarded, counted, and audited as `barrier_dropped`): the barrier
+  itself is delivered as a control message (`msg.barrier.epoch`, user cut
+  metadata in `msg.payload` verbatim), and every message arriving after
+  it in delivery order is held pre-queue until the barrier is handed to
+  the handler — then released at once, re-injected through the normal
+  pipeline. The barrier gate runs before the causal gate, so
+  happens-before order is preserved on both sides of the cut.
+  Subscribers that did not opt in never see barrier messages. Every hold
+  terminates: the hold buffer is bounded (`maxHeldMessages`, default
+  1000) — on overflow the gate fails open (releases everything held,
+  disarms, counted in `getStats().barrier.overflowedHolds`); a barrier
+  shed by backpressure before delivery also releases fail-open.
+  `getStats().barrier` reports `{ publishedBarriers, droppedBarriers,
+  heldMessages, releasedMessages, overflowedHolds }`. See "Barrier cut
+  markers" below for the delayed / retained / replay combination matrix.
 - **Delayed delivery** (in `src/bus.ts` + `src/delayed.ts`, via
   `publishDelayed(topic, payload, { delayMs } | { deliverAt })`): the message
   waits in a timer min-heap and fans out once the bus clock reaches its due
@@ -2662,7 +2690,8 @@ Details:
   `signature_verification_failed` carries `{ seq, kid? }`;
   `retention_updated` carries `{ from, to }` (null when unset);
   `retained_rule_set` carries `{ enabled }`, `retained_cleared` carries
-  `{ via: 'publish' }`; `partition_rule_set` carries `{ partitions }`.
+  `{ via: 'publish' }`; `partition_rule_set` carries `{ partitions }`;
+  `barrier_dropped` carries `{ epoch, lastEpoch }` (EB-98).
 
 ## Prometheus metrics
 
@@ -2753,3 +2782,82 @@ deliberate exception to the per-topic rule: only the hot-topics set
 carries it (10 topics × 3 windows = 30 series max), because
 rate-limit/scaling decisions need the busiest topics, not the full topic
 space.
+
+## Barrier cut markers
+
+A barrier (`publish(topic, payload, { barrier: { epoch } })`, EB-98) is a
+consistency cut point for barrier-opted-in subscribers
+(`subscribe(pattern, handler, { barrier: true })`) — the primitive behind
+config switches and snapshot boundaries: "everything the subscriber saw
+before this marker is pre-cut; everything after is post-cut."
+
+Protocol, per opted-in subscriber:
+
+1. The first barrier with an epoch strictly higher than any seen before
+   arms the gate. The barrier itself is delivered to the handler as a
+   control message — `msg.barrier.epoch` on the envelope, `seq` 0, the
+   published payload carried verbatim as the cut metadata.
+2. Every message arriving after the barrier in *delivery order* is held in
+   a pre-queue side buffer (no backpressure budget, no filter/throttle
+   evaluated yet) instead of being enqueued.
+3. When the barrier is handed to the handler (drained), everything held
+   behind it is released at once — re-injected through the normal
+   pipeline in arrival order — and the gate disarms.
+4. Barrier epochs must be monotonically increasing per subscriber. An
+   out-of-order barrier (epoch at or below the highest seen) is discarded
+   — never delivered, never arming — counted in
+   `getStats().barrier.droppedBarriers`, and recorded in the subscription
+   audit log as `barrier_dropped` with `{ epoch, lastEpoch }`.
+
+The cut orders the delivery stream, not publish time. A barrier is
+control-plane, not business data: it consumes no per-topic sequence
+number (subscribers see no gap; gap detection skips barrier messages),
+passes the ACL but skips schema validation, rate limiting, compression,
+signing, TTL and the durable log, and never crosses the bridge. The
+barrier control message bypasses the subscriber's content filter and
+composite matching — a filter must never swallow the cut marker and wedge
+the hold behind it — but it is subject to backpressure: if the queue
+sheds the barrier, the hold releases fail-open immediately (abandoning
+the cut beats abandoning the data, and the stream was already lossy).
+Subscribers that did not opt in never see barrier messages at all.
+
+Combination matrix:
+
+- **Causal clocks (EB-62)** — the barrier gate runs first, then the
+  causal gate. A held message re-enters the pipeline after the barrier
+  gate at release time, so happens-before order is preserved on both
+  sides of the cut; the cut marker itself is never reordered behind data.
+  (Per-key ordering layers the same way: barrier, then causal, then
+  keyed.)
+- **Delayed delivery (EB-24)** — a delayed schedule fans out through the
+  normal pipeline at its due time, so a message whose due time falls
+  after the barrier armed arrives after the barrier in delivery order and
+  is held behind it — even when it was scheduled earlier. A barrier
+  cannot itself be delayed (`publishDelayed` has no barrier option): the
+  cut arms at fan-out time, and a future-dated cut would arm at an
+  unpredictable delivery-stream position.
+- **Retained messages (EB-87)** — the retained snapshot is handed to a
+  late joiner synchronously at subscribe time, before any barrier can
+  arm, so it bypasses the barrier gate. A barrier publish ignores the
+  `retain` flag: a cut marker is not a value snapshot and never becomes
+  one.
+- **Durable-log replay (EB-17/EB-42)** — barriers are never written to
+  the durable log (replay restores data, not live coordination cuts), so
+  a resuming subscriber replays data messages only, with their original
+  seqs, and the replay path bypasses the barrier gate. Live barriers arm
+  only on live barrier messages, after the replay completes.
+- **Consumer groups** — a barrier routes like any message: in a
+  competing group exactly one member (the assignee) receives it and arms
+  its own hold. It carries no business seq, so it never moves the group's
+  committed offsets.
+- **Shadow subscriptions** — the mirror carries barrier markers like any
+  message, but the hold/release gate does not apply to shadows.
+
+Every hold terminates: the side buffer is bounded (`maxHeldMessages`,
+default 1000). On overflow the gate fails open — everything held is
+released at once, the barrier is disarmed, and the abandonment is
+counted in `getStats().barrier.overflowedHolds`. `getStats().barrier`
+reports `{ publishedBarriers, droppedBarriers, heldMessages,
+releasedMessages, overflowedHolds }`. Invalid epochs (non-integer,
+negative) and hold bounds throw `RangeError` fail-fast, before anything
+is mutated.
