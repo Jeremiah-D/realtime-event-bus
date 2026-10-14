@@ -2861,3 +2861,70 @@ reports `{ publishedBarriers, droppedBarriers, heldMessages,
 releasedMessages, overflowedHolds }`. Invalid epochs (non-integer,
 negative) and hold bounds throw `RangeError` fail-fast, before anything
 is mutated.
+
+## WebSocket gateway (EB-99)
+
+`src/gateway-ws.ts` exposes an `EventBus` over RFC 6455 WebSocket so remote
+processes — other languages, browsers, edge workers — can publish and
+subscribe without embedding the bus. Zero new dependencies (`node:net` +
+`node:crypto` only); the server-side frame codec is adapted from the
+client-side codec in webhook-relay-ts (`src/websocket.ts`, WR-45).
+
+```ts
+import { EventBus } from './src/bus.ts';
+import { GatewayServer } from './src/gateway-ws.ts';
+
+const bus = new EventBus({ durableLogDir: './data' });
+const gw = new GatewayServer(bus, { port: 8080, authToken: 's3cr3t' });
+const port = await gw.listen(); // resolves with the bound port
+// ... later:
+await gw.close(); // drops connections (unsubscribing them) and stops
+```
+
+Wire protocol — every frame is a JSON text frame:
+
+- client → server: `subscribe{pattern,opts}` / `unsubscribe{subId}` /
+  `publish{topic,payload,opts}` / `publishBatch{entries}` / `ack{deliveryId}` /
+  `nack{deliveryId}` / `ping`
+- server → client: `subscribed{subId}` / `unsubscribed` / `message{...}` /
+  `published{delivered,duplicate?}` / `pong` / `error{code,message}`
+
+Semantics:
+
+- **Full admission on publish.** Gateway publishes go through `publish`
+  (or `publishIdempotent` when `opts.messageId` is set, EB-27), so ACL
+  (EB-41), schema (EB-20), rate-limit (EB-19), TTL, and dedup all apply
+  exactly as for in-process publishers. `publishBatch` maps to
+  `publishBatch` (EB-03). A refused publish replies `delivered: 0`.
+- **ACL on subscribe.** Unauthorized patterns get an error frame with
+  `code: 'subscribe_denied'` and nothing registers; the connection stays
+  usable.
+- **At-least-once over the wire.** `subscribe` with `opts.reliable`
+  routes through `subscribeReliable` (EB-11): each message carries a
+  `deliveryId` the client must `ack` / `nack`. Nack and ack-timeout
+  redeliver through the bus's normal redelivery path; unknown delivery
+  ids are ignored (stale acks are normal).
+- **Reconnect resume.** `opts` is a `SubscribeOptions` passthrough, so
+  `resumeFromSeq` / `resumeFromTime` (EB-17/EB-42) and namespaces (EB-52)
+  work for reconnecting clients. Function-valued options (filters, hooks)
+  cannot cross the wire.
+- **Retained snapshots keep wire order.** A synchronous retained snapshot
+  (EB-87) is buffered until the subscription registers, so the client
+  sees snapshot messages before the `subscribed` ack, then live messages.
+- **Auth (opt-in).** With `authToken` set, the handshake must carry
+  `Authorization: Bearer <token>` (constant-time compare); otherwise the
+  server answers 401 and drops the connection.
+- **Backpressure.** While a connection's socket buffer is past
+  `sendHighWaterMarkBytes` (default 256 KiB) the gateway pauses pushing
+  frames and queues them locally, bounded by `maxPendingBytes` (default
+  1 MiB). Past the bound the newest frame is dropped and counted in
+  `droppedFrames` — the gateway sheds load instead of growing memory.
+  `gw.getStats()` reports
+  `{connections, framesReceived, framesSent, droppedFrames, authFailures,
+  protocolErrors}`.
+
+Invalid option values throw `RangeError` fail-fast. Inbound frames larger
+than `maxFrameBytes` (default 1 MiB) close the connection with 1009;
+binary frames are rejected with 1003 (the protocol is JSON text frames
+only). Malformed JSON and unknown frame types get error frames without
+dropping the connection.
