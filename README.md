@@ -359,7 +359,29 @@ library.
   `getStats().durableLog.corruptSegments` — and fires one
   `segment_checksum_failed` subscription-audit event
   (`getSubscriptionAudit()`). Segments archived before checksums (no
-  sidecar) read exactly as before.
+  sidecar) read exactly as before. Pluggable storage backends (EB-96):
+  every object the log keeps — the per-topic live log, archived segments
+  and their sidecars, the group-offset journal (`__group_offsets.jsonl`),
+  the subscriber-dedup journal (`__dedup.jsonl`), and the publish-dedup
+  journal (`__publish_dedup.jsonl`) — is read and written through the
+  `DurableStorageBackend` interface (`src/storage.ts`: atomic
+  write/replace with optional exclusivity, append, read, prefix list,
+  delete, rename, and `scoped()` views; all synchronous, because the
+  log's durability contract is that an append is on stable storage before
+  it returns). The default is the local filesystem rooted at
+  `durableLogDir` — the historical on-disk layout, byte for byte — and
+  recovery enumerates the backend (`list()`) instead of reading a
+  directory. Pass `new EventBus({ durableLogDir, durableLogStorageBackend })`
+  for anything else; namespace child logs share the root backend through
+  `scoped('namespaces/<prefix>')` (the `namespaces/` key prefix is
+  reserved — the root log's enumeration skips it). At-rest encryption
+  (EB-80) and segment checksums (EB-94) are computed above the backend
+  layer, so they hold identically on every backend. `src/storage-s3.ts`
+  is a worked S3-compatible example: the caller injects SigV4 signing
+  and the (synchronous) HTTP transport — the bundled default shells out
+  to `curl` — with zero new dependencies; note its documented limits
+  (read-modify-write append, best-effort exclusive write) before using it
+  for real.
   `getStats().durableLog` additionally reports `archived` (total archived
   entries), `corruptArchives`, and per-topic `segments`
   (`{ live, segments, archived }`). Opt-in at-rest encryption

@@ -52,7 +52,8 @@ import {
   resolveGroupLagOptions,
   type GroupLagStat,
 } from './grouplag.ts';
-import { DurableTopicLog, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
+import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
+import type { DurableStorageBackend } from './storage.ts';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import {
   BUS_CONFIG_SNAPSHOT_VERSION,
@@ -2097,6 +2098,20 @@ export interface EventBusOptions {
    * every `publish` pays one synchronous file append.
    */
   durableLogDir?: string;
+  /**
+   * EB-96: pluggable persistence for the durable topic log. When set,
+   * every object the log keeps — the per-topic live log, archived
+   * segments, the group-offset journal, the subscriber-dedup journal,
+   * and the publish-dedup journal — is read and written through this
+   * backend instead of the local filesystem; recovery enumerates the
+   * backend (`list()`), and namespace child logs use
+   * `backend.scoped(...)`. Defaults to the filesystem rooted at
+   * `durableLogDir` (the historical on-disk layout, byte for byte).
+   * Requires `durableLogDir` (still the human-readable label and the
+   * default backend's root). See `src/storage.ts` (`DurableStorageBackend`)
+   * and the S3-compatible example in `src/storage-s3.ts`.
+   */
+  durableLogStorageBackend?: DurableStorageBackend;
   /**
    * Enables disk persistence for the subscription lifecycle audit log
    * (EB-78): every subscribe / unsubscribe / pattern hot-update /
@@ -7785,9 +7800,15 @@ export class EventBus {
     if (options?.durableLogDir == null && options?.durableLogMaxAgeMs !== undefined) {
       throw new RangeError('durableLogMaxAgeMs requires EventBusOptions.durableLogDir to be set');
     }
+    if (options?.durableLogDir == null && options?.durableLogStorageBackend !== undefined) {
+      throw new RangeError('durableLogStorageBackend requires EventBusOptions.durableLogDir to be set');
+    }
     if (options?.durableLogDir != null) {
       const log = DurableTopicLog.open({
         dir: options.durableLogDir,
+        // EB-96: pluggable storage backend; the default is the local
+        // filesystem rooted at `durableLogDir`.
+        backend: options.durableLogStorageBackend,
         maxEntriesPerTopic: options.durableLogMaxEntriesPerTopic,
         // Time-based retention runs on the bus clock, so retention stays
         // deterministic under an injected `EventBusOptions.now` (EB-85).
@@ -9964,6 +9985,10 @@ export class EventBus {
     if (this.durableLog != null) {
       const child = DurableTopicLog.open({
         dir: `${this.durableLog.dir}/namespaces/${encodeURIComponent(prefix)}`,
+        // EB-96: the namespace child lives in a scoped view of the root
+        // log's backend — one backend serves the root log and every
+        // namespace, including custom (e.g. S3) backends.
+        backend: this.durableLog.storageBackend.scoped(`${NAMESPACE_LOG_KEY_PREFIX}${encodeURIComponent(prefix)}`),
         maxEntriesPerTopic: this.durableLogMaxEntriesPerTopic,
         maxAgeMs: this.durableLogMaxAgeMs,
         now: this.now,

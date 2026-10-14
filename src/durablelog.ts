@@ -1,15 +1,21 @@
-import {
-  appendFileSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { Buffer } from 'node:buffer';
+import {
+  FilesystemStorageBackend,
+  type DurableStorageBackend,
+} from './storage.ts';
+
+/**
+ * EB-96: reserved storage-key prefix for namespace child logs. The bus
+ * opens one child `DurableTopicLog` per namespace in a scoped backend
+ * view under this prefix, so a root log's own enumeration (recovery,
+ * archive scans) skips these keys — they belong to the child logs, and
+ * a child log's keys are relative to its scope so it never sees them.
+ * A concrete topic can never produce such a key: topic names are
+ * URL-encoded into the key, so a literal `/` in a topic becomes `%2F`.
+ */
+export const NAMESPACE_LOG_KEY_PREFIX = 'namespaces/';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import { isEncryptedPayload } from './encrypt.ts';
 
@@ -299,6 +305,19 @@ export interface DurableLogOptions {
    * audit log (`segment_checksum_failed`).
    */
   onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void;
+  /**
+   * EB-96: pluggable storage backend for every object the log keeps —
+   * the per-topic live log (EB-17), archived segments (EB-61), the
+   * group-offset journal (EB-32), the subscriber-dedup journal, and the
+   * publish-dedup journal (EB-66). Keys are the former file basenames
+   * (`<urlencoded-topic>.log`, `__group_offsets.jsonl`, …); recovery
+   * enumerates them with `backend.list()`. Defaults to a
+   * `FilesystemStorageBackend` rooted at `dir`, which preserves the
+   * exact on-disk layout the log always used. Encryption (EB-80) and
+   * per-segment checksums (EB-94) are computed above this layer and are
+   * unaffected by which backend is in use.
+   */
+  backend?: DurableStorageBackend;
 }
 
 /**
@@ -968,10 +987,12 @@ function parseDedupLine(line: string): DedupEntry | null {
  * adopts orphan archives, so seq/keySeq numbering never reuses an
  * archived number.
  *
- * Durability note: appends are synchronous (`appendFileSync`), so a record
- * is handed to the OS before `append` returns. A power loss can still lose
- * whatever the OS had not flushed to disk — this is crash recovery for
- * process restarts, not a write-ahead log with `fsync` per message.
+ * Durability note: appends are synchronous through the storage backend
+ * (EB-96 — `DurableStorageBackend.append`, the filesystem default is a
+ * single `appendFileSync`), so a record is handed to the OS before
+ * `append` returns. A power loss can still lose whatever the OS had not
+ * flushed to disk — this is crash recovery for process restarts, not a
+ * write-ahead log with `fsync` per message.
  *
  * Supported mode is one writer per directory per process. Two live logs over
  * the same directory interleave lines safely (O_APPEND) but their in-memory
@@ -1034,11 +1055,17 @@ export class DurableTopicLog {
   /** Lines that failed to parse during recovery/reads. Skipped, never fatal. */
   private corruptLines = 0;
   /**
-   * Path of the group-offset journal (`__group_offsets.jsonl`) inside the
-   * log directory. One append-only file for every group, separate from the
-   * per-topic message files.
+   * The storage backend every object lives behind (EB-96): the per-topic
+   * live log, archived segments, and all journals. Defaults to the local
+   * filesystem rooted at `dir`.
    */
-  private readonly offsetFile: string;
+  private readonly backend: DurableStorageBackend;
+  /**
+   * Storage key of the group-offset journal (`__group_offsets.jsonl`).
+   * One append-only object for every group, separate from the per-topic
+   * message objects.
+   */
+  private readonly offsetKey = OFFSET_JOURNAL_NAME;
   /**
    * Latest committed offset per (group, topic), keyed by
    * `offsetKey(groupId, topic)` — the in-memory side of the offset
@@ -1048,11 +1075,11 @@ export class DurableTopicLog {
   /** Lines currently in the offset journal, used for compaction. */
   private offsetEntries = 0;
   /**
-   * Path of the subscriber-dedup journal (`__dedup.jsonl`) inside the
-   * log directory. One append-only file for every dedup-enabled
-   * consumer, separate from the per-topic message files.
+   * Storage key of the subscriber-dedup journal (`__dedup.jsonl`). One
+   * append-only object for every dedup-enabled consumer, separate from
+   * the per-topic message objects.
    */
-  private readonly dedupFile: string;
+  private readonly dedupKey = DEDUP_JOURNAL_NAME;
   /**
    * Latest dedup sighting per (consumer, topic, messageId), keyed by
    * `dedupKey(...)` — the in-memory side of the dedup journal, rebuilt
@@ -1062,13 +1089,12 @@ export class DurableTopicLog {
   /** Lines currently in the dedup journal, used for compaction. */
   private dedupEntries = 0;
   /**
-   * Path of the publish-dedup journal (`__publish_dedup.jsonl`) inside
-   * the log directory. One append-only file for the whole bus —
-   * publish-side dedup identities are scoped to concrete topics (which
-   * already include any namespace prefix), so a single root journal
-   * covers every namespace.
+   * Storage key of the publish-dedup journal (`__publish_dedup.jsonl`).
+   * One append-only object for the whole bus — publish-side dedup
+   * identities are scoped to concrete topics (which already include any
+   * namespace prefix), so a single root journal covers every namespace.
    */
-  private readonly publishDedupFile: string;
+  private readonly publishDedupKey = PUBLISH_DEDUP_JOURNAL_NAME;
   /**
    * Latest claim per (topic, messageId), keyed by
    * `publishDedupKey(...)` — the in-memory side of the publish-dedup
@@ -1124,8 +1150,8 @@ export class DurableTopicLog {
   private readonly checksumRejected = new Set<string>();
   /** EB-94: observer hook for checksum failures; never throws into the read path. */
   private readonly onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void;
-  /** Path of the archive index (`__archive_index.jsonl`) in the log dir. */
-  private readonly archiveIndexFile: string;
+  /** Storage key of the archive index (`__archive_index.jsonl`). */
+  private readonly archiveIndexKey = ARCHIVE_INDEX_NAME;
   /** Set while a background archive pass is scheduled. */
   private archiveScheduled = false;
   /**
@@ -1155,6 +1181,7 @@ export class DurableTopicLog {
     maxAgeMs?: number,
     now: () => number = Date.now,
     onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void,
+    backend?: DurableStorageBackend,
   ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
@@ -1165,11 +1192,11 @@ export class DurableTopicLog {
     this.maxAgeMs = maxAgeMs;
     this.now = now;
     this.onSegmentChecksumFailed = onSegmentChecksumFailed;
-    this.offsetFile = join(dir, OFFSET_JOURNAL_NAME);
-    this.dedupFile = join(dir, DEDUP_JOURNAL_NAME);
-    this.publishDedupFile = join(dir, PUBLISH_DEDUP_JOURNAL_NAME);
-    this.archiveIndexFile = join(dir, ARCHIVE_INDEX_NAME);
-    mkdirSync(dir, { recursive: true });
+    // EB-96: every object the log keeps goes through the backend. The
+    // default is the local filesystem rooted at `dir` — the exact
+    // on-disk layout the log always used — so existing directories keep
+    // working byte for byte.
+    this.backend = backend ?? new FilesystemStorageBackend(dir);
     this.recover();
     this.recoverArchiveIndex();
     this.recoverOffsets();
@@ -1216,6 +1243,17 @@ export class DurableTopicLog {
     ) {
       throw new RangeError('durableLogEncryptor must be a PayloadEncryptor with encrypt/decrypt methods');
     }
+    const backend = options.backend;
+    if (
+      backend !== undefined &&
+      (typeof backend !== 'object' ||
+        backend === null ||
+        typeof (backend as DurableStorageBackend).write !== 'function' ||
+        typeof (backend as DurableStorageBackend).read !== 'function' ||
+        typeof (backend as DurableStorageBackend).list !== 'function')
+    ) {
+      throw new RangeError('durableLog backend must be a DurableStorageBackend');
+    }
     return new DurableTopicLog(
       dir,
       maxEntriesPerTopic,
@@ -1226,6 +1264,7 @@ export class DurableTopicLog {
       maxAgeMs,
       now,
       options.onSegmentChecksumFailed,
+      backend,
     );
   }
 
@@ -1252,9 +1291,29 @@ export class DurableTopicLog {
     return this.logDir;
   }
 
-  /** File name for a topic: URL-encoded so any topic string is a safe name. */
+  /**
+   * The storage backend this log reads and writes through (EB-96). The
+   * bus scopes it for namespace child logs (`backend.scoped(...)`).
+   */
+  get storageBackend(): DurableStorageBackend {
+    return this.backend;
+  }
+
+  /** Storage key for a topic's live log: URL-encoded so any topic string is a safe key. */
   private fileFor(topic: string): string {
-    return join(this.logDir, `${encodeURIComponent(topic)}.log`);
+    return `${encodeURIComponent(topic)}.log`;
+  }
+
+  /**
+   * Reads a UTF-8 text object from the backend, or `undefined` when the
+   * key is absent or unreadable. The backend never throws for a missing
+   * key; this also swallows decode-level surprises so recovery stays
+   * non-fatal.
+   */
+  private readText(key: string): string | undefined {
+    const bytes = this.backend.read(key);
+    if (bytes === undefined) return undefined;
+    return Buffer.from(bytes).toString('utf8');
   }
 
   /**
@@ -1318,11 +1377,16 @@ export class DurableTopicLog {
   private recover(): void {
     let names: string[];
     try {
-      names = readdirSync(this.logDir);
+      // EB-96: recovery enumerates the backend — the same listing a
+      // custom (e.g. S3) backend serves, not a directory read.
+      names = this.backend.list();
     } catch {
       return;
     }
     for (const name of names) {
+      // EB-96: namespace child logs live under the reserved prefix —
+      // their keys belong to the child log's scoped view, not this one.
+      if (name.startsWith(NAMESPACE_LOG_KEY_PREFIX)) continue;
       if (!name.endsWith('.log')) continue;
       let topic: string;
       try {
@@ -1370,12 +1434,7 @@ export class DurableTopicLog {
    * sequence number from an archived segment.
    */
   private recoverArchiveIndex(): void {
-    let text: string | undefined;
-    try {
-      text = readFileSync(this.archiveIndexFile, 'utf8');
-    } catch {
-      text = undefined;
-    }
+    const text = this.readText(this.archiveIndexKey);
     if (text !== undefined) {
       for (const line of text.split('\n')) {
         if (line.length === 0) continue;
@@ -1400,12 +1459,15 @@ export class DurableTopicLog {
     }
     let names: string[];
     try {
-      names = readdirSync(this.logDir);
+      names = this.backend.list();
     } catch {
       return;
     }
     let pending = false;
     for (const name of names) {
+      // EB-96: namespace child logs live under the reserved prefix —
+      // their segments belong to the child log's scoped view.
+      if (name.startsWith(NAMESPACE_LOG_KEY_PREFIX)) continue;
       if (name.endsWith('.jsonl.tmp')) {
         pending = true;
         continue;
@@ -1420,7 +1482,7 @@ export class DurableTopicLog {
       if (adopted == null) continue;
       this.addArchiveEntry(adopted);
       try {
-        appendFileSync(this.archiveIndexFile, `${JSON.stringify(archiveIndexLineOf(adopted))}\n`, 'utf8');
+        this.backend.append(this.archiveIndexKey, `${JSON.stringify(archiveIndexLineOf(adopted))}\n`);
       } catch {
         // The in-memory view is rebuilt; the index rewrite is retried on
         // the next adoption — a missing line never loses data, the file
@@ -1446,10 +1508,14 @@ export class DurableTopicLog {
     name: string,
     topic: string,
   ): ArchiveEntry | null {
-    let raw: Buffer;
+    let raw: Buffer | undefined;
     try {
-      raw = readFileSync(join(this.logDir, name));
+      const bytes = this.backend.read(name);
+      raw = bytes === undefined ? undefined : Buffer.from(bytes);
     } catch {
+      raw = undefined;
+    }
+    if (raw === undefined) {
       this.corruptArchives += 1;
       return null;
     }
@@ -1555,12 +1621,8 @@ export class DurableTopicLog {
 
   /** Reads and parses every well-formed record for a topic. */
   private readFileRecords(topic: string): DurableLogRecord[] {
-    let text: string;
-    try {
-      text = readFileSync(this.fileFor(topic), 'utf8');
-    } catch {
-      return [];
-    }
+    const text = this.readText(this.fileFor(topic));
+    if (text === undefined) return [];
     const records: DurableLogRecord[] = [];
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
@@ -1599,7 +1661,10 @@ export class DurableTopicLog {
       return false;
     }
     try {
-      appendFileSync(this.fileFor(record.topic), line, 'utf8');
+      // The backend append is synchronous — the record is on stable
+      // storage before this returns, the same durability the log always
+      // relied on.
+      this.backend.append(this.fileFor(record.topic), line);
     } catch {
       return false;
     }
@@ -1668,13 +1733,13 @@ export class DurableTopicLog {
   }
 
   /**
-   * EB-94: checksum sidecar for an archived segment — `<archive
+   * EB-94: checksum sidecar key for an archived segment — `<archive
    * name>.sha256` holding the hex SHA-256 of the segment's gzipped bytes
    * (`node:crypto`, zero new dependencies). Written right after the
    * `.gz`, before the index line.
    */
-  private checksumPath(archiveName: string): string {
-    return join(this.logDir, `${archiveName}.sha256`);
+  private checksumKey(archiveName: string): string {
+    return `${archiveName}.sha256`;
   }
 
   /**
@@ -1684,22 +1749,14 @@ export class DurableTopicLog {
    * `.gz` write and the sidecar write, are unverifiable and read exactly
    * as before. Returns `false` when a sidecar exists but the bytes are
    * missing, unreadable, or mismatched: the segment is corrupt and must
-   * be isolated, never read.
+   * be isolated, never read. The sidecar and the bytes both come from
+   * the storage backend (EB-96) — verification itself is unchanged.
    */
   private verifySegmentChecksum(archiveName: string): boolean {
-    let expected: string | undefined;
-    try {
-      expected = readFileSync(this.checksumPath(archiveName), 'utf8').trim();
-    } catch {
-      expected = undefined;
-    }
+    const expected = this.readText(this.checksumKey(archiveName))?.trim();
     if (expected === undefined) return true;
-    let bytes: Buffer;
-    try {
-      bytes = readFileSync(join(this.logDir, archiveName));
-    } catch {
-      return false;
-    }
+    const bytes = this.backend.read(archiveName);
+    if (bytes === undefined) return false;
     return createHash('sha256').update(bytes).digest('hex') === expected;
   }
 
@@ -1759,9 +1816,11 @@ export class DurableTopicLog {
     const seqStart = this.segmentStartSeq.get(topic) ?? 0;
     const seqEnd = this.lastSeqs.get(topic) ?? seqStart;
     const live = this.fileFor(topic);
-    const pending = join(this.logDir, this.pendingSegmentName(topic, seqStart, seqEnd));
+    const pending = this.pendingSegmentName(topic, seqStart, seqEnd);
     try {
-      renameSync(live, pending);
+      // EB-96: the rename is the commit point on every backend — a
+      // crash leaves the live object or the complete pending object.
+      this.backend.rename(live, pending);
     } catch {
       return;
     }
@@ -1798,15 +1857,17 @@ export class DurableTopicLog {
     timer.unref();
   }
 
-  /** Archives every pending segment (`*.jsonl.tmp`) in the log directory. */
+  /** Archives every pending segment (`*.jsonl.tmp`) in the log's key space. */
   private drainArchiveQueue(): void {
     let names: string[];
     try {
-      names = readdirSync(this.logDir);
+      names = this.backend.list();
     } catch {
       return;
     }
     for (const name of names) {
+      // EB-96: a child log drains its own pending segments.
+      if (name.startsWith(NAMESPACE_LOG_KEY_PREFIX)) continue;
       if (name.endsWith('.jsonl.tmp')) this.archiveOne(name);
     }
   }
@@ -1823,13 +1884,8 @@ export class DurableTopicLog {
    * the pending file for the next pass.
    */
   private archiveOne(pendingName: string): void {
-    const pendingPath = join(this.logDir, pendingName);
-    let text: string;
-    try {
-      text = readFileSync(pendingPath, 'utf8');
-    } catch {
-      return;
-    }
+    const text = this.readText(pendingName);
+    if (text === undefined) return;
     // The topic rides the file name (see `pendingSegmentName`); records
     // are validated against it, so a renamed file can never corrupt reads.
     const marker = pendingName.lastIndexOf('.seg-');
@@ -1859,7 +1915,7 @@ export class DurableTopicLog {
     }
     if (records.length === 0) {
       try {
-        unlinkSync(pendingPath);
+        this.backend.delete(pendingName);
       } catch {
         // Left for the next pass.
       }
@@ -1876,13 +1932,12 @@ export class DurableTopicLog {
       // Already indexed (crash between the index append and the pending
       // delete): drop the leftover, the archive itself is intact.
       try {
-        unlinkSync(pendingPath);
+        this.backend.delete(pendingName);
       } catch {
         // Left for the next pass.
       }
       return;
     }
-    const gzPath = join(this.logDir, entry.path);
     const canonical = records.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
     let gzBytes: Buffer;
     try {
@@ -1894,7 +1949,9 @@ export class DurableTopicLog {
     try {
       // EB-80: the archived record bytes are sealed per line before
       // compression, so the archive at rest is encrypted end to end.
-      writeFileSync(gzPath, gzBytes, { flag: 'wx' });
+      // EB-96: exclusive write through the backend — a racing pass
+      // that already archived this segment loses the race benignly.
+      this.backend.write(entry.path, gzBytes, { exclusive: true });
     } catch {
       // Either the write failed or the archive already exists (a
       // concurrent pass won the race): leave the pending file for the
@@ -1906,19 +1963,22 @@ export class DurableTopicLog {
     // pending delete). Best-effort: a failed sidecar write leaves the
     // segment unverifiable but fully readable, never lost.
     try {
-      writeFileSync(`${gzPath}.sha256`, createHash('sha256').update(gzBytes).digest('hex'), 'utf8');
+      this.backend.write(
+        this.checksumKey(entry.path),
+        createHash('sha256').update(gzBytes).digest('hex'),
+      );
     } catch {
       // The archive itself is intact; it just reads without verification.
     }
     try {
-      appendFileSync(this.archiveIndexFile, `${JSON.stringify(archiveIndexLineOf(entry))}\n`, 'utf8');
+      this.backend.append(this.archiveIndexKey, `${JSON.stringify(archiveIndexLineOf(entry))}\n`);
     } catch {
       // The `.gz` is safely on disk; the index append is retried via
       // orphan adoption on the next open.
       return;
     }
     try {
-      unlinkSync(pendingPath);
+      this.backend.delete(pendingName);
     } catch {
       // The archive and index are complete; the leftover pending file is
       // dropped idempotently by the next pass.
@@ -1941,7 +2001,9 @@ export class DurableTopicLog {
       : retained.slice(-this.maxEntriesPerTopic);
     const text = kept.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
     try {
-      writeFileSync(this.fileFor(topic), text, 'utf8');
+      // EB-96: atomic replace through the backend — readers never see a
+      // half-compacted object.
+      this.backend.write(this.fileFor(topic), text);
     } catch {
       return;
     }
@@ -2061,7 +2123,9 @@ export class DurableTopicLog {
       }
       let text: string;
       try {
-        text = gunzipSync(readFileSync(join(this.logDir, segment.path))).toString('utf8');
+        const bytes = this.backend.read(segment.path);
+        if (bytes === undefined) throw new Error('missing segment');
+        text = gunzipSync(bytes).toString('utf8');
       } catch {
         this.corruptArchives += 1;
         continue;
@@ -2084,22 +2148,20 @@ export class DurableTopicLog {
       }
     }
     // Pending segments: rotated, awaiting the background archive pass.
-    // The rename is atomic, so the file is complete and safe to read.
+    // The rename is atomic, so the object is complete and safe to read.
     const prefix = `${encodeURIComponent(topic)}.seg-`;
     let names: string[];
     try {
-      names = readdirSync(this.logDir);
+      names = this.backend.list();
     } catch {
       return out;
     }
     for (const name of names) {
+      // EB-96: a child log reads its own pending segments.
+      if (name.startsWith(NAMESPACE_LOG_KEY_PREFIX)) continue;
       if (!name.startsWith(prefix) || !name.endsWith('.jsonl.tmp')) continue;
-      let text: string;
-      try {
-        text = readFileSync(join(this.logDir, name), 'utf8');
-      } catch {
-        continue;
-      }
+      const text = this.readText(name);
+      if (text === undefined) continue;
       for (const line of text.split('\n')) {
         if (line.length === 0) continue;
         const inner = this.openLine(line);
@@ -2171,12 +2233,8 @@ export class DurableTopicLog {
    * log from opening.
    */
   private recoverOffsets(): void {
-    let text: string;
-    try {
-      text = readFileSync(this.offsetFile, 'utf8');
-    } catch {
-      return;
-    }
+    const text = this.readText(this.offsetKey);
+    if (text === undefined) return;
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
       this.offsetEntries += 1;
@@ -2233,7 +2291,7 @@ export class DurableTopicLog {
       return false;
     }
     try {
-      appendFileSync(this.offsetFile, line, 'utf8');
+      this.backend.append(this.offsetKey, line);
     } catch {
       return false;
     }
@@ -2259,7 +2317,7 @@ export class DurableTopicLog {
       .map((c) => `${JSON.stringify(offsetLineOf(c))}\n`)
       .join('');
     try {
-      writeFileSync(this.offsetFile, text, 'utf8');
+      this.backend.write(this.offsetKey, text);
     } catch {
       return;
     }
@@ -2285,12 +2343,8 @@ export class DurableTopicLog {
   }
 
   private recoverDedup(): void {
-    let text: string;
-    try {
-      text = readFileSync(this.dedupFile, 'utf8');
-    } catch {
-      return;
-    }
+    const text = this.readText(this.dedupKey);
+    if (text === undefined) return;
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
       this.dedupEntries += 1;
@@ -2327,7 +2381,7 @@ export class DurableTopicLog {
       return false;
     }
     try {
-      appendFileSync(this.dedupFile, line, 'utf8');
+      this.backend.append(this.dedupKey, line);
     } catch {
       return false;
     }
@@ -2348,7 +2402,7 @@ export class DurableTopicLog {
       .map((e) => `${JSON.stringify(dedupLineOf(e))}\n`)
       .join('');
     try {
-      writeFileSync(this.dedupFile, text, 'utf8');
+      this.backend.write(this.dedupKey, text);
     } catch {
       return;
     }
@@ -2375,12 +2429,8 @@ export class DurableTopicLog {
   }
 
   private recoverPublishDedup(): void {
-    let text: string;
-    try {
-      text = readFileSync(this.publishDedupFile, 'utf8');
-    } catch {
-      return;
-    }
+    const text = this.readText(this.publishDedupKey);
+    if (text === undefined) return;
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
       this.publishDedupEntries += 1;
@@ -2429,7 +2479,7 @@ export class DurableTopicLog {
       return false;
     }
     try {
-      appendFileSync(this.publishDedupFile, line, 'utf8');
+      this.backend.append(this.publishDedupKey, line);
     } catch {
       return false;
     }
@@ -2456,7 +2506,7 @@ export class DurableTopicLog {
     const kept = [...this.publishDedupSeen.values()].slice(-this.publishDedupMaxEntries);
     const text = kept.map((e) => this.sealLine(`${JSON.stringify(publishDedupLineOf(e))}\n`)).join('');
     try {
-      writeFileSync(this.publishDedupFile, text, 'utf8');
+      this.backend.write(this.publishDedupKey, text);
     } catch {
       return;
     }
