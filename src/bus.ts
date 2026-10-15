@@ -2548,6 +2548,14 @@ export interface EventBusOptions {
    * must be finite numbers `>= 0`, else `RangeError` at construction.
    * Lag rows are always observable via `EventBus.getStats().groupLag`
    * regardless of this option; this only enables the alert callback.
+   *
+   * `slo` (EB-112) layers consumer-lag SLO alerting on top of the same
+   * rows: `onLagSloBreach` fires once per breach episode — the breach
+   * condition (`maxLagMessages` and/or `maxLagMs`) must hold for
+   * `breachSamples` consecutive samples before it fires, and it rearms
+   * only after the breach clears. Independent of `onGroupLag`; either,
+   * both, or neither may be configured. Total breach episodes are
+   * observable via `EventBus.getStats().lagSloBreaches`.
    */
   groupLag?: GroupLagMonitorOptions;
   /**
@@ -3636,6 +3644,13 @@ export interface BusStats {
    * `EventBusOptions.groupLag`).
    */
   groupLag: GroupLagStat[];
+  /**
+   * Total consumer-lag SLO breach episodes fired (EB-112, see
+   * `EventBusOptions.groupLag.slo`): each edge-triggered
+   * `onLagSloBreach` firing moves this by one. 0 when SLO alerting is
+   * not configured.
+   */
+  lagSloBreaches: number;
   /**
    * Per-subscriber durable-log replay progress (EB-71): one row per
    * subscription that ran a `resumeFromSeq` / `resumeFromTime` replay,
@@ -14342,12 +14357,14 @@ export class EventBus {
 
   /**
    * Feeds one group's current lag rows to the alert monitor. No-op unless
-   * `onGroupLag` alerting is enabled, so the publish/commit/rebalance hot
-   * paths stay cheap for buses that only observe lag via `getStats()`.
+   * `onGroupLag` or SLO alerting is enabled, so the publish/commit/
+   * rebalance hot paths stay cheap for buses that only observe lag via
+   * `getStats()`. One call is one SLO sample for the `breachSamples`
+   * debounce (see `LagSloOptions`).
    */
   private checkGroupLagForGroup(groupId: string): void {
     if (!this.groupLagMonitor.enabled()) return;
-    this.groupLagMonitor.check(this.groupLagRowsFor(groupId));
+    this.groupLagMonitor.check(this.groupLagRowsFor(groupId), this.now());
   }
 
   /**
@@ -20793,6 +20810,7 @@ export class EventBus {
         };
       }),
       groupLag: this.groupLagRowsFor(undefined),
+      lagSloBreaches: this.groupLagMonitor.lagSloBreaches(),
       replayProgress,
       // MQTT-style retained messages (EB-87): one row per concrete
       // topic currently holding a retained message, sorted by topic. A

@@ -2797,6 +2797,7 @@ Exported series:
 | `eventbus_diagnostic_events_total` | counter | `diagnosticEvents` — admitted DLQ diagnostic events |
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
 | `eventbus_expiring_soon_alerts_total` | counter | `expiringSoonAlerts` — TTL expiring-soon warnings fired for subscriber queue heads (EB-110) |
+| `eventbus_consumer_lag_slo_breach_total` | counter | `lagSloBreaches` — consumer-group lag SLO breach episodes fired (EB-112) |
 | `eventbus_keyed_reordered_messages_total` | counter | `keyedReorderedMessages` — keyed messages held in per-(subscriber, key) reorder buffers |
 | `eventbus_causal_buffer_dropped_messages_total` | counter | `causalBuffer.droppedMessages` — causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock) |
 | `eventbus_causal_buffer_regressed_messages_total` | counter | `causalBuffer.regressedMessages` — causal messages delivered immediately on clock regression |
@@ -3486,3 +3487,47 @@ longPollTimeouts }` bus-wide. Validation throws `RangeError` fail-fast
 `waitMs`, negative/non-integer `fromOffset`); a denied namespace or an
 unauthorized topic throws exactly like `subscribe` does
 (`NamespaceDeniedError` / `AclDeniedError`).
+
+## Consumer-lag SLO alerting (EB-112)
+
+`EventBusOptions.groupLag.slo` layers opt-in SLO alerting on top of the
+always-on consumer-group lag rows (`getStats().groupLag`): while
+`onGroupLag` pages on a single threshold excursion, the SLO watches for a
+*breach episode* — the condition holding long enough to matter.
+
+```ts
+const bus = new EventBus({
+  groupLag: {
+    slo: {
+      maxLagMessages: 1000, // breach when a row's lag exceeds 1000 messages…
+      maxLagMs: 60_000,     // …or stays above zero lag for 60s straight
+      breachSamples: 3,      // …for 3 consecutive evaluations
+      onLagSloBreach: (e) => page(e),
+    },
+  },
+});
+```
+
+Semantics:
+
+- **Two bounds, either trips.** `maxLagMessages` breaches when a lag
+  row's message lag exceeds it; `maxLagMs` breaches when the row's
+  continuous above-zero-lag episode lasts at least that long on the bus
+  clock (the consumer has been behind for the whole window). At least one
+  bound is required (`RangeError` otherwise).
+- **Debounced.** The breach condition must hold for `breachSamples`
+  consecutive evaluations (integer `>= 1`, default 3) before the callback
+  fires — one sample per lag evaluation (group assignment on publish,
+  `commitOffset`, rebalance, threshold change), so a single slow commit
+  never pages.
+- **Edge-triggered latch.** The callback fires once per episode and
+  rearms only after the breach clears; `event.violated` reports which
+  bound tripped (`'maxLagMessages'` / `'maxLagMs'` / `'both'`).
+- **Isolated.** A throwing `onLagSloBreach` is swallowed — monitoring
+  never breaks the publish/commit path. Works with or without
+  `onGroupLag`; valid but silent when no callback is set.
+
+`getStats().lagSloBreaches` counts total breach episodes fired, and the
+Prometheus exposition carries
+`eventbus_consumer_lag_slo_breach_total`. Clocks are injectable
+(`EventBusOptions.now`), so SLO timing stays deterministic in tests.

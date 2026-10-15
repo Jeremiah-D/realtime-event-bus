@@ -155,6 +155,9 @@
  * - `eventbus_group_partition_lag_messages{group,topic,partition}`: the
  *   same, per partition, for groups that opted into
  *   `GroupSubscribeOptions.partitions`.
+ * - `eventbus_consumer_lag_slo_breach_total`: consumer-group lag SLO
+ *   breach episodes fired (EB-112, see `EventBusOptions.groupLag.slo`):
+ *   each edge-triggered `onLagSloBreach` firing moves this by one.
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
@@ -331,6 +334,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_expiring_soon_alerts_total',
     'Total TTL expiring-soon warnings fired for subscriber queue heads (EB-110).',
     stats.expiringSoonAlerts ?? 0,
+  );
+  counter(
+    'eventbus_consumer_lag_slo_breach_total',
+    'Total consumer-group lag SLO breach episodes fired (EB-112, see EventBusOptions.groupLag.slo).',
+    stats.lagSloBreaches ?? 0,
   );
   counter(
     'eventbus_keyed_reordered_messages_total',
