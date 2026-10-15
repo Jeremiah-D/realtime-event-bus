@@ -117,6 +117,12 @@ import {
   type TraceOptions,
   type TraceSpan,
 } from './trace.ts';
+import {
+  OtlpSpanExporter,
+  resolveOtlpOptions,
+  type OtlpSpanExporterOptions,
+  type OtlpSpanExportStats,
+} from './otlp.ts';
 import type {
   ClusterConnectOptions,
   ClusterLink,
@@ -2539,6 +2545,25 @@ export interface EventBusOptions {
    */
   trace?: boolean | TraceOptions;
   /**
+   * OTLP/HTTP span export (see `src/otlp.ts`, EB-105): ships the
+   * delivery-pipeline trace spans (`EventBusOptions.trace`) to an
+   * OpenTelemetry collector as OTLP/HTTP JSON, hand-encoded with zero
+   * new dependencies. Requires tracing to be enabled — spans only exist
+   * when the trace pipeline samples them — and composes with a
+   * user-supplied `TraceOptions.onTraceSpan` (the callback still fires).
+   *
+   * Best-effort by design: spans buffer in memory (bounded,
+   * drop-oldest) and flush on an unref'd timer or when the buffer
+   * reaches `batchSize`; a failed export drops that batch and counts it
+   * in `getStats().otlp.failedSpans` instead of disturbing delivery.
+   * `traceId`/`spanId` need no translation — EB-45 already mints 32-hex
+   * trace ids and 16-hex span ids, exactly the OTLP format, so exported
+   * traces correlate with `webhook-relay-ts` WR-18/WR-83 traces by string
+   * equality. Disabled by default; an invalid config throws `RangeError`
+   * from the constructor.
+   */
+  otlp?: OtlpSpanExporterOptions | false;
+  /**
    * Cross-process fan-out bridge (see `src/bridge.ts`, EB-51): a pluggable
    * `BridgeTransport` that mirrors every admitted local publish to an
    * external broker (Redis Streams, NATS, … — the adapter is implemented
@@ -3354,6 +3379,15 @@ export interface BusStats {
    * receives. A snapshot — mutating it does not affect the bus.
    */
   traceSpans: TraceSpan[];
+  /**
+   * OTLP span export state (see `EventBusOptions.otlp` and `src/otlp.ts`,
+   * EB-105). Present only when OTLP export is configured: `bufferedSpans`
+   * spans awaiting flush, `exportedSpans` successfully POSTed,
+   * `failedSpans` dropped because their export POST failed (best-effort,
+   * never retried), `droppedSpans` dropped because the buffer was full
+   * (drop-oldest). A snapshot — mutating it does not affect the bus.
+   */
+  otlp?: OtlpSpanExportStats;
   /**
    * The hottest topics by 1m publish rate (see `src/rates.ts`), hottest
    * first — at most `HOT_TOPICS_LIMIT` (10) entries; topics with no
@@ -7820,6 +7854,12 @@ export class EventBus {
    */
   private readonly trace: TraceRecorder | undefined;
   /**
+   * OTLP span exporter (`EventBusOptions.otlp`), or `undefined` when
+   * export is not configured (EB-105). Fed through the trace pipeline's
+   * span fan-out, so it only ever sees spans of sampled traces.
+   */
+  private readonly otlpExporter: OtlpSpanExporter | undefined;
+  /**
    * Compiled broker-level ACL rules in evaluation order
    * (`EventBusOptions.acl` / `setAclRules`). Empty means no ACL — every
    * verdict falls through to `aclDefault`.
@@ -8335,6 +8375,29 @@ export class EventBus {
     // change). TEST / PRE-PRODUCTION USE ONLY.
     this.chaos = resolveChaosOptions(options?.chaos, 'EventBus');
     const resolvedTrace = resolveTraceOptions(options?.trace, 'EventBus');
+    const resolvedOtlp = resolveOtlpOptions(options?.otlp, 'EventBus');
+    if (resolvedOtlp !== undefined && resolvedTrace === undefined) {
+      throw new RangeError('EventBus: otlp span export requires EventBusOptions.trace to be enabled');
+    }
+    if (resolvedOtlp !== undefined && resolvedTrace !== undefined) {
+      // The exporter rides the trace pipeline's span fan-out behind the
+      // user's own onTraceSpan (if any): one composition point, no
+      // changes to TraceRecorder, and the disabled-trace path stays
+      // untouched. resolvedTrace is a fresh object from the resolver, so
+      // replacing its callback cannot affect the caller's options.
+      const exporter = new OtlpSpanExporter(resolvedOtlp);
+      const userHook = resolvedTrace.onTraceSpan;
+      resolvedTrace.onTraceSpan =
+        userHook === undefined
+          ? (span) => exporter.exportSpan(span)
+          : (span) => {
+              userHook(span);
+              exporter.exportSpan(span);
+            };
+      this.otlpExporter = exporter;
+    } else {
+      this.otlpExporter = undefined;
+    }
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
     this.groupLagMonitor = new GroupLagMonitor(resolveGroupLagOptions(options?.groupLag, 'EventBus'));
@@ -19410,6 +19473,16 @@ export class EventBus {
   }
 
   /**
+   * Flushes buffered OTLP spans to the configured collector now instead
+   * of waiting for the flush timer (EB-105) — the deterministic hook for
+   * tests and graceful shutdown. No-op when OTLP export is not
+   * configured; never throws (best-effort export).
+   */
+  flushOtlp(): Promise<void> {
+    return this.otlpExporter?.flush() ?? Promise.resolve();
+  }
+
+  /**
    * Returns a point-in-time snapshot of live bus metrics: active
    * subscriptions (total and per pattern) plus per-topic fan-out widths and
    * publish counts. The snapshot is a plain-data copy — mutating it does
@@ -19715,6 +19788,12 @@ export class EventBus {
       },
       hotKeys: hottestKeys,
       traceSpans: this.trace?.snapshot() ?? [],
+      // OTLP span export (EB-105): present only when configured — the
+      // field stays absent otherwise so unconfigured buses keep
+      // byte-identical stats.
+      ...(this.otlpExporter == null
+        ? {}
+        : { otlp: this.otlpExporter.getStats() }),
       hotTopics: this.publishRates.hotTopics(ratesNow),
       ...(this.clusterLink == null
         ? {}
