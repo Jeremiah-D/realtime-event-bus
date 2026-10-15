@@ -18,7 +18,9 @@
  *     (EB-52). `opts.reliable` (gateway-local, stripped before the bus
  *     sees it) routes through `subscribeReliable` for at-least-once
  *     delivery; each message then carries a `deliveryId` the client must
- *     `ack` / `nack`. Function-valued options (filters, hooks) cannot
+ *     `ack` / `nack`. `opts.binary` (gateway-local, stripped before the
+ *     bus sees it) switches this subscription's deliveries to binary
+ *     frames (see below). Function-valued options (filters, hooks) cannot
  *     cross the wire and are ignored.
  *   - `{type:'unsubscribe', id, subId}`
  *   - `{type:'publish', id, topic, payload, opts?}` — full admission
@@ -30,6 +32,35 @@
  *     reliable delivery. Unknown ids are ignored: stale acks are normal
  *     under at-least-once semantics.
  *   - `{type:'ping', id?}` — answered with `{type:'pong', id?}`.
+ *
+ *   Binary frames (EB-109): a binary frame is
+ *   `[u32 BE headerLen][UTF-8 JSON header][raw payload bytes]`.
+ *
+ *   client -> server (binary)
+ *   - `publish`: header `{type:'publish', id?, topic, opts?}`, body = raw
+ *     payload bytes. Published via `bus.publish(topic, bytes,
+ *     {...opts, binary: true})` (EB-92), so the whole admission pipeline
+ *     runs on the raw bytes: byte validators (EB-20), the byte-size cap
+ *     (EB-64) and compression threshold (EB-22) measure wire bytes, and
+ *     the HMAC topic signature (EB-84) covers those same wire bytes.
+ *     `opts.messageId` routes through `publishIdempotent` like the text
+ *     form. Answered with the text frame
+ *     `{type:'published', id, delivered, duplicate?}`.
+ *
+ *   server -> client (binary): only for subscriptions whose `subscribe`
+ *   carried `opts.binary: true`. Each delivery is a binary frame whose
+ *   header is `{type:'message', subId, topic, seq,
+ *   encoding: 'binary'|'json', deliveryId?, redeliveries?}`:
+ *   - `encoding: 'binary'` — the message was a binary (EB-92) publish and
+ *     the body is its raw wire bytes, untouched (compressed binary
+ *     messages are inflated by the bus before the gateway sees them).
+ *   - `encoding: 'json'` — any other payload, UTF-8 JSON-encoded, so a
+ *     binary subscriber on a mixed topic never breaks.
+ *   Malformed binary frames get an `error` frame (`bad_frame` /
+ *   `unknown_frame` / `invalid_request`); the connection stays open.
+ *   `maxFrameBytes` still bounds binary frames (1009 close past it), and
+ *   the backpressure queue (`maxPendingBytes`) counts binary frames by
+ *   their byte size exactly like text frames.
  *
  *   server -> client
  *   - `{type:'subscribed', id, subId}` / `{type:'unsubscribed', id, subId}`
@@ -112,6 +143,48 @@ function encodeFrame(opcode: number, payload: Buffer): Buffer {
 interface WsMessage {
   opcode: number;
   payload: Buffer;
+}
+
+/**
+ * Binary frame envelope (EB-109): `[u32 BE headerLen][UTF-8 JSON
+ * header][raw payload bytes]`. `encodeBinaryFrame` builds one;
+ * `parseBinaryFrame` splits one, throwing on a truncated or
+ * out-of-bounds header length (the caller turns that into a `bad_frame`
+ * error — the connection stays open).
+ */
+function encodeBinaryFrame(header: object, body: Buffer): Buffer {
+  const headerBytes = Buffer.from(JSON.stringify(header), 'utf8');
+  const out = Buffer.alloc(4 + headerBytes.length + body.length);
+  out.writeUInt32BE(headerBytes.length, 0);
+  headerBytes.copy(out, 4);
+  body.copy(out, 4 + headerBytes.length);
+  return out;
+}
+
+function parseBinaryFrame(payload: Buffer): { header: unknown; body: Buffer } {
+  if (payload.length < 4) throw new Error('binary frame too short for header length');
+  const headerLen = payload.readUInt32BE(0);
+  if (headerLen > payload.length - 4) throw new Error('binary frame header length out of bounds');
+  const header = JSON.parse(payload.subarray(4, 4 + headerLen).toString('utf8'));
+  // Copy the body: the parser's chunk buffer is transient, and a queued
+  // message must not pin it.
+  return { header, body: Buffer.from(payload.subarray(4 + headerLen)) };
+}
+
+/**
+ * Encodes one outbound binary message body (EB-109). A binary (EB-92)
+ * publish's `Uint8Array` payload travels as raw wire bytes
+ * (`encoding: 'binary'`); anything else is UTF-8 JSON-encoded
+ * (`encoding: 'json'`) so a binary subscriber on a mixed topic never
+ * breaks. Unserializable payloads encode as `null` — the bus never
+ * delivers those to a handler anyway, this is a wire-level fallback.
+ */
+function encodeBinaryMessageBody(payload: unknown): { bytes: Buffer; encoding: 'binary' | 'json' } {
+  if (payload instanceof Uint8Array) {
+    return { bytes: Buffer.from(payload), encoding: 'binary' };
+  }
+  const serialized = JSON.stringify(payload);
+  return { bytes: Buffer.from(serialized ?? 'null', 'utf8'), encoding: 'json' };
 }
 
 /**
@@ -203,6 +276,12 @@ export interface GatewaySubscribeOptions extends SubscribeOptions {
    * Stripped before the bus sees the options.
    */
   reliable?: boolean | ReliableSubscribeOptions;
+  /**
+   * Gateway-local: deliver this subscription's messages as binary frames
+   * (EB-109) instead of JSON text frames. Stripped before the bus sees
+   * the options.
+   */
+  binary?: boolean;
 }
 
 /** Client -> server `publish` options: `PublishOptions` passthrough. */
@@ -254,6 +333,8 @@ export interface GatewayStats {
 interface ConnectionSubscription {
   sub: Subscription;
   pendingAcks: Map<number, Delivery<BusMessage>>;
+  /** Whether this subscription's deliveries go out as binary frames. */
+  binary: boolean;
 }
 
 interface Connection {
@@ -580,11 +661,20 @@ export class GatewayServer {
         this.handleFrame(conn, frame);
         return;
       }
-      case OP_BINARY:
-        // The gateway protocol is JSON text frames only.
-        this.stats.protocolErrors += 1;
-        this.closeWithCode(conn, 1003, 'binary frames not supported');
+      case OP_BINARY: {
+        this.stats.framesReceived += 1;
+        let header: unknown;
+        let body: Buffer;
+        try {
+          ({ header, body } = parseBinaryFrame(msg.payload));
+        } catch {
+          this.stats.protocolErrors += 1;
+          this.sendError(conn, 'bad_frame', 'malformed binary frame');
+          return;
+        }
+        this.handleBinaryFrame(conn, header, body);
         return;
+      }
       case OP_PING:
         try {
           conn.socket.write(encodeFrame(OP_PONG, msg.payload));
@@ -646,7 +736,8 @@ export class GatewayServer {
       return;
     }
     const wireOpts = (opts ?? {}) as GatewaySubscribeOptions;
-    const { reliable, ...subOpts } = wireOpts;
+    const { reliable, binary, ...subOpts } = wireOpts;
+    const binaryDelivery = binary === true;
     // Retained snapshots (EB-87) invoke the handler synchronously inside
     // `subscribe()` — before the `Subscription` (and its id) exists. Live
     // deliveries arrive later via the async flush. A `registering` flag
@@ -664,6 +755,29 @@ export class GatewayServer {
     let registering = true;
     const pendingAcks = new Map<number, Delivery<BusMessage>>();
     const emitLive = (item: OutboxItem, subId: string): void => {
+      if (binaryDelivery) {
+        const { bytes, encoding } = encodeBinaryMessageBody(item.payload);
+        this.sendRaw(
+          conn,
+          encodeFrame(
+            OP_BINARY,
+            encodeBinaryFrame(
+              {
+                type: 'message',
+                subId,
+                topic: item.topic,
+                seq: item.seq,
+                encoding,
+                ...(item.delivery !== undefined
+                  ? { deliveryId: item.delivery.seq, redeliveries: item.redeliveries }
+                  : {}),
+              },
+              bytes,
+            ),
+          ),
+        );
+        return;
+      }
       this.sendJson(conn, {
         type: 'message',
         subId,
@@ -729,7 +843,7 @@ export class GatewayServer {
       return;
     }
     registering = false;
-    conn.subscriptions.set(sub.id, { sub, pendingAcks });
+    conn.subscriptions.set(sub.id, { sub, pendingAcks, binary: binaryDelivery });
     for (const item of outbox) emitLive(item, sub.id);
     this.sendJson(conn, { type: 'subscribed', id, subId: sub.id });
   }
@@ -780,6 +894,62 @@ export class GatewayServer {
         duplicate = res.duplicate;
       } else {
         delivered = this.bus.publish(topic, payload, publishOpts as PublishOptions);
+      }
+    } catch (err) {
+      if (err instanceof RangeError || err instanceof TypeError) {
+        this.sendError(conn, 'invalid_request', (err as Error).message, id);
+      } else {
+        this.sendError(conn, 'publish_failed', (err as Error).message, id);
+      }
+      return;
+    }
+    this.sendJson(conn, { type: 'published', id, delivered, duplicate });
+  }
+
+  private handleBinaryFrame(conn: Connection, header: unknown, body: Buffer): void {
+    if (!isRecord(header) || typeof header.type !== 'string') {
+      this.sendError(conn, 'bad_frame', 'binary frame header must be an object with a string type');
+      return;
+    }
+    if (header.type !== 'publish') {
+      this.sendError(conn, 'unknown_frame', `unknown binary frame type: ${header.type}`);
+      return;
+    }
+    this.handleBinaryPublish(conn, header, body);
+  }
+
+  /**
+   * Binary `publish` (EB-109): the frame body is the raw payload bytes,
+   * published with `binary: true` (EB-92) so the full admission pipeline
+   * — schema, rate-limit, TTL, idempotent dedup — runs on the wire bytes:
+   * byte validators see the bytes, the byte-size cap and compression
+   * threshold measure them, and the HMAC topic signature (EB-84) covers
+   * them. Answered with the same text `published` frame as text publish.
+   */
+  private handleBinaryPublish(conn: Connection, header: Record<string, unknown>, body: Buffer): void {
+    const { id, topic, opts } = header;
+    if (typeof topic !== 'string' || topic.length === 0) {
+      this.sendError(conn, 'invalid_request', 'publish requires a non-empty topic', id);
+      return;
+    }
+    if (opts !== undefined && !isRecord(opts)) {
+      this.sendError(conn, 'invalid_request', 'publish opts must be an object', id);
+      return;
+    }
+    const publishOpts: GatewayPublishOptions = { ...((opts ?? {}) as GatewayPublishOptions), binary: true };
+    let delivered = 0;
+    let duplicate = false;
+    try {
+      if (typeof publishOpts.messageId === 'string' && publishOpts.messageId.length > 0) {
+        const res = this.bus.publishIdempotent(
+          topic,
+          body,
+          publishOpts as IdempotentPublishOptions,
+        );
+        delivered = res.accepted;
+        duplicate = res.duplicate;
+      } else {
+        delivered = this.bus.publish(topic, body, publishOpts as PublishOptions);
       }
     } catch (err) {
       if (err instanceof RangeError || err instanceof TypeError) {

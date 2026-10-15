@@ -2946,13 +2946,25 @@ const port = await gw.listen(); // resolves with the bound port
 await gw.close(); // drops connections (unsubscribing them) and stops
 ```
 
-Wire protocol — every frame is a JSON text frame:
+Wire protocol — JSON text frames, plus binary frames (EB-109):
 
 - client → server: `subscribe{pattern,opts}` / `unsubscribe{subId}` /
   `publish{topic,payload,opts}` / `publishBatch{entries}` / `ack{deliveryId}` /
   `nack{deliveryId}` / `ping`
 - server → client: `subscribed{subId}` / `unsubscribed` / `message{...}` /
   `published{delivered,duplicate?}` / `pong` / `error{code,message}`
+- client → server (binary): a binary frame is
+  `[u32 BE headerLen][UTF-8 JSON header][raw payload bytes]`. The only
+  binary frame type is `publish` — header `{type:'publish', id?, topic,
+  opts?}`, body = raw bytes — published with `binary: true` (EB-92), so
+  the full admission pipeline runs on the wire bytes. Answered with the
+  text `published` frame.
+- server → client (binary): for subscriptions whose `subscribe` carried
+  `opts.binary: true`, each delivery is a binary frame with header
+  `{type:'message', subId, topic, seq, encoding: 'binary'|'json',
+  deliveryId?, redeliveries?}`. `encoding: 'binary'` means the message was
+  a binary (EB-92) publish and the body is its raw wire bytes;
+  `encoding: 'json'` means any other payload, UTF-8 JSON-encoded.
 
 Semantics:
 
@@ -2969,6 +2981,17 @@ Semantics:
   `deliveryId` the client must `ack` / `nack`. Nack and ack-timeout
   redeliver through the bus's normal redelivery path; unknown delivery
   ids are ignored (stale acks are normal).
+- **Binary payloads over the wire (EB-109).** A binary `publish` goes
+  through the exact same admission as a text publish — schema validators
+  see the raw bytes (EB-20), the byte-size cap (EB-64) and compression
+  threshold (EB-22) measure wire bytes, the HMAC topic signature (EB-84)
+  covers those bytes, and `opts.messageId` still routes through
+  idempotent dedup. A binary subscriber receives binary publishes as raw
+  bytes; non-binary publishes arrive JSON-encoded (`encoding: 'json'` in
+  the binary header), so binary subscribers on mixed topics never break.
+  Backpressure treats binary frames like text frames: `maxPendingBytes`
+  counts their byte size, and overflowing binary frames are dropped and
+  counted in `droppedFrames` the same way.
 - **Reconnect resume.** `opts` is a `SubscribeOptions` passthrough, so
   `resumeFromSeq` / `resumeFromTime` (EB-17/EB-42) and namespaces (EB-52)
   work for reconnecting clients. Function-valued options (filters, hooks)
@@ -2989,10 +3012,11 @@ Semantics:
   protocolErrors}`.
 
 Invalid option values throw `RangeError` fail-fast. Inbound frames larger
-than `maxFrameBytes` (default 1 MiB) close the connection with 1009;
-binary frames are rejected with 1003 (the protocol is JSON text frames
-only). Malformed JSON and unknown frame types get error frames without
-dropping the connection.
+than `maxFrameBytes` (default 1 MiB) close the connection with 1009 —
+this bounds binary frames too. Malformed binary frames (bad header
+length, unparseable header) get `bad_frame` error frames without dropping
+the connection; malformed JSON text frames and unknown frame types behave
+the same.
 
 ## Atomic batch subscription (EB-100)
 
