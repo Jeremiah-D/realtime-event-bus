@@ -3318,6 +3318,14 @@ export interface BusStats {
    */
   degradedSubscribers: number;
   /**
+   * Subscriptions currently paused by the operator (see
+   * `EventBus.pauseSubscriber`): delivery is held — the backlog stays
+   * queued under the normal backpressure policy — until
+   * `EventBus.resumeSubscriber`. Orthogonal to `degradedSubscribers`:
+   * a subscriber can be in both states at once.
+   */
+  pausedSubscribers: number;
+  /**
    * Subscriptions currently having messages held back by delivery-side
    * rate shaping (see `SubscribeOptions.deliveryShaping`): their queues
    * still hold messages the token budget did not allow this round.
@@ -4268,6 +4276,18 @@ interface Subscriber {
    * keeps counting as live in `getStats()` (see `migratingSubscribers`).
    */
   migrating?: boolean;
+  /**
+   * Manual operator pause (EB-113): set by `pauseSubscriber`, cleared by
+   * `resumeSubscriber`. While true `drainSubscriber` skips the
+   * subscriber — its backlog stays queued under the normal backpressure
+   * policy, untouched by the drain — exactly like the health-probe
+   * degraded pause, but operator-controlled and orthogonal to it:
+   * degraded recovery (`resume`, or the probe's auto-resume timer) clears
+   * only the degraded flag and never a manual pause.
+   */
+  manuallyPaused?: boolean;
+  /** Operator-supplied reason recorded at `pauseSubscriber` time. */
+  manuallyPausedReason?: string;
   /**
    * Subscription migration (EB-82): the outermost unsubscribe closure
    * for this subscription — the plain `subscribe` closure, replaced by
@@ -20472,6 +20492,7 @@ export class EventBus {
     let unackedDeliveries = 0;
     let throttledSubscribers = 0;
     let degradedSubscribers = 0;
+    let pausedSubscribers = 0;
     let shapedSubscribers = 0;
     let rampingSubscribers = 0;
     let migratingSubscribers = 0;
@@ -20493,6 +20514,7 @@ export class EventBus {
       if (subscriber.migrating === true) migratingSubscribers += 1;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
+      if (subscriber.manuallyPaused === true) pausedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
       const slowStart = subscriber.slowStart;
       if (slowStart !== undefined && !slowStart.isComplete(ratesNow)) rampingSubscribers += 1;
@@ -20747,6 +20769,7 @@ export class EventBus {
       redactedFields: this.totalRedactedFields,
       throttledSubscribers,
       degradedSubscribers,
+      pausedSubscribers,
       shapedSubscribers,
       rampingSubscribers,
       rateLimitedWaiting,
@@ -21242,6 +21265,78 @@ export class EventBus {
   }
 
   /**
+   * Pauses delivery to one subscriber (EB-113): an operator-controlled,
+   * per-subscriber hold orthogonal to the health-probe degraded pause
+   * (EB-18). While paused the subscriber's queue keeps accumulating
+   * under its normal backpressure policy — nothing is dropped by the
+   * pause itself — and the drain skips it, so `resumeSubscriber` picks
+   * up exactly where delivery paused.
+   *
+   * Manual pause outranks degraded recovery: `resume` (and the
+   * health-probe auto-resume timer) clears only the degraded flag, so a
+   * subscriber that is both degraded and manually paused stays paused
+   * until `resumeSubscriber` runs.
+   *
+   * Returns true when the subscriber was newly paused, false when it
+   * was already manually paused (idempotent — no duplicate audit).
+   * Audited as `subscriber_paused` (`{ reason }` when one is given).
+   * Throws on an unknown subscriber id; `reason` must be a non-empty
+   * string when provided.
+   */
+  pauseSubscriber(subId: string, opts?: { reason?: string }): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const reason = opts?.reason;
+    if (reason !== undefined) {
+      if (typeof reason !== 'string') {
+        throw new TypeError('pauseSubscriber: reason must be a string');
+      }
+      if (reason.length === 0) {
+        throw new RangeError('pauseSubscriber: reason must be a non-empty string');
+      }
+    }
+    if (subscriber.manuallyPaused === true) return false;
+    subscriber.manuallyPaused = true;
+    if (reason !== undefined) subscriber.manuallyPausedReason = reason;
+    this.auditSubscription({
+      action: 'subscriber_paused',
+      actor: 'system',
+      subId,
+      pattern: subscriber.pattern,
+      ...(reason === undefined ? {} : { detail: { reason } }),
+    });
+    return true;
+  }
+
+  /**
+   * Resumes delivery to a manually paused subscriber (see
+   * `pauseSubscriber`): clears the operator pause and schedules a flush
+   * so the preserved backlog is delivered promptly, in order. Does not
+   * touch the health-probe degraded state — a degraded subscriber stays
+   * degraded until `resume` (or its cooldown) clears it.
+   *
+   * Returns true when the subscriber was manually paused and is now
+   * resumed, false when it was not paused (idempotent — no duplicate
+   * audit). Audited as `subscriber_resumed`. Throws on an unknown
+   * subscriber id.
+   */
+  resumeSubscriber(subId: string): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    if (subscriber.manuallyPaused !== true) return false;
+    subscriber.manuallyPaused = false;
+    subscriber.manuallyPausedReason = undefined;
+    this.auditSubscription({
+      action: 'subscriber_resumed',
+      actor: 'system',
+      subId,
+      pattern: subscriber.pattern,
+    });
+    this.scheduleFlush();
+    return true;
+  }
+
+  /**
    * Point-in-time health snapshot for one subscriber (see
    * `SubscribeOptions.healthProbe`). `enabled` is false and the counters
    * are 0 when the probe is not enabled for the subscriber. Throws on an
@@ -21590,6 +21685,11 @@ export class EventBus {
     // queued under the normal backpressure policy, untouched by the
     // drain, so resuming picks up exactly where delivery paused.
     if (subscriber.health?.degraded === true) return;
+    // Manual operator pause (EB-113): the same skip semantics as the
+    // degraded gate above — the backlog stays queued under the normal
+    // backpressure policy until `resumeSubscriber`. Orthogonal to the
+    // health probe: degraded recovery never clears a manual pause.
+    if (subscriber.manuallyPaused === true) return;
     // Batched subscribers collect messages across flush rounds instead of
     // delivering one message per handler call (see drainBatchedSubscriber).
     if (subscriber.batch != null) {

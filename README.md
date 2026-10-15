@@ -2809,6 +2809,7 @@ Exported series:
 | `eventbus_unacked_deliveries` | gauge | `unackedDeliveries` |
 | `eventbus_throttled_subscribers` | gauge | `throttledSubscribers` |
 | `eventbus_degraded_subscribers` | gauge | `degradedSubscribers` |
+| `eventbus_paused_subscribers` | gauge | `pausedSubscribers` — operator-paused subscriptions (EB-113) |
 | `eventbus_shaped_subscribers` | gauge | `shapedSubscribers` |
 | `eventbus_pending_delayed` | gauge | `pendingDelayed` |
 | `eventbus_queue_bytes` | gauge | `queueBytes` — buffered payload bytes across subscriber queues |
@@ -3531,3 +3532,38 @@ Semantics:
 Prometheus exposition carries
 `eventbus_consumer_lag_slo_breach_total`. Clocks are injectable
 (`EventBusOptions.now`), so SLO timing stays deterministic in tests.
+
+## Manual subscriber pause/resume (EB-113)
+
+`bus.pauseSubscriber(subId, { reason? })` / `bus.resumeSubscriber(subId)`
+give operators a per-subscriber delivery hold — the runbook counterpart
+to the health probe's automatic degraded pause (EB-18):
+
+```ts
+const sub = bus.subscribe('orders.eu', handle);
+// Deploy window: hold this consumer without touching the others.
+bus.pauseSubscriber(sub.id, { reason: 'deploy freeze' });
+// …later, pick up exactly where delivery paused:
+bus.resumeSubscriber(sub.id);
+```
+
+Semantics:
+
+- **Queue keeps accumulating.** While paused the subscriber's queue
+  keeps filling under its normal backpressure policy (`drop-oldest` /
+  `drop-newest` / `block`) — the pause itself drops nothing — and the
+  drain skips the subscriber, so resume redelivers the preserved backlog
+  in order on the next flush.
+- **Orthogonal to the health probe.** Manual pause outranks degraded
+  recovery: `resume()` (and the probe's auto-resume timer) clears only
+  the degraded flag, never a manual pause — a subscriber can be in both
+  states at once, and each is cleared by its own API.
+- **Idempotent.** Pausing an already-paused subscriber (or resuming a
+  non-paused one) returns `false` and audits nothing; unknown subscriber
+  ids throw, matching `resume()` / `throttledCount()`.
+- **Audited.** Transitions land in the subscription audit log as
+  `subscriber_paused` (`{ reason }` when given) / `subscriber_resumed`,
+  queryable via `getSubscriptionAudit({ action })`.
+
+`getStats().pausedSubscribers` counts live manual pauses and the
+Prometheus exposition carries `eventbus_paused_subscribers`.

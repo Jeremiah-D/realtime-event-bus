@@ -11,7 +11,8 @@
  * `topic_resumed`) / bulk delayed-delivery cancellation (EB-89,
  * `delayed_cancelled`) / publish-side partition-count rule changes (EB-90,
  * `partition_rule_set` / `partition_rule_cleared`) / out-of-order barrier
- * discards (EB-98, `barrier_dropped`).
+ * discards (EB-98, `barrier_dropped`) / manual subscriber pause-resume
+ * (EB-113, `subscriber_paused` / `subscriber_resumed`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -62,7 +63,9 @@ export type SubscriptionAuditAction =
   | 'config_applied'
   | 'config_rolled_back'
   | 'segment_checksum_failed'
-  | 'barrier_dropped';
+  | 'barrier_dropped'
+  | 'subscriber_paused'
+  | 'subscriber_resumed';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -96,6 +99,11 @@ export type SubscriptionAuditAction =
  *   epoch seen> }` — an out-of-order barrier was discarded for epoch
  *   monotonicity (EB-98): never delivered, never arming (the `topic`
  *   field carries the barrier's topic, `subId` the subscriber)
+ * - `subscriber_paused`: `{ reason?: <operator reason> }` — delivery to
+ *   one subscriber was manually paused (EB-113); `subId`/`pattern`
+ *   identify the subscription
+ * - `subscriber_resumed`: no detail — a manual subscriber pause (EB-113)
+ *   was cleared; `subId`/`pattern` identify the subscription
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -156,6 +164,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'partition_rule_set',
   'partition_rule_cleared',
   'barrier_dropped',
+  'subscriber_paused',
+  'subscriber_resumed',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

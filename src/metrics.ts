@@ -86,6 +86,8 @@
  *   publish-side throttling.
  * - `eventbus_degraded_subscribers`: subscriptions auto-paused by health
  *   probing.
+ * - `eventbus_paused_subscribers`: subscriptions manually paused by the
+ *   operator (see `EventBus.pauseSubscriber`, EB-113).
  * - `eventbus_shaped_subscribers`: subscriptions held back by
  *   delivery-side rate shaping.
  * - `eventbus_pending_delayed`: delayed messages scheduled but not yet
@@ -376,6 +378,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_degraded_subscribers',
     'Subscriptions currently auto-paused by health probing.',
     stats.degradedSubscribers,
+  );
+  gauge(
+    'eventbus_paused_subscribers',
+    'Subscriptions currently manually paused by the operator (see EventBus.pauseSubscriber, EB-113).',
+    stats.pausedSubscribers ?? 0,
   );
   gauge(
     'eventbus_shaped_subscribers',
