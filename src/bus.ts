@@ -1392,6 +1392,67 @@ export interface SubscribeOptions {
 }
 
 /**
+ * Options for `EventBus.pull` (EB-111): opt-in pull-mode consumption with
+ * long-polling, the complement to push `subscribe`.
+ */
+export interface PullOptions {
+  /**
+   * Maximum number of messages to return. Required; must be an integer
+   * `>= 1`, otherwise `pull` throws `RangeError`.
+   */
+  maxMessages: number;
+  /**
+   * Long-poll window in milliseconds (default `0` — no wait). When no
+   * message newer than `fromOffset` is available, `pull` waits up to
+   * `waitMs` for a new publish on the topic instead of returning `[]`
+   * immediately; on expiry it resolves `[]` (never throws). Must be a
+   * finite number `>= 0`, otherwise `RangeError`.
+   */
+  waitMs?: number;
+  /**
+   * Exclusive per-topic offset (default `0`): only messages with
+   * `seq > fromOffset` are returned. The offset space is the topic's own
+   * sequence numbers (EB-13) — the same numbers push subscribers see on
+   * `BusMessage.seq`. Progress is the caller's responsibility: pass back
+   * the last returned message's `seq` to advance; not advancing returns
+   * the same messages again (at-least-once). Must be an integer `>= 0`,
+   * otherwise `RangeError`.
+   */
+  fromOffset?: number;
+  /**
+   * Tenant namespace: resolved to the concrete `<namespace>/<topic>`
+   * exactly like `publish`/`subscribe`, with the same unknown-namespace
+   * (`RangeError`) and subscribe-disallowed (`NamespaceDeniedError`)
+   * failures.
+   */
+  namespace?: string;
+}
+
+/**
+ * One message returned by `EventBus.pull` (EB-111). The `payload` is the
+ * application payload — the same value a push subscriber's handler
+ * receives (compressed payloads are inflated, binary payloads stay
+ * bytes) — never the wire envelope.
+ */
+export interface PulledMessage {
+  /** Concrete topic the message was published to. */
+  topic: string;
+  /**
+   * Per-topic sequence number (EB-13). Pass back as `fromOffset` to
+   * advance the pull cursor.
+   */
+  seq: number;
+  /** Application payload, as the publisher sent it. */
+  payload: unknown;
+  /** Publish timestamp in milliseconds (the bus clock). */
+  at: number;
+  /** Application-level message identity, when the publish carried one. */
+  messageId?: string;
+  /** Publisher identity, when the publish carried one. */
+  publisherId?: string;
+}
+
+/**
  * Tuning for a shadow subscriber's independent backpressure queue (see
  * `SubscribeOptions.shadow`). Unset fields fall back to the
  * subscription's own `queueSize` / `dropPolicy`, so `shadow: true` needs
@@ -2391,6 +2452,15 @@ export interface EventBusOptions {
    */
   durableLogMaxEntriesPerTopic?: number;
   /**
+   * Per-topic in-memory pull buffer for pull-mode consumption (EB-111):
+   * how many of the most recent admitted messages per topic the bus keeps
+   * in memory for `pull()` (default 1000). Used as the message source on
+   * buses without `durableLogDir`; buses with a durable log read from the
+   * log instead, but still keep the buffer — it drives long-poll wakeups
+   * and keeps the hot path allocation-cheap. Must be a positive integer.
+   */
+  pullBufferSize?: number;
+  /**
    * Opt-in time-based retention for the durable log (EB-85): records older
    * than `now - durableLogMaxAgeMs` (bus clock, `EventBusOptions.now`) are
    * evicted when their topic compacts, alongside the count bound above —
@@ -3082,6 +3152,18 @@ export interface BusStats {
    * readers never need a fallback.
    */
   expiringSoonAlerts: number;
+  /**
+   * Pull-mode consumption counters (EB-111): `pulls` counts `pull()` calls,
+   * `pulledMessages` the messages those calls returned, and
+   * `longPollTimeouts` the long polls that waited the full `waitMs`
+   * without a message arriving (expired empty). Always present, so
+   * readers never need a fallback.
+   */
+  pullStats: {
+    pulls: number;
+    pulledMessages: number;
+    longPollTimeouts: number;
+  };
   /**
    * Total publish/subscribe operations denied by the broker-level ACL
    * (see `setAclRules`). Every denied publish is also counted in
@@ -3846,6 +3928,31 @@ interface CompositeSubscriberState {
   mode: 'any' | 'all';
   /** Composite-cache keys held by this subscription. */
   cacheKeys: string[];
+}
+
+/** One pending `EventBus.pull` long-poll waiter (EB-111). */
+interface PullWaiter {  /** Exclusive per-topic offset the waiter is polling from. */
+  fromOffset: number;
+  /** Maximum messages to hand the waiter on wake. */
+  maxMessages: number;
+  /**
+   * Resolves the waiter's promise: clears the timer, unregisters the
+   * waiter, and counts the returned messages in the pull stats.
+   */
+  resolve: (messages: PulledMessage[]) => void;
+  /** Expiry timer for `waitMs`; `unref`'d so a pending poll never keeps the process alive. */
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * One entry of the per-topic pull ring buffer (EB-111): a pulled message
+ * plus its TTL deadline, so the ring path skips expired messages exactly
+ * like the durable-log path does. The deadline is bus-internal — it never
+ * leaks onto `PulledMessage`.
+ */
+interface PullRingEntry extends PulledMessage {
+  /** TTL deadline in milliseconds (bus clock); `undefined` when no TTL rule matched. */
+  expiresAt?: number;
 }
 
 interface Subscriber {
@@ -8374,6 +8481,20 @@ export class EventBus {
    */
   private readonly durableLog?: DurableTopicLog;
   /**
+   * Pull-mode consumption state (EB-111): per-topic ring of the most
+   * recent admitted messages (bounded by `pullBufferSize`), feeding
+   * `pull()` on buses without a durable log; per-topic sets of pending
+   * long-poll waiters, woken synchronously on the next admitted publish.
+   */
+  private readonly pullRing = new Map<string, PullRingEntry[]>();
+  private readonly pullWaiters = new Map<string, Set<PullWaiter>>();
+  /** `EventBusOptions.pullBufferSize` as configured (default 1000). */
+  private readonly pullBufferSize: number;
+  /** Pull-mode counters surfaced as `getStats().pullStats` (EB-111). */
+  private totalPulls = 0;
+  private totalPulledMessages = 0;
+  private totalLongPollTimeouts = 0;
+  /**
    * Attached outbox relay (EB-102), present only after
    * `attachOutboxRelay`. Its lag feeds `getStats()` (`outboxPending` /
    * `outboxLagMs` / `outboxCursor` / `outboxRelayed`) and the Prometheus
@@ -8761,6 +8882,16 @@ export class EventBus {
       maxEntries: subscriptionAuditMaxEntries,
       now: this.now,
     });
+    // Pull-mode ring buffer size (EB-111): validated fail-fast like the
+    // other bounded options above.
+    const pullBufferSize = options?.pullBufferSize;
+    if (
+      pullBufferSize !== undefined &&
+      (!Number.isInteger(pullBufferSize) || pullBufferSize < 1)
+    ) {
+      throw new RangeError('pullBufferSize must be a positive integer');
+    }
+    this.pullBufferSize = pullBufferSize ?? 1000;
   }
 
   /**
@@ -15350,6 +15481,248 @@ export class EventBus {
   }
 
   /**
+   * Pull-mode consumption (EB-111): opt-in long-polling pull, the
+   * complement to push `subscribe`. Returns up to `opts.maxMessages`
+   * messages on the exact topic with `seq > (opts.fromOffset ?? 0)`, in
+   * ascending `seq` order.
+   *
+   * Semantics, and why they are the way they are:
+   * - **Exact topic only.** `topic` must not contain `*` (`RangeError`
+   *   otherwise): pull offsets live in one topic's sequence space
+   *   (EB-13), and a pattern fan-out would mix several topics' sequence
+   *   numbers into one unreadable cursor.
+   * - **Caller-owned cursor, at-least-once.** The bus keeps no server-side
+   *   cursor: pass back the last returned message's `seq` as `fromOffset`
+   *   to advance. Not advancing returns the same messages again — every
+   *   message is delivered at least once, duplicates are the caller's to
+   *   dedupe. Concurrent `pull` calls on the same topic are allowed; each
+   *   carries its own offset, so they never disturb each other.
+   * - **Message source.** With `EventBusOptions.durableLogDir` the pull
+   *   reads the durable log (`readSince`, `seq > fromOffset`), so a
+   *   restarted bus keeps pulling from the same offset. Without a durable
+   *   log it reads a per-topic in-memory ring of the most recent
+   *   `pullBufferSize` admitted messages (default 1000) — history older
+   *   than the ring is simply unavailable, and an unknown topic resolves
+   *   to `[]`, never an error.
+   * - **Long poll.** When nothing newer than `fromOffset` is available and
+   *   `waitMs > 0`, the call waits up to `waitMs` for the next publish on
+   *   the topic instead of returning `[]` immediately; on expiry it
+   *   resolves `[]` (counted in `getStats().pullStats.longPollTimeouts`).
+   *   The wait timer is `unref()`'d, so a pending poll never keeps the
+   *   process alive.
+   * - **Orthogonal to reliable delivery / ACK.** Pulled messages never
+   *   enter the `AckTracker`, never consume ACK timeouts, and never move
+   *   `getStats().unackedDeliveries` — pull and push-ACK are independent
+   *   consumption contracts on the same stream.
+   * - **Application payloads.** Returned `payload`s are the same values a
+   *   push subscriber's handler receives: compressed payloads are
+   *   inflated, binary payloads stay bytes. TTL-expired records are never
+   *   returned (they are dead to every consumer).
+   *
+   * Validation throws `RangeError` before anything is read: an empty
+   * topic, a pattern topic, `maxMessages < 1`, a negative/non-finite
+   * `waitMs`, or a negative/non-integer `fromOffset`. A denied namespace
+   * or an unauthorized topic throws exactly like `subscribe` does.
+   */
+  async pull(topic: string, opts: PullOptions): Promise<PulledMessage[]> {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('pull: topic must be a non-empty string');
+    }
+    if (topic.includes('*')) {
+      throw new RangeError(
+        'pull: topic must be an exact topic name — patterns are not supported ' +
+          '(pull offsets live in one topic\'s sequence space; a pattern fan-out would mix sequence spaces)',
+      );
+    }
+    const maxMessages = opts.maxMessages;
+    if (!Number.isInteger(maxMessages) || maxMessages < 1) {
+      throw new RangeError('pull: maxMessages must be an integer >= 1');
+    }
+    const waitMs = opts.waitMs ?? 0;
+    if (
+      typeof waitMs !== 'number' ||
+      !Number.isFinite(waitMs) ||
+      waitMs < 0 ||
+      waitMs > 2147483647
+    ) {
+      throw new RangeError('pull: waitMs must be a finite number >= 0');
+    }
+    const fromOffset = opts.fromOffset ?? 0;
+    if (!Number.isInteger(fromOffset) || fromOffset < 0) {
+      throw new RangeError('pull: fromOffset must be an integer >= 0');
+    }
+    // Multi-tenant namespace (EB-52): resolved exactly like `subscribe` —
+    // the concrete `<namespace>/<topic>` is the pull topic.
+    const scope = this.resolveNamespaceForSubscribe(opts.namespace, topic);
+    if (scope !== undefined) topic = scope.internalPattern;
+    // Broker-level ACL: same verdict as `subscribe` — an unauthorized pull
+    // is audited and rejected, never answered with silence.
+    if (!this.aclAllowsSubscribe(topic)) {
+      this.emitAuthzDenied('subscribe', undefined, topic);
+      throw new AclDeniedError('subscribe', topic);
+    }
+    this.totalPulls += 1;
+    const available = this.readPullAvailable(topic, fromOffset, maxMessages);
+    if (available.length > 0 || waitMs === 0) {
+      this.totalPulledMessages += available.length;
+      return available;
+    }
+    // Long poll: `publish()` is fully synchronous, so nothing can
+    // interleave between the read above and the waiter registration inside
+    // the promise executor (which runs synchronously) — but the re-check
+    // below still guards the theoretical gap, so a message is never
+    // missed between the two reads.
+    return new Promise<PulledMessage[]>((resolvePromise) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const waiter: PullWaiter = {
+        fromOffset,
+        maxMessages,
+        resolve: (messages: PulledMessage[]) => {
+          clearTimeout(timer);
+          const set = this.pullWaiters.get(topic);
+          if (set !== undefined) {
+            set.delete(waiter);
+            if (set.size === 0) this.pullWaiters.delete(topic);
+          }
+          this.totalPulledMessages += messages.length;
+          resolvePromise(messages);
+        },
+        timer: undefined as unknown as ReturnType<typeof setTimeout>,
+      };
+      timer = setTimeout(() => {
+        waiter.resolve([]);
+        this.totalLongPollTimeouts += 1;
+      }, waitMs);
+      // A pending long poll never keeps the process alive — the bus has no
+      // close/stop lifecycle; every timer in it is unref'd by convention,
+      // and the waiter self-resolves on expiry.
+      if (typeof timer.unref === 'function') timer.unref();
+      waiter.timer = timer;
+      let set = this.pullWaiters.get(topic);
+      if (set === undefined) {
+        set = new Set();
+        this.pullWaiters.set(topic, set);
+      }
+      set.add(waiter);
+      const raced = this.readPullAvailable(topic, fromOffset, maxMessages);
+      if (raced.length > 0) waiter.resolve(raced);
+    });
+  }
+
+  /**
+   * Reads the messages available for a pull (EB-111): up to `maxMessages`
+   * messages on `topic` with `seq > fromOffset`, ascending. With a durable
+   * log the source is the log (`readSince`); otherwise the in-memory pull
+   * ring. TTL-expired records are skipped — they are dead to every
+   * consumer. Never throws for an unknown topic (`readSince` on a missing
+   * topic and a missing ring both yield nothing).
+   */
+  private readPullAvailable(
+    topic: string,
+    fromOffset: number,
+    maxMessages: number,
+  ): PulledMessage[] {
+    const nowMs = this.now();
+    const log = this.durableLogForTopic(topic);
+    if (log !== undefined) {
+      const out: PulledMessage[] = [];
+      for (const rec of log.readSince(topic, fromOffset)) {
+        if (rec.expiresAt !== undefined && rec.expiresAt <= nowMs) continue;
+        out.push(this.pulledMessageFromRecord(rec));
+        if (out.length >= maxMessages) break;
+      }
+      return out;
+    }
+    const ring = this.pullRing.get(topic);
+    if (ring === undefined) return [];
+    const out: PulledMessage[] = [];
+    for (const entry of ring) {
+      if (entry.seq <= fromOffset) continue;
+      // TTL-expired entries are dead to every consumer (EB-58): pull never
+      // resurrects them — the same filter the durable-log path applies.
+      if (entry.expiresAt !== undefined && entry.expiresAt <= nowMs) continue;
+      const { expiresAt: _expired, ...message } = entry;
+      out.push(message);
+      if (out.length >= maxMessages) break;
+    }
+    return out;
+  }
+
+  /**
+   * Converts a durable-log record to a pulled message (EB-111): the wire
+   * payload is resolved to the application payload — a compressed
+   * envelope (EB-92) is inflated with the record's dictionary, exactly
+   * like replay does — so pull sees what push subscribers see.
+   */
+  private pulledMessageFromRecord(rec: DurableLogRecord): PulledMessage {
+    const wire = this.wirePayloadOfRecord(rec);
+    const payload = isCompressedPayload(wire)
+      ? inflateEnvelopePayload(wire, this.dictionaryForRecord(rec))
+      : wire;
+    return {
+      topic: rec.topic,
+      seq: rec.seq,
+      payload,
+      at: rec.at,
+      ...(rec.messageId === undefined ? {} : { messageId: rec.messageId }),
+      ...(rec.publisherId === undefined ? {} : { publisherId: rec.publisherId }),
+    };
+  }
+
+  /**
+   * Pull-mode publish bookkeeping (EB-111): called once per admitted
+   * message, right after the durable-log append — i.e. only for messages
+   * that cleared every admission gate (schema, ACL, rate limits) and drew
+   * a sequence number. Shed, rejected, buffered or barrier messages never
+   * reach this line, so they never appear in pulls. Feeds the per-topic
+   * ring buffer and wakes long-poll waiters on the topic.
+   */
+  private notePullPublish(
+    topic: string,
+    seq: number,
+    payload: unknown,
+    at: number,
+    expiresAt: number | undefined,
+    messageId: string | undefined,
+    publisherId: string | undefined,
+  ): void {
+    const cap = this.pullBufferSize;
+    let ring = this.pullRing.get(topic);
+    if (ring === undefined) {
+      ring = [];
+      this.pullRing.set(topic, ring);
+    }
+    ring.push({
+      topic,
+      seq,
+      payload,
+      at,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(messageId === undefined ? {} : { messageId }),
+      ...(publisherId === undefined ? {} : { publisherId }),
+    });
+    if (ring.length > cap) ring.splice(0, ring.length - cap);
+    this.wakePullWaiters(topic);
+  }
+
+  /**
+   * Wakes the pending long-poll waiters on a topic (EB-111): each waiter
+   * re-reads from its own `fromOffset` (offsets stay caller-owned — one
+   * waiter's progress never moves another's) and resolves with up to its
+   * `maxMessages`. A waiter whose offset is still unsatisfiable stays
+   * parked until its timer expires.
+   */
+  private wakePullWaiters(topic: string): void {
+    const waiters = this.pullWaiters.get(topic);
+    if (waiters === undefined || waiters.size === 0) return;
+    for (const waiter of [...waiters]) {
+      const messages = this.readPullAvailable(topic, waiter.fromOffset, waiter.maxMessages);
+      if (messages.length === 0) continue;
+      waiter.resolve(messages);
+    }
+  }
+
+  /**
    * Idempotent publish: within the idempotency window
    * (`EventBusOptions.idempotencyWindowMs`), a `(topic, messageId)` pair is
    * published at most once. A retry carrying the same `messageId` on the
@@ -19721,6 +20094,11 @@ export class EventBus {
             },
           }),
     });
+    // Pull-mode consumption (EB-111): the message cleared every admission
+    // gate and was stamped and logged — feed the per-topic pull ring
+    // buffer and wake long-poll waiters. The application payload (not the
+    // wire form) is what pull returns, matching push delivery.
+    this.notePullPublish(topic, msg.seq, payload, nowMs, expiresAt, cleanMessageId, publisherId);
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the
     // admitted message is additionally forwarded to the hub. The hub
@@ -20291,6 +20669,11 @@ export class EventBus {
       unregisteredTopicPublishes: this.unregisteredTopicPublishes,
       lateMessages: this.totalLateMessages,
       expiringSoonAlerts: this.totalExpiringSoonAlerts,
+      pullStats: {
+        pulls: this.totalPulls,
+        pulledMessages: this.totalPulledMessages,
+        longPollTimeouts: this.totalLongPollTimeouts,
+      },
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
       dedupDropped: this.totalDedupDropped,

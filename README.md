@@ -3423,3 +3423,66 @@ Semantics:
 `eventbus_expiring_soon_alerts_total` in the Prometheus exposition.
 Invalid options throw fail-fast from `subscribe` (`RangeError` for a
 negative/non-finite threshold, `TypeError` for a non-function callback).
+
+## Pull-mode consumption (long-polling) (EB-111)
+
+`bus.pull(topic, { maxMessages, waitMs?, fromOffset? })` is the opt-in
+pull-mode complement to push `subscribe`: it returns up to `maxMessages`
+messages on one exact topic with `seq > fromOffset`, in ascending `seq`
+order — the same per-topic sequence numbers (EB-13) push subscribers see
+on `BusMessage.seq`. No subscription is registered; the caller owns the
+cursor.
+
+```ts
+let offset = 0;
+for (;;) {
+  // Long-poll up to 5s for the next batch; resolves [] on expiry.
+  const batch = await bus.pull('orders', { maxMessages: 100, waitMs: 5000, fromOffset: offset });
+  for (const msg of batch) {
+    await handle(msg);          // your code
+    offset = msg.seq;           // advance only after handling
+  }
+}
+```
+
+Semantics:
+
+- **Caller-owned cursor, at-least-once.** The bus keeps no server-side
+  cursor — pass back the last handled message's `seq` as `fromOffset` to
+  advance. Not advancing returns the same messages again, so every
+  message is delivered at least once and duplicates are the caller's to
+  dedupe (e.g. via `messageId`). Concurrent `pull` calls on the same
+  topic are allowed; each carries its own offset and they never disturb
+  each other — the stateless contract that keeps pull horizontally
+  scalable.
+- **Exact topic only.** `topic` must not contain `*` (`RangeError`):
+  pull offsets live in one topic's sequence space, and a pattern fan-out
+  would mix several topics' sequence numbers into one unreadable cursor.
+- **Message source.** With `EventBusOptions.durableLogDir` the pull reads
+  the durable log (`readSince`, `seq > fromOffset`), so a restarted bus
+  keeps pulling from the same offset — the disaster-recovery counterpart
+  to `resumeFromSeq`. Without a durable log it reads a per-topic
+  in-memory ring of the most recent admitted messages
+  (`EventBusOptions.pullBufferSize`, default 1000); history older than
+  the ring is unavailable, and an unknown topic resolves `[]`, never an
+  error.
+- **Long poll.** When nothing newer than `fromOffset` is available and
+  `waitMs > 0`, the call waits up to `waitMs` for the next publish on
+  the topic instead of returning `[]` immediately; on expiry it resolves
+  `[]` (never throws). The wait timer is `unref()`'d, so a pending poll
+  never keeps the process alive.
+- **Orthogonal to reliable delivery / ACK.** Pulled messages never enter
+  the `AckTracker`, never consume ACK timeouts, and never move
+  `getStats().unackedDeliveries` — pull and push-ACK are independent
+  consumption contracts on the same stream.
+- **Application payloads.** Returned `payload`s are the same values a
+  push subscriber's handler receives (compressed payloads inflated,
+  binary payloads stay bytes); TTL-expired messages are never returned.
+  `messageId` / `publisherId` ride along when the publish carried them.
+
+`getStats().pullStats` reports `{ pulls, pulledMessages,
+longPollTimeouts }` bus-wide. Validation throws `RangeError` fail-fast
+(empty topic, pattern topic, `maxMessages < 1`, negative/non-finite
+`waitMs`, negative/non-integer `fromOffset`); a denied namespace or an
+unauthorized topic throws exactly like `subscribe` does
+(`NamespaceDeniedError` / `AclDeniedError`).
