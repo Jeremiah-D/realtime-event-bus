@@ -88,7 +88,20 @@ library.
   sample — the last acked message's accepted→ack latency — while each
   delivery still runs the tracker's uniform settle path (so
   `maxInflight` slots release and idle-ack activity records exactly as
-  with individual acks). `getStats().ackedRanges` counts the calls. The
+  with individual acks). `getStats().ackedRanges` counts the calls. Consumers that process out of
+  order or in subsets call `ackBatch(subId, deliveries)` / `nackBatch(subId,
+  deliveries)` (EB-107) to settle an arbitrary set of `Delivery` handles
+  in one call — the complement of `ackUpTo`'s contiguous range, amortizing
+  per-message bookkeeping. Each handle settles exactly like an individual
+  `ack()` / `nack()` (per-message ack-timeout/DLQ budget, per-message
+  ack-latency/trace/SLO sampling under the live-only guard; a batch nack
+  requeues each message at the tail in batch order, EB-11 FIFO), stale
+  handles are silent no-ops, and handles that never came from this
+  subscriber throw after the valid ones settle (one bad handle never
+  pollutes the rest of the batch). Returns the number actually settled;
+  unknown subscriber returns 0, non-reliable subscriber throws
+  `RangeError`. `getStats().ackBatches` / `getStats().nackBatches` count
+  the calls. The
   diagnostic goes through the normal publish
   pipeline (ACL, schema validation, rate limiting); an admission rejection
   suppresses it without affecting the DLQ move, and a dead-lettered
@@ -1745,6 +1758,12 @@ npm test
   auto-requeues, double/late settles are no-ops, unsubscribe cancels pending
   timers, redelivered messages keep their original TTL deadline, and
   `ackTimeoutMs` validation.
+- `test/ackbatch.test.ts` — batch settles (`ackBatch` / `nackBatch`,
+  EB-107): out-of-order subset acking, per-message nack tail-requeue in
+  batch order (EB-11 FIFO), duplicates/stale handles as no-ops, invalid
+  handles throw after the valid ones settle, empty batch no-op, unknown /
+  non-reliable subscriber rules, unwrapped-handle recognition, and
+  tracker-level `ackBatch` / `nackBatch` ownership validation.
 - `test/ackupto.test.ts` — cumulative ack (`ackUpTo`, EB-76): whole-range
   acking with the per-call count, silent skipping of non-outstanding seqs,
   `RangeError` on out-of-history seqs and non-reliable subscribers, 0 on

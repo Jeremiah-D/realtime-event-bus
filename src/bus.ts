@@ -3139,6 +3139,18 @@ export interface BusStats {
    */
   ackedRanges: number;
   /**
+   * Total batch-ack calls (`ackBatch`, EB-107) on known reliable
+   * subscribers — one per call, regardless of how many deliveries the
+   * batch actually settled.
+   */
+  ackBatches: number;
+  /**
+   * Total batch-nack calls (`nackBatch`, EB-107) on known reliable
+   * subscribers — one per call, regardless of how many deliveries the
+   * batch actually requeued.
+   */
+  nackBatches: number;
+  /**
    * Total DLQ diagnostic events admitted to their diagnostic topic (see
    * `DeadLetterOptions.diagnosticTopic`). Counted on admission, not
    * delivery — the event exists even when nothing subscribes to the
@@ -3867,6 +3879,26 @@ interface Subscriber {
      * `DeadLetterEntry.lastError` always describes the final failure.
      */
     lastFailure: WeakMap<BusMessage, string>;
+    /**
+     * EB-107: every delivery handle handed to the consumer, mapped to
+     * its underlying tracker handle plus the EB-53 delivery stamp. The
+     * consumer only ever sees these objects — the wrapped handle when
+     * instrumentation is enabled, the raw tracker handle itself
+     * otherwise — so `ackBatch` / `nackBatch` validate ownership
+     * against this map: a handle from another subscriber (or garbage)
+     * is invalid and throws.
+     */
+    batchHandles: WeakMap<
+      Delivery<BusMessage>,
+      { raw: Delivery<BusMessage>; deliveredAtMs: number }
+    >;
+    /**
+     * EB-107: which handle is currently outstanding per message,
+     * shared with the `trackDelivery` wrapper so batch settles apply
+     * the same live-only instrumentation guard as individual `ack()`
+     * calls.
+     */
+    liveDeliveries: WeakMap<BusMessage, { live: boolean }>;
   };
   /**
    * Present for reliable subscriptions with `deadLetter` enabled: the
@@ -7985,6 +8017,18 @@ export class EventBus {
    */
   private totalAckedRanges = 0;
   /**
+   * Batch-ack calls (`ackBatch`, EB-107): one per call on a known
+   * reliable subscriber, regardless of how many deliveries the batch
+   * actually settled.
+   */
+  private totalAckBatches = 0;
+  /**
+   * Batch-nack calls (`nackBatch`, EB-107): one per call on a known
+   * reliable subscriber, regardless of how many deliveries the batch
+   * actually requeued.
+   */
+  private totalNackBatches = 0;
+  /**
    * Messages flagged as DLQ diagnostics at creation (see
    * `DeadLetterOptions.diagnosticTopic`). A dead-lettered diagnostic
    * message never emits a second diagnostic — the recursion cut. The mark
@@ -11944,6 +11988,125 @@ export class EventBus {
   }
 
   /**
+   * Batch-acks an arbitrary set of delivery handles (EB-107): one call
+   * settles the whole set, amortizing the per-message bookkeeping of
+   * individual `ack()` calls. The out-of-order / subset complement of
+   * `ackUpTo`'s contiguous-range cumulative ack — use this when the
+   * consumer processes messages in any order or only a subset.
+   *
+   * Each valid handle settles exactly like an individual `ack()`: the
+   * tracker's settle path runs per delivery (timer cleanup,
+   * `maxInflight` slot release, idle-ack activity), and the
+   * instrumentation mirrors the wrapped handle's `ack()` — the trace
+   * `bus.ack` span closes, the ack-latency tracker samples, and the
+   * EB-53 processing-latency SLO records, all under the same live-only
+   * guard: only the currently outstanding delivery for a message
+   * samples. Stale handles (already settled, timed out, dead-lettered)
+   * are silent no-ops.
+   *
+   * Handles that did not come from this subscriber (another
+   * subscriber's handles, garbage input) are invalid: every valid
+   * handle still settles first, then an `Error` naming the invalid
+   * indexes is thrown — one bad handle never pollutes the rest of the
+   * batch. An empty array is a no-op returning `0`.
+   *
+   * Returns the number of deliveries actually settled. Unknown
+   * subscriber ids return `0` (like `ackUpTo`); a non-reliable
+   * subscriber throws `RangeError`.
+   *
+   * `getStats().ackBatches` counts the calls.
+   */
+  ackBatch(subId: string, deliveries: Array<Delivery<BusMessage>>): number {
+    return this.settleDeliveryBatch(subId, deliveries, false);
+  }
+
+  /**
+   * The nack mirror of {@link ackBatch} (EB-107): each valid handle
+   * requeues exactly like an individual `nack()` — immediate tail
+   * requeue per message (the EB-11 FIFO ordering), same
+   * ack-timeout/DLQ per-message budget — only the call overhead is
+   * amortized. Same validity rules: stale handles no-op, invalid
+   * handles throw after the valid ones settle. Returns the number of
+   * deliveries actually requeued.
+   *
+   * `getStats().nackBatches` counts the calls.
+   */
+  nackBatch(subId: string, deliveries: Array<Delivery<BusMessage>>): number {
+    return this.settleDeliveryBatch(subId, deliveries, true);
+  }
+
+  /**
+   * Shared implementation for {@link ackBatch} / {@link nackBatch}.
+   */
+  private settleDeliveryBatch(
+    subId: string,
+    deliveries: Array<Delivery<BusMessage>>,
+    requeue: boolean,
+  ): number {
+    const name = requeue ? 'nackBatch' : 'ackBatch';
+    if (!Array.isArray(deliveries)) {
+      throw new TypeError(`${name}: deliveries must be an array of Delivery handles`);
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) return 0;
+    const reliable = subscriber.reliable;
+    if (reliable == null) {
+      throw new RangeError(`${name}: subscriber is not a reliable (subscribeReliable) subscription`);
+    }
+    // Resolve the consumer-held handles to tracker handles, collecting
+    // invalid indexes. The tracker itself settles the valid ones and
+    // reports which actually settled, so duplicates and stale handles
+    // count exactly once (or not at all).
+    const raws: Array<Delivery<BusMessage>> = [];
+    const stamps = new Map<BusMessage, number>();
+    const invalid: number[] = [];
+    for (let i = 0; i < deliveries.length; i++) {
+      const entry = reliable.batchHandles.get(deliveries[i]);
+      if (entry === undefined) {
+        invalid.push(i);
+        continue;
+      }
+      raws.push(entry.raw);
+      // At most one delivery per message is outstanding at a time, so
+      // the message keys the EB-53 delivery stamp unambiguously.
+      stamps.set(entry.raw.msg, entry.deliveredAtMs);
+    }
+    const settled = requeue ? reliable.tracker.nackBatch(raws) : reliable.tracker.ackBatch(raws);
+    // Instrumentation mirrors the per-handle `ack()` / `nack()`
+    // wrappers: the same live-only guard decides whether an ack settle
+    // samples the trackers, so a batch ack behaves exactly like the
+    // equivalent sequence of individual acks.
+    const ackState = subscriber.ackLatency;
+    const sloState = subscriber.latencySlo;
+    for (const { msg } of settled) {
+      if (requeue) {
+        this.trace?.abandonAckSpan(msg);
+        continue;
+      }
+      const live = reliable.liveDeliveries.get(msg);
+      if (live !== undefined && live.live) {
+        if (ackState != null) ackState.tracker.sampleOnAck(msg);
+        if (sloState !== undefined) {
+          this.recordProcessingLatency(subscriber, sloState, stamps.get(msg) ?? this.now());
+        }
+        this.trace?.closeAckSpan(subscriber, msg, this.now());
+      }
+    }
+    if (requeue) {
+      this.totalNackBatches += 1;
+    } else {
+      this.totalAckBatches += 1;
+    }
+    if (invalid.length > 0) {
+      throw new Error(
+        `${name}: ${invalid.length} invalid delivery handle(s) at index(es) ${invalid.join(', ')} — ` +
+          `handles must come from this subscriber`,
+      );
+    }
+    return settled.length;
+  }
+
+  /**
    * Atomically replaces a live subscription's topic pattern (EB-74): from
    * the next publish on, the subscriber matches `newPattern` instead of
    * its registration pattern — no unsubscribe/resubscribe round-trip, no
@@ -12453,6 +12616,13 @@ export class EventBus {
     // finishes — a late ack() on a stale handle records nothing against
     // the restarted clock.
     const liveDeliveries = new WeakMap<BusMessage, { live: boolean }>();
+    // EB-107: ownership registry for batch settles — every handle the
+    // consumer receives (wrapped or raw), mapped to its tracker handle
+    // and the EB-53 delivery stamp.
+    const batchHandles = new WeakMap<
+      Delivery<BusMessage>,
+      { raw: Delivery<BusMessage>; deliveredAtMs: number }
+    >();
     const tracker = new AckTracker<BusMessage>({
       ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
       now: this.now,
@@ -12504,7 +12674,7 @@ export class EventBus {
         this.scheduleFlush();
       },
     });
-    subscriber.reliable = { tracker, redeliveries, lastFailure };
+    subscriber.reliable = { tracker, redeliveries, lastFailure, batchHandles, liveDeliveries };
     if (dlq != null) {
       subscriber.deadLetter = { entries: [], nextSeq: 0, ...dlq };
     }
@@ -12532,10 +12702,15 @@ export class EventBus {
       // guard), mirroring the ack-latency tracker's single-sample rule.
       const sloState = subscriber.latencySlo;
       const deliveredAtMs = sloState === undefined ? 0 : this.now();
-      if (ackState == null && !ackTraced && sloState === undefined) return delivery;
+      if (ackState == null && !ackTraced && sloState === undefined) {
+        // EB-107: register even the raw handle — the consumer holds it
+        // directly in this branch, and batch settles must recognize it.
+        batchHandles.set(delivery, { raw: delivery, deliveredAtMs });
+        return delivery;
+      }
       const live = { live: true };
       liveDeliveries.set(msg, live);
-      return {
+      const wrapped: Delivery<BusMessage> = {
         ...delivery,
         ack: () => {
           delivery.ack();
@@ -12555,6 +12730,10 @@ export class EventBus {
           delivery.nack();
         },
       };
+      // EB-107: the consumer holds `wrapped`; batch settles resolve it
+      // back to the tracker handle through this registry.
+      batchHandles.set(wrapped, { raw: delivery, deliveredAtMs });
+      return wrapped;
     };
     deliver = (msgOrBatch) => {
       // Batched delivery: one tracked envelope per message in the batch,
@@ -19843,6 +20022,8 @@ export class EventBus {
       signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
       ackedRanges: this.totalAckedRanges,
+      ackBatches: this.totalAckBatches,
+      nackBatches: this.totalNackBatches,
       diagnosticEvents: this.totalDiagnosticEvents,
       compressedMessages: this.totalCompressed,
       compressedBytesBefore: this.totalCompressedBytesBefore,

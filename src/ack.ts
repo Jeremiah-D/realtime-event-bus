@@ -115,6 +115,14 @@ export class AckTracker<T> {
   private readonly now: () => number;
   private readonly pending = new Map<number, PendingDelivery<T>>();
   private nextSeq = 0;
+  /**
+   * Every handle this tracker ever issued, mapped to its record (EB-107).
+   * Settle-by-handle (`ackBatch` / `nackBatch`) looks the handle up here
+   * to tell an issued-but-stale handle (silent no-op, like `ack()`) from
+   * a foreign handle this tracker never issued (invalid — throws). A
+   * `WeakMap` so a consumer that drops its handles never pins memory.
+   */
+  private readonly issued = new WeakMap<Delivery<T>, { seq: number; record: PendingDelivery<T> }>();
 
   constructor(options: AckTrackerOptions<T>) {
     if (!Number.isFinite(options.ackTimeoutMs) || options.ackTimeoutMs <= 0) {
@@ -178,7 +186,7 @@ export class AckTracker<T> {
     const handle = record.timer as unknown as { unref?: () => unknown };
     if (typeof handle.unref === 'function') handle.unref();
     this.pending.set(seq, record);
-    return {
+    const delivery: Delivery<T> = {
       msg,
       seq,
       redeliveries,
@@ -186,6 +194,8 @@ export class AckTracker<T> {
       ack: () => this.settleOne(seq, record, false),
       nack: () => this.settleOne(seq, record, true),
     };
+    this.issued.set(delivery, { seq, record });
+    return delivery;
   }
 
   /**
@@ -212,6 +222,82 @@ export class AckTracker<T> {
       acked.push({ seq: s, msg: record.msg });
     }
     return acked;
+  }
+
+  /**
+   * Settles an arbitrary set of delivery handles at once (EB-107): the
+   * high-throughput alternative to acking each `Delivery` handle when
+   * the consumer processes messages out of order or in subsets — the
+   * complement of [`ackUpTo`](AckTracker#ackUpTo)'s contiguous-range
+   * cumulative ack. Amortizes the per-message bookkeeping: one call
+   * settles the whole set instead of one call per delivery.
+   *
+   * Each handle settles exactly like an individual `ack()` — same
+   * timer cleanup, same `onAck`/`onSettle` hooks, no requeue —
+   * including the ack-latency / trace / SLO choke points that sit on
+   * the settle path. Stale handles (already settled, timed out, or
+   * dead-lettered) are silent no-ops, exactly like `ack()` itself.
+   *
+   * Handles this tracker never issued (foreign handles from another
+   * subscriber, garbage input) are invalid: every valid handle still
+   * settles, then an `Error` naming the invalid indexes is thrown —
+   * one bad handle never pollutes the rest of the batch. An empty
+   * array is a no-op returning `[]`.
+   *
+   * Returns the settled deliveries in batch order, so the caller can
+   * run per-delivery side effects (trace spans, ack-latency sampling).
+   */
+  ackBatch(deliveries: Array<Delivery<T>>): Array<{ seq: number; msg: T }> {
+    return this.settleBatch(deliveries, false);
+  }
+
+  /**
+   * The nack mirror of [`ackBatch`](AckTracker#ackBatch) (EB-107): each
+   * handle requeues exactly like an individual `nack()` — immediate
+   * tail requeue per message (the EB-11 FIFO ordering), `onRedeliver`
+   * with reason `'nack'`, same ack-timeout/DLQ per-message budget —
+   * only the call overhead is amortized. Same validity rules: stale
+   * handles no-op, invalid handles throw after the valid ones settle.
+   */
+  nackBatch(deliveries: Array<Delivery<T>>): Array<{ seq: number; msg: T }> {
+    return this.settleBatch(deliveries, true);
+  }
+
+  /**
+   * Shared settle-by-handle loop for `ackBatch` / `nackBatch`.
+   */
+  private settleBatch(
+    deliveries: Array<Delivery<T>>,
+    requeue: boolean,
+  ): Array<{ seq: number; msg: T }> {
+    const name = requeue ? 'nackBatch' : 'ackBatch';
+    const settled: Array<{ seq: number; msg: T }> = [];
+    const invalid: number[] = [];
+    for (let i = 0; i < deliveries.length; i++) {
+      const handle = deliveries[i];
+      const entry =
+        handle !== null && (typeof handle === 'object' || typeof handle === 'function')
+          ? this.issued.get(handle)
+          : undefined;
+      if (entry === undefined) {
+        invalid.push(i);
+        continue;
+      }
+      // The issued guard is the validity check; the settled guard is
+      // the staleness check. A stale handle no-ops here exactly the way
+      // the handle's own `ack()` / `nack()` would.
+      if (!entry.record.settled) {
+        this.settleOne(entry.seq, entry.record, requeue);
+        settled.push({ seq: entry.seq, msg: entry.record.msg });
+      }
+    }
+    if (invalid.length > 0) {
+      throw new Error(
+        `${name}: ${invalid.length} invalid delivery handle(s) at index(es) ${invalid.join(', ')} — ` +
+          `handles must come from this tracker's track()`,
+      );
+    }
+    return settled;
   }
 
   /**
