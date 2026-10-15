@@ -40,6 +40,8 @@
  *   subscriber dead-letter queues.
  * - `eventbus_sequence_gaps_total`: sequence numbers observed missing by
  *   subscribers (see `TopicStats.sequenceGaps` for the counting rules).
+ * - `eventbus_expiring_soon_alerts_total`: TTL expiring-soon warnings
+ *   fired for subscriber queue heads (EB-110).
  * - `eventbus_keyed_reordered_messages_total`: keyed messages held in
  *   per-(subscriber, key) reorder buffers because an earlier keySeq had not
  *   been fanned out yet — the observable count of per-key publish-order
@@ -324,6 +326,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_sequence_gaps_total',
     'Total sequence numbers observed missing by subscribers.',
     stats.sequenceGaps,
+  );
+  counter(
+    'eventbus_expiring_soon_alerts_total',
+    'Total TTL expiring-soon warnings fired for subscriber queue heads (EB-110).',
+    stats.expiringSoonAlerts ?? 0,
   );
   counter(
     'eventbus_keyed_reordered_messages_total',

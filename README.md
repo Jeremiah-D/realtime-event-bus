@@ -2796,6 +2796,7 @@ Exported series:
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
 | `eventbus_diagnostic_events_total` | counter | `diagnosticEvents` — admitted DLQ diagnostic events |
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
+| `eventbus_expiring_soon_alerts_total` | counter | `expiringSoonAlerts` — TTL expiring-soon warnings fired for subscriber queue heads (EB-110) |
 | `eventbus_keyed_reordered_messages_total` | counter | `keyedReorderedMessages` — keyed messages held in per-(subscriber, key) reorder buffers |
 | `eventbus_causal_buffer_dropped_messages_total` | counter | `causalBuffer.droppedMessages` — causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock) |
 | `eventbus_causal_buffer_regressed_messages_total` | counter | `causalBuffer.regressedMessages` — causal messages delivered immediately on clock regression |
@@ -3377,3 +3378,48 @@ Semantics notes:
   (`getSubscriptionAudit({ action: 'rebalance' })` → `detail.assignor` +
   `detail.assignment`), so an operator can reconstruct exactly who owned
   what after the fact.
+
+## TTL expiring-soon warnings (EB-110)
+
+`SubscribeOptions.expiringSoon` (`src/expiring.ts`) arms an early warning
+that a slow consumer is about to lose messages to TTL expiry (EB-10): when
+the oldest queued message's remaining TTL is at or below `expiringSoonMs`,
+the bus calls `onExpiringSoon` — before the messages are silently
+discarded as `expired`, while there is still time to intervene (scale the
+consumer, raise the TTL, shed the backlog).
+
+```ts
+bus.setTopicTtl('orders.**', 30_000);
+bus.subscribe('orders.**', handler, {
+  expiringSoon: {
+    expiringSoonMs: 5_000, // warn when the head has <= 5s of life left
+    onExpiringSoon: ({ subscriberId, pattern, remainingMs, queueDepth, at }) => {
+      alert(`consumer ${subscriberId} on ${pattern}: head expires in ${remainingMs}ms, ${queueDepth} queued`);
+    },
+  },
+});
+```
+
+Semantics:
+
+- **Read-only.** The warning never changes delivery or TTL semantics: the
+  message still delivers if the consumer catches up, still expires if it
+  does not. Messages without a TTL never warn.
+- **Edge-triggered, re-arms on drain.** The callback fires once per
+  backlog — even as the head turns over — and re-arms when the queue
+  drains empty. (This differs from the lag monitor's latch, which re-arms
+  when the watermark drops below its threshold.)
+- **Already-expired heads still warn.** A head past its deadline fires
+  with a non-positive `remainingMs` — the loudest possible signal that
+  the consumer is behind.
+- **Error-isolated.** A throwing `onExpiringSoon` is swallowed; a
+  monitoring hook can never break the publish or drain path.
+- **Evaluated on every enqueue and after every drain**, on the bus's
+  injected clock (`EventBusOptions.now`) — a completely idle bus cannot
+  observe its own deadlines approaching, the same documented limitation
+  as the lag watermark.
+
+`getStats().expiringSoonAlerts` counts every warning bus-wide, rendered as
+`eventbus_expiring_soon_alerts_total` in the Prometheus exposition.
+Invalid options throw fail-fast from `subscribe` (`RangeError` for a
+negative/non-finite threshold, `TypeError` for a non-function callback).

@@ -41,6 +41,12 @@ import {
   type SubscriberLagState,
 } from './lag.ts';
 import {
+  resolveExpiringSoonOptions,
+  type ExpiringSoonEvent,
+  type ExpiringSoonOptions,
+  type SubscriberExpiringState,
+} from './expiring.ts';
+import {
   HOT_KEYS_LIMIT,
   resolveKeyHotspotOptions,
   type HotKeyStat,
@@ -862,6 +868,16 @@ export interface SubscribeOptions {
    * throws, since the callback could never fire. Disabled by default.
    */
   lagMonitor?: boolean | LagMonitorOptions;
+  /**
+   * Opt-in TTL expiring-soon warnings (see `src/expiring.ts`, EB-110):
+   * warns when the oldest queued message's remaining TTL is at or below
+   * `expiringSoonMs` — the early signal that a slow consumer is about to
+   * lose messages to TTL expiry. Purely read-only: the warning never
+   * changes delivery or TTL semantics. Edge-triggered, re-arms when the
+   * queue drains empty; a throwing callback is swallowed (error-isolated).
+   * Disabled by default.
+   */
+  expiringSoon?: ExpiringSoonOptions;
   /**
    * Opt-in per-(subscriber, key) hotspot monitoring (see `PublishOptions.key`
    * and `src/keyhotspot.ts`). When enabled, the bus samples the depth of
@@ -3059,6 +3075,14 @@ export interface BusStats {
    */
   lateMessages: number;
   /**
+   * Total TTL expiring-soon warnings fired across all subscribers (see
+   * `SubscribeOptions.expiringSoon`, EB-110). Counts each warning once;
+   * rendered as `eventbus_expiring_soon_alerts_total` in `src/metrics.ts`.
+   * 0 when no warning was ever armed — the field is always present, so
+   * readers never need a fallback.
+   */
+  expiringSoonAlerts: number;
+  /**
    * Total publish/subscribe operations denied by the broker-level ACL
    * (see `setAclRules`). Every denied publish is also counted in
    * `rejectedMessages`; every denied subscribe throws `AclDeniedError`.
@@ -3987,6 +4011,11 @@ interface Subscriber {
    * Absent when monitoring is disabled for this subscriber.
    */
   lag?: SubscriberLagState;
+  /**
+   * TTL expiring-soon monitoring state (see `SubscribeOptions.expiringSoon`).
+   * Absent when monitoring is disabled for this subscriber.
+   */
+  expiring?: SubscriberExpiringState;
   /**
    * Keyed hotspot monitoring state (see `SubscribeOptions.keyHotspot`).
    * Absent when monitoring is disabled for this subscriber.
@@ -7478,6 +7507,11 @@ export class EventBus {
    * `getStats().expiredLeases`.
    */
   private totalExpiredLeases = 0;
+  /**
+   * TTL expiring-soon warnings fired (see `src/expiring.ts`, EB-110).
+   * Surfaced as `getStats().expiringSoonAlerts`.
+   */
+  private totalExpiringSoonAlerts = 0;
   /**
    * Active subscription-lease timers (see `src/lease.ts`, EB-69), keyed
    * by subscription id. Armed at subscribe time, cleared from every
@@ -11310,6 +11344,9 @@ export class EventBus {
     const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const expiring = resolveExpiringSoonOptions(opts?.expiringSoon, 'subscribe');
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const keyHotspot = resolveKeyHotspotOptions(opts?.keyHotspot);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -11486,6 +11523,7 @@ export class EventBus {
       ackLatency,
       latencySlo,
       lag: lagMonitor,
+      expiring,
       keyHotspot,
       causal,
       // Barrier cut-marker gate (EB-98): opt-in per subscriber.
@@ -17803,6 +17841,13 @@ export class EventBus {
       lag.enqueuedAt.set(msg, nowMs);
       this.checkLag(subscriber, lag, nowMs);
     }
+    const expiring = subscriber.expiring;
+    if (expiring != null && result === 'accepted') {
+      // Evaluate the TTL warning on every accepted enqueue: a message
+      // arriving while the head's remaining TTL sits inside the warning
+      // window trips the alert here, without waiting for the next drain.
+      this.checkExpiringSoon(subscriber, expiring, this.now());
+    }
     const ackLatency = subscriber.ackLatency;
     if (ackLatency != null && result === 'accepted') {
       // Stamp the accepted time for the ack-latency tracker (see
@@ -17940,6 +17985,47 @@ export class EventBus {
     }
   }
 
+  /**
+   * Evaluates an expiring-soon-monitored subscriber's queue head against
+   * its warning threshold (see `SubscribeOptions.expiringSoon`, EB-110).
+   * Fires `onExpiringSoon` once per excursion — when the head message's
+   * remaining TTL is at or below `expiringSoonMs` while the latch is clear
+   * — and re-arms the latch when the queue drains empty. Messages without
+   * a TTL (`Infinity` remaining) never warn. A throwing callback is
+   * swallowed: a monitoring hook must never break the publish/drain path.
+   * Purely read-only — delivery and TTL semantics are never touched.
+   */
+  private checkExpiringSoon(
+    subscriber: Subscriber,
+    expiring: SubscriberExpiringState,
+    nowMs: number,
+  ): void {
+    const head = subscriber.queue.peekOldest();
+    if (head === undefined) {
+      // Queue drained: re-arm the latch for the next backlog.
+      expiring.alerted = false;
+      return;
+    }
+    const deadline = this.messageDeadlines.get(head);
+    const remainingMs = deadline === undefined ? Infinity : deadline - nowMs;
+    if (remainingMs <= expiring.expiringSoonMs && !expiring.alerted) {
+      expiring.alerted = true;
+      this.totalExpiringSoonAlerts += 1;
+      try {
+        expiring.onExpiringSoon({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          remainingMs,
+          expiringSoonMs: expiring.expiringSoonMs,
+          queueDepth: subscriber.queue.size,
+          at: nowMs,
+        });
+      } catch {
+        // Error isolation (EB-110): swallow — monitoring must never break
+        // the publish/drain path.
+      }
+    }
+  }
   /**
    * Evaluates one (subscriber, key) ordering stream's reorder-buffer depth
    * against the hotspot alert threshold (see `SubscribeOptions.keyHotspot`
@@ -18443,6 +18529,10 @@ export class EventBus {
       const nowMs = this.now();
       lag.enqueuedAt.set(msg, nowMs);
       this.checkLag(subscriber, lag, nowMs);
+    }
+    const expiring = subscriber.expiring;
+    if (expiring != null && result === 'accepted') {
+      this.checkExpiringSoon(subscriber, expiring, this.now());
     }
     const tracer = this.trace;
     if (tracer !== undefined && result === 'accepted' && tracer.hasTrace(msg)) {
@@ -20200,6 +20290,7 @@ export class EventBus {
       deprecatedSchemaVersions: this.totalDeprecatedSchemaVersions,
       unregisteredTopicPublishes: this.unregisteredTopicPublishes,
       lateMessages: this.totalLateMessages,
+      expiringSoonAlerts: this.totalExpiringSoonAlerts,
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
       dedupDropped: this.totalDedupDropped,
@@ -20931,6 +21022,11 @@ export class EventBus {
     // production path's tail.
     const lag = subscriber.lag;
     if (lag != null) this.checkLag(subscriber, lag, nowMs);
+    // Re-evaluate the TTL warning after the drain: the head moved (a new
+    // head may sit inside the warning window) or the queue drained
+    // (re-arming a fired alert).
+    const expiring = subscriber.expiring;
+    if (expiring != null) this.checkExpiringSoon(subscriber, expiring, nowMs);
   }
 
   /**
@@ -21237,6 +21333,11 @@ export class EventBus {
     // batched subscribers alike.
     const lag = subscriber.lag;
     if (lag != null) this.checkLag(subscriber, lag, nowMs);
+    // Re-evaluate the TTL warning after the drain, same coverage: a new
+    // head inside the warning window fires (latch clear), a drained queue
+    // re-arms the latch.
+    const expiring = subscriber.expiring;
+    if (expiring != null) this.checkExpiringSoon(subscriber, expiring, nowMs);
   }
 
   /**
