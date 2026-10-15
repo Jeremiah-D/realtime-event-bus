@@ -2566,6 +2566,48 @@ How it works:
   decision: delayed schedules, pause-buffered messages, and bridge/cluster
   ingress fan out as ordinary (partition-0) publishes.
 
+## Admission dry-run: previewPublish
+
+`bus.previewPublish(topic, payload, opts?)` (`src/bus.ts`, EB-108 —
+backend engineering) walks the FULL publish-side admission gate sequence
+with ZERO side effects and reports the verdict:
+
+```ts
+bus.previewPublish('orders.eu', order);
+// -> { admitted: true }
+
+bus.pauseTopic('orders.*');
+bus.previewPublish('orders.eu', order);
+// -> { admitted: false, reason: 'topic-paused', failedGate: 'topic-pause' }
+```
+
+The gate walk mirrors `publish` / `publishIdempotent` exactly: topic-alias
+resolution (EB-44) → partition routing (EB-90) → topic pause (EB-88) →
+per-publisher rate limit (EB-79) → ACL (EB-41) → schema validation incl.
+versioned schemas (EB-20/EB-86) → per-message size cap (EB-64) →
+per-topic rate limit (EB-19). With a non-empty `opts.messageId` the
+idempotent-dedup suppression gate (EB-27) is consulted where
+`publishIdempotent` consults it (after the ACL, before the remaining
+gates). The verdict is computed by the same pure shadow decider
+(`admissionVerdict`) that `publishAtomic`'s phase-1 admission uses, so a
+preview and the real path agree gate-for-gate.
+
+Zero side effects means: no sequence number consumed (no downstream
+gap), no durable-log writes, no rate-limit tokens taken (budgets are
+peeked read-only — repeated previews never drain anything), no enqueue,
+no stats counters moved, no subscription-audit events, no idempotency
+slot claimed, and no `onAdmissionRejected` callback invocation. Option
+validation throws exactly like `publish` (`RangeError` / `TypeError` /
+`NamespaceDeniedError`); an out-of-range explicit partition throws
+`RangeError`, never a rejection, like `publish`.
+
+Intentional divergences (documented in `src/bus.ts`): a preview never
+claims the `(topic, messageId)` dedup slot — a real `publishIdempotent`
+after the preview still admits once; chaos faults (EB-103) are not
+evaluated (they are one-shot injections); the advisory topic-registry
+check (EB-77) is skipped; barrier cut markers (`opts.barrier`) take the
+slim alias→ACL admission path, mirroring `fanOutBarrier`.
+
 ## Declarative configuration snapshots
 
 `exportBusConfig()` / `applyConfig(snapshot, { dryRun? })` /

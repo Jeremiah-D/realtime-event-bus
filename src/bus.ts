@@ -5631,6 +5631,66 @@ export type AtomicRejectReason =
   | 'topic-paused';
 
 /**
+ * Which publish-side admission gate decided a `previewPublish` call — the
+ * `failedGate` half of `PreviewPublishResult`. One name per gate in the
+ * walk, in walk order:
+ * - `'topic-alias'`: topic-alias resolution (EB-44) — the only gate whose
+ *   reason is `'alias-retired'`
+ * - `'partition-routing'`: publish-side partition routing (EB-90) — walked
+ *   (the range check runs), but an out-of-range explicit partition throws
+ *   `RangeError` instead of rejecting, exactly like `publish`, so this
+ *   name never appears as a `failedGate` in practice
+ * - `'topic-pause'`: topic pause (EB-88), reason `'topic-paused'`
+ * - `'publisher-rate-limit'`: per-publisher rate limiting (EB-79)
+ * - `'acl'`: broker-level ACL (EB-41)
+ * - `'schema'`: schema validation incl. versioned schemas (EB-20/EB-86)
+ * - `'max-message-bytes'`: per-message size cap (EB-64), reason
+ *   `'message-too-big'`
+ * - `'topic-rate-limit'`: per-topic rate limiting (EB-19), reason
+ *   `'rate-limit'`
+ * - `'idempotency-dedup'`: idempotent-dedup suppression (EB-27), reason
+ *   `'duplicate'` — only consulted when `PublishOptions.messageId` is a
+ *   non-empty string, mirroring `publishIdempotent`
+ */
+export type PreviewGateName =
+  | 'topic-alias'
+  | 'partition-routing'
+  | 'topic-pause'
+  | 'publisher-rate-limit'
+  | 'acl'
+  | 'schema'
+  | 'max-message-bytes'
+  | 'topic-rate-limit'
+  | 'idempotency-dedup';
+
+/**
+ * The admission verdict for a publish that was never executed (see
+ * `EventBus.previewPublish`, EB-108). `admitted` is true when the publish
+ * would clear every admission gate; otherwise `reason` (the
+ * `AdmissionRejectReason` vocabulary) and `failedGate` name the gate that
+ * would have rejected it. A preview consumes no sequence number, writes
+ * nothing to the durable log, burns no rate-limit budget, claims no
+ * idempotency slot, moves no stats counter, and never fires
+ * `onAdmissionRejected` — the verdict is computed by the same code as the
+ * real publish path, in shadow mode.
+ */
+export interface PreviewPublishResult {
+  /** Whether the publish would clear every admission gate. */
+  admitted: boolean;
+  /**
+   * Which admission gate would have rejected the publish
+   * (`AdmissionRejectReason` vocabulary) — present only when `admitted`
+   * is false.
+   */
+  reason?: AdmissionRejectReason;
+  /**
+   * Name of the gate that would have rejected the publish — present only
+   * when `admitted` is false.
+   */
+  failedGate?: PreviewGateName;
+}
+
+/**
  * Pause mode for `EventBus.pauseTopic` (EB-88, ops window):
  * - `'shed'` (default): publishes to a matching topic are rejected
  *   outright while the pause is active — counted in
@@ -15439,6 +15499,152 @@ export class EventBus {
   }
 
   /**
+   * Admission dry-run (EB-108, backend engineering): walks the FULL
+   * publish-side admission gate sequence for `(topic, payload, opts)`
+   * with ZERO side effects and reports the verdict — `{ admitted: true }`
+   * when the publish would clear every gate, otherwise
+   * `{ admitted: false, reason, failedGate }` naming the rejecting gate.
+   *
+   * Gate walk, in order (mirroring `fanOut` / `publishIdempotent` exactly):
+   * topic-alias resolution (EB-44) → partition routing (EB-90) → topic
+   * pause (EB-88) → per-publisher rate limit (EB-79) → ACL (EB-41) →
+   * schema validation incl. versioned schemas (EB-20/EB-86) → per-message
+   * size cap (EB-64) → per-topic rate limit (EB-19). When `opts.messageId`
+   * is a non-empty string the idempotent-dedup suppression gate (EB-27)
+   * is additionally consulted where `publishIdempotent` consults it —
+   * after the ACL, before the remaining gates. The remaining gates run
+   * through the same pure shadow decider (`admissionVerdict`) as
+   * `publishAtomic`'s phase-1 admission, so the decision is computed by
+   * the same code as the real path, in shadow mode.
+   *
+   * Zero side effects means: no sequence number consumed (no downstream
+   * gap), no durable-log writes, no rate-limit/budget token taken, no
+   * enqueue, no stats counters moved (rejected / rate-limited / duplicate
+   * / paused / deprecated-schema / redaction counts all stay put), no
+   * subscription-audit events, no idempotency-slot claim, and specifically
+   * NO `onAdmissionRejected` callback invocation. Rate-limit budgets are
+   * peeked read-only (`TokenBucket.availableTokens` never takes a token),
+   * so repeated previews never drain anything; the dedup table is read
+   * without pruning (the per-key expiry re-check gives the identical
+   * verdict); redaction runs in its pure form (no redaction counters).
+   * Pattern-matcher caches may memoize — internal memoization only,
+   * invisible to stats and hooks.
+   *
+   * Intentional divergences from the live path, documented:
+   * - Dedup: a preview never claims the `(topic, messageId)` slot — a
+   *   real `publishIdempotent` after the preview still admits once, and a
+   *   second preview still reports `admitted`. The verdict is identical;
+   *   the registration is skipped.
+   * - Chaos faults (EB-103) are not evaluated: they are one-shot test
+   *   injections, and evaluating one here would consume the fault.
+   * - The advisory topic-registry check (EB-77) is skipped: it moves a
+   *   counter and fires a hook, and it is not an admission gate.
+   * - Partition routing (EB-90) is walked — the range check runs against
+   *   the alias-resolved topic — but an out-of-range explicit partition
+   *   throws `RangeError` instead of rejecting, exactly like `publish`.
+   * - Barrier cut markers (EB-98, `opts.barrier`) take the slim admission
+   *   path: alias resolution, then the one gate a control message keeps
+   *   (the ACL) — everything else is inert for barriers, exactly as in
+   *   `fanOutBarrier`.
+   *
+   * Option validation is identical to `publish`: an invalid `key`,
+   * `traceparent`, `eventTime`, `causal`, `publisherId`, `schemaVersion`,
+   * `partitionKey`/`partition`, or `barrier` throws `RangeError` (a
+   * non-bytes payload with `binary: true` throws `TypeError`); an unknown
+   * namespace throws `RangeError` and a publish-denied namespace throws
+   * `NamespaceDeniedError` — all before any gate runs, exactly like the
+   * real entry point. A throwing schema validator propagates, exactly as
+   * in `publish`.
+   */
+  previewPublish(topic: string, payload: unknown, opts?: PublishOptions): PreviewPublishResult {
+    // Option validation first — identical throws to `publish`, before
+    // anything is read.
+    validateMessageKey(opts?.key, 'previewPublish');
+    validateTraceparent(opts?.traceparent, 'previewPublish');
+    validateEventTime(opts?.eventTime, 'previewPublish');
+    validateCausal(opts?.causal, 'previewPublish');
+    validatePublisherId(opts?.publisherId, 'previewPublish');
+    validateSchemaVersion(opts?.schemaVersion, 'previewPublish');
+    validatePartitionOptions(opts?.partitionKey, opts?.partition, 'previewPublish');
+    validateBarrier(opts?.barrier, 'previewPublish');
+    // Binary payload passthrough (EB-92): same contract as `publish` — a
+    // non-bytes payload with `binary: true` throws `TypeError`.
+    payload = normalizeBinaryPayload(payload, opts?.binary, 'previewPublish');
+    const binary = opts?.binary === true;
+    // Multi-tenant namespace (EB-52): same resolution as `publish` — the
+    // full gate walk below operates on the concrete `<namespace>/<topic>`.
+    topic = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    // Topic aliases (EB-44) resolve before every admission gate, exactly
+    // like `fanOut`: a retired old topic is refused here, never admitted.
+    const aliasResolution = this.resolvePublishTopic(topic);
+    if (aliasResolution.retired) {
+      return { admitted: false, reason: 'alias-retired', failedGate: 'topic-alias' };
+    }
+    topic = aliasResolution.topic;
+    // Barrier cut markers (EB-98) take the slim admission path: the one
+    // gate a control message keeps is the ACL — mirroring `fanOutBarrier`
+    // minus its counting, hook, and delivery.
+    if (opts?.barrier !== undefined) {
+      if (!this.aclAllowsPublish(topic)) {
+        return { admitted: false, reason: 'acl', failedGate: 'acl' };
+      }
+      return { admitted: true };
+    }
+    // Publish-side partition routing (EB-90): resolved here, right after
+    // alias resolution and before the pause gate, exactly like `fanOut`.
+    // Out-of-range throws `RangeError` — never a rejection — like `publish`.
+    this.resolvePartition(topic, opts?.partitionKey, opts?.partition);
+    // Sensitive-field redaction (EB-68): admission-time, before every
+    // gate — the schema validator and the size cap see the redacted bytes,
+    // exactly like `fanOut`. The pure form: no redaction counters move.
+    // Skipped for binary payloads (EB-92), like `fanOut`.
+    if (!binary) {
+      const paths = this.redactionForTopic(topic);
+      if (paths !== undefined) payload = redactFieldPaths(payload, paths).value;
+    }
+    // Idempotent-dedup gate (EB-27): consulted only when `messageId` is a
+    // non-empty string, mirroring `publishIdempotent` — the ACL runs
+    // before the suppression check, and the suppression check runs before
+    // the remaining admission gates (a duplicate is decided on identity
+    // alone, even if a later gate would also reject it). The slot is
+    // NEVER claimed: a preview must not make a later real publish (or
+    // preview) see this messageId. No pruneDedup either: pruning only
+    // drops expired entries, and the per-key expiry re-check below treats
+    // them as absent anyway — the verdict is identical without mutating
+    // the table.
+    const messageId =
+      typeof opts?.messageId === 'string' && opts.messageId.length > 0 ? opts.messageId : undefined;
+    if (messageId !== undefined) {
+      if (!this.aclAllowsPublish(topic)) {
+        return { admitted: false, reason: 'acl', failedGate: 'acl' };
+      }
+      const nowMs = this.now();
+      const firstAt = this.dedup.get(`${topic}\0${messageId}`);
+      if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
+        return { admitted: false, reason: 'duplicate', failedGate: 'idempotency-dedup' };
+      }
+    }
+    // The remaining gates run through the same pure shadow decider as
+    // `publishAtomic`'s phase-1 admission (EB-23): topic pause →
+    // per-publisher rate limit → ACL → schema → size cap → per-topic
+    // rate limit. Fresh per-call shadow budgets: nothing is reserved,
+    // nothing is taken, nothing is counted, and `onAdmissionRejected`
+    // never fires.
+    const verdict = this.admissionVerdict(
+      topic,
+      payload,
+      new Map<string, number>(),
+      opts?.publisherId,
+      new Map<string, number>(),
+      opts?.schemaVersion,
+    );
+    if (verdict !== undefined) {
+      return { admitted: false, reason: verdict.reason, failedGate: verdict.failedGate };
+    }
+    return { admitted: true };
+  }
+
+  /**
    * Fans out every message in the batch to its matching subscribers' bounded
    * queues, then schedules a single flush for the whole batch — so N messages
    * cost one event-loop round instead of N, at the price of one larger drain.
@@ -15605,7 +15811,7 @@ export class EventBus {
       // the size cap, and the commit phase all see the redacted bytes.
       payload = this.redactAdmissionPayload(resolvedTopic, payload);
       redactedPayloads[index] = payload;
-      const reason = this.admissionVerdict(
+      const verdict = this.admissionVerdict(
         resolvedTopic,
         payload,
         shadowBudget,
@@ -15613,13 +15819,14 @@ export class EventBus {
         publisherShadowBudget,
         entries[index].schemaVersion,
       );
-      if (reason !== undefined) {
+      if (verdict !== undefined) {
         // The batch is rejected on the failing entry: count it once against
         // that entry's admission-gate counters and surface it on the unified
         // admission-rejection hook, so an atomic rejection stays reconcilable
         // with stats like any other admission rejection. Everything else
         // stays untouched: no sequence numbers, no rate-limit tokens, no
         // durable-log writes.
+        const reason = verdict.reason;
         const publisherId = entries[index].publisherId;
         if (reason === 'schema') this.countSchemaRejection(topic, payload, publisherId);
         else if (reason === 'acl') this.countAclDenied(topic, payload, publisherId);
@@ -15682,14 +15889,22 @@ export class EventBus {
   }
 
   /**
-   * Runs the admission gate of the publish pipeline — the per-publisher
-   * rate-limit budget first (EB-79), then schema validation
-   * (rejections happen before admission: no seq, no rate-limit
-   * budget), then the per-topic message-size cap, then the per-topic
-   * rate-limit budget — WITHOUT mutating any
-   * bus state, so `publishAtomic` can pre-validate a batch before
-   * committing anything. Returns the rejection reason when the publish
-   * would be rejected or shed, `undefined` when it would be admitted.
+   * Runs the admission gates of the publish pipeline — the topic pause
+   * first (EB-88), then the per-publisher rate-limit budget (EB-79), then
+   * the broker-level ACL (EB-41), then schema validation (EB-20/EB-86),
+   * then the per-topic message-size cap (EB-64), then the per-topic
+   * rate-limit budget (EB-19) — WITHOUT mutating any bus state, so
+   * `publishAtomic` can pre-validate a batch before committing anything
+   * and `previewPublish` can dry-run one publish. Returns the rejection
+   * reason plus the failing gate name when the publish would be rejected
+   * or shed, `undefined` when it would be admitted.
+   *
+   * This is the single shared shadow decider: `publishAtomic`'s phase-1
+   * admission and `previewPublish` both run their gate verdicts through
+   * it, so the decision is computed by the same code as the real
+   * `fanOut` path, in shadow mode. The gate order mirrors `fanOut`
+   * exactly; callers handle what `fanOut` does outside the gates
+   * (topic-alias resolution, partition routing, redaction) themselves.
    *
    * `shadowBudget` maps a concrete topic to the tokens this batch has
    * already reserved: the balance peeked from the live bucket
@@ -15715,13 +15930,14 @@ export class EventBus {
     publisherId: string | undefined,
     publisherShadowBudget: Map<string, number>,
     schemaVersion: number | undefined,
-  ): AtomicRejectReason | undefined {
+  ): { reason: AtomicRejectReason; failedGate: PreviewGateName } | undefined {
     // Topic pause (EB-88) is the first shadow gate, mirroring `fanOut`:
     // any paused entry — shed or queue mode — rejects the whole batch. A
     // queued message cannot be committed synchronously, so atomicity
     // forces the batch to fail rather than partially buffer; the entry's
     // reason is 'topic-paused' either way.
-    if (this.pauseForTopic(topic) !== undefined) return 'topic-paused';
+    if (this.pauseForTopic(topic) !== undefined)
+      return { reason: 'topic-paused', failedGate: 'topic-pause' };
     // Per-publisher rate limiting (EB-79) is the second shadow gate, as in
     // `fanOut`: the peek/reserve mirrors `takePublisherToken` without
     // mutating the live bucket, and the shadow bucket is never stored —
@@ -15734,32 +15950,35 @@ export class EventBus {
           bucket = new TokenBucket(publisherLimit.burst, publisherLimit.messagesPerSec, this.now);
         }
         const reserved = publisherShadowBudget.get(publisherId) ?? 0;
-        if (bucket.availableTokens - reserved < 1) return 'publisher-rate-limit';
+        if (bucket.availableTokens - reserved < 1)
+          return { reason: 'publisher-rate-limit', failedGate: 'publisher-rate-limit' };
         publisherShadowBudget.set(publisherId, reserved + 1);
       }
     }
-    // The ACL is the second admission gate everywhere (after topic-alias
-    // resolution, which rewrites the topic before the gates), including
-    // the atomic batch's shadow admission: an unauthorized entry aborts
-    // the batch.
-    if (!this.aclAllowsPublish(topic)) return 'acl';
+    // The ACL is the next admission gate (after topic-alias resolution,
+    // which rewrites the topic before the gates), including the atomic
+    // batch's shadow admission: an unauthorized entry aborts the batch.
+    if (!this.aclAllowsPublish(topic)) return { reason: 'acl', failedGate: 'acl' };
     // Versioned schema validators (EB-86): the shadow admission runs the
     // pure verdict — no counting here. A rejection is counted once by the
     // caller; a deprecated admission is counted in the commit phase (see
     // `isDeprecatedSchemaAdmission`), so an aborted batch never moves the
     // counter for messages that were never published.
-    if (!this.schemaVerdict(topic, payload, schemaVersion).admitted) return 'schema';
+    if (!this.schemaVerdict(topic, payload, schemaVersion).admitted)
+      return { reason: 'schema', failedGate: 'schema' };
     // Per-message size cap, same position as in `fanOut` (after schema, and
     // before any sequence number or rate-limit budget is touched): an
     // oversized entry aborts the batch like a schema rejection.
     const maxBytes = this.maxMessageBytesForTopic(topic);
-    if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) return 'message-too-big';
+    if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes)
+      return { reason: 'message-too-big', failedGate: 'max-message-bytes' };
     const limit = this.rateLimitForTopic(topic);
     if (limit !== undefined) {
       let bucket = this.rateLimitBuckets.get(topic);
       if (bucket == null) bucket = new TokenBucket(limit.burst, limit.messagesPerSec, this.now);
       const reserved = shadowBudget.get(topic) ?? 0;
-      if (bucket.availableTokens - reserved < 1) return 'rate-limit';
+      if (bucket.availableTokens - reserved < 1)
+        return { reason: 'rate-limit', failedGate: 'topic-rate-limit' };
       shadowBudget.set(topic, reserved + 1);
     }
     return undefined;
