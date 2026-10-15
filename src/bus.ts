@@ -102,7 +102,14 @@ import {
   type NamespaceStats,
 } from './namespace.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
-import { stickyPartitionAssignment } from './sticky.ts';
+import {
+  assertValidPartitionAssignor,
+  assertValidPartitionAssignment,
+  rendezvousPartitionAssignor,
+  resolveBuiltinPartitionAssignor,
+  stickyPartitionAssignor,
+  type PartitionAssignor,
+} from './assignor.ts';
 import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
@@ -1926,12 +1933,14 @@ export interface PartitionRebalanceInfo {
   /** Partitions whose owner changed in this rebalance. */
   migrated: PartitionMigration[];
   /**
-   * Assignment strategy that produced this rebalance
-   * (`GroupSubscribeOptions.assignment`): `'rendezvous'` (default) or
-   * `'sticky'` (EB-54 cooperative). Lets the operator tell a minimal-diff
-   * sticky migration apart from a rendezvous recomputation.
+   * Assignor that produced this rebalance: the `PartitionAssignor.name`
+   * (`GroupSubscribeOptions.assignor`, EB-106), or the
+   * `GroupSubscribeOptions.assignment` string for the built-ins —
+   * `'rendezvous'` (default) or `'sticky'` (EB-54 cooperative). Lets the
+   * operator tell a minimal-diff sticky migration apart from a
+   * rendezvous recomputation or a custom placement.
    */
-  strategy: 'rendezvous' | 'sticky';
+  strategy: string;
 }
 
 export interface GroupRebalanceEvent {
@@ -2059,7 +2068,7 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
   partitions?: number;
   /**
    * Partition assignment strategy for the competing set (EB-54), only
-   * meaningful together with `partitions`. Two strategies:
+   * meaningful together with `partitions`. Two built-in strategies:
    *
    * - `'rendezvous'` (default): deterministic highest-random-weight
    *   hashing over the member roster. Minimal disruption — a join/leave
@@ -2073,14 +2082,40 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    *   with no pause and no replay — the cooperative protocol, no
    *   stop-the-world full reassignment.
    *
-   * Like the partition count, the strategy is fixed by the FIRST
+   * For anything else, pass `assignor` (EB-106) with a custom
+   * `PartitionAssignor` — the string selects the built-in of the same
+   * name, and specifying both with different names throws `RangeError`.
+   *
+   * Like the partition count, the assignor is fixed by the FIRST
    * `subscribeToGroup` for the (groupId, pattern): a later member that
-   * specifies a different strategy throws `RangeError` and its
+   * specifies a different assignor throws `RangeError` and its
    * subscription is rolled back. Members that omit it inherit the group's
-   * strategy. The active strategy is reported on every
+   * assignor. The active assignor name is reported on every
    * `partitionRebalance` event (`PartitionRebalanceInfo.strategy`).
    */
   assignment?: 'rendezvous' | 'sticky';
+  /**
+   * Pluggable partition assignor for the competing set (EB-106, see
+   * `src/assignor.ts`), only meaningful together with `partitions`. A
+   * `{ name, assign }` object: `assign(partitions, members, previous)`
+   * computes `partition -> owner member id` and must be pure and
+   * deterministic — the same inputs always yield the same assignment.
+   *
+   * Overrides the `assignment` string selection: omit `assignment`, or
+   * set it to the assignor's own `name` (the built-ins
+   * `rendezvousPartitionAssignor`/`stickyPartitionAssignor` are named
+   * `'rendezvous'`/`'sticky'`, so the historical options keep working
+   * unchanged). A contradictory pair throws `RangeError` at registration.
+   *
+   * Like `assignment`, fixed by the group's first member; a later member
+   * naming a different assignor throws `RangeError` and rolls back. An
+   * assignor that returns an invalid assignment (empty, missing
+   * partition, unknown owner) fails the join with `RangeError` before
+   * the roster is touched; a throwing assignor propagates. Every
+   * assignment is recorded in the subscription audit log
+   * (`getSubscriptionAudit`, action `'rebalance'`).
+   */
+  assignor?: PartitionAssignor;
   /**
    * Kafka-style static membership (EB-104): a stable identity for this
    * member, independent of its subscription id. When a static member
@@ -8093,20 +8128,24 @@ export class EventBus {
    */
   private partitionAssignmentCache = new Map<string, Map<number, string>>();
   /**
-   * Last sticky assignment per competing set (EB-54): the `previous` input
-   * for the next sticky recomputation. Updated only when a sticky
-   * assignment is (re)computed; dropped when the group fully drains so a
-   * dead generation never pins partitions to departed members.
+   * Last assignment per competing set (EB-54, extended EB-106): the
+   * `previous` input for the next recomputation, so sticky-style
+   * assignors can minimize migration. Updated on every (re)computation;
+   * dropped when the group fully drains so a dead generation never pins
+   * partitions to departed members.
    */
   private previousPartitionAssignment = new Map<string, Map<number, string>>();
   /**
-   * Partition assignment strategy per competing set
+   * Partition assignor per competing set
    * (`groupKey(groupId, pattern)`), for groups that opted into
-   * `GroupSubscribeOptions.assignment`. Fixed by the group's first member
-   * (like the partition count); absent means the default rendezvous.
-   * Retained after the last member leaves, mirroring `groupPartitions`.
+   * `GroupSubscribeOptions.partitions`. Fixed by the group's first member
+   * (like the partition count): either one of the built-ins selected via
+   * `GroupSubscribeOptions.assignment`, or a custom
+   * `GroupSubscribeOptions.assignor`. Absent means the default rendezvous
+   * assignor. Retained after the last member leaves, mirroring
+   * `groupPartitions`.
    */
-  private groupAssignmentStrategy = new Map<string, 'rendezvous' | 'sticky'>();
+  private groupAssignors = new Map<string, { name: string; assignor: PartitionAssignor }>();
   /**
    * Per-partition assignment watermarks: groupKey -> partition ->
    * concrete topic -> highest per-topic `seq` assigned to that partition.
@@ -12073,7 +12112,7 @@ export class EventBus {
       leaveRebalance = {
         assignment: Object.fromEntries(after),
         migrated,
-        strategy: this.groupAssignmentStrategy.get(oldKey) ?? 'rendezvous',
+        strategy: this.groupAssignorName(oldKey),
       };
       const oldStaticSubs = this.groupStaticSubs.get(oldKey);
       for (const m of migrated) {
@@ -12085,7 +12124,7 @@ export class EventBus {
     this.fireRebalance(groupId, oldPattern, oldKey, 'leave', rosterKey, linger, leaveRebalance);
     const newKey = EventBus.groupKey(groupId, newPattern);
     this.checkPartitionConfig(newKey, undefined);
-    this.checkAssignmentConfig(newKey, undefined);
+    this.checkAssignmentConfig(newKey, undefined, undefined);
     let members = this.groupMembers.get(newKey);
     if (members == null) {
       members = [];
@@ -12105,7 +12144,7 @@ export class EventBus {
       joinRebalance = {
         assignment: Object.fromEntries(after),
         migrated,
-        strategy: this.groupAssignmentStrategy.get(newKey) ?? 'rendezvous',
+        strategy: this.groupAssignorName(newKey),
       };
       for (const m of migrated) {
         if (m.to === rosterKey) this.replayPartitionBacklog(subscriber, newKey, m.partition);
@@ -12681,6 +12720,8 @@ export class EventBus {
     if (assignment !== undefined && assignment !== 'rendezvous' && assignment !== 'sticky') {
       throw new RangeError("assignment must be 'rendezvous' or 'sticky'");
     }
+    const assignor = opts?.assignor;
+    if (assignor !== undefined) assertValidPartitionAssignor(assignor, 'subscribeToGroup');
     // Static membership (EB-104): validated before anything registers, so
     // a throw leaves no half-registered subscriber behind.
     const instanceId = opts?.instanceId;
@@ -12702,7 +12743,7 @@ export class EventBus {
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
-    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, instanceId: _instanceId, sessionTimeoutMs: _sessionTimeoutMs, onReplayProgress: replayObserver, progressInterval: replayInterval, ...restOpts } = opts ?? {};
+    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, assignor: _assignor, instanceId: _instanceId, sessionTimeoutMs: _sessionTimeoutMs, onReplayProgress: replayObserver, progressInterval: replayInterval, ...restOpts } = opts ?? {};
     this.validateResumeFromSeq(resumeFromSeq);
     this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
     // Durable-log replay progress (EB-71): validated before anything
@@ -12717,7 +12758,13 @@ export class EventBus {
     // so no half-joined member is left behind.
     try {
       this.checkPartitionConfig(key, partitions);
-      this.checkAssignmentConfig(key, assignment);
+      this.checkAssignmentConfig(key, assignment, assignor);
+      // Pluggable assignor fail-fast (EB-106): a custom assignor's result
+      // is validated against the post-join roster before the roster is
+      // touched, so an invalid assignment throws here with nothing to
+      // roll back beyond the just-registered subscriber. Built-in
+      // assignors are infallible and skip the trial.
+      this.validateJoinAssignment(key, instanceId ?? sub.id);
     } catch (err) {
       sub.unsubscribe();
       throw err;
@@ -12792,7 +12839,7 @@ export class EventBus {
         partitionRebalance = {
           assignment: Object.fromEntries(after),
           migrated,
-          strategy: this.groupAssignmentStrategy.get(key) ?? 'rendezvous',
+          strategy: this.groupAssignorName(key),
         };
         // Automatic watermark replay: partitions the newcomer just took over
         // get their uncommitted backlog `(committed, watermark]` from the
@@ -12858,7 +12905,7 @@ export class EventBus {
           pr = {
             assignment: Object.fromEntries(after),
             migrated,
-            strategy: this.groupAssignmentStrategy.get(key) ?? 'rendezvous',
+            strategy: this.groupAssignorName(key),
           };
           for (const m of migrated) {
             const owner = this.subscribers.get(m.to);
@@ -13010,7 +13057,7 @@ export class EventBus {
       pr = {
         assignment: Object.fromEntries(after),
         migrated,
-        strategy: this.groupAssignmentStrategy.get(key) ?? 'rendezvous',
+        strategy: this.groupAssignorName(key),
       };
       const staticSubs = this.groupStaticSubs.get(key);
       for (const m of migrated) {
@@ -13085,13 +13132,26 @@ export class EventBus {
       });
     }
     // Subscription lifecycle audit (EB-78): one entry per rebalance, not
-    // per notified member — the group roster change is a single fact.
+    // per notified member — the group roster change is a single fact. For
+    // partitioned groups the assignment result rides along (EB-106): the
+    // assignor name plus the post-change partition -> member map, so an
+    // operator can reconstruct exactly who owned what after the fact.
     this.auditSubscription({
       action: 'rebalance',
       groupId,
       pattern,
       actor: 'system',
-      detail: { trigger, memberId, members: members.length },
+      detail: {
+        trigger,
+        memberId,
+        members: members.length,
+        ...(partitionRebalance == null
+          ? {}
+          : {
+              assignor: partitionRebalance.strategy,
+              assignment: partitionRebalance.assignment,
+            }),
+      },
     });
     // Membership changed: the assignment-to-commitment balance for the
     // group just shifted (a member's uncommitted backlog may now be
@@ -13296,68 +13356,64 @@ export class EventBus {
   }
 
   /**
-   * Rendezvous (highest-random-weight) score of a member for a partition:
-   * SHA-256 over `partition\0memberId`, first 8 bytes as uint64. Every
-   * node computes the same winner from the same roster, and adding or
-   * removing a member only changes the winner where the newcomer/leaver
-   * actually wins — the minimal-disruption property rebalancing wants.
+   * SHA-256 based 64-bit hash for partition mapping (see `partitionForMessage`).
+   * (The rendezvous assignor's own score function lives in
+   * `src/assignor.ts`, next to the strategy it implements.)
    */
-  private static rendezvousScore(partition: number, memberId: string): bigint {
-    const digest = createHash('sha256').update(`${partition}\0${memberId}`, 'utf8').digest();
-    return digest.readBigUInt64BE(0);
-  }
-
-  /** SHA-256 based 64-bit hash for partition mapping (see `partitionForMessage`). */
   private static hash64(preimage: string): bigint {
     return createHash('sha256').update(preimage, 'utf8').digest().readBigUInt64BE(0);
   }
 
   /**
+   * Assignor name for a competing set, for rebalance events and the
+   * subscription audit log. Absent means the default rendezvous.
+   */
+  private groupAssignorName(groupKey: string): string {
+    return this.groupAssignors.get(groupKey)?.name ?? 'rendezvous';
+  }
+
+  /**
    * Deterministic partition assignment for one competing set: every
-   * partition goes to the member picked by the group's assignment
-   * strategy. Cached per group key; invalidated on join/leave. Empty when
-   * the group is not partitioned or has no members.
+   * partition goes to the member picked by the group's assignor. Cached
+   * per group key; invalidated on join/leave. Empty when the group is
+   * not partitioned or has no members.
    *
-   * Strategies (see `GroupSubscribeOptions.assignment`):
-   * - `'rendezvous'` (default): highest-random-weight hashing over the
-   *   roster — deterministic from the roster alone.
-   * - `'sticky'` (EB-54): sticky balanced assignment (`src/sticky.ts`) —
-   *   `floor(P/N)`/`ceil(P/N)` per member, maximally sticky across
-   *   rebalances, computed from the previous assignment.
+   * The assignor is the group's fixed choice (see
+   * `GroupSubscribeOptions.assignor`): a custom assignor when the first
+   * member provided one, otherwise the built-in selected by
+   * `GroupSubscribeOptions.assignment` (`'rendezvous'` by default,
+   * `'sticky'` for the EB-54 cooperative assignor). Every result —
+   * built-in or custom — passes `assertValidPartitionAssignment`, so a
+   * broken custom assignor fails fast with `RangeError` instead of
+   * stranding the group with a partial assignment. A throwing assignor
+   * propagates to the caller.
    */
   private partitionAssignment(groupKey: string): Map<number, string> {
     const cached = this.partitionAssignmentCache.get(groupKey);
     if (cached !== undefined) return cached;
-    const strategy = this.groupAssignmentStrategy.get(groupKey) ?? 'rendezvous';
-    if (strategy === 'sticky') {
-      const assignment = stickyPartitionAssignment({
-        partitions: this.groupPartitions.get(groupKey) ?? 0,
-        members: this.groupMembers.get(groupKey) ?? [],
-        previous: this.previousPartitionAssignment.get(groupKey),
-      });
-      // Defensive copy: the cached map is shared with readers, the prev
-      // map must stay a pristine snapshot of this generation.
-      this.previousPartitionAssignment.set(groupKey, new Map(assignment));
-      this.partitionAssignmentCache.set(groupKey, assignment);
-      return assignment;
-    }
-    const assignment = new Map<number, string>();
-    const n = this.groupPartitions.get(groupKey) ?? 0;
+    const resolved = this.groupAssignors.get(groupKey);
+    const assignor = resolved?.assignor ?? rendezvousPartitionAssignor;
+    const partitions = this.groupPartitions.get(groupKey) ?? 0;
     const members = this.groupMembers.get(groupKey) ?? [];
-    for (let p = 0; p < n; p++) {
-      let best: string | undefined;
-      let bestScore = -1n;
-      for (const m of members) {
-        const score = EventBus.rendezvousScore(p, m);
-        // Strictly greater: join order breaks the (astronomically
-        // unlikely) tie deterministically.
-        if (score > bestScore) {
-          bestScore = score;
-          best = m;
-        }
-      }
-      if (best !== undefined) assignment.set(p, best);
+    if (partitions === 0 || members.length === 0) {
+      // Degenerate: nothing to place. The bus owns this invariant — a
+      // custom assignor is never asked to assign an empty roster, so a
+      // sloppy `members[0]` in user code cannot break unsubscribe
+      // teardown when the last member leaves.
+      const empty = new Map<number, string>();
+      this.partitionAssignmentCache.set(groupKey, empty);
+      return empty;
     }
+    const assignment = assignor.assign(
+      partitions,
+      members,
+      this.previousPartitionAssignment.get(groupKey),
+    );
+    assertValidPartitionAssignment(assignment, partitions, members, assignor.name);
+    // Snapshot for the next generation's `previous` input. Defensive
+    // copy: the cached map is shared with readers, the prev map must
+    // stay a pristine snapshot of this generation.
+    this.previousPartitionAssignment.set(groupKey, new Map(assignment));
     this.partitionAssignmentCache.set(groupKey, assignment);
     return assignment;
   }
@@ -13481,29 +13537,67 @@ export class EventBus {
   }
 
   /**
-   * Validates a joining member's `assignment` strategy against the group's
-   * fixed configuration (see `checkPartitionConfig`). The group's strategy
-   * is fixed by its first member; a later member that specifies a
-   * different strategy throws `RangeError`. Called before the member
-   * joins the competing set, so the caller can roll back the subscription.
+   * Validates a joining member's partition assignor against the group's
+   * fixed configuration (see `checkPartitionConfig`). The group's
+   * assignor is fixed by its first member — a custom
+   * `GroupSubscribeOptions.assignor`, or the built-in selected by
+   * `GroupSubscribeOptions.assignment` — and a later member that
+   * specifies a different one throws `RangeError`. Called before the
+   * member joins the competing set, so the caller can roll back the
+   * subscription.
    */
   private checkAssignmentConfig(
     groupKey: string,
     assignment: 'rendezvous' | 'sticky' | undefined,
+    assignor: PartitionAssignor | undefined,
   ): void {
-    if (!this.groupMembers.has(groupKey)) {
-      // New (or fully drained and recreated) group: the first member fixes
-      // the strategy; a stale strategy from a dead generation is dropped.
-      if (assignment !== undefined) this.groupAssignmentStrategy.set(groupKey, assignment);
-      else this.groupAssignmentStrategy.delete(groupKey);
-      return;
-    }
-    const configured = this.groupAssignmentStrategy.get(groupKey) ?? 'rendezvous';
-    if (assignment !== undefined && assignment !== configured) {
+    // A custom assignor and the string option must agree when both are
+    // given — the string is the legacy alias for the two built-ins, so a
+    // mismatch is a contradictory config, not a fallback.
+    if (assignment !== undefined && assignor !== undefined && assignor.name !== assignment) {
       throw new RangeError(
-        `partition assignment strategy mismatch: group uses '${configured}', got '${assignment}'`,
+        `partition assignor mismatch: assignment is '${assignment}' but assignor.name is '${assignor.name}'`,
       );
     }
+    const name = assignor?.name ?? assignment ?? 'rendezvous';
+    const impl = assignor ?? resolveBuiltinPartitionAssignor(assignment ?? 'rendezvous');
+    if (!this.groupMembers.has(groupKey)) {
+      // New (or fully drained and recreated) group: the first member fixes
+      // the assignor; a stale entry from a dead generation is dropped.
+      this.groupAssignors.set(groupKey, { name, assignor: impl });
+      return;
+    }
+    // Members that specify nothing inherit the group's assignor — only an
+    // explicitly different choice is a mismatch.
+    const specified = assignor !== undefined || assignment !== undefined;
+    const configuredName = this.groupAssignorName(groupKey);
+    if (specified && name !== configuredName) {
+      throw new RangeError(
+        `partition assignor strategy mismatch: group uses '${configuredName}', got '${name}'`,
+      );
+    }
+  }
+
+  /**
+   * Fail-fast validation of a custom assignor's result against the
+   * post-join roster (EB-106). Runs before the roster is touched, so an
+   * invalid assignment throws `RangeError` with nothing to roll back —
+   * the join never half-registers. Built-in assignors are infallible by
+   * construction and skip the trial computation. A throwing assignor
+   * propagates to the joiner.
+   */
+  private validateJoinAssignment(groupKey: string, rosterKey: string): void {
+    const resolved = this.groupAssignors.get(groupKey);
+    if (resolved === undefined) return;
+    const impl = resolved.assignor;
+    if (impl === rendezvousPartitionAssignor || impl === stickyPartitionAssignor) return;
+    const partitions = this.groupPartitions.get(groupKey);
+    if (partitions === undefined) return;
+    const members = [...(this.groupMembers.get(groupKey) ?? []), rosterKey];
+    const assignment = impl.assign(partitions, members, this.previousPartitionAssignment.get(groupKey));
+    assertValidPartitionAssignment(assignment, partitions, members, resolved.name);
+    // The result is intentionally not cached: the join below recomputes
+    // it deterministically through `partitionAssignment()`.
   }
 
   /**

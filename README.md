@@ -135,7 +135,11 @@ library.
   `ceil(P/N)` partitions and each rebalance migrates exactly the minimal
   diff the balance requires, so unaffected partitions keep consuming
   through the rebalance with no pause and no replay (cooperative
-  protocol, no stop-the-world reassignment). The strategy is fixed by the
+  protocol, no stop-the-world reassignment). For anything else, pass a
+  custom `assignor` (`src/assignor.ts`, EB-106): any `{ name, assign }`
+  object whose `assign(partitions, members, previous)` computes
+  `partition -> owner` purely and deterministically (rack-aware,
+  weighted, …). The assignor is fixed by the
   group's first member (like the partition count); `onRebalance` events
   report it as `partitionRebalance.strategy`. The bus tracks per-partition
   assignment watermarks (`getPartitionWatermarks`: highest per-topic `seq`
@@ -3181,3 +3185,110 @@ Semantics notes:
   (`{ injected, byTarget }`), present only when scenarios were
   configured. Without chaos the stats shape — and everything else — is
   byte-for-byte identical to before.
+
+## OTLP span export (EB-105)
+
+**Opt-in.** Ships the delivery-pipeline trace spans (`src/trace.ts`,
+EB-45) to an OpenTelemetry collector over OTLP/HTTP as hand-encoded
+JSON — zero new dependencies, no OTel SDK:
+
+```ts
+const bus = new EventBus({
+  trace: { sampleRate: 1 },
+  otlp: {
+    endpoint: 'http://collector:4318/v1/traces',
+    serviceName: 'checkout-bus', // default 'realtime-event-bus'
+    batchSize: 512, // spans per POST (default 512)
+    flushIntervalMs: 5000, // periodic flush (default 5000)
+    timeoutMs: 5000, // per-request timeout (default 5000)
+    headers: { Authorization: 'Bearer …' }, // extra POST headers
+    sampleRate: 1, // export-side sampling, independent of trace sampling
+    maxBuffered: 10000, // drop-oldest bound (default 10000)
+  },
+});
+```
+
+Every sampled span (`bus.publish` → `bus.admission` → `bus.fanout` →
+`bus.enqueue` → `bus.deliver` → `bus.ack`) becomes one OTLP span:
+`traceId`/`spanId` need no translation — EB-45 already mints 32-hex
+trace ids and 16-hex span ids, exactly the OTLP 128/64-bit format — so
+an exported trace joins the same trace a `webhook-relay-ts` WR-18/WR-83
+pipeline reports by string equality. Span attributes map 1:1
+(`string`→`stringValue`, integer→`intValue`, float→`doubleValue`,
+`boolean`→`boolValue`); `service.name` rides the resource attributes.
+
+Semantics notes:
+
+- `otlp` requires `EventBusOptions.trace` to be enabled — spans only
+  exist when the trace pipeline samples them. Setting `otlp` without
+  `trace` throws `RangeError` from the constructor.
+- Best-effort, never in the delivery path: spans buffer in memory and
+  flush on an unref'd timer (never holds the process open) or when the
+  buffer reaches `batchSize`. A failed export POST drops that batch and
+  counts it — the exporter does not retry, and a down collector surfaces
+  as a rising counter, not as backpressure.
+- Composes with a user-supplied `TraceOptions.onTraceSpan`: the callback
+  still fires for every sampled span.
+- `getStats().otlp` (`{ endpoint, bufferedSpans, exportedSpans,
+  failedSpans, droppedSpans }`) is present only when export is
+  configured; without it the stats shape is byte-identical to before.
+- `bus.flushOtlp()` drains the buffer deterministically — the hook for
+  tests and graceful shutdown. Invalid options throw `RangeError` from
+  the constructor.
+
+## Pluggable partition assignors (EB-106)
+
+**Opt-in.** Consumer-group partition placement (`partitions` on
+`subscribeToGroup`) is no longer limited to the two built-in
+strategies — any `{ name, assign }` object works as the group's
+assignor (`src/assignor.ts`):
+
+```ts
+import type { PartitionAssignor } from './src/assignor.ts';
+
+// Rack-aware placement: keep each member's partitions on its own rack.
+const rackAware: PartitionAssignor = {
+  name: 'rack-aware',
+  assign(partitions, members, previous) {
+    // …pure and deterministic: same inputs, same assignment…
+    return new Map(/* partition -> owner member id */);
+  },
+};
+
+bus.subscribeToGroup('g', 'orders.*', handler, {
+  partitions: 12,
+  assignor: rackAware,
+});
+```
+
+The built-ins are adapted as assignors with their exact historical
+semantics, so the existing string options are unchanged:
+`rendezvousPartitionAssignor` (`'rendezvous'`, the default) and
+`stickyPartitionAssignor` (`'sticky'`, `src/sticky.ts`). Pass
+`assignor` alone, or together with the `assignment` string set to the
+assignor's own `name` — a contradictory pair throws `RangeError` at
+registration.
+
+Semantics notes:
+
+- `assign(partitions, members, previous)` must be pure and deterministic;
+  `previous` is the assignment in force before the rebalance (absent for
+  a fresh group) for sticky-style minimal-migration logic. The bus never
+  calls it with an empty roster — the drained-group case stays a
+  bus-owned invariant, so unsubscribe teardown cannot break on a custom
+  assignor.
+- Fail-fast: a malformed assignor object throws `RangeError` at
+  `subscribeToGroup`; an assignor that returns an invalid assignment
+  (empty, missing partition, unknown owner, out-of-range key) fails the
+  join with `RangeError` before the roster is touched — the subscription
+  rolls back with nothing half-registered. A throwing assignor
+  propagates to the joiner.
+- Like the partition count, the assignor is fixed by the group's first
+  member; a later member naming a different assignor throws `RangeError`
+  (members that specify nothing inherit the group's assignor).
+- `partitionRebalance.strategy` now reports the assignor *name* (a
+  string: `'rendezvous'`/`'sticky'` for the built-ins), and every
+  assignment is recorded in the subscription audit log
+  (`getSubscriptionAudit({ action: 'rebalance' })` → `detail.assignor` +
+  `detail.assignment`), so an operator can reconstruct exactly who owned
+  what after the fact.
