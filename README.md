@@ -403,7 +403,31 @@ library.
   offline, the chain keeps naming its original digest, so verify reports
   the tamper instead of silently dropping the link. Rotation and
   compaction never break the chain: rotation appends new links, and
-  compaction only rewrites the live file. Pluggable storage backends (EB-96):
+  compaction only rewrites the live file. Byte-based retention (EB-119):
+  opt-in per-topic live-byte budget (`durableLogMaxBytesPerTopic`, a
+  positive finite number of bytes; `RangeError` otherwise, and it
+  requires `durableLogDir` like `durableLogMaxAgeMs`) — the count bound
+  counts records, this one counts bytes. When a topic's live bytes grow
+  past twice the budget the topic compacts, keeping the newest records
+  whose sealed on-disk bytes fit the budget: the count, age, and byte
+  bounds are dual constraints, enforced at compact time with the same
+  amortized semantics (live bytes never exceed twice the budget between
+  compacts). With segment rotation on, crossing the budget archives the
+  live segment instead of evicting it — the oldest data lands in a
+  `.jsonl.gz` segment, still replayable via `readSince`/`readSinceTime`
+  with `{ includeArchived: true }` (time-based resume keeps working from
+  the archive index). Byte cost is the actual on-disk line bytes, so
+  compressed records count their compressed wire bytes and binary
+  records their base64 line bytes. Two deliberate exemptions: seq-0
+  records (delayed-delivery schedules, retained snapshots, pause
+  buffers) are never evicted by the byte bound — the same rationale as
+  `maxAgeMs` — and under keyed compaction the latest record per key is
+  exempt too (the key space itself bounds retention, Kafka-style);
+  exempt state can push live bytes over the budget. `getStats().
+  durableLog` reports `bytes` (live-segment bytes across topics, the
+  budget's scope — archived segments are history and are not counted)
+  and `bytesLimit` (absent when no byte bound is configured). Pluggable
+  storage backends (EB-96):
   every object the log keeps — the per-topic live log, archived segments
   and their sidecars, the group-offset journal (`__group_offsets.jsonl`),
   the subscriber-dedup journal (`__dedup.jsonl`), and the publish-dedup

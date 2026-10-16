@@ -255,6 +255,26 @@ export interface DurableLogOptions {
    */
   maxAgeMs?: number;
   /**
+   * EB-119: opt-in per-topic byte budget for the live segment — the count
+   * bound (`maxEntriesPerTopic`) counts records, this one counts bytes.
+   * When a topic's live bytes grow past twice this value the topic
+   * compacts, keeping the newest records whose sealed on-disk bytes fit
+   * the budget (dual constraints with the count and age bounds, same
+   * amortized semantics as `maxAgeMs`: enforced at compact time only).
+   * With segment rotation on, crossing the budget archives the live
+   * segment instead of evicting it — the oldest data lands in a
+   * `.jsonl.gz` segment, still replayable via `readSince`/`readSinceTime`
+   * with `{ includeArchived: true }`. Byte cost is the actual on-disk
+   * line bytes, so compressed records count their compressed wire bytes
+   * and binary records their base64 line bytes. Seq-0 records
+   * (delayed-delivery schedules, retained snapshots, pause buffers) are
+   * never evicted by the byte bound — the same rationale as `maxAgeMs` —
+   * and under keyed compaction the latest record per key is exempt too
+   * (the key space itself bounds retention, Kafka-style). Must be a
+   * positive finite number of bytes. Absent by default (no byte bound).
+   */
+  maxBytesPerTopic?: number;
+  /**
    * Clock source for time-based retention (`maxAgeMs`): the eviction
    * cutoff is `now() - maxAgeMs`, so an injectable clock keeps retention
    * deterministic in tests. The bus passes its own
@@ -1374,6 +1394,20 @@ export class DurableTopicLog {
    * marker, `SEGMENT_CHAIN_GENESIS_PREV`).
    */
   private readonly chainTails = new Map<string, string>();
+  /**
+   * EB-119: live-segment bytes per topic — the actual on-disk line bytes
+   * (sealed when encryption is on), so compressed records count their
+   * compressed wire bytes and binary records their base64 line bytes.
+   * Maintained on append, reset by rotation, recomputed by compaction,
+   * seeded from the file bytes on recovery.
+   */
+  private readonly topicBytes = new Map<string, number>();
+  /**
+   * EB-119: per-topic live-byte budget (`maxBytesPerTopic`), `undefined`
+   * when no byte bound is configured (the default — count/age retention
+   * behave exactly as before).
+   */
+  private readonly maxBytesPerTopic: number | undefined;
   /** Set while a background archive pass is scheduled. */
   private archiveScheduled = false;
   /**
@@ -1404,6 +1438,7 @@ export class DurableTopicLog {
     now: () => number = Date.now,
     onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void,
     backend?: DurableStorageBackend,
+    maxBytesPerTopic?: number,
   ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
@@ -1414,6 +1449,7 @@ export class DurableTopicLog {
     this.maxAgeMs = maxAgeMs;
     this.now = now;
     this.onSegmentChecksumFailed = onSegmentChecksumFailed;
+    this.maxBytesPerTopic = maxBytesPerTopic;
     // EB-96: every object the log keeps goes through the backend. The
     // default is the local filesystem rooted at `dir` — the exact
     // on-disk layout the log always used — so existing directories keep
@@ -1434,8 +1470,8 @@ export class DurableTopicLog {
    * empty `dir`, a non-positive-integer `maxEntriesPerTopic`, a
    * non-positive-integer `publishDedupMaxEntries`, invalid
    * `segmentRotation` triggers, a non-positive-finite `maxAgeMs`, a
-   * non-function `now`, or an `encryptor` that is not a usable
-   * `PayloadEncryptor`.
+   * non-positive-finite `maxBytesPerTopic`, a non-function `now`, or an
+   * `encryptor` that is not a usable `PayloadEncryptor`.
    */
   static open(options: DurableLogOptions): DurableTopicLog {
     const dir = options.dir;
@@ -1453,6 +1489,13 @@ export class DurableTopicLog {
     const maxAgeMs = options.maxAgeMs;
     if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
       throw new RangeError('durableLogMaxAgeMs must be a positive finite number of milliseconds');
+    }
+    const maxBytesPerTopic = options.maxBytesPerTopic;
+    if (
+      maxBytesPerTopic !== undefined &&
+      (!Number.isFinite(maxBytesPerTopic) || maxBytesPerTopic <= 0)
+    ) {
+      throw new RangeError('durableLogMaxBytesPerTopic must be a positive finite number of bytes');
     }
     const now = options.now ?? Date.now;
     if (typeof now !== 'function') {
@@ -1490,6 +1533,7 @@ export class DurableTopicLog {
       now,
       options.onSegmentChecksumFailed,
       backend,
+      maxBytesPerTopic,
     );
   }
 
@@ -1620,7 +1664,11 @@ export class DurableTopicLog {
         this.corruptLines += 1;
         continue;
       }
-      const records = this.readFileRecords(topic);
+      const text = this.readText(this.fileFor(topic));
+      // EB-119: byte accounting starts from the actual on-disk bytes —
+      // the same measure `append` maintains per line.
+      this.topicBytes.set(topic, text === undefined ? 0 : Buffer.byteLength(text));
+      const records = text === undefined ? [] : this.parseFileRecords(topic, text);
       this.topicsSeen.add(topic);
       this.entryCounts.set(topic, records.length);
       let last = 0;
@@ -1943,6 +1991,11 @@ export class DurableTopicLog {
   private readFileRecords(topic: string): DurableLogRecord[] {
     const text = this.readText(this.fileFor(topic));
     if (text === undefined) return [];
+    return this.parseFileRecords(topic, text);
+  }
+
+  /** Parses every well-formed record in one topic file's text. */
+  private parseFileRecords(topic: string, text: string): DurableLogRecord[] {
     const records: DurableLogRecord[] = [];
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
@@ -1991,6 +2044,9 @@ export class DurableTopicLog {
     this.topicsSeen.add(record.topic);
     const count = (this.entryCounts.get(record.topic) ?? 0) + 1;
     this.entryCounts.set(record.topic, count);
+    // EB-119: the line's actual on-disk bytes — sealed when encryption is
+    // on — so compressed/binary records count their wire bytes.
+    this.topicBytes.set(record.topic, (this.topicBytes.get(record.topic) ?? 0) + Buffer.byteLength(line));
     if (record.seq >= 1) {
       this.messageCounts.set(record.topic, (this.messageCounts.get(record.topic) ?? 0) + 1);
     }
@@ -2027,10 +2083,28 @@ export class DurableTopicLog {
     // triggering record belongs to the closed segment, so a rotation
     // resets the live counts and the trigger below must read them fresh
     // — never the stale pre-rotation count.
-    if (this.segmentRotation !== undefined) this.noteSegmentAppend(record);
+    if (this.segmentRotation !== undefined) {
+      this.noteSegmentAppend(record);
+      // EB-119: with rotation the byte budget archives the oldest live
+      // data instead of evicting it — the rotated segment stays
+      // replayable via `readSince`/`readSinceTime` with
+      // `{ includeArchived: true }`. The rename is O(1); without
+      // rotation the byte bound is enforced by compaction below.
+      if (
+        this.maxBytesPerTopic !== undefined &&
+        (this.topicBytes.get(record.topic) ?? 0) > this.maxBytesPerTopic
+      ) {
+        this.rotateSegment(record.topic);
+      }
+    }
     const liveCount = this.entryCounts.get(record.topic) ?? 0;
+    const liveBytes = this.topicBytes.get(record.topic) ?? 0;
     const superseded = this.supersededCounts.get(record.topic) ?? 0;
-    if (liveCount > this.maxEntriesPerTopic * 2 || (this.keyCompaction && superseded >= this.maxEntriesPerTopic)) {
+    if (
+      liveCount > this.maxEntriesPerTopic * 2 ||
+      (this.maxBytesPerTopic !== undefined && liveBytes > this.maxBytesPerTopic * 2) ||
+      (this.keyCompaction && superseded >= this.maxEntriesPerTopic)
+    ) {
       this.compact(record.topic);
     }
     return true;
@@ -2151,6 +2225,8 @@ export class DurableTopicLog {
     // now, resolved by the merged read instead.
     this.entryCounts.set(topic, 0);
     this.messageCounts.set(topic, 0);
+    // EB-119: the archived records leave the live byte budget too.
+    this.topicBytes.set(topic, 0);
     this.segmentEntries.set(topic, 0);
     this.segmentStartSeq.delete(topic);
     this.segmentStartAt.delete(topic);
@@ -2326,9 +2402,11 @@ export class DurableTopicLog {
   private compact(topic: string): void {
     const records = this.readFileRecords(topic);
     const retained = this.applyRetention(records);
-    const kept = this.keyCompaction
-      ? compactKeyed(retained, this.maxEntriesPerTopic)
-      : retained.slice(-this.maxEntriesPerTopic);
+    const kept = this.applyBytesBound(
+      this.keyCompaction
+        ? compactKeyed(retained, this.maxEntriesPerTopic)
+        : retained.slice(-this.maxEntriesPerTopic),
+    );
     const text = kept.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
     try {
       // EB-96: atomic replace through the backend — readers never see a
@@ -2339,6 +2417,8 @@ export class DurableTopicLog {
     }
     this.entryCounts.set(topic, kept.length);
     this.messageCounts.set(topic, kept.filter((rec) => rec.seq >= 1).length);
+    // EB-119: byte accounting restarts from the rewritten file's actual bytes.
+    this.topicBytes.set(topic, Buffer.byteLength(text));
     if (this.keyCompaction) this.rebuildKeyIndex(topic, kept);
   }
 
@@ -2364,6 +2444,45 @@ export class DurableTopicLog {
       this.retentionEvicted += 1;
     }
     return retained;
+  }
+
+  /**
+   * EB-119: trims records to the per-topic byte budget — the newest
+   * records whose sealed on-disk bytes fit. Byte cost is the actual
+   * sealed line length, so compressed records count their compressed
+   * wire bytes and binary records their base64 line bytes. Walked
+   * newest-first so the survivors are always the newest records that
+   * fit; relative order is preserved.
+   *
+   * Two exemptions, both deliberate: seq-0 records are state
+   * (delayed-delivery schedules, retained snapshots, pause buffers) and
+   * are never evicted by the byte bound — the same rationale as
+   * `maxAgeMs` — and under keyed compaction the latest record per key is
+   * exempt too (the key space itself bounds retention, Kafka-style, so a
+   * hot key's current value is never evicted by size). Exempt state can
+   * push live bytes over the budget; the budget bounds evictable
+   * history, not pinned state.
+   *
+   * No-op when no byte bound is configured.
+   */
+  private applyBytesBound(records: DurableLogRecord[]): DurableLogRecord[] {
+    const budget = this.maxBytesPerTopic;
+    if (budget === undefined) return records;
+    const costs = new Array<number>(records.length);
+    for (let i = 0; i < records.length; i++) {
+      costs[i] = Buffer.byteLength(this.sealLine(`${JSON.stringify(logLineOf(records[i]))}\n`));
+    }
+    const keep = new Array<boolean>(records.length).fill(false);
+    let bytes = 0;
+    for (let i = records.length - 1; i >= 0; i--) {
+      const rec = records[i];
+      const exempt = rec.seq === 0 || (this.keyCompaction && rec.key !== undefined);
+      if (exempt || bytes + costs[i] <= budget) {
+        keep[i] = true;
+        bytes += costs[i];
+      }
+    }
+    return records.filter((_, i) => keep[i]);
   }
 
   /**
@@ -2964,6 +3083,17 @@ export class DurableTopicLog {
     /** Total entries across all archived segments. */
     archived: number;
     /**
+     * EB-119: live-segment bytes across all topics — the actual on-disk
+     * line bytes (the budget's scope). Archived segments are history and
+     * are not counted.
+     */
+    bytes: number;
+    /**
+     * EB-119: the configured per-topic byte budget (`maxBytesPerTopic`).
+     * Absent when no byte bound is configured.
+     */
+    bytesLimit?: number;
+    /**
      * Per-topic segment view: live entries in the current segment,
      * closed archived segment count, and archived entries — in
      * first-seen order.
@@ -2986,6 +3116,9 @@ export class DurableTopicLog {
       const view = segments[entry.topic];
       if (view !== undefined) view.archived += entry.entries;
     }
+    // EB-119: live bytes across topics — the budget's scope.
+    let bytes = 0;
+    for (const b of this.topicBytes.values()) bytes += b;
     return {
       topics: this.topicsSeen.size,
       entries,
@@ -3000,6 +3133,8 @@ export class DurableTopicLog {
       corruptSegments: this.corruptSegments,
       archived,
       segments,
+      bytes,
+      ...(this.maxBytesPerTopic === undefined ? {} : { bytesLimit: this.maxBytesPerTopic }),
     };
   }
 

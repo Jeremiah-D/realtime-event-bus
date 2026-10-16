@@ -2562,6 +2562,20 @@ export interface EventBusOptions {
    */
   durableLogMaxAgeMs?: number;
   /**
+   * Opt-in per-topic byte budget for the durable log's live segment
+   * (EB-119): the count bound above counts records, this one counts
+   * bytes. When a topic's live bytes grow past twice this value the topic
+   * compacts, keeping the newest records whose sealed on-disk bytes fit
+   * the budget; with `durableLogSegmentRotation` on, crossing the budget
+   * archives the live segment instead of evicting it (still replayable
+   * via `readSince`/`readSinceTime` with `{ includeArchived: true }`).
+   * Compressed records count their compressed wire bytes. Evictions are
+   * visible in `getStats().durableLog.bytes` / `bytesLimit`. Only
+   * meaningful with `durableLogDir`. Must be a positive finite number of
+   * bytes.
+   */
+  durableLogMaxBytesPerTopic?: number;
+  /**
    * Opt-in Kafka-style keyed log compaction for the durable log (see
    * `DurableTopicLog`). A published message may then carry a `key` (see
    * `PublishOptions.key`): only the latest record per (topic, key) is
@@ -3876,6 +3890,18 @@ export interface BusStats {
     corruptSegments: number;
     /** Total entries across all archived segments. */
     archived: number;
+    /**
+     * Live-segment bytes across all topics — the actual on-disk line
+     * bytes, the scope of `durableLogMaxBytesPerTopic` (EB-119).
+     * Archived segments are history and are not counted.
+     */
+    bytes: number;
+    /**
+     * The configured per-topic byte budget
+     * (`durableLogMaxBytesPerTopic`, EB-119). Absent when no byte bound
+     * is configured.
+     */
+    bytesLimit?: number;
     /**
      * Per-topic segment view: live entries in the current segment,
      * closed archived segment count, and archived entries.
@@ -8857,6 +8883,11 @@ export class EventBus {
    */
   private durableLogMaxAgeMs?: number;
   /**
+   * `durableLogMaxBytesPerTopic` as configured — namespace child logs
+   * (EB-52) open with the same per-topic byte budget as the root log.
+   */
+  private readonly durableLogMaxBytesPerTopic?: number;
+  /**
    * `durableLogKeyCompaction` as configured — namespace child logs
    * (EB-52) open with the same compaction mode as the root log.
    */
@@ -9059,6 +9090,11 @@ export class EventBus {
     if (options?.durableLogDir == null && options?.durableLogMaxAgeMs !== undefined) {
       throw new RangeError('durableLogMaxAgeMs requires EventBusOptions.durableLogDir to be set');
     }
+    if (options?.durableLogDir == null && options?.durableLogMaxBytesPerTopic !== undefined) {
+      throw new RangeError(
+        'durableLogMaxBytesPerTopic requires EventBusOptions.durableLogDir to be set',
+      );
+    }
     if (options?.durableLogDir == null && options?.durableLogStorageBackend !== undefined) {
       throw new RangeError('durableLogStorageBackend requires EventBusOptions.durableLogDir to be set');
     }
@@ -9072,6 +9108,9 @@ export class EventBus {
         // Time-based retention runs on the bus clock, so retention stays
         // deterministic under an injected `EventBusOptions.now` (EB-85).
         maxAgeMs: options.durableLogMaxAgeMs,
+        // EB-119: per-topic live-byte budget, enforced at compact time
+        // (archived instead of evicted when rotation is on).
+        maxBytesPerTopic: options.durableLogMaxBytesPerTopic,
         now: this.now,
         keyCompaction: options.durableLogKeyCompaction,
         segmentRotation: options.durableLogSegmentRotation,
@@ -9098,6 +9137,7 @@ export class EventBus {
       // retention bound and encryptor as the root log.
       this.durableLogMaxEntriesPerTopic = options.durableLogMaxEntriesPerTopic;
       this.durableLogMaxAgeMs = options.durableLogMaxAgeMs;
+      this.durableLogMaxBytesPerTopic = options.durableLogMaxBytesPerTopic;
       this.durableLogKeyCompaction = options.durableLogKeyCompaction ?? false;
       this.durableLogSegmentRotation = options.durableLogSegmentRotation;
       this.durableLogEncryptor = options.durableLogEncryptor;
@@ -11447,6 +11487,8 @@ export class EventBus {
         backend: this.durableLog.storageBackend.scoped(`${NAMESPACE_LOG_KEY_PREFIX}${encodeURIComponent(prefix)}`),
         maxEntriesPerTopic: this.durableLogMaxEntriesPerTopic,
         maxAgeMs: this.durableLogMaxAgeMs,
+        // EB-119: namespace child logs share the root log's byte budget.
+        maxBytesPerTopic: this.durableLogMaxBytesPerTopic,
         now: this.now,
         keyCompaction: this.durableLogKeyCompaction,
         segmentRotation: this.durableLogSegmentRotation,
