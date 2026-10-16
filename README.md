@@ -381,7 +381,29 @@ library.
   `getStats().durableLog.corruptSegments` — and fires one
   `segment_checksum_failed` subscription-audit event
   (`getSubscriptionAudit()`). Segments archived before checksums (no
-  sidecar) read exactly as before. Pluggable storage backends (EB-96):
+  sidecar) read exactly as before. Segment hash chaining (EB-118): every
+  archived segment additionally appends one line to the versioned chain
+  manifest (`__segment_chain.jsonl`, line format `v: 2`) —
+  `{topic, segmentId, path, sha256, prevHash, entries, bytes}` — linking
+  each topic's segments in landing order (`prevHash` is the previous
+  segment's SHA-256; the first segment's is the deterministic genesis
+  marker `'genesis'`, reproducible by construction). The digest covers
+  the gzipped archive bytes — the same byte range the EB-94 sidecar
+  covers; the sidecar file itself is metadata and is not hashed, so a
+  crash between the `.gz` write and the sidecar write cannot break the
+  chain. This is the inter-segment ordering integrity that per-segment
+  checksums cannot see: EB-94 proves each segment's bytes are intact,
+  the chain proves the sequence of segments is the one that landed.
+  `DurableTopicLog.verifySegmentChain(dir)` replays the manifest offline
+  and reports reordered lines, missing / replaced / unreadable segments,
+  and rogue (unchained) segment files, each located by topic/segmentId/
+  path — O(segments) plus one full byte read per segment, an operator
+  tool, not a hot-path check. A damaged segment is still isolated
+  in-process per the EB-94 convention (skipped, counted, audited);
+  offline, the chain keeps naming its original digest, so verify reports
+  the tamper instead of silently dropping the link. Rotation and
+  compaction never break the chain: rotation appends new links, and
+  compaction only rewrites the live file. Pluggable storage backends (EB-96):
   every object the log keeps — the per-topic live log, archived segments
   and their sidecars, the group-offset journal (`__group_offsets.jsonl`),
   the subscriber-dedup journal (`__dedup.jsonl`), and the publish-dedup

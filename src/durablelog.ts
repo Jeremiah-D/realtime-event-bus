@@ -609,6 +609,23 @@ const DEDUP_JOURNAL_NAME = '__dedup.jsonl';
 const ARCHIVE_INDEX_NAME = '__archive_index.jsonl';
 
 /**
+ * EB-118: file name of the segment-chain manifest (`__segment_chain.jsonl`)
+ * inside the log directory. A `.jsonl` name — not `.log` — so topic-file
+ * recovery never mistakes it for a topic file, and it can never collide
+ * with a topic file either (`fileFor` always appends `.log`).
+ */
+const CHAIN_MANIFEST_NAME = '__segment_chain.jsonl';
+
+/**
+ * EB-118: the `prevHash` of the first segment in each topic's chain — a
+ * fixed, deterministic marker, never a real digest (real digests are 64
+ * lowercase hex chars; this marker is not). The genesis anchor is
+ * reproducible by construction: any verifier recomputing the chain starts
+ * from this constant.
+ */
+export const SEGMENT_CHAIN_GENESIS_PREV = 'genesis';
+
+/**
  * One closed, gzipped log segment: the on-disk archive of a rotated
  * per-topic live segment, described by one line of the archive index.
  */
@@ -755,6 +772,141 @@ function parseArchiveIndexLine(line: string): ArchiveEntry | null {
     keySeqs,
     partitionSeqs,
   };
+}
+
+/**
+ * EB-118: one link of a topic's archived-segment hash chain. Archived
+ * segments link in landing order — `prevHash` is the previous segment's
+ * `sha256`, the first segment's is `SEGMENT_CHAIN_GENESIS_PREV` — so a
+ * reordered, dropped, or swapped segment breaks the chain. This is the
+ * inter-segment ordering integrity that per-segment checksums (EB-94)
+ * cannot see: EB-94 proves each segment's bytes are intact, the chain
+ * proves the sequence of segments is the one that landed.
+ */
+export interface SegmentChainEntry {
+  /** Concrete topic the segment belongs to. */
+  topic: string;
+  /** Segment identity: `<seqStart>-<seqEnd>` of the segment's records. */
+  segmentId: string;
+  /** Archive file name (`<topic>.seg-<start>-<end>.jsonl.gz`). */
+  path: string;
+  /**
+   * SHA-256 hex of the archived segment's gzipped bytes — the same byte
+   * range the EB-94 sidecar covers. The sidecar file itself is metadata
+   * and is NOT hashed: a crash between the `.gz` write and the sidecar
+   * write must not break the chain.
+   */
+  sha256: string;
+  /** Previous segment's `sha256` in this topic's chain (`'genesis'` for the first). */
+  prevHash: string;
+  /** Records in the segment, including seq-0 schedule records. */
+  entries: number;
+  /** Gzipped archive size in bytes. */
+  bytes: number;
+}
+
+/** On-disk envelope for one chain-manifest line. `v: 2` pins the format. */
+interface ChainManifestLine {
+  v: 2;
+  topic: string;
+  segmentId: string;
+  path: string;
+  sha256: string;
+  prevHash: string;
+  entries: number;
+  bytes: number;
+}
+
+/** Builds the on-disk envelope for a chain entry. */
+function chainManifestLineOf(entry: SegmentChainEntry): ChainManifestLine {
+  return {
+    v: 2,
+    topic: entry.topic,
+    segmentId: entry.segmentId,
+    path: entry.path,
+    sha256: entry.sha256,
+    prevHash: entry.prevHash,
+    entries: entry.entries,
+    bytes: entry.bytes,
+  };
+}
+
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Parses one chain-manifest line. Returns `null` for anything malformed —
+ * wrong version, an empty topic/segmentId/path, a non-digest `sha256`, an
+ * empty `prevHash`, a non-positive-integer entry count, or a negative byte
+ * count. Corrupt lines are skipped, never fatal.
+ */
+function parseChainManifestLine(line: string): SegmentChainEntry | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const o = parsed as Record<string, unknown>;
+  if (o['v'] !== 2) return null;
+  for (const field of ['topic', 'segmentId', 'path'] as const) {
+    if (typeof o[field] !== 'string' || (o[field] as string).length === 0) return null;
+  }
+  if (typeof o['sha256'] !== 'string' || !SHA256_HEX_PATTERN.test(o['sha256'] as string)) {
+    return null;
+  }
+  if (typeof o['prevHash'] !== 'string' || (o['prevHash'] as string).length === 0) return null;
+  if (!Number.isInteger(o['entries']) || (o['entries'] as number) < 1) return null;
+  if (!Number.isInteger(o['bytes']) || (o['bytes'] as number) < 0) return null;
+  return {
+    topic: o['topic'] as string,
+    segmentId: o['segmentId'] as string,
+    path: o['path'] as string,
+    sha256: o['sha256'] as string,
+    prevHash: o['prevHash'] as string,
+    entries: o['entries'] as number,
+    bytes: o['bytes'] as number,
+  };
+}
+
+/**
+ * EB-118: one problem found by offline chain verification. `kind` is the
+ * failure mode:
+ * - `link`: a manifest line's `prevHash` does not match the previous
+ *   segment's digest — the manifest was reordered or a line was forged;
+ * - `hash`: the segment's bytes no longer match its manifest digest — the
+ *   segment was replaced or tampered with;
+ * - `missing`: the manifest names a segment file that is gone from the
+ *   directory;
+ * - `rogue`: a segment file on disk has no manifest line — landed outside
+ *   the chained archive path;
+ * - `unreadable`: the segment file exists but its bytes cannot be read.
+ * `topic`/`segmentId` are empty on manifest-level problems (a corrupt
+ * manifest line).
+ */
+export interface SegmentChainIssue {
+  /** Concrete topic the segment belongs to. */
+  topic: string;
+  /** Segment identity (`<seqStart>-<seqEnd>`). */
+  segmentId: string;
+  /** Archive file name, or the manifest name for manifest-level problems. */
+  path: string;
+  kind: 'link' | 'hash' | 'missing' | 'rogue' | 'unreadable';
+  /** What was expected and what was found — the operator evidence. */
+  detail: string;
+}
+
+/**
+ * EB-118: the offline chain-verification report. `ok` is true only when
+ * no issue was found; `segments` counts the manifest lines checked.
+ * Verification is O(segments) manifest lines plus one full byte read per
+ * archived segment — the I/O cost is proportional to archived data, so
+ * this is an offline/operator tool, not a hot-path check.
+ */
+export interface SegmentChainReport {
+  ok: boolean;
+  segments: number;
+  issues: SegmentChainIssue[];
 }
 
 /**
@@ -1029,6 +1181,22 @@ function parseDedupLine(line: string): DedupEntry | null {
  * adopts orphan archives, so seq/keySeq numbering never reuses an
  * archived number.
  *
+ * Segment hash chaining (EB-118): every archived segment additionally
+ * appends one line to the versioned chain manifest
+ * (`__segment_chain.jsonl`, line format `v: 2`) —
+ * `{topic, segmentId, path, sha256, prevHash, entries, bytes}` — linking
+ * each topic's segments in landing order (`prevHash` is the previous
+ * segment's SHA-256, the first segment's is the deterministic genesis
+ * marker `SEGMENT_CHAIN_GENESIS_PREV`). The digest covers the gzipped
+ * archive bytes (the same byte range the EB-94 sidecar covers; the
+ * sidecar itself is metadata and is not hashed). `DurableTopicLog.
+ * verifySegmentChain(dir)` replays the manifest offline and reports
+ * reordered lines, missing/replaced/unreadable segments, and rogue
+ * (unchained) segment files — O(segments) plus one byte read per
+ * segment, an operator tool, not a hot-path check. Rotation and
+ * compaction never break the chain: rotation appends new links, and
+ * compaction only rewrites the live file.
+ *
  * Durability note: appends are synchronous through the storage backend
  * (EB-96 — `DurableStorageBackend.append`, the filesystem default is a
  * single `appendFileSync`), so a record is handed to the OS before
@@ -1194,6 +1362,18 @@ export class DurableTopicLog {
   private readonly onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void;
   /** Storage key of the archive index (`__archive_index.jsonl`). */
   private readonly archiveIndexKey = ARCHIVE_INDEX_NAME;
+  /**
+   * EB-118: the in-memory view of `__segment_chain.jsonl`, in manifest
+   * (landing) order — rebuilt on open, healed for pre-chain archives.
+   */
+  private readonly chainEntries: SegmentChainEntry[] = [];
+  /**
+   * EB-118: each topic's chain tail — the `sha256` of its most recently
+   * archived segment, the `prevHash` of the next link. Absent until the
+   * topic's first segment archives (its `prevHash` is the genesis
+   * marker, `SEGMENT_CHAIN_GENESIS_PREV`).
+   */
+  private readonly chainTails = new Map<string, string>();
   /** Set while a background archive pass is scheduled. */
   private archiveScheduled = false;
   /**
@@ -1241,6 +1421,9 @@ export class DurableTopicLog {
     this.backend = backend ?? new FilesystemStorageBackend(dir);
     this.recover();
     this.recoverArchiveIndex();
+    // EB-118: the chain view is rebuilt after the archive view — healing
+    // links segments the manifest does not know in archive-index order.
+    this.recoverChainManifest();
     this.recoverOffsets();
     this.recoverDedup();
     this.recoverPublishDedup();
@@ -1536,6 +1719,101 @@ export class DurableTopicLog {
     // history from a previous configuration, and leaving them would lose
     // their records to `includeArchived` reads.
     if (pending) this.scheduleArchive();
+  }
+
+  /**
+   * EB-118: rebuilds the in-memory chain view from
+   * `__segment_chain.jsonl` (corrupt lines counted and skipped), then
+   * heals it: archived segments the manifest does not know — archived
+   * before the chain existed, or a crash between the index append and
+   * the chain append — are linked in archive-index (landing) order with
+   * their bytes re-hashed from disk. Checksum-isolated segments
+   * (`checksumRejected`) never enter the chain: they are not history the
+   * log will ever read.
+   */
+  private recoverChainManifest(): void {
+    const text = this.readText(CHAIN_MANIFEST_NAME);
+    if (text !== undefined) {
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue;
+        const entry = parseChainManifestLine(line);
+        if (entry == null) {
+          this.corruptLines += 1;
+          continue;
+        }
+        this.chainEntries.push(entry);
+        this.chainTails.set(entry.topic, entry.sha256);
+      }
+    }
+    this.healChainManifest();
+  }
+
+  /**
+   * EB-118: links every archived segment missing from the chain manifest,
+   * in archive-index order. Healing reads each such segment's bytes once
+   * — O(archived data), one time per process start — and appends the
+   * missing line, so a directory that predates the chain (or survived a
+   * crash mid-archive) becomes fully chained without operator action.
+   * Never throws: a failed manifest append is healed again on the next
+   * open, and the archive view itself is already complete.
+   */
+  private healChainManifest(): void {
+    const known = new Set(this.chainEntries.map((e) => e.path));
+    for (const entry of this.archives) {
+      if (known.has(entry.path)) continue;
+      // EB-94: an isolated segment must not anchor a chain link.
+      if (this.checksumRejected.has(entry.path)) continue;
+      let raw: Buffer | undefined;
+      try {
+        const bytes = this.backend.read(entry.path);
+        raw = bytes === undefined ? undefined : Buffer.from(bytes);
+      } catch {
+        raw = undefined;
+      }
+      // Unreadable now: left out of the chain — `verifySegmentChain`
+      // reports it as missing/unreadable for the operator.
+      if (raw === undefined) continue;
+      this.appendChainLink(
+        entry.topic,
+        entry,
+        createHash('sha256').update(raw).digest('hex'),
+        raw.length,
+      );
+    }
+  }
+
+  /**
+   * EB-118: appends one chain-manifest line for a freshly archived
+   * segment and advances the topic's in-memory chain tail. Returns
+   * `false` when the manifest append failed — the caller leaves the
+   * archive's pending file for the next pass, and the next open heals
+   * the missing line in index order. Never throws.
+   */
+  private appendChainLink(
+    topic: string,
+    entry: ArchiveEntry,
+    segmentHash: string,
+    bytes: number,
+  ): boolean {
+    const link: SegmentChainEntry = {
+      topic,
+      segmentId: entry.segmentId,
+      path: entry.path,
+      sha256: segmentHash,
+      // The chain is per topic, in landing order: the previous segment's
+      // digest, or the deterministic genesis marker for the first.
+      prevHash: this.chainTails.get(topic) ?? SEGMENT_CHAIN_GENESIS_PREV,
+      entries: entry.entries,
+      bytes,
+    };
+    try {
+      this.backend.append(CHAIN_MANIFEST_NAME, `${JSON.stringify(chainManifestLineOf(link))}\n`);
+    } catch {
+      return false;
+    }
+    this.chainEntries.push(link);
+    this.chainTails.set(topic, segmentHash);
+    return true;
   }
 
   /**
@@ -2004,11 +2282,14 @@ export class DurableTopicLog {
     // extending the crash-safe ordering (.gz -> sidecar -> index ->
     // pending delete). Best-effort: a failed sidecar write leaves the
     // segment unverifiable but fully readable, never lost.
+    //
+    // EB-118: the chain digest covers the gzipped archive bytes — the
+    // same byte range the sidecar covers. The sidecar file itself is
+    // metadata and is NOT hashed: a crash between the `.gz` write and the
+    // sidecar write must not break the chain.
+    const segmentHash = createHash('sha256').update(gzBytes).digest('hex');
     try {
-      this.backend.write(
-        this.checksumKey(entry.path),
-        createHash('sha256').update(gzBytes).digest('hex'),
-      );
+      this.backend.write(this.checksumKey(entry.path), segmentHash);
     } catch {
       // The archive itself is intact; it just reads without verification.
     }
@@ -2019,6 +2300,13 @@ export class DurableTopicLog {
       // orphan adoption on the next open.
       return;
     }
+    // EB-118: chain manifest line — after the index line, before the
+    // pending delete, extending the crash-safe ordering (.gz -> sidecar
+    // -> index -> chain -> pending delete). A crash here leaves an indexed
+    // segment without a chain line; the next open heals it in index
+    // order, and the leftover pending file is dropped idempotently by the
+    // next pass (the archive itself is already complete).
+    if (!this.appendChainLink(topic, entry, segmentHash, gzBytes.length)) return;
     try {
       this.backend.delete(pendingName);
     } catch {
@@ -2713,6 +3001,136 @@ export class DurableTopicLog {
       archived,
       segments,
     };
+  }
+
+  /**
+   * EB-118: offline chain verification over a log directory — no log
+   * instance needed. Reads `__segment_chain.jsonl` and, per topic in
+   * manifest order, checks that every line's `prevHash` links to the
+   * previous segment's digest (the first links to the genesis marker),
+   * that every named segment file exists, and that its bytes still hash
+   * to the manifest digest. Segment files on disk with no manifest line
+   * are reported as rogue. A directory with no manifest (no archives, or
+   * archives that predate the chain and were never healed) verifies as an
+   * empty chain — backward compatible by construction.
+   *
+   * The chain hash is recomputed from the archive bytes here — the
+   * verifier does not trust the EB-94 sidecar, which is a separate
+   * integrity layer with its own lifecycle.
+   *
+   * Cost: O(segments) manifest lines plus one full byte read per archived
+   * segment — I/O proportional to archived data. An offline/operator
+   * tool, never a hot-path check.
+   */
+  static verifySegmentChain(dir: string): SegmentChainReport {
+    const backend = new FilesystemStorageBackend(dir);
+    const issues: SegmentChainIssue[] = [];
+    let text: string | undefined;
+    try {
+      const bytes = backend.read(CHAIN_MANIFEST_NAME);
+      text = bytes === undefined ? undefined : Buffer.from(bytes).toString('utf8');
+    } catch {
+      text = undefined;
+    }
+    const entries: SegmentChainEntry[] = [];
+    if (text !== undefined) {
+      let lineNo = 0;
+      for (const line of text.split('\n')) {
+        lineNo += 1;
+        if (line.length === 0) continue;
+        const entry = parseChainManifestLine(line);
+        if (entry == null) {
+          // A corrupt manifest line breaks the chain exactly like a
+          // reordered one: the linkage from here on is unverifiable.
+          issues.push({
+            topic: '',
+            segmentId: '',
+            path: CHAIN_MANIFEST_NAME,
+            kind: 'link',
+            detail: `corrupt chain manifest line ${lineNo}`,
+          });
+          continue;
+        }
+        entries.push(entry);
+      }
+    }
+    const expectedPrev = new Map<string, string>();
+    const knownPaths = new Set<string>();
+    for (const entry of entries) {
+      const want = expectedPrev.get(entry.topic) ?? SEGMENT_CHAIN_GENESIS_PREV;
+      if (entry.prevHash !== want) {
+        issues.push({
+          topic: entry.topic,
+          segmentId: entry.segmentId,
+          path: entry.path,
+          kind: 'link',
+          detail:
+            `prevHash ${entry.prevHash} does not link to the previous segment's ` +
+            `digest ${want} — the manifest was reordered or the line was forged`,
+        });
+      }
+      knownPaths.add(entry.path);
+      let raw: Buffer | undefined;
+      let unreadable = false;
+      try {
+        const bytes = backend.read(entry.path);
+        raw = bytes === undefined ? undefined : Buffer.from(bytes);
+      } catch {
+        unreadable = true;
+      }
+      if (unreadable) {
+        issues.push({
+          topic: entry.topic,
+          segmentId: entry.segmentId,
+          path: entry.path,
+          kind: 'unreadable',
+          detail: 'the segment file exists but its bytes cannot be read',
+        });
+      } else if (raw === undefined) {
+        issues.push({
+          topic: entry.topic,
+          segmentId: entry.segmentId,
+          path: entry.path,
+          kind: 'missing',
+          detail: 'the manifest names a segment file that is gone from the log directory',
+        });
+      } else {
+        const actual = createHash('sha256').update(raw).digest('hex');
+        if (actual !== entry.sha256) {
+          issues.push({
+            topic: entry.topic,
+            segmentId: entry.segmentId,
+            path: entry.path,
+            kind: 'hash',
+            detail:
+              `segment bytes hash ${actual} != manifest digest ${entry.sha256} — ` +
+              `the segment was replaced or tampered with`,
+          });
+        }
+      }
+      expectedPrev.set(entry.topic, entry.sha256);
+    }
+    // Rogue segments: archived on disk but never chained.
+    let names: string[];
+    try {
+      names = backend.list();
+    } catch {
+      names = [];
+    }
+    for (const name of names) {
+      const parsed = parseSegmentFileName(name);
+      if (parsed == null) continue;
+      if (!knownPaths.has(name)) {
+        issues.push({
+          topic: parsed.topic,
+          segmentId: `${parsed.seqStart}-${parsed.seqEnd}`,
+          path: name,
+          kind: 'rogue',
+          detail: 'an archived segment on disk has no chain manifest line',
+        });
+      }
+    }
+    return { ok: issues.length === 0, segments: entries.length, issues };
   }
 }
 
