@@ -743,6 +743,38 @@ library.
   `publishAtomic` runs the cap in shadow admission (an oversized entry aborts
   the batch with reason `'message-too-big'`), and `publishDelayed`
   fail-fasts on it at schedule time, exactly like schema validation.
+- **Per-topic payload-size cap** (in `src/bus.ts`, via
+  `setTopicMaxPayloadBytes(pattern, maxPayloadBytes)`, EB-120): an
+  admission gate for oversized payloads positioned after schema validation
+  (and after the message-size cap) and before any rate-limit budget is
+  touched (backend engineering). A publish whose payload serializes to more
+  than `maxPayloadBytes` UTF-8 JSON bytes is rejected before admission —
+  the same zero-side-effect semantics as a schema rejection: it consumes
+  no sequence number (subscribers see no gap), is never written to the
+  durable log, never reaches a queue, and does not burn rate-limit budget;
+  `publish` returns 0 for it. The byte measure is `payloadByteSize` — JSON
+  UTF-8 bytes, `Uint8Array` binary payloads measured as their wire bytes,
+  and payloads with no JSON encoding (`undefined`, functions, circular
+  structures, BigInt) measuring 0 bytes and always passing (the compress
+  path's passthrough semantics). Rejections share
+  `TopicStats.rejectedMessages` (and the global total) with the other
+  pre-admission rejections, additionally sum the rejected bytes into
+  `TopicStats.payloadRejectedBytes` / `BusStats.payloadRejectedBytes`, and
+  surface on `onAdmissionRejected` with reason `'payload-too-large'` (the
+  event carries `payloadBytes`, never the payload). The gate applies
+  uniformly: `publish`, `publishBatch` (per entry, through the shared
+  `fanOut` admission path — a batch envelope never bypasses it),
+  `publishAtomic` (any oversized entry rejects the whole batch, surfaced as
+  `'payload-too-large'`), `publishDelayed` (fail-fast at schedule time),
+  `publishIdempotent`, and `previewPublish` (gate name
+  `'max-payload-bytes'`). Rule matching mirrors `setTopicTtl`: an
+  exact-topic rule wins over patterns, the earliest-registered matching
+  pattern wins (independent matcher cache — never inflates
+  `patternCacheSize`), and re-setting a rule replaces it.
+  `clearTopicMaxPayloadBytes` removes a rule. When both this cap and
+  `setTopicMaxMessageBytes` are configured for a topic, the message-size
+  cap is evaluated first. Empty patterns and non-positive-integer sizes
+  throw `RangeError`. Unset by default (fully backward compatible).
 - **Per-topic sensitive-field redaction** (in `src/bus.ts`, via
   `setTopicRedaction(pattern, fields)`): admission-time masking of
   sensitive payload fields for PII/secret hygiene (backend/real-time
