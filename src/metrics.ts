@@ -348,6 +348,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.keyedReorderedMessages,
   );
   counter(
+    'eventbus_offset_store_write_errors_total',
+    'Total failed OffsetStore.set calls (EB-114, see EventBusOptions.offsetStore): a throwing custom store never breaks the in-memory commit.',
+    stats.offsetStoreWriteErrors,
+  );
+  counter(
     'eventbus_causal_buffer_dropped_messages_total',
     'Total causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock).',
     stats.causalBuffer?.droppedMessages ?? 0,

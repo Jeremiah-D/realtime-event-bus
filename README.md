@@ -123,7 +123,12 @@ library.
   tracks the per-group assignment watermark (`getGroupOffsets`: highest
   per-topic `seq` handed to any member) and consumer checkpoints
   (`commitOffset` / `getCommittedOffsets`); `getStats().consumerGroups`
-  lists live groups. Opt-in `partitions` on `subscribeToGroup` switches a
+  lists live groups. Group-level checkpoints are mirrored into a pluggable
+  `OffsetStore` (`EventBusOptions.offsetStore`, in `src/offsetstore.ts`;
+  default in-memory): inject a shared store (e.g. a Redis/Postgres adapter)
+  so checkpoints survive restarts and are visible across bus instances,
+  and reseed a fresh bus with `await bus.recoverFromOffsetStore()`
+  (highest-seq-wins, never regressing live commits). Opt-in `partitions` on `subscribeToGroup` switches a
   competing set from per-message round-robin to Kafka-style partition
   assignment: the key space is divided into N logical partitions, each owned
   exclusively by one member. A keyed message's partition is
@@ -1680,6 +1685,13 @@ npm test
   skipping in-flight seqs during the window, live traffic unaffected,
   backlog replayable after expiry, no window when fully committed, inert
   without a durable log, option validation.
+- `test/offsetstore.test.ts` — pluggable `OffsetStore` (EB-114):
+  group-level commits mirrored to an injected store, per-partition and
+  per-instance checkpoints staying in memory, default in-memory zero
+  behavior change, `TypeError` on malformed stores, throwing stores never
+  breaking the commit (counted in `offsetStoreWriteErrors`),
+  `recoverFromOffsetStore()` reseeding highest-seq-wins with malformed
+  entries skipped.
 - `test/cluster.test.ts` — cluster federation: route-table sync on join,
   route-aware forwarding with hub-global per-topic seqs, monotonic hub seqs
   across publishers, local vs hub seq spaces, no phantom gaps across seq

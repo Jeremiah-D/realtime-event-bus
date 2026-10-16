@@ -59,6 +59,11 @@ import {
   type GroupLagStat,
 } from './grouplag.ts';
 import {
+  InMemoryOffsetStore,
+  resolveOffsetStore,
+  type OffsetStore,
+} from './offsetstore.ts';
+import {
   diagnoseBusHealth,
   type BusHealthReport,
   type DoctorInput,
@@ -2559,6 +2564,20 @@ export interface EventBusOptions {
    */
   groupLag?: GroupLagMonitorOptions;
   /**
+   * Pluggable backing store for consumer-group committed offsets
+   * (EB-114, see `src/offsetstore.ts`). Every group-level `commitOffset`
+   * (no `partition`/`instanceId`) is mirrored into the store, so a
+   * shared store — e.g. a Redis/Postgres adapter — keeps checkpoints
+   * across processes and restarts; `EventBus.recoverFromOffsetStore()`
+   * reseeds a new bus from it. The bus's in-memory map stays the read
+   * path (`getCommittedOffsets`, group-lag rows), and the store's `set`
+   * is never awaited — a throwing `set` is counted in
+   * `getStats().offsetStoreWriteErrors` and never breaks the commit.
+   * Default: a new `InMemoryOffsetStore` — pure in-memory, zero behavior
+   * change. Shape-validated at construction (`TypeError` otherwise).
+   */
+  offsetStore?: OffsetStore;
+  /**
    * Unified publish-side admission-rejection hook: called once for every
    * publish the admission gates drop — ACL denials (`'acl'`, see
    * `setAclRules`), schema-validation rejections
@@ -3114,6 +3133,14 @@ export interface BusStats {
    * exact counting rules.
    */
   pausedMessages: number;
+  /**
+   * Total failed `OffsetStore.set` calls (EB-114, see
+   * `EventBusOptions.offsetStore`): a throwing custom store never breaks
+   * the in-memory commit — the live process keeps serving from memory —
+   * so this counter is the only visible trace of a sick store. Monotonic.
+   * Always 0 with the default `InMemoryOffsetStore`.
+   */
+  offsetStoreWriteErrors: number;
   /**
    * Currently active topic-pause rules (see `EventBus.pauseTopic`,
    * EB-88), in registration order: the rule key, its mode, and how many
@@ -8387,6 +8414,18 @@ export class EventBus {
    */
   private committedOffsets = new Map<string, Map<string, number>>();
   /**
+   * Pluggable backing store for group-level committed offsets (EB-114):
+   * every `commitOffset` without `partition`/`instanceId` is mirrored
+   * here, so a caller-supplied store (Redis/Postgres adapter) keeps
+   * checkpoints across processes and restarts. The bus's own map above
+   * stays the read path — the store is a write-through seam plus the
+   * `recoverFromOffsetStore()` recovery source. Defaults to
+   * `InMemoryOffsetStore` (zero behavior change).
+   */
+  private readonly offsetStore: OffsetStore;
+  /** Failed `OffsetStore.set` calls (EB-114): counted, never thrown. */
+  private totalOffsetStoreWriteErrors = 0;
+  /**
    * Active handoff-linger windows: groupId -> windows (see
    * `GroupSubscribeOptions.handoffLingerMs`). While a window is live,
    * durable-log replay skips the covered seqs for members of the group,
@@ -8734,6 +8773,10 @@ export class EventBus {
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
     this.groupLagMonitor = new GroupLagMonitor(resolveGroupLagOptions(options?.groupLag, 'EventBus'));
+    // EB-114: validated here, fail-fast — an invalid store must never
+    // half-wire a bus. Absent means the default in-memory store: the bus
+    // behaves exactly as before.
+    this.offsetStore = resolveOffsetStore(options?.offsetStore, 'EventBus') ?? new InMemoryOffsetStore();
     const aclDefault = options?.acl?.defaultPolicy ?? 'allow';
     if (aclDefault !== 'allow' && aclDefault !== 'deny') {
       throw new RangeError("acl.defaultPolicy must be 'allow' or 'deny'");
@@ -14227,9 +14270,59 @@ export class EventBus {
       this.committedOffsets.set(groupId, committed);
     }
     committed.set(topic, seq);
+    // EB-114: write-through to the pluggable offset store (group-level
+    // checkpoints only — per-partition/per-instance checkpoints stay in
+    // memory, see `src/offsetstore.ts`).
+    this.mirrorOffsetToStore(groupId, topic, seq);
     this.durableLog?.appendOffset(groupId, topic, seq, this.now());
     // Same re-evaluation as the partitioned branch above.
     this.checkGroupLagForGroup(groupId);
+  }
+
+  /**
+   * Mirrors one group-level checkpoint into the `OffsetStore` (EB-114).
+   * Error-isolated like the durable-log journal append: a failing custom
+   * store is counted in `getStats().offsetStoreWriteErrors` and never
+   * breaks the in-memory commit — the live process keeps serving from
+   * memory.
+   */
+  private mirrorOffsetToStore(groupId: string, topic: string, seq: number): void {
+    try {
+      this.offsetStore.set(groupId, topic, seq);
+    } catch {
+      this.totalOffsetStoreWriteErrors += 1;
+    }
+  }
+
+  /**
+   * Reseeds group-level committed offsets from the `OffsetStore`'s
+   * recovery hook (EB-114): the multi-instance / restart story for a
+   * shared store. `store.entries()` (sync or async) yields every
+   * persisted checkpoint; each is merged highest-seq-wins — an offset the
+   * live process already committed past is never regressed — and
+   * malformed entries are skipped. Group lag is re-evaluated for every
+   * touched group, exactly like `commitOffset` does. A store without
+   * `entries()` (or the default in-memory store) is a no-op.
+   */
+  async recoverFromOffsetStore(): Promise<void> {
+    const entries = this.offsetStore.entries;
+    if (entries === undefined) return;
+    const touched = new Set<string>();
+    for (const e of await entries.call(this.offsetStore)) {
+      if (typeof e?.groupId !== 'string' || e.groupId.length === 0) continue;
+      if (typeof e?.topic !== 'string' || e.topic.length === 0) continue;
+      if (!Number.isInteger(e?.seq) || (e.seq as number) < 1) continue;
+      let byTopic = this.committedOffsets.get(e.groupId);
+      if (byTopic == null) {
+        byTopic = new Map<string, number>();
+        this.committedOffsets.set(e.groupId, byTopic);
+      }
+      if (e.seq > (byTopic.get(e.topic) ?? 0)) {
+        byTopic.set(e.topic, e.seq);
+        touched.add(e.groupId);
+      }
+    }
+    for (const groupId of touched) this.checkGroupLagForGroup(groupId);
   }
 
   /**
@@ -20697,6 +20790,7 @@ export class EventBus {
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
       pausedMessages: this.totalPaused,
+      offsetStoreWriteErrors: this.totalOffsetStoreWriteErrors,
       // Active topic-pause rules (EB-88), in registration order.
       pausedTopics: [...this.pauseRules.entries()].map(([topicPattern, rule]) => ({
         topicPattern,
