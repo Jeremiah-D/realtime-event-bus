@@ -120,6 +120,11 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     compressedBytesAfter: 0,
     compressionRatio: 0,
     meanCompressionMs: 0,
+    lanes: {
+      queued: { urgent: 0, normal: 0, bulk: 0 },
+      delivered: { urgent: 0, normal: 0, bulk: 0 },
+      dropped: { urgent: 0, normal: 0, bulk: 0 },
+    },
     rates: { r1s: 0, r1m: 0, r5m: 0 },
   });
   const stats: BusStats = {

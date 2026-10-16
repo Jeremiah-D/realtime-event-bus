@@ -10,6 +10,8 @@
  * O(1) and never needs an arbitrary-position heap removal.
  */
 
+import type { MessageLane } from './lanes.ts';
+
 /** One scheduled delayed delivery waiting in the timer heap. */
 export interface DelayedEntry {
   /** Opaque handle returned by `publishDelayed` (`delayed-1`, …). */
@@ -61,6 +63,12 @@ export interface DelayedEntry {
    * restarts.
    */
   publisherId?: string;
+  /**
+   * Priority lane carried from `PublishDelayedOptions` into the fan-out
+   * (see `PublishOptions.priority`, EB-122): the schedule fans out into
+   * this lane at its due time. Absent means `normal`.
+   */
+  priority?: MessageLane;
 }
 
 interface HeapNode {

@@ -1,9 +1,19 @@
 import {
-  BoundedQueue,
   assertValidBackpressurePolicy,
   type BackpressurePolicy,
   type DropPolicy,
 } from './backpressure.ts';
+import {
+  LaneQueue,
+  MESSAGE_LANES,
+  assertValidMessageLane,
+  resolvePriorityLanesOptions,
+  zeroedLaneCounts,
+  type LaneCounts,
+  type LaneWeights,
+  type MessageLane,
+  type PriorityLanesOptions,
+} from './lanes.ts';
 import { LeaseManager, type LeaseExpiredCallback, type LeaseExpiredEvent } from './lease.ts';
 import {
   IdleReclaimer,
@@ -353,6 +363,18 @@ export interface BusMessage {
    * (`undefined`) otherwise, so existing consumers see no shape change.
    */
   retained?: boolean;
+  /**
+   * Priority lane (see `PublishOptions.priority`, EB-122): which of the
+   * subscriber's three priority lanes (`urgent` / `normal` / `bulk`) this
+   * message queues in. Absent means `normal` — messages published without
+   * a priority, and every message written before priority lanes existed,
+   * ride the normal lane, so the envelope shape is unchanged for
+   * priority-unaware traffic. Bus-side metadata like `partition`: stamped
+   * at admission, carried end to end (durable log, replay, redeliveries,
+   * delayed schedules) so a message keeps its lane across restarts and
+   * retries.
+   */
+  lane?: MessageLane;
   /**
    * Barrier cut marker (see `PublishOptions.barrier`, EB-98): present
    * exactly on barrier control messages — `{ epoch }`, the cut's
@@ -2632,6 +2654,19 @@ export interface EventBusOptions {
    */
   idempotencyMaxEntries?: number;
   /**
+   * Per-topic priority-lane tuning (EB-122, opt-in): every subscriber's
+   * queue holds three priority lanes (`urgent` / `normal` / `bulk`) drained
+   * in weighted round-robin order. `weights` sets the per-lane drain
+   * weights (positive integers, default 8:2:1); `bulkStarvationRounds`
+   * sets how many consecutive drain rounds the bulk lane may sit
+   * nonempty-but-undrained before one bulk message is force-interleaved
+   * (positive integer, default 10). Publishes opt into lanes via
+   * `PublishOptions.priority` (default `normal`); without priorities all
+   * traffic rides the normal lane and the drain behaves exactly as
+   * before.
+   */
+  priorityLanes?: PriorityLanesOptions;
+  /**
    * Opt-in consumer-group lag alerting (see `src/grouplag.ts`): per
    * (group, topic) lag — the highest per-topic `seq` assigned to any
    * member minus the consumer checkpoint (`commitOffset`) — is computed
@@ -3102,6 +3137,21 @@ export interface TopicStats {
    * sequence number assigned so far.
    */
   partitions?: Array<{ partition: number; publishedMessages: number; lastSeq: number }>;
+  /**
+   * Per-priority-lane counters (EB-122): `queued` is the live backlog per
+   * lane (entries currently sitting in subscriber queues — a message
+   * fanned out to N subscribers contributes N, like `expiredMessages`),
+   * `delivered` the per-lane drain total, `dropped` the per-lane
+   * backpressure shed/refusal total. Production fan-out only — shadow
+   * mirrors stay in the shadow's independent counters. `queued` always
+   * reconciles: `queued == enqueued - delivered - dropped - expired` per
+   * lane, where expiries leave `queued` through `expiredMessages`.
+   */
+  lanes: {
+    queued: LaneCounts;
+    delivered: LaneCounts;
+    dropped: LaneCounts;
+  };
 }
 
 /** Point-in-time snapshot returned by `EventBus.getStats()`. */
@@ -3159,6 +3209,19 @@ export interface BusStats {
    * big/small messages, `droppedMessages` stays 0 while this climbs.
    */
   queueBytes: number;
+  /**
+   * Global per-priority-lane counters (EB-122): `queued` is the live
+   * backlog per lane across all subscriber queues, `delivered` the
+   * per-lane drain total, `dropped` the per-lane backpressure
+   * shed/refusal total. Production fan-out only — shadow mirrors stay in
+   * the shadow's independent counters. Always present (lanes always
+   * exist); all-normal traffic shows everything under `normal`.
+   */
+  lanes: {
+    queued: LaneCounts;
+    delivered: LaneCounts;
+    dropped: LaneCounts;
+  };
   /**
    * Total messages shed at the publish side by adaptive publish-side
    * throttling (see `SubscribeOptions.throttle`) — the sum of every
@@ -4204,7 +4267,14 @@ interface Subscriber {
    */
   durableLog?: DurableTopicLog;
   handler: MessageHandler;
-  queue: BoundedQueue<BusMessage>;
+  /**
+   * The subscriber's three priority lanes (see `PublishOptions.priority`,
+   * EB-122): one `LaneQueue` coordinating the urgent / normal / bulk
+   * lanes over the subscriber's single capacity budget. Messages without
+   * a priority land in the normal lane; the drain serves lanes in
+   * weighted round-robin order with bulk starvation protection.
+   */
+  queue: LaneQueue<BusMessage>;
   /**
    * Slow-consumer backpressure tier (see `SubscribeOptions.backpressure`,
    * EB-83): what the bus does when `queue` is full at enqueue time.
@@ -4713,6 +4783,11 @@ function zeroedTopicStats(): {
   compressedBytesBefore: number;
   compressedBytesAfter: number;
   compressionTimeMs: number;
+  lanes: {
+    queued: LaneCounts;
+    delivered: LaneCounts;
+    dropped: LaneCounts;
+  };
 } {
   return {
     subscriberCount: 0,
@@ -4738,6 +4813,11 @@ function zeroedTopicStats(): {
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,
     compressionTimeMs: 0,
+    lanes: {
+      queued: zeroedLaneCounts(),
+      delivered: zeroedLaneCounts(),
+      dropped: zeroedLaneCounts(),
+    },
   };
 }
 
@@ -6222,6 +6302,11 @@ interface PauseBufferEntry {
   routed?: boolean;
   fromBridge?: boolean;
   diagnostic?: boolean;
+  /**
+   * Priority lane at pause admission (EB-122): the resume fan-out
+   * re-admits the message into this lane. Absent means `normal`.
+   */
+  priority?: MessageLane;
 }
 
 /**
@@ -6959,6 +7044,24 @@ export interface PublishOptions {
    * delayed publishes ignore the flag.
    */
   barrier?: { epoch: number };
+  /**
+   * Priority lane for this publish (EB-122, opt-in): `'urgent'`,
+   * `'normal'` (default), or `'bulk'`. The message queues in that lane of
+   * each matched subscriber's queue and drains in weighted round-robin
+   * order (default weights 8:2:1, tunable via
+   * `EventBusOptions.priorityLanes`), with bulk starvation protection —
+   * urgent traffic drains first, bulk traffic still drains.
+   *
+   * FIFO is preserved within each lane; across lanes the order is
+   * priority-based by design. Publishes without a priority land in the
+   * normal lane and behave exactly as before (the rotation is a no-op
+   * until a second lane holds messages). The lane is stamped on the
+   * envelope (`BusMessage.lane`) and the durable-log record, so it
+   * survives replay, redeliveries, and delayed schedules. Anything but
+   * the three lane names throws `RangeError` from the publish entry
+   * point, before anything is mutated.
+   */
+  priority?: MessageLane;
 }
 
 /**
@@ -7042,6 +7145,15 @@ export interface PublishDelayedOptions {
    * time, not re-run at fan-out. Same validation as `publish`.
    */
   schemaVersion?: number;
+  /**
+   * Priority lane for this delayed publish (EB-122, opt-in): `'urgent'`,
+   * `'normal'` (default), or `'bulk'`. Carried on the schedule (in memory
+   * and on the durable-log schedule record) and applied when the message
+   * fans out at its due time — a delayed urgent message queues in the
+   * urgent lane exactly like a live urgent publish. Same validation as
+   * `publish`.
+   */
+  priority?: MessageLane;
 }
 
 /**
@@ -8505,6 +8617,29 @@ export class EventBus {
    */
   private readonly idempotencyMaxEntries: number;
   /**
+   * Per-lane drain weights for the priority-lane rotation (EB-122), from
+   * `EventBusOptions.priorityLanes` (default 8:2:1). Shared by every
+   * subscriber's `LaneQueue` — lanes are a bus-wide mechanism, not a
+   * per-subscription tuning.
+   */
+  private readonly laneWeights: LaneWeights;
+  /**
+   * Bulk starvation threshold in consecutive undrained drain rounds
+   * (EB-122), from `EventBusOptions.priorityLanes` (default 10). Shared
+   * by every subscriber's `LaneQueue`.
+   */
+  private readonly bulkStarvationRounds: number;
+  /**
+   * Global per-lane queue-entry counters (EB-122): `laneQueued` is the
+   * live backlog per lane (entries currently sitting in subscriber
+   * queues), `laneDelivered` the per-lane drain total, `laneDropped` the
+   * per-lane shed/refusal total. Production fan-out only — shadow mirrors
+   * stay in the shadow's independent counters (see `enqueueShadowMessage`).
+   */
+  private readonly laneQueued: LaneCounts = zeroedLaneCounts();
+  private readonly laneDelivered: LaneCounts = zeroedLaneCounts();
+  private readonly laneDropped: LaneCounts = zeroedLaneCounts();
+  /**
    * Unified publish-side admission-rejection hook
    * (`EventBusOptions.onAdmissionRejected`), or `undefined` when unset —
    * the bus is then exactly as before (stats counting only).
@@ -9058,6 +9193,12 @@ export class EventBus {
       throw new RangeError('idempotencyMaxEntries must be a positive integer');
     }
     this.idempotencyMaxEntries = idempotencyMaxEntries;
+    // Per-topic priority lanes (EB-122): validated fail-fast — a bad
+    // weight or starvation threshold must never silently degrade the
+    // drain rotation.
+    const laneTuning = resolvePriorityLanesOptions(options?.priorityLanes, 'EventBus');
+    this.laneWeights = laneTuning.weights;
+    this.bulkStarvationRounds = laneTuning.bulkStarvationRounds;
     const onAdmissionRejected = options?.onAdmissionRejected;
     if (onAdmissionRejected !== undefined && typeof onAdmissionRejected !== 'function') {
       throw new RangeError('onAdmissionRejected must be a function');
@@ -11881,6 +12022,11 @@ export class EventBus {
         compressedBytesBefore: 0,
         compressedBytesAfter: 0,
         compressionTimeMs: 0,
+        lanes: {
+          queued: zeroedLaneCounts(),
+          delivered: zeroedLaneCounts(),
+          dropped: zeroedLaneCounts(),
+        },
       });
     }
     for (const [key, maxSeq] of log.recoveredKeySeqs()) {
@@ -12126,7 +12272,13 @@ export class EventBus {
     const queuePolicy: DropPolicy =
       shadowOpts?.dropPolicy ??
       (backpressure === 'block' ? (opts?.dropPolicy ?? 'drop-oldest') : backpressure);
-    const queue = new BoundedQueue<BusMessage>({
+    // Per-topic priority lanes (EB-122): the subscriber's queue is a
+    // `LaneQueue` — three FIFO lanes (urgent / normal / bulk) over the one
+    // capacity budget, drained in weighted round-robin order. Lanes are a
+    // bus-wide mechanism: every subscriber shares the bus's weights and
+    // bulk-starvation threshold. Without priorities everything lands in
+    // the normal lane and the drain delegates verbatim to a single FIFO.
+    const queue = new LaneQueue<BusMessage>({
       capacity,
       // The shadow queue's backpressure policy is independently tunable
       // via `ShadowSubscribeOptions`; otherwise the subscription's own
@@ -12139,6 +12291,8 @@ export class EventBus {
             maxBytes: queueMaxBytes,
             byteSize: (msg: BusMessage) => payloadByteSize(msg.payload),
           }),
+      weights: this.laneWeights,
+      bulkStarvationRounds: this.bulkStarvationRounds,
       // The internal wrappers are registered whenever throttling is enabled,
       // even without user callbacks: the bus needs the excursion signals to
       // engage/disengage the throttle.
@@ -12348,6 +12502,14 @@ export class EventBus {
       id,
       unsubscribe: () => {
         if (!this.subscribers.delete(id)) return;
+        // Priority lanes (EB-122): the subscriber's queued backlog
+        // vanishes with it — release its entries from the lane backlog
+        // counters so the `queued` gauges don't leak. (Migration teardown
+        // runs through here too: the exported backlog leaves this bus, so
+        // its entries leave this bus's gauges.)
+        for (const msg of subscriber.queue.snapshot()) {
+          this.countLaneUnqueued(msg.topic, msg.lane ?? 'normal');
+        }
         // Subscription lifecycle audit (EB-78): name the live pattern —
         // `updateSubscriptionPattern` rewrites it in place, and the audit
         // must reflect what the subscription actually matched on.
@@ -15914,6 +16076,10 @@ export class EventBus {
           ...(typeof rec.publisherId === 'string' && rec.publisherId.length > 0
             ? { publisherId: rec.publisherId }
             : {}),
+          // Restores the priority lane logged at publish time (EB-122):
+          // the replayed message queues in its original lane. Records
+          // written before lanes carry no lane and replay as `normal`.
+          ...(rec.lane === undefined ? {} : { lane: rec.lane }),
         };
         // The log stores the wire payload: a record written while a
         // compression rule was active carries the deflated envelope, so
@@ -16074,6 +16240,8 @@ export class EventBus {
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publish');
     // Barrier cut marker (EB-98): fail-fast, before anything is mutated.
     validateBarrier(opts?.barrier, 'publish');
+    // Priority lane (EB-122): fail-fast, before anything is mutated.
+    if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publish');
     // Binary payload passthrough (EB-92): validated and normalized here
     // — `binary: true` with a non-bytes payload throws `TypeError`
     // before anything is mutated.
@@ -16142,6 +16310,9 @@ export class EventBus {
       opts?.partitionKey,
       opts?.partition,
       binary,
+      // Priority lane (EB-122): validated above; `fanOut` stamps it onto
+      // the envelope and the durable-log record. Absent means `normal`.
+      opts?.priority,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -16458,6 +16629,9 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'publishIdempotent');
     validateSchemaVersion(opts?.schemaVersion, 'publishIdempotent');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishIdempotent');
+    // Priority lane (EB-122): fail-fast, before anything is mutated —
+    // `IdempotentPublishOptions` inherits `priority` from `PublishOptions`.
+    if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishIdempotent');
     // Binary payload passthrough (EB-92): same contract as `publish`.
     payload = normalizeBinaryPayload(payload, opts?.binary, 'publishIdempotent');
     const binary = opts?.binary === true;
@@ -16504,6 +16678,7 @@ export class EventBus {
         opts?.partitionKey,
         opts?.partition,
         binary,
+        opts?.priority,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -16548,6 +16723,7 @@ export class EventBus {
       opts?.partitionKey,
       opts?.partition,
       binary,
+      opts?.priority,
     );
     // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
     // and the per-publisher rate-limit gate lives inside `fanOut` — so a
@@ -16756,6 +16932,10 @@ export class EventBus {
       validatePublisherId(msg.publisherId, 'publishBatch');
       validateSchemaVersion(msg.schemaVersion, 'publishBatch');
       validatePartitionOptions(msg.partitionKey, msg.partition, 'publishBatch');
+      // Priority lane (EB-122): a batch entry carries its lane on the
+      // inherited `BusMessage.lane` field — validated per entry, like the
+      // other per-entry options.
+      if (msg.lane !== undefined) assertValidMessageLane(msg.lane, 'publishBatch');
     }
     let accepted = 0;
     for (const msg of messages) {
@@ -16783,6 +16963,10 @@ export class EventBus {
         // like `PublishOptions`.
         msg.partitionKey,
         msg.partition,
+        false, // binary: batch entries carry no binary flag
+        // Priority lane (EB-122): the entry's inherited `BusMessage.lane`,
+        // validated per entry above.
+        msg.lane,
       ).accepted;
     }
     this.scheduleFlush();
@@ -16849,6 +17033,9 @@ export class EventBus {
       validatePublisherId(entry.publisherId, 'publishAtomic');
       validateSchemaVersion(entry.schemaVersion, 'publishAtomic');
       validatePartitionOptions(entry.partitionKey, entry.partition, 'publishAtomic');
+      // Priority lane (EB-122): validated per entry, like the other
+      // per-entry options; the commit phase carries it into `fanOut`.
+      if (entry.lane !== undefined) assertValidMessageLane(entry.lane, 'publishAtomic');
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
@@ -16966,6 +17153,10 @@ export class EventBus {
         // throw at commit.
         partitionKey,
         partition,
+        false, // binary: atomic entries carry no binary flag
+        // Priority lane (EB-122): the entry's inherited `BusMessage.lane`,
+        // validated per entry in the key-validation loop above.
+        entries[index].lane,
       );
     }
     this.scheduleFlush();
@@ -17164,6 +17355,9 @@ export class EventBus {
     // must leave zero state behind — no schedule, no counted rejection.
     validatePublisherId(opts?.publisherId, 'publishDelayed');
     validateSchemaVersion(opts?.schemaVersion, 'publishDelayed');
+    // Priority lane (EB-122): fail-fast, before anything is mutated.
+    if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishDelayed');
+    const priority = opts?.priority;
     const publisherId = opts?.publisherId;
     // Topic aliases (EB-44) resolve before every other gate: the schedule
     // is filed under the resolved topic — the fail-fast ACL/schema checks
@@ -17267,6 +17461,9 @@ export class EventBus {
       // The producer label rides the schedule record so a restart rebuilds
       // the timer with the attribution intact.
       publisherId,
+      // The priority lane rides the schedule so the due-time fan-out
+      // queues the message in its original lane (EB-122).
+      priority,
     };
     // Persist the schedule before it is visible anywhere: a crash between
     // here and the due time must still deliver the message after restart.
@@ -17294,6 +17491,10 @@ export class EventBus {
         // timer fans out with the original attribution (see
         // `DelayedEntry.publisherId`).
         ...(publisherId === undefined ? {} : { publisherId }),
+        // The priority lane rides the schedule record so the rebuilt
+        // timer fans out into the original lane (EB-122; absent means
+        // `normal`).
+        ...(priority === undefined || priority === 'normal' ? {} : { lane: priority }),
       });
       if (!persisted) {
         // The schedule died before it existed: its keySeq will never fan
@@ -17493,6 +17694,8 @@ export class EventBus {
             // The schedule-time deadline rides along verbatim — the
             // message was "published" at schedule time, not at deferral.
             expiresAtOverride: top.expiresAt,
+            // The schedule-time lane rides along too (EB-122).
+            priority: top.priority,
           });
         }
         this.appendDelayTombstone(top.id, top.topic);
@@ -17523,6 +17726,15 @@ export class EventBus {
         undefined, // eventTime: delayed schedules carry no event-time stamp
         undefined, // causal: delayed schedules carry no causal clock
         top.publisherId, // the schedule's producer attribution survives the timer
+        undefined, // schemaVersion: validated fail-fast at schedule time
+        undefined, // retain: delayed schedules never retain
+        undefined, // pausedExpiresAt
+        undefined, // partitionKey: delayed schedules carry no partition routing
+        undefined, // partition
+        false, // binary: delayed schedules carry no binary flag
+        // The schedule-time lane (EB-122): the due-time fan-out queues
+        // the message in its original lane.
+        top.priority,
       );
       this.appendDelayTombstone(top.id, top.topic);
       fannedOut = true;
@@ -17626,6 +17838,12 @@ export class EventBus {
       expiresAtOverride?: number;
       /** Binary-payload marker (EB-92), propagated to the buffer entry. */
       binary?: boolean;
+      /**
+       * Priority lane at pause admission (EB-122), propagated to the
+       * buffer entry so the resume fan-out re-admits the message into
+       * its original lane.
+       */
+      priority?: MessageLane;
     },
   ): void {
     const nowMs = this.now();
@@ -17660,6 +17878,10 @@ export class EventBus {
       // and the pause journal, so the resume fan-out — in this process
       // or after a restart — stays byte-oriented.
       ...(opts.binary === true ? { binary: true } : {}),
+      // The pause-time lane rides the in-memory entry and the pause
+      // journal, so the resume fan-out — in this process or after a
+      // restart — re-admits the message into its original lane (EB-122).
+      ...(opts.priority === undefined || opts.priority === 'normal' ? {} : { priority: opts.priority }),
     };
     // Internal-only flags (`routed`, `fromBridge`, `diagnostic`) and the
     // traceparent are runtime state: they ride the in-memory entry but are
@@ -17683,6 +17905,10 @@ export class EventBus {
       ...(entry.eventTime === undefined ? {} : { eventTime: entry.eventTime }),
       ...(entry.causal === undefined ? {} : { causal: entry.causal }),
       ...(entry.schemaVersion === undefined ? {} : { schemaVersion: entry.schemaVersion }),
+      // The pause-time lane rides the journal so restart recovery
+      // re-admits the message into its original lane (EB-122; absent
+      // means `normal`).
+      ...(entry.priority === undefined || entry.priority === 'normal' ? {} : { lane: entry.priority }),
     });
     rule.buffer.push(entry);
   }
@@ -17758,6 +17984,9 @@ export class EventBus {
           undefined, // partitionKey
           undefined, // partition
           entry.binary ?? false,
+          // The pause-time lane (EB-122): the resume fan-out re-admits
+          // the message into its original lane.
+          entry.priority,
         );
         if (admitted && entry.messageId !== undefined) {
           // Claim the dedup slot exactly like `publishIdempotent`: only
@@ -18133,7 +18362,7 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const nowMs = this.now();
-    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string; keySeq?: number; messageId?: string; publisherId?: string }>();
+    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string; keySeq?: number; messageId?: string; publisherId?: string; lane?: MessageLane }>();
     const closed = new Set<string>();
     // `readSince(topic, -1)`: the exclusive bound sits below every real
     // seq, so seq-0 schedule records and tombstones come along too.
@@ -18160,6 +18389,9 @@ export class EventBus {
             // entry below always intended to carry it).
             messageId: rec.messageId,
             publisherId: rec.publisherId,
+            // The schedule-time lane rides the schedule record so the
+            // rebuilt timer fans out into the original lane (EB-122).
+            lane: rec.lane,
           });
         }
       }
@@ -18187,6 +18419,8 @@ export class EventBus {
         // The producer attribution rides the rebuilt timer so the
         // fan-out counts the publish under the original publisher.
         publisherId: rec.publisherId,
+        // The schedule-time lane rides the rebuilt timer (EB-122).
+        priority: rec.lane,
       };
       this.delayedById.set(delayId, entry);
       this.delayHeap.push(entry);
@@ -18285,6 +18519,9 @@ export class EventBus {
         undefined, // partitionKey
         undefined, // partition
         rec.binary ?? false,
+        // The pause-time lane rides the journal (EB-122); absent means
+        // `normal`.
+        rec.lane,
       );
       this.appendPauseTombstone(pauseId, rec.topic);
       fannedOut = true;
@@ -18994,6 +19231,9 @@ export class EventBus {
       this.totalDropped += 1;
       this.totalBlocked += 1;
       subscriber.blockedCount += 1;
+      // The refusal never reached a lane — a lane drop with no backlog
+      // change, like any other refused newcomer.
+      this.countLaneRefused(msg.topic, msg.lane ?? 'normal');
       this.auditBackpressureDrop(subscriber, msg, 'block', 1);
       return 'dropped';
     }
@@ -19002,9 +19242,37 @@ export class EventBus {
     // count headroom does not arm it — memory pressure always sheds per
     // policy, independently of the tier.
     const wasFull = queue.size >= subscriber.queueCapacity;
-    const droppedBefore = queue.droppedCount;
-    const result = queue.push(msg, 0, deadline);
-    const shed = queue.droppedCount - droppedBefore;
+    // Per-lane drop deltas around the push (EB-122): a full queue sheds
+    // an OLD entry to admit the newcomer under `drop-oldest`, so the
+    // shed is only visible in the per-lane drop counters — the evicted
+    // entry's lane, not the newcomer's, is charged.
+    const droppedBefore: LaneCounts = {
+      urgent: queue.droppedByLane('urgent'),
+      normal: queue.droppedByLane('normal'),
+      bulk: queue.droppedByLane('bulk'),
+    };
+    // Priority lanes (EB-122): the message queues in its stamped lane —
+    // absent means `normal`, so priority-unaware traffic behaves exactly
+    // as before. Urgent still respects the backpressure policy: a full
+    // queue sheds per the lane shed precedence (bulk first, urgent last).
+    const lane: MessageLane = msg.lane ?? 'normal';
+    const result = queue.push(msg, lane, deadline);
+    let shed = 0;
+    for (const shedLane of MESSAGE_LANES) {
+      const shedInLane = queue.droppedByLane(shedLane) - droppedBefore[shedLane];
+      shed += shedInLane;
+      if (result === 'accepted') {
+        // Accepted: every drop in this window is a shed eviction — the
+        // victim leaves its lane's backlog and counts as a lane drop.
+        if (shedInLane > 0) this.countLaneShed(msg.topic, shedLane, shedInLane);
+      } else if (shedLane === lane && shedInLane > 0) {
+        // Refused newcomer: it never entered a lane — a lane drop with
+        // no backlog change. (A refused push sheds nothing: the whole
+        // delta sits in the newcomer's own lane.)
+        this.countLaneRefused(msg.topic, lane);
+      }
+    }
+    if (result === 'accepted') this.countLaneQueued(msg.topic, lane);
     this.totalDropped += shed;
     if (shed > 0 || result === 'dropped') {
       // Every queue-level drop is audited (EB-83): shed evictions and
@@ -19743,8 +20011,12 @@ export class EventBus {
     // a full queue sheds an OLD entry to admit the newcomer, so `push`
     // returns 'accepted' while still shedding — the eviction is only
     // visible in `droppedCount` (same accounting as `enqueueMessage`).
+    // Shadow drops stay shadow-local: they never touch the lane stats or
+    // the bus-wide drop counters (see `enqueueMessage`).
     const droppedBefore = queue.droppedCount;
-    const result = queue.push(msg, 0, deadline);
+    // The shadow copy keeps the source message's lane (same envelope),
+    // so the mirror drains in the same priority order as production.
+    const result = queue.push(msg, msg.lane ?? 'normal', deadline);
     const shed = queue.droppedCount - droppedBefore;
     if (shed > 0) {
       shadow.dropped += shed;
@@ -20441,6 +20713,16 @@ export class EventBus {
     // message's flag so a binary payload is never reinterpreted as
     // JSON mid-pipeline.
     binary = false,
+    // Priority lane (see `PublishOptions.priority`, EB-122): already
+    // validated by the publish entry points — `fanOut` never validates.
+    // Stamped onto the envelope and the durable-log record below; absent
+    // (the default) means `normal`. Internal re-fan-out paths that are a
+    // new admission (route forwards, bridge/cluster ingress, diagnostic
+    // events) leave it undefined and land in the normal lane — the lane
+    // is admission-scoped, not a cross-bus property. Delayed schedules
+    // and pause-buffered messages carry their schedule/pause-time lane
+    // through.
+    priority?: MessageLane,
   ): { matched: number; accepted: number; admitted: boolean } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
@@ -20525,6 +20807,9 @@ export class EventBus {
           fromBridge,
           diagnostic,
           binary,
+          // The pause-time lane rides the buffer entry so the resume
+          // fan-out re-admits the message into its original lane.
+          priority,
         });
         return { matched: 0, accepted: 0, admitted: false };
       }
@@ -20631,6 +20916,12 @@ export class EventBus {
       // undefined stays absent, so messages without one never participate in
       // the watermark.
       ...(eventTime === undefined ? {} : { eventTime }),
+      // Priority lane (EB-122): stamped exactly when it is not `normal` —
+      // absent means the normal lane, so priority-unaware envelopes keep
+      // their exact shape. The lane is delivery-side only: the per-topic
+      // sequence number above stays publish-order and monotonic — lanes
+      // never renumber.
+      ...(priority === undefined || priority === 'normal' ? {} : { lane: priority }),
     };
     // EB-57: mark DLQ diagnostic messages at creation (the envelope marker
     // is bus-side, so a user's payload can never collide with it) — a
@@ -20936,6 +21227,12 @@ export class EventBus {
       // per-(topic, partition) sequence counters from it, so numbering
       // never restarts and never reuses a number across restarts.
       partition: resolvedPartition,
+      // The priority lane rides the record (EB-122): replay restores it
+      // onto the envelope so a resumed subscriber keeps the message's
+      // lane. Written only for non-normal lanes — absent means `normal`,
+      // so pre-lane log lines and normal-lane records stay byte-identical
+      // to before.
+      ...(priority === undefined || priority === 'normal' ? {} : { lane: priority }),
       ...(delayed == null ? {} : { deliverAt: delayed.deliverAt, delayId: delayed.delayId }),
       ...(keyed === undefined ? {} : { key: keyed.key, keySeq: keyed.keySeq }),
       // Only present when a preset dictionary compressed this message:
@@ -21533,6 +21830,12 @@ export class EventBus {
         (sum, subscriber) => sum + subscriber.queue.queueBytes,
         0,
       ),
+      // Global per-priority-lane counters (EB-122): plain-data copies.
+      lanes: {
+        queued: { ...this.laneQueued },
+        delivered: { ...this.laneDelivered },
+        dropped: { ...this.laneDropped },
+      },
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
       expiredLeases: this.totalExpiredLeases,
@@ -21815,6 +22118,13 @@ export class EventBus {
           }
           return { partitions };
         })(),
+        // Per-priority-lane counters (EB-122): plain-data copies of the
+        // topic's lane stats — the snapshot never aliases live counters.
+        lanes: {
+          queued: { ...stats.lanes.queued },
+          delivered: { ...stats.lanes.delivered },
+          dropped: { ...stats.lanes.dropped },
+        },
       })),
       // Per-namespace aggregates (EB-52), in registration order — derived
       // from the per-topic stats above. Omitted when no namespace is
@@ -22552,8 +22862,11 @@ export class EventBus {
       // Only the expired records need accounting; the live backlog is
       // deliberately discarded — the loss stays visible as a sequence
       // gap, exactly like a backpressure shed.
-      const { expired } = subscriber.queue.drainLive(nowMs);
-      for (const msg of expired) this.recordExpired(msg.topic);
+      const { live: chaosLive, expired } = subscriber.queue.drainLive(nowMs);
+      for (const msg of expired) this.recordExpired(msg.topic, msg.lane ?? 'normal');
+      // The discarded live backlog leaves its lanes' backlogs and counts
+      // as lane sheds — the same visibility a backpressure shed gets.
+      for (const msg of chaosLive) this.countLaneShed(msg.topic, msg.lane ?? 'normal', 1);
       return true;
     }
     // 'latency': defer this round; the timer drains directly afterwards
@@ -22668,7 +22981,7 @@ export class EventBus {
         credits == null ? undefined : (msg) => !this.isReplayBypass(msg),
       );
       for (const msg of expired) {
-        this.recordExpired(msg.topic);
+        this.recordExpired(msg.topic, msg.lane ?? 'normal');
       }
       const health = subscriber.health;
       if (health == null) {
@@ -22694,6 +23007,10 @@ export class EventBus {
           // idempotency and envelope-collision notes.
           this.inflateMessagePayload(msg);
           this.noteMessageDelivered(subscriber, msg);
+          // Priority-lane accounting (EB-122): the drain hands the message
+          // toward the handler — it leaves its lane's backlog and counts
+          // as a lane delivery.
+          this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');
           this.totalDelivered += 1;
           // Sampled before the handler runs: queue dwell, not processing time.
           this.recordDeliveryLatency(subscriber, msg, nowMs);
@@ -22867,7 +23184,7 @@ export class EventBus {
           credits == null ? undefined : (msg) => !this.isReplayBypass(msg),
         );
         for (const msg of expired) {
-          this.recordExpired(msg.topic);
+          this.recordExpired(msg.topic, msg.lane ?? 'normal');
         }
         batch.pending.push(...live);
       }
@@ -22941,7 +23258,7 @@ export class EventBus {
     for (const msg of pending) {
       const deadline = this.messageDeadlines.get(msg);
       if (deadline !== undefined && nowMs >= deadline) {
-        this.recordExpired(msg.topic);
+        this.recordExpired(msg.topic, msg.lane ?? 'normal');
       } else {
         live.push(msg);
       }
@@ -22980,6 +23297,7 @@ export class EventBus {
     for (const msg of live) {
       this.inflateMessagePayload(msg);
       this.noteMessageDelivered(subscriber, msg);
+      this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');
       this.totalDelivered += 1;
       // Sampled before the handler runs: queue dwell, not processing time.
       this.recordDeliveryLatency(subscriber, msg, nowMs);
@@ -23508,6 +23826,9 @@ export class EventBus {
     const startedAtMs = budgetMs !== undefined || invocationSlo != null ? this.now() : 0;
     let failed = false;
     let reason: 'error' | 'timeout' = 'error';
+    // Priority-lane accounting (EB-122): same as the plain drain path —
+    // the message leaves its lane's backlog here, at hand-off.
+    this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');
     this.totalDelivered += 1;
     // Sampled before the handler runs: queue dwell, not processing time.
     this.recordDeliveryLatency(subscriber, msg, nowMs);
@@ -23667,10 +23988,82 @@ export class EventBus {
    * and the global total. Each discarded queue entry counts once (see
    * `TopicStats.expiredMessages`).
    */
-  private recordExpired(topic: string): void {
+  private recordExpired(topic: string, lane?: MessageLane): void {
     this.totalExpired += 1;
     const stats = this.topicStats.get(topic);
     if (stats != null) stats.expiredMessages += 1;
+    // A queued entry expired: leave the lane backlog. `lane` is present
+    // exactly when the expired entry sat in a subscriber queue (the drain
+    // paths pass it); delayed schedules and pause-buffered messages expire
+    // before ever queueing, so they move no lane counter.
+    if (lane !== undefined) this.countLaneUnqueued(topic, lane);
+  }
+
+  /**
+   * Priority-lane backlog accounting (EB-122). Every production queue
+   * entry moves these counters: `countLaneQueued` on every accepted
+   * `enqueueMessage`, `countLaneDelivered` on every drain that hands the
+   * message toward a handler, `countLaneShed` on every backpressure shed
+   * or chaos-drop of a queued entry, `countLaneRefused` on every refused
+   * newcomer, `countLaneUnqueued` on every TTL expiry of a queued entry.
+   * The per-topic `lanes` and the global `laneQueued`/`laneDelivered`/
+   * `laneDropped` always agree: `queued` is the live backlog, so
+   * `queued == enqueued - delivered - shed - expired` per lane.
+   */
+  /**
+   * Priority-lane backlog accounting (EB-122). Every production queue
+   * entry moves these counters: `countLaneQueued` on every accepted
+   * `enqueueMessage`, `countLaneDelivered` on every drain that hands the
+   * message toward a handler, `countLaneShed` on every backpressure shed
+   * or chaos-drop of a queued entry, `countLaneRefused` on every refused
+   * newcomer, `countLaneUnqueued` on every TTL expiry of a queued entry
+   * and on unsubscribe (the backlog vanishes with the subscriber).
+   *
+   * Per-topic counters never create the topic's stats entry: like
+   * `recordExpired`, they only touch an entry the publish pipeline
+   * already created — per-node topicStats describe the node's own publish
+   * stream, so a cluster receive path that never published the topic
+   * leaves no per-topic row (the global counters still move). When the
+   * entry exists, per-topic and global always agree: `queued` is the live
+   * backlog, so `queued == enqueued - delivered - dropped - expired` per
+   * lane.
+   */
+  private countLaneQueued(topic: string, lane: MessageLane): void {
+    const lanes = this.topicStats.get(topic)?.lanes;
+    if (lanes !== undefined) lanes.queued[lane] += 1;
+    this.laneQueued[lane] += 1;
+  }
+
+  private countLaneDelivered(topic: string, lane: MessageLane): void {
+    const lanes = this.topicStats.get(topic)?.lanes;
+    if (lanes !== undefined) {
+      lanes.queued[lane] -= 1;
+      lanes.delivered[lane] += 1;
+    }
+    this.laneQueued[lane] -= 1;
+    this.laneDelivered[lane] += 1;
+  }
+
+  private countLaneShed(topic: string, lane: MessageLane, count: number): void {
+    const lanes = this.topicStats.get(topic)?.lanes;
+    if (lanes !== undefined) {
+      lanes.queued[lane] -= count;
+      lanes.dropped[lane] += count;
+    }
+    this.laneQueued[lane] -= count;
+    this.laneDropped[lane] += count;
+  }
+
+  private countLaneRefused(topic: string, lane: MessageLane): void {
+    const lanes = this.topicStats.get(topic)?.lanes;
+    if (lanes !== undefined) lanes.dropped[lane] += 1;
+    this.laneDropped[lane] += 1;
+  }
+
+  private countLaneUnqueued(topic: string, lane: MessageLane): void {
+    const lanes = this.topicStats.get(topic)?.lanes;
+    if (lanes !== undefined) lanes.queued[lane] -= 1;
+    this.laneQueued[lane] -= 1;
   }
 
   /**

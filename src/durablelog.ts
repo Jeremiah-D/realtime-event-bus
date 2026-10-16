@@ -1,6 +1,7 @@
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import type { MessageLane } from './lanes.ts';
 import {
   FilesystemStorageBackend,
   type DurableStorageBackend,
@@ -157,6 +158,16 @@ export interface DurableLogRecord {
    * restarts and never reuses a number across restarts.
    */
   partition?: number;
+  /**
+   * Priority lane (see `PublishOptions.priority`, EB-122): `'urgent'` or
+   * `'bulk'` when the publish carried a non-normal lane — absent means
+   * `normal`, including on records written before priority lanes existed.
+   * Replay restores it onto the envelope so a resumed subscriber keeps
+   * the message's lane; delayed-delivery schedule records and
+   * pause-buffer records carry it so restart recovery rebuilds their
+   * timers/buffers with the lane intact.
+   */
+  lane?: MessageLane;
   /**
    * Compaction key for keyed log compaction (see
    * `DurableLogOptions.keyCompaction`): records sharing a (topic, key)
@@ -466,6 +477,13 @@ interface LogLine {
    * exactly when the publish carried a signed publisher identity.
    */
   publisherSignature?: { kid: string; sig: string };
+  /**
+   * Priority lane (see `DurableLogRecord.lane`, EB-122): `'urgent'` or
+   * `'bulk'`, present exactly when the publish carried a non-normal
+   * lane. Absent means `normal` — including on records written before
+   * priority lanes existed.
+   */
+  lane?: MessageLane;
   /**
    * v1 only: the JSON application payload. Absent on v2 lines, which
    * carry `payload_b64` instead.
@@ -3349,6 +3367,9 @@ function logLineOf(record: DurableLogRecord): LogLine {
     line.signature = { kid: record.signature.kid, sig: record.signature.sig };
   if (record.publisherSignature !== undefined)
     line.publisherSignature = { kid: record.publisherSignature.kid, sig: record.publisherSignature.sig };
+  // The priority lane (EB-122): written only for non-normal lanes —
+  // absent means `normal`, so pre-lane lines stay byte-identical.
+  if (record.lane === 'urgent' || record.lane === 'bulk') line.lane = record.lane;
   return line;
 }
 
@@ -3573,6 +3594,15 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       return null;
     }
     record.publisherId = o['publisherId'] as string;
+  }
+  if (o['lane'] !== undefined) {
+    // The priority lane (EB-122): the bus only ever writes 'urgent' or
+    // 'bulk' — a malformed value means the line was tampered with or
+    // miswritten, so the line is corrupt. A 'normal' value (never
+    // written) is accepted leniently and dropped: absent means `normal`.
+    const lane = o['lane'];
+    if (lane !== 'urgent' && lane !== 'normal' && lane !== 'bulk') return null;
+    if (lane !== 'normal') record.lane = lane;
   }
   if (o['signature'] !== undefined) {
     // The signature is integrity metadata: a malformed value means the

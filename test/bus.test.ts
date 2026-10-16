@@ -364,6 +364,11 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       // All publishes happened synchronously within the same wall-clock
       // millisecond, so every window holds both events.
       rates: { r1s: 2, r1m: 2 / 60, r5m: 2 / 300 },
+      lanes: {
+        queued: { urgent: 0, normal: 4, bulk: 0 },
+        delivered: { urgent: 0, normal: 0, bulk: 0 },
+        dropped: { urgent: 0, normal: 0, bulk: 0 },
+      },
     },
     {
       topic: 'market.eth',
@@ -393,6 +398,11 @@ test('getStats tracks per-topic fan-out width and publish counts', () => {
       compressionRatio: 0,
       meanCompressionMs: 0,
       rates: { r1s: 1, r1m: 1 / 60, r5m: 1 / 300 },
+      lanes: {
+        queued: { urgent: 0, normal: 1, bulk: 0 },
+        delivered: { urgent: 0, normal: 0, bulk: 0 },
+        dropped: { urgent: 0, normal: 0, bulk: 0 },
+      },
     },
   ]);
 });

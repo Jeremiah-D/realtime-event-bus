@@ -274,6 +274,23 @@ export class BoundedQueue<T> {
   }
 
   /**
+   * Removes and returns the oldest queued entry's item, or `undefined`
+   * when the queue is empty. Unlike the shed inside `push`, this does NOT
+   * count a drop — the caller owns drop accounting (used by `LaneQueue`,
+   * which charges the drop to the victim's lane). Bytes are freed. The
+   * high-water-mark latch is deliberately untouched, matching the
+   * original single-queue shed: the transient dip during evict-then-push
+   * must not end the excursion.
+   */
+  evictOldest(): T | undefined {
+    const entry = this.entries[0];
+    if (entry === undefined) return undefined;
+    this.entries.splice(0, 1);
+    this.bytesTotal -= entry.bytes;
+    return entry.item;
+  }
+
+  /**
    * Subscription-migration support (EB-82): returns the queued items in
    * FIFO order WITHOUT removing them — no drops, no expiry sweep, no
    * high-water-mark side effects. Per-entry TTL deadlines and priorities

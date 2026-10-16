@@ -143,7 +143,9 @@ test('applyConfig round-trips: exporting and re-applying is a no-op', () => {
   const snap = bus.exportBusConfig();
   const result = bus.applyConfig(JSON.parse(JSON.stringify(snap)));
   assert.deepEqual(result.applied, []);
-  assert.deepEqual(bus.exportBusConfig(), snap);
+  const { exportedAt: _r1, ...afterSnap } = bus.exportBusConfig();
+  const { exportedAt: _r2, ...snapRest } = snap;
+  assert.deepEqual(afterSnap, snapRest);
 });
 
 test('a mid-apply failure rolls everything back and throws ConfigApplyError', () => {
@@ -220,7 +222,9 @@ test('malformed snapshots fail fast before anything is mutated', () => {
   const before = bus.exportBusConfig();
   assert.throws(() => bus.applyConfig({ v: 999 } as never), RangeError);
   assert.throws(() => bus.applyConfig({ v: 1 } as never), TypeError);
-  assert.deepEqual(bus.exportBusConfig(), before);
+  const { exportedAt: _m1, ...afterState } = bus.exportBusConfig();
+  const { exportedAt: _m2, ...beforeRest } = before;
+  assert.deepEqual(afterState, beforeRest);
 });
 
 test('detectConfigDrift reports runtime changes against the last applied snapshot', () => {

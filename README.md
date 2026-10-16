@@ -3768,3 +3768,74 @@ Semantics:
 `getStats().creditExhaustedSubscribers` counts live exhausted
 subscriptions and the Prometheus exposition carries
 `eventbus_credit_exhausted_subscribers`.
+
+## Priority lanes (EB-122)
+
+Every subscriber queue is split into three priority lanes — `urgent`,
+`normal`, `bulk` — and the drain serves them in weighted round-robin
+rotation. Opt-in: `publish` without a priority behaves exactly as before
+(everything rides the normal lane, and a single occupied lane drains as a
+plain FIFO, so the rotation is a no-op until you use a second lane).
+
+```ts
+const bus = new EventBus({
+  priorityLanes: {
+    weights: { urgent: 8, normal: 2, bulk: 1 }, // the default
+    bulkStarvationRounds: 10,                  // the default
+  },
+});
+bus.publish('alerts', page, { priority: 'urgent' });
+bus.publish('events', click, { priority: 'bulk' }); // default is 'normal'
+```
+
+Semantics:
+
+- **Where the lanes live.** Per subscriber queue, not per topic — the
+  drain already runs per subscriber, so each subscriber's backlog is its
+  own three-lane queue. Per-topic and global lane counters are aggregated
+  in `getStats()`.
+- **Weighted rotation.** Each drain pass serves up to `weights.urgent`
+  urgent messages, then `weights.normal` normal, then `weights.bulk`
+  bulk, and repeats while the drain budget (shaping, throttle, credits)
+  allows. Weights must be positive integers; anything else throws
+  `RangeError` at construction or per publish.
+- **Bulk starvation protection.** If a drain round serves no bulk while
+  bulk is waiting, a starvation counter increments; when it would reach
+  `bulkStarvationRounds`, the next round force-interleaves one bulk
+  message ahead of the rotation. The forced message still consumes drain
+  budget — the guard reorders within the budget, it never exceeds it.
+- **FIFO within a lane; priority across lanes.** Ordering is preserved
+  per lane, but an urgent message published later jumps ahead of an
+  earlier bulk message. That is the documented trade-off; keep one
+  priority per causal chain (e.g. same-key keyed messages) if cross-lane
+  reordering would break the consumer.
+- **Sequence numbers stay publish-order.** `seq` is assigned at admission,
+  so it is monotonic per topic regardless of lane. A subscriber that
+  watches `sequenceGaps` sees lane reordering as at-least-once
+  redeliveries, never phantom gaps.
+- **Backpressure is per lane, precedence-aware.** Under `drop-oldest`
+  the victim lane is the lowest-precedence non-empty lane at or below
+  the newcomer's precedence — a bulk newcomer never evicts an urgent
+  message, and is refused outright when the queue holds only
+  higher-precedence lanes (no churn). `drop-newest` refuses overflow
+  regardless of lane. Byte budgets work the same way, on aggregate
+  bytes. Urgent messages still drop when the policy says so; priority
+  is not a backpressure bypass.
+- **Metrics.** `TopicStats.lanes` and the top-level `BusStats.lanes`
+  carry `{ queued, delivered, dropped }` × `{ urgent, normal, bulk }`.
+  `queued` is the live backlog (`enqueued − delivered − dropped −
+  expired` per lane); `unsubscribe` releases a subscriber's lane backlog
+  from the gauges.
+- **Durable log.** The lane persists on log lines (only non-normal lanes
+  are written, so default traffic stays byte-identical) and is restored
+  on replay; delayed messages keep their lane from schedule to fan-out.
+- **Interactions.** Admission features run before the lane is consulted:
+  rate-limit shed (EB-19) and schema validation (EB-20) can still reject
+  the publish. Consumer-group assignment (EB-16) happens at fan-out, so
+  the lane survives group routing. Shaping (EB-21), throttling (EB-14)
+  and credits (EB-117) bound the drain budget that the rotation allocates
+  within; the EB-117 replay bypass still flows even at zero budget. Keyed
+  / causal gates run pre-queue. Routes, forwards, the bridge and cluster
+  links re-admit messages into the normal lane. Pause buffers, barriers
+  and shadow traffic keep their existing semantics (shadow drains never
+  touch lane stats).
