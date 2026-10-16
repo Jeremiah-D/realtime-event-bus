@@ -33,10 +33,17 @@
  * epoch, which supersedes the route version.
  *
  * Wire protocol: 4-byte big-endian length prefix + UTF-8 JSON frame.
- * Frames: hello / welcome / routes / heartbeat / heartbeat-ack /
- * publish / message / goodbye / error. Payloads must be JSON-serializable;
- * `Buffer` payloads (e.g. compressed envelopes) travel as
- * `{ "__buf": "<base64>" }`.
+ * Frames: hello / welcome / routes / routes-diff / routes-sync /
+ * heartbeat / heartbeat-ack / publish / message / goodbye / error.
+ * Payloads must be JSON-serializable; `Buffer` payloads (e.g. compressed
+ * envelopes) travel as `{ "__buf": "<base64>" }`.
+ *
+ * Route propagation is incremental (EB-121): steady-state routing changes
+ * broadcast `routes-diff` frames that chain onto the member's cached table
+ * by `baseVersion`; joins, reconnects, and gap recovery use the full
+ * `routes` snapshot. Members that never advertised the `routesDiff`
+ * capability keep receiving full snapshots, so old nodes degrade to stale
+ * routes rather than breaking — upgrade them (see README).
  *
  * Zero new dependencies: `node:net` / `node:tls` only.
  */
@@ -57,6 +64,15 @@ export interface ClusterHubOptions {
   heartbeatTimeoutMs?: number;
   /** When set, the hub listens with TLS using this key/cert. */
   tls?: { key: string | Buffer; cert: string | Buffer };
+  /**
+   * How many recent route diffs the hub retains for incremental sync
+   * (default 64). Each routing change is broadcast as a `routes-diff`
+   * frame chaining onto the previous version; members that missed diffs
+   * (gap, or a version older than the retained window) fall back to a
+   * full `routes` snapshot. Set to 0 to disable diffs and always
+   * broadcast full snapshots.
+   */
+  routeDiffRetention?: number;
 }
 
 export interface ClusterConnectOptions {
@@ -101,6 +117,8 @@ export interface ClusterLinkStats extends ClusterLinkStatus {
   receiveDropped: number;
   /** Successful (re)connects, including the first. */
   connects: number;
+  /** Full-snapshot requests sent after a route-diff gap or epoch mismatch. */
+  routeSyncRequests: number;
 }
 
 export interface ClusterHubStats {
@@ -110,6 +128,14 @@ export interface ClusterHubStats {
   /** Messages forwarded hub -> members (excludes the sender). */
   forwardedMessages: number;
   topics: number;
+  /** Incremental `routes-diff` frames broadcast. */
+  routeDiffsSent: number;
+  /** Full `routes` snapshots sent (joins, legacy members, gap recovery). */
+  routeSnapshotsSent: number;
+  /** `routes-sync` requests served. */
+  routeSyncRequests: number;
+  /** Configured diff retention window. */
+  routeDiffRetention: number;
 }
 
 interface HubMember {
@@ -118,6 +144,8 @@ interface HubMember {
   matchers: RegExp[];
   socket: Socket | TLSSocket;
   lastHeartbeat: number;
+  /** True when the member advertised the `routesDiff` hello capability. */
+  supportsRouteDiff: boolean;
 }
 
 interface RouteEntry {
@@ -125,15 +153,31 @@ interface RouteEntry {
   patterns: string[];
 }
 
+/**
+ * One incremental route-table change: transforms the table at
+ * `baseVersion` into the table at `version`. `added` carries new or
+ * pattern-changed entries (upsert by nodeId); `removed` carries departed
+ * members (patterns kept for observability, ignored on apply).
+ */
+interface RouteDiff {
+  baseVersion: number;
+  version: number;
+  hubEpoch: string;
+  added: RouteEntry[];
+  removed: RouteEntry[];
+}
+
 type HubFrame =
-  | { type: 'hello'; nodeId: string; patterns: string[] }
+  | { type: 'hello'; nodeId: string; patterns: string[]; routesDiff?: boolean }
   | { type: 'heartbeat'; nodeId: string }
   | { type: 'goodbye'; nodeId: string }
+  | { type: 'routes-sync'; nodeId: string }
   | { type: 'publish'; topic: string; payload: unknown; key?: string; expiresAt?: number; compressed?: boolean; dictId?: string; messageId?: string };
 
 type NodeFrame =
   | { type: 'welcome'; nodeId: string; routeVersion: number; hubEpoch: string }
   | { type: 'routes'; version: number; hubEpoch: string; members: RouteEntry[] }
+  | { type: 'routes-diff'; baseVersion: number; version: number; hubEpoch: string; added: RouteEntry[]; removed: RouteEntry[] }
   | { type: 'heartbeat-ack'; nodeId: string }
   | {
       type: 'message';
@@ -243,11 +287,58 @@ function isValidPatterns(patterns: unknown): patterns is string[] {
   );
 }
 
+function isValidRouteEntry(entry: unknown): entry is RouteEntry {
+  return (
+    entry !== null &&
+    typeof entry === 'object' &&
+    typeof (entry as RouteEntry).nodeId === 'string' &&
+    (entry as RouteEntry).nodeId.length > 0 &&
+    isValidPatterns((entry as RouteEntry).patterns)
+  );
+}
+
+function isValidRouteEntries(entries: unknown): entries is RouteEntry[] {
+  return Array.isArray(entries) && entries.every(isValidRouteEntry);
+}
+
+function sameStringArrays(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/**
+ * Diffs two route-table snapshots (both sorted by construction — hub
+ * snapshots are built in member-insertion order and patterns are stored
+ * sorted at hello time... compare defensively anyway).
+ */
+function diffRouteSnapshots(prev: RouteEntry[], next: RouteEntry[]): { added: RouteEntry[]; removed: RouteEntry[] } {
+  const prevById = new Map(prev.map((e) => [e.nodeId, e]));
+  const nextById = new Map(next.map((e) => [e.nodeId, e]));
+  const added: RouteEntry[] = [];
+  const removed: RouteEntry[] = [];
+  for (const [nodeId, entry] of nextById) {
+    const old = prevById.get(nodeId);
+    // Compare order-insensitively: a re-hello with the same pattern set
+    // in a different order is not a routing change.
+    if (old == null || !sameStringArrays([...old.patterns].sort(), [...entry.patterns].sort())) {
+      added.push({ nodeId, patterns: [...entry.patterns] });
+    }
+  }
+  for (const [nodeId, entry] of prevById) {
+    if (!nextById.has(nodeId)) removed.push({ nodeId, patterns: [...entry.patterns] });
+  }
+  return { added, removed };
+}
+
 /**
  * Central cluster hub: accepts member connections, keeps the authoritative
  * route table (member -> subscribed patterns), and forwards published
  * messages to the members whose patterns match — stamping hub-global
  * per-topic (and per-key) sequence numbers on the way.
+ *
+ * Route propagation is incremental: each table change is broadcast as a
+ * `routes-diff` frame chaining onto the previous version (bounded history
+ * via `routeDiffRetention`); joins, reconnects, and members that missed
+ * diffs receive the full `routes` snapshot instead.
  */
 export class ClusterHub {
   private server: TcpServer | TlsServer | null = null;
@@ -263,6 +354,14 @@ export class ClusterHub {
   private readonly tls: ClusterHubOptions['tls'];
   private readonly host: string;
   private readonly port: number;
+  private readonly routeDiffRetention: number;
+  /** Snapshot behind the latest route version; the diff baseline. */
+  private lastSnapshot: RouteEntry[] = [];
+  /** Bounded history of recent diffs, oldest first. */
+  private readonly routeDiffs: RouteDiff[] = [];
+  private routeDiffsSent = 0;
+  private routeSnapshotsSent = 0;
+  private routeSyncRequests = 0;
 
   constructor(options: ClusterHubOptions = {}) {
     const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5000;
@@ -273,8 +372,13 @@ export class ClusterHub {
     if (!Number.isFinite(heartbeatTimeoutMs) || heartbeatTimeoutMs <= 0) {
       throw new RangeError('heartbeatTimeoutMs must be a positive finite number');
     }
+    const routeDiffRetention = options.routeDiffRetention ?? 64;
+    if (!Number.isInteger(routeDiffRetention) || routeDiffRetention < 0) {
+      throw new RangeError('routeDiffRetention must be a non-negative integer');
+    }
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.heartbeatTimeoutMs = heartbeatTimeoutMs;
+    this.routeDiffRetention = routeDiffRetention;
     this.tls = options.tls;
     this.host = options.host ?? '127.0.0.1';
     this.port = options.port ?? 0;
@@ -323,7 +427,20 @@ export class ClusterHub {
       hubEpoch: this.hubEpoch,
       forwardedMessages: this.forwardedMessages,
       topics: this.topicSeq.size,
+      routeDiffsSent: this.routeDiffsSent,
+      routeSnapshotsSent: this.routeSnapshotsSent,
+      routeSyncRequests: this.routeSyncRequests,
+      routeDiffRetention: this.routeDiffRetention,
     };
+  }
+
+  /**
+   * The authoritative route table: one entry per member with its
+   * advertised patterns. Members converge to this via diffs or full
+   * snapshots.
+   */
+  getRouteTable(): Array<{ nodeId: string; patterns: string[] }> {
+    return this.snapshotRoutes().map((e) => ({ nodeId: e.nodeId, patterns: [...e.patterns] }));
   }
 
   private handleConnection(socket: Socket | TLSSocket): void {
@@ -365,6 +482,7 @@ export class ClusterHub {
         // Re-hello (pattern change or reconnect with the same nodeId)
         // replaces the member's patterns: last-writer-wins at the hub.
         const prev = this.members.get(nodeId);
+        const isNewMember = prev == null || prev.socket !== socket;
         if (prev != null && prev.socket !== socket) prev.socket.destroy();
         let matchers: RegExp[];
         try {
@@ -373,10 +491,27 @@ export class ClusterHub {
           socket.write(encodeFrame({ type: 'error', message: 'invalid pattern' }));
           return undefined;
         }
-        this.members.set(nodeId, { nodeId, patterns: [...patterns], matchers, socket, lastHeartbeat: Date.now() });
+        this.members.set(nodeId, {
+          nodeId,
+          patterns: [...patterns],
+          matchers,
+          socket,
+          lastHeartbeat: Date.now(),
+          supportsRouteDiff: frame.routesDiff === true,
+        });
         this.bumpRoutes();
         socket.write(encodeFrame({ type: 'welcome', nodeId, routeVersion: this.routeVersion, hubEpoch: this.hubEpoch } satisfies NodeFrame));
-        this.broadcastRoutes();
+        if (isNewMember) {
+          // Join/reconnect: the member needs the authoritative full
+          // snapshot; everyone else learns the roster change as a diff
+          // (or a full snapshot when it lacks the routesDiff capability).
+          this.sendFullRoutes(socket);
+          this.broadcastRouteChange(socket);
+        } else {
+          // Pattern change on a live member: it is already synced, so the
+          // incremental diff goes to everyone, including itself.
+          this.broadcastRouteChange();
+        }
         return nodeId;
       }
       case 'heartbeat': {
@@ -398,6 +533,17 @@ export class ClusterHub {
       }
       case 'goodbye': {
         if (typeof frame.nodeId === 'string') this.removeMember(frame.nodeId, 'goodbye');
+        return undefined;
+      }
+      case 'routes-sync': {
+        // A member that missed diffs (gap, or a version older than the
+        // retained window) asks for the authoritative full snapshot.
+        if (typeof frame.nodeId !== 'string') return undefined;
+        const member = this.members.get(frame.nodeId);
+        if (member != null && member.socket === socket) {
+          this.routeSyncRequests += 1;
+          this.sendFullRoutes(socket);
+        }
         return undefined;
       }
       default:
@@ -454,7 +600,7 @@ export class ClusterHub {
   private removeMember(nodeId: string, _reason: string): void {
     if (!this.members.delete(nodeId)) return;
     this.bumpRoutes();
-    this.broadcastRoutes();
+    this.broadcastRouteChange();
   }
 
   private sweepSilentMembers(): void {
@@ -469,19 +615,79 @@ export class ClusterHub {
     }
     if (swept) {
       this.bumpRoutes();
-      this.broadcastRoutes();
+      this.broadcastRouteChange();
     }
   }
 
+  /**
+   * Bumps the route version and records the incremental diff against the
+   * previous snapshot (bounded by `routeDiffRetention`).
+   */
   private bumpRoutes(): void {
+    const snapshot = this.snapshotRoutes();
+    const prev = this.lastSnapshot;
     this.routeVersion += 1;
+    if (this.routeDiffRetention > 0) {
+      const { added, removed } = diffRouteSnapshots(prev, snapshot);
+      this.routeDiffs.push({
+        baseVersion: this.routeVersion - 1,
+        version: this.routeVersion,
+        hubEpoch: this.hubEpoch,
+        added,
+        removed,
+      });
+      while (this.routeDiffs.length > this.routeDiffRetention) this.routeDiffs.shift();
+    }
+    this.lastSnapshot = snapshot;
   }
 
-  private broadcastRoutes(): void {
-    const members: RouteEntry[] = [...this.members.values()].map((m) => ({ nodeId: m.nodeId, patterns: [...m.patterns] }));
-    const frame: NodeFrame = { type: 'routes', version: this.routeVersion, hubEpoch: this.hubEpoch, members };
-    const bytes = encodeFrame(frame);
-    for (const member of this.members.values()) member.socket.write(bytes);
+  private snapshotRoutes(): RouteEntry[] {
+    return [...this.members.values()].map((m) => ({ nodeId: m.nodeId, patterns: [...m.patterns] }));
+  }
+
+  /** Sends the authoritative full route snapshot to one member. */
+  private sendFullRoutes(socket: Socket | TLSSocket): void {
+    const frame: NodeFrame = { type: 'routes', version: this.routeVersion, hubEpoch: this.hubEpoch, members: this.snapshotRoutes() };
+    socket.write(encodeFrame(frame));
+    this.routeSnapshotsSent += 1;
+  }
+
+  /**
+   * Pushes the latest route change to every member (optionally skipping
+   * one socket, e.g. the joiner that just got the full snapshot).
+   * Steady-state changes go out as incremental `routes-diff` frames to
+   * members that advertised the capability; members without it receive
+   * the full snapshot, preserving compatibility with pre-diff nodes.
+   */
+  private broadcastRouteChange(exceptSocket?: Socket | TLSSocket): void {
+    const latest = this.routeDiffs.length > 0 ? this.routeDiffs[this.routeDiffs.length - 1] : null;
+    const diffBytes =
+      latest != null && latest.version === this.routeVersion
+        ? encodeFrame({
+            type: 'routes-diff',
+            baseVersion: latest.baseVersion,
+            version: latest.version,
+            hubEpoch: latest.hubEpoch,
+            added: latest.added,
+            removed: latest.removed,
+          } satisfies NodeFrame)
+        : null;
+    const fullBytes = encodeFrame({
+      type: 'routes',
+      version: this.routeVersion,
+      hubEpoch: this.hubEpoch,
+      members: this.snapshotRoutes(),
+    } satisfies NodeFrame);
+    for (const member of this.members.values()) {
+      if (member.socket === exceptSocket) continue;
+      if (member.supportsRouteDiff && diffBytes != null) {
+        member.socket.write(diffBytes);
+        this.routeDiffsSent += 1;
+      } else {
+        member.socket.write(fullBytes);
+        this.routeSnapshotsSent += 1;
+      }
+    }
   }
 }
 
@@ -521,6 +727,9 @@ export class ClusterLink {
   private forwardErrors = 0;
   private receiveDropped = 0;
   private connects = 0;
+  private routeSyncRequests = 0;
+  /** True while a full-snapshot request is in flight (gap recovery). */
+  private syncPending = false;
   private initialResolve: (() => void) | null = null;
   private initialReject: ((err: Error) => void) | null = null;
 
@@ -657,6 +866,9 @@ export class ClusterLink {
     this.welcomeReject?.(new Error('cluster transport lost before welcome'));
     this.welcomeReject = null;
     this.welcomeResolve = null;
+    // A fresh connection re-syncs from the full snapshot, so any pending
+    // gap recovery is moot.
+    this.syncPending = false;
     if (this.closed) return;
     // Degraded: keep the cached routes (the bus serves local-only now) and
     // back off towards a reconnect unless the link was built without one.
@@ -683,6 +895,10 @@ export class ClusterLink {
       }
       case 'routes': {
         this.applyRoutes(frame.version, frame.hubEpoch, frame.members);
+        break;
+      }
+      case 'routes-diff': {
+        this.applyRouteDiff(frame);
         break;
       }
       case 'heartbeat-ack':
@@ -737,7 +953,79 @@ export class ClusterLink {
       compiled.push({ nodeId: m.nodeId, patterns: [...m.patterns], matchers });
     }
     this.routes = { version, hubEpoch, members: compiled };
+    // A full snapshot resolves any pending gap recovery.
+    this.syncPending = false;
     this.emitStatus();
+  }
+
+  /**
+   * Applies an incremental route-table diff. A diff is applied only when
+   * it chains exactly onto the cached table — `baseVersion` equals the
+   * applied version, the hub epoch is unchanged, and the new version is
+   * strictly increasing. A gap, an epoch mismatch, or a malformed frame
+   * requests the authoritative full snapshot instead; a diff is never
+   * applied out of order. The epoch-change merge semantics of
+   * `applyRoutes` are preserved: the full snapshot that answers the sync
+   * request carries the new epoch.
+   */
+  private applyRouteDiff(frame: Extract<NodeFrame, { type: 'routes-diff' }>): void {
+    if (
+      !Number.isInteger(frame.baseVersion) ||
+      !Number.isInteger(frame.version) ||
+      typeof frame.hubEpoch !== 'string' ||
+      !isValidRouteEntries(frame.added) ||
+      !isValidRouteEntries(frame.removed)
+    ) {
+      // Corrupt diff: the hub's snapshot is the only safe baseline.
+      this.requestRouteSync();
+      return;
+    }
+    const { baseVersion, version, hubEpoch, added, removed } = frame;
+    const currentEpoch = this.routes.hubEpoch;
+    if (currentEpoch === null || currentEpoch !== hubEpoch) {
+      // A diff cannot cross hub epochs: the version space restarts with
+      // the epoch, so `baseVersion` is meaningless here.
+      this.requestRouteSync();
+      return;
+    }
+    if (version <= this.routes.version) return; // stale or duplicate diff
+    if (baseVersion !== this.routes.version) {
+      // One or more diffs were missed (or the hub trimmed them out of its
+      // retention window): rebuild from the full snapshot.
+      this.requestRouteSync();
+      return;
+    }
+    const merged = new Map<string, CachedRoutes['members'][number]>();
+    for (const m of this.routes.members) merged.set(m.nodeId, m);
+    for (const r of removed) merged.delete(r.nodeId);
+    for (const a of added) {
+      let matchers: RegExp[];
+      try {
+        matchers = a.patterns.map((p) => compilePattern(p));
+      } catch {
+        continue;
+      }
+      merged.set(a.nodeId, { nodeId: a.nodeId, patterns: [...a.patterns], matchers });
+    }
+    this.routes = { version, hubEpoch, members: [...merged.values()] };
+    this.emitStatus();
+  }
+
+  /**
+   * Asks the hub for the authoritative full route snapshot (gap
+   * recovery). Coalesced: at most one request is in flight until a full
+   * snapshot lands or the transport drops.
+   */
+  private requestRouteSync(): void {
+    const socket = this.socket;
+    if (socket == null || !this.connectedFlag || this.syncPending) return;
+    this.syncPending = true;
+    this.routeSyncRequests += 1;
+    try {
+      socket.write(encodeFrame({ type: 'routes-sync', nodeId: this.nodeId } satisfies HubFrame));
+    } catch {
+      /* the transport-loss handler deals with dead sockets */
+    }
   }
 
   /**
@@ -750,7 +1038,7 @@ export class ClusterLink {
     if (socket == null) return;
     const patterns = [...this.getPatterns()].sort();
     this.advertised = patterns;
-    socket.write(encodeFrame({ type: 'hello', nodeId: this.nodeId, patterns } satisfies HubFrame));
+    socket.write(encodeFrame({ type: 'hello', nodeId: this.nodeId, patterns, routesDiff: true } satisfies HubFrame));
   }
 
   /**
@@ -767,7 +1055,7 @@ export class ClusterLink {
     }
     if (this.socket == null || !this.connectedFlag) return;
     this.advertised = sorted;
-    this.socket.write(encodeFrame({ type: 'hello', nodeId: this.nodeId, patterns: sorted } satisfies HubFrame));
+    this.socket.write(encodeFrame({ type: 'hello', nodeId: this.nodeId, patterns: sorted, routesDiff: true } satisfies HubFrame));
   }
 
   /** Node ids (excluding self) with at least one pattern matching `topic`. */
@@ -821,6 +1109,15 @@ export class ClusterLink {
     return this.connectedFlag;
   }
 
+  /**
+   * The member's cached route table — the exact table its forwarding
+   * decisions use. Converges to the hub's `getRouteTable()` via diffs or
+   * full snapshots.
+   */
+  getRouteTable(): Array<{ nodeId: string; patterns: string[] }> {
+    return this.routes.members.map((m) => ({ nodeId: m.nodeId, patterns: [...m.patterns] }));
+  }
+
   getStatus(): ClusterLinkStatus {
     return {
       connected: this.connectedFlag,
@@ -840,6 +1137,7 @@ export class ClusterLink {
       forwardErrors: this.forwardErrors,
       receiveDropped: this.receiveDropped,
       connects: this.connects,
+      routeSyncRequests: this.routeSyncRequests,
     };
   }
 

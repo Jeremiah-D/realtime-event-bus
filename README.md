@@ -223,9 +223,24 @@ library.
   each node joins with `bus.connectToHub({ url: 'tcp://host:port' })`,
   advertises its subscribed topic patterns, and receives the hub's route
   table. The hub is authoritative for routing: every membership or pattern
-  change bumps a monotonic route version and rebroadcasts the table; nodes
-  apply only newer versions (a hub restart is detected via a new hub epoch,
-  which supersedes the version — the version-conflict merge). A publish
+  change bumps a monotonic route version and propagates it; nodes apply only
+  newer versions (a hub restart is detected via a new hub epoch,
+  which supersedes the version — the version-conflict merge). Steady-state
+  changes travel as incremental `routes-diff` frames
+  (`{ type: 'routes-diff', baseVersion, version, hubEpoch, added, removed }`,
+  `added`/`removed` are `{ nodeId, patterns }` entries) that chain onto the
+  member's cached table: a diff applies only when `baseVersion` equals the
+  applied version, the hub epoch is unchanged, and the version is strictly
+  increasing — anything else (gap, epoch mismatch, corrupt frame) makes the
+  member request the authoritative full `routes` snapshot via `routes-sync`
+  instead of ever applying a diff out of order. Joins and reconnects always
+  receive the full snapshot; the hub retains a bounded window of recent
+  diffs (`new ClusterHub({ routeDiffRetention })`, default 64, `0` disables
+  diffs) so a member that fell behind the window also rebuilds from the
+  snapshot. Wire compatibility: members advertise the `routesDiff`
+  capability in `hello`; members without it (pre-diff nodes) keep receiving
+  full snapshots on every change — upgrade old nodes rather than mixing
+  versions long-term, since they miss the bandwidth win, not correctness. A publish
   whose topic matches subscribers on other members is additionally forwarded
   to the hub, which stamps hub-global per-topic sequence numbers (and
   hub-global per-key numbers for keyed messages) and forwards only to the
