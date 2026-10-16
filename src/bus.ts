@@ -2571,6 +2571,34 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * `instanceId`; ignored otherwise.
    */
   sessionTimeoutMs?: number;
+  /**
+   * Opt-in Kafka-style offset auto-commit for the competing set (EB-127),
+   * the `enable.auto.commit` analogue. Every `intervalMs` the member's
+   * commit timer checkpoints the highest per-topic `seq` the group has
+   * been handed since the last commit — through the same `commitOffset`
+   * path as manual commits, so the durable-log offset journal and the
+   * `OffsetStore` write-through (EB-114) see exactly the same writes.
+   *
+   * Pending checkpoints also flush early — before any handoff-linger
+   * window is computed — on every rebalance (member join or leave), on
+   * member leave/unsubscribe, and on static session expiry: a revoked
+   * member's in-flight work is checkpointed before ownership moves.
+   * Manual `commitOffset` and auto-commit are idempotent together,
+   * highest-seq-wins — an auto-commit never regresses a checkpoint a
+   * manual commit moved further.
+   *
+   * For partitioned groups the auto-commit moves the group-level
+   * checkpoint (the fallback for partitions without their own
+   * checkpoint); per-partition precision still needs manual
+   * `commitOffset(..., { partition })`.
+   *
+   * The timer is an unref'd wall-clock interval — it never keeps the
+   * process alive. `intervalMs` must be a finite number `> 0`. Default
+   * off: absent means no timer, no tracking, zero behavior change.
+   * `getStats().autoCommittedOffsets` counts the checkpoints auto-commit
+   * wrote.
+   */
+  autoCommit?: { intervalMs: number };
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -3581,6 +3609,16 @@ export interface BusStats {
    * Always 0 with the default `InMemoryOffsetStore`.
    */
   offsetStoreWriteErrors: number;
+  /**
+   * Checkpoints written by offset auto-commit (see
+   * `GroupSubscribeOptions.autoCommit`, EB-127): one per (group, topic)
+   * flushed, either by a member's commit timer or by a
+   * rebalance/leave/unsubscribe flush. Every one of them went through
+   * `commitOffset`, so the durable-log journal and the `OffsetStore`
+   * write-through saw exactly the same writes. Monotonic. Rendered as
+   * `eventbus_autocommitted_offsets_total` in `src/metrics.ts`.
+   */
+  autoCommittedOffsets: number;
   /**
    * Currently active topic-pause rules (see `EventBus.pauseTopic`,
    * EB-88), in registration order: the rule key, its mode, and how many
@@ -9327,6 +9365,31 @@ export class EventBus {
   /** Failed `OffsetStore.set` calls (EB-114): counted, never thrown. */
   private totalOffsetStoreWriteErrors = 0;
   /**
+   * Offset auto-commit timers (EB-127): roster key (instanceId for static
+   * members, subscription id otherwise) -> the member's commit timer and
+   * its group. One unref'd wall-clock `setInterval` per member that
+   * opted into `GroupSubscribeOptions.autoCommit`; cleared on leave,
+   * static session expiry, and re-arm.
+   */
+  private autoCommitTimers = new Map<string, { timer: ReturnType<typeof setInterval>; groupId: string }>();
+  /**
+   * Offset auto-commit reference counts (EB-127): groupId -> number of
+   * members with an armed auto-commit timer. Delivery tracking only
+   * records for groups in this map — default-off groups pay zero
+   * tracking overhead.
+   */
+  private autoCommitGroups = new Map<string, number>();
+  /**
+   * Pending auto-commit checkpoints (EB-127): groupId -> concrete topic
+   * -> highest per-topic `seq` handed to any member since the last flush.
+   * Flushed by the member timers, every rebalance, and every
+   * leave/unsubscribe — always through `commitOffset`, so the journal and
+   * the `OffsetStore` write-through see identical writes.
+   */
+  private autoCommitPending = new Map<string, Map<string, number>>();
+  /** Checkpoints written by offset auto-commit (EB-127). Monotonic. */
+  private totalAutoCommittedOffsets = 0;
+  /**
    * Active handoff-linger windows: groupId -> windows (see
    * `GroupSubscribeOptions.handoffLingerMs`). While a window is live,
    * durable-log replay skips the covered seqs for members of the group,
@@ -14367,6 +14430,26 @@ export class EventBus {
     if (!Number.isFinite(sessionTimeoutMs) || sessionTimeoutMs <= 0) {
       throw new RangeError('sessionTimeoutMs must be a finite number of milliseconds > 0');
     }
+    // Offset auto-commit (EB-127): validated before anything registers,
+    // so a throw leaves no half-registered subscriber behind. Opt-in only
+    // — absent means no timer, no tracking, zero behavior change.
+    const autoCommit = opts?.autoCommit;
+    let autoCommitIntervalMs: number | undefined;
+    if (autoCommit !== undefined) {
+      if (autoCommit === null || typeof autoCommit !== 'object' || Array.isArray(autoCommit)) {
+        throw new RangeError('autoCommit must be an object like { intervalMs }');
+      }
+      for (const key of Object.keys(autoCommit)) {
+        if (key !== 'intervalMs') {
+          throw new RangeError(`autoCommit: unknown option "${key}"`);
+        }
+      }
+      const intervalMs = (autoCommit as { intervalMs?: unknown }).intervalMs;
+      if (!Number.isFinite(intervalMs) || (intervalMs as number) <= 0) {
+        throw new RangeError('autoCommit.intervalMs must be a finite number of milliseconds > 0');
+      }
+      autoCommitIntervalMs = intervalMs as number;
+    }
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
@@ -14522,6 +14605,12 @@ export class EventBus {
           );
           return;
         }
+        // Offset auto-commit (EB-127): flush the group's pending checkpoints
+        // first — before the linger window below is computed, so the
+        // window covers only what is still uncommitted — then stop this
+        // member's commit timer.
+        this.flushAutoCommits(groupId);
+        this.disarmAutoCommitTimer(rosterKey);
         const wasPartitioned = this.groupPartitions.get(key) !== undefined;
         const before = wasPartitioned ? new Map(this.partitionAssignment(key)) : undefined;
         this.removeGroupMember(key, sub.id);
@@ -14567,6 +14656,13 @@ export class EventBus {
     // group members (`exportSubscription` rejects them), so no migration
     // path changes.
     subscriber.teardown = groupSubscription.unsubscribe;
+    // Offset auto-commit (EB-127): arm the member's commit timer after the
+    // join rebalance above flushed the group's pending checkpoints. Keyed
+    // by roster key so a static rejoin re-arms in place instead of leaking
+    // a timer.
+    if (autoCommitIntervalMs !== undefined) {
+      this.armAutoCommitTimer(rosterKey, groupId, autoCommitIntervalMs);
+    }
     return groupSubscription;
   }
 
@@ -14625,6 +14721,12 @@ export class EventBus {
     teardown: () => void,
   ): void {
     this.groupStaticSubs.get(key)?.delete(instanceId);
+    // Offset auto-commit (EB-127): flush the group's pending checkpoints
+    // before the handoff window is computed (same ordering as the normal
+    // leave path). The member keeps its roster slot — and its commit
+    // timer — for the session window; a rejoin re-arms the timer in
+    // place, and `expireStaticSession` disarms it on real expiry.
+    this.flushAutoCommits(groupId);
     // Computed before the teardown, like the normal leave path — the
     // handoff window covers the leaver's uncommitted backlog for durable
     // replay, orthogonal to the session hold.
@@ -14720,6 +14822,10 @@ export class EventBus {
     });
     // The rebalance itself is audited inside fireRebalance, like the
     // normal leave path.
+    // Offset auto-commit (EB-127): the session died with no rejoin — the
+    // member's commit timer goes with it. `fireRebalance` below flushes
+    // any pending checkpoints the group still holds.
+    this.disarmAutoCommitTimer(instanceId);
     this.fireRebalance(groupId, pattern, key, 'leave', instanceId, undefined, pr);
   }
 
@@ -14742,6 +14848,11 @@ export class EventBus {
   ): void {
     const members = this.groupMembers.get(key);
     if (members == null) return;
+    // Offset auto-commit (EB-127): every rebalance — join or leave —
+    // checkpoints the group's pending offsets first, before ownership
+    // moves: the Kafka revoke-hook analogue. Idempotent with the
+    // explicit leave-path flushes (pending is already empty by then).
+    this.flushAutoCommits(groupId);
     // Roster keys are instanceIds for static members (EB-104): resolve
     // to the live subscription before notifying. A member in its session
     // limbo has no live subscription and is skipped — it will not observe
@@ -15438,6 +15549,89 @@ export class EventBus {
       this.offsetStore.set(groupId, topic, seq);
     } catch {
       this.totalOffsetStoreWriteErrors += 1;
+    }
+  }
+
+  /**
+   * Arms one member's offset auto-commit timer (EB-127): an unref'd
+   * wall-clock `setInterval` that flushes the group's pending checkpoints
+   * every `intervalMs`. Wall-clock, like
+   * `GroupSubscribeOptions.sessionTimeoutMs` — a liveness cadence, not
+   * bus time, so it still fires under an injected `EventBusOptions.now`.
+   * Keyed by roster key (instanceId for static members, subscription id
+   * otherwise) so a static rejoin re-arms in place instead of leaking a
+   * timer. Re-arming an already-armed roster key replaces the timer and
+   * leaves the refcount untouched.
+   */
+  private armAutoCommitTimer(rosterKey: string, groupId: string, intervalMs: number): void {
+    const existing = this.autoCommitTimers.get(rosterKey);
+    if (existing !== undefined) clearInterval(existing.timer);
+    else this.autoCommitGroups.set(groupId, (this.autoCommitGroups.get(groupId) ?? 0) + 1);
+    const timer = setInterval(() => {
+      this.flushAutoCommits(groupId);
+    }, Math.min(intervalMs, 2_147_483_647));
+    unrefTimer(timer);
+    this.autoCommitTimers.set(rosterKey, { timer, groupId });
+  }
+
+  /**
+   * Stops one member's offset auto-commit timer (EB-127). When the last
+   * armed member of the group leaves, the group's pending row is dropped —
+   * a rejoining generation re-tracks from scratch. No-op for members that
+   * never opted in.
+   */
+  private disarmAutoCommitTimer(rosterKey: string): void {
+    const armed = this.autoCommitTimers.get(rosterKey);
+    if (armed == null) return;
+    this.autoCommitTimers.delete(rosterKey);
+    clearInterval(armed.timer);
+    const remaining = (this.autoCommitGroups.get(armed.groupId) ?? 1) - 1;
+    if (remaining <= 0) {
+      this.autoCommitGroups.delete(armed.groupId);
+      this.autoCommitPending.delete(armed.groupId);
+    } else {
+      this.autoCommitGroups.set(armed.groupId, remaining);
+    }
+  }
+
+  /**
+   * Remembers one group delivery for offset auto-commit (EB-127): the
+   * highest per-topic `seq` handed to a member's queue since the last
+   * flush is what the member's commit timer (or the next
+   * rebalance/leave/unsubscribe flush) checkpoints via `commitOffset`.
+   * No-op unless at least one member of the group opted into
+   * `GroupSubscribeOptions.autoCommit` — default-off groups pay zero
+   * tracking overhead.
+   */
+  private trackAutoCommitDelivery(groupId: string, topic: string, seq: number): void {
+    if (!this.autoCommitGroups.has(groupId)) return;
+    let byTopic = this.autoCommitPending.get(groupId);
+    if (byTopic == null) {
+      byTopic = new Map<string, number>();
+      this.autoCommitPending.set(groupId, byTopic);
+    }
+    const prev = byTopic.get(topic) ?? 0;
+    if (seq > prev) byTopic.set(topic, seq);
+  }
+
+  /**
+   * Commits the group's pending auto-commit checkpoints (EB-127): the
+   * highest per-topic `seq` handed to any member since the last flush.
+   * Runs through `commitOffset`, so the durable-log journal, the
+   * `OffsetStore` write-through, and lag re-evaluation all reuse the
+   * manual-commit semantics exactly. Highest-seq-wins against manual
+   * commits: a pending seq at or below the current checkpoint is
+   * skipped, never regressing a checkpoint the operator moved further.
+   */
+  private flushAutoCommits(groupId: string): void {
+    const pending = this.autoCommitPending.get(groupId);
+    if (pending == null || pending.size === 0) return;
+    const committed = this.committedOffsets.get(groupId);
+    for (const [topic, seq] of pending) {
+      if (seq > (committed?.get(topic) ?? 0)) {
+        this.commitOffset(groupId, topic, seq);
+        this.totalAutoCommittedOffsets += 1;
+      }
     }
   }
 
@@ -22914,7 +23108,16 @@ export class EventBus {
             if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
           }
         }
-        if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier)) accepted += 1;
+        const delivered = this.deliverToSubscriber(
+          assignee,
+          msg,
+          expiresAt,
+          rawPayload,
+          keyed,
+          causal,
+          barrier,
+        );
+        if (delivered) accepted += 1;
         // A barrier control message (EB-98) carries no business seq — it
         // must not move the group's data offsets: recording seq 0 would
         // regress the committed offset below real deliveries.
@@ -22922,6 +23125,10 @@ export class EventBus {
           this.recordPartitionOffset(key, partition, topic, msg.seq);
           this.recordGroupOffset(hit.groupId, topic, msg.seq);
           this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
+          // Offset auto-commit (EB-127): the highest seq handed to a
+          // member's queue since the last commit is what the member's
+          // commit timer (or the next rebalance/leave flush) checkpoints.
+          if (delivered) this.trackAutoCommitDelivery(hit.groupId, topic, msg.seq);
         }
         continue;
       }
@@ -22945,12 +23152,17 @@ export class EventBus {
           if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
         }
       }
-      if (this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier)) accepted += 1;
+      const delivered = this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier);
+      if (delivered) accepted += 1;
       // Barrier control messages (EB-98) carry no business seq — see the
       // partitioned branch above: they never move group offsets.
       if (barrier === undefined) {
         this.recordGroupOffset(hit.groupId, topic, msg.seq);
         this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
+        // Offset auto-commit (EB-127): the highest seq handed to a
+        // member's queue since the last commit is what the member's
+        // commit timer (or the next rebalance/leave flush) checkpoints.
+        if (delivered) this.trackAutoCommitDelivery(hit.groupId, topic, msg.seq);
       }
     }
     return { matched, accepted };
@@ -23203,6 +23415,7 @@ export class EventBus {
         rejectedMessages: breaker.rejectedMessages,
       })),
       offsetStoreWriteErrors: this.totalOffsetStoreWriteErrors,
+      autoCommittedOffsets: this.totalAutoCommittedOffsets,
       // Active topic-pause rules (EB-88), in registration order.
       pausedTopics: [...this.pauseRules.entries()].map(([topicPattern, rule]) => ({
         topicPattern,

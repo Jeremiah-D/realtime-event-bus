@@ -57,6 +57,11 @@
  * - `eventbus_causal_buffer_regressed_messages_total`: causal messages
  *   delivered immediately on clock regression (see
  *   `SubscribeOptions.causal`).
+ * - `eventbus_autocommitted_offsets_total`: consumer-group offset
+ *   checkpoints written by offset auto-commit
+ *   (`GroupSubscribeOptions.autoCommit`, EB-127) — every one went through
+ *   `commitOffset`, so the offset journal and the `OffsetStore`
+ *   write-through saw exactly the same writes as manual commits.
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
  * - `eventbus_topic_partition_published_total{topic,partition}`: admitted
  *   publishes per topic partition (EB-90; only emitted for topics with
@@ -373,6 +378,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_offset_store_write_errors_total',
     'Total failed OffsetStore.set calls (EB-114, see EventBusOptions.offsetStore): a throwing custom store never breaks the in-memory commit.',
     stats.offsetStoreWriteErrors,
+  );
+  counter(
+    'eventbus_autocommitted_offsets_total',
+    'Total consumer-group offset checkpoints written by offset auto-commit (GroupSubscribeOptions.autoCommit, EB-127): each went through commitOffset, so the offset journal and OffsetStore write-through saw the same writes.',
+    stats.autoCommittedOffsets ?? 0,
   );
   counter(
     'eventbus_hotkey_mitigations_total',

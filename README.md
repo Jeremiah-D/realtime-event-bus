@@ -128,7 +128,23 @@ library.
   default in-memory): inject a shared store (e.g. a Redis/Postgres adapter)
   so checkpoints survive restarts and are visible across bus instances,
   and reseed a fresh bus with `await bus.recoverFromOffsetStore()`
-  (highest-seq-wins, never regressing live commits). Opt-in `partitions` on `subscribeToGroup` switches a
+  (highest-seq-wins, never regressing live commits). Opt-in
+  `autoCommit: { intervalMs }` on `subscribeToGroup` (EB-127) is the
+  Kafka-style `enable.auto.commit` analogue: every `intervalMs` each
+  member's commit timer checkpoints the highest per-topic `seq` its group
+  has been handed since the last commit, through the same `commitOffset`
+  path — so the offset journal and the `OffsetStore` write-through see
+  exactly the same writes as manual commits. Pending checkpoints also
+  flush early — before any handoff-linger window is computed — on every
+  rebalance (member join or leave), on member leave/unsubscribe, and on
+  static session expiry: a revoked member's in-flight work is checkpointed
+  before ownership moves. Manual `commitOffset` and auto-commit are
+  idempotent together, highest-seq-wins: an auto-commit never regresses a
+  checkpoint a manual commit moved further. The timer is an unref'd
+  wall-clock interval — it never keeps the process alive. Default off:
+  absent means no timer, no tracking, zero behavior change.
+  `getStats().autoCommittedOffsets` counts the auto-committed checkpoints
+  (`eventbus_autocommitted_offsets_total` in `src/metrics.ts`). Opt-in `partitions` on `subscribeToGroup` switches a
   competing set from per-message round-robin to Kafka-style partition
   assignment: the key space is divided into N logical partitions, each owned
   exclusively by one member. A keyed message's partition is
