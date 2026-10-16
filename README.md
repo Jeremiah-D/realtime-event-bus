@@ -2721,6 +2721,67 @@ evaluated (they are one-shot injections); the advisory topic-registry
 check (EB-77) is skipped; barrier cut markers (`opts.barrier`) take the
 slim alias→ACL admission path, mirroring `fanOutBarrier`.
 
+## Publisher confirmations: publishWithConfirmation
+
+`bus.publishWithConfirmation(topic, payload, opts?)`
+(`src/bus.ts`, EB-125 — backend engineering) runs the EXACT `publish`
+pipeline — chaos gate, option validation, namespace resolution, circuit
+breaker, `fanOut` admission, flush scheduling — and resolves with a
+receipt saying what admission decided, Kafka-`acks` style:
+
+```ts
+const ok = await bus.publishWithConfirmation('orders.eu', order);
+// -> { admitted: true, topic: 'orders.eu', seq: 41,
+//      admittedAtMs: 1728981234567,
+//      payloadSha256: '9f2c…' }
+
+bus.setTopicSchema('orders.eu', (p) => p.total > 0);
+const no = await bus.publishWithConfirmation('orders.eu', { total: -1 });
+// -> { admitted: false, topic: 'orders.eu', reason: 'schema',
+//      rejectedAtMs: 1728981234567 }
+```
+
+The receipt is a discriminated union on `admitted`. `topic` is the fully
+resolved concrete topic (namespace + alias resolution) — the topic the
+sequence number and the durable-log record belong to. `seq` is the
+per-(topic, partition) sequence number stamped at fan-out. `reason`
+reuses the `onAdmissionRejected` vocabulary verbatim (`'acl'`,
+`'schema'`, `'message-too-big'`, `'payload-too-large'`,
+`'rate-limit'`, `'publisher-rate-limit'`, `'alias-retired'`,
+`'topic-paused'`) — no new spellings — and the
+rejection's zero-side-effect contract matches `publish` exactly: no
+sequence number consumed, nothing written to the durable log, no
+rate-limit budget burned (the `'rate-limit'` and shed-mode
+`'topic-paused'` sheds consume a sequence number, exactly like
+`publish`, so subscribers observe the same gap). Invalid arguments
+(empty topic, illegal options) throw `RangeError` fail-fast,
+synchronously, exactly like `publish`.
+
+`payloadSha256` is the SHA-256 hex (`node:crypto`, zero new
+dependencies) of the admitted application-payload bytes: post
+admission-time redaction (EB-68) — the exact bytes the durable log
+persists for the payload and subscribers receive — and pre
+compression (EB-22) / encryption (EB-80), so the publisher can
+reproduce the digest from its own bytes (`sha256(JSON.stringify(payload))`
+for JSON; raw bytes for binary payloads, EB-92). Payloads with no JSON
+encoding hash as the empty byte string.
+
+Opt-in `waitForDurable: true` gives Kafka-`acks=all` semantics: the
+receipt resolves only after the message's durable-log record has been
+appended. The bus's durable-log append is synchronous (the record is
+handed to the OS before `append` returns), so this never sleeps or
+polls — the receipt simply resolves after the synchronous publish, at
+which point the record is guaranteed on disk. Without a durable log
+configured there is nothing to persist and the publish is trivially
+durable. (Bus durability is OS-handoff, not fsync-per-message: a power
+loss can still lose whatever the OS had not flushed.)
+
+Notes: a topic paused in queue mode (EB-88) reports
+`{ admitted: false, reason: 'topic-paused' }` — the message is buffered
+for resume, not rejected, and no second receipt fires at resume;
+barrier cut markers (`opts.barrier`) confirm with `seq: 0`
+(control-plane, never durably logged).
+
 ## Declarative configuration snapshots
 
 `exportBusConfig()` / `applyConfig(snapshot, { dryRun? })` /

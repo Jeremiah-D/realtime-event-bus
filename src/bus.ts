@@ -6467,6 +6467,148 @@ export interface PreviewPublishResult {
 }
 
 /**
+ * Options for `EventBus.publishWithConfirmation` (EB-125): every
+ * `PublishOptions` field applies exactly as in `publish`, plus the
+ * opt-in durability wait below.
+ */
+export interface PublishConfirmationOptions extends PublishOptions {
+  /**
+   * Opt-in Kafka-`acks=all`-style durability: the returned promise
+   * resolves only after the message's durable-log record has been
+   * appended. The bus's durable-log append is synchronous
+   * (`DurableTopicLog.append` hands the record to the OS before it
+   * returns), so this never sleeps or polls — the receipt simply
+   * resolves after the synchronous publish, at which point the record
+   * is guaranteed handed to the OS. Without a durable log configured
+   * (`EventBusOptions.durableLogDir` unset) there is nothing to persist
+   * and the publish is trivially durable: the receipt resolves
+   * immediately. Barrier control messages (`PublishOptions.barrier`)
+   * are never durably logged, so the wait is vacuous for them too.
+   * Bus durability is OS-handoff, not fsync-per-message (see the
+   * durability note on `DurableTopicLog`): a power loss can still lose
+   * whatever the OS had not flushed — this confirms the write reached
+   * the log, not the platter.
+   */
+  waitForDurable?: boolean;
+}
+
+/**
+ * Publisher confirmation receipt for an admitted publish (see
+ * `EventBus.publishWithConfirmation`, EB-125) — the Kafka-`acks`
+ * semantic: the broker confirms what it admitted, keyed so the
+ * publisher can reconcile.
+ */
+export interface PublishConfirmation {
+  /** Discriminant: this receipt confirms an admission. */
+  admitted: true;
+  /**
+   * The fully resolved concrete topic the message landed on —
+   * namespace-resolved (`PublishOptions.namespace`) and alias-resolved
+   * (EB-44) — the topic the sequence number and the durable-log record
+   * belong to.
+   */
+  topic: string;
+  /**
+   * The per-(topic, partition) sequence number stamped at fan-out
+   * (EB-13/EB-90). Barrier control messages confirm with `seq` 0 — they
+   * are control-plane, not sequenced business data.
+   */
+  seq: number;
+  /** Bus-clock timestamp of admission (`EventBusOptions.now`). */
+  admittedAtMs: number;
+  /**
+   * SHA-256 hex (`node:crypto`, zero new dependencies) of the admitted
+   * application-payload bytes: the payload AFTER admission-time
+   * redaction (EB-68) — the exact bytes the durable log persists for
+   * the payload and subscribers receive — and BEFORE
+   * compression (EB-22) / encryption (EB-80) storage transforms, so the
+   * publisher can reproduce the digest from its own bytes. Binary
+   * payloads (EB-92) hash as their raw bytes; JSON payloads as the
+   * UTF-8 bytes of the bus's canonical serialization; a payload with no
+   * JSON encoding (`undefined`, functions, `BigInt`, circular) hashes
+   * as the empty byte string.
+   */
+  payloadSha256: string;
+}
+
+/**
+ * Publisher confirmation receipt for a publish the admission gates
+ * refused (see `EventBus.publishWithConfirmation`, EB-125). `reason`
+ * reuses the `onAdmissionRejected` vocabulary verbatim — no new
+ * spellings — and the zero-side-effect contract matches the existing
+ * admission exactly (a rejection consumes no sequence number, writes
+ * nothing to the durable log, and burns no rate-limit budget — except
+ * the two shed gates, `'rate-limit'` and `'topic-paused'` in shed
+ * mode, which consume a sequence number exactly like `publish`, so
+ * subscribers observe the same gap).
+ */
+export interface PublishRejection {
+  /** Discriminant: this receipt reports a refusal. */
+  admitted: false;
+  /**
+   * The concrete topic the rejected publish targeted (never a pattern)
+   * — the same topic `onAdmissionRejected` reports.
+   */
+  topic: string;
+  /**
+   * Which admission gate refused it (`AdmissionRejectReason`
+   * vocabulary). A topic paused in queue mode (EB-88) reports
+   * `'topic-paused'`: the message is buffered for resume, not rejected
+   * — no second receipt fires when it is admitted at resume.
+   */
+  reason: AdmissionRejectReason;
+  /** Bus-clock timestamp of the refusal (`EventBusOptions.now`). */
+  rejectedAtMs: number;
+}
+
+/**
+ * The receipt `EventBus.publishWithConfirmation` resolves with (EB-125):
+ * an admission confirmation or a rejection, discriminated by `admitted`.
+ */
+export type ConfirmationReceipt = PublishConfirmation | PublishRejection;
+
+/**
+ * The admission outcome of one run through the publish pipeline — shared
+ * by `publish` (which only reads `accepted`) and `publishWithConfirmation`
+ * (EB-125, which builds the receipt from the rest). `topic` is the
+ * namespace-resolved topic; the receipt prefers the capture's
+ * fully-resolved (namespace + alias) topic when present.
+ */
+interface PublishOutcome {
+  /** Subscriber queues that accepted the message (the `publish` return). */
+  accepted: number;
+  /** Whether the message cleared every admission gate. */
+  admitted: boolean;
+  /** The refusing gate (`AdmissionRejectReason` vocabulary), when refused. */
+  rejectReason?: AdmissionRejectReason;
+  /** Namespace-resolved topic (pre-alias). */
+  topic: string;
+  /**
+   * The per-(topic, partition) sequence number stamped at fan-out when
+   * admitted — 0 for admitted barrier control messages (control-plane,
+   * not sequenced business data).
+   */
+  seq?: number;
+}
+
+/**
+ * Out-param for `publishWithConfirmation` (EB-125): `publishCore` passes
+ * one into `fanOut`, and the admitted path records the receipt's content
+ * fields here — computed once, right after admission-time redaction, so
+ * the hot path (every other caller passes nothing) pays zero hashing
+ * cost. Rejections leave it alone: a rejection receipt carries no
+ * content hash.
+ */
+interface ConfirmationCapture {
+  /** Fully resolved concrete topic (namespace + alias), set after alias resolution. */
+  topic?: string;
+  /** Bus-clock timestamp taken on the admitted path. */
+  admittedAtMs?: number;
+  /** SHA-256 hex of the admitted application-payload bytes (see `PublishConfirmation`). */
+  payloadSha256?: string;
+}
+
+/**
  * Pause mode for `EventBus.pauseTopic` (EB-88, ops window):
  * - `'shed'` (default): publishes to a matching topic are rejected
  *   outright while the pause is active — counted in
@@ -8015,6 +8157,21 @@ function wireBytesOfPayload(payload: unknown, binary: boolean): Buffer | undefin
   }
   const serialized = serializeToJson(payload);
   return serialized === undefined ? undefined : Buffer.from(serialized, 'utf8');
+}
+
+/**
+ * Content digest for publisher confirmation receipts (EB-125): SHA-256
+ * hex (`node:crypto`, zero new dependencies) of the canonical
+ * application-payload bytes — the same `wireBytesOfPayload` measure
+ * compression, HMAC signing and the durable-log v2 encoding use, so
+ * "payload bytes" means one thing everywhere. A payload with no
+ * encoding (`undefined`, functions, `BigInt`, circular) hashes as the
+ * empty byte string — documented on `PublishConfirmation`, and the
+ * digest stays total (never `undefined`) on every path.
+ */
+function confirmationPayloadHash(payload: unknown, binary: boolean): string {
+  const bytes = wireBytesOfPayload(payload, binary) ?? Buffer.alloc(0);
+  return createHash('sha256').update(bytes).digest('hex');
 }
 
 /**
@@ -16534,25 +16691,106 @@ export class EventBus {
    * `PublishOptions.key`).
    */
   publish(topic: string, payload: unknown, opts?: PublishOptions): number {
+    return this.publishCore(topic, payload, opts, 'publish').accepted;
+  }
+
+  /**
+   * Publishes with a Kafka-`acks`-style confirmation receipt (EB-125):
+   * runs the EXACT `publish` pipeline (chaos gate, option validation,
+   * namespace resolution, barrier slim path, circuit breaker, `fanOut`
+   * admission, flush scheduling) and resolves with what admission
+   * decided — an admission receipt `{ admitted: true, topic, seq,
+   * admittedAtMs, payloadSha256 }` or a rejection receipt `{ admitted:
+   * false, topic, reason, rejectedAtMs }` whose `reason` reuses the
+   * `onAdmissionRejected` vocabulary verbatim. The rejection's
+   * zero-side-effect contract matches `publish` exactly (no sequence
+   * number consumed, nothing written to the durable log, no rate-limit
+   * budget burned — except the `'rate-limit'` and shed-mode
+   * `'topic-paused'` sheds, which consume a sequence number exactly
+   * like `publish`).
+   *
+   * The method itself is synchronous up to the returned promise: invalid
+   * arguments (empty topic, illegal options) throw `RangeError`
+   * fail-fast exactly like `publish`, and `CircuitBreakerOpenError` /
+   * `NamespaceDeniedError` propagate the same way — only the receipt
+   * travels on the promise. With `opts.waitForDurable` the receipt
+   * resolves after the message's durable-log record has been appended;
+   * the append is synchronous, so this never sleeps — see
+   * `PublishConfirmationOptions.waitForDurable`.
+   */
+  publishWithConfirmation(
+    topic: string,
+    payload: unknown,
+    opts?: PublishConfirmationOptions,
+  ): Promise<ConfirmationReceipt> {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('publishWithConfirmation: topic must be a non-empty string');
+    }
+    const confirm: ConfirmationCapture = {};
+    const outcome = this.publishCore(topic, payload, opts, 'publishWithConfirmation', confirm);
+    if (!outcome.admitted) {
+      const rejectedAtMs = this.now();
+      return Promise.resolve({
+        admitted: false,
+        topic: confirm.topic ?? outcome.topic,
+        // EB-103 chaos 'drop' sheds the publish before any admission
+        // gate runs — no gate decided, no hook fired, so no
+        // AdmissionRejectReason was captured; the generic shed reason
+        // stands in. Chaos faults are one-shot test injections, never
+        // production traffic.
+        reason: outcome.rejectReason ?? 'rate-limit',
+        rejectedAtMs,
+      });
+    }
+    return Promise.resolve({
+      admitted: true,
+      topic: confirm.topic ?? outcome.topic,
+      seq: outcome.seq ?? 0,
+      admittedAtMs: confirm.admittedAtMs ?? this.now(),
+      // The data path always captures the hash in `fanOut`; the barrier
+      // path captures it in `publishCore` below — the fallback only
+      // covers a hypothetical uncaptured path and keeps the receipt total.
+      payloadSha256: confirm.payloadSha256 ?? confirmationPayloadHash(payload, opts?.binary === true),
+    });
+  }
+
+  /**
+   * The shared publish pipeline behind `publish` and
+   * `publishWithConfirmation` (EB-125): chaos gate, option validation,
+   * namespace resolution, the barrier slim path, the circuit-breaker
+   * gate, `fanOut` admission, and flush scheduling — byte-for-byte the
+   * old `publish` semantics, returning the admission outcome instead of
+   * just the accepted count. `caller` names the entry point in
+   * validation errors, following the `previewPublish` convention.
+   * `confirm`, when provided, receives the receipt's content fields
+   * from `fanOut`'s admitted path.
+   */
+  private publishCore(
+    topic: string,
+    payload: unknown,
+    opts: PublishOptions | undefined,
+    caller: string,
+    confirm?: ConfirmationCapture,
+  ): PublishOutcome {
     // Chaos (EB-103): an admission fault is evaluated before any
     // validation — a 'drop' sheds the publish (returns 0), an 'error'
     // throws ChaosInjectionError, both with zero side effects.
-    if (this.checkChaosAdmission()) return 0;
-    validateMessageKey(opts?.key, 'publish');
-    validateTraceparent(opts?.traceparent, 'publish');
-    validateEventTime(opts?.eventTime, 'publish');
-    validateCausal(opts?.causal, 'publish');
-    validatePublisherId(opts?.publisherId, 'publish');
-    validateSchemaVersion(opts?.schemaVersion, 'publish');
-    validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publish');
+    if (this.checkChaosAdmission()) return { accepted: 0, admitted: false, topic };
+    validateMessageKey(opts?.key, caller);
+    validateTraceparent(opts?.traceparent, caller);
+    validateEventTime(opts?.eventTime, caller);
+    validateCausal(opts?.causal, caller);
+    validatePublisherId(opts?.publisherId, caller);
+    validateSchemaVersion(opts?.schemaVersion, caller);
+    validatePartitionOptions(opts?.partitionKey, opts?.partition, caller);
     // Barrier cut marker (EB-98): fail-fast, before anything is mutated.
-    validateBarrier(opts?.barrier, 'publish');
+    validateBarrier(opts?.barrier, caller);
     // Priority lane (EB-122): fail-fast, before anything is mutated.
-    if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publish');
+    if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, caller);
     // Binary payload passthrough (EB-92): validated and normalized here
     // — `binary: true` with a non-bytes payload throws `TypeError`
     // before anything is mutated.
-    payload = normalizeBinaryPayload(payload, opts?.binary, 'publish');
+    payload = normalizeBinaryPayload(payload, opts?.binary, caller);
     const binary = opts?.binary === true;
     // Multi-tenant namespace (EB-52): resolve to the concrete
     // `<namespace>/<topic>` before admission — the full pipeline below
@@ -16567,9 +16805,16 @@ export class EventBus {
     // retained update, no schema/rate-limit/compression/signing) instead
     // of the full admission pipeline below.
     if (opts?.barrier !== undefined) {
-      const accepted = this.fanOutBarrier(topic, payload, opts.barrier.epoch);
+      const barrier = this.fanOutBarrier(topic, payload, opts.barrier.epoch);
+      if (barrier.admitted && confirm !== undefined) {
+        // The barrier path never redacts (EB-98 slim admission), so the
+        // normalized payload above IS the admitted bytes.
+        confirm.topic = barrier.topic;
+        confirm.admittedAtMs = this.now();
+        confirm.payloadSha256 = confirmationPayloadHash(payload, binary);
+      }
       this.scheduleFlush();
-      return accepted;
+      return { ...barrier, seq: barrier.admitted ? 0 : undefined };
     }
     // Publish circuit breaker (EB-116): the fail-fast gate for topics
     // whose every subscriber is degraded or shedding. Opt-in per topic —
@@ -16590,7 +16835,7 @@ export class EventBus {
         this.checkPublishCircuitBreaker(breakerTopic, payload, opts?.publisherId);
       }
     }
-    const { accepted } = this.fanOut(
+    const { accepted, admitted, seq, rejectReason } = this.fanOut(
       topic,
       payload,
       false,
@@ -16620,6 +16865,9 @@ export class EventBus {
       // Priority lane (EB-122): validated above; `fanOut` stamps it onto
       // the envelope and the durable-log record. Absent means `normal`.
       opts?.priority,
+      // Publisher confirmation (EB-125): the admitted path records the
+      // receipt's content fields here.
+      confirm,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -16627,7 +16875,7 @@ export class EventBus {
       this.updatePublishCircuitBreaker(breakerTopic);
     }
     this.scheduleFlush();
-    return accepted;
+    return { accepted, admitted, rejectReason, seq, topic };
   }
 
   /**
@@ -21342,20 +21590,24 @@ export class EventBus {
    *
    * Returns the number of opted-in subscribers that accepted the barrier.
    */
-  private fanOutBarrier(topic: string, payload: unknown, epoch: number): number {
+  private fanOutBarrier(
+    topic: string,
+    payload: unknown,
+    epoch: number,
+  ): { accepted: number; admitted: boolean; rejectReason?: AdmissionRejectReason; topic: string } {
     // Topic aliases (EB-44) resolve before the ACL, exactly like the full
     // pipeline: a barrier naming a retired old topic is refused and claims
     // nothing — it must not cut a stream that no longer exists.
     const aliasResolution = this.resolvePublishTopic(topic);
     if (aliasResolution.retired) {
       this.countAliasRetired(topic, payload, undefined);
-      return 0;
+      return { accepted: 0, admitted: false, rejectReason: 'alias-retired', topic };
     }
     topic = aliasResolution.topic;
     // Broker-level ACL: the one admission gate a control message keeps.
     if (!this.aclAllowsPublish(topic)) {
       this.countAclDenied(topic, payload, undefined);
-      return 0;
+      return { accepted: 0, admitted: false, rejectReason: 'acl', topic };
     }
     const msg: BusMessage = {
       topic,
@@ -21368,7 +21620,7 @@ export class EventBus {
     };
     this.totalBarriersPublished += 1;
     const { accepted } = this.deliverMatched(msg, undefined, payload, undefined, undefined, { epoch });
-    return accepted;
+    return { accepted, admitted: true, topic };
   }
 
   private fanOut(
@@ -21433,7 +21685,21 @@ export class EventBus {
     // and pause-buffered messages carry their schedule/pause-time lane
     // through.
     priority?: MessageLane,
-  ): { matched: number; accepted: number; admitted: boolean } {
+    // Publisher confirmation (EB-125): only `publishCore` passes one, on
+    // behalf of `publishWithConfirmation`. The admitted path records the
+    // receipt's content fields here — the hash is computed once, right
+    // after admission-time redaction, so every other caller (which
+    // passes nothing) pays zero hashing cost.
+    confirm?: ConfirmationCapture,
+  ): {
+    matched: number;
+    accepted: number;
+    admitted: boolean;
+    /** The stamped per-(topic, partition) seq — present only when admitted. */
+    seq?: number;
+    /** The refusing gate (`AdmissionRejectReason` vocabulary) — present only when refused. */
+    rejectReason?: AdmissionRejectReason;
+  } {
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
     // branch and nothing else (no allocation, no WeakMap lookup).
@@ -21453,9 +21719,13 @@ export class EventBus {
     const aliasResolution = this.resolvePublishTopic(topic);
     if (aliasResolution.retired) {
       this.countAliasRetired(topic, payload, publisherId);
-      return { matched: 0, accepted: 0, admitted: false };
+      return { matched: 0, accepted: 0, admitted: false, rejectReason: 'alias-retired' };
     }
     topic = aliasResolution.topic;
+    // Publisher confirmation (EB-125): the receipt names the fully
+    // resolved concrete topic — the one the seq and the durable-log
+    // record belong to.
+    if (confirm !== undefined) confirm.topic = topic;
     // Publish-side partition routing (EB-90): resolves the message's
     // partition from the explicit `partition` (wins) or the consistent
     // hash of `partitionKey` over the topic's configured partition count
@@ -21502,7 +21772,7 @@ export class EventBus {
           this.totalPublished += 1;
           this.countPartitionPublish(topic, resolvedPartition, shedSeq);
           this.countTopicPaused(topic, payload, publisherId);
-          return { matched: 0, accepted: 0, admitted: false };
+          return { matched: 0, accepted: 0, admitted: false, rejectReason: 'topic-paused' };
         }
         this.bufferPausedMessage(pauseRule, topic, payload, {
           key,
@@ -21521,7 +21791,11 @@ export class EventBus {
           // fan-out re-admits the message into its original lane.
           priority,
         });
-        return { matched: 0, accepted: 0, admitted: false };
+        // Publisher confirmation (EB-125): a buffered publish is held
+        // for resume, not rejected — but it is not admitted either, so
+        // it reports 'topic-paused' with no admission. Documented on
+        // `PublishRejection`.
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'topic-paused' };
       }
     }
     // Causal clock (see `PublishOptions.causal`): validated by the
@@ -21555,7 +21829,7 @@ export class EventBus {
       // ambiguous (paused vs. over-budget).
       if (this.takePublisherToken(publisherId) !== undefined) {
         this.countPublisherRateLimited(topic, payload, publisherId);
-        return { matched: 0, accepted: 0, admitted: false };
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'publisher-rate-limit' };
       }
       // Broker-level ACL runs before every other admission gate except
       // the per-publisher rate limiter above it (EB-79); topic aliases
@@ -21566,7 +21840,7 @@ export class EventBus {
       // rejection with reason 'acl' (see countAclDenied).
       if (!this.aclAllowsPublish(topic)) {
         this.countAclDenied(topic, payload, publisherId);
-        return { matched: 0, accepted: 0, admitted: false };
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'acl' };
       }
       // Publish-side schema validation runs before admission: a rejected
       // payload never becomes a message — no sequence number is consumed
@@ -21576,7 +21850,7 @@ export class EventBus {
       // superseded-but-graced version are counted in
       // `deprecatedSchemaVersions`.
       if (!this.applySchemaVerdict(topic, payload, schemaVersion, publisherId)) {
-        return { matched: 0, accepted: 0, admitted: false };
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'schema' };
       }
       // Per-topic maximum message size runs after schema validation and
       // before sequence-number assignment: an oversized payload is rejected
@@ -21588,7 +21862,7 @@ export class EventBus {
       const maxBytes = this.maxMessageBytesForTopic(topic);
       if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
         this.countMessageTooBig(topic, payload, publisherId);
-        return { matched: 0, accepted: 0, admitted: false };
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'message-too-big' };
       }
       // Per-topic payload-size cap (EB-120) runs right after the
       // message-size cap and before sequence-number assignment: an
@@ -21602,7 +21876,7 @@ export class EventBus {
       const maxPayloadBytes = this.maxPayloadBytesForTopic(topic);
       if (maxPayloadBytes !== undefined && payloadByteSize(payload) > maxPayloadBytes) {
         this.countPayloadTooLarge(topic, payload, publisherId);
-        return { matched: 0, accepted: 0, admitted: false };
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'payload-too-large' };
       }
     }
     // The message identity rides the envelope end to end (durable log,
@@ -21685,7 +21959,7 @@ export class EventBus {
         if (delayedKeyed !== undefined) {
           this.releaseKeySequence(delayedKeyed.key, delayedKeyed.keySeq);
         }
-        return { matched: 0, accepted: 0, admitted: false };
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'rate-limit' };
       }
     }
     // Delivery-trace sampling decision (EB-45): head-based, taken once the
@@ -22131,7 +22405,16 @@ export class EventBus {
         }
       }
     }
-    return { matched, accepted, admitted: true };
+    // Publisher confirmation (EB-125): the admitted path records the
+    // receipt's content fields — the hash covers the redacted
+    // application payload (local `payload`, pre-compression), exactly
+    // the bytes the durable log persists for the payload. Computed only
+    // when a capture was passed, so the hot path pays nothing.
+    if (confirm !== undefined) {
+      confirm.admittedAtMs = this.now();
+      confirm.payloadSha256 = confirmationPayloadHash(payload, binary);
+    }
+    return { matched, accepted, admitted: true, seq: msg.seq };
   }
 
   /**
