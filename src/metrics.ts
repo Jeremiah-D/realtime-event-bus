@@ -353,6 +353,16 @@ export function renderPrometheus(stats: BusStats): string {
     stats.offsetStoreWriteErrors,
   );
   counter(
+    'eventbus_hotkey_mitigations_total',
+    'Total hot-key auto-mitigation engagements: a (subscriber, key) reorder buffer reached the hotspot threshold while auto-mitigation was enabled (EB-115).',
+    stats.hotKeyMitigations,
+  );
+  counter(
+    'eventbus_hotkey_shed_messages_total',
+    'Total keyed messages shed by hot-key auto-mitigation instead of piling onto a mitigated reorder buffer (EB-115).',
+    stats.hotKeyShedMessages,
+  );
+  counter(
     'eventbus_causal_buffer_dropped_messages_total',
     'Total causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock).',
     stats.causalBuffer?.droppedMessages ?? 0,

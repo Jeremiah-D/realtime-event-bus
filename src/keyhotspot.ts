@@ -36,6 +36,19 @@
  * injected clock. Enabling monitoring changes nothing about delivery
  * order, admission, or backpressure.
  *
+ * Opt-in auto-mitigation (EB-115, `KeyHotspotOptions.autoMitigate`)
+ * turns detection into action: when a monitored stream's buffer depth
+ * reaches the alert threshold, the stream is *mitigated* — new
+ * out-of-order arrivals for that (subscriber, key) are shed at fan-out
+ * instead of piling onto the reorder buffer, so a stuck predecessor
+ * cannot grow the pile without bound. The shed keySeq is marked skipped
+ * (see `EventBus.skipKeySeq`), so the stream's expectation advances past
+ * the shed message and a later cascade never hangs on the gap; other
+ * keys are untouched. Mitigation releases automatically once the buffer
+ * drains strictly below `recoverDepth`. In-order arrivals
+ * (`keySeq == expected`) still flow while mitigated — they do not grow
+ * the pile. Disabled by default: monitoring alone never sheds.
+ *
  * Semantics worth knowing:
  * - The depth counts messages held *pre-queue*: they have not yet run the
  *   content filter, adaptive throttling, or the subscriber's backpressure
@@ -67,6 +80,51 @@ export interface KeyHotspotOptions {
    * Must be a function.
    */
   onKeyHotspot?: (event: KeyHotspotEvent) => void;
+  /**
+   * Opt-in per-key auto-mitigation (EB-115). `true` enables it with
+   * defaults (`recoverDepth` = `thresholdDepth`, no callback); an object
+   * tunes it. Absent or `false` (default) means detection only — the bus
+   * never sheds a monitored stream's messages, fully backward
+   * compatible.
+   */
+  autoMitigate?: boolean | HotKeyMitigateOptions;
+}
+
+/** Tuning for hot-key auto-mitigation (see `KeyHotspotOptions.autoMitigate`, EB-115). */
+export interface HotKeyMitigateOptions {
+  /**
+   * Buffer depth strictly below which an engaged mitigation releases:
+   * the stream must drain below this depth before new messages for the
+   * key flow again — the hysteresis band against flapping. Default: the
+   * subscription's `thresholdDepth` (release mirrors the alert latch's
+   * re-arm). Must be a non-negative integer `<= thresholdDepth`.
+   */
+  recoverDepth?: number;
+  /**
+   * Called once per mitigation engagement, when a stream's buffer depth
+   * reaches `thresholdDepth` while auto-mitigation is enabled and the
+   * stream is not already mitigated. Must be a function. A throwing
+   * callback propagates to the caller, like `onKeyHotspot`.
+   */
+  onHotKeyMitigated?: (event: HotKeyMitigatedEvent) => void;
+}
+
+/** Fired when a (subscriber, key) stream's auto-mitigation engages (EB-115). */
+export interface HotKeyMitigatedEvent {
+  /** The monitored subscription's id. */
+  subscriberId: string;
+  /** The pattern the subscription was registered with. */
+  pattern: string;
+  /** The piling-up key now under mitigation. */
+  key: string;
+  /** The buffer depth that engaged mitigation. */
+  bufferedDepth: number;
+  /** The subscription's configured hotspot threshold. */
+  thresholdDepth: number;
+  /** The configured recovery depth (mitigation releases below it). */
+  recoverDepth: number;
+  /** Bus-clock reading of the engagement, in milliseconds. */
+  at: number;
 }
 
 /** Fired when a (subscriber, key) reorder buffer reaches its threshold. */
@@ -97,6 +155,8 @@ export interface HotKeyStat {
   bufferedDepth: number;
   /** The subscription's configured hotspot threshold. */
   thresholdDepth: number;
+  /** Whether the stream is currently under auto-mitigation (EB-115). */
+  mitigated: boolean;
 }
 
 /** Per-subscriber hotspot monitoring state (see `SubscribeOptions.keyHotspot`). */
@@ -109,6 +169,21 @@ export interface SubscriberKeyHotspotState {
    * depth drops below the threshold.
    */
   alertedKeys: Set<string>;
+  /**
+   * Auto-mitigation config (see `KeyHotspotOptions.autoMitigate`,
+   * EB-115). Absent = detection only (default, backward compatible).
+   */
+  mitigate?: {
+    recoverDepth: number;
+    onHotKeyMitigated?: (event: HotKeyMitigatedEvent) => void;
+  };
+  /**
+   * Epoch-scoped ordering-stream keys (`keyOrderKey`) currently under
+   * auto-mitigation: new out-of-order arrivals for these streams are shed
+   * at fan-out instead of piling onto the reorder buffer, until the depth
+   * drains strictly below `mitigate.recoverDepth`.
+   */
+  mitigatedKeys: Set<string>;
 }
 
 /** How many of the deepest buffers `BusStats.hotKeys` reports. */
@@ -121,7 +196,10 @@ export const DEFAULT_KEY_HOTSPOT_THRESHOLD_DEPTH = 100;
  * Validates `SubscribeOptions.keyHotspot` and builds the initial
  * per-subscriber monitoring state. Returns `undefined` when monitoring is
  * disabled. Throws `RangeError` for a non-positive-integer threshold and
- * `TypeError` for a non-function callback.
+ * `TypeError` for a non-function callback. `autoMitigate` (EB-115) is
+ * validated the same way: `true` enables defaults, an object tunes
+ * `recoverDepth` (non-negative integer `<= thresholdDepth`) and
+ * `onHotKeyMitigated` (function).
  */
 export function resolveKeyHotspotOptions(
   opt: boolean | KeyHotspotOptions | undefined,
@@ -139,5 +217,25 @@ export function resolveKeyHotspotOptions(
   if (onKeyHotspot !== undefined && typeof onKeyHotspot !== 'function') {
     throw new TypeError('keyHotspot.onKeyHotspot must be a function');
   }
-  return { thresholdDepth, onKeyHotspot, alertedKeys: new Set() };
+  const autoMitigate = o.autoMitigate;
+  let mitigate: SubscriberKeyHotspotState['mitigate'];
+  if (autoMitigate !== undefined && autoMitigate !== false) {
+    if (autoMitigate !== true && (typeof autoMitigate !== 'object' || autoMitigate === null)) {
+      throw new TypeError('keyHotspot.autoMitigate must be true or a HotKeyMitigateOptions object');
+    }
+    const m: HotKeyMitigateOptions = autoMitigate === true ? {} : autoMitigate;
+    const recoverDepth = m.recoverDepth ?? thresholdDepth;
+    if (!Number.isInteger(recoverDepth) || recoverDepth < 0) {
+      throw new RangeError('keyHotspot.autoMitigate.recoverDepth must be a non-negative integer');
+    }
+    if (recoverDepth > thresholdDepth) {
+      throw new RangeError('keyHotspot.autoMitigate.recoverDepth must not exceed thresholdDepth');
+    }
+    const onHotKeyMitigated = m.onHotKeyMitigated;
+    if (onHotKeyMitigated !== undefined && typeof onHotKeyMitigated !== 'function') {
+      throw new TypeError('keyHotspot.autoMitigate.onHotKeyMitigated must be a function');
+    }
+    mitigate = { recoverDepth, onHotKeyMitigated };
+  }
+  return { thresholdDepth, onKeyHotspot, alertedKeys: new Set(), mitigate, mitigatedKeys: new Set() };
 }

@@ -897,6 +897,15 @@ export interface SubscribeOptions {
    * semantics). Detection only reads buffer depth: it never mutates the
    * reorder buffer, the per-key expectation, or delivery order.
    *
+   * `autoMitigate` (EB-115) opts the subscription into automatic
+   * mitigation: when a stream's buffer reaches the threshold, the stream
+   * is mitigated — new out-of-order arrivals for that key are shed at
+   * fan-out instead of piling onto the buffer (their keySeqs are marked
+   * skipped so the stream never hangs on the gap), `onHotKeyMitigated`
+   * fires once per engagement, and mitigation releases automatically
+   * once the buffer drains below `recoverDepth`. Other keys are
+   * untouched.
+   *
    * Pass `true` for the defaults (threshold 100, depth reporting with no
    * alerting), or a `KeyHotspotOptions` object to tune the threshold and
    * arm the alert. Invalid values throw `RangeError` / `TypeError` from
@@ -3493,6 +3502,20 @@ export interface BusStats {
    * Monotonic.
    */
   keyedReorderedMessages: number;
+  /**
+   * Total hot-key auto-mitigation engagements (EB-115, see
+   * `SubscribeOptions.keyHotspot`): a (subscriber, key) stream's reorder
+   * buffer reached the hotspot threshold while auto-mitigation was
+   * enabled. Monotonic.
+   */
+  hotKeyMitigations: number;
+  /**
+   * Total keyed messages shed by hot-key auto-mitigation (EB-115):
+   * out-of-order arrivals for a mitigated stream, dropped at fan-out
+   * instead of piling onto its reorder buffer (their keySeqs are marked
+   * skipped so the stream never hangs on the gap). Monotonic.
+   */
+  hotKeyShedMessages: number;
   /**
    * Causal (happens-before) reorder-buffer state (see
    * `SubscribeOptions.causal`). Always present — zeros when no
@@ -7779,6 +7802,18 @@ export class EventBus {
    * publishes). Monotonic.
    */
   private totalKeyedReordered = 0;
+  /**
+   * Hot-key auto-mitigation engagements (EB-115): a (subscriber, key)
+   * stream's reorder buffer reached the hotspot threshold while
+   * auto-mitigation was enabled. Monotonic.
+   */
+  private totalHotKeyMitigations = 0;
+  /**
+   * Keyed messages shed by hot-key auto-mitigation (EB-115): out-of-order
+   * arrivals for a mitigated stream, dropped instead of piling onto its
+   * reorder buffer. Monotonic.
+   */
+  private totalHotKeyShed = 0;
   /**
    * Causal messages dropped from full per-source reorder buffers
    * (drop-oldest anti-deadlock) — the observable count of causal waits
@@ -18561,8 +18596,40 @@ export class EventBus {
           });
         }
       }
+      // EB-115: engage per-key auto-mitigation — once per excursion, while
+      // the stream is not already mitigated. New out-of-order arrivals
+      // for this stream are shed at fan-out (see `deliverKeyed`) instead
+      // of piling onto the reorder buffer.
+      const mitigate = monitor.mitigate;
+      if (mitigate !== undefined && !monitor.mitigatedKeys.has(mapKey)) {
+        monitor.mitigatedKeys.add(mapKey);
+        this.totalHotKeyMitigations += 1;
+        const onHotKeyMitigated = mitigate.onHotKeyMitigated;
+        if (onHotKeyMitigated !== undefined) {
+          const [, key] = splitKeyOrderKey(mapKey);
+          onHotKeyMitigated({
+            subscriberId: subscriber.id,
+            pattern: subscriber.pattern,
+            key,
+            bufferedDepth: depth,
+            thresholdDepth: monitor.thresholdDepth,
+            recoverDepth: mitigate.recoverDepth,
+            at: this.now(),
+          });
+        }
+      }
     } else {
       monitor.alertedKeys.delete(mapKey);
+      // EB-115: release mitigation once the buffer drains strictly below
+      // the recovery threshold — the hysteresis band against flapping.
+      const mitigate = monitor.mitigate;
+      if (
+        mitigate !== undefined &&
+        monitor.mitigatedKeys.has(mapKey) &&
+        depth < mitigate.recoverDepth
+      ) {
+        monitor.mitigatedKeys.delete(mapKey);
+      }
     }
   }
 
@@ -19093,6 +19160,19 @@ export class EventBus {
       return this.admitKeyed(subscriber, delivery);
     }
     if (keySeq > order.expected) {
+      // EB-115: per-key auto-mitigation — a mitigated stream sheds new
+      // out-of-order arrivals at fan-out instead of piling them onto the
+      // reorder buffer. The shed keySeq is marked skipped so the stream's
+      // expectation advances past it and a later cascade never hangs on
+      // the gap (same convention as rate-limiter shed, see `skipKeySeq`);
+      // other keys are untouched. In-order arrivals (keySeq ==
+      // expected) still flow below — they do not grow the pile.
+      const monitor = subscriber.keyHotspot;
+      if (monitor?.mitigate !== undefined && monitor.mitigatedKeys.has(mapKey)) {
+        this.totalHotKeyShed += 1;
+        this.skipKeySeq(subscriber, key, keySeq, delivery.msg.epoch ?? '');
+        return false;
+      }
       order.buffer.set(keySeq, delivery);
       this.totalKeyedReordered += 1;
       // Keyed hotspot sampling (see `SubscribeOptions.keyHotspot`): a pure
@@ -20727,6 +20807,7 @@ export class EventBus {
             key,
             bufferedDepth: depth,
             thresholdDepth: keyHotspot.thresholdDepth,
+            mitigated: keyHotspot.mitigatedKeys.has(mapKey),
           });
         }
       }
@@ -20876,6 +20957,8 @@ export class EventBus {
       lag,
       laggingSubscribers,
       keyedReorderedMessages: this.totalKeyedReordered,
+      hotKeyMitigations: this.totalHotKeyMitigations,
+      hotKeyShedMessages: this.totalHotKeyShed,
       causalBuffer: {
         depth: causalBufferDepth,
         droppedMessages: this.totalCausalDropped,

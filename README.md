@@ -1179,7 +1179,15 @@ library.
   `thresholdDepth` (default 100) fires the callback once per excursion,
   re-arming after the depth drains below the threshold. Detection only reads
   buffer depth — it never mutates the reorder buffer, the per-key
-  expectation, or delivery order. Only monitored subscriptions are sampled;
+  expectation, or delivery order. Opt-in `autoMitigate` turns detection into
+  action: when a stream's buffer reaches the threshold the stream is
+  mitigated — new out-of-order arrivals for that key are shed at fan-out
+  instead of piling onto the buffer (their keySeqs are marked skipped so the
+  stream never hangs on the gap), `onHotKeyMitigated` fires once per
+  engagement, and mitigation releases automatically once the buffer drains
+  below `recoverDepth` (default: the alert threshold). Other keys are
+  untouched; `getStats().hotKeyMitigations` / `.hotKeyShedMessages` count
+  engagements and sheds, and each `hotKeys` entry reports `mitigated`. Only monitored subscriptions are sampled;
   invalid options throw `RangeError`/`TypeError` from `subscribe`. Disabled
   by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
