@@ -3636,3 +3636,42 @@ Semantics:
   `eventbus_circuit_breaker_trips_total`,
   `eventbus_circuit_breakers_open`, and per-topic
   `eventbus_topic_circuit_broken_messages_total{topic}`.
+
+## Credit-based delivery flow control (EB-117)
+
+`bus.grantCredits(subId, n)` gives one subscriber an explicit delivery
+budget — subscriber-driven backpressure for push subscribers, orthogonal
+to `deliveryShaping` (bus-paced rate smoothing, EB-21) and `pull()`
+(consumer-driven long-polling, EB-111). Opt-in: a subscriber that never
+receives a grant has unlimited credit and behaves exactly as before.
+
+```ts
+const sub = bus.subscribe('orders.eu', handle, {
+  onCreditExhausted: (e) => alert(`${e.subscriberId} out of credit, ${e.pendingMessages} queued`),
+});
+bus.grantCredits(sub.id, 100); // returns the new balance (100)
+```
+
+Semantics:
+
+- **One credit per delivery.** The bus delivers only while the balance
+  is positive; each delivered message consumes 1. Batch deliveries
+  (`SubscribeOptions.batch`) consume per message, like shaping's
+  one-token-per-message take.
+- **Exhaustion pauses, never drops.** At zero credit the drain holds
+  the subscriber back — the backlog keeps accumulating under its normal
+  backpressure policy — and `onCreditExhausted` fires once per episode
+  (edge-triggered latch, `{ subscriberId, pattern, pendingMessages }`).
+  Granting more credit re-arms the latch and schedules a flush, so the
+  preserved backlog resumes automatically, in order.
+- **Durable-log replay walks an independent budget.** Replayed messages
+  never consume credit (they don't even count against the drain's
+  credit bound), so a resume never wedges behind an exhausted
+  subscriber — while FIFO order with live messages is preserved.
+- **Validation.** `n` must be a positive integer (`RangeError`
+  otherwise); unknown subscriber ids throw, matching
+  `pauseSubscriber` / `resumeSubscriber`.
+
+`getStats().creditExhaustedSubscribers` counts live exhausted
+subscriptions and the Prometheus exposition carries
+`eventbus_credit_exhausted_subscribers`.

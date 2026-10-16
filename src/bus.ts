@@ -661,6 +661,17 @@ export interface SubscribeOptions {
    */
   onThrottled?: (event: ThrottleEvent) => void;
   /**
+   * Called when this subscriber's delivery credit is exhausted (see
+   * `EventBus.grantCredits`, EB-117): the balance reached zero through
+   * deliveries, so delivery pauses — the backlog stays queued under the
+   * subscriber's normal backpressure policy, nothing is dropped — until
+   * more credit is granted. Edge-triggered: fires once per exhaustion
+   * episode and re-arms on the next `grantCredits` call. Disabled by
+   * default — without `grantCredits` the subscriber has unlimited
+   * credit and this callback never fires.
+   */
+  onCreditExhausted?: (event: CreditExhaustedEvent) => void;
+  /**
    * Opt-in delivery-side rate shaping for a slow downstream consumer. When
    * enabled, the bus delivers at most `messagesPerSec` messages per second
    * to this subscriber (token bucket, first `burst` messages go at once);
@@ -1779,6 +1790,26 @@ export interface ThrottleEvent {
    * the configured initial rate applies.
    */
   adapted: boolean;
+}
+
+/**
+ * Snapshot delivered to `SubscribeOptions.onCreditExhausted` when a
+ * subscriber's delivery credit is exhausted (EB-117): the balance
+ * reached zero through deliveries, so delivery pauses until
+ * `grantCredits` tops it up. Fires once per exhaustion episode
+ * (edge-triggered); the latch re-arms on the next grant.
+ */
+export interface CreditExhaustedEvent {
+  /** The subscriber whose credit balance reached zero. */
+  subscriberId: string;
+  /** The topic pattern the subscriber registered. */
+  pattern: string;
+  /**
+   * Messages preserved in the subscriber's queue when the credit ran
+   * out — nothing was dropped by the exhaustion itself, and granting
+   * credit resumes them in order.
+   */
+  pendingMessages: number;
 }
 
 /**
@@ -3444,6 +3475,14 @@ export interface BusStats {
    */
   shapedSubscribers: number;
   /**
+   * Subscriptions currently out of delivery credit (see
+   * `EventBus.grantCredits`, EB-117): the balance reached zero through
+   * deliveries, so delivery is held — the backlog stays queued under
+   * the subscriber's normal backpressure policy — until more credit is
+   * granted.
+   */
+  creditExhaustedSubscribers: number;
+  /**
    * Subscriptions currently in their slow-start ramp (see
    * `SubscribeOptions.slowStart`): the ramp window has not elapsed yet,
    * so delivery is still paced below the subscriber's full speed. Once
@@ -4215,6 +4254,12 @@ interface Subscriber {
   /** Fired once when adaptive throttling engages for this subscriber. */
   onThrottled?: (event: ThrottleEvent) => void;
   /**
+   * Fired once per credit-exhaustion episode (see
+   * `SubscribeOptions.onCreditExhausted`, EB-117): edge-triggered, the
+   * latch re-arms on the next `grantCredits` call.
+   */
+  onCreditExhausted?: (event: CreditExhaustedEvent) => void;
+  /**
    * Delivery-side rate shaping state (see `SubscribeOptions.deliveryShaping`).
    * Absent when shaping is disabled for this subscriber.
    */
@@ -4415,6 +4460,16 @@ interface Subscriber {
   /** Operator-supplied reason recorded at `pauseSubscriber` time. */
   manuallyPausedReason?: string;
   /**
+   * Credit-based pull-style flow control (see `EventBus.grantCredits`,
+   * EB-117). Opt-in: absent means the subscriber has unlimited delivery
+   * credit — zero behavior change until the first `grantCredits` call
+   * creates it. While present, each delivery consumes one credit and the
+   * drain holds messages back when the balance is zero; granting credit
+   * re-arms the exhaustion latch and schedules a flush so the preserved
+   * backlog resumes in order.
+   */
+  credits?: SubscriberCreditState;
+  /**
    * Subscription migration (EB-82): the outermost unsubscribe closure
    * for this subscription — the plain `subscribe` closure, replaced by
    * the subscribe-family wrappers (`subscribeReliable`) with their
@@ -4446,6 +4501,24 @@ interface Subscriber {
    * subscription received no retained snapshot.
    */
   retainedDelivered?: Map<string, number>;
+}
+
+/**
+ * One subscriber's credit-based flow-control state (see
+ * `EventBus.grantCredits`, EB-117). Created by the first `grantCredits`
+ * call — before that the subscriber is unlimited and pays only the
+ * `credits == null` check per drain.
+ */
+interface SubscriberCreditState {
+  /** Remaining delivery credit; each non-replay delivery consumes 1. */
+  balance: number;
+  /**
+   * Edge-triggered latch for `onCreditExhausted`: set when the balance
+   * reaches zero through deliveries, cleared by every `grantCredits`
+   * call so the next exhaustion episode fires again. Also the
+   * `getStats().creditExhaustedSubscribers` membership flag.
+   */
+  exhaustedLatch: boolean;
 }
 
 /**
@@ -8541,6 +8614,15 @@ export class EventBus {
    */
   private compressedPayloads = new WeakSet<BusMessage>();
   /**
+   * Messages admitted by durable-log replay (`admitReplayRecords`,
+   * EB-117). Replays walk an independent delivery budget: they never
+   * consume subscriber delivery credit, so the credit-bounded drain
+   * counts only non-replay messages against the balance and
+   * `consumeDeliveryCredit` skips these. Live messages are never
+   * registered here; entries die with their message (WeakSet).
+   */
+  private replayCreditBypass = new WeakSet<BusMessage>();
+  /**
    * Messages carrying a binary (raw-bytes) payload (EB-92). Registered
    * by the publish path when `PublishOptions.binary` is set, and by
    * replay when the log record is a v2 line. Bus-side, like
@@ -11768,6 +11850,7 @@ export class EventBus {
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
     const onThrottled = opts?.onThrottled;
+    const onCreditExhausted = opts?.onCreditExhausted;
     const hwmRatio = opts?.highWaterMarkRatio ?? 0.8;
     const throttle = resolveThrottleOptions(opts?.throttle, capacity, hwmRatio, this.now);
     // Validated before anything registers, so a throw leaves no
@@ -11976,6 +12059,10 @@ export class EventBus {
       lastEpoch: new Map(),
       throttle,
       onThrottled,
+      // Credit-based flow control (EB-117): the subscriber starts
+      // unlimited — `grantCredits` creates the credit state on first
+      // use, so a never-granted subscriber pays nothing for it.
+      onCreditExhausted,
       deliveryShaping,
       slowStart,
       maxInflight: maxInflight == null ? undefined : { max: maxInflight, inFlight: 0 },
@@ -12465,7 +12552,6 @@ export class EventBus {
     this.scheduleFlush();
     return true;
   }
-
   /**
    * Subscription migration (EB-82): point-in-time backlog reading for
    * one subscriber. `unackedCount` is passed in because an export
@@ -15692,6 +15778,12 @@ export class EventBus {
           };
         }
         if (rec.expiresAt !== undefined) this.messageDeadlines.set(msg, rec.expiresAt);
+        // Credit-based flow control (EB-117): replayed messages walk an
+        // independent budget — they never consume subscriber delivery
+        // credit. Registered here, once, so every replay path
+        // (`resumeFromSeq` / `resumeFromTime` / partition migration)
+        // shares the bypass.
+        this.replayCreditBypass.add(msg);
         // Subscriber-side signature verification (EB-84) applies to replay
         // exactly as to live fan-out: a replayed message that fails
         // verification is dropped — never queued, never delivered —
@@ -21021,6 +21113,7 @@ export class EventBus {
     let degradedSubscribers = 0;
     let pausedSubscribers = 0;
     let shapedSubscribers = 0;
+    let creditExhaustedSubscribers = 0;
     let rampingSubscribers = 0;
     let migratingSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
@@ -21043,6 +21136,7 @@ export class EventBus {
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.manuallyPaused === true) pausedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
+      if (subscriber.credits?.exhaustedLatch === true) creditExhaustedSubscribers += 1;
       const slowStart = subscriber.slowStart;
       if (slowStart !== undefined && !slowStart.isComplete(ratesNow)) rampingSubscribers += 1;
       // Shadow mirror counters (see `SubscribeOptions.shadow`): the
@@ -21309,6 +21403,7 @@ export class EventBus {
       degradedSubscribers,
       pausedSubscribers,
       shapedSubscribers,
+      creditExhaustedSubscribers,
       rampingSubscribers,
       rateLimitedWaiting,
       inFlightUsage,
@@ -21878,6 +21973,83 @@ export class EventBus {
   }
 
   /**
+   * Grants delivery credit to one subscriber (EB-117): credit-based
+   * pull-style flow control for push subscribers, orthogonal to
+   * `deliveryShaping` (rate pacing) and `pull()` (consumer-driven
+   * polling). Opt-in — a subscriber that never receives a grant has
+   * unlimited credit and behaves exactly as before.
+   *
+   * The bus delivers to the subscriber only while the balance is
+   * positive; each delivered message consumes 1 credit (replayed
+   * durable-log messages walk an independent budget and consume
+   * nothing). When the balance reaches zero through deliveries,
+   * delivery pauses — the backlog stays queued under the subscriber's
+   * normal backpressure policy, nothing is dropped — and
+   * `onCreditExhausted` fires once (edge-triggered). Granting more
+   * credit re-arms the latch and schedules a flush so the preserved
+   * backlog resumes promptly, in order.
+   *
+   * Returns the subscriber's new credit balance. Throws on an unknown
+   * subscriber id; `n` must be a positive integer (`RangeError`
+   * otherwise), and the grant must not overflow the balance.
+   */
+  grantCredits(subId: string, n: number): number {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new RangeError('grantCredits: n must be a positive integer');
+    }
+    let credits = subscriber.credits;
+    if (credits === undefined) {
+      credits = subscriber.credits = { balance: 0, exhaustedLatch: false };
+    }
+    if (credits.balance > Number.MAX_SAFE_INTEGER - n) {
+      throw new RangeError('grantCredits: credit balance would overflow');
+    }
+    credits.balance += n;
+    // Re-arm the exhaustion latch: this grant starts a new episode, so
+    // the next time the balance hits zero the callback fires again.
+    credits.exhaustedLatch = false;
+    this.scheduleFlush();
+    return credits.balance;
+  }
+
+  /**
+   * Consumes one delivery credit for a message handed to a subscriber's
+   * handler (EB-117). Durable-log replay deliveries are registered in
+   * `replayCreditBypass` and consume nothing — replay walks its own
+   * budget. A live delivery that empties the balance trips the
+   * edge-triggered `onCreditExhausted` latch.
+   */
+  private consumeDeliveryCredit(subscriber: Subscriber, msg: BusMessage): void {
+    const credits = subscriber.credits;
+    if (credits === undefined || this.replayCreditBypass.has(msg)) return;
+    credits.balance -= 1;
+    if (credits.balance === 0) this.fireCreditExhausted(subscriber);
+  }
+
+  /** True when the message is a credit-bypass replay delivery (EB-117). */
+  private isReplayBypass(msg: BusMessage | undefined): boolean {
+    return msg !== undefined && this.replayCreditBypass.has(msg);
+  }
+
+  /**
+   * Fires `onCreditExhausted` once per exhaustion episode (EB-117):
+   * edge-triggered on the balance reaching zero through deliveries; the
+   * latch re-arms on the next `grantCredits` call.
+   */
+  private fireCreditExhausted(subscriber: Subscriber): void {
+    const credits = subscriber.credits;
+    if (credits == null || credits.exhaustedLatch) return;
+    credits.exhaustedLatch = true;
+    subscriber.onCreditExhausted?.({
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      pendingMessages: subscriber.queue.size,
+    });
+  }
+
+  /**
    * Point-in-time health snapshot for one subscriber (see
    * `SubscribeOptions.healthProbe`). `enabled` is false and the counters
    * are 0 when the probe is not enabled for the subscriber. Throws on an
@@ -22254,9 +22426,16 @@ export class EventBus {
         maxInflight == null ? Infinity : Math.max(0, maxInflight.max - maxInflight.inFlight);
       const slowStartMaxLive =
         slowStart == null ? Infinity : Math.floor(slowStart.availableTokens(nowMs));
+      // Credit-based flow control (EB-117): the drain dequeues at most
+      // the credit balance — replayed messages walk the independent
+      // replay budget, so they neither consume credit nor count against
+      // it, while FIFO order is preserved.
+      const credits = subscriber.credits;
+      const creditBudget = credits == null ? Infinity : Math.max(0, credits.balance);
       const { live, expired } = subscriber.queue.drainLiveUpTo(
         nowMs,
-        Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive, slowStartMaxLive),
+        Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive, slowStartMaxLive, creditBudget),
+        credits == null ? undefined : (msg) => !this.isReplayBypass(msg),
       );
       for (const msg of expired) {
         this.recordExpired(msg.topic);
@@ -22275,6 +22454,10 @@ export class EventBus {
           // take: dequeued-but-expired messages never reach this loop, so
           // TTL expiry consumes no window budget.
           rateLimit?.limiter.record(nowMs);
+          // Credit-based flow control (EB-117): one credit per delivered
+          // message — guaranteed affordable, the drain above dequeued at
+          // most the balance (replay deliveries consume nothing).
+          this.consumeDeliveryCredit(subscriber, msg);
           // Compressed payloads are inflated here — once per message, before
           // any handler sees it — so every subscriber transparently receives
           // the original payload. See `inflateMessagePayload` for the
@@ -22327,6 +22510,11 @@ export class EventBus {
           shaping?.bucket.take();
           slowStart?.take(nowMs);
           rateLimit?.limiter.record(nowMs);
+          // Credit-based flow control (EB-117): consumed per attempted
+          // delivery, mirroring the shaping take — messages requeued by a
+          // mid-drain health trip were never attempted and keep their
+          // credit.
+          this.consumeDeliveryCredit(subscriber, live[i]);
           this.inflateMessagePayload(live[i]);
           this.invokeWithInflightSlot(subscriber, (): unknown =>
             this.deliverWithHealth(subscriber, live[i], nowMs),
@@ -22409,11 +22597,45 @@ export class EventBus {
       rateLimit == null ? Infinity : Math.max(0, rateLimit.limiter.budget(nowMs) - batch.pending.length);
     const slowStartBudget =
       slowStart == null ? Infinity : Math.floor(slowStart.availableTokens(nowMs));
-    const budget = Math.min(shapingBudget, rateLimitBudget, slowStartBudget);
-    if (budget >= 1) {
-      const room = batch.maxSize - batch.pending.length;
+    // Credit-based flow control (EB-117): pending messages already
+    // reserve credit (consumed per message at hand-off in deliverBatch),
+    // so collection must not exceed what is still free — otherwise a
+    // batch filled across several rounds could over-deliver the credit
+    // before any delivery is consumed. Replay-marked messages walk the
+    // independent replay budget: they never consume credit, so they
+    // don't count against it.
+    const credits = subscriber.credits;
+    let pendingCredit = 0;
+    if (credits !== undefined) {
+      for (const msg of batch.pending) {
+        if (!this.isReplayBypass(msg)) pendingCredit += 1;
+      }
+    }
+    const creditBudget = credits == null ? Infinity : Math.max(0, credits.balance - pendingCredit);
+    const budget = Math.min(shapingBudget, rateLimitBudget, slowStartBudget, creditBudget);
+    const room = batch.maxSize - batch.pending.length;
+    // With zero balance only replay-marked messages may flow: collect
+    // them even though the credit budget is 0, so a replay never wedges
+    // behind an exhausted subscriber — but only when credit is the
+    // binding constraint, so shaping/rate-limit/slow-start holdbacks
+    // keep their bookkeeping in the branch below. FIFO order is
+    // preserved: the predicate drain stops at the first
+    // credit-consuming message.
+    const creditFreeFlow =
+      credits !== undefined &&
+      credits.balance === 0 &&
+      room > 0 &&
+      shapingBudget >= 1 &&
+      rateLimitBudget >= 1 &&
+      slowStartBudget >= 1 &&
+      this.isReplayBypass(subscriber.queue.peekOldest());
+    if (budget >= 1 || creditFreeFlow) {
       if (room > 0) {
-        const { live, expired } = subscriber.queue.drainLiveUpTo(nowMs, Math.min(room, budget));
+        const { live, expired } = subscriber.queue.drainLiveUpTo(
+          nowMs,
+          Math.min(room, budget),
+          credits == null ? undefined : (msg) => !this.isReplayBypass(msg),
+        );
         for (const msg of expired) {
           this.recordExpired(msg.topic);
         }
@@ -22514,6 +22736,16 @@ export class EventBus {
     const rateLimit = subscriber.rateLimit;
     if (rateLimit != null) {
       for (let i = 0; i < live.length; i += 1) rateLimit.limiter.record(nowMs);
+    }
+    // Credit-based flow control (EB-117): the whole batch consumes one
+    // credit per delivered message, mirroring the shaping take above —
+    // replay-marked messages walk the independent replay budget and
+    // consume nothing. Collection was bounded by the balance (minus
+    // already-collected pending), and only grants add credit between
+    // collection and hand-off, so the balance cannot go negative.
+    const credits = subscriber.credits;
+    if (credits !== undefined) {
+      for (const msg of live) this.consumeDeliveryCredit(subscriber, msg);
     }
     for (const msg of live) {
       this.inflateMessagePayload(msg);

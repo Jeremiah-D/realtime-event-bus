@@ -97,6 +97,9 @@
  *   operator (see `EventBus.pauseSubscriber`, EB-113).
  * - `eventbus_shaped_subscribers`: subscriptions held back by
  *   delivery-side rate shaping.
+ * - `eventbus_credit_exhausted_subscribers`: subscriptions out of
+ *   delivery credit (EB-117) — delivery held until more credit is
+ *   granted.
  * - `eventbus_pending_delayed`: delayed messages scheduled but not yet
  *   due.
  * - `eventbus_paused_topics`: currently active topic-pause rules (EB-88).
@@ -422,6 +425,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_shaped_subscribers',
     'Subscriptions currently held back by delivery-side rate shaping.',
     stats.shapedSubscribers,
+  );
+  gauge(
+    'eventbus_credit_exhausted_subscribers',
+    'Subscriptions currently out of delivery credit (EB-117): the balance reached zero through deliveries, so delivery is held — the backlog stays queued under the normal backpressure policy — until more credit is granted via grantCredits.',
+    stats.creditExhaustedSubscribers ?? 0,
   );
   gauge(
     'eventbus_pending_delayed',

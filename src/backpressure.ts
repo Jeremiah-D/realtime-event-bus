@@ -316,21 +316,35 @@ export class BoundedQueue<T> {
    * this pass; they are evaluated when a later drain reaches them. Used by
    * delivery-side rate shaping to dequeue only what the subscriber's token
    * budget allows in one round.
+   *
+   * `countAgainstBudget`, when given, marks which dequeued entries count
+   * against `maxLive`: an entry for which it returns false flows through
+   * freely (EB-117 credit bypass for durable-log replay — replay walks an
+   * independent budget, so it never consumes credit but still respects
+   * FIFO order and the expiry sweep). Expiry is always evaluated for
+   * every entry, budget or not.
    */
-  drainLiveUpTo(nowMs: number, maxLive: number): { live: T[]; expired: T[] } {
+  drainLiveUpTo(
+    nowMs: number,
+    maxLive: number,
+    countAgainstBudget?: (item: T) => boolean,
+  ): { live: T[]; expired: T[] } {
     const live: T[] = [];
     const expired: T[] = [];
     const rest: QueueEntry<T>[] = [];
     let removedBytes = 0;
+    let counted = 0;
     for (const entry of this.entries) {
       if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) {
         expired.push(entry.item);
         removedBytes += entry.bytes;
         continue;
       }
-      if (live.length < maxLive) {
+      const counts = countAgainstBudget === undefined || countAgainstBudget(entry.item);
+      if (!counts || counted < maxLive) {
         live.push(entry.item);
         removedBytes += entry.bytes;
+        if (counts) counted += 1;
       } else {
         rest.push(entry);
       }
