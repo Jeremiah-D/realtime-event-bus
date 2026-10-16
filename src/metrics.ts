@@ -521,6 +521,31 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_subscriber_processing_latency_p99{${labels}} ${s.p99Ms}`);
   }
 
+  // Per-subscriber nack-reason counters (EB-129): one series per
+  // (subscriber, reason) with a non-zero count, in subscription order
+  // (same as BusStats.nackReasons). Zero-count classes emit no series,
+  // and reliable subscribers with zero counts emit none at all, so
+  // cardinality stays proportional to actual redelivery activity.
+  // Diagnostic only — orthogonal to the EB-18 health probe. The `?? []`
+  // keeps the renderer tolerant of a stats object that predates the
+  // field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_nack_reasons_total Total redeliveries per reliable subscriber, classified by trigger: handler_throw (the handler threw synchronously), explicit_nack (the consumer called nack()/nackBatch()), ack_timeout (the ack-timeout timer requeued the delivery). Diagnostic only — orthogonal to the EB-18 health probe.',
+  );
+  lines.push('# TYPE eventbus_nack_reasons_total counter');
+  for (const s of stats.nackReasons ?? []) {
+    const labels = `subscriber="${escapeLabelValue(s.subscriberId)}"`;
+    if (s.handlerThrow > 0) {
+      lines.push(`eventbus_nack_reasons_total{${labels},reason="handler_throw"} ${s.handlerThrow}`);
+    }
+    if (s.explicitNack > 0) {
+      lines.push(`eventbus_nack_reasons_total{${labels},reason="explicit_nack"} ${s.explicitNack}`);
+    }
+    if (s.ackTimeout > 0) {
+      lines.push(`eventbus_nack_reasons_total{${labels},reason="ack_timeout"} ${s.ackTimeout}`);
+    }
+  }
+
   // Per-subscriber lag watermark series (only subscriptions with
   // `lagMonitor` enabled), in subscription order (same as BusStats.lag).
   // The `?? []` keeps the renderer tolerant of a stats object that

@@ -3815,6 +3815,25 @@ export interface BusStats {
    */
   nackBatches: number;
   /**
+   * Per-subscriber nack-reason aggregation (EB-129): one row per reliable
+   * subscription with at least one counted redelivery, in subscription
+   * order. Each redelivery increments exactly one of `handlerThrow`
+   * (the handler threw synchronously, driving the redelivery),
+   * `explicitNack` (the consumer called `nack()` / `nackBatch()` with no
+   * throw recorded), or `ackTimeout` (the ack-timeout timer requeued the
+   * delivery). Reliable subscriptions with zero counts and all plain
+   * subscriptions are omitted — this bounds the row count. Counters are
+   * cumulative and never decremented. Diagnostic only: orthogonal to
+   * the EB-18 health probe, counting never triggers degradation.
+   */
+  nackReasons: Array<{
+    subscriberId: string;
+    pattern: string;
+    handlerThrow: number;
+    explicitNack: number;
+    ackTimeout: number;
+  }>;
+  /**
    * Total DLQ diagnostic events admitted to their diagnostic topic (see
    * `DeadLetterOptions.diagnosticTopic`). Counted on admission, not
    * delivery — the event exists even when nothing subscribes to the
@@ -4593,6 +4612,21 @@ interface DrainState {
   onComplete: () => void;
 }
 
+/**
+ * Per-subscriber nack-reason diagnostic counters (EB-129): the
+ * cumulative, mutually-exclusive classification of every redelivery a
+ * reliable subscriber has seen — each redelivery increments exactly one
+ * of the three.
+ */
+export interface NackReasonCounts {
+  /** Handler threw synchronously, driving the redelivery. */
+  handler_throw: number;
+  /** Consumer called `nack()` / `nackBatch()` with no throw recorded. */
+  explicit_nack: number;
+  /** The ack-timeout timer requeued the delivery. */
+  ack_timeout: number;
+}
+
 interface Subscriber {
   id: string;
   pattern: string;
@@ -4639,6 +4673,19 @@ interface Subscriber {
   blockedCount: number;
   /** The queue's count capacity, for saturation checks at enqueue time. */
   queueCapacity: number;
+  /**
+   * Per-subscriber nack-reason diagnostic counters (EB-129). Present only
+   * for reliable subscriptions — plain subscriptions never carry them.
+   * Each redelivery increments exactly one of the three counters:
+   * `handler_throw` (the handler threw synchronously, driving the
+   * redelivery), `explicit_nack` (the consumer called `nack()` /
+   * `nackBatch()` with no throw recorded), or `ack_timeout` (the
+   * ack-timeout timer requeued the delivery). Cumulative and
+   * never decremented, like the other bus counters. Diagnostic only:
+   * orthogonal to the EB-18 health probe — counting never degrades,
+   * pauses, or fires callbacks.
+   */
+  nackReasons?: NackReasonCounts;
   /**
    * Present for reliable subscriptions: at-least-once delivery state.
    * `redeliveries` counts, per message, how many times this subscriber has
@@ -14397,6 +14444,26 @@ export class EventBus {
         const thrown = lastFailure.get(msg);
         lastFailure.delete(msg);
         const lastError = thrown ?? reason;
+        // EB-129: nack-reason aggregation — classify this redelivery
+        // into exactly one of the three mutually-exclusive classes. A
+        // redelivery whose handler threw counts as handler_throw (even
+        // though it requeues through nack()); an explicit delivery.nack()
+        // with no throw record counts as explicit_nack; the tracker's
+        // ack-timeout requeue counts as ack_timeout. Diagnostic only —
+        // orthogonal to the EB-18 health probe: this never degrades,
+        // pauses, or fires callbacks. The counters live on the reliable
+        // subscriber's record, cumulative, never decremented. A
+        // dead-lettering below is the *result* of this redelivery, not a
+        // separate count — it still counts once here. Redeliveries during
+        // an EB-128 graceful drain count normally; no special casing.
+        const nackClass: keyof NackReasonCounts =
+          thrown !== undefined
+            ? 'handler_throw'
+            : reason === 'nack'
+              ? 'explicit_nack'
+              : 'ack_timeout';
+        const nackReasons = subscriber.nackReasons;
+        if (nackReasons !== undefined) nackReasons[nackClass] += 1;
         // The redelivery budget is exhausted: the message is poison
         // (repeated nacks, ack timeouts, or a handler that keeps throwing
         // and never settles). Dead-letter it instead of requeueing
@@ -14421,6 +14488,9 @@ export class EventBus {
       },
     });
     subscriber.reliable = { tracker, redeliveries, lastFailure, batchHandles, liveDeliveries };
+    // EB-129: allocate the per-subscriber nack-reason counters — only
+    // reliable subscriptions carry them; plain subscriptions never do.
+    subscriber.nackReasons = { handler_throw: 0, explicit_nack: 0, ack_timeout: 0 };
     if (dlq != null) {
       subscriber.deadLetter = { entries: [], nextSeq: 0, ...dlq };
     }
@@ -23477,6 +23547,7 @@ export class EventBus {
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const inFlightUsage: BusStats['inFlightUsage'] = [];
+    const nackReasons: BusStats['nackReasons'] = [];
     const shadows: BusStats['shadows'] = [];
     const replayProgress: BusStats['replayProgress'] = [];
     const hotKeys: HotKeyStat[] = [];
@@ -23556,6 +23627,23 @@ export class EventBus {
           pattern: subscriber.pattern,
           maxInflight: inflight.max,
           inFlight: inflight.inFlight,
+        });
+      }
+      // Nack-reason aggregation (EB-129): one row per reliable subscriber
+      // with at least one counted redelivery, in subscription order.
+      // Zero rows are omitted to bound the row count; plain subscribers
+      // never carry the counters, so they never appear.
+      const nr = subscriber.nackReasons;
+      if (
+        nr !== undefined &&
+        (nr.handler_throw > 0 || nr.explicit_nack > 0 || nr.ack_timeout > 0)
+      ) {
+        nackReasons.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          handlerThrow: nr.handler_throw,
+          explicitNack: nr.explicit_nack,
+          ackTimeout: nr.ack_timeout,
         });
       }
       const latency = subscriber.latency;
@@ -23774,6 +23862,7 @@ export class EventBus {
       rampingSubscribers,
       rateLimitedWaiting,
       inFlightUsage,
+      nackReasons,
       pendingDelayed: this.delayedById.size,
       recurringJobs: {
         active: [...this.recurringById.values()].filter((j) => !j.dormant).length,

@@ -584,6 +584,22 @@ library.
   per-subscriber state. Invalid probe options throw `RangeError` from
   `subscribe`. Disabled by default — a throwing handler behaves exactly as
   before unless a subscriber opts in.
+- **Nack-reason aggregation** (in `src/bus.ts` + `src/metrics.ts`, always
+  on for reliable subscriptions): every redelivery is classified into
+  exactly one of three mutually-exclusive triggers — `handler_throw` (the
+  handler threw synchronously, driving the redelivery),
+  `explicit_nack` (the consumer called `nack()` / `nackBatch()` with no
+  throw recorded), or `ack_timeout` (the ack-timeout timer requeued the
+  delivery). The per-subscriber counters live on the reliable
+  subscription's record, are cumulative and never decremented, and never
+  appear on plain subscriptions. `getStats().nackReasons` emits one row
+  per reliable subscriber with a non-zero count
+  (`{ subscriberId, pattern, handlerThrow, explicitNack, ackTimeout }` —
+  zero rows omitted to bound cardinality), and `src/metrics.ts` renders
+  `eventbus_nack_reasons_total{subscriber,reason}` (one series per
+  non-zero class). Diagnostic only: it is orthogonal to subscriber health
+  probing above — counting never degrades, pauses, or fires callbacks,
+  and redeliveries during an unsubscribe drain count normally.
 - **Subscription leases** (in `src/lease.ts`, opt-in via
   `subscribe(..., { leaseMs })`): a lifetime bound on a subscription — when
   the lease expires, the bus unsubscribes the subscriber automatically,
@@ -3045,6 +3061,7 @@ Exported series:
 | `eventbus_group_lag_messages{group,topic}` | gauge | consumer-group lag per (group, topic): assigned seq minus consumer checkpoint, excluding live handoff-linger holds |
 | `eventbus_group_partition_lag_messages{group,topic,partition}` | gauge | per-partition consumer-group lag for partitioned groups |
 | `eventbus_publisher_published_messages_total{publisher}` | counter | admitted publishes per publisher identity (`PublishOptions.publisherId`); only emitted when at least one publisher has admitted a publish |
+| `eventbus_nack_reasons_total{subscriber,reason}` | counter | per-subscriber redelivery counts by trigger (`reason` = `handler_throw` / `explicit_nack` / `ack_timeout`); one series per non-zero class, so `getStats().nackReasons` rows with zero counts emit nothing (EB-129) |
 
 The per-publisher series grow with the distinct publisher identities ever
 admitted — the same bound as `BusStats.publishers` — so a bus admitting
