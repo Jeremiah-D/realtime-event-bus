@@ -183,6 +183,10 @@ import {
   type TopicSigningKeysConfig,
 } from './signing.ts';
 import {
+  compileFilterExpression,
+  type CompiledFilterExpression,
+} from './filterexpr.ts';
+import {
   ChaosInjectionError,
   resolveChaosOptions,
   type ChaosFaultType,
@@ -265,6 +269,8 @@ export type {
   TopicSigningKeysConfig,
 } from './signing.ts';
 export { assertValidSigningKeys, SIGNING_KID_PATTERN, SIGNATURE_HEX_LENGTH } from './signing.ts';
+export { compileFilterExpression } from './filterexpr.ts';
+export type { CompiledFilterExpression, FilterOperator, FilterPathSegment } from './filterexpr.ts';
 
 export interface BusMessage {
   topic: string;
@@ -1073,6 +1079,37 @@ export interface SubscribeOptions {
    * from `subscribe`. Disabled by default.
    */
   filter?: MessageFilter;
+  /**
+   * Opt-in declarative subscription filter expression (EB-123): a
+   * compile-time-checked predicate over the message payload, e.g.
+   * `type == "trade" && price > 100 && exists(user.id)`. Compiled once
+   * at subscribe time — an illegal expression (syntax error, unknown
+   * operator, invalid regex) throws `RangeError` from `subscribe`, so a
+   * bad expression can never half-register a subscriber. A non-string
+   * value throws `TypeError`.
+   *
+   * Evaluated at fan-out, after the `filter` predicate and before
+   * composite patterns: both must accept for the message to be queued
+   * (`filter` and `filterExpr` compose with AND). A rejected message is
+   * never queued — it consumes no backpressure budget, burns no
+   * adaptive-throttle token, never counts as a sequence gap (the
+   * per-topic baseline advances over it, exactly like a `filter`
+   * rejection), never consumes delivery credit (credit is spent at
+   * drain time, and a filtered message never reaches the drain), and
+   * never creates an ack obligation on reliable subscriptions (ack
+   * tracking starts at delivery, which never happens). Rejections count
+   * into `getStats().filteredMessages`, like `filter` rejections.
+   *
+   * Applies to live fan-out, durable-log replay (`resumeFromSeq` /
+   * `resumeFromTime`), the retained snapshot, and shadow mirrors
+   * (uncounted there, like `filter`). Unlike `filter`, evaluation never
+   * throws: a missing field, a type mismatch, or a non-object payload
+   * simply fails the predicate. See `src/filterexpr.ts` for the
+   * grammar and the full operator table.
+   *
+   * Disabled by default.
+   */
+  filterExpr?: string;
   /**
    * Opt-in envelope signature verification (EB-84, backend security).
    * When true, every message fanned out to this subscriber is checked
@@ -4491,6 +4528,15 @@ interface Subscriber {
    * Absent when the subscriber has no filter.
    */
   filter?: MessageFilter;
+  /**
+   * Compiled subscription filter expression (see
+   * `SubscribeOptions.filterExpr`, EB-123). Absent when the subscriber
+   * has no expression filter. Compiled once at subscribe time; every
+   * fan-out path (live delivery, durable-log replay, retained snapshot,
+   * shadow mirror) evaluates it right after the predicate `filter` —
+   * both must accept for the message to be queued.
+   */
+  filterExpr?: CompiledFilterExpression;
   /**
    * Opt-in envelope signature verification (see
    * `SubscribeOptions.verifySignature`, EB-84). False by default — a
@@ -12242,6 +12288,19 @@ export class EventBus {
     if (filter !== undefined && typeof filter !== 'function') {
       throw new TypeError('filter must be a function');
     }
+    // Declarative filter expression (EB-123): compiled here — an
+    // illegal expression throws RangeError from subscribe, before
+    // anything registers, so a throw leaves no half-registered
+    // subscriber behind. Compiled once per subscription; every fan-out
+    // path shares the compiled form.
+    const filterExprSource = opts?.filterExpr;
+    let filterExpr: CompiledFilterExpression | undefined;
+    if (filterExprSource !== undefined) {
+      if (typeof filterExprSource !== 'string') {
+        throw new TypeError('filterExpr must be a string');
+      }
+      filterExpr = compileFilterExpression(filterExprSource);
+    }
     // Envelope signature verification (EB-84): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const verifySignature = opts?.verifySignature ?? false;
@@ -12412,6 +12471,10 @@ export class EventBus {
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
       filter,
+      // Declarative filter expression (EB-123): the compiled form is
+      // stored on the subscriber and evaluated at fan-out, right after
+      // the predicate filter (see deliverUnkeyed / deliverShadow).
+      filterExpr,
       // Envelope signature verification (EB-84): opt-in integrity check
       // at the publish side — a failed check drops the message before
       // any content processing, counted and audited. False by default:
@@ -15941,6 +16004,7 @@ export class EventBus {
       }
     }
     const filter = subscriber.filter;
+    const filterExpr = subscriber.filterExpr;
     try {
       for (const rec of records) {
         // A subscriber content filter applies to replay exactly as it does
@@ -15951,7 +16015,7 @@ export class EventBus {
         // filter judges the raw application payload. A dictionary-compressed
         // record resolves its bytes from the registry here; an unregistered
         // dictionary fails loudly rather than judging garbage.
-        if (filter !== undefined) {
+        if (filter !== undefined || filterExpr !== undefined) {
           // The log holds the wire payload — resolve a binary record's
           // v2 bytes first (a binary+compressed record's bytes encode
           // the envelope), then inflate a compressed envelope so the
@@ -15961,7 +16025,7 @@ export class EventBus {
           const rawPayload = isCompressedPayload(wirePayload)
             ? this.inflateReplayEnvelope(wirePayload, rec)
             : wirePayload;
-          if (!filter(rawPayload, rec.topic)) {
+          if (filter !== undefined && !filter(rawPayload, rec.topic)) {
             this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
             // A filtered replayed message is deliberately skipped: advance
             // the key baseline past it like the live path does, or a later
@@ -15972,6 +16036,23 @@ export class EventBus {
             // Same for a filtered causal message: its clock will never be
             // fanned out to this subscriber, so the source's expectation
             // advances past it instead of hanging on a missing dependency.
+            if (rec.causal !== undefined) {
+              this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+            }
+            countReplaySkipped();
+            continue;
+          }
+          if (filterExpr !== undefined && !filterExpr.test(rawPayload)) {
+            // Filter-expression (EB-123) rejection on replay: the same
+            // deliberate-skip semantics as the predicate filter above —
+            // never queued, baseline advanced, key/causal baselines
+            // advanced past it, counted as filtered. Replayed messages
+            // walk the independent replay credit budget (EB-117), so no
+            // credit interaction either way.
+            this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
+            if (rec.key !== undefined && rec.keySeq !== undefined) {
+              this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+            }
             if (rec.causal !== undefined) {
               this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
             }
@@ -18249,6 +18330,14 @@ export class EventBus {
         this.countFiltered(subscriber, msg.topic, msg.seq, '', msg.partition ?? 0);
         continue;
       }
+      const filterExpr = subscriber.filterExpr;
+      if (filterExpr !== undefined && !filterExpr.test(msg.payload)) {
+        // Filter-expression (EB-123) rejection: seen and deliberately
+        // skipped — never queued, never a sequence gap, counted as
+        // filtered, exactly like a predicate-filter rejection above.
+        this.countFiltered(subscriber, msg.topic, msg.seq, '', msg.partition ?? 0);
+        continue;
+      }
       this.noteMessageDelivered(subscriber, msg);
       this.totalDelivered += 1;
       delivered.set(entry.topic, entry.seq);
@@ -19921,6 +20010,21 @@ export class EventBus {
       this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
       return false;
     }
+    const filterExpr = subscriber.filterExpr;
+    if (filterExpr !== undefined && !filterExpr.test(rawPayload)) {
+      // Filter-expression (EB-123) rejection, evaluated after the
+      // predicate filter: both must accept for the message to be queued.
+      // Same deliberate-skip semantics as a filter rejection — never
+      // queued, baseline advanced, no gap — and the evaluation never
+      // throws, so unlike the predicate it can never propagate into the
+      // publish call. Because this runs at fan-out, before the queue and
+      // the drain, a rejected message also never consumes delivery
+      // credit (EB-117 spends credit per drained delivery) and never
+      // reaches the ack tracker (no ack obligation on reliable
+      // subscriptions).
+      this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
+      return false;
+    }
     const composite = subscriber.composite;
     if (composite !== undefined && !this.matchesComposite(composite, msg.topic)) {
       // Composite-pattern (EB-70) rejection, evaluated after the content
@@ -19975,6 +20079,14 @@ export class EventBus {
       // queued, never counted anywhere. Shadow deliveries track no
       // sequence gaps, so — unlike production — there is no baseline to
       // advance over the skip.
+      return;
+    }
+    const filterExpr = subscriber.filterExpr;
+    if (filterExpr !== undefined && !filterExpr.test(rawPayload)) {
+      // A filter-expression (EB-123) rejected shadow copy is
+      // deliberately skipped, exactly like a predicate-filter rejection
+      // above: never queued, never counted anywhere, so the mirror
+      // cannot move production stats.
       return;
     }
     const composite = subscriber.composite;

@@ -3839,3 +3839,75 @@ Semantics:
   links re-admit messages into the normal lane. Pause buffers, barriers
   and shadow traffic keep their existing semantics (shadow drains never
   touch lane stats).
+
+## Subscription filter expressions (EB-123)
+
+`SubscribeOptions.filterExpr` attaches a declarative, compile-time-checked
+predicate to a subscription — a content filter you can write as data
+instead of code:
+
+```ts
+const sub = bus.subscribe('market.**', handle, {
+  filterExpr: `type == "trade" && price > 100 && exists(user.id) && symbol =~ /^BTC/`,
+});
+```
+
+The expression is compiled once at subscribe time by the zero-dependency
+parser in `src/filterexpr.ts` (hand-written tokenizer + recursive-descent
+parser — no `eval`, no `Function` constructor). An illegal expression
+(syntax error, unknown operator, invalid regex) throws `RangeError` from
+`subscribe`, before anything registers.
+
+### Syntax
+
+| Class | Operators | Examples |
+|---|---|---|
+| Equality | `==`, `!=` | `type == "trade"`, `retries != 3` |
+| Range | `>`, `>=`, `<`, `<=` | `price > 100`, `price <= 500` |
+| Existence | `exists(path)` or `path exists` | `exists(user.id)`, `user.id exists` |
+| Regex | `=~` with a `/re/flags` literal | `symbol =~ /^BTC/`, `sym =~ /^btc/i` |
+
+- **Composition:** `&&`, `||`, prefix `!`, and parentheses:
+  `a == 1 && (b == 2 || !c == 3)`.
+- **Paths:** dotted field paths with array indexes — `user.id`,
+  `legs[0].amount`.
+- **Literals:** single/double-quoted strings (with escapes), numbers
+  (`-5`, `1.5e2`), `true`, `false`, `null`.
+
+### Evaluation semantics
+
+- **Never throws.** A missing field, a type mismatch, or a non-object
+  payload simply fails the predicate — a filter expression can never
+  take down a publish call (unlike a throwing `filter` predicate, which
+  propagates by design).
+- **Missing is not a value.** A missing field never equals a literal —
+  not even `null` (`x == null` is false when `x` is absent, `x != null`
+  is true); only `exists(x)` observes absence.
+- **Range** compares numbers numerically and strings lexicographically;
+  mixed or non-comparable types never match (no coercion).
+- **Regex** requires the field to be a string; the pattern is validated
+  by the RegExp engine at compile time.
+
+### Pipeline position and interactions
+
+Evaluated at fan-out, **after** the `filter` predicate and **before**
+composite patterns — `filter` and `filterExpr` compose with AND (both
+must accept). A rejected message:
+
+- is never queued — no backpressure budget, no throttle token, no
+  sequence gap (the per-topic baseline advances over it, exactly like a
+  `filter` rejection);
+- **consumes no delivery credit** — credit (EB-117) is spent per message
+  at drain time, and a filtered message never reaches the drain, so
+  filtering can never trip `onCreditExhausted` or starve real deliveries;
+- **creates no ack obligation** — ack tracking starts at delivery, which
+  never happens, so reliable subscriptions see no pending delivery, no
+  redelivery timer, and no timeout for filtered messages;
+- counts into `getStats().filteredMessages` (global + per-topic), like
+  `filter` rejections.
+
+Applies uniformly to live fan-out, durable-log replay
+(`resumeFromSeq` / `resumeFromTime`), the retained snapshot, and shadow
+mirrors (uncounted there, like `filter`). Like `filter`, it is a string
+and therefore survives subscription migration snapshots; unlike
+`filter`, it needs no code on the receiving side.
