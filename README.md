@@ -632,6 +632,29 @@ library.
   `maxIdleMs` (including `NaN`), an `idleActivity` without `maxIdleMs`,
   or an unknown activity mode throws `RangeError` at subscribe time.
   Disabled by default — fully backward compatible.
+- **Graceful drain-on-unsubscribe** (opt-in via
+  `subscription.unsubscribe({ drain: true, drainTimeoutMs })`): instead of
+  tearing the subscription down immediately, the bus stops admitting new
+  messages for it and removes the subscription only after its queued
+  backlog has been fully delivered — for reliable subscriptions, only
+  after every outstanding delivery has settled, with `nack()` and ack
+  timeouts keeping their normal redelivery and dead-letter semantics while
+  draining. Publishes arriving during the drain are skipped: never queued,
+  never delivered, and deliberately *not* counted as drops (the consumer
+  asked to leave, so fresh work must not be enqueued behind it nor pollute
+  backpressure statistics). A second `unsubscribe()` call while draining
+  abandons the drain and tears down immediately; `drainTimeoutMs` (default
+  30000, must be a positive finite number) bounds the wait — on expiry the
+  subscription is torn down through the normal path, with outstanding
+  reliable deliveries forgotten exactly as an immediate unsubscribe would
+  (no requeue, no further redelivery). `getStats().drainingSubscribers`
+  reports how many subscriptions are mid-drain. A non-boolean `drain` or a
+  non-positive/non-finite `drainTimeoutMs` throws `RangeError` before any
+  state changes. Works through `subscribeReliable` and `subscribeToGroup`
+  (a draining group member stays in the competing set until its backlog
+  drains, so quiesce publishers first); lease/idle expiry, migration
+  completion and topic deletion keep the immediate semantics. Disabled by
+  default — a plain `unsubscribe()` behaves exactly as before.
 - **Subscription pattern hot update** (`bus.updateSubscriptionPattern(subId, newPattern)`):
   atomically replaces a live subscription's topic pattern — from the next
   publish on, the subscriber matches the new pattern instead of its

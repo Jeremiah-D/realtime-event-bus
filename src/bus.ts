@@ -1787,6 +1787,9 @@ const REPLAY_PROGRESS_INTERVAL_DEFAULT = 100;
 /** Format marker carried by every `SubscriptionSnapshot` (EB-82). */
 const SUBSCRIPTION_SNAPSHOT_KIND = 'realtime-event-bus/subscription-snapshot' as const;
 
+/** Default drain window for `unsubscribe({ drain: true })` (EB-128). */
+const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
+
 /**
  * Subscription migration (EB-82): splits a subscribe-options bag into
  * the serializable subset that can travel in a `SubscriptionSnapshot`
@@ -2631,9 +2634,36 @@ export interface DrainedEvent {
   highWaterMark: number;
 }
 
+/**
+ * Options for `Subscription.unsubscribe` (EB-128).
+ */
+export interface UnsubscribeOptions {
+  /**
+   * Opt-in graceful drain: when true, the subscription stops admitting
+   * new messages and is torn down only after its queued backlog has been
+   * fully delivered — and, for reliable subscriptions, every outstanding
+   * delivery has settled (ack/nack/ack-timeout keep their normal
+   * redelivery and dead-letter semantics while draining). Publishes
+   * arriving during the drain are skipped: never queued, never counted
+   * as drops, never delivered. A second `unsubscribe()` call while
+   * draining abandons the drain and tears down immediately. Defaults to
+   * false — immediate teardown, the historical behavior.
+   */
+  drain?: boolean;
+  /**
+   * Upper bound in milliseconds on the drain window. When the window
+   * elapses with backlog or unacked deliveries still outstanding, the
+   * subscription is torn down immediately — outstanding reliable
+   * deliveries are forgotten exactly as a normal immediate unsubscribe
+   * would (no requeue, no further redelivery). Must be a positive finite
+   * number; defaults to 30000. Only meaningful with `drain: true`.
+   */
+  drainTimeoutMs?: number;
+}
+
 export interface Subscription {
   id: string;
-  unsubscribe(): void;
+  unsubscribe(opts?: UnsubscribeOptions): void;
 }
 
 /**
@@ -3547,6 +3577,14 @@ export interface BusStats {
    * subscription still counts as live everywhere else.
    */
   migratingSubscribers: number;
+  /**
+   * Subscriptions currently in a graceful drain (see
+   * `Subscription.unsubscribe` with `drain: true`, EB-128): new
+   * publishes skip their queue while the already-queued backlog drains,
+   * and the subscription still counts as live everywhere else until the
+   * drain completes or the drain timeout fires.
+   */
+  drainingSubscribers: number;
   /**
    * Number of distinct literal-prefix keys currently held in the
    * publish-side prefix index — one entry per prefix with at least one
@@ -4535,6 +4573,26 @@ interface PullRingEntry extends PulledMessage {
   expiresAt?: number;
 }
 
+/**
+ * Graceful-drain state for one subscriber (EB-128): set while
+ * `unsubscribe({ drain: true })` is waiting for the backlog to empty.
+ * New publishes are skipped at `enqueueMessage` while this is set; the
+ * drain completes when the queue is empty and every reliable delivery
+ * has settled, or when the timeout fires — whichever comes first.
+ */
+interface DrainState {
+  /** Wall-clock bound on the drain window; unref'd, never keeps the process alive. */
+  timer: ReturnType<typeof setTimeout>;
+  /** The configured bound, for observability. */
+  timeoutMs: number;
+  /**
+   * The level-specific teardown to run when the drain completes or the
+   * timeout fires: the outermost unsubscribe's immediate path (reliable
+   * ack-tracker clear, group leave, …) followed by the inner teardown.
+   */
+  onComplete: () => void;
+}
+
 interface Subscriber {
   id: string;
   pattern: string;
@@ -4855,6 +4913,14 @@ interface Subscriber {
    * keeps counting as live in `getStats()` (see `migratingSubscribers`).
    */
   migrating?: boolean;
+  /**
+   * Graceful drain-on-unsubscribe (EB-128): set while
+   * `unsubscribe({ drain: true })` waits for the subscriber's backlog to
+   * empty. New publishes skip the queue while draining (see
+   * `enqueueMessage`); the subscriber still counts as live in
+   * `getStats()` (see `drainingSubscribers`).
+   */
+  draining?: DrainState;
   /**
    * Manual operator pause (EB-113): set by `pauseSubscriber`, cleared by
    * `resumeSubscriber`. While true `drainSubscriber` skips the
@@ -13030,65 +13096,73 @@ export class EventBus {
 
     const subscription: Subscription = {
       id,
-      unsubscribe: () => {
-        if (!this.subscribers.delete(id)) return;
-        // Priority lanes (EB-122): the subscriber's queued backlog
-        // vanishes with it — release its entries from the lane backlog
-        // counters so the `queued` gauges don't leak. (Migration teardown
-        // runs through here too: the exported backlog leaves this bus, so
-        // its entries leave this bus's gauges.)
-        for (const msg of subscriber.queue.snapshot()) {
-          this.countLaneUnqueued(msg.topic, msg.lane ?? 'normal');
-        }
-        // Subscription lifecycle audit (EB-78): name the live pattern —
-        // `updateSubscriptionPattern` rewrites it in place, and the audit
-        // must reflect what the subscription actually matched on.
-        this.auditSubscription({
-          action: 'unsubscribe',
-          subId: id,
-          pattern: subscriber.pattern,
-          actor: 'system',
+      unsubscribe: (opts?: UnsubscribeOptions) => {
+        // Graceful drain (EB-128): the whole teardown below runs through
+        // the shared drain entry — deferred until the backlog drains (or
+        // the drain timeout fires) when `drain: true` is passed.
+        // Bus-initiated removals (lease/idle expiry via the adopted
+        // outermost closure, migration completion, topic deletion) call
+        // without opts and keep the immediate semantics.
+        this.unsubscribeWithDrain(id, opts, () => {
+          if (!this.subscribers.delete(id)) return;
+          // Priority lanes (EB-122): the subscriber's queued backlog
+          // vanishes with it — release its entries from the lane backlog
+          // counters so the `queued` gauges don't leak. (Migration teardown
+          // runs through here too: the exported backlog leaves this bus, so
+          // its entries leave this bus's gauges.)
+          for (const msg of subscriber.queue.snapshot()) {
+            this.countLaneUnqueued(msg.topic, msg.lane ?? 'normal');
+          }
+          // Subscription lifecycle audit (EB-78): name the live pattern —
+          // `updateSubscriptionPattern` rewrites it in place, and the audit
+          // must reflect what the subscription actually matched on.
+          this.auditSubscription({
+            action: 'unsubscribe',
+            subId: id,
+            pattern: subscriber.pattern,
+            actor: 'system',
+          });
+          // A lease must not outlive its subscriber: no phantom expiry
+          // after unsubscribe (EB-69).
+          this.leases.clear(id);
+          // An idle window must not outlive its subscriber either: no
+          // phantom expiry after unsubscribe (EB-72).
+          this.idleReclaimer.clear(id);
+          // Pending timers must not outlive the subscriber: no phantom
+          // resume or re-flush after unsubscribe.
+          const health = subscriber.health;
+          if (health?.autoResumeTimer !== undefined) {
+            clearTimeout(health.autoResumeTimer);
+            health.autoResumeTimer = undefined;
+          }
+          this.clearShapingTimer(subscriber);
+          this.clearSlowStartTimer(subscriber);
+          this.clearRateLimitTimer(subscriber);
+          this.clearBatchTimer(subscriber);
+          this.clearWindowTimer(subscriber);
+          const bucket = this.prefixIndex.get(indexKey);
+          if (bucket != null) {
+            bucket.delete(id);
+            // Evict emptied keys so a churn of short-lived patterns cannot
+            // grow the index without bound.
+            if (bucket.size === 0) this.prefixIndex.delete(indexKey);
+          }
+          const remaining = (this.subscribersByPattern.get(topicPattern) ?? 1) - 1;
+          if (remaining <= 0) {
+            this.subscribersByPattern.delete(topicPattern);
+            this.patternCache.delete(topicPattern);
+          } else {
+            this.subscribersByPattern.set(topicPattern, remaining);
+          }
+          // Composite subscriptions (EB-70): release the composite-cache
+          // references and drop the live count.
+          if (subscriber.composite !== undefined) {
+            this.releaseComposite(subscriber.composite);
+            this.compositeSubscriptionCount -= 1;
+          }
+          // The advertised pattern set may have shrunk.
+          this.advertiseClusterPatterns();
         });
-        // A lease must not outlive its subscriber: no phantom expiry
-        // after unsubscribe (EB-69).
-        this.leases.clear(id);
-        // An idle window must not outlive its subscriber either: no
-        // phantom expiry after unsubscribe (EB-72).
-        this.idleReclaimer.clear(id);
-        // Pending timers must not outlive the subscriber: no phantom
-        // resume or re-flush after unsubscribe.
-        const health = subscriber.health;
-        if (health?.autoResumeTimer !== undefined) {
-          clearTimeout(health.autoResumeTimer);
-          health.autoResumeTimer = undefined;
-        }
-        this.clearShapingTimer(subscriber);
-        this.clearSlowStartTimer(subscriber);
-        this.clearRateLimitTimer(subscriber);
-        this.clearBatchTimer(subscriber);
-        this.clearWindowTimer(subscriber);
-        const bucket = this.prefixIndex.get(indexKey);
-        if (bucket != null) {
-          bucket.delete(id);
-          // Evict emptied keys so a churn of short-lived patterns cannot
-          // grow the index without bound.
-          if (bucket.size === 0) this.prefixIndex.delete(indexKey);
-        }
-        const remaining = (this.subscribersByPattern.get(topicPattern) ?? 1) - 1;
-        if (remaining <= 0) {
-          this.subscribersByPattern.delete(topicPattern);
-          this.patternCache.delete(topicPattern);
-        } else {
-          this.subscribersByPattern.set(topicPattern, remaining);
-        }
-        // Composite subscriptions (EB-70): release the composite-cache
-        // references and drop the live count.
-        if (subscriber.composite !== undefined) {
-          this.releaseComposite(subscriber.composite);
-          this.compositeSubscriptionCount -= 1;
-        }
-        // The advertised pattern set may have shrunk.
-        this.advertiseClusterPatterns();
       },
     };
     // Subscription migration (EB-82): the plain teardown, replaced with
@@ -13118,6 +13192,154 @@ export class EventBus {
     // uses, so a namespaced subscription audits under its concrete form.
     this.auditSubscription({ action: 'subscribe', subId: id, pattern: topicPattern, actor });
     return subscription;
+  }
+
+  /**
+   * Validates `Subscription.unsubscribe` options (EB-128). Runs before
+   * any state is read or changed, so a throw leaves the subscription
+   * exactly as it was. Throws `RangeError` when `drain` is present and
+   * not a boolean, or when `drainTimeoutMs` is present and not a
+   * positive finite number.
+   */
+  private validateUnsubscribeOptions(opts: UnsubscribeOptions | undefined): void {
+    if (opts === undefined) return;
+    if (opts.drain !== undefined && typeof opts.drain !== 'boolean') {
+      throw new RangeError('unsubscribe: drain must be a boolean');
+    }
+    const timeoutMs = opts.drainTimeoutMs;
+    if (
+      timeoutMs !== undefined &&
+      (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0)
+    ) {
+      throw new RangeError(
+        'unsubscribe: drainTimeoutMs must be a positive finite number of milliseconds',
+      );
+    }
+  }
+
+  /**
+   * Shared entry for every `unsubscribe` closure in the subscribe family
+   * (EB-128): plain `subscribe`, `subscribeReliable`, `subscribeToGroup`.
+   * `teardown` is the level's immediate teardown — the outermost
+   * wrapper's work (reliable ack-tracker clear, group leave) followed by
+   * the inner subscription teardown.
+   *
+   * - No opts, or `drain` falsy: run `teardown` immediately (historical).
+   * - `drain: true` on a non-draining subscription: enter the drain —
+   *   stop admitting new messages, arm the timeout, and run `teardown`
+   *   when the backlog empties or the timeout fires.
+   * - Any call on a draining subscription: abandon the drain and run
+   *   `teardown` immediately (forced teardown).
+   * - Unknown or already-removed id: no-op (historical).
+   */
+  private unsubscribeWithDrain(
+    id: string,
+    opts: UnsubscribeOptions | undefined,
+    teardown: () => void,
+  ): void {
+    this.validateUnsubscribeOptions(opts);
+    const subscriber = this.subscribers.get(id);
+    if (subscriber === undefined) return;
+    if (subscriber.draining !== undefined) {
+      // A second unsubscribe while draining: abandon the drain and tear
+      // down now — the caller asked out twice, so waiting is pointless.
+      this.cancelDrain(subscriber);
+      teardown();
+      return;
+    }
+    if (opts?.drain === true) {
+      this.startDrain(subscriber, opts.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS, teardown);
+      return;
+    }
+    teardown();
+  }
+
+  /**
+   * Enters the graceful drain (EB-128): marks the subscriber draining
+   * and arms the wall-clock timeout. New publishes skip the queue from
+   * here on (see `enqueueMessage`); `onComplete` — the level's immediate
+   * teardown — runs when the backlog empties or the timeout fires.
+   */
+  private startDrain(subscriber: Subscriber, timeoutMs: number, onComplete: () => void): void {
+    const timer = setTimeout(() => this.forceDrainTimeout(subscriber), timeoutMs);
+    // A drain wait must never keep the process alive on its own — the
+    // same rule as the ack-timeout, lease, idle and health-probe timers.
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    subscriber.draining = { timer, timeoutMs, onComplete };
+    // A drain entered with nothing outstanding completes immediately —
+    // an empty backlog with no unacked deliveries needs no waiting.
+    this.checkDrainComplete(subscriber);
+  }
+
+  /**
+   * Abandons a drain without tearing down: clears the timeout and the
+   * draining mark. Used when a second `unsubscribe()` forces immediate
+   * teardown.
+   */
+  private cancelDrain(subscriber: Subscriber): void {
+    const draining = subscriber.draining;
+    if (draining === undefined) return;
+    clearTimeout(draining.timer);
+    subscriber.draining = undefined;
+  }
+
+  /**
+   * True when a draining subscriber's drain may complete: the queue —
+   * including a batch subscriber's collected-but-undelivered pending
+   * batch — is empty and no reliable delivery is still outstanding.
+   * Redeliveries requeue through `onRedeliver`, so a nacked message
+   * keeps the drain open until it is acked, dead-lettered, or the
+   * timeout fires.
+   */
+  private isDrainComplete(subscriber: Subscriber): boolean {
+    if (subscriber.draining === undefined) return false;
+    if (this.subscribers.get(subscriber.id) !== subscriber) return false;
+    if (subscriber.queue.size !== 0) return false;
+    if ((subscriber.batch?.pending.length ?? 0) !== 0) return false;
+    const tracker = subscriber.reliable?.tracker;
+    if (tracker !== undefined && tracker.unackedCount !== 0) return false;
+    return true;
+  }
+
+  /**
+   * Completes a drain: clears the timeout and the draining mark, then
+   * runs the level's immediate teardown. The teardown is the normal
+   * unsubscribe path — ack-tracker clear, group leave, lease/idle
+   * clears, queue disposal — so a drained unsubscribe is
+   * indistinguishable from an immediate one in every audit and stat
+   * except the delay.
+   */
+  private finishDrain(subscriber: Subscriber): void {
+    const draining = subscriber.draining;
+    if (draining === undefined) return;
+    clearTimeout(draining.timer);
+    subscriber.draining = undefined;
+    draining.onComplete();
+  }
+
+  /**
+   * Drain-completion checkpoint (EB-128): call after any event that can
+   * advance a drain — a flush round emptied the queue, a reliable
+   * delivery settled, a redelivery requeued or dead-lettered. Completes
+   * the drain when the backlog is empty and nothing is unacked.
+   */
+  private checkDrainComplete(subscriber: Subscriber): void {
+    if (this.isDrainComplete(subscriber)) this.finishDrain(subscriber);
+  }
+
+  /**
+   * The drain timeout fired: the window elapsed with backlog or unacked
+   * deliveries still outstanding. Abandons the drain and tears down
+   * through the normal path — outstanding reliable deliveries are
+   * forgotten exactly as a normal immediate unsubscribe would (the outer
+   * teardown clears the ack tracker without requeueing): they are
+   * neither delivered again nor redelivered further.
+   */
+  private forceDrainTimeout(subscriber: Subscriber): void {
+    if (subscriber.draining === undefined) return;
+    if (this.subscribers.get(subscriber.id) !== subscriber) return;
+    this.finishDrain(subscriber);
   }
 
   /**
@@ -14148,14 +14370,16 @@ export class EventBus {
         cap.inFlight = Math.max(0, cap.inFlight - 1);
         this.scheduleFlush();
       },
-      // EB-72: ack-settle activity for idle reclamation. Allocated only
-      // when the subscriber opted into maxIdleMs — otherwise the tracker
-      // behaves exactly as before, zero overhead.
-      ...(opts?.maxIdleMs === undefined
-        ? {}
-        : {
-            onAck: () => this.recordIdleActivity(subscriber, 'ack'),
-          }),
+      // EB-72: ack-settle activity for idle reclamation, recorded only
+      // when the subscriber opted into maxIdleMs. The hook is always
+      // allocated: it also carries the graceful-drain completion check
+      // (EB-128) — an ack settle is final (acks never requeue), so a
+      // drain whose last outstanding delivery just acked can complete
+      // right here instead of waiting for the next flush.
+      onAck: () => {
+        if (opts?.maxIdleMs !== undefined) this.recordIdleActivity(subscriber, 'ack');
+        this.checkDrainComplete(subscriber);
+      },
       onRedeliver: (msg, reason) => {
         // EB-45: the outstanding delivery's `bus.ack` span never
         // completes — abandon it. The requeue below emits a fresh
@@ -14179,10 +14403,21 @@ export class EventBus {
         // forever.
         if (dlq != null && count > dlq.maxRedeliveries) {
           this.moveToDeadLetter(subscriber, msg, count - 1, lastError);
+          // A dead-lettered message settles the drain like any other
+          // settle: the queue may now be empty with nothing unacked.
+          this.checkDrainComplete(subscriber);
           return;
         }
-        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg));
+        // `fromRedelivery`: a redelivery is already-admitted work, so it
+        // bypasses the graceful-drain admission gate (EB-128) — refusing
+        // it here would break at-least-once and wedge the drain.
+        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), false, true);
         this.scheduleFlush();
+        // The requeue re-armed the backlog: re-evaluate the drain — a
+        // drain whose queue just refilled stays open, and one whose last
+        // redelivery landed in an otherwise empty queue stays open until
+        // the redelivery itself settles.
+        this.checkDrainComplete(subscriber);
       },
     });
     subscriber.reliable = { tracker, redeliveries, lastFailure, batchHandles, liveDeliveries };
@@ -14324,10 +14559,16 @@ export class EventBus {
     this.deliverRetainedSnapshot(subscriber);
     const reliableSubscription: Subscription = {
       id: sub.id,
-      unsubscribe: () => {
-        // Cancel pending ack timers first: no phantom redeliveries after unsubscribe.
-        tracker.clear();
-        sub.unsubscribe();
+      unsubscribe: (opts?: UnsubscribeOptions) => {
+        // Graceful drain (EB-128): the ack-tracker clear below is
+        // deferred until the drain completes — unacked deliveries keep
+        // their normal redelivery and dead-letter semantics while
+        // draining, and the tracker is cleared exactly once, at teardown.
+        this.unsubscribeWithDrain(sub.id, opts, () => {
+          // Cancel pending ack timers first: no phantom redeliveries after unsubscribe.
+          tracker.clear();
+          sub.unsubscribe();
+        });
       },
     };
     // Lease expiry must run the outermost teardown (ack-tracker clear
@@ -14591,7 +14832,10 @@ export class EventBus {
     }
     const groupSubscription: Subscription = {
       id: sub.id,
-      unsubscribe: () => {
+      unsubscribe: (opts?: UnsubscribeOptions) => {
+        // Options validated before any roster or subscription state is
+        // read, so a throw leaves both untouched.
+        this.validateUnsubscribeOptions(opts);
         // Second call is a no-op: no double leave-event, no roster churn.
         if (!this.subscribers.has(sub.id)) return;
         // Static membership (EB-104): the roster slot is held for the
@@ -14605,42 +14849,51 @@ export class EventBus {
           );
           return;
         }
-        // Offset auto-commit (EB-127): flush the group's pending checkpoints
-        // first — before the linger window below is computed, so the
-        // window covers only what is still uncommitted — then stop this
-        // member's commit timer.
-        this.flushAutoCommits(groupId);
-        this.disarmAutoCommitTimer(rosterKey);
-        const wasPartitioned = this.groupPartitions.get(key) !== undefined;
-        const before = wasPartitioned ? new Map(this.partitionAssignment(key)) : undefined;
-        this.removeGroupMember(key, sub.id);
-        let pr: PartitionRebalanceInfo | undefined;
-        if (wasPartitioned) {
-          const after = this.partitionAssignment(key);
-          const migrated = this.diffPartitionAssignment(key, before!, after);
-          pr = {
-            assignment: Object.fromEntries(after),
-            migrated,
-            strategy: this.groupAssignorName(key),
-          };
-          for (const m of migrated) {
-            const owner = this.subscribers.get(m.to);
-            if (owner !== undefined) this.replayPartitionBacklog(owner, key, m.partition);
+        // Graceful drain (EB-128): the whole leave below — roster
+        // removal, linger, audit, rebalance — is deferred until the
+        // member's backlog drains (or the drain timeout fires). A
+        // draining member stays in the competing set meanwhile, so
+        // quiesce publishers before draining a group member — the same
+        // guidance as quiescing producers between migration export and
+        // complete.
+        this.unsubscribeWithDrain(sub.id, opts, () => {
+          // Offset auto-commit (EB-127): flush the group's pending checkpoints
+          // first — before the linger window below is computed, so the
+          // window covers only what is still uncommitted — then stop this
+          // member's commit timer.
+          this.flushAutoCommits(groupId);
+          this.disarmAutoCommitTimer(rosterKey);
+          const wasPartitioned = this.groupPartitions.get(key) !== undefined;
+          const before = wasPartitioned ? new Map(this.partitionAssignment(key)) : undefined;
+          this.removeGroupMember(key, sub.id);
+          let pr: PartitionRebalanceInfo | undefined;
+          if (wasPartitioned) {
+            const after = this.partitionAssignment(key);
+            const migrated = this.diffPartitionAssignment(key, before!, after);
+            pr = {
+              assignment: Object.fromEntries(after),
+              migrated,
+              strategy: this.groupAssignorName(key),
+            };
+            for (const m of migrated) {
+              const owner = this.subscribers.get(m.to);
+              if (owner !== undefined) this.replayPartitionBacklog(owner, key, m.partition);
+            }
           }
-        }
-        const linger = this.beginLingerHandoff(groupId, subscriber);
-        sub.unsubscribe();
-        // Subscription lifecycle audit (EB-78): the leave itself, on top
-        // of the 'unsubscribe' the inner closure recorded. Audited before
-        // the rebalance fires, so the leave entry precedes it.
-        this.auditSubscription({
-          action: 'group_leave',
-          subId: sub.id,
-          groupId,
-          pattern: topicPattern,
-          actor: 'system',
+          const linger = this.beginLingerHandoff(groupId, subscriber);
+          sub.unsubscribe();
+          // Subscription lifecycle audit (EB-78): the leave itself, on top
+          // of the 'unsubscribe' the inner closure recorded. Audited before
+          // the rebalance fires, so the leave entry precedes it.
+          this.auditSubscription({
+            action: 'group_leave',
+            subId: sub.id,
+            groupId,
+            pattern: topicPattern,
+            actor: 'system',
+          });
+          this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id, linger, pr);
         });
-        this.fireRebalance(groupId, topicPattern, key, 'leave', sub.id, linger, pr);
       },
     };
     // Lease expiry must run the outermost teardown (group leave above);
@@ -20679,7 +20932,28 @@ export class EventBus {
     msg: BusMessage,
     deadline: number | undefined,
     skipDedup = false,
+    fromRedelivery = false,
   ): 'accepted' | 'dropped' | 'duplicate' {
+    // Graceful drain (EB-128): a draining subscription is on its way out —
+    // newly published messages skip the queue entirely. This is
+    // deliberately NOT a drop: the consumer asked to leave, so fresh work
+    // must not be enqueued behind it, and the skip must not pollute
+    // backpressure or drop statistics — it reads as 'dropped' to the
+    // fan-out (not accepted, like a content-filter skip) but touches no
+    // counter. The per-topic sequence baseline still advances over the
+    // skip, exactly like a filter skip: the message was seen and
+    // deliberately not queued, so it must never surface as a sequence gap
+    // while the remaining backlog drains.
+    // Redeliveries (nack / ack-timeout requeues via `onRedeliver`,
+    // internal queue rebuilds via `requeueUndelivered`) bypass this gate:
+    // they are already-admitted work the at-least-once contract still
+    // owes the consumer — refusing them here would both break the
+    // contract and wedge the drain (a refused redelivery never re-enters
+    // the queue, so the backlog could never empty).
+    if (subscriber.draining !== undefined && !fromRedelivery) {
+      this.advanceBaseline(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
+      return 'dropped';
+    }
     // Every queue insertion funnels through here — fan-out, redeliveries,
     // log replays, DLQ replays, and mid-drain requeues — so the dedup
     // check here covers every path a duplicate can arrive on. Internal
@@ -23196,6 +23470,7 @@ export class EventBus {
     let creditExhaustedSubscribers = 0;
     let rampingSubscribers = 0;
     let migratingSubscribers = 0;
+    let drainingSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
     const ackLatency: BusStats['ackLatency'] = [];
     const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
@@ -23212,6 +23487,9 @@ export class EventBus {
       // Subscription migration (EB-82): a paused-for-export subscription
       // still counts as live everywhere else.
       if (subscriber.migrating === true) migratingSubscribers += 1;
+      // Graceful drain (EB-128): a draining subscription is on its way
+      // out but still counts as live everywhere else.
+      if (subscriber.draining !== undefined) drainingSubscribers += 1;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.manuallyPaused === true) pausedSubscribers += 1;
@@ -23400,6 +23678,7 @@ export class EventBus {
       patternCacheSize: this.patternCache.size,
       compositeSubscriptions: this.compositeSubscriptionCount,
       migratingSubscribers,
+      drainingSubscribers,
       indexSize: this.prefixIndex.size,
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
@@ -24293,8 +24572,21 @@ export class EventBus {
       // path: advancing an injected clock past a trigger time and then
       // publishing anything fires the job in tests.
       this.sweepRecurring(nowMs, false);
+      // Drains (EB-128) that complete in this flush round are collected
+      // here and torn down after the loop below.
+      let completedDrains: Subscriber[] | undefined;
       for (const subscriber of this.subscribers.values()) {
         this.drainSubscriber(subscriber, nowMs);
+        // Graceful drain (EB-128): a subscriber whose backlog just
+        // emptied completes below, after the loop — teardown mutates the
+        // subscriber map, so it must not run mid-iteration.
+        if (this.isDrainComplete(subscriber)) {
+          if (completedDrains === undefined) completedDrains = [];
+          completedDrains.push(subscriber);
+        }
+      }
+      if (completedDrains !== undefined) {
+        for (const subscriber of completedDrains) this.finishDrain(subscriber);
       }
     });
   }
@@ -25190,15 +25482,19 @@ export class EventBus {
     // skipDedup: this is an internal queue rebuild, not a new delivery —
     // the messages were already admitted (and dedup-recorded) when first
     // enqueued; suppressing them here would silently lose them.
+    // fromRedelivery: same reasoning against the graceful-drain gate
+    // (EB-128) — already-admitted work re-enters the queue, it is never
+    // a fresh publish.
     if (queue.size === 0) {
       for (const msg of undelivered)
-        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true);
+        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
       return;
     }
     const rest = queue.drain();
     for (const msg of undelivered)
-      this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true);
-    for (const msg of rest) this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true);
+      this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
+    for (const msg of rest)
+      this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
   }
 
   /**
