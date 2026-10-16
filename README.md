@@ -2806,6 +2806,8 @@ Exported series:
 | `eventbus_deprecated_schema_messages_total` | counter | `deprecatedSchemaVersions` — publishes admitted under a superseded-but-graced schema version (EB-86) |
 | `eventbus_late_messages_total` | counter | `lateMessages` — admitted messages older than their topic's event-time watermark (EB-59; still delivered) |
 | `eventbus_rate_limited_messages_total` | counter | `rateLimitedMessages` — per-topic rate-limit sheds |
+| `eventbus_circuit_broken_messages_total` | counter | `circuitBrokenMessages` — publishes refused by publish circuit breakers (EB-116): the breaker was open, so `publish` threw `CircuitBreakerOpenError` (fast-fail) |
+| `eventbus_circuit_breaker_trips_total` | counter | `circuitBreakerTrips` — times a publish circuit breaker opened (EB-116) |
 | `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |
 | `eventbus_unregistered_topic_publishes_total` | counter | `unregisteredTopicPublishes` — publishes to topics with no live catalog registration (advisory; delivered normally) |
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
@@ -2822,6 +2824,7 @@ Exported series:
 | `eventbus_causal_buffer_dropped_messages_total` | counter | `causalBuffer.droppedMessages` — causal messages dropped from full per-source reorder buffers (drop-oldest anti-deadlock) |
 | `eventbus_causal_buffer_regressed_messages_total` | counter | `causalBuffer.regressedMessages` — causal messages delivered immediately on clock regression |
 | `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
+| `eventbus_topic_circuit_broken_messages_total{topic}` | counter | per-topic `circuitBrokenMessages` (EB-116) |
 | `eventbus_topic_partition_published_total{topic,partition}` | counter | per-partition `publishedMessages` (EB-90); only emitted for topics with more than one configured partition |
 | `eventbus_topic_late_messages_total{topic}` | counter | per-topic `lateMessages` (EB-59) |
 | `eventbus_topic_event_time_watermark{topic}` | gauge | per-topic event-time watermark in epoch ms (EB-59); only emitted for topics with at least one event-time publish |
@@ -2830,6 +2833,7 @@ Exported series:
 | `eventbus_throttled_subscribers` | gauge | `throttledSubscribers` |
 | `eventbus_degraded_subscribers` | gauge | `degradedSubscribers` |
 | `eventbus_paused_subscribers` | gauge | `pausedSubscribers` — operator-paused subscriptions (EB-113) |
+| `eventbus_circuit_breakers_open` | gauge | publish circuit breakers currently open (fast-failing; EB-116) |
 | `eventbus_shaped_subscribers` | gauge | `shapedSubscribers` |
 | `eventbus_pending_delayed` | gauge | `pendingDelayed` |
 | `eventbus_queue_bytes` | gauge | `queueBytes` — buffered payload bytes across subscriber queues |
@@ -3587,3 +3591,48 @@ Semantics:
 
 `getStats().pausedSubscribers` counts live manual pauses and the
 Prometheus exposition carries `eventbus_paused_subscribers`.
+
+## Publish circuit breaker (EB-116)
+
+`bus.setPublishCircuitBreaker(topic, opts?)` arms an opt-in publish-side
+circuit breaker for one topic — a fail-fast for a topic whose consumers
+are all down. Disabled by default: without a rule the topic keeps
+exactly its old publish behavior (backward compatible).
+
+```ts
+bus.setPublishCircuitBreaker('orders.eu', {
+  consecutiveShedPublishes: 5, // default
+  halfOpenProbeIntervalMs: 1000, // default, bus clock
+});
+```
+
+Semantics:
+
+- **Trip condition.** The breaker opens when `consecutiveShedPublishes`
+  publishes in a row each find *every* production subscriber of the
+  topic degraded (health-probe auto-pause, EB-18) or shedding at the
+  publish side (adaptive-throttle excursion, EB-14). A publish that finds
+  at least one healthy subscriber resets the streak; a topic with no
+  subscribers never trips.
+- **Fast-fail, never silent.** While open, `publish` throws
+  `CircuitBreakerOpenError` immediately instead of fanning the message
+  out to subscribers that cannot consume it — a dropped message is never
+  mistaken for a delivered one. The refusal is counted in
+  `TopicStats.circuitBrokenMessages` / `BusStats.circuitBrokenMessages`
+  (plus `circuitBreakerTrips` per open transition) and surfaced on
+  `EventBusOptions.onAdmissionRejected` with reason `'circuit-breaker'`.
+  Refusals are pre-admission: no sequence number is consumed.
+- **Half-open probe.** After `halfOpenProbeIntervalMs`, one publish is
+  admitted as a probe: it closes the breaker when it finds a healthy
+  subscriber, and re-opens it (restarting the interval) when every
+  subscriber is still degraded/shedding.
+- **Observability.** `getStats().circuitBreakers` lists each armed
+  breaker (`topic`, `state`, `rejectedMessages`);
+  `bus.circuitBreakerState(topic)` reads one breaker's live state
+  (`'closed'` | `'open'` | `'half-open'`, `undefined` when no rule is
+  armed); `bus.clearPublishCircuitBreaker(topic)` disarms it. The
+  Prometheus exposition carries
+  `eventbus_circuit_broken_messages_total`,
+  `eventbus_circuit_breaker_trips_total`,
+  `eventbus_circuit_breakers_open`, and per-topic
+  `eventbus_topic_circuit_broken_messages_total{topic}`.

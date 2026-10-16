@@ -32,6 +32,11 @@
  *   per-topic rate limiting.
  * - `eventbus_paused_messages_total`: publishes shed by topic pauses in
  *   shed mode (EB-88).
+ * - `eventbus_circuit_broken_messages_total`: publishes refused by
+ *   publish circuit breakers (EB-116) — the breaker was open, so
+ *   `publish` threw `CircuitBreakerOpenError` (fast-fail).
+ * - `eventbus_circuit_breaker_trips_total`: times a publish circuit
+ *   breaker opened (EB-116).
  * - `eventbus_duplicate_messages_total`: idempotent publishes suppressed
  *   as duplicates.
  * - `eventbus_filtered_messages_total`: messages skipped by subscriber
@@ -59,6 +64,8 @@
  *   byte-identical exposition to before).
  * - `eventbus_topic_paused_messages_total{topic}`: publishes per topic
  *   shed by topic pauses in shed mode (EB-88).
+ * - `eventbus_topic_circuit_broken_messages_total{topic}`: publishes per
+ *   topic refused by its publish circuit breaker (EB-116).
  * - `eventbus_topic_late_messages_total{topic}`: messages per topic whose
  *   business event time was older than the topic's event-time watermark
  *   (EB-59; still delivered — a data-quality counter, not a loss
@@ -93,6 +100,8 @@
  * - `eventbus_pending_delayed`: delayed messages scheduled but not yet
  *   due.
  * - `eventbus_paused_topics`: currently active topic-pause rules (EB-88).
+ * - `eventbus_circuit_breakers_open`: publish circuit breakers currently
+ *   open (fast-failing; EB-116).
  * - `eventbus_causal_buffer_depth`: messages currently held in
  *   per-(subscriber, source) causal reorder buffers, waiting on their
  *   dependencies.
@@ -298,6 +307,16 @@ export function renderPrometheus(stats: BusStats): string {
     stats.pausedMessages ?? 0,
   );
   counter(
+    'eventbus_circuit_broken_messages_total',
+    'Total publishes refused by publish circuit breakers (EB-116): the topic breaker was open (every subscriber degraded or shedding), so publish threw CircuitBreakerOpenError (fast-fail).',
+    stats.circuitBrokenMessages ?? 0,
+  );
+  counter(
+    'eventbus_circuit_breaker_trips_total',
+    'Total times a publish circuit breaker opened (EB-116).',
+    stats.circuitBreakerTrips ?? 0,
+  );
+  counter(
     'eventbus_duplicate_messages_total',
     'Total idempotent publishes suppressed as duplicates.',
     stats.duplicateMessages,
@@ -415,6 +434,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.pausedTopics?.length ?? 0,
   );
   gauge(
+    'eventbus_circuit_breakers_open',
+    'Publish circuit breakers currently open (fast-failing; EB-116).',
+    (stats.circuitBreakers ?? []).filter((row) => row.state === 'open').length,
+  );
+  gauge(
     'eventbus_queue_bytes',
     'Estimated buffered payload bytes across all live subscriber backpressure queues.',
     stats.queueBytes ?? 0,
@@ -528,6 +552,10 @@ export function renderPrometheus(stats: BusStats): string {
   );
   lines.push('# TYPE eventbus_topic_paused_messages_total counter');
   lines.push(
+    '# HELP eventbus_topic_circuit_broken_messages_total Total publishes to the topic refused by its publish circuit breaker (EB-116).',
+  );
+  lines.push('# TYPE eventbus_topic_circuit_broken_messages_total counter');
+  lines.push(
     '# HELP eventbus_topic_subscribers Subscribers matched by the most recent publish to the topic (fan-out width).',
   );
   lines.push('# TYPE eventbus_topic_subscribers gauge');
@@ -543,6 +571,10 @@ export function renderPrometheus(stats: BusStats): string {
     const label = `topic="${escapeLabelValue(t.topic)}"`;
     lines.push(`eventbus_topic_published_messages_total{${label}} ${t.publishedMessages}`);
     lines.push(`eventbus_topic_paused_messages_total{${label}} ${t.pausedMessages ?? 0}`);
+    // `?? 0` keeps the renderer tolerant of a stats object that predates
+    // the field (hand-built fixtures included), mirroring the late-message
+    // idiom below.
+    lines.push(`eventbus_topic_circuit_broken_messages_total{${label}} ${t.circuitBrokenMessages ?? 0}`);
     lines.push(`eventbus_topic_subscribers{${label}} ${t.subscriberCount}`);
     // `?? 0` keeps the renderer tolerant of a stats object that predates
     // the field (hand-built fixtures included), mirroring the namespaces

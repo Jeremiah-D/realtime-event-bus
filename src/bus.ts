@@ -1879,6 +1879,50 @@ export interface ReliableSubscribeOptions extends SubscribeOptions {
 }
 
 /**
+ * Live state of one topic's publish circuit breaker (see
+ * `setPublishCircuitBreaker`, EB-116).
+ */
+export type PublishCircuitBreakerState = 'closed' | 'open' | 'half-open';
+
+/**
+ * Tuning for a topic's publish circuit breaker (see
+ * `setPublishCircuitBreaker`, EB-116). The breaker is opt-in per topic —
+ * without a rule the topic keeps exactly its old publish behavior.
+ */
+export interface PublishCircuitBreakerOptions {
+  /**
+   * How many consecutive publishes must find every subscriber of the
+   * topic degraded (health-probe auto-pause, EB-18) or shedding at the
+   * publish side (adaptive-throttle excursion, EB-14) before the breaker
+   * opens. A publish that finds at least one healthy subscriber resets
+   * the streak. Must be a positive integer. Defaults to 5.
+   */
+  consecutiveShedPublishes?: number;
+  /**
+   * How long an open breaker waits before admitting one probe publish
+   * (half-open): a probe that finds at least one healthy subscriber
+   * closes the breaker; a probe that still finds every subscriber
+   * degraded/shedding re-opens it. Measured on the bus clock
+   * (`EventBusOptions.now`). Must be a positive finite number.
+   * Defaults to 1000.
+   */
+  halfOpenProbeIntervalMs?: number;
+}
+
+/**
+ * One row of `BusStats.circuitBreakers`: the live state of a topic's
+ * publish circuit breaker (see `setPublishCircuitBreaker`, EB-116).
+ */
+export interface CircuitBreakerStat {
+  /** The concrete topic the breaker guards. */
+  topic: string;
+  /** `'closed'` (normal), `'open'` (fast-failing), or `'half-open'` (probing). */
+  state: PublishCircuitBreakerState;
+  /** Publishes refused while the breaker was open (fast-fail). */
+  rejectedMessages: number;
+}
+
+/**
  * Tuning for a reliable subscriber's dead-letter queue (see
  * `ReliableSubscribeOptions.deadLetter`).
  */
@@ -2838,6 +2882,17 @@ export interface TopicStats {
    */
   pausedMessages: number;
   /**
+   * Publishes to this topic refused by the publish circuit breaker (see
+   * `setPublishCircuitBreaker`, EB-116): the breaker was open when the
+   * message was published — every subscriber was degraded or shedding —
+   * so `publish` threw `CircuitBreakerOpenError` instead of fanning the
+   * message out. Unlike rate-limit sheds this is a fail-fast refusal: the
+   * payload never became a message, so it consumed no sequence number and
+   * is invisible to gap detection. Surfaced on `onAdmissionRejected`
+   * with reason `'circuit-breaker'`.
+   */
+  circuitBrokenMessages: number;
+  /**
    * Publishes to this topic rejected by admission gates that fire before
    * admission — schema validation (see `setTopicSchema`), the broker-level
    * ACL (see `setAclRules`), the per-topic message-size cap (see
@@ -3142,6 +3197,27 @@ export interface BusStats {
    * exact counting rules.
    */
   pausedMessages: number;
+  /**
+   * Total publishes refused by publish circuit breakers (see
+   * `setPublishCircuitBreaker`, EB-116) — the sum of every topic's
+   * `circuitBrokenMessages`. See `TopicStats.circuitBrokenMessages` for
+   * the exact counting rules.
+   */
+  circuitBrokenMessages: number;
+  /**
+   * Total times a publish circuit breaker opened (see
+   * `setPublishCircuitBreaker`, EB-116): one trip per closed→open
+   * transition. Monotonic.
+   */
+  circuitBreakerTrips: number;
+  /**
+   * Live per-topic publish circuit breakers (see
+   * `setPublishCircuitBreaker`, EB-116), in registration order: the
+   * topic, its current state, and how many publishes it has refused.
+   * Empty when no breaker is configured — the field is always present,
+   * so readers never need a fallback.
+   */
+  circuitBreakers: CircuitBreakerStat[];
   /**
    * Total failed `OffsetStore.set` calls (EB-114, see
    * `EventBusOptions.offsetStore`): a throwing custom store never breaks
@@ -4414,6 +4490,33 @@ interface ThrottleState {
 }
 
 /**
+ * Live state of one topic's publish circuit breaker (see
+ * `setPublishCircuitBreaker`, EB-116). Present only for topics with an
+ * installed rule — the breaker is opt-in, so the map entry existing is
+ * what arms the gate on the publish path.
+ */
+interface PublishCircuitBreaker {
+  /** The concrete topic the breaker guards. */
+  topic: string;
+  /** Publishes-in-a-row with every subscriber degraded/shedding that trip the breaker. */
+  consecutiveShedPublishes: number;
+  /** Milliseconds an open breaker waits before admitting a half-open probe. */
+  halfOpenProbeIntervalMs: number;
+  /** Current gate state. */
+  state: PublishCircuitBreakerState;
+  /**
+   * Consecutive publishes that found every production subscriber of the
+   * topic degraded (health-probe auto-pause) or shedding (throttle
+   * excursion). Reset by any publish that finds a healthy subscriber.
+   */
+  consecutiveBlocked: number;
+  /** `now()` reading when the breaker last opened. */
+  openedAtMs: number;
+  /** Publishes refused while open (fast-fail). */
+  rejectedMessages: number;
+}
+
+/**
  * Per-subscriber dead-letter queue state (see
  * `ReliableSubscribeOptions.deadLetter`). `entries` holds the poison
  * messages in dead-lettering order; each record keeps the original
@@ -4480,6 +4583,7 @@ function zeroedTopicStats(): {
   rateLimitedMessages: number;
   publisherRateLimited: number;
   pausedMessages: number;
+  circuitBrokenMessages: number;
   rejectedMessages: number;
   deprecatedSchemaVersions: number;
   lateMessages: number;
@@ -4503,6 +4607,7 @@ function zeroedTopicStats(): {
     rateLimitedMessages: 0,
     publisherRateLimited: 0,
     pausedMessages: 0,
+    circuitBrokenMessages: 0,
     rejectedMessages: 0,
     deprecatedSchemaVersions: 0,
     lateMessages: 0,
@@ -6025,6 +6130,12 @@ interface PauseBufferEntry {
  *   `BusStats.pausedMessages` (publish to a topic paused in shed mode —
  *   the shed consumes a sequence number like a `'rate-limit'` shed, so
  *   subscribers see the loss as a gap, EB-88)
+ * - `'circuit-breaker'` → `TopicStats.circuitBrokenMessages` /
+ *   `BusStats.circuitBrokenMessages` (the topic's publish circuit breaker
+ *   was open — every subscriber degraded or shedding — so `publish`
+ *   threw `CircuitBreakerOpenError` instead of admitting; the refusal is
+ *   pre-admission, consumes no sequence number, and is invisible to gap
+ *   detection, EB-116)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
@@ -6041,7 +6152,8 @@ export type AdmissionRejectReason =
   | 'publisher-rate-limit'
   | 'duplicate'
   | 'alias-retired'
-  | 'topic-paused';
+  | 'topic-paused'
+  | 'circuit-breaker';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -6368,6 +6480,31 @@ export class AclDeniedError extends Error {
     this.name = 'AclDeniedError';
     this.action = action;
     this.pattern = pattern;
+  }
+}
+
+/**
+ * Thrown by `publish` when the topic's publish circuit breaker (see
+ * `setPublishCircuitBreaker`, EB-116) is open: every subscriber of the
+ * topic has been degraded (health-probe auto-pause, EB-18) or shedding at
+ * the publish side (adaptive-throttle excursion, EB-14) for the
+ * configured number of consecutive publishes, so the bus refuses the
+ * publish outright instead of fanning it out to subscribers that cannot
+ * consume it. Fail-fast, never silent: the refusal is counted in
+ * `TopicStats.circuitBrokenMessages` / `BusStats.circuitBrokenMessages`
+ * and surfaced on `EventBusOptions.onAdmissionRejected` with reason
+ * `'circuit-breaker'` before the throw.
+ */
+export class CircuitBreakerOpenError extends Error {
+  /** The concrete topic whose breaker refused the publish. */
+  readonly topic: string;
+  /** Always `'CIRCUIT_BREAKER_OPEN'`. */
+  readonly code = 'CIRCUIT_BREAKER_OPEN';
+
+  constructor(topic: string) {
+    super(`publish: circuit breaker is open for topic "${topic}" — refusing publish (fast-fail)`);
+    this.name = 'CircuitBreakerOpenError';
+    this.topic = topic;
   }
 }
 
@@ -7672,6 +7809,7 @@ export class EventBus {
       rateLimitedMessages: number;
       publisherRateLimited: number;
       pausedMessages: number;
+      circuitBrokenMessages: number;
       rejectedMessages: number;
       duplicateMessages: number;
       filteredMessages: number;
@@ -7965,6 +8103,13 @@ export class EventBus {
    */
   private rateLimitRules = new Map<string, { messagesPerSec: number; burst: number }>();
   /**
+   * Publish circuit breakers by concrete topic (see
+   * `setPublishCircuitBreaker`, EB-116). Empty by default — the breaker
+   * gate is opt-in, so a bus with no rules keeps exactly its old publish
+   * behavior.
+   */
+  private publishCircuitBreakers = new Map<string, PublishCircuitBreaker>();
+  /**
    * Per-topic subscriber caps (EB-81), keyed by the exact string passed
    * to `setTopicMaxSubscribers` — either a concrete topic name or a
    * wildcard pattern. Match resolution mirrors `setTopicTtl`: an
@@ -8040,6 +8185,14 @@ export class EventBus {
    * `totalRejected`.
    */
   private totalPaused = 0;
+  /**
+   * Publishes refused by publish circuit breakers (global total) — the
+   * fail-fast refusals that threw `CircuitBreakerOpenError` (EB-116).
+   * Pre-admission like `totalRejected`: no sequence number consumed.
+   */
+  private totalCircuitBroken = 0;
+  /** Times a publish circuit breaker opened (closed→open), global total (EB-116). */
+  private totalCircuitBreakerTrips = 0;
   /** Counter for pause-buffer message ids (`paused-1`, …). */
   private nextPauseId = 0;
   /**
@@ -9511,6 +9664,73 @@ export class EventBus {
     const removed = this.rateLimitRules.delete(topicPattern);
     if (removed) this.rateLimitBuckets.clear();
     return removed;
+  }
+
+  /**
+   * Arms a publish circuit breaker for `topic` (EB-116) — an opt-in
+   * publish-side fast-fail for a topic whose consumers are all down.
+   * Disabled by default: without a rule the topic keeps exactly its old
+   * publish behavior.
+   *
+   * The breaker trips open when `consecutiveShedPublishes` publishes in a
+   * row (default 5) each find every production subscriber of the topic
+   * degraded (health-probe auto-pause, EB-18) or shedding at the publish
+   * side (adaptive-throttle excursion, EB-14). A publish that finds at
+   * least one healthy subscriber resets the streak; a topic with no
+   * subscribers never trips. While open, `publish` throws
+   * `CircuitBreakerOpenError` immediately — the refusal is counted in
+   * `TopicStats.circuitBrokenMessages` (and the global total) and
+   * surfaced on `EventBusOptions.onAdmissionRejected` with reason
+   * `'circuit-breaker'`, so a producer is never left thinking a dropped
+   * message was delivered. After `halfOpenProbeIntervalMs` (default
+   * 1000ms, bus clock) one probe publish is admitted (half-open): it
+   * closes the breaker when it finds a healthy subscriber, and re-opens
+   * it when every subscriber is still degraded/shedding.
+   *
+   * The rule keys on the exact concrete topic name (post namespace and
+   * alias resolution). Re-setting replaces the rule and resets the
+   * breaker's state and streak. Throws `RangeError` when `topic` is
+   * empty, when `consecutiveShedPublishes` is not a positive integer, or
+   * when `halfOpenProbeIntervalMs` is not a positive finite number.
+   */
+  setPublishCircuitBreaker(topic: string, opts?: PublishCircuitBreakerOptions): void {
+    if (topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    const consecutiveShedPublishes = opts?.consecutiveShedPublishes ?? 5;
+    if (!Number.isInteger(consecutiveShedPublishes) || consecutiveShedPublishes < 1) {
+      throw new RangeError('consecutiveShedPublishes must be a positive integer');
+    }
+    const halfOpenProbeIntervalMs = opts?.halfOpenProbeIntervalMs ?? 1000;
+    if (!Number.isFinite(halfOpenProbeIntervalMs) || halfOpenProbeIntervalMs <= 0) {
+      throw new RangeError('halfOpenProbeIntervalMs must be a positive finite number of milliseconds');
+    }
+    this.publishCircuitBreakers.set(topic, {
+      topic,
+      consecutiveShedPublishes,
+      halfOpenProbeIntervalMs,
+      state: 'closed',
+      consecutiveBlocked: 0,
+      openedAtMs: 0,
+      rejectedMessages: 0,
+    });
+  }
+
+  /**
+   * Removes the publish circuit breaker previously armed for `topic`.
+   * Returns true when a rule existed and was removed.
+   */
+  clearPublishCircuitBreaker(topic: string): boolean {
+    return this.publishCircuitBreakers.delete(topic);
+  }
+
+  /**
+   * Returns the live state (`'closed'` | `'open'` | `'half-open'`) of the
+   * publish circuit breaker armed for `topic`, or `undefined` when no
+   * rule is configured (the breaker is disabled for the topic).
+   */
+  circuitBreakerState(topic: string): PublishCircuitBreakerState | undefined {
+    return this.publishCircuitBreakers.get(topic)?.state;
   }
 
   /**
@@ -11397,6 +11617,7 @@ export class EventBus {
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
         pausedMessages: 0,
+        circuitBrokenMessages: 0,
         rejectedMessages: 0,
         lateMessages: 0,
         duplicateMessages: 0,
@@ -15613,6 +15834,25 @@ export class EventBus {
       this.scheduleFlush();
       return accepted;
     }
+    // Publish circuit breaker (EB-116): the fail-fast gate for topics
+    // whose every subscriber is degraded or shedding. Opt-in per topic —
+    // with no rules installed this branch is a single map-size check and
+    // publish behaves exactly as before. The rule keys on the concrete
+    // (alias-resolved) topic; a retired alias is rejected by `fanOut`
+    // below with reason 'alias-retired' and never consults the breaker.
+    // Barrier control messages return above and skip the gate
+    // (control-plane, not business data).
+    let breakerTopic: string | undefined;
+    if (this.publishCircuitBreakers.size > 0) {
+      const aliasResolution = this.resolvePublishTopic(topic);
+      if (!aliasResolution.retired) {
+        breakerTopic = aliasResolution.topic;
+        // Throws CircuitBreakerOpenError when the breaker is open (and
+        // counts the refusal); moves open→half-open when the probe
+        // interval has elapsed.
+        this.checkPublishCircuitBreaker(breakerTopic, payload, opts?.publisherId);
+      }
+    }
     const { accepted } = this.fanOut(
       topic,
       payload,
@@ -15641,6 +15881,11 @@ export class EventBus {
       opts?.partition,
       binary,
     );
+    if (breakerTopic !== undefined) {
+      // Trip/close evaluation: trips open after enough consecutive
+      // all-degraded/shedding publishes; resolves a half-open probe.
+      this.updatePublishCircuitBreaker(breakerTopic);
+    }
     this.scheduleFlush();
     return accepted;
   }
@@ -17967,6 +18212,115 @@ export class EventBus {
     this.statsFor(topic).pausedMessages += 1;
     this.totalPaused += 1;
     this.emitAdmissionRejected(topic, 'topic-paused', payload, publisherId);
+  }
+
+  /**
+   * Publish circuit breaker fast-fail gate (EB-116): runs in `publish`
+   * after namespace resolution, before `fanOut`. When the topic's
+   * breaker is open and its half-open probe interval has not elapsed,
+   * the publish is refused outright — counted in
+   * `circuitBrokenMessages`, surfaced on the admission-rejection hook
+   * with reason `'circuit-breaker'`, and thrown as
+   * `CircuitBreakerOpenError` so the caller never mistakes the refusal
+   * for a delivered message. When the probe interval has elapsed the
+   * breaker moves to half-open and this one publish is admitted as the
+   * probe; the post-fan-out evaluation in `updatePublishCircuitBreaker`
+   * then closes or re-opens it. No-op for topics without a rule.
+   */
+  private checkPublishCircuitBreaker(topic: string, payload: unknown, publisherId?: string): void {
+    const breaker = this.publishCircuitBreakers.get(topic);
+    if (breaker === undefined || breaker.state === 'closed') return;
+    if (breaker.state === 'open') {
+      if (this.now() - breaker.openedAtMs < breaker.halfOpenProbeIntervalMs) {
+        this.countCircuitBroken(topic, breaker, payload, publisherId);
+        throw new CircuitBreakerOpenError(topic);
+      }
+      // Half-open: admit this publish as the probe. If `fanOut` throws
+      // below (a throwing filter or validator), the breaker stays
+      // half-open and the next publish simply probes again — the probe
+      // is always re-evaluated after a completed fan-out.
+      breaker.state = 'half-open';
+      return;
+    }
+    // 'half-open': a probe is already admitted (or one died in `fanOut`
+    // with a throw) — admit this publish as the probe as well and let
+    // the post-fan-out evaluation resolve the state.
+  }
+
+  /**
+   * Publish circuit breaker trip/close evaluation (EB-116): runs in
+   * `publish` right after `fanOut`. When every production subscriber of
+   * the topic is degraded (health-probe auto-pause, EB-18) or shedding
+   * at the publish side (adaptive-throttle excursion, EB-14), the
+   * consecutive streak grows and the breaker trips open at the
+   * configured threshold; any publish that finds at least one healthy
+   * subscriber resets the streak. A half-open probe closes the breaker
+   * on success and re-opens it when every subscriber is still
+   * degraded/shedding. A topic with no subscribers never trips.
+   */
+  private updatePublishCircuitBreaker(topic: string): void {
+    const breaker = this.publishCircuitBreakers.get(topic);
+    if (breaker === undefined) return;
+    const unhealthy = this.circuitBreakerUnhealthy(topic);
+    if (breaker.state === 'half-open') {
+      if (unhealthy.allUnhealthy) {
+        // Probe failed: every subscriber is still degraded/shedding —
+        // re-open and restart the probe interval.
+        breaker.state = 'open';
+        breaker.openedAtMs = this.now();
+      } else {
+        breaker.state = 'closed';
+        breaker.consecutiveBlocked = 0;
+      }
+      return;
+    }
+    if (unhealthy.allUnhealthy) {
+      breaker.consecutiveBlocked += 1;
+      if (breaker.consecutiveBlocked >= breaker.consecutiveShedPublishes) {
+        breaker.state = 'open';
+        breaker.openedAtMs = this.now();
+        this.totalCircuitBreakerTrips += 1;
+      }
+    } else {
+      breaker.consecutiveBlocked = 0;
+    }
+  }
+
+  /**
+   * Whether every production subscriber matching `topic` is currently
+   * unable to consume: degraded by the health probe (delivery
+   * auto-paused, EB-18) or mid throttle excursion (publish-side shed,
+   * EB-14). Shadow mirrors are not consumers of the topic and are
+   * excluded. `allUnhealthy` is false when the topic has no production
+   * subscribers.
+   */
+  private circuitBreakerUnhealthy(topic: string): { count: number; allUnhealthy: boolean } {
+    let count = 0;
+    let allUnhealthy = true;
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.shadow !== undefined) continue;
+      if (!subscriber.matcher.test(topic)) continue;
+      count += 1;
+      const degraded = subscriber.health?.degraded === true;
+      const shedding = subscriber.throttle?.throttled === true;
+      if (!degraded && !shedding) {
+        allUnhealthy = false;
+      }
+    }
+    return { count, allUnhealthy: count > 0 && allUnhealthy };
+  }
+
+  /** Counts one fast-fail refusal of the topic's publish circuit breaker. */
+  private countCircuitBroken(
+    topic: string,
+    breaker: PublishCircuitBreaker,
+    payload: unknown,
+    publisherId?: string,
+  ): void {
+    breaker.rejectedMessages += 1;
+    this.statsFor(topic).circuitBrokenMessages += 1;
+    this.totalCircuitBroken += 1;
+    this.emitAdmissionRejected(topic, 'circuit-breaker', payload, publisherId);
   }
 
   /**
@@ -20871,6 +21225,15 @@ export class EventBus {
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
       pausedMessages: this.totalPaused,
+      circuitBrokenMessages: this.totalCircuitBroken,
+      circuitBreakerTrips: this.totalCircuitBreakerTrips,
+      // Live per-topic publish circuit breakers (EB-116), in registration
+      // order — `[]` when no breaker is configured.
+      circuitBreakers: [...this.publishCircuitBreakers.values()].map((breaker) => ({
+        topic: breaker.topic,
+        state: breaker.state,
+        rejectedMessages: breaker.rejectedMessages,
+      })),
       offsetStoreWriteErrors: this.totalOffsetStoreWriteErrors,
       // Active topic-pause rules (EB-88), in registration order.
       pausedTopics: [...this.pauseRules.entries()].map(([topicPattern, rule]) => ({
@@ -21061,6 +21424,7 @@ export class EventBus {
         rateLimitedMessages: stats.rateLimitedMessages,
         publisherRateLimited: stats.publisherRateLimited,
         pausedMessages: stats.pausedMessages,
+        circuitBrokenMessages: stats.circuitBrokenMessages,
         rejectedMessages: stats.rejectedMessages,
         deprecatedSchemaVersions: stats.deprecatedSchemaVersions,
         lateMessages: stats.lateMessages,
