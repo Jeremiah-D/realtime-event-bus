@@ -212,4 +212,13 @@ export class PublishRateTable {
   get topicCount(): number {
     return this.rings.size;
   }
+
+  /**
+   * Drops a topic's rate ring (EB-126): the per-topic publish-rate state
+   * is torn down with the topic instead of lingering as a stale ring.
+   * A re-created topic starts from all-zero rates.
+   */
+  remove(topic: string): boolean {
+    return this.rings.delete(topic);
+  }
 }

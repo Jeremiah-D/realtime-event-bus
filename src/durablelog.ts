@@ -2740,6 +2740,99 @@ export class DurableTopicLog {
   }
 
   /**
+   * Destroys one topic's durable state (EB-126 `deleteTopic` with
+   * `purge: true`): the live log file (`<topic>.log`), pending and
+   * archived segments (`<topic>.seg-<start>-<end>.jsonl.tmp/.gz`) and
+   * their EB-94 checksum sidecars (`.sha256`), the topic's lines in the
+   * archive index (`__archive_index.jsonl`) and the EB-118 segment-chain
+   * manifest (`__segment_chain.jsonl`), and every in-memory counter keyed
+   * by the topic (`lastSeqs` and friends — numbering restarts from 1 if
+   * the topic is ever re-provisioned). The two journals are rewritten
+   * without the topic's lines rather than deleted; every other topic's
+   * data is untouched.
+   *
+   * Key matching is exact: the URL-encoded topic plus the `.log` / `.seg-`
+   * suffixes, so topic `orders` never takes `orders.eu`'s files with it.
+   * Returns what was destroyed, for the audit trail.
+   */
+  purgeTopic(topic: string): { filesDeleted: number; indexLinesRemoved: number; chainLinesRemoved: number } {
+    const enc = encodeURIComponent(topic);
+    const liveKey = `${enc}.log`;
+    const segmentPrefix = `${enc}.seg-`;
+    let filesDeleted = 0;
+    for (const key of this.backend.list()) {
+      if (key === liveKey || key.startsWith(segmentPrefix)) {
+        try {
+          this.backend.delete(key);
+          filesDeleted += 1;
+        } catch {
+          // Best effort: the in-memory state below is still cleared so
+          // the bus never serves a half-purged topic.
+        }
+      }
+    }
+    // The topic's archive-index and chain-manifest lines go; unparseable
+    // lines are kept verbatim (recovery already skips them — never fatal).
+    let indexLinesRemoved = 0;
+    const indexText = this.readText(this.archiveIndexKey);
+    if (indexText !== undefined) {
+      const kept: string[] = [];
+      for (const line of indexText.split('\n')) {
+        if (line.trim() === '') continue;
+        const entry = parseArchiveIndexLine(line);
+        if (entry !== null && entry.topic === topic) {
+          indexLinesRemoved += 1;
+          continue;
+        }
+        kept.push(line);
+      }
+      this.backend.write(this.archiveIndexKey, kept.length === 0 ? '' : `${kept.join('\n')}\n`);
+    }
+    let chainLinesRemoved = 0;
+    const chainText = this.readText(CHAIN_MANIFEST_NAME);
+    if (chainText !== undefined) {
+      const kept: string[] = [];
+      for (const line of chainText.split('\n')) {
+        if (line.trim() === '') continue;
+        const entry = parseChainManifestLine(line);
+        if (entry !== null && entry.topic === topic) {
+          chainLinesRemoved += 1;
+          continue;
+        }
+        kept.push(line);
+      }
+      this.backend.write(CHAIN_MANIFEST_NAME, kept.length === 0 ? '' : `${kept.join('\n')}\n`);
+    }
+    // In-memory state: the topic must read as never-seen afterwards.
+    this.topicsSeen.delete(topic);
+    this.entryCounts.delete(topic);
+    this.messageCounts.delete(topic);
+    this.lastSeqs.delete(topic);
+    this.maxPartitionSeqs.delete(topic);
+    this.keyIndex.delete(topic);
+    // maxKeySeqs is keyed by message key, not topic — key sequence numbers
+    // are a cross-topic publish-order space (mirrors the bus's keyCursors),
+    // so purging one topic must not touch it.
+    this.supersededCounts.delete(topic);
+    this.segmentEntries.delete(topic);
+    this.segmentStartSeq.delete(topic);
+    this.segmentStartAt.delete(topic);
+    this.topicBytes.delete(topic);
+    this.archivesByTopic.delete(topic);
+    this.chainTails.delete(topic);
+    for (const path of [...this.checksumRejected]) {
+      if (path.startsWith(segmentPrefix)) this.checksumRejected.delete(path);
+    }
+    for (let i = this.archives.length - 1; i >= 0; i--) {
+      if (this.archives[i].topic === topic) this.archives.splice(i, 1);
+    }
+    for (let i = this.chainEntries.length - 1; i >= 0; i--) {
+      if (this.chainEntries[i].topic === topic) this.chainEntries.splice(i, 1);
+    }
+    return { filesDeleted, indexLinesRemoved, chainLinesRemoved };
+  }
+
+  /**
    * Scans the offset journal and rebuilds the in-memory checkpoint index:
    * the highest committed seq per (group, topic) wins, so a restarted bus
    * resumes from where its consumers committed, not from zero. Corrupt

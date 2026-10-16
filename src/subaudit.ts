@@ -49,6 +49,8 @@ export type SubscriptionAuditAction =
   | 'rebalance'
   | 'topic_register'
   | 'topic_deregister'
+  | 'topic_created'
+  | 'topic_deleted'
   | 'backpressure_dropped'
   | 'signature_verification_failed'
   | 'retention_updated'
@@ -76,6 +78,14 @@ export type SubscriptionAuditAction =
  *   the held roster slot was released after the session window)
  * - `topic_register`: `{ owner?, description?, schemaVersion?, tags?, updated: <bool> }`
  * - `topic_deregister`: `{ owner?, description? }` (last-known metadata)
+ * - `topic_created`: `{ updated: <bool>, ttlMs?, retentionMaxAgeMs?,
+ *   compression: <bool>, signing: <bool> }` — a topic lifecycle
+ *   provisioning (EB-126); the `topic` field carries the concrete topic
+ * - `topic_deleted`: `{ purge: <bool>, invalidatedSubscriptions: <count>,
+ *   hadProvisioning: <bool> }` — a topic lifecycle deletion (EB-126); the
+ *   `topic` field carries the concrete topic. Per invalidated wildcard
+ *   subscription a second event is recorded with `subId`/`pattern` and
+ *   `detail: { reason: 'wildcard_subscription_invalidated', purge }`
  * - `backpressure_dropped`: `{ policy: <backpressure tier>, dropped: <count>, queueSize: <number> }`
  * - `signature_verification_failed`: `{ seq: <per-topic seq>, kid?: <key id that signed, when present> }`
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
@@ -152,6 +162,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'rebalance',
   'topic_register',
   'topic_deregister',
+  'topic_created',
+  'topic_deleted',
   'backpressure_dropped',
   'signature_verification_failed',
   'retention_updated',

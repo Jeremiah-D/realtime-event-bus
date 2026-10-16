@@ -4046,3 +4046,83 @@ wake-up timer is unref'd (a pending job never keeps the process alive), and
 due sweeps also run at the start of every flush, so advancing an injected
 clock past a trigger time and then publishing anything fires
 deterministically in tests.
+
+## Topic lifecycle management (EB-126)
+
+`bus.createTopic(name, opts)` provisions a topic — one call that registers
+the topic in the lifecycle registry and atomically applies a policy bundle
+through the existing per-topic configuration APIs, keyed by the exact
+(concrete, namespace-resolved) topic name:
+
+```ts
+bus.createTopic('orders.eu', {
+  metadata: { owner: 'payments-svc', tags: ['payments'] },
+  ttlMs: 60_000, // → setTopicTtl
+  compression: { thresholdBytes: 1024 }, // → setTopicCompression
+  signing: { keys: [{ kid: 'k1', secret: '…' }] }, // → setTopicSigningKey
+  retention: { maxAgeMs: 86_400_000 }, // → setDurableLogMaxAgeMs (bus-global!)
+});
+```
+
+Every option is validated before the first policy lands — a bad bundle
+throws `RangeError` with zero side effects. Re-provisioning a live topic
+updates its policies (returns `{ created: false }`); a topic deleted
+earlier re-provisions fresh (`{ created: true }`) and admits publishes
+again. This registry is independent of the advisory EB-77 catalog:
+`createTopic` neither requires nor performs `registerTopic`.
+
+One honest deviation: **retention is bus-global** in this codebase (EB-85
+`setDurableLogMaxAgeMs`, EB-119 `durableLogMaxBytesPerTopic`) — there is
+no per-topic retention rule API to apply. `retention.maxAgeMs` therefore
+moves the shared durable-log age bound for every topic, exactly like
+calling `setDurableLogMaxAgeMs` yourself (same validation, same audit
+trail). Pass it only when you mean it.
+
+`bus.deleteTopic(name, { purge })` tears the topic down and leaves a
+tombstone:
+
+- **Wildcard subscriptions die with the topic.** Any subscription whose
+  pattern contains `*` and whose compiled matcher still hits the topic is
+  removed through the normal unsubscribe path (queues, timers, indexes
+  disposed; `unsubscribe` audited). For consumer-group members that path
+  performs the group leave and fires the **real** `onRebalance`
+  (`GroupRebalanceEvent`, trigger `'leave'`) — the membership hook's
+  actual scope. Plain wildcard subscriptions get the audit event, not a
+  fabricated group event: there is no generic topic-level rebalance hook
+  in this codebase. Exact-topic subscriptions are deliberately left
+  alone — they idle, and on a soft delete their replay still works.
+- **Future publishes are refused.** The tombstone is an admission gate in
+  `fanOut` (also `previewPublish` and `publishAtomic`): publishes to a
+  deleted topic are rejected with reason `'alias-retired'` — the
+  vocabulary's only "this name is retired from service" item, with its
+  zero-side-effect contract (no sequence number, no durable-log write,
+  no rate-limit budget). The gate is named `'topic-lifecycle'` in
+  `previewPublish` so the verdict stays attributable. The retired-alias
+  machinery itself is *not* reused: it is TTL-driven on alias links with
+  a migration target, while deletion has no successor.
+- **`purge: true` destroys durable history**: the live `<topic>.log`
+  file, archived segments and their checksum sidecars, the topic's
+  archive-index and segment-chain lines, the registered compression
+  dictionary (only when no other rule references its id), and every
+  sequence counter (`lastSeqs`, per-partition seqs, the bus's `topicSeq`)
+  — a re-provisioned topic numbers from 1 again. Without purge the
+  history is kept and stays replayable (`resumeFromSeq`,
+  `resumeFromTime`), including the retained message.
+- Pending delayed schedules and recurring jobs targeting the topic are
+  cancelled (a timer firing into a tombstoned topic would only burn
+  rejection counts); exact-name policy rules are removed (pattern keys
+  may still match other topics).
+
+Not purged, by design: the advisory EB-77 catalog, topic aliases/routes,
+committed consumer offsets and dedup journals (consumer/producer identity
+state, not topic data), cumulative `TopicStats`, and cross-topic key
+sequence cursors. Dictionaries and encryption keys live in memory in this
+codebase — there are no per-topic dictionary/key files; the sealed log
+lines die with the `.log` file.
+
+Names: empty strings, non-strings, and anything containing `*` throw
+`RangeError` — lifecycle manages concrete topics only. Both calls take an
+`actor` (default `'system'`) and are audited as `topic_created` /
+`topic_deleted` in the subscription lifecycle audit log. Deleting an
+unknown topic is a no-op returning `{ deleted: false }`; a soft-deleted
+topic deleted again with `purge: true` purges the retained history then.

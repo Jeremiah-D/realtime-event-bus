@@ -113,6 +113,16 @@ import {
   type TopicRegistration,
 } from './topics.ts';
 import {
+  TopicLifecycleRegistry,
+  assertValidLifecycleTopicName,
+  assertValidProvisioningMetadata,
+  type CreateTopicResult,
+  type DeleteTopicOptions,
+  type DeleteTopicResult,
+  type TopicLifecycleInfo,
+  type TopicProvisioningOptions,
+} from './topic-lifecycle.ts';
+import {
   NamespaceDeniedError,
   NamespaceHandle,
   NamespaceNotEmptyError,
@@ -6407,8 +6417,12 @@ export type AtomicRejectReason =
  * Which publish-side admission gate decided a `previewPublish` call — the
  * `failedGate` half of `PreviewPublishResult`. One name per gate in the
  * walk, in walk order:
- * - `'topic-alias'`: topic-alias resolution (EB-44) — the only gate whose
- *   reason is `'alias-retired'`
+ * - `'topic-alias'`: topic-alias resolution (EB-44) — a retired (TTL-expired)
+ *   old topic is refused here with reason `'alias-retired'`
+ * - `'topic-lifecycle'`: topic lifecycle (EB-126) — a deleted (tombstoned)
+ *   topic is refused here, also with reason `'alias-retired'` (the shared
+ *   "this name is retired from service" vocabulary); the gate is named
+ *   distinctly so the verdict stays attributable
  * - `'partition-routing'`: publish-side partition routing (EB-90) — walked
  *   (the range check runs), but an out-of-range explicit partition throws
  *   `RangeError` instead of rejecting, exactly like `publish`, so this
@@ -6429,6 +6443,7 @@ export type AtomicRejectReason =
  */
 export type PreviewGateName =
   | 'topic-alias'
+  | 'topic-lifecycle'
   | 'partition-routing'
   | 'topic-pause'
   | 'publisher-rate-limit'
@@ -9506,6 +9521,12 @@ export class EventBus {
    * counted and surfaced on `onUnregisteredTopic`, never blocked.
    */
   private readonly topicRegistry = new TopicRegistry();
+  /**
+   * Topic lifecycle registry (EB-126): provisioning records + deletion
+   * tombstones. Unlike the advisory EB-77 catalog above, a tombstone here
+   * is an admission gate — `fanOut` refuses publishes to a deleted topic.
+   */
+  private readonly topicLifecycle = new TopicLifecycleRegistry();
   /**
    * Unregistered-topic publish hook (`EventBusOptions.onUnregisteredTopic`),
    * or `undefined` when unset — the bus is then exactly as before (stats
@@ -14540,6 +14561,12 @@ export class EventBus {
     // member that goes idle leaves the competing set and triggers the
     // normal rebalance (EB-72).
     this.idleReclaimer.adoptUnsubscribe(sub.id, groupSubscription.unsubscribe);
+    // Recorded teardown is the outermost wrapper (EB-126): a bus-initiated
+    // removal (topic deletion) then performs the group leave and fires the
+    // rebalance instead of leaking the roster entry. Migration never sees
+    // group members (`exportSubscription` rejects them), so no migration
+    // path changes.
+    subscriber.teardown = groupSubscription.unsubscribe;
     return groupSubscription;
   }
 
@@ -17395,6 +17422,12 @@ export class EventBus {
       return { admitted: false, reason: 'alias-retired', failedGate: 'topic-alias' };
     }
     topic = aliasResolution.topic;
+    // Topic lifecycle (EB-126): mirrors `fanOut` — a deleted topic is
+    // refused with the shared 'alias-retired' reason under the
+    // 'topic-lifecycle' gate.
+    if (this.topicLifecycle.isDeleted(topic)) {
+      return { admitted: false, reason: 'alias-retired', failedGate: 'topic-lifecycle' };
+    }
     // Barrier cut markers (EB-98) take the slim admission path: the one
     // gate a control message keeps is the ACL — mirroring `fanOutBarrier`
     // minus its counting, hook, and delivery.
@@ -17623,6 +17656,13 @@ export class EventBus {
         return { published: 0, rejected: { index, topic, reason: 'alias-retired' } };
       }
       const resolvedTopic = aliasResolution.topic;
+      // Topic lifecycle (EB-126): mirrors `fanOut` — an entry targeting a
+      // deleted topic aborts the batch with the shared 'alias-retired'
+      // reason, counted exactly like any other admission failure.
+      if (this.topicLifecycle.isDeleted(resolvedTopic)) {
+        this.countAliasRetired(topic, payload);
+        return { published: 0, rejected: { index, topic, reason: 'alias-retired' } };
+      }
       resolvedTopics[index] = resolvedTopic;
       // Publish-side partition routing (EB-90): the range check runs here,
       // in admission — an out-of-range explicit partition aborts the batch
@@ -20004,6 +20044,304 @@ export class EventBus {
   }
 
   /**
+   * Provisions a topic's lifecycle (EB-126): registers the topic in the
+   * lifecycle registry and atomically applies the policy bundle through
+   * the existing per-topic configuration APIs, keyed by the exact
+   * (concrete, namespace-resolved) topic name:
+   * - `ttlMs` → `setTopicTtl`
+   * - `compression` → `setTopicCompression`
+   * - `signing` → `setTopicSigningKey`
+   * - `retention.maxAgeMs` → `setDurableLogMaxAgeMs` — bus-global, not
+   *   per-topic (see `TopicRetentionOptions`); throws `RangeError` when
+   *   the bus has no `durableLogDir`, exactly like `setDurableLogMaxAgeMs`
+   *
+   * Every option is validated before the first policy is applied, so a
+   * bad bundle throws `RangeError` with zero side effects. Re-provisioning
+   * an already-provisioned topic re-applies the supplied policies (absent
+   * options leave the current rule in place); a topic deleted earlier
+   * re-provisions fresh and accepts publishes again.
+   *
+   * This is independent of the advisory EB-77 catalog: `createTopic`
+   * neither requires nor performs `registerTopic`. Returns `{ topic,
+   * created }` — `created` is `true` when the call established a live
+   * provisioning (first-time or after deletion), `false` on a policy
+   * update. Audited as `topic_created`.
+   */
+  createTopic(name: string, opts?: TopicProvisioningOptions): CreateTopicResult {
+    assertValidLifecycleTopicName(name, 'createTopic');
+    const o = opts ?? {};
+    const actor = o.actor ?? 'system';
+    assertValidActor(actor, 'createTopic');
+    assertValidProvisioningMetadata(o.metadata, 'createTopic');
+    // Validate the whole bundle before mutating anything: the application
+    // below is atomic — a bad option throws before the first rule lands.
+    // Each check mirrors the setter it feeds (which re-validates; harmless).
+    const ttlMs = o.ttlMs;
+    if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 0)) {
+      throw new RangeError('createTopic: ttlMs must be a non-negative finite number of milliseconds');
+    }
+    const retentionMaxAgeMs = o.retention?.maxAgeMs;
+    if (retentionMaxAgeMs !== undefined) {
+      if (!Number.isFinite(retentionMaxAgeMs) || retentionMaxAgeMs <= 0) {
+        throw new RangeError('createTopic: retention.maxAgeMs must be a positive finite number of milliseconds');
+      }
+      if (this.durableLog == null) {
+        throw new RangeError('createTopic: retention requires EventBusOptions.durableLogDir to be set');
+      }
+    }
+    const compression = o.compression;
+    if (compression !== undefined) {
+      if (!Number.isFinite(compression.thresholdBytes) || compression.thresholdBytes <= 0) {
+        throw new RangeError('createTopic: compression.thresholdBytes must be a positive finite number of bytes');
+      }
+      const level = compression.level ?? 6;
+      if (!Number.isInteger(level) || level < 0 || level > 9) {
+        throw new RangeError('createTopic: compression.level must be an integer in 0-9');
+      }
+      coerceCompressionDictionary(compression.dictionary);
+      if (compression.autoTrain !== undefined) {
+        resolveAutoTrainOptions(compression.autoTrain, `createTopic("${name}")`);
+      }
+    }
+    const signing = o.signing;
+    if (signing !== undefined) {
+      assertValidSigningKeys(signing.keys, `createTopic("${name}")`);
+      const graceMs = signing.graceMs ?? 0;
+      if (!Number.isFinite(graceMs) || graceMs < 0) {
+        throw new RangeError('createTopic: signing.graceMs must be a non-negative finite number of milliseconds');
+      }
+    }
+    // All valid — apply through the existing per-topic APIs.
+    if (ttlMs !== undefined) this.setTopicTtl(name, ttlMs);
+    if (retentionMaxAgeMs !== undefined) this.setDurableLogMaxAgeMs(retentionMaxAgeMs, actor);
+    if (compression !== undefined) this.setTopicCompression(name, compression);
+    if (signing !== undefined) this.setTopicSigningKey(name, signing);
+    const { created } = this.topicLifecycle.provision(name, o.metadata, this.now());
+    this.auditSubscription({
+      action: 'topic_created',
+      topic: name,
+      actor,
+      detail: {
+        updated: !created,
+        ...(ttlMs === undefined ? {} : { ttlMs }),
+        ...(retentionMaxAgeMs === undefined ? {} : { retentionMaxAgeMs }),
+        compression: compression !== undefined,
+        signing: signing !== undefined,
+      },
+    });
+    return { topic: name, created };
+  }
+
+  /**
+   * Deletes a topic's lifecycle (EB-126): tears the topic down and leaves
+   * a tombstone that refuses future publishes (see `fanOut`'s
+   * `topic-lifecycle` gate — reason `'alias-retired'`, zero side
+   * effects). The teardown, in order:
+   *
+   * 1. Wildcard subscriptions (pattern contains `*`) whose compiled
+   *    matcher still hits the topic are removed through the normal
+   *    unsubscribe path — for consumer-group members that path performs
+   *    the group leave and fires the real `onRebalance`
+   *    (`GroupRebalanceEvent`, trigger `'leave'`). Each invalidation is
+   *    audited as `topic_deleted` with the subId/pattern. Plain
+   *    subscriptions get the subaudit event; there is no generic
+   *    topic-level rebalance hook to fire, and none is fabricated.
+   *    Exact-topic subscriptions are left alone (documented): they idle,
+   *    and on a soft delete their replay/resume still works.
+   * 2. Pending delayed schedules and recurring jobs targeting the topic
+   *    are cancelled through `cancelDelayedByTopic` / the recurring
+   *    canceller — a timer firing into a tombstoned topic would only burn
+   *    rejection counts.
+   * 3. With `purge: true`, the topic's durable state is destroyed via
+   *    `DurableTopicLog.purgeTopic` on the log that owns the concrete
+   *    name (namespace child logs included): the live `.log` file,
+   *    archived segments and checksum sidecars, archive-index and
+   *    segment-chain lines, and every in-memory sequence counter
+   *    (`lastSeqs`, per-partition seqs, bus `topicSeq`). Without purge
+   *    the history is kept and stays replayable (`replay`,
+   *    `resumeFromTime`).
+   * 4. Exact-name policy rules for the topic are removed (TTL, retained,
+   *    partitions, signing, compression + its dictionary registration
+   *    when no other rule references it, rate limits, subscriber caps,
+   *    schemas, size caps, redaction, lateness, pause rules); pattern
+   *    keys are left alone — they may match other topics. Per-topic
+   *    runtime state goes too: retained message (purge only — the soft
+   *    delete keeps it as history), publish-rate ring, circuit breaker,
+   *    per-partition publish counters.
+   *
+   * Not touched (documented): the advisory EB-77 catalog, topic aliases
+   * and routes (name-routing config, orthogonal), committed consumer
+   * offsets and dedup journals (consumer/producer identity state, not
+   * topic data), cumulative `TopicStats`, and cross-topic key sequence
+   * cursors.
+   *
+   * Returns `{ topic, deleted, purged, invalidatedSubscriptions }`.
+   * `deleted` is `false` only when the name was completely unknown to the
+   * bus. A soft-deleted topic deleted again with `purge: true` purges the
+   * retained history then. Audited as `topic_deleted`.
+   */
+  deleteTopic(name: string, opts?: DeleteTopicOptions): DeleteTopicResult {
+    assertValidLifecycleTopicName(name, 'deleteTopic');
+    const o = opts ?? {};
+    const actor = o.actor ?? 'system';
+    assertValidActor(actor, 'deleteTopic');
+    const purge = o.purge ?? false;
+    const nowMs = this.now();
+
+    // 1. Invalidate wildcard subscriptions through the normal teardown
+    // path. Snapshot first: teardown mutates `this.subscribers`. Wiring
+    // `subscriber.teardown` to the outermost wrapper (see
+    // `subscribeToGroup`) is what makes a group member's leave +
+    // `onRebalance` fire here instead of leaking its roster entry.
+    let invalidatedSubscriptions = 0;
+    const victims: Array<{ id: string; pattern: string; teardown: (() => void) | undefined }> = [];
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.pattern.includes('*') && subscriber.matcher.test(name)) {
+        victims.push({ id: subscriber.id, pattern: subscriber.pattern, teardown: subscriber.teardown });
+      }
+    }
+    for (const victim of victims) {
+      victim.teardown?.();
+      if (this.subscribers.has(victim.id)) continue;
+      invalidatedSubscriptions += 1;
+      this.auditSubscription({
+        action: 'topic_deleted',
+        actor,
+        subId: victim.id,
+        pattern: victim.pattern,
+        topic: name,
+        detail: { reason: 'wildcard_subscription_invalidated', purge },
+      });
+    }
+
+    // 2. Cancel pending delayed schedules and recurring jobs for the topic.
+    let delayedCancelled = 0;
+    let hasDelayed = false;
+    for (const entry of this.delayedById.values()) {
+      if (entry.topic === name) {
+        hasDelayed = true;
+        break;
+      }
+    }
+    if (hasDelayed) delayedCancelled = this.cancelDelayedByTopic(name).cancelled;
+    let recurringCancelled = 0;
+    for (const job of this.recurringById.values()) {
+      if (!job.cancelled && job.topic === name && this.cancelRecurring(job.id)) {
+        recurringCancelled += 1;
+      }
+    }
+
+    // 3. Durable purge (opt-in): the log that owns the concrete name.
+    let purged = false;
+    let purgeFilesDeleted = 0;
+    if (purge) {
+      const log = this.durableLogForTopic(name);
+      if (log !== undefined && log.topics().includes(name)) {
+        const report = log.purgeTopic(name);
+        purged = true;
+        purgeFilesDeleted = report.filesDeleted + report.indexLinesRemoved + report.chainLinesRemoved;
+      }
+    }
+
+    // 4. Bus-side per-topic state. Exact-name rule keys only — a pattern
+    // key may still match other live topics.
+    let rulesCleared = 0;
+    const ruleMaps: Array<Map<string, unknown>> = [
+      this.ttlRules,
+      this.retainedRules,
+      this.partitionRules,
+      this.rateLimitRules,
+      this.subscriberLimitRules,
+      this.schemaRules,
+      this.schemaVersionRules,
+      this.maxMessageBytesRules,
+      this.maxPayloadBytesRules,
+      this.redactionRules,
+      this.allowedLatenessRules,
+    ];
+    for (const rules of ruleMaps) {
+      if (rules.delete(name)) rulesCleared += 1;
+    }
+    if (this.clearTopicSigningKey(name)) rulesCleared += 1;
+    const compressionRule = this.compressionRules.get(name);
+    if (this.clearTopicCompression(name)) {
+      rulesCleared += 1;
+      // The preset dictionary is registered by SHA-256 id for durable-log
+      // replay; evict it only when no other live rule references the same
+      // id — two topics may share identical dictionary bytes.
+      const dictId = compressionRule?.dictionaryId;
+      if (dictId !== undefined) {
+        let referenced = false;
+        for (const rule of this.compressionRules.values()) {
+          if (rule.dictionaryId === dictId) {
+            referenced = true;
+            break;
+          }
+        }
+        if (!referenced) this.compressionDictionaryRegistry.delete(dictId);
+      }
+    }
+    const pauseRule = this.pauseRules.get(name);
+    if (pauseRule !== undefined) {
+      // Dropped, not drained: queue-mode buffered messages were never
+      // admitted (no seq, nothing in the durable log) and draining them
+      // would only fan them into the tombstone gate below.
+      this.pauseRules.delete(name);
+      rulesCleared += 1;
+    }
+    for (const key of [...this.topicSeq.keys()]) {
+      if (key.startsWith(`${name}\0`)) this.topicSeq.delete(key);
+    }
+    if (this.partitionPublished.delete(name)) rulesCleared += 1;
+    this.publishRates.remove(name);
+    this.publishCircuitBreakers.delete(name);
+    if (purge) {
+      // Direct map delete, not `clearRetained`: that helper journals a
+      // seq-0 tombstone to the durable log, which would recreate the file
+      // the purge just destroyed. The retained message is topic data —
+      // on a soft delete it stays as replayable history.
+      this.retainedMessages.delete(name);
+    }
+
+    // The tombstone: refuse future publishes to the name.
+    const hadProvisioning = this.topicLifecycle.remove(name, nowMs, purged);
+    const deleted =
+      hadProvisioning ||
+      purged ||
+      invalidatedSubscriptions > 0 ||
+      rulesCleared > 0 ||
+      delayedCancelled > 0 ||
+      recurringCancelled > 0;
+    if (deleted && !hadProvisioning) {
+      this.topicLifecycle.tombstone(name, nowMs, purged);
+    }
+    if (deleted) {
+      this.auditSubscription({
+        action: 'topic_deleted',
+        actor,
+        topic: name,
+        detail: {
+          purge: purged,
+          invalidatedSubscriptions,
+          hadProvisioning,
+          ...(purged ? { destroyedRecords: purgeFilesDeleted } : {}),
+          ...(pauseRule === undefined ? {} : { droppedPauseBuffer: pauseRule.buffer.length }),
+        },
+      });
+    }
+    return { topic: name, deleted, purged, invalidatedSubscriptions };
+  }
+
+  /**
+   * A topic's lifecycle record (EB-126), tombstones included —
+   * `undefined` when the topic was never provisioned or deleted.
+   * `provisioned: false` marks a deletion tombstone (publishes refused).
+   */
+  getTopicLifecycle(name: string): TopicLifecycleInfo | undefined {
+    return this.topicLifecycle.get(name);
+  }
+
+  /**
    * Counts one publish to an unregistered topic and fires the opt-in
    * hook (EB-77). Advisory only — never blocks the publish. The hook is
    * error-isolated: a throwing observer is swallowed.
@@ -21726,6 +22064,18 @@ export class EventBus {
     // resolved concrete topic — the one the seq and the durable-log
     // record belong to.
     if (confirm !== undefined) confirm.topic = topic;
+    // Topic lifecycle (EB-126): a deleted (tombstoned) topic refuses new
+    // publishes — the name is retired from service. Reuses the
+    // 'alias-retired' admission reason: it is the vocabulary's only "this
+    // name is no longer in service" item, and its zero-side-effect
+    // contract (no sequence number, no durable-log write, no rate-limit
+    // budget) is exactly right for a deleted topic. The retired-alias
+    // machinery itself is NOT reused: it is TTL-driven on alias links
+    // with a migration target, while deletion has no successor.
+    if (this.topicLifecycle.isDeleted(topic)) {
+      this.countAliasRetired(topic, payload, publisherId);
+      return { matched: 0, accepted: 0, admitted: false, rejectReason: 'alias-retired' };
+    }
     // Publish-side partition routing (EB-90): resolves the message's
     // partition from the explicit `partition` (wins) or the consistent
     // hash of `partitionKey` over the topic's configured partition count
