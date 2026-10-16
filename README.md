@@ -3911,3 +3911,77 @@ Applies uniformly to live fan-out, durable-log replay
 mirrors (uncounted there, like `filter`). Like `filter`, it is a string
 and therefore survives subscription migration snapshots; unlike
 `filter`, it needs no code on the receiving side.
+
+## Recurring publishes (cron) (EB-124)
+
+`bus.scheduleRecurring(topic, payloadFactory, cronExpr, opts?)` registers a
+cron-driven recurring publish: on every trigger of `cronExpr` the bus calls
+`payloadFactory()` and publishes its return value to `topic` through the
+normal publish pipeline — admission, schema validation, rate limiting, TTL —
+exactly as if `publish` had been called at that moment. Returns a
+`{ id, cancel() }` handle (`cancel()` is idempotent).
+
+```ts
+const job = bus.scheduleRecurring(
+  'ops.heartbeat',
+  () => ({ at: Date.now(), status: 'ok' }),
+  '*/30 * * * *', // every 30 minutes
+  { publisherId: 'cron-agent' },
+);
+// ... later:
+job.cancel();
+```
+
+The expression language is five fields — `minute hour day-of-month month
+day-of-week` — evaluated in **UTC**, parsed by the zero-dependency parser in
+`src/cronparse.ts` (also exported as `parseCronExpression` /
+`nextCronOccurrence` for reuse):
+
+- `*`, `*/n`, `n`, `n-m`, `n-m/s`, comma lists, and `n/s` (= `n-max/s`);
+- month and weekday names (`JAN`–`DEC`, `SUN`–`SAT`), case-insensitive;
+  day-of-week accepts `0`–`7` with `7` meaning Sunday;
+- `L` / `W` / `#` extensions: `L` (last day of month; in day-of-week: last
+  Saturday), `L-n` (n days before month end), `LW` (last weekday of month),
+  `15W` (weekday nearest the 15th), `5L` (last Friday of month), `MON#3`
+  (third Monday of month).
+
+Day matching is classic cron: both day fields restricted → either may match;
+exactly one restricted → it decides; neither → every day. Parsing is
+fail-fast — `scheduleRecurring` throws `RangeError` for any malformed
+expression (wrong field count, out-of-range value, reversed range, bad
+`L`/`W`/`#` form, or an expression that can never fire such as February 30)
+and for an invalid topic, with zero side effects: no job, no timer, no log
+record. A non-function factory throws `TypeError`.
+
+Trigger semantics:
+
+- The factory is called fresh on every trigger. A throwing factory skips the
+  trigger and counts it (`errorCount`) — the schedule never dies.
+- A trigger rejected by admission (schema, rate limit, TTL, ACL…) follows
+  normal admission semantics — counted, not published — and the job keeps
+  its cadence. A throwing schema validator is caught and counted like a
+  factory throw, so one bad trigger cannot kill the timer chain.
+- **No catch-up**: a job that falls behind fires exactly once per sweep,
+  then recomputes its next trigger strictly after now — missed occurrences
+  are skipped, never replayed in a burst (no restart storm).
+- TTL is stamped at fire time (each trigger is a fresh publish); topic
+  aliases resolve at fire time too.
+
+Durability is opt-in via `EventBusOptions.durableLogDir`: scheduling writes
+a seq-0 schedule record (`recurringJobId` + `cronExpr`), every trigger
+writes a seq-0 trigger record (audit trail), and `cancel()` writes a seq-0
+tombstone — the EB-24 convention, invisible to replay. Restart recovery:
+a tombstoned job is never rebuilt; a schedule record without a tombstone
+becomes a **dormant** entry in `getStats().recurringJobs` (its next trigger
+recomputed from now) — the payload factory is in-process state and cannot
+be restored, so no live timer is rebuilt and nothing is re-recorded. The
+application re-registers its jobs on startup (as it does its subscriptions);
+re-registering the same (topic, cron) supersedes the dormant entry so
+dormant generations do not accumulate.
+
+`getStats().recurringJobs` reports `{ active, jobs: [{ id, topic, cron,
+nextTriggerMs, triggerCount, errorCount, dormant? }] }`. The shared
+wake-up timer is unref'd (a pending job never keeps the process alive), and
+due sweeps also run at the start of every flush, so advancing an injected
+clock past a trigger time and then publishing anything fires
+deterministically in tests.

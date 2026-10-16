@@ -124,6 +124,13 @@ import {
 } from './namespace.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import {
+  parseCronExpression,
+  nextCronOccurrence,
+  type CronSchedule,
+  type CronDomSpec,
+  type CronDowSpec,
+} from './cronparse.ts';
+import {
   assertValidPartitionAssignor,
   assertValidPartitionAssignment,
   rendezvousPartitionAssignor,
@@ -271,6 +278,189 @@ export type {
 export { assertValidSigningKeys, SIGNING_KID_PATTERN, SIGNATURE_HEX_LENGTH } from './signing.ts';
 export { compileFilterExpression } from './filterexpr.ts';
 export type { CompiledFilterExpression, FilterOperator, FilterPathSegment } from './filterexpr.ts';
+export { parseCronExpression, nextCronOccurrence } from './cronparse.ts';
+export type { CronSchedule, CronDomSpec, CronDowSpec } from './cronparse.ts';
+
+/**
+ * One cron-driven recurring publish job (see `EventBus.scheduleRecurring`).
+ */
+interface RecurringJob {
+  /** Opaque handle id (`recurring-1`, …). */
+  id: string;
+  /** Concrete topic each trigger publishes to. */
+  topic: string;
+  /** Parsed cron schedule (validated once at schedule time). */
+  schedule: CronSchedule;
+  /** The original cron expression (trimmed), for stats and the durable log. */
+  cronExpr: string;
+  /** Called on every trigger; its return value is published. */
+  payloadFactory: () => unknown;
+  publisherId?: string;
+  traceparent?: string;
+  priority?: MessageLane;
+  /**
+   * Next fire time in milliseconds (bus clock), recomputed from the
+   * trigger time after every fire — never from the previous schedule, so
+   * a late fire does not shift the cadence.
+   */
+  nextTriggerMs: number;
+  /** Triggers where the factory returned and a publish was attempted. */
+  triggerCount: number;
+  /** Skipped triggers: the factory threw, or the publish threw. */
+  errorCount: number;
+  /** Set by cancel; the heap skips marked jobs lazily. */
+  cancelled: boolean;
+  /**
+   * Rebuilt from the durable log without a payload factory (see
+   * `recoverRecurring`): informational only — no timer, never fires.
+   */
+  dormant: boolean;
+}
+
+interface RecurringHeapNode {
+  job: RecurringJob;
+  /** Insertion order; breaks `nextTriggerMs` ties deterministically. */
+  order: number;
+}
+
+/**
+ * Binary min-heap of recurring jobs ordered by `nextTriggerMs`
+ * (insertion order breaks ties, so same-instant jobs fire in schedule
+ * order). Supports peek/pop/push only — cancellation is lazy via
+ * `RecurringJob.cancelled`, never an in-place removal. Dormant
+ * post-restart jobs never enter the heap.
+ */
+class RecurringJobHeap {
+  private nodes: RecurringHeapNode[] = [];
+  private nextOrder = 0;
+
+  /** Jobs currently in the heap, including lazily-cancelled ones. */
+  get size(): number {
+    return this.nodes.length;
+  }
+
+  /** The earliest-triggering job without removing it, if any. */
+  peek(): RecurringJob | undefined {
+    return this.nodes[0]?.job;
+  }
+
+  /** Adds a job to the heap. */
+  push(job: RecurringJob): void {
+    const node: RecurringHeapNode = { job, order: this.nextOrder++ };
+    this.nodes.push(node);
+    this.siftUp(this.nodes.length - 1);
+  }
+
+  /** Removes and returns the earliest-triggering job, if any. */
+  pop(): RecurringJob | undefined {
+    const nodes = this.nodes;
+    const top = nodes[0];
+    if (top == null) return undefined;
+    const last = nodes.pop()!;
+    if (nodes.length > 0) {
+      nodes[0] = last;
+      this.siftDown(0);
+    }
+    return top.job;
+  }
+
+  private less(a: RecurringHeapNode, b: RecurringHeapNode): boolean {
+    if (a.job.nextTriggerMs !== b.job.nextTriggerMs) {
+      return a.job.nextTriggerMs < b.job.nextTriggerMs;
+    }
+    return a.order < b.order;
+  }
+
+  private siftUp(index: number): void {
+    const nodes = this.nodes;
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      if (!this.less(nodes[index], nodes[parent])) break;
+      [nodes[index], nodes[parent]] = [nodes[parent], nodes[index]];
+      index = parent;
+    }
+  }
+
+  private siftDown(index: number): void {
+    const nodes = this.nodes;
+    for (;;) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let smallest = index;
+      if (left < nodes.length && this.less(nodes[left], nodes[smallest])) smallest = left;
+      if (right < nodes.length && this.less(nodes[right], nodes[smallest])) smallest = right;
+      if (smallest === index) break;
+      [nodes[index], nodes[smallest]] = [nodes[smallest], nodes[index]];
+      index = smallest;
+    }
+  }
+}
+
+/**
+ * Static per-trigger publish attributes for `EventBus.scheduleRecurring`.
+ * The payload itself comes from `payloadFactory` on every trigger; these
+ * ride along unchanged.
+ */
+export interface RecurringScheduleOptions {
+  /**
+   * Publisher identity stamped on every trigger's publish (see
+   * `PublishOptions.publisherId`).
+   */
+  publisherId?: string;
+  /**
+   * Upstream W3C `traceparent` carried into every trigger's publish (see
+   * `PublishOptions.traceparent`).
+   */
+  traceparent?: string;
+  /**
+   * Priority lane for every trigger's publish (see
+   * `PublishOptions.priority`, EB-122). Absent means `normal`.
+   */
+  priority?: MessageLane;
+}
+
+/**
+ * Handle returned by `EventBus.scheduleRecurring`.
+ */
+export interface RecurringJobHandle {
+  /**
+   * The job's id (`recurring-1`, …) — the same id shown in
+   * `getStats().recurringJobs` and written to the durable log.
+   */
+  id: string;
+  /**
+   * Stops the job: no further triggers. Idempotent — cancelling twice is
+   * a no-op, never a throw, and writes a single tombstone.
+   */
+  cancel(): void;
+}
+
+/**
+ * One row of `getStats().recurringJobs.jobs`, in schedule order (live
+ * jobs first, then dormant post-restart entries).
+ */
+export interface RecurringJobInfo {
+  /** The job's id (`recurring-1`, …). */
+  id: string;
+  /** Concrete topic each trigger publishes to. */
+  topic: string;
+  /** The cron expression the job was scheduled with. */
+  cron: string;
+  /** Next fire time in milliseconds (bus clock). */
+  nextTriggerMs: number;
+  /** Triggers where the factory returned and a publish was attempted. */
+  triggerCount: number;
+  /** Skipped triggers: the factory threw, or the publish threw. */
+  errorCount: number;
+  /**
+   * Present and true for jobs rebuilt from the durable log after a
+   * restart: the payload factory is in-process state and could not be
+   * restored, so the job has no timer and never fires. Re-register with
+   * `scheduleRecurring` to reactivate it, or `cancel()` its handle to
+   * tombstone it away.
+   */
+  dormant?: boolean;
+}
 
 export interface BusMessage {
   topic: string;
@@ -3660,6 +3850,17 @@ export interface BusStats {
    * in the timer heap until its due time.
    */
   pendingDelayed: number;
+  /**
+   * Cron-driven recurring publish jobs (see `scheduleRecurring`): live
+   * jobs with armed timers, plus dormant post-restart entries rebuilt
+   * from the durable log (no factory, no timer — informational only).
+   */
+  recurringJobs: {
+    /** Live jobs with armed timers (excludes dormant entries). */
+    active: number;
+    /** One row per job: live jobs in schedule order, then dormant ones. */
+    jobs: RecurringJobInfo[];
+  };
   /**
    * Per-subscriber delivery-latency summaries (see
    * `SubscribeOptions.deliveryLatency`): one entry per subscription with
@@ -9201,6 +9402,26 @@ export class EventBus {
    */
   private delayTimer?: ReturnType<typeof setTimeout>;
   /**
+   * Live recurring jobs by their `scheduleRecurring` id, in schedule
+   * order. Dormant post-restart jobs (see `recoverRecurring`) also live
+   * here — they carry no timer and never fire — until the application
+   * re-registers or cancels them.
+   */
+  private recurringById = new Map<string, RecurringJob>();
+  /**
+   * Live recurring jobs ordered by their next trigger time. Cancellation
+   * is lazy (see `RecurringJobHeap`); dormant jobs never enter the heap.
+   */
+  private recurringHeap = new RecurringJobHeap();
+  /** Counter for `scheduleRecurring` ids (`recurring-1`, …). */
+  private nextRecurringId = 0;
+  /**
+   * Wall-clock timer armed for the heap's next trigger time. Unref'd — a
+   * pending recurring job never keeps the process alive on its own —
+   * and re-armed after every sweep, cancel, and schedule.
+   */
+  private recurringTimer?: ReturnType<typeof setTimeout>;
+  /**
    * Cluster hub link, present after `connectToHub` resolves and until
    * `disconnectCluster`. Loaded lazily (dynamic import) so buses that
    * never cluster never load the TCP/TLS code.
@@ -9405,6 +9626,11 @@ export class EventBus {
       // that never fanned out (and were not cancelled) survive the
       // restart. Already-due entries fan out immediately.
       this.recoverDelayed();
+      // Rebuild recurring-job metadata from the log (EB-124): cancelled
+      // jobs (tombstoned) are dropped; surviving schedule records become
+      // dormant entries — the payload factory is in-process state and no
+      // live timer is rebuilt.
+      this.recoverRecurring();
       // Rebuild queue-mode pause buffers from the log (EB-88): buffered
       // messages that never drained survive the restart and fan out
       // immediately — pause rules themselves are runtime state and do not
@@ -17691,6 +17917,378 @@ export class EventBus {
   }
 
   /**
+   * Schedules a cron-driven recurring publish: on every trigger of
+   * `cronExpr` the bus calls `payloadFactory()` and publishes its return
+   * value to `topic` through the normal publish pipeline — admission,
+   * schema validation, rate limiting, TTL — exactly as if `publish` had
+   * been called at that moment. Returns a `{ id, cancel() }` handle.
+   *
+   * The cron expression is parsed once, NOW, fail-fast: an invalid
+   * expression throws `RangeError` and schedules nothing. The language is
+   * five fields (`minute hour day-of-month month day-of-week`, UTC) with
+   * `*`, `*\/n`, `n`, `n-m`, `n-m/s`, comma lists, month/weekday names,
+   * and `L`/`W`/`#` extensions — see `parseCronExpression`. An invalid
+   * topic (non-string or empty) also throws `RangeError`; a non-function
+   * `payloadFactory` throws `TypeError`. All validation runs before any
+   * state changes: a throw leaves zero side effects — no job, no timer,
+   * no log record, no counted rejection.
+   *
+   * Trigger semantics:
+   * - The payload factory is called fresh on every trigger. When it
+   *   throws, the trigger is skipped and counted (`errorCount`) — the
+   *   schedule never dies from a bad factory call.
+   * - Each trigger goes through the full publish pipeline with the
+   *   static `opts` (`publisherId`, `traceparent`, `priority`): a trigger
+   *   rejected by admission (schema, rate limit, TTL, ACL…) follows the
+   *   normal admission semantics — counted, not published — and the job
+   *   keeps its cadence. A throwing schema validator is caught and
+   *   counted like a factory throw, so one bad trigger cannot unwind the
+   *   sweep and kill the timer chain.
+   * - No catch-up: a job that falls behind (process down, event loop
+   *   blocked) fires exactly once per sweep, then recomputes its next
+   *   trigger strictly after now — missed occurrences are skipped, never
+   *   replayed in a burst.
+   * - TTL is stamped at fire time, not schedule time: each trigger is a
+   *   fresh publish. Topic aliases resolve at fire time too, so an alias
+   *   changed after scheduling applies to later triggers.
+   *
+   * Durability (opt-in, `EventBusOptions.durableLogDir`): scheduling
+   * writes a seq-0 schedule record (`recurringJobId` + `cronExpr`), every
+   * trigger writes a seq-0 trigger record (audit trail), and `cancel()`
+   * writes a seq-0 tombstone — the EB-24 convention, best-effort like all
+   * durable-log writes. Without a durable log the job lives in memory
+   * only. Restart recovery: a tombstoned job is never rebuilt; a schedule
+   * record without a tombstone becomes a dormant entry in
+   * `getStats().recurringJobs` (its next trigger recomputed from now) —
+   * the payload factory is in-process state and cannot be restored, so no
+   * live timer is rebuilt and nothing is re-recorded. The application
+   * re-registers its jobs on startup, as it does its subscriptions;
+   * re-registering the same (topic, cron) supersedes the dormant entry so
+   * dormant generations do not accumulate across restarts.
+   *
+   * The timer is unref'd: a pending recurring job never keeps the
+   * process alive on its own.
+   */
+  scheduleRecurring(
+    topic: string,
+    payloadFactory: () => unknown,
+    cronExpr: string,
+    opts: RecurringScheduleOptions = {},
+  ): RecurringJobHandle {
+    // Fail-fast admission, before anything is mutated: a throw must
+    // leave zero state behind — no job, no timer, no log record.
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('scheduleRecurring: topic must be a non-empty string');
+    }
+    if (typeof payloadFactory !== 'function') {
+      throw new TypeError('scheduleRecurring: payloadFactory must be a function');
+    }
+    // Throws RangeError on any malformed expression — parsed once here,
+    // reused for every trigger computation, never parsed mid-schedule.
+    const schedule = parseCronExpression(cronExpr);
+    validatePublisherId(opts?.publisherId, 'scheduleRecurring');
+    validateTraceparent(opts?.traceparent, 'scheduleRecurring');
+    if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'scheduleRecurring');
+    const nowMs = this.now();
+    // Supersede dormant post-restart entries for the same (topic, cron):
+    // the application re-registering a job after a restart retires the
+    // previous generation's record — otherwise dormant entries would
+    // accumulate one per restart. Live jobs are never touched.
+    for (const [otherId, other] of this.recurringById) {
+      if (
+        other.dormant &&
+        !other.cancelled &&
+        other.topic === topic &&
+        other.cronExpr === schedule.source
+      ) {
+        other.cancelled = true;
+        this.recurringById.delete(otherId);
+        this.appendRecurringTombstone(other);
+      }
+    }
+    const id = `recurring-${++this.nextRecurringId}`;
+    const job: RecurringJob = {
+      id,
+      topic,
+      schedule,
+      cronExpr: schedule.source,
+      payloadFactory,
+      publisherId: opts?.publisherId,
+      traceparent: opts?.traceparent,
+      priority: opts?.priority,
+      nextTriggerMs: nextCronOccurrence(schedule, nowMs),
+      triggerCount: 0,
+      errorCount: 0,
+      cancelled: false,
+      dormant: false,
+    };
+    // The schedule record is best-effort audit state (unlike
+    // `publishDelayed`, whose payload must survive a restart): the live
+    // job is the source of truth, so a failed append never throws here.
+    this.appendRecurringScheduleRecord(job, nowMs);
+    this.recurringById.set(id, job);
+    this.recurringHeap.push(job);
+    // Re-arm the shared timer for the new earliest trigger (the sweep
+    // also fires anything already due — impossible here since the next
+    // trigger is strictly after now — so this is purely the arm).
+    this.sweepRecurring(nowMs);
+    return {
+      id,
+      cancel: () => {
+        this.cancelRecurring(id);
+      },
+    };
+  }
+
+  /**
+   * Cancels a recurring job: no further triggers. Returns `true` when a
+   * live or dormant job was cancelled. Idempotent — unknown or
+   * already-cancelled ids return `false`, never throw — and writes a
+   * single tombstone to the durable log (when enabled) so a restart never
+   * revives the job.
+   */
+  private cancelRecurring(id: string): boolean {
+    const job = this.recurringById.get(id);
+    if (job == null || job.cancelled) return false;
+    // Lazy heap deletion: the job stays in the heap, marked, and the
+    // sweep skips it when it surfaces — cancel is O(1). (Dormant jobs
+    // never enter the heap, so there is nothing to skip for them.)
+    job.cancelled = true;
+    this.recurringById.delete(id);
+    this.appendRecurringTombstone(job);
+    this.armRecurringTimer();
+    return true;
+  }
+
+  /**
+   * Fires every recurring job whose trigger time has arrived (bus clock),
+   * in trigger-time order. Each fire publishes through the normal
+   * `publish` pipeline and recomputes the job's next trigger strictly
+   * after now — exactly one fire per sweep no matter how far behind the
+   * job is (no catch-up: missed occurrences are skipped, never replayed
+   * in a burst).
+   *
+   * `trailingFlush` schedules a flush when anything fired; pass `false`
+   * when the sweep already runs inside a flush — the drain below it picks
+   * the messages up.
+   */
+  private sweepRecurring(nowMs: number = this.now(), trailingFlush = true): void {
+    let fired = false;
+    for (;;) {
+      const top = this.recurringHeap.peek();
+      if (top == null) break;
+      if (top.cancelled || top.dormant) {
+        // Lazy deletion surfacing: already dropped from `recurringById`
+        // by `cancelRecurring`; just discard the heap node. (Dormant jobs
+        // never enter the heap — the guard is defensive.)
+        this.recurringHeap.pop();
+        continue;
+      }
+      if (top.nextTriggerMs > nowMs) break;
+      this.recurringHeap.pop();
+      this.fireRecurringJob(top, nowMs);
+      fired = true;
+      // A trigger may cancel its own job from inside the factory — a
+      // cancelled job is never re-armed.
+      if (!top.cancelled) {
+        top.nextTriggerMs = nextCronOccurrence(top.schedule, nowMs);
+        this.recurringHeap.push(top);
+      }
+    }
+    if (fired && trailingFlush) this.scheduleFlush();
+    this.armRecurringTimer();
+  }
+
+  /**
+   * One trigger of a recurring job: call the factory, publish its return
+   * value through the normal pipeline, and record the trigger. A throwing
+   * factory — or a throwing publish (a schema validator that throws
+   * propagates out of `publish`, per EB-20) — skips the trigger, counts
+   * it in `errorCount`, and never kills the schedule.
+   */
+  private fireRecurringJob(job: RecurringJob, nowMs: number): void {
+    let payload: unknown;
+    try {
+      payload = job.payloadFactory();
+    } catch {
+      // A throwing factory skips this trigger and counts it — the
+      // schedule never dies from a bad factory call, and no trigger
+      // record is written (nothing was published).
+      job.errorCount += 1;
+      return;
+    }
+    job.triggerCount += 1;
+    try {
+      // The normal publish pipeline: admission, schema, rate-limit, TTL.
+      // A rejected trigger follows the normal admission semantics
+      // (counted, not published); the job keeps its cadence.
+      this.publish(job.topic, payload, {
+        ...(job.publisherId === undefined ? {} : { publisherId: job.publisherId }),
+        ...(job.traceparent === undefined ? {} : { traceparent: job.traceparent }),
+        ...(job.priority === undefined ? {} : { priority: job.priority }),
+      });
+    } catch {
+      // One bad trigger must not unwind the sweep and kill the timer
+      // chain.
+      job.errorCount += 1;
+    }
+    this.appendRecurringTriggerRecord(job, nowMs);
+  }
+
+  private armRecurringTimer(): void {
+    if (this.recurringTimer !== undefined) {
+      clearTimeout(this.recurringTimer);
+      this.recurringTimer = undefined;
+    }
+    for (;;) {
+      const top = this.recurringHeap.peek();
+      if (top == null || !top.cancelled) break;
+      this.recurringHeap.pop();
+    }
+    const next = this.recurringHeap.peek();
+    if (next == null) return;
+    const delayMs = Math.max(0, next.nextTriggerMs - this.now());
+    // `setTimeout` saturates past 2^31-1 ms (~24.8 days); longer waits
+    // re-arm on fire.
+    const timer = setTimeout(() => {
+      this.recurringTimer = undefined;
+      this.sweepRecurring();
+    }, Math.min(delayMs, 2_147_483_647));
+    // A pending recurring job must not keep the process alive on its own.
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    this.recurringTimer = timer;
+  }
+
+  /**
+   * Writes the seq-0 schedule record for a recurring job to the durable
+   * log, when one is enabled. Best-effort like all durable-log writes: a
+   * failed append never throws into the caller.
+   */
+  private appendRecurringScheduleRecord(job: RecurringJob, nowMs: number): void {
+    this.durableLogForTopic(job.topic)?.append({
+      seq: 0,
+      topic: job.topic,
+      at: nowMs,
+      recurring: true,
+      recurringJobId: job.id,
+      cronExpr: job.cronExpr,
+      payload: null,
+    });
+  }
+
+  /**
+   * Writes the seq-0 trigger record for one firing of a recurring job to
+   * the durable log, when one is enabled — the audit trail of the job's
+   * fire history. Best-effort like all durable-log writes.
+   */
+  private appendRecurringTriggerRecord(job: RecurringJob, nowMs: number): void {
+    this.durableLogForTopic(job.topic)?.append({
+      seq: 0,
+      topic: job.topic,
+      at: nowMs,
+      recurring: true,
+      recurringJobId: job.id,
+      cronExpr: job.cronExpr,
+      recurringTrigger: true,
+      payload: null,
+    });
+  }
+
+  /**
+   * Writes a tombstone closing a recurring job (cancelled) to the durable
+   * log, when one is enabled. Restart recovery treats a tombstoned job as
+   * resolved and never rebuilds it. Best-effort like all durable-log
+   * writes: a failed append never throws into the caller.
+   */
+  private appendRecurringTombstone(job: RecurringJob): void {
+    this.durableLogForTopic(job.topic)?.append({
+      seq: 0,
+      topic: job.topic,
+      at: this.now(),
+      recurring: true,
+      recurringJobId: job.id,
+      cancelled: true,
+      payload: null,
+    });
+  }
+
+  /**
+   * Rebuilds recurring-job metadata from the durable log after a restart
+   * (EB-124). A tombstoned job (`cancelled`) is dropped and never
+   * rebuilt; a schedule record with no tombstone becomes a dormant entry
+   * in `recurringById` — visible in `getStats().recurringJobs` with its
+   * next trigger recomputed from now — but gets no timer: the payload
+   * factory is in-process state and cannot be restored from the log, so a
+   * restarted bus can never rebuild a live recurring timer. The
+   * application re-registers its jobs on startup (as it does its
+   * subscriptions); re-registering the same (topic, cron) supersedes the
+   * dormant entry so dormant generations do not accumulate.
+   *
+   * Trigger records are audit state: they neither close nor re-arm a job.
+   * Nothing is written to the log here — recovery never re-records.
+   */
+  private recoverRecurring(): void {
+    const log = this.durableLog;
+    if (log == null) return;
+    const nowMs = this.now();
+    const scheduled = new Map<string, { topic: string; cronExpr: string }>();
+    const closed = new Set<string>();
+    // `readSince(topic, -1)`: the exclusive bound sits below every real
+    // seq, so the seq-0 schedule/trigger/tombstone records come along too.
+    for (const topic of log.topics()) {
+      for (const rec of log.readSince(topic, -1)) {
+        if (rec.recurringJobId == null) continue;
+        if (rec.cancelled === true || rec.seq >= 1) {
+          closed.add(rec.recurringJobId);
+          continue;
+        }
+        // Trigger records are per-fire audit state — they neither close
+        // the job nor describe a schedule.
+        if (rec.recurringTrigger === true) continue;
+        // Defensive: the log parser already rejects schedule records
+        // without a cron expression.
+        if (rec.cronExpr == null) continue;
+        if (!closed.has(rec.recurringJobId) && !scheduled.has(rec.recurringJobId)) {
+          scheduled.set(rec.recurringJobId, { topic: rec.topic, cronExpr: rec.cronExpr });
+        }
+      }
+    }
+    for (const [jobId, rec] of scheduled) {
+      if (closed.has(jobId)) continue;
+      // A schedule record written by this bus always parses — the guard
+      // is for lines written by a foreign process.
+      let schedule: CronSchedule;
+      try {
+        schedule = parseCronExpression(rec.cronExpr);
+      } catch {
+        continue;
+      }
+      const dormant: RecurringJob = {
+        id: jobId,
+        topic: rec.topic,
+        schedule,
+        cronExpr: rec.cronExpr,
+        payloadFactory: () => {
+          throw new Error('dormant recurring job has no payload factory');
+        },
+        nextTriggerMs: nextCronOccurrence(schedule, nowMs),
+        triggerCount: 0,
+        errorCount: 0,
+        cancelled: false,
+        dormant: true,
+      };
+      this.recurringById.set(jobId, dormant);
+      // Keep generated ids ahead of recovered ones — `scheduleRecurring`
+      // must never reuse an id the previous process handed out.
+      const match = /^recurring-(\d+)$/.exec(jobId);
+      if (match != null) {
+        this.nextRecurringId = Math.max(this.nextRecurringId, parseInt(match[1], 10) + 1);
+      }
+    }
+  }
+
+  /**
    * Fans out every delayed entry whose due time has arrived (bus clock),
    * in due-time order. Due entries go through the normal `fanOut` path —
    * sequence stamping, rate-limit budget, compression, durable log (whose
@@ -22052,6 +22650,18 @@ export class EventBus {
       rateLimitedWaiting,
       inFlightUsage,
       pendingDelayed: this.delayedById.size,
+      recurringJobs: {
+        active: [...this.recurringById.values()].filter((j) => !j.dormant).length,
+        jobs: [...this.recurringById.values()].map((j) => ({
+          id: j.id,
+          topic: j.topic,
+          cron: j.cronExpr,
+          nextTriggerMs: j.nextTriggerMs,
+          triggerCount: j.triggerCount,
+          errorCount: j.errorCount,
+          ...(j.dormant ? { dormant: true as const } : {}),
+        })),
+      },
       deliveryLatency,
       ackLatency,
       subscriberLatencyP99,
@@ -22833,6 +23443,10 @@ export class EventBus {
       // publishing anything delivers deterministically in tests. No
       // trailing flush: the drain below picks the fanned-out messages up.
       this.sweepDelayed(nowMs, false);
+      // Recurring jobs due by now fire next, through the same deterministic
+      // path: advancing an injected clock past a trigger time and then
+      // publishing anything fires the job in tests.
+      this.sweepRecurring(nowMs, false);
       for (const subscriber of this.subscribers.values()) {
         this.drainSubscriber(subscriber, nowMs);
       }

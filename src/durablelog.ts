@@ -86,6 +86,42 @@ export interface DurableLogRecord {
    */
   delayId?: string;
   /**
+   * EB-124: recurring-job family marker — `true` on a seq-0 record means
+   * this line is recurring-job state, not a message and not a
+   * delayed-delivery schedule. A schedule record (`recurringJobId` +
+   * `cronExpr`) is written when `EventBus.scheduleRecurring` registers a
+   * job; a trigger record (`recurringTrigger: true`) is written each time
+   * the job fires (audit trail, never re-armed); a tombstone (`cancelled:
+   * true`) closes the job. Like the other seq-0 families these records
+   * are invisible to `readSince` replay and never move the per-topic
+   * sequence counter. A recurring record never carries `delayId`,
+   * `retained`, or `paused` — the four seq-0 families are disjoint by
+   * construction.
+   */
+  recurring?: boolean;
+  /**
+   * EB-124: identifies one recurring job (`recurring-1`, …). Present on
+   * the seq-0 schedule record, on every trigger record, and on the
+   * tombstone — so restart recovery can tell a cancelled job (never
+   * revived) from one whose schedule record has no tombstone.
+   */
+  recurringJobId?: string;
+  /**
+   * EB-124: the cron expression the job was scheduled with. Present on
+   * the seq-0 schedule record (restart recovery recomputes the next
+   * trigger from it) and on trigger records (audit). The payload factory
+   * is in-process state and is never persisted — a restarted bus cannot
+   * rebuild a live timer from this record (see `EventBus.scheduleRecurring`).
+   */
+  cronExpr?: string;
+  /**
+   * EB-124: trigger audit marker — `true` on a seq-0 recurring record
+   * means the job with this `recurringJobId` fired once at `at`. Trigger
+   * records never close the job and never re-arm anything; they exist so
+   * the log shows the job's fire history next to its schedule record.
+   */
+  recurringTrigger?: boolean;
+  /**
    * Tombstone for a delayed-delivery schedule: `true` on a seq-0 record
    * means the schedule with this `delayId` is closed (cancelled, expired
    * while delayed, or shed at fan-out) and must not be rebuilt on restart.
@@ -96,6 +132,9 @@ export interface DurableLogRecord {
    * `true` on a seq-0 pause record means the buffered message with this
    * `pauseId` was drained at resume or dropped as expired and must not be
    * rebuilt on restart.
+   * Also the tombstone marker for a recurring job (see `recurring`):
+   * `true` on a seq-0 recurring record means the job with this
+   * `recurringJobId` was cancelled and must not be rebuilt on restart.
    */
   cancelled?: boolean;
   /**
@@ -424,6 +463,14 @@ interface LogLine {
   deliverAt?: number;
   delayId?: string;
   cancelled?: boolean;
+  /** Recurring-job family marker (see `DurableLogRecord.recurring`). */
+  recurring?: boolean;
+  /** Recurring-job identity (see `DurableLogRecord.recurringJobId`). */
+  recurringJobId?: string;
+  /** The job's cron expression (see `DurableLogRecord.cronExpr`). */
+  cronExpr?: string;
+  /** Recurring trigger audit marker (see `DurableLogRecord.recurringTrigger`). */
+  recurringTrigger?: boolean;
   /** Retained-state marker (see `DurableLogRecord.retained`). */
   retained?: boolean;
   /** The retained message's original per-topic seq (see `DurableLogRecord.retainedSeq`). */
@@ -3349,6 +3396,10 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.deliverAt !== undefined) line.deliverAt = record.deliverAt;
   if (record.delayId !== undefined) line.delayId = record.delayId;
   if (record.cancelled !== undefined) line.cancelled = record.cancelled;
+  if (record.recurring !== undefined) line.recurring = record.recurring;
+  if (record.recurringJobId !== undefined) line.recurringJobId = record.recurringJobId;
+  if (record.cronExpr !== undefined) line.cronExpr = record.cronExpr;
+  if (record.recurringTrigger !== undefined) line.recurringTrigger = record.recurringTrigger;
   if (record.retained !== undefined) line.retained = record.retained;
   if (record.retainedSeq !== undefined) line.retainedSeq = record.retainedSeq;
   if (record.paused !== undefined) line.paused = record.paused;
@@ -3402,6 +3453,16 @@ function logLineOf(record: DurableLogRecord): LogLine {
  * and a pause record never carries `delayId` or `retained` — the three
  * seq-0 families are disjoint by construction.
  *
+ * `seq` 0 is also reserved for recurring-job records (`recurring: true`,
+ * EB-124): a schedule record carries the job's identity (`recurringJobId`,
+ * a non-empty string) and its cron expression (`cronExpr`, a non-empty
+ * string); a trigger record (`recurringTrigger: true`) is per-fire audit
+ * state and also carries `cronExpr`; a tombstone (`cancelled: true`)
+ * carries only `recurringJobId` and closes the job. `recurring` is only
+ * valid with `seq` 0, and a recurring record never carries `delayId`,
+ * `retained`, or `paused` — the four seq-0 families are disjoint by
+ * construction.
+ *
  * A `key`, when present, must be a non-empty string; anything else makes
  * the line corrupt. A `keySeq`, when present, must be a positive integer
  * and requires `key` — the bus always writes both together.
@@ -3430,9 +3491,12 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   const isScheduleRecord = seq === 0;
   const isRetainedRecord = o['retained'] === true;
   const isPauseRecord = o['paused'] === true;
+  const isRecurringRecord = o['recurring'] === true;
   if (isRetainedRecord && !isScheduleRecord) return null;
   if (isPauseRecord && !isScheduleRecord) return null;
   if (isRetainedRecord && isPauseRecord) return null;
+  if (isRecurringRecord && !isScheduleRecord) return null;
+  if (isRecurringRecord && (isRetainedRecord || isPauseRecord)) return null;
   if (isScheduleRecord) {
     if (isRetainedRecord) {
       // Retained set records carry the retained message's original seq;
@@ -3448,6 +3512,24 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       if (typeof o['pauseId'] !== 'string' || (o['pauseId'] as string).length === 0) return null;
       if (o['cancelled'] !== true) {
         if (!Number.isInteger(o['pauseOrder']) || (o['pauseOrder'] as number) < 1) return null;
+      }
+    } else if (isRecurringRecord) {
+      // Recurring-job records carry the job's identity. A schedule record
+      // and a trigger record carry the cron expression; a tombstone
+      // carries neither (and a trigger is never a tombstone). A recurring
+      // record never carries `delayId` — the families are disjoint by
+      // construction.
+      if (typeof o['recurringJobId'] !== 'string' || (o['recurringJobId'] as string).length === 0) {
+        return null;
+      }
+      if (o['delayId'] !== undefined) return null;
+      const isTrigger = o['recurringTrigger'] === true;
+      const isTombstone = o['cancelled'] === true;
+      if (isTrigger && isTombstone) return null;
+      if (!isTombstone) {
+        if (typeof o['cronExpr'] !== 'string' || (o['cronExpr'] as string).length === 0) return null;
+      } else if (o['cronExpr'] !== undefined || o['recurringTrigger'] !== undefined) {
+        return null;
       }
     } else if (typeof o['delayId'] !== 'string' || (o['delayId'] as string).length === 0) {
       return null;
@@ -3485,6 +3567,31 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   if (o['delayId'] !== undefined) {
     if (typeof o['delayId'] !== 'string' || (o['delayId'] as string).length === 0) return null;
     record.delayId = o['delayId'] as string;
+  }
+  if (o['recurring'] !== undefined) {
+    // The bus only ever writes `recurring: true` on seq-0 recurring-job
+    // records; any other value means the line was tampered with or
+    // miswritten.
+    if (o['recurring'] !== true || !isRecurringRecord) return null;
+    record.recurring = true;
+  }
+  if (o['recurringJobId'] !== undefined) {
+    // Validated above: present and non-empty exactly on recurring-job
+    // records — a stray identity on any other line is corruption.
+    if (!isRecurringRecord) return null;
+    record.recurringJobId = o['recurringJobId'] as string;
+  }
+  if (o['cronExpr'] !== undefined) {
+    // Validated above: a non-empty cron expression on schedule and
+    // trigger records only — anywhere else is corruption.
+    if (!isRecurringRecord) return null;
+    record.cronExpr = o['cronExpr'] as string;
+  }
+  if (o['recurringTrigger'] !== undefined) {
+    // The bus only ever writes `recurringTrigger: true` on seq-0
+    // recurring trigger records.
+    if (o['recurringTrigger'] !== true || !isRecurringRecord) return null;
+    record.recurringTrigger = true;
   }
   if (o['deliverAt'] !== undefined) {
     if (typeof o['deliverAt'] !== 'number' || !Number.isFinite(o['deliverAt'])) return null;
@@ -3646,13 +3753,14 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     };
   }
   // A non-tombstone delayed-delivery schedule record must say when it is
-  // due. Retained-message records (EB-87) and pause-buffer records
-  // (EB-88) are the other seq-0 families and carry no due time — only
-  // their own identity fields, validated above.
+  // due. Retained-message records (EB-87), pause-buffer records (EB-88),
+  // and recurring-job records (EB-124) are the other seq-0 families and
+  // carry no due time — only their own identity fields, validated above.
   if (
     isScheduleRecord &&
     !isRetainedRecord &&
     !isPauseRecord &&
+    !isRecurringRecord &&
     record.cancelled !== true &&
     record.deliverAt === undefined
   ) {
