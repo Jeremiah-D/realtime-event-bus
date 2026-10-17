@@ -39,7 +39,11 @@ import { Buffer } from 'node:buffer';
 export const OPS_SIGNATURE_HEADER = 'x-ops-signature';
 
 /** What the ops outlet can report. */
-export type OpsAlertKind = 'lag-slo-breach' | 'dead-letter-growth' | 'gateway-disconnect-storm';
+export type OpsAlertKind =
+  | 'lag-slo-breach'
+  | 'dead-letter-growth'
+  | 'gateway-disconnect-storm'
+  | 'processing-latency-slo-breach';
 
 /** One operational alert, as built by the bus. */
 export interface OpsAlert {
@@ -53,8 +57,10 @@ export interface OpsAlert {
    * Signal-specific detail — JSON-safe primitives only. `lag-slo-breach`
    * carries the breach event fields (groupId/pattern/topic/partition/
    * lag/violated/...); `dead-letter-growth` carries
-   * subscriberId/pattern/topic/redeliveries/lastError; 
-   * `gateway-disconnect-storm` carries disconnects/windowMs/threshold.
+   * subscriberId/pattern/topic/redeliveries/lastError;
+   * `gateway-disconnect-storm` carries disconnects/windowMs/threshold;
+   * `processing-latency-slo-breach` carries
+   * subscriberId/pattern/p99Ms/thresholdMs/samples/phaseAttribution.
    */
   detail: Record<string, unknown>;
 }

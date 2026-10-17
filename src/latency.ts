@@ -152,6 +152,41 @@ export interface ProcessingLatencySloOptions {
 }
 
 /**
+ * One phase's windowed p50/p99 summary, for SLO-miss attribution (EB-133).
+ */
+export interface SloPhaseSummary {
+  p50Ms: number;
+  p99Ms: number;
+}
+
+/**
+ * Phase attribution carried on `LatencySloMissEvent` when the bus was
+ * built with `EventBusOptions.processingLatencySloAlert` (EB-133): the
+ * windowed p50/p99 of the four per-delivery phases the bus stamps on the
+ * delivery path, so a miss names the phase that dominates the p99 — a
+ * slow consumer shows queueWaitMs, a throttled one backpressureWaitMs, a
+ * slow handler handlerMs, a nack-heavy one redeliveryWaitMs. Phases with
+ * no samples yet report 0s (honest, not interpolated). The `handlerMs`
+ * phase is the SLO tracker's own window, so it always agrees with the
+ * event's `p99Ms`.
+ */
+export interface SloPhaseAttribution {
+  /** Enqueue → handler hand-off (queue dwell), per delivery. */
+  queueWaitMs: SloPhaseSummary;
+  /**
+   * Time a delivery waited while the subscriber's drain was fully gated
+   * by flow-control gates (shaping / rate window / max-inflight /
+   * slow-start / credit / block tier), clipped to the message's own
+   * queue lifetime. 0 when the drain was never fully gated.
+   */
+  backpressureWaitMs: SloPhaseSummary;
+  /** Handler processing time — the SLO tracker's own window. */
+  handlerMs: SloPhaseSummary;
+  /** Last redelivery schedule → hand-off (reliable redeliveries only). */
+  redeliveryWaitMs: SloPhaseSummary;
+}
+
+/**
  * Fired when a subscriber's windowed handler processing-latency p99
  * exceeds its SLO (`SubscribeOptions.latencySlo`). The bus fills in the
  * subscriber's identity when it fires the callback.
@@ -169,4 +204,10 @@ export interface LatencySloMissEvent {
   samples: number;
   /** Bus-clock reading at the moment the alert fired. */
   at: number;
+  /**
+   * Phase attribution (EB-133): present only when the bus was built with
+   * `EventBusOptions.processingLatencySloAlert`. Absent otherwise — the
+   * event's legacy shape is unchanged.
+   */
+  phaseAttribution?: SloPhaseAttribution;
 }

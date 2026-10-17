@@ -35,6 +35,8 @@ import {
   type DeliveryLatencySummaryStats,
   type LatencySloMissEvent,
   type ProcessingLatencySloOptions,
+  type SloPhaseAttribution,
+  type SloPhaseSummary,
 } from './latency.ts';
 import {
   AckLatencyTracker,
@@ -3083,6 +3085,19 @@ export interface EventBusOptions {
     gatewayDisconnectWindowMs?: number;
   };
   /**
+   * Opt-in SLO-miss phase attribution (EB-133): when true, subscribers
+   * with `SubscribeOptions.latencySlo` also stamp the four delivery
+   * phases — queue wait, backpressure wait, handler time, redelivery
+   * wait — on the delivery path, and every SLO miss carries a
+   * `phaseAttribution` (windowed p50/p99 per phase) on the
+   * `onLatencySloMiss` event plus a `processing-latency-slo-breach`
+   * alert on the ops outlet (when configured). The in-process callback's
+   * legacy fields are unchanged. Default false: with the flag off, SLO
+   * tracking behaves exactly like EB-53 alone — no phase stamping, no
+   * extra clock reads, no ops alert.
+   */
+  processingLatencySloAlert?: boolean;
+  /**
    * Pluggable backing store for consumer-group committed offsets
    * (EB-114, see `src/offsetstore.ts`). Every group-level `commitOffset`
    * (no `partition`/`instanceId`) is mirrored into the store, so a
@@ -4173,6 +4188,29 @@ export interface BusStats {
     breaching: boolean;
   }>;
   /**
+   * Total SLO-miss excursions fired across all latency-SLO subscribers
+   * (EB-133). Counts only when `EventBusOptions.processingLatencySloAlert`
+   * armed attribution; 0 otherwise.
+   */
+  sloMisses: number;
+  /**
+   * Per-subscriber SLO-miss phase attribution (EB-133, see
+   * `EventBusOptions.processingLatencySloAlert`): one entry per
+   * subscription with attribution armed, in subscription order. Each
+   * entry carries the miss count plus the current windowed p50/p99 of the
+   * four delivery phases — the same shape as
+   * `LatencySloMissEvent.phaseAttribution`. Empty when no subscriber
+   * opts in.
+   */
+  sloMissesByPhase: Array<{
+    subscriberId: string;
+    pattern: string;
+    /** SLO-miss excursions fired for this subscriber. */
+    sloMisses: number;
+    /** Windowed p50/p99 of the four delivery phases. */
+    phaseAttribution: SloPhaseAttribution;
+  }>;
+  /**
    * The slowest latency-tracked subscribers by p99 queue dwell (top 5,
    * descending) — the first place to look when end-to-end lag grows.
    * Only subscribers with at least one sample appear.
@@ -4972,6 +5010,13 @@ interface Subscriber {
    * for this subscriber.
    */
   latencySlo?: SubscriberLatencySloState;
+  /**
+   * SLO phase-attribution state (EB-133, see
+   * `EventBusOptions.processingLatencySloAlert`). Absent unless the
+   * subscriber tracks a processing-latency SLO *and* the bus enabled
+   * attribution — untracked subscribers never stamp phases.
+   */
+  sloPhase?: SubscriberSloPhaseState;
   /**
    * Lag watermark monitoring state (see `SubscribeOptions.lagMonitor`).
    * Absent when monitoring is disabled for this subscriber.
@@ -6544,6 +6589,55 @@ interface SubscriberLatencySloState {
 }
 
 /**
+ * Per-subscriber SLO phase-attribution state (EB-133). Present only when
+ * the subscriber tracks a processing-latency SLO (`latencySlo`) *and* the
+ * bus was built with `EventBusOptions.processingLatencySloAlert` —
+ * otherwise the bus never stamps phases and behaves exactly like EB-53
+ * alone: zero overhead, zero behavior change. Each feature keeps its own
+ * window, so enabling attribution never double-samples the SLO tracker's
+ * handler window.
+ */
+interface SubscriberSloPhaseState {
+  /** Per-delivery queue-wait (enqueue → handler hand-off) samples. */
+  queueWait: DeliveryLatencyTracker;
+  /**
+   * Per-delivery backpressure-wait samples: how long the delivery waited
+   * while the subscriber's drain was fully gated by flow-control gates
+   * (shaping / rate window / max-inflight / slow-start / credit),
+   * clipped to the message's own queue lifetime. Sampled only on the
+   * plain drain path — batched subscribers always report 0 (batch-fill
+   * delay is batching, not backpressure). 0 when the drain was never
+   * fully gated.
+   */
+  backpressureWait: DeliveryLatencyTracker;
+  /**
+   * Per-delivery redelivery-wait samples (reliable redeliveries only):
+   * last redelivery schedule → hand-off.
+   */
+  redeliveryWait: DeliveryLatencyTracker;
+  /**
+   * Enqueue stamps, one clock read per accepted enqueue (the same
+   * convention as `SubscriberLatencyState`). Entries die with their
+   * messages (WeakMap), so no cleanup is needed on unsubscribe.
+   */
+  enqueuedAt: WeakMap<BusMessage, number>;
+  /**
+   * Last redelivery-schedule stamps (reliable nack/timeout requeues via
+   * `onRedeliver`). Entries die with their messages (WeakMap).
+   */
+  redeliveryScheduledAt: WeakMap<BusMessage, number>;
+  /**
+   * First drain time at which the subscriber was fully gated by
+   * flow-control gates while holding queued work; cleared the moment a
+   * drain can hand anything off again. Per-message backpressure waits
+   * are clipped against this at hand-off.
+   */
+  backpressureBlockedSinceMs: number | undefined;
+  /** SLO misses fired for this subscriber (excursion count). */
+  sloMisses: number;
+}
+
+/**
  * Validates `SubscribeOptions.latencySlo` and builds the initial
  * per-subscriber SLO state. Returns `undefined` when the feature is
  * disabled. Throws `RangeError` for a missing/invalid `p99ThresholdMs`
@@ -6578,6 +6672,25 @@ function resolveLatencySloOptions(
     thresholdMs,
     alerted: false,
     onLatencySloMiss,
+  };
+}
+
+/**
+ * Builds the per-subscriber SLO phase-attribution state (EB-133). The
+ * phase windows mirror the SLO window size so the attribution covers the
+ * same history the miss was evaluated against. `windowSize` comes from
+ * the already-validated `latencySlo` options — always a positive integer
+ * here.
+ */
+function resolveSloPhaseState(windowSize: number): SubscriberSloPhaseState {
+  return {
+    queueWait: new DeliveryLatencyTracker(windowSize),
+    backpressureWait: new DeliveryLatencyTracker(windowSize),
+    redeliveryWait: new DeliveryLatencyTracker(windowSize),
+    enqueuedAt: new WeakMap(),
+    redeliveryScheduledAt: new WeakMap(),
+    backpressureBlockedSinceMs: undefined,
+    sloMisses: 0,
   };
 }
 
@@ -9689,6 +9802,13 @@ export class EventBus {
    */
   private readonly opsAlerter: OpsAlerter | undefined;
   /**
+   * Whether SLO-miss phase attribution is armed bus-wide (EB-133, see
+   * `EventBusOptions.processingLatencySloAlert`). When false, no
+   * subscriber stamps phases — SLO tracking behaves exactly like EB-53
+   * alone.
+   */
+  private readonly processingLatencySloAlert: boolean;
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -9722,6 +9842,13 @@ export class EventBus {
    * including replays that failed again.
    */
   private totalDeadLettered = 0;
+  /**
+   * Total SLO-miss excursions fired across all latency-SLO subscribers
+   * (EB-133). Counts only when `EventBusOptions.processingLatencySloAlert`
+   * enabled attribution; see `getStats().sloMissesByPhase` for the
+   * per-subscriber phase breakdown.
+   */
+  private totalSloMisses = 0;
   /**
    * Cumulative-ack calls (`ackUpTo`, EB-76): one per call on a known
    * reliable subscriber, regardless of how many deliveries the range
@@ -10227,6 +10354,10 @@ export class EventBus {
             busId,
             now: () => this.now(),
           });
+    // EB-133: opt-in SLO-miss phase attribution. A plain boolean — no
+    // validation needed, anything truthy arms it; keep the strict
+    // `=== true` read so only an explicit `true` changes behavior.
+    this.processingLatencySloAlert = options?.processingLatencySloAlert === true;
     const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
     if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
       throw new RangeError(
@@ -13588,6 +13719,14 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const latencySlo = resolveLatencySloOptions(opts?.latencySlo);
+    // SLO-miss phase attribution (EB-133): armed only when the subscriber
+    // tracks a processing-latency SLO *and* the bus enabled attribution.
+    // The phase windows mirror the SLO window size so the attribution
+    // covers the same history the miss was evaluated against.
+    const sloPhase =
+      latencySlo !== undefined && this.processingLatencySloAlert
+        ? resolveSloPhaseState(opts?.latencySlo?.windowSize ?? 1024)
+        : undefined;
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
@@ -13796,6 +13935,9 @@ export class EventBus {
       latency: deliveryLatency,
       ackLatency,
       latencySlo,
+      // SLO-miss phase attribution (EB-133): armed only when the bus
+      // enabled it and this subscriber tracks a processing-latency SLO.
+      sloPhase,
       lag: lagMonitor,
       expiring,
       keyHotspot,
@@ -15192,6 +15334,12 @@ export class EventBus {
         // `bus.enqueue` span in the same trace, and the redelivery opens
         // a new ack span when it is handed to the handler.
         this.trace?.abandonAckSpan(msg);
+        // EB-133: stamp the redelivery schedule for SLO phase attribution
+        // (redelivery wait = re-hand-off − this stamp). Only
+        // attribution-enabled subscribers pay for the clock read.
+        if (subscriber.sloPhase !== undefined) {
+          subscriber.sloPhase.redeliveryScheduledAt.set(msg, this.now());
+        }
         const live = liveDeliveries.get(msg);
         if (live !== undefined) live.live = false;
         const count = (redeliveries.get(msg) ?? 0) + 1;
@@ -15277,6 +15425,12 @@ export class EventBus {
       // guard), mirroring the ack-latency tracker's single-sample rule.
       const sloState = subscriber.latencySlo;
       const deliveredAtMs = sloState === undefined ? 0 : this.now();
+      // EB-133: sample the SLO phase windows at hand-off. `deliveredAtMs`
+      // is a real clock reading exactly when `sloState` (and therefore a
+      // possible `sloPhase`) exists — otherwise the helper is a no-op.
+      if (subscriber.sloPhase !== undefined) {
+        this.sampleSloPhases(subscriber, msg, deliveredAtMs);
+      }
       if (ackState == null && !ackTraced && sloState === undefined) {
         // EB-107: register even the raw handle — the consumer holds it
         // directly in this branch, and batch settles must recognize it.
@@ -21944,6 +22098,15 @@ export class EventBus {
       // tracker still records at most one sample per message.
       ackLatency.tracker.accepted(msg);
     }
+    const sloPhase = subscriber.sloPhase;
+    if (sloPhase != null && result === 'accepted') {
+      // Stamp the enqueue time for SLO phase attribution (EB-133, see
+      // `EventBusOptions.processingLatencySloAlert`). Only
+      // attribution-enabled subscribers pay for the clock read; a dropped
+      // message never reaches a handler, so it is never stamped. Requeues
+      // re-stamp: each delivery samples its own queue wait.
+      sloPhase.enqueuedAt.set(msg, this.now());
+    }
     const tracer = this.trace;
     if (tracer !== undefined && result === 'accepted' && tracer.hasTrace(msg)) {
       // One `bus.enqueue` span per subscriber that accepted the message,
@@ -22219,6 +22382,57 @@ export class EventBus {
   }
 
   /**
+   * Samples the SLO phase windows for one hand-off (EB-133): queue wait
+   * (enqueue → hand-off), backpressure wait (fully-gated drain time,
+   * clipped to the message's own queue lifetime), and redelivery wait
+   * (last redelivery schedule → hand-off). Untracked subscribers pay one
+   * branch; tracked ones pay three WeakMap reads and up to three tracker
+   * records. The handler phase needs no sampling here — it is the SLO
+   * tracker's own window, read at miss time so it always agrees with the
+   * event's `p99Ms`.
+   */
+  private sampleSloPhases(subscriber: Subscriber, msg: BusMessage, handOffAtMs: number): void {
+    const phase = subscriber.sloPhase;
+    if (phase == null) return;
+    const enqueuedAt = phase.enqueuedAt.get(msg);
+    if (enqueuedAt !== undefined) {
+      phase.queueWait.record(Math.max(0, handOffAtMs - enqueuedAt));
+      const blockedSince = phase.backpressureBlockedSinceMs;
+      phase.backpressureWait.record(
+        blockedSince === undefined
+          ? 0
+          : Math.max(0, handOffAtMs - Math.max(enqueuedAt, blockedSince)),
+      );
+    }
+    const redeliveryAt = phase.redeliveryScheduledAt.get(msg);
+    if (redeliveryAt !== undefined) {
+      phase.redeliveryWait.record(Math.max(0, handOffAtMs - redeliveryAt));
+    }
+  }
+
+  /**
+   * Builds the SLO-miss phase attribution from the current phase windows
+   * (EB-133). Phases with no samples yet report 0s — honest, not
+   * interpolated. The `handlerMs` phase reads the SLO tracker's own
+   * window, so it always agrees with the miss event's `p99Ms`.
+   */
+  private sloPhaseAttribution(
+    phase: SubscriberSloPhaseState,
+    handlerSummary: DeliveryLatencySummaryStats,
+  ): SloPhaseAttribution {
+    const summarize = (tracker: DeliveryLatencyTracker): SloPhaseSummary => {
+      const s = tracker.summary();
+      return { p50Ms: s.p50Ms, p99Ms: s.p99Ms };
+    };
+    return {
+      queueWaitMs: summarize(phase.queueWait),
+      backpressureWaitMs: summarize(phase.backpressureWait),
+      handlerMs: { p50Ms: handlerSummary.p50Ms, p99Ms: handlerSummary.p99Ms },
+      redeliveryWaitMs: summarize(phase.redeliveryWait),
+    };
+  }
+
+  /**
    * The invocation-time SLO state to sample, if any: reliable
    * subscribers sample exclusively on `ack()` completion (see the ack
    * wrapper in `subscribeReliable`), so the synchronous
@@ -22253,6 +22467,29 @@ export class EventBus {
     if (summary.p99Ms > slo.thresholdMs) {
       if (!slo.alerted) {
         slo.alerted = true;
+        // EB-133: attach phase attribution when the bus armed it, and
+        // feed the ops alert outlet. The in-process callback's legacy
+        // fields are unchanged — attribution is purely additive.
+        const phase = subscriber.sloPhase;
+        const phaseAttribution =
+          phase === undefined ? undefined : this.sloPhaseAttribution(phase, summary);
+        if (phase !== undefined) {
+          phase.sloMisses += 1;
+          this.totalSloMisses += 1;
+          this.opsAlerter?.note('processing-latency-slo-breach', subscriber.id, {
+            subscriberId: subscriber.id,
+            pattern: subscriber.pattern,
+            p99Ms: summary.p99Ms,
+            thresholdMs: slo.thresholdMs,
+            samples: summary.samples,
+            phaseAttribution: {
+              queueWaitMs: phaseAttribution?.queueWaitMs ?? { p50Ms: 0, p99Ms: 0 },
+              backpressureWaitMs: phaseAttribution?.backpressureWaitMs ?? { p50Ms: 0, p99Ms: 0 },
+              handlerMs: phaseAttribution?.handlerMs ?? { p50Ms: 0, p99Ms: 0 },
+              redeliveryWaitMs: phaseAttribution?.redeliveryWaitMs ?? { p50Ms: 0, p99Ms: 0 },
+            },
+          });
+        }
         const onLatencySloMiss = slo.onLatencySloMiss;
         if (onLatencySloMiss !== undefined) {
           try {
@@ -22263,6 +22500,7 @@ export class EventBus {
               thresholdMs: slo.thresholdMs,
               samples: summary.samples,
               at: this.now(),
+              ...(phaseAttribution === undefined ? {} : { phaseAttribution }),
             });
           } catch {
             // Advisory-only alert: a throwing SLO callback must never
@@ -24447,6 +24685,7 @@ export class EventBus {
     const deliveryLatency: BusStats['deliveryLatency'] = [];
     const ackLatency: BusStats['ackLatency'] = [];
     const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
+    const sloMissesByPhase: BusStats['sloMissesByPhase'] = [];
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const inFlightUsage: BusStats['inFlightUsage'] = [];
@@ -24576,6 +24815,18 @@ export class EventBus {
           thresholdMs: slo.thresholdMs,
           breaching: slo.alerted,
         });
+        // EB-133: per-subscriber SLO-miss phase attribution. The handler
+        // phase reads the SLO tracker's own window so it agrees with the
+        // miss event's p99Ms.
+        const phase = subscriber.sloPhase;
+        if (phase != null) {
+          sloMissesByPhase.push({
+            subscriberId: subscriber.id,
+            pattern: subscriber.pattern,
+            sloMisses: phase.sloMisses,
+            phaseAttribution: this.sloPhaseAttribution(phase, p99),
+          });
+        }
       }
       const lagState = subscriber.lag;
       if (lagState != null) {
@@ -24793,6 +25044,8 @@ export class EventBus {
       deliveryLatency,
       ackLatency,
       subscriberLatencyP99,
+      sloMisses: this.totalSloMisses,
+      sloMissesByPhase,
       slowestSubscribers,
       lag,
       laggingSubscribers,
@@ -26027,6 +26280,9 @@ export class EventBus {
       // time — same rule as production.
       this.recordDeliveryLatency(subscriber, msg, nowMs);
       this.recordLagSample(subscriber, msg, nowMs);
+      // EB-133: sample the SLO phase windows at hand-off — queue wait,
+      // backpressure wait, redelivery wait.
+      this.sampleSloPhases(subscriber, msg, nowMs);
       shadow.delivered += 1;
       this.totalShadowed += 1;
       const invocationSlo = this.invocationLatencySlo(subscriber);
@@ -26249,6 +26505,25 @@ export class EventBus {
       // it, while FIFO order is preserved.
       const credits = subscriber.credits;
       const creditBudget = credits == null ? Infinity : Math.max(0, credits.balance);
+      const sloPhase = subscriber.sloPhase;
+      if (sloPhase != null) {
+        // EB-133: detect a fully-gated drain — the subscriber holds
+        // queued work but no flow-control gate lets any of it through.
+        // The blocked-since time anchors per-message backpressure waits
+        // (clipped to each message's own queue lifetime at hand-off). It
+        // is cleared after the hand-off loop below, so messages handed
+        // off in the very round the gate opens still sample their full
+        // gated wait. Partial gating (budget > 0 but below the backlog)
+        // is not counted — the documented semantics are "fully gated".
+        const fullyGated =
+          Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive, slowStartMaxLive, creditBudget) <=
+          0;
+        if (fullyGated && subscriber.queue.size > 0) {
+          if (sloPhase.backpressureBlockedSinceMs === undefined) {
+            sloPhase.backpressureBlockedSinceMs = nowMs;
+          }
+        }
+      }
       const { live, expired } = subscriber.queue.drainLiveUpTo(
         nowMs,
         Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive, slowStartMaxLive, creditBudget),
@@ -26289,6 +26564,9 @@ export class EventBus {
           // Sampled before the handler runs: queue dwell, not processing time.
           this.recordDeliveryLatency(subscriber, msg, nowMs);
           this.recordLagSample(subscriber, msg, nowMs);
+          // EB-133: sample the SLO phase windows at hand-off — queue wait,
+          // backpressure wait, redelivery wait.
+          this.sampleSloPhases(subscriber, msg, nowMs);
           // Handler processing time (EB-53): sampled per invocation for
           // plain subscribers. Reliable subscribers sample on ack()
           // completion instead (see invocationLatencySlo), so the
@@ -26349,6 +26627,14 @@ export class EventBus {
           this.reportDegraded(subscriber);
           break;
         }
+      }
+      if (sloPhase != null && live.length > 0) {
+        // EB-133: at least one message was handed off, so the gate is
+        // flowing — the current gated interval ends here. (A stale
+        // timestamp from a message that expired while gated is harmless:
+        // per-message waits are clipped to each message's own queue
+        // lifetime at sample time.)
+        sloPhase.backpressureBlockedSinceMs = undefined;
       }
       if (shaping != null) {
         // Expired entries were discarded above, so a non-empty queue means
@@ -26576,6 +26862,9 @@ export class EventBus {
       // Sampled before the handler runs: queue dwell, not processing time.
       this.recordDeliveryLatency(subscriber, msg, nowMs);
       this.recordLagSample(subscriber, msg, nowMs);
+      // EB-133: sample the SLO phase windows at hand-off — queue wait,
+      // backpressure wait, redelivery wait.
+      this.sampleSloPhases(subscriber, msg, nowMs);
     }
     if (subscriber.health == null) {
       this.invokeBatchWithProcessingLatency(subscriber, () => {
@@ -27111,6 +27400,9 @@ export class EventBus {
     // Sampled before the handler runs: queue dwell, not processing time.
     this.recordDeliveryLatency(subscriber, msg, nowMs);
     this.recordLagSample(subscriber, msg, nowMs);
+    // EB-133: sample the SLO phase windows at hand-off — queue wait,
+    // backpressure wait, redelivery wait.
+    this.sampleSloPhases(subscriber, msg, nowMs);
     // The handler's return value is captured so the in-flight cap (see
     // `SubscribeOptions.maxInflight`) can hold the slot until a returned
     // promise settles; a throw is still swallowed into the failure

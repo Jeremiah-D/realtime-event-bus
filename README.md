@@ -1334,6 +1334,22 @@ library.
   series per tracked subscriber). `p99ThresholdMs` is required and must
   be a positive finite number; invalid options throw `RangeError` /
   `TypeError` from `subscribe`. Disabled by default.
+- **SLO-miss phase attribution** (in `src/bus.ts`, opt-in via
+  `new EventBus({ processingLatencySloAlert: true })`): when a
+  `latencySlo` subscriber's p99 breaches, the miss event carries a
+  `phaseAttribution` — windowed p50/p99 for the four delivery phases —
+  so you can tell *where* the latency came from without guessing:
+  `queueWaitMs` (enqueue→hand-off), `backpressureWaitMs` (time behind a
+  fully-gated drain: shaping / rate window / max-inflight / slow-start /
+  credit, clipped to the message's own queue lifetime; plain drain path
+  only — batched subscribers report 0), `handlerMs` (the SLO tracker's
+  own window, always agreeing with the event's `p99Ms`), and
+  `redeliveryWaitMs` (reliable nack/timeout requeue→re-hand-off). The
+  breach also emits a `processing-latency-slo-breach` alert on the ops
+  outlet (when configured) and is counted in `getStats().sloMisses` /
+  `sloMissesByPhase`. Default off: with the flag off, SLO tracking
+  behaves exactly like the bullet above — no phase stamping, no extra
+  clock reads, no ops alert.
 - **Per-subscriber lag watermark monitoring** (in `src/lag.ts`, opt-in via
   `subscribe(..., { lagMonitor: true })`): answers the live question — "how
   far behind is this consumer *right now*?" — Kafka-consumer-lag style.
