@@ -3092,6 +3092,50 @@ Details:
   `{ via: 'publish' }`; `partition_rule_set` carries `{ partitions }`;
   `barrier_dropped` carries `{ epoch, lastEpoch }` (EB-98).
 
+## Publish audit journal (EB-138)
+
+`EventBusOptions.publishAudit` opts into an append-only journal of every
+publish admission decision — admitted publishes and admission rejections
+(the EB-39 `AdmissionRejectReason` vocabulary) — persisted as
+`__publish_audit.jsonl` under `durableLogDir` (requires it):
+
+```ts
+const bus = new EventBus({ durableLogDir: './data', publishAudit: true });
+bus.publish('orders.created', payload, { publisherId: 'checkout-svc' });
+
+bus.getPublishAudit({ topic: 'orders.created' });
+// [{ v:1, outcome:'admitted', topic:'orders.created', seq:1,
+//    publisherId:'checkout-svc', admittedAtMs:… }]
+bus.getPublishAudit({ since, until, publisherId, limit });
+```
+
+Details:
+
+- **Admitted lines** carry `{ topic, seq, publisherId?, traceId,
+  messageId?, key?, admittedAtMs }` — never the payload body, so large
+  or sensitive payloads stay out of the audit trail. `traceId` is parsed
+  from the publish's `traceparent`.
+- **Rejected lines** cite the EB-39 `reason` (`'acl' | 'schema' |
+  'message-too-big' | 'payload-too-large' | 'rate-limit' |
+  'publisher-rate-limit' | 'duplicate' | 'alias-retired' |
+  'topic-paused' | 'circuit-breaker' | 'sampled'`).
+- **Rotation** — the live file rotates (renamed, never deleted — the
+  EB-61 archive convention) to `__publish_audit.<YYYYMMDD>.<n>.jsonl` on
+  UTC-day rollover or past the live-file byte budget (default 64 MiB,
+  `maxBytes` tunes it).
+- **Recovery** — on construction the bounded in-memory read view
+  (default 10000 entries, `maxEntries` tunes it) back-fills from the
+  on-disk files, skipping corrupt lines; a damaged journal directory
+  never prevents the bus from starting.
+- **Best-effort** — a failed append or rotation never throws into the
+  publish path; it is counted in
+  `getStats().publishAuditWriteErrors` instead.
+- **Scope** — every genuine fresh admission is journaled: `publish`,
+  `publishBatch` (per entry), `publishAtomic`, `publishIdempotent`,
+  delayed publishes (at due-time admission), route forwards,
+  bridge/cluster ingress, and pause-buffer drains. Pre-admitted
+  re-fan-outs and diagnostic publishes are not.
+
 ## Prometheus metrics
 
 `src/metrics.ts` renders a `getStats()` snapshot as Prometheus text

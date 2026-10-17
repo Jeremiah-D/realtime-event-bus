@@ -1,0 +1,375 @@
+/**
+ * Publish audit journal (EB-138): an opt-in append-only JSONL journal of
+ * every publish admission decision on the bus — admitted publishes and
+ * admission rejections (the EB-39 `AdmissionRejectReason` vocabulary).
+ * The journal answers "what did this bus admit, when, from whom" without
+ * re-reading the message log: each line carries the topic, the per-topic
+ * sequence number (admitted only), the publisher identity, the
+ * end-to-end trace id, the message identity and key — never the payload
+ * body, so large or sensitive payloads stay out of the audit trail.
+ *
+ * Two layers, mirroring the subscription audit log (EB-78):
+ * - an always-on bounded in-memory ring (default 10000 entries, oldest
+ *   evicted) that `EventBus.getPublishAudit()` queries;
+ * - disk persistence under the bus's `durableLogDir`: one live
+ *   `__publish_audit.jsonl` file, rotated (renamed, never deleted — the
+ *   EB-61 archive convention) to `__publish_audit.<YYYYMMDD>.<n>.jsonl`
+ *   on UTC-day rollover or when the live file would exceed its byte
+ *   budget. On construction the in-memory ring is back-filled from the
+ *   on-disk files (archived first, live last), skipping corrupt lines.
+ *
+ * All timestamps come from the bus clock (`now`), so tests stay
+ * deterministic. Disk writes are synchronous and error-isolated: a
+ * failed append or rotation never throws into the publish path — it is
+ * counted in `writeErrors()` instead (best-effort journaling).
+ */
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync } from 'node:fs';
+import { join } from 'node:path';
+import { Buffer } from 'node:buffer';
+
+/** Live journal file name inside the log directory. */
+export const PUBLISH_AUDIT_LIVE_NAME = '__publish_audit.jsonl';
+
+/** Default bound of the in-memory read view (oldest entries evicted first). */
+export const PUBLISH_AUDIT_DEFAULT_MAX_ENTRIES = 10_000;
+
+/** Default live-file byte budget before rotation (64 MiB). */
+export const PUBLISH_AUDIT_DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * One publish admission record. `outcome` decides which of `seq` /
+ * `reason` is present:
+ * - `admitted`: the publish fanned out; `seq` is its per-topic sequence
+ *   number.
+ * - `rejected`: an admission gate refused it; `reason` names the gate in
+ *   the EB-39 vocabulary (`'acl' | 'schema' | 'message-too-big' |
+ *   'payload-too-large' | 'rate-limit' | 'publisher-rate-limit' |
+ *   'duplicate' | 'alias-retired' | 'topic-paused' | 'circuit-breaker' |
+ *   'sampled'`).
+ */
+export interface PublishAuditEntry {
+  v: 1;
+  outcome: 'admitted' | 'rejected';
+  /** The concrete topic the publish targeted (never a pattern). */
+  topic: string;
+  /** Per-topic sequence number; present only when admitted. */
+  seq?: number;
+  /** The refusing gate (EB-39 vocabulary); present only when rejected. */
+  reason?: string;
+  /** Publisher identity, when the publish carried one. */
+  publisherId?: string;
+  /** End-to-end trace id (parsed from the publish's traceparent). */
+  traceId?: string;
+  /** Application message identity, when the publish carried one. */
+  messageId?: string;
+  /** Message key, when the publish carried one. */
+  key?: string;
+  /** Bus-clock milliseconds of the admission decision. */
+  admittedAtMs: number;
+}
+
+/** Query filters for `PublishAuditLog.query`. */
+export interface PublishAuditQuery {
+  /** Exact topic match. */
+  topic?: string;
+  /** Exact publisher identity match. */
+  publisherId?: string;
+  /** Inclusive lower bound on `admittedAtMs`. */
+  since?: number;
+  /** Exclusive upper bound on `admittedAtMs`. */
+  until?: number;
+  /** Return at most this many of the most recent matching entries. */
+  limit?: number;
+}
+
+/** Options for `PublishAuditLog`. */
+export interface PublishAuditOptions {
+  /** Bounded in-memory read view; oldest entries evicted first. */
+  maxEntries?: number;
+  /** Live-file byte budget; the file rotates past it. */
+  maxBytes?: number;
+  /** Clock source; defaults to `Date.now`. */
+  now?: () => number;
+}
+
+function utcDay(at: number): string {
+  const d = new Date(at);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function archivedName(day: string, n: number): string {
+  return `__publish_audit.${day}.${n}.jsonl`;
+}
+
+function isArchivedAuditFile(name: string): boolean {
+  return (
+    name.startsWith('__publish_audit.') &&
+    name.endsWith('.jsonl') &&
+    /^__publish_audit\.\d{8}\.\d+\.jsonl$/.test(name)
+  );
+}
+
+/** Validates a publish-audit query; throws `RangeError` on illegal values. */
+export function assertValidPublishAuditQuery(query: PublishAuditQuery): void {
+  const { topic, publisherId, since, until, limit } = query;
+  if (topic !== undefined && (typeof topic !== 'string' || topic.length === 0)) {
+    throw new RangeError('getPublishAudit: topic must be a non-empty string');
+  }
+  if (publisherId !== undefined && (typeof publisherId !== 'string' || publisherId.length === 0)) {
+    throw new RangeError('getPublishAudit: publisherId must be a non-empty string');
+  }
+  if (since !== undefined && (!Number.isFinite(since) || since < 0)) {
+    throw new RangeError('getPublishAudit: since must be a finite non-negative timestamp');
+  }
+  if (until !== undefined && (!Number.isFinite(until) || until < 0)) {
+    throw new RangeError('getPublishAudit: until must be a finite non-negative timestamp');
+  }
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+    throw new RangeError('getPublishAudit: limit must be a positive integer');
+  }
+}
+
+/**
+ * Parses one JSONL journal line; returns `undefined` for corrupt lines
+ * (bad JSON, wrong shape) so recovery skips them instead of dying.
+ */
+export function parsePublishAuditLine(line: string): PublishAuditEntry | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const o = parsed as Record<string, unknown>;
+  if (o['v'] !== 1) return undefined;
+  if (o['outcome'] !== 'admitted' && o['outcome'] !== 'rejected') return undefined;
+  if (typeof o['topic'] !== 'string' || (o['topic'] as string).length === 0) return undefined;
+  if (typeof o['admittedAtMs'] !== 'number' || !Number.isFinite(o['admittedAtMs'])) return undefined;
+  const entry: PublishAuditEntry = {
+    v: 1,
+    outcome: o['outcome'],
+    topic: o['topic'] as string,
+    admittedAtMs: o['admittedAtMs'] as number,
+  };
+  if (o['outcome'] === 'admitted') {
+    if (!Number.isInteger(o['seq']) || (o['seq'] as number) < 1) return undefined;
+    entry.seq = o['seq'] as number;
+    if (o['reason'] !== undefined) return undefined;
+  } else {
+    if (typeof o['reason'] !== 'string' || (o['reason'] as string).length === 0) return undefined;
+    entry.reason = o['reason'] as string;
+    if (o['seq'] !== undefined) return undefined;
+  }
+  for (const key of ['publisherId', 'traceId', 'messageId', 'key'] as const) {
+    const value = o[key];
+    if (value !== undefined) {
+      if (typeof value !== 'string') return undefined;
+      entry[key] = value;
+    }
+  }
+  return entry;
+}
+
+export class PublishAuditLog {
+  private readonly dir: string;
+  private readonly maxEntries: number;
+  private readonly maxBytes: number;
+  private readonly now: () => number;
+  private readonly entries: PublishAuditEntry[] = [];
+  private diskWriteErrors = 0;
+  private corruptLines = 0;
+  /** UTC day of the live file's newest line; null when the live file is empty/absent. */
+  private liveDay: string | null = null;
+  /** Byte size of the live file. */
+  private liveBytes = 0;
+
+  constructor(dir: string, options: PublishAuditOptions = {}) {
+    if (typeof dir !== 'string' || dir.length === 0) {
+      throw new RangeError('publishAuditDir must be a non-empty string');
+    }
+    const { maxEntries = PUBLISH_AUDIT_DEFAULT_MAX_ENTRIES, maxBytes = PUBLISH_AUDIT_DEFAULT_MAX_BYTES, now = Date.now } = options;
+    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+      throw new RangeError('publishAuditMaxEntries must be a positive integer');
+    }
+    if (!Number.isFinite(maxBytes) || maxBytes < 1) {
+      throw new RangeError('publishAuditMaxBytes must be a positive finite number of bytes');
+    }
+    if (typeof now !== 'function') {
+      throw new RangeError('publishAudit now must be a function');
+    }
+    this.dir = dir;
+    this.maxEntries = maxEntries;
+    this.maxBytes = maxBytes;
+    this.now = now;
+    this.recover();
+  }
+
+  /**
+   * Records one admission decision. The timestamp is stamped here on the
+   * bus clock, so callers pass everything except `v`/`admittedAtMs`.
+   * Never throws: disk failures (append or rotation) are counted in
+   * `writeErrors()` and the in-memory entry always lands — the publish
+   * path is never blocked by the journal.
+   */
+  record(entry: Omit<PublishAuditEntry, 'v' | 'admittedAtMs'> & { admittedAtMs?: number }): void {
+    const full: PublishAuditEntry = {
+      v: 1,
+      outcome: entry.outcome,
+      topic: entry.topic,
+      admittedAtMs: entry.admittedAtMs ?? this.now(),
+      ...(entry.seq === undefined ? {} : { seq: entry.seq }),
+      ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+      ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
+      ...(entry.traceId === undefined ? {} : { traceId: entry.traceId }),
+      ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
+      ...(entry.key === undefined ? {} : { key: entry.key }),
+    };
+    this.entries.push(full);
+    if (this.entries.length > this.maxEntries) {
+      this.entries.splice(0, this.entries.length - this.maxEntries);
+    }
+    try {
+      const line = JSON.stringify(full) + '\n';
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      this.rotateIfNeeded(full.admittedAtMs, lineBytes);
+      appendFileSync(join(this.dir, PUBLISH_AUDIT_LIVE_NAME), line, 'utf8');
+      this.liveDay = utcDay(full.admittedAtMs);
+      this.liveBytes += lineBytes;
+    } catch {
+      this.diskWriteErrors += 1;
+    }
+  }
+
+  /**
+   * Queries the in-memory read view: filters by topic, publisher, and
+   * time window, then returns at most `limit` of the most recent matches
+   * (oldest first). Throws `RangeError` on illegal query values.
+   */
+  query(query: PublishAuditQuery = {}): PublishAuditEntry[] {
+    assertValidPublishAuditQuery(query);
+    const { topic, publisherId, since, until, limit } = query;
+    const matched: PublishAuditEntry[] = [];
+    for (const e of this.entries) {
+      if (topic !== undefined && e.topic !== topic) continue;
+      if (publisherId !== undefined && e.publisherId !== publisherId) continue;
+      if (since !== undefined && e.admittedAtMs < since) continue;
+      if (until !== undefined && e.admittedAtMs >= until) continue;
+      matched.push(e);
+    }
+    if (limit !== undefined && matched.length > limit) {
+      return matched.slice(matched.length - limit);
+    }
+    return matched;
+  }
+
+  /** In-memory read-view size. */
+  size(): number {
+    return this.entries.length;
+  }
+
+  /** Disk append/rotation failures since construction. */
+  writeErrors(): number {
+    return this.diskWriteErrors;
+  }
+
+  /** Corrupt JSONL lines skipped during recovery. */
+  corruptLineCount(): number {
+    return this.corruptLines;
+  }
+
+  /**
+   * Rotates the live file when the incoming line belongs to a new UTC
+   * day or would push the live file past its byte budget. Rotation is a
+   * rename to `__publish_audit.<day>.<n>.jsonl` (EB-61 archive
+   * convention: archived, never deleted); a failed rename is counted
+   * and the line still lands in the live file — data preservation beats
+   * rotation hygiene.
+   */
+  private rotateIfNeeded(admittedAtMs: number, lineBytes: number): void {
+    const day = utcDay(admittedAtMs);
+    if (this.liveDay === day && this.liveBytes + lineBytes <= this.maxBytes) return;
+    // Nothing to rotate: no live file yet (or it is empty).
+    if (this.liveBytes === 0) {
+      this.liveDay = day;
+      return;
+    }
+    try {
+      const archivedDay = this.liveDay ?? day;
+      const name = archivedName(archivedDay, this.nextArchiveIndex(archivedDay));
+      renameSync(join(this.dir, PUBLISH_AUDIT_LIVE_NAME), join(this.dir, name));
+      this.liveBytes = 0;
+      this.liveDay = day;
+    } catch {
+      this.diskWriteErrors += 1;
+    }
+  }
+
+  /** Next archive sequence number for `day` (max existing + 1). */
+  private nextArchiveIndex(day: string): number {
+    let max = -1;
+    let files: string[];
+    try {
+      files = readdirSync(this.dir);
+    } catch {
+      return 0;
+    }
+    const prefix = `__publish_audit.${day}.`;
+    for (const f of files) {
+      if (!f.startsWith(prefix) || !f.endsWith('.jsonl')) continue;
+      const n = parseInt(f.slice(prefix.length, -'.jsonl'.length), 10);
+      if (Number.isInteger(n) && n > max) max = n;
+    }
+    return max + 1;
+  }
+
+  /**
+   * Back-fills the in-memory read view from the on-disk journal
+   * (archived files first, live file last), skipping corrupt lines.
+   * Failures here are silent by design: a damaged journal directory
+   * must never prevent the bus from starting.
+   */
+  private recover(): void {
+    let files: string[];
+    try {
+      mkdirSync(this.dir, { recursive: true });
+      files = readdirSync(this.dir);
+    } catch {
+      return;
+    }
+    const archived = files.filter(isArchivedAuditFile).sort();
+    const ordered = files.includes(PUBLISH_AUDIT_LIVE_NAME) ? [...archived, PUBLISH_AUDIT_LIVE_NAME] : archived;
+    const recovered: PublishAuditEntry[] = [];
+    for (const file of ordered) {
+      let text: string;
+      try {
+        text = readFileSync(join(this.dir, file), 'utf8');
+      } catch {
+        continue;
+      }
+      if (file === PUBLISH_AUDIT_LIVE_NAME) {
+        this.liveBytes = Buffer.byteLength(text, 'utf8');
+      }
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed === '') continue;
+        const entry = parsePublishAuditLine(trimmed);
+        if (entry === undefined) {
+          this.corruptLines += 1;
+          continue;
+        }
+        recovered.push(entry);
+      }
+    }
+    if (recovered.length > this.maxEntries) {
+      recovered.splice(0, recovered.length - this.maxEntries);
+    }
+    this.entries.push(...recovered);
+    if (recovered.length > 0) {
+      this.liveDay = utcDay(recovered[recovered.length - 1].admittedAtMs);
+    }
+  }
+}

@@ -191,11 +191,18 @@ import {
   formatTraceparent,
   newSpanId,
   newTraceId,
+  parseTraceparent,
   resolveTraceOptions,
   validateTraceparent,
   type TraceOptions,
   type TraceSpan,
 } from './trace.ts';
+import {
+  PublishAuditLog,
+  type PublishAuditEntry,
+  type PublishAuditOptions,
+  type PublishAuditQuery,
+} from './publishaudit.ts';
 import {
   OtlpSpanExporter,
   resolveOtlpOptions,
@@ -3060,6 +3067,26 @@ export interface EventBusOptions {
    */
   subscriptionAuditMaxEntries?: number;
   /**
+   * Opt-in publish audit journal (EB-138): every publish admission — each
+   * admitted publish and every admission rejection (the EB-39
+   * `AdmissionRejectReason` vocabulary) — is appended to
+   * `__publish_audit.jsonl` under `durableLogDir` (append-only JSONL;
+   * UTC-day rotation and a live-file byte budget archive old files per
+   * the EB-61 convention, never delete). An admitted line carries
+   * `{ topic, seq, publisherId?, traceId, messageId?, key?,
+   * admittedAtMs }` — never the payload body; a rejected line cites the
+   * EB-39 `reason`. Query it with `getPublishAudit({ topic?,
+   * publisherId?, since, until, limit })`.
+   *
+   * Requires `durableLogDir`. Disabled by default. The journal is
+   * best-effort: a failed append or rotation never throws into the
+   * publish path — it is counted in
+   * `getStats().publishAuditWriteErrors` instead. Pass `true` for the
+   * defaults, or a `PublishAuditOptions` (`maxEntries` bounds the
+   * in-memory read view, `maxBytes` the live-file byte budget).
+   */
+  publishAudit?: boolean | PublishAuditOptions;
+  /**
    * Maximum retained log entries per topic before the log compacts away the
    * oldest entries (default 10000). Only meaningful with `durableLogDir`.
    * Must be a positive integer.
@@ -3895,6 +3922,13 @@ export interface BusStats {
    * visible in `subscribersByPattern`.
    */
   multiPatternSubscriptions: number;
+  /**
+   * Publish-audit journal (EB-138) disk write/rotation failures since
+   * the bus started. The journal is best-effort: a failed append or
+   * rotation never throws into the publish path — it is counted here
+   * instead. Always 0 when the journal is disabled.
+   */
+  publishAuditWriteErrors: number;
   /**
    * Currently active subscriptions paused for cross-instance migration
    * (see `exportSubscription`, EB-82): delivery is paused but the
@@ -10618,6 +10652,12 @@ export class EventBus {
    */
   private readonly subAudit: SubscriptionAuditLog;
   /**
+   * Publish audit journal (EB-138): opt-in via `EventBusOptions.publishAudit`
+   * (requires `durableLogDir`). Undefined when disabled — the publish path
+   * then pays a single undefined-check per admission and nothing else.
+   */
+  private readonly publishAudit: PublishAuditLog | undefined;
+  /**
    * Topic metadata registry (EB-77): the operator-side catalog of known
    * topics. Advisory only — publishing to an unregistered topic is
    * counted and surfaced on `onUnregisteredTopic`, never blocked.
@@ -10910,6 +10950,13 @@ export class EventBus {
     if (options?.durableLogDir == null && options?.durableLogStorageBackend !== undefined) {
       throw new RangeError('durableLogStorageBackend requires EventBusOptions.durableLogDir to be set');
     }
+    if (
+      options?.durableLogDir == null &&
+      options?.publishAudit !== undefined &&
+      options?.publishAudit !== false
+    ) {
+      throw new RangeError('publishAudit requires EventBusOptions.durableLogDir to be set');
+    }
     if (options?.durableLogDir != null) {
       const log = DurableTopicLog.open({
         dir: options.durableLogDir,
@@ -11065,6 +11112,29 @@ export class EventBus {
         committed.set(topic, seq);
       }
     }
+    // Publish audit journal (EB-138): opt-in append-only journal of every
+    // publish admission decision, persisted as `__publish_audit.jsonl`
+    // under `durableLogDir`. The `durableLogDir` requirement is validated
+    // with the other durable-log options above, so reaching here means the
+    // directory is set. The journal recovers its read view from disk at
+    // construction; recording is best-effort and never throws into the
+    // publish path (see `PublishAuditLog`).
+    const publishAuditOpt = options?.publishAudit;
+    if (
+      publishAuditOpt !== undefined &&
+      publishAuditOpt !== false &&
+      publishAuditOpt !== true &&
+      (publishAuditOpt === null || typeof publishAuditOpt !== 'object' || Array.isArray(publishAuditOpt))
+    ) {
+      throw new RangeError('publishAudit must be true or a PublishAuditOptions object');
+    }
+    this.publishAudit =
+      publishAuditOpt === undefined || publishAuditOpt === false
+        ? undefined
+        : new PublishAuditLog(options.durableLogDir as string, {
+            ...(publishAuditOpt === true ? {} : (publishAuditOpt as PublishAuditOptions)),
+            now: this.now,
+          });
     // Subscription lifecycle audit log (EB-78): always constructed — the
     // in-memory index records every change even without a disk directory.
     // Validated before construction, so a throw leaves no half-built bus.
@@ -19245,6 +19315,14 @@ export class EventBus {
     const aliasResolution = this.resolvePublishTopic(topic);
     if (aliasResolution.retired) {
       this.countAliasRetired(topic, payload, publisherId);
+      this.recordPublishAudit(topic, {
+        admitted: false,
+        reason: 'alias-retired',
+        key: opts?.key,
+        traceparent: opts?.traceparent,
+        messageId,
+        publisherId,
+      });
       return { duplicate: false, accepted: 0 };
     }
     topic = aliasResolution.topic;
@@ -19288,6 +19366,14 @@ export class EventBus {
     // denied, not deduplicated, and its retry stays a fresh publish.
     if (!this.aclAllowsPublish(topic)) {
       this.countAclDenied(topic, payload, publisherId);
+      this.recordPublishAudit(topic, {
+        admitted: false,
+        reason: 'acl',
+        key: opts?.key,
+        traceparent: opts?.traceparent,
+        messageId,
+        publisherId,
+      });
       return { duplicate: false, accepted: 0 };
     }
     const nowMs = this.now();
@@ -19298,7 +19384,17 @@ export class EventBus {
       // Suppressed duplicate: dropped before admission — no sequence
       // number, no durable-log write, no rate-limit budget. Counted for
       // observability only, and surfaced on the admission-rejection hook.
+      // Journaled as a rejection with the EB-39 'duplicate' reason, like
+      // every other admission decision.
       this.countDuplicate(topic, payload, publisherId);
+      this.recordPublishAudit(topic, {
+        admitted: false,
+        reason: 'duplicate',
+        key: opts?.key,
+        traceparent: opts?.traceparent,
+        messageId,
+        publisherId,
+      });
       return { duplicate: true, accepted: 0 };
     }
     const { accepted, admitted } = this.fanOut(
@@ -22051,6 +22147,55 @@ export class EventBus {
   }
 
   /**
+   * Records one publish admission decision in the audit journal
+   * (EB-138). No-op when the journal is disabled — the publish path then
+   * pays a single undefined-check and nothing else. Never throws: the
+   * journal itself is best-effort (failures are counted, not raised).
+   */
+  private recordPublishAudit(
+    topic: string,
+    decision: {
+      admitted: boolean;
+      seq?: number;
+      reason?: AdmissionRejectReason;
+      key?: string;
+      traceparent?: string;
+      messageId?: string;
+      publisherId?: string;
+    },
+  ): void {
+    const journal = this.publishAudit;
+    if (journal === undefined) return;
+    journal.record({
+      outcome: decision.admitted ? 'admitted' : 'rejected',
+      topic,
+      ...(decision.admitted ? { seq: decision.seq } : { reason: decision.reason }),
+      ...(decision.publisherId === undefined ? {} : { publisherId: decision.publisherId }),
+      ...(decision.traceparent === undefined
+        ? {}
+        : { traceId: parseTraceparent(decision.traceparent)?.traceId }),
+      ...(decision.messageId === undefined ? {} : { messageId: decision.messageId }),
+      ...(decision.key === undefined ? {} : { key: decision.key }),
+    });
+  }
+
+  /**
+   * Queries the publish audit journal (EB-138): the bounded in-memory
+   * read view of every publish admission decision — admitted publishes
+   * (`{ topic, seq, publisherId?, traceId, messageId?, key?,
+   * admittedAtMs }`, never the payload body) and admission rejections
+   * (citing the EB-39 `reason`). Filters by exact `topic` /
+   * `publisherId` and by time window; `limit` keeps the most recent
+   * matches. Entries come back oldest-first.
+   *
+   * Returns `[]` when the journal is disabled (no `publishAudit`
+   * option). Throws `RangeError` on illegal query values.
+   */
+  getPublishAudit(query?: PublishAuditQuery): PublishAuditEntry[] {
+    return this.publishAudit?.query(query ?? {}) ?? [];
+  }
+
+  /**
    * Registers a topic in the operator-side catalog (EB-77): the concrete
    * topic name plus optional ownership metadata (`owner`, `description`,
    * `schemaVersion`, `tags`). Registering an already-registered topic
@@ -24254,6 +24399,20 @@ export class EventBus {
     // branch and nothing else (no allocation, no WeakMap lookup).
     const tracer = this.trace;
     const fanOutStart = tracer !== undefined ? this.now() : 0;
+    // Publish audit journal (EB-138): records this fan-out's admission
+    // decision — best-effort, never throws into the publish path (see
+    // `PublishAuditLog.record`). Only genuine fresh admissions are
+    // journaled: pre-admitted re-fan-outs (the publishAtomic commit
+    // phase) are skipped, while a delayed due-time fan-out IS the
+    // admission (it carries the `delayed` context); diagnostic publishes
+    // are internal health traffic, not publishes. `topic` is read lazily
+    // so the journal names the alias-resolved concrete topic, and the
+    // payload body is never recorded.
+    const auditPublish = (admitted: boolean, seq?: number, reason?: AdmissionRejectReason): void => {
+      if (diagnostic) return;
+      if (preAdmitted && delayed === undefined) return;
+      this.recordPublishAudit(topic, { admitted, seq, reason, key, traceparent, messageId, publisherId });
+    };
     // Topic aliases (EB-44) resolve before every other admission gate: the
     // resolved topic is the real publish topic — ACL, schema validation,
     // rate-limit budget, TTL, compression, the durable log and the
@@ -24268,6 +24427,7 @@ export class EventBus {
     const aliasResolution = this.resolvePublishTopic(topic);
     if (aliasResolution.retired) {
       this.countAliasRetired(topic, payload, publisherId);
+      auditPublish(false, undefined, 'alias-retired');
       return { matched: 0, accepted: 0, admitted: false, rejectReason: 'alias-retired' };
     }
     topic = aliasResolution.topic;
@@ -24285,6 +24445,7 @@ export class EventBus {
     // with a migration target, while deletion has no successor.
     if (this.topicLifecycle.isDeleted(topic)) {
       this.countAliasRetired(topic, payload, publisherId);
+      auditPublish(false, undefined, 'alias-retired');
       return { matched: 0, accepted: 0, admitted: false, rejectReason: 'alias-retired' };
     }
     // Publish-side partition routing (EB-90): resolves the message's
@@ -24333,6 +24494,7 @@ export class EventBus {
           this.totalPublished += 1;
           this.countPartitionPublish(topic, resolvedPartition, shedSeq);
           this.countTopicPaused(topic, payload, publisherId);
+          auditPublish(false, undefined, 'topic-paused');
           return { matched: 0, accepted: 0, admitted: false, rejectReason: 'topic-paused' };
         }
         this.bufferPausedMessage(pauseRule, topic, payload, {
@@ -24355,7 +24517,9 @@ export class EventBus {
         // Publisher confirmation (EB-125): a buffered publish is held
         // for resume, not rejected — but it is not admitted either, so
         // it reports 'topic-paused' with no admission. Documented on
-        // `PublishRejection`.
+        // `PublishRejection`. The resume-time fan-out journals the real
+        // admission; this line records the buffering decision.
+        auditPublish(false, undefined, 'topic-paused');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'topic-paused' };
       }
     }
@@ -24390,6 +24554,7 @@ export class EventBus {
       // ambiguous (paused vs. over-budget).
       if (this.takePublisherToken(publisherId) !== undefined) {
         this.countPublisherRateLimited(topic, payload, publisherId);
+        auditPublish(false, undefined, 'publisher-rate-limit');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'publisher-rate-limit' };
       }
       // Broker-level ACL runs before every other admission gate except
@@ -24401,6 +24566,7 @@ export class EventBus {
       // rejection with reason 'acl' (see countAclDenied).
       if (!this.aclAllowsPublish(topic)) {
         this.countAclDenied(topic, payload, publisherId);
+        auditPublish(false, undefined, 'acl');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'acl' };
       }
       // Publish-side schema validation runs before admission: a rejected
@@ -24411,6 +24577,7 @@ export class EventBus {
       // superseded-but-graced version are counted in
       // `deprecatedSchemaVersions`.
       if (!this.applySchemaVerdict(topic, payload, schemaVersion, publisherId)) {
+        auditPublish(false, undefined, 'schema');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'schema' };
       }
       // Per-topic maximum message size runs after schema validation and
@@ -24423,6 +24590,7 @@ export class EventBus {
       const maxBytes = this.maxMessageBytesForTopic(topic);
       if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
         this.countMessageTooBig(topic, payload, publisherId);
+        auditPublish(false, undefined, 'message-too-big');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'message-too-big' };
       }
       // Per-topic payload-size cap (EB-120) runs right after the
@@ -24437,6 +24605,7 @@ export class EventBus {
       const maxPayloadBytes = this.maxPayloadBytesForTopic(topic);
       if (maxPayloadBytes !== undefined && payloadByteSize(payload) > maxPayloadBytes) {
         this.countPayloadTooLarge(topic, payload, publisherId);
+        auditPublish(false, undefined, 'payload-too-large');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'payload-too-large' };
       }
       // Publish-side adaptive sampling (EB-38): the load-shedding gate
@@ -24467,6 +24636,7 @@ export class EventBus {
           this.samplingRandom() < sampleRate
         ) {
           this.countSampled(topic, payload, publisherId);
+          auditPublish(false, undefined, 'sampled');
           return { matched: 0, accepted: 0, admitted: false, rejectReason: 'sampled' };
         }
       }
@@ -24590,6 +24760,7 @@ export class EventBus {
         if (delayedKeyed !== undefined) {
           this.releaseKeySequence(delayedKeyed.key, delayedKeyed.keySeq);
         }
+        auditPublish(false, undefined, 'rate-limit');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'rate-limit' };
       }
     }
@@ -25045,6 +25216,10 @@ export class EventBus {
       confirm.admittedAtMs = this.now();
       confirm.payloadSha256 = confirmationPayloadHash(payload, binary);
     }
+    // The publish is admitted: journal it (EB-138) — the seq is stamped
+    // and the admission decision is final here, right before returning
+    // to the caller.
+    auditPublish(true, msg.seq);
     return { matched, accepted, admitted: true, seq: msg.seq };
   }
 
@@ -25546,6 +25721,7 @@ export class EventBus {
       patternCacheSize: this.patternCache.size,
       compositeSubscriptions: this.compositeSubscriptionCount,
       multiPatternSubscriptions: this.multiPatternSubscriptionCount,
+      publishAuditWriteErrors: this.publishAudit?.writeErrors() ?? 0,
       migratingSubscribers,
       drainingSubscribers,
       indexSize: this.prefixIndex.size,
