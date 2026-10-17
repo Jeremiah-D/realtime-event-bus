@@ -121,6 +121,11 @@ import {
   type HlcTimestamp,
 } from './hlc.ts';
 import {
+  OpsAlerter,
+  resolveOpsAlerterOptions,
+  type OpsAlertStats,
+} from './ops-alert.ts';
+import {
   TopicRegistry,
   assertValidTopicRegistration,
   type TopicInfo,
@@ -3048,6 +3053,36 @@ export interface EventBusOptions {
    */
   groupLag?: GroupLagMonitorOptions;
   /**
+   * Ops alert webhook outlet (EB-132): opt-in delivery of operational
+   * signals — consumer-lag SLO breaches (on top of the EB-112
+   * in-process `onLagSloBreach` callback), dead-letter queue growth,
+   * and gateway disconnect storms — as HMAC-SHA256-signed HTTP POSTs
+   * (`x-ops-signature`) to a configured ops endpoint. The sink is
+   * pluggable: the caller implements the actual HTTP delivery (see
+   * `src/ops-alert.ts` `OpsAlertSink`); the bus never touches the
+   * network. Alerts carry bounded retries and a dedup window, and
+   * never block the publish path. Absent (the default) disables the
+   * outlet entirely — zero behavior change.
+   */
+  opsAlert?: {
+    /** Where to POST alerts — the caller implements the HTTP delivery. */
+    sink: import('./ops-alert.ts').OpsAlertSink;
+    /** HMAC secret signing every delivery. A string is UTF-8 encoded. */
+    secret: string | Buffer;
+    /** Key id annotation for secret rotation. */
+    keyId?: string;
+    /** Burst-collapse window per (kind, key). Default 5 minutes. */
+    dedupWindowMs?: number;
+    /** Max delivery attempts per alert, including the first. Default 3. */
+    maxAttempts?: number;
+    /** Base backoff between attempts; doubled per attempt, capped at 30s. Default 1s. */
+    retryBaseMs?: number;
+    /** Disconnects inside the window that declare a storm. Default 10. */
+    gatewayDisconnectThreshold?: number;
+    /** Sliding window for the disconnect-storm detector. Default 60s. */
+    gatewayDisconnectWindowMs?: number;
+  };
+  /**
    * Pluggable backing store for consumer-group committed offsets
    * (EB-114, see `src/offsetstore.ts`). Every group-level `commitOffset`
    * (no `partition`/`instanceId`) is mirrored into the store, so a
@@ -3896,6 +3931,12 @@ export interface BusStats {
    * predate the field (hand-built fixtures).
    */
   mirrorConflictsByTopic?: Array<{ topic: string; conflicts: number }>;
+  /**
+   * Ops alert outlet counters (EB-132): `{ sent, failed, suppressed }`.
+   * Zeros when the outlet is disabled — the outlet changes no behavior
+   * unless `EventBusOptions.opsAlert` enabled it.
+   */
+  opsAlert: OpsAlertStats;
   /**
    * Total messages skipped by subscriber content filters and composite
    * include/exclude patterns — the sum of every topic's
@@ -9642,6 +9683,12 @@ export class EventBus {
   /** Per-topic mirror-conflict counts, feeding the Prometheus series. */
   private readonly mirrorConflictTopics = new Map<string, number>();
   /**
+   * Ops alert outlet (EB-132): undefined unless `EventBusOptions.opsAlert`
+   * enabled it — the disabled path allocates nothing and changes no
+   * behavior.
+   */
+  private readonly opsAlerter: OpsAlerter | undefined;
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -10169,6 +10216,17 @@ export class EventBus {
     // EB-131: the HLC runs on the bus clock so tests inject time
     // deterministically via `EventBusOptions.now`.
     this.hlc = new HybridLogicalClock(busId, () => this.now());
+    // EB-132: validated fail-fast — a bad ops config must never
+    // half-wire a bus. Absent means the outlet stays off entirely.
+    const opsAlertOptions = options?.opsAlert;
+    this.opsAlerter =
+      opsAlertOptions === undefined
+        ? undefined
+        : new OpsAlerter({
+            ...opsAlertOptions,
+            busId,
+            now: () => this.now(),
+          });
     const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
     if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
       throw new RangeError(
@@ -10263,7 +10321,36 @@ export class EventBus {
     }
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
-    this.groupLagMonitor = new GroupLagMonitor(resolveGroupLagOptions(options?.groupLag, 'EventBus'));
+    const resolvedGroupLag = resolveGroupLagOptions(options?.groupLag, 'EventBus');
+    // EB-132: the ops alert outlet sits on top of the EB-112 lag-SLO
+    // in-process callback — a breach fires the user's hook first, then
+    // raises a signed alert. The user's hook still runs even when the
+    // alert path throws (it cannot — `note` is infallible — but the
+    // `finally` documents the ordering contract).
+    if (this.opsAlerter !== undefined && resolvedGroupLag?.slo?.onLagSloBreach !== undefined) {
+      const userHook = resolvedGroupLag.slo.onLagSloBreach;
+      const alerter = this.opsAlerter;
+      resolvedGroupLag.slo.onLagSloBreach = (event) => {
+        try {
+          userHook(event);
+        } finally {
+          alerter.note(
+            'lag-slo-breach',
+            [event.groupId, event.pattern, event.topic, String(event.partition ?? '')].join('\0'),
+            {
+              groupId: event.groupId,
+              pattern: event.pattern,
+              topic: event.topic,
+              ...(event.partition === undefined ? {} : { partition: event.partition }),
+              lag: event.lag,
+              violated: event.violated,
+              consecutiveSamples: event.consecutiveSamples,
+            },
+          );
+        }
+      };
+    }
+    this.groupLagMonitor = new GroupLagMonitor(resolvedGroupLag);
     // EB-114: validated here, fail-fast — an invalid store must never
     // half-wire a bus. Absent means the default in-memory store: the bus
     // behaves exactly as before.
@@ -11779,6 +11866,26 @@ export class EventBus {
   private countMirrorConflict(topic: string): void {
     this.totalMirrorConflicts += 1;
     this.mirrorConflictTopics.set(topic, (this.mirrorConflictTopics.get(topic) ?? 0) + 1);
+  }
+
+  /**
+   * Records one gateway connection disconnect for the ops alert
+   * outlet's storm detector (EB-132). Wire a `GatewayServer` to it:
+   *
+   * ```ts
+   * const gateway = new GatewayServer(bus, {
+   *   onDisconnect: () => bus.noteGatewayDisconnect(),
+   * });
+   * ```
+   *
+   * When `gatewayDisconnectThreshold` disconnects land inside
+   * `gatewayDisconnectWindowMs`, one `gateway-disconnect-storm` alert
+   * fires. A no-op unless `EventBusOptions.opsAlert` enabled the
+   * outlet — synchronous and infallible, safe to call from any
+   * connection teardown path.
+   */
+  noteGatewayDisconnect(): void {
+    this.opsAlerter?.noteGatewayDisconnect();
   }
 
   /**
@@ -24643,6 +24750,7 @@ export class EventBus {
         topic,
         conflicts,
       })),
+      opsAlert: this.opsAlerter?.getStats() ?? { sent: 0, failed: 0, suppressed: 0 },
       filteredMessages: this.totalFiltered,
       signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
@@ -25051,6 +25159,17 @@ export class EventBus {
     };
     dlq.entries.push({ ...entry, msg });
     this.totalDeadLettered += 1;
+    // EB-132: dead-letter queue growth feeds the ops alert outlet. The
+    // dedup window collapses a flood of moves into one alert per
+    // subscriber per window — the outlet reports growth, not every
+    // single move.
+    this.opsAlerter?.note('dead-letter-growth', subscriber.id, {
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      topic: msg.topic,
+      redeliveries,
+      ...(lastError === undefined ? {} : { lastError }),
+    });
     dlq.onDeadLetter?.({
       subscriberId: subscriber.id,
       pattern: subscriber.pattern,

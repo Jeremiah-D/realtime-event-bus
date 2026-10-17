@@ -3815,6 +3815,74 @@ Prometheus exposition carries
 `eventbus_consumer_lag_slo_breach_total`. Clocks are injectable
 (`EventBusOptions.now`), so SLO timing stays deterministic in tests.
 
+## Ops alert webhook outlet (EB-132)
+
+`EventBusOptions.opsAlert` opts into a signed webhook outlet for the
+bus's operational signals — consumer-lag SLO breaches (on top of the
+EB-112 in-process `onLagSloBreach` callback), dead-letter queue growth,
+and gateway disconnect storms. Following the AV-118 keeper-notifier
+convention, the transport is pluggable: the caller implements the
+actual HTTP POST via the `OpsAlertSink` trait (`send(delivery)`), and
+the bus never touches the network.
+
+```ts
+import { EventBus } from './src/bus.ts';
+
+const bus = new EventBus({
+  opsAlert: {
+    sink: {
+      // POST delivery JSON; set x-ops-signature to delivery.signature.
+      send: async (delivery) => {
+        await fetch('https://ops.example.com/alerts', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-ops-signature': delivery.signature,
+          },
+          body: JSON.stringify(delivery),
+        });
+      },
+    },
+    secret: 'ops-webhook-secret', // HMAC-SHA256 secret (string or Buffer)
+    keyId: 'ops-2026-10',         // optional rotation label
+    dedupWindowMs: 5 * 60_000,    // burst-collapse window (default 5m)
+    maxAttempts: 3,               // bounded retries (default 3)
+    retryBaseMs: 1000,            // exponential backoff base (default 1s)
+    gatewayDisconnectThreshold: 10,  // storm threshold (default 10)
+    gatewayDisconnectWindowMs: 60_000, // storm window (default 60s)
+  },
+});
+
+// Wire a gateway to the storm detector:
+const gateway = new GatewayServer(bus, {
+  onDisconnect: () => bus.noteGatewayDisconnect(),
+});
+```
+
+Semantics:
+
+- **Three signals.** `lag-slo-breach` fires on top of the EB-112
+  callback (the user's hook runs first, then the alert is raised);
+  `dead-letter-growth` fires on every per-subscriber DLQ move;
+  `gateway-disconnect-storm` fires when the disconnect count inside
+  the window reaches the threshold (edge-triggered, rearms below
+  threshold).
+- **Signed.** Every delivery carries `signature =
+  hex(HMAC-SHA256(secret, canonicalJSON(alert)))` in the
+  `x-ops-signature` header, with an optional `keyId`. `verifyDelivery`
+  is the receiver-side check — forge a byte and it fails.
+- **Bounded + deduplicated.** Each alert is attempted at most
+  `maxAttempts` times with capped exponential backoff (unref'd timers),
+  then dropped and counted. Repeats for the same `(kind, key)` inside
+  the dedup window are suppressed — a DLQ flood or a flapping SLO
+  produces one alert per window, not one per event.
+- **Never blocks.** `note` is synchronous and infallible; delivery
+  runs on a detached promise chain. A dead ops endpoint can neither
+  stall nor break the publish path.
+- **Off by default.** Without `opsAlert` the bus creates no alerter —
+  zero behavior change. `getStats().opsAlert` reports
+  `{ sent, failed, suppressed }`.
+
 ## Manual subscriber pause/resume (EB-113)
 
 `bus.pauseSubscriber(subId, { reason? })` / `bus.resumeSubscriber(subId)`

@@ -318,6 +318,21 @@ export interface GatewayOptions {
    * closed with 1009. Default 1 MiB.
    */
   maxFrameBytes?: number;
+  /**
+   * Opt-in disconnect hook (EB-132): called once per established
+   * (handshook) connection teardown — wire it to
+   * `bus.noteGatewayDisconnect()` to feed the ops alert outlet's
+   * disconnect-storm detector. Failed handshakes never fire it (they
+   * are auth/protocol errors, counted separately). Throwing hooks are
+   * swallowed: teardown must not fail.
+   */
+  onDisconnect?: (event: GatewayDisconnectEvent) => void;
+}
+
+/** One established gateway connection's teardown, as delivered to `onDisconnect`. */
+export interface GatewayDisconnectEvent {
+  /** Remote address when the socket reports one. */
+  remoteAddress?: string;
 }
 
 export interface GatewayStats {
@@ -379,6 +394,7 @@ export class GatewayServer {
   private readonly sendHighWaterMarkBytes: number;
   private readonly maxPendingBytes: number;
   private readonly maxFrameBytes: number;
+  private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
   private server: TcpServer | null = null;
   private readonly connections = new Set<Connection>();
   private readonly stats: GatewayStats = {
@@ -414,6 +430,11 @@ export class GatewayServer {
       fail('maxFrameBytes must be a positive finite number');
     }
     this.maxFrameBytes = maxFrameBytes;
+    const onDisconnect = options.onDisconnect;
+    if (onDisconnect !== undefined && typeof onDisconnect !== 'function') {
+      fail('onDisconnect must be a function');
+    }
+    this.onDisconnect = onDisconnect;
   }
 
   /** Starts listening; resolves with the bound port. */
@@ -559,6 +580,20 @@ export class GatewayServer {
     if (conn.closed) return;
     conn.closed = true;
     this.connections.delete(conn);
+    // EB-132: established-connection teardown feeds the ops alert
+    // outlet's storm detector (when wired). Failed handshakes are not
+    // disconnects — they are auth/protocol errors, counted separately.
+    // A throwing hook must not break teardown.
+    if (conn.handshook && this.onDisconnect !== undefined) {
+      try {
+        const remoteAddress = conn.socket.remoteAddress;
+        this.onDisconnect(
+          remoteAddress === undefined ? {} : { remoteAddress },
+        );
+      } catch {
+        // Teardown is infallible.
+      }
+    }
     for (const { sub } of conn.subscriptions.values()) {
       try {
         sub.unsubscribe();
