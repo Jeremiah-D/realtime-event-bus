@@ -1698,7 +1698,25 @@ library.
   deterministically in tests. `getStats().pendingDelayed` reports the
   scheduled count. Invalid timing options throw `RangeError`; with a durable
   log, a non-JSON-serializable payload throws instead of scheduling
-  something that could not survive a restart.
+  something that could not survive a restart. Opt-in schedule-skew
+  observability (EB-136, in `src/scheduleskew.ts`, via `new EventBus({
+  scheduleSkew: {} })`): samples every fanned-out schedule's skew — the
+  actual fan-out time minus its due time (`deliverAt`, the expected
+  fan-out moment; no redundant timestamp is stamped) — into a bounded
+  rolling window (default 1024, oldest evicted) with nearest-rank p50/p99.
+  A clock that moved backwards clamps the sample at 0. `getStats()
+  .delayedScheduleSkew` reports `{ samples, p50Ms, p99Ms, minMs, maxMs,
+  meanMs }`, and `src/metrics.ts` renders
+  `eventbus_delayed_schedule_skew_ms{quantile="0.5"|"0.99"}`. With
+  `scheduleSkew: { alertThresholdMs, onScheduleSkew }`, every sample whose
+  skew exceeds the threshold fires `onScheduleSkew` with `{
+  scheduledFor, fannedOutAtMs, skewMs, topic, delayId }` — advisory only:
+  a throwing callback is isolated and never breaks fan-out. Only
+  schedules that actually fan out are sampled; cancelled, expired, and
+  pause-shed/pause-buffered schedules never fan out and stay out of the
+  distribution. Schedules rebuilt from the durable log sample exactly like
+  live ones, and invalid options throw `RangeError`/`TypeError` from the
+  constructor.
 - **Shadow subscriber traffic mirroring** (in `src/bus.ts`, via
   `subscribe(pattern, handler, { shadow: true | { queueSize?,
   dropPolicy? } })`): the subscription becomes a shadow subscriber — it
@@ -2123,6 +2141,18 @@ npm test
   double delivery, no recount), unserializable payloads throwing with a
   durable log and scheduling in memory without one, timing-option
   validation, and `getStats().pendingDelayed`.
+- `test/schedule-skew.test.ts` — delayed-delivery schedule-skew observability
+  (EB-136): skew sampling (`now - deliverAt`) on the real fan-out path only,
+  nearest-rank p50/p99 over the window, oldest-first eviction past
+  `windowSize`, negative-sample clamping (backwards clock), per-sample alert
+  (`onScheduleSkew` fires when skew exceeds `alertThresholdMs`, with
+  `scheduledFor === deliverAt`, `fannedOutAtMs`, `skewMs`, `topic`,
+  `delayId`; a throwing callback never breaks fan-out; at-or-below
+  threshold stays silent), opt-in semantics (no option: zeroed stats, no
+  Prometheus series), durable-log restart recovery sampling through the
+  same sweep, constructor option validation, `renderPrometheus` exposition
+  of `eventbus_delayed_schedule_skew_ms{quantile="0.5"|"0.99"}`, and
+  expired-while-delayed schedules staying out of the distribution.
 - `test/filter.test.ts` — subscriber content filtering: reject/accept
   semantics, filtered messages consuming no backpressure budget, no
   sequence gaps from skipped messages (while a genuinely dropped message
@@ -3126,6 +3156,7 @@ Exported series:
 | `eventbus_topic_subscribers{topic}` | gauge | per-topic fan-out width (subscribers matched by the most recent publish) |
 | `eventbus_delivery_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber enqueue→delivery queue-dwell p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `deliveryLatency`-tracked subscriptions |
 | `eventbus_delivery_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's latency window |
+| `eventbus_delayed_schedule_skew_ms{quantile}` | gauge | delayed-delivery schedule skew: actual fan-out time minus due time (`deliverAt`), p50/p99 (`quantile` = "0.5"/"0.99"); only `scheduleSkew`-enabled buses, only once at least one schedule has been sampled (EB-136) |
 | `eventbus_ack_latency_ms{quantile,subscriber,pattern}` | gauge | per-subscriber accepted→ack end-to-end latency p50/p95/p99 (`quantile` = "0.5"/"0.95"/"0.99"); only `ackLatency`-enabled reliable subscriptions |
 | `eventbus_ack_latency_samples{subscriber,pattern}` | gauge | samples in the subscriber's ack-latency window |
 | `eventbus_subscriber_processing_latency_p99{subscriber,pattern}` | gauge | per-subscriber handler processing-latency windowed p99 — the `latencySlo` alerting signal; only SLO-tracked subscriptions |

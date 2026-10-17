@@ -138,6 +138,15 @@
  *   appear.
  * - `eventbus_delivery_latency_samples{subscriber,pattern}`: samples
  *   currently in each tracked subscriber's latency window.
+ * - `eventbus_delayed_schedule_skew_ms{quantile}`: delayed-delivery
+ *   schedule-skew distribution (EB-136) — each fanned-out schedule's
+ *   actual fan-out time minus its due time (`deliverAt`), nearest-rank
+ *   p50/p99 over the bus's bounded rolling window (`quantile` is "0.5"
+ *   or "0.99"). The timer-fidelity signal for due-time SLAs. Rendered
+ *   only when the bus was built with `EventBusOptions.scheduleSkew` and
+ *   at least one schedule has been sampled; cancelled, expired,
+ *   pause-shed and pause-buffered schedules never fan out and are never
+ *   sampled.
  * - `eventbus_ack_latency_ms{quantile,subscriber,pattern}`: per-subscriber
  *   accepted→ack end-to-end latency distribution for reliable
  *   subscriptions with `ackLatency` enabled — nearest-rank p50/p95/p99
@@ -502,6 +511,23 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_delivery_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
     lines.push(`eventbus_delivery_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
     lines.push(`eventbus_delivery_latency_samples{${labels}} ${s.samples}`);
+  }
+
+  // Delayed-delivery schedule-skew distribution (EB-136): bus-wide,
+  // opt-in via `EventBusOptions.scheduleSkew`. HELP/TYPE always render
+  // like the other opt-in blocks; the series render only once at least
+  // one schedule has been sampled (`samples > 0`) — a disabled bus, or
+  // one whose window is still empty, contributes no series. The `??`
+  // keeps the renderer tolerant of a stats object that predates the
+  // field (hand-built fixtures included).
+  lines.push(
+    "# HELP eventbus_delayed_schedule_skew_ms Delayed-delivery schedule skew: actual fan-out time minus the schedule's due time (deliverAt), in milliseconds — nearest-rank p50/p99 over the rolling sample window. Only schedules that actually fan out are sampled.",
+  );
+  lines.push('# TYPE eventbus_delayed_schedule_skew_ms gauge');
+  const skew = stats.delayedScheduleSkew ?? undefined;
+  if (skew !== undefined && skew.samples > 0) {
+    lines.push(`eventbus_delayed_schedule_skew_ms{quantile="0.5"} ${skew.p50Ms}`);
+    lines.push(`eventbus_delayed_schedule_skew_ms{quantile="0.99"} ${skew.p99Ms}`);
   }
 
   // Per-subscriber ack-latency series (only reliable subscriptions with

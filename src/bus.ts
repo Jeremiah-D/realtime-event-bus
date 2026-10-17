@@ -114,6 +114,14 @@ import {
   type TopicFairnessOptions,
 } from './fair.ts';
 import {
+  emptyScheduleSkewSummary,
+  resolveScheduleSkewOptions,
+  ScheduleSkewTracker,
+  type ResolvedScheduleSkewOptions,
+  type ScheduleSkewOptions,
+  type ScheduleSkewSummaryStats,
+} from './scheduleskew.ts';
+import {
   resolveMirrorRules,
   type MirrorHandle,
   type MirrorProvenance,
@@ -270,6 +278,11 @@ export type {
   AckLatencySummaryStats,
   AckSloMissEvent,
 } from './acklatency.ts';
+export type {
+  ScheduleSkewEvent,
+  ScheduleSkewOptions,
+  ScheduleSkewSummaryStats,
+} from './scheduleskew.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
 export type {
   BusHealthReport,
@@ -3213,6 +3226,28 @@ export interface EventBusOptions {
    */
   processingLatencySloAlert?: boolean;
   /**
+   * Opt-in delayed-delivery schedule-skew observability (EB-136, see
+   * `src/scheduleskew.ts`): samples every fanned-out schedule's skew —
+   * the actual fan-out time minus its due time (`DelayedEntry.deliverAt`,
+   * the schedule's expected fan-out moment; no redundant timestamp is
+   * stamped, `scheduledFor === deliverAt` by definition) — into a bounded
+   * rolling window with nearest-rank p50/p99.
+   *
+   * Only schedules that actually fan out are sampled. Cancelled,
+   * expired-while-delayed, pause-shed and pause-buffered schedules never
+   * fan out, so they have no actual fan-out moment and stay out of the
+   * distribution. Schedules rebuilt from the durable log after a restart
+   * (EB-55) sample exactly like live ones: the recovery sweep is the
+   * same code path. Skew is computed on the bus clock
+   * (`EventBusOptions.now`); a backwards clock movement clamps at 0.
+   *
+   * `getStats().delayedScheduleSkew` reports the window summary and
+   * `src/metrics.ts` renders
+   * `eventbus_delayed_schedule_skew_ms{quantile="0.5"|"0.99"}`. Absent
+   * (default): no sampling, zeroed stats, no Prometheus series.
+   */
+  scheduleSkew?: ScheduleSkewOptions;
+  /**
    * Pluggable backing store for consumer-group committed offsets
    * (EB-114, see `src/offsetstore.ts`). Every group-level `commitOffset`
    * (no `partition`/`instanceId`) is mirrored into the store, so a
@@ -4276,6 +4311,16 @@ export interface BusStats {
    * in the timer heap until its due time.
    */
   pendingDelayed: number;
+  /**
+   * Delayed-delivery schedule-skew summary (EB-136, see
+   * `EventBusOptions.scheduleSkew`): the bounded rolling window over
+   * every fanned-out schedule's skew (actual fan-out time minus its due
+   * time `deliverAt`) — `{ samples, p50Ms, p99Ms, minMs, maxMs, meanMs }`
+   * with nearest-rank percentiles. Cancelled, expired-while-delayed,
+   * pause-shed and pause-buffered schedules never fan out and are never
+   * sampled. All zeros when the option is not passed (disabled).
+   */
+  delayedScheduleSkew: ScheduleSkewSummaryStats;
   /**
    * Cron-driven recurring publish jobs (see `scheduleRecurring`): live
    * jobs with armed timers, plus dormant post-restart entries rebuilt
@@ -10027,6 +10072,14 @@ export class EventBus {
    */
   private readonly processingLatencySloAlert: boolean;
   /**
+   * Delayed-delivery schedule-skew observability (EB-136, see
+   * `EventBusOptions.scheduleSkew`). Absent when the option is not
+   * passed — no sampling, no tracker, zeroed stats.
+   */
+  private readonly scheduleSkew:
+    | { tracker: ScheduleSkewTracker; options: ResolvedScheduleSkewOptions }
+    | undefined;
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -10592,6 +10645,17 @@ export class EventBus {
     // validation needed, anything truthy arms it; keep the strict
     // `=== true` read so only an explicit `true` changes behavior.
     this.processingLatencySloAlert = options?.processingLatencySloAlert === true;
+    // EB-136: opt-in schedule-skew sampling. A present (even empty)
+    // options object arms the tracker; an absent option disables
+    // everything — no sampling, zeroed stats, no Prometheus series.
+    const scheduleSkewOptions = resolveScheduleSkewOptions(options?.scheduleSkew);
+    this.scheduleSkew =
+      scheduleSkewOptions === undefined
+        ? undefined
+        : {
+            tracker: new ScheduleSkewTracker(scheduleSkewOptions.windowSize),
+            options: scheduleSkewOptions,
+          };
     const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
     if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
       throw new RangeError(
@@ -20433,6 +20497,35 @@ export class EventBus {
         // the message in its original lane.
         top.priority,
       );
+      // EB-136: schedule-skew sampling — this is the only sampling point.
+      // It sits on the true fan-out path: cancelled, expired,
+      // pause-shed and pause-buffered entries never fan out, so they have
+      // no actual fan-out moment and are never sampled. The sweep clock
+      // (`nowMs`) is shared by the whole pass, so every sample in the
+      // pass reads the same "now". `scheduledFor` is `deliverAt` — the
+      // schedule's expected fan-out moment; no redundant field exists.
+      // Recovered schedules (EB-55) rebuild the heap and call this same
+      // sweep, so restart recovery samples exactly like live sweeps.
+      const skewState = this.scheduleSkew;
+      if (skewState !== undefined) {
+        const skewMs = Math.max(0, nowMs - top.deliverAt);
+        skewState.tracker.record(skewMs);
+        const { alertThresholdMs, onScheduleSkew } = skewState.options;
+        if (alertThresholdMs !== undefined && onScheduleSkew !== undefined && skewMs > alertThresholdMs) {
+          try {
+            onScheduleSkew({
+              scheduledFor: top.deliverAt,
+              fannedOutAtMs: nowMs,
+              skewMs,
+              topic: top.topic,
+              delayId: top.id,
+            });
+          } catch {
+            // Advisory alert: a throwing callback is isolated and never
+            // breaks the fan-out that already ran above.
+          }
+        }
+      }
       this.appendDelayTombstone(top.id, top.topic);
       fannedOut = true;
     }
@@ -25324,6 +25417,7 @@ export class EventBus {
       inFlightUsage,
       nackReasons,
       pendingDelayed: this.delayedById.size,
+      delayedScheduleSkew: this.scheduleSkew?.tracker.summary() ?? emptyScheduleSkewSummary(),
       recurringJobs: {
         active: [...this.recurringById.values()].filter((j) => !j.dormant).length,
         jobs: [...this.recurringById.values()].map((j) => ({
