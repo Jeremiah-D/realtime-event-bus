@@ -180,6 +180,11 @@
  * - `eventbus_consumer_lag_slo_breach_total`: consumer-group lag SLO
  *   breach episodes fired (EB-112, see `EventBusOptions.groupLag.slo`):
  *   each edge-triggered `onLagSloBreach` firing moves this by one.
+ * - `eventbus_mirror_conflicts_total{topic}`: mirror writes discarded as
+ *   stale by per-key last-writer-wins arbitration on the mirror receive
+ *   side (EB-131, see `BusStats.mirrorConflictsByTopic`) — the signal
+ *   that two buses are writing the same key concurrently. Only topics
+ *   with at least one conflict carry a series.
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
@@ -762,6 +767,21 @@ export function renderPrometheus(stats: BusStats): string {
     'Total inbound bridge envelopes shed on a full ingress buffer.',
     bridge.dropped,
   );
+
+  // Mirror active-active write conflicts (EB-131): per-topic stale-write
+  // drops from per-key last-writer-wins arbitration on the mirror
+  // receive side. Only topics with at least one conflict carry a series,
+  // so cardinality tracks conflict activity, not the topic space. The
+  // `?? []` keeps the renderer tolerant of a stats object that predates
+  // the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_mirror_conflicts_total Mirror writes discarded as stale by per-key last-writer-wins arbitration on the mirror receive side.',
+  );
+  lines.push('# TYPE eventbus_mirror_conflicts_total counter');
+  for (const row of stats.mirrorConflictsByTopic ?? []) {
+    const label = `topic="${escapeLabelValue(row.topic)}"`;
+    lines.push(`eventbus_mirror_conflicts_total{${label}} ${row.conflicts}`);
+  }
 
   // Transactional outbox relay lag (EB-102). Always rendered — zeros when
   // no relay is attached — so the alert rule `eventbus_outbox_lag_ms > X`

@@ -3069,6 +3069,7 @@ Exported series:
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
 | `eventbus_signature_failures_total` | counter | `signatureFailures` — messages discarded by `verifySignature` subscribers (missing/invalid HMAC signature, EB-84) |
 | `eventbus_signature_failures_total{topic}` | counter | per-topic `signatureFailures` (EB-84) |
+| `eventbus_mirror_conflicts_total{topic}` | counter | per-topic mirror write conflicts — stale writes dropped by per-key last-writer-wins arbitration on the mirror receive side (EB-131); only topics with ≥1 conflict carry a series |
 | `eventbus_retained_topics` | gauge | `retainedTopics.length` — topics currently holding an MQTT-style retained message (EB-87) |
 | `eventbus_dedup_dropped_messages_total` | counter | `dedupDropped` — subscriber exactly-once dedup suppressions |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
@@ -3913,6 +3914,34 @@ The call returns a `SubscriberSeekResult` with one per-topic outcome
 the `invalidatedInflight` count. Clocks are injectable
 (`EventBusOptions.now`), so timestamp seeks stay deterministic in
 tests.
+
+## Mirror active-active write-conflict resolution (EB-131)
+
+Two buses mirroring the same keyed topic to each other
+(`dst.mirror(src, rules)`, EB-37) form an active-active pair: either
+side may publish a new value for the same key. Every admitted message
+carries a hybrid logical clock timestamp (`BusMessage.hlc`,
+`{ pt, l, node }` — physical millis from the bus clock, a logical
+tick, and the bus id as tiebreak), stamped at admission and preserved
+verbatim across mirror hops.
+
+On the mirror receive side the destination arbitrates per-key
+last-writer-wins: it keeps the greatest HLC seen per `(topic, key)`;
+an incoming mirrored write whose HLC does not beat the register is
+dropped as stale and counted in `getStats().mirrorConflicts` (per-topic
+in `getStats().mirrorConflictsByTopic`, exported as
+`eventbus_mirror_conflicts_total{topic}`). Unkeyed messages skip
+arbitration. The destination merges the incoming HLC into its own
+clock on receipt, so a local write made after seeing a remote write
+orders after it even under clock skew.
+
+The arbitration runs after the EB-37 trail loop check, and it runs
+even for loop-dropped messages: a message whose trail already holds
+this bus's id counts as `loopsPrevented` *and* still updates the LWW
+register / counts a conflict, so a loop can never resurrect a stale
+write. The application key now rides the envelope end to end
+(`BusMessage.key`), so the mirror frame carries it and the destination
+draws its own per-key sequence numbers for the mirrored write.
 
 ## Publish circuit breaker (EB-116)
 

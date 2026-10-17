@@ -115,6 +115,12 @@ import {
   type ResolvedMirrorRule,
 } from './mirror.ts';
 import {
+  HybridLogicalClock,
+  compareHlc,
+  isHlcTimestamp,
+  type HlcTimestamp,
+} from './hlc.ts';
+import {
   TopicRegistry,
   assertValidTopicRegistration,
   type TopicInfo,
@@ -527,6 +533,25 @@ export interface BusMessage {
    * spaces. Absent for locally published messages.
    */
   mirror?: MirrorProvenance;
+  /**
+   * Hybrid logical clock timestamp of the write (EB-131): stamped at
+   * admission by the publishing bus and preserved verbatim across
+   * mirror hops, so the mirror receive side can arbitrate concurrent
+   * writes to the same key with last-writer-wins ordering that stays
+   * correct under clock skew. Absent on envelopes built outside the
+   * publish fan-out (aggregates, retained snapshots, cluster frames
+   * that predate the field) — the mirror path falls back to a local
+   * tick for those.
+   */
+  hlc?: HlcTimestamp;
+  /**
+   * Application message key (see `PublishOptions.key`): stamped at
+   * admission so it rides the envelope end to end — mirror frames,
+   * durable-log records — driving per-key publish order (EB-36) and
+   * per-key last-writer-wins arbitration (EB-131) on the receive side.
+   * Absent for unkeyed publishes.
+   */
+  key?: string;
   /**
    * Application-level message identity, set when the publish carried one
    * (`PublishOptions.messageId`, always set by `publishIdempotent` when
@@ -3856,6 +3881,21 @@ export interface BusStats {
    * counters. A snapshot — mutating it does not affect the mirrors.
    */
   mirrors: MirrorRuleInfo[];
+  /**
+   * Total mirror writes discarded as stale by per-key last-writer-wins
+   * arbitration (EB-131): the incoming write's HLC did not beat the
+   * per-(topic, key) register. Loop-dropped messages arbitrate too, so
+   * a looped-back write counts here as well as in `loopsPrevented`.
+   */
+  mirrorConflicts: number;
+  /**
+   * Per-topic mirror-conflict counts (EB-131), feeding the
+   * `eventbus_mirror_conflicts_total{topic}` Prometheus series. Only
+   * topics that saw at least one conflict appear — a snapshot,
+   * mutating it does not affect the bus. Absent on stats objects that
+   * predate the field (hand-built fixtures).
+   */
+  mirrorConflictsByTopic?: Array<{ topic: string; conflicts: number }>;
   /**
    * Total messages skipped by subscriber content filters and composite
    * include/exclude patterns — the sum of every topic's
@@ -7272,6 +7312,16 @@ export interface ForwardFrame {
    * frames, which draw no provenance.
    */
   mirror?: MirrorProvenance;
+  /**
+   * Write HLC (EB-131): set by mirror registrations to the source
+   * message's hybrid logical timestamp. The destination preserves it
+   * verbatim on the admitted envelope and arbitrates per-key
+   * last-writer-wins against it on the receive side; it also merges it
+   * into its own HLC clock so later local writes order after the remote
+   * write under clock skew. Absent on plain forward frames, which draw
+   * a fresh local timestamp at admission.
+   */
+  hlc?: HlcTimestamp;
 }
 
 /**
@@ -9564,6 +9614,34 @@ export class EventBus {
    */
   private mirrorIngressCount = 0;
   /**
+   * This bus's hybrid logical clock (EB-131): stamped onto every
+   * admitted envelope (`BusMessage.hlc`) and merged with remote
+   * timestamps on mirror receipt, so a local write made after seeing a
+   * remote write orders after it even under clock skew. Runs on the
+   * bus's injected clock (`EventBusOptions.now`), so tests drive it
+   * deterministically.
+   */
+  private readonly hlc: HybridLogicalClock;
+  /**
+   * Latest write HLC seen per `(topic, key)` (EB-131), keyed
+   * `topic\0key`: the mirror receive side's last-writer-wins register.
+   * Local publishes and non-mirror ingress record their write HLC here
+   * at admission; mirror ingress is recorded by the mirror callback's
+   * arbitration (the origin HLC, not the destination's admission
+   * stamp). Unbounded in the pathological case of unbounded key
+   * cardinality — same tradeoff as the per-key sequence state (EB-36).
+   */
+  private readonly mirrorWriteHlc = new Map<string, HlcTimestamp>();
+  /**
+   * Mirror writes discarded as stale by per-key LWW arbitration
+   * (EB-131): the incoming write's HLC did not beat the register.
+   * Loop-dropped messages arbitrate too ("环内仍仲裁"), so a looped-back
+   * write counts here as well as in `loopsPrevented`.
+   */
+  private totalMirrorConflicts = 0;
+  /** Per-topic mirror-conflict counts, feeding the Prometheus series. */
+  private readonly mirrorConflictTopics = new Map<string, number>();
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -10088,6 +10166,9 @@ export class EventBus {
       throw new RangeError('busId must be a non-empty string');
     }
     this.busId = busId;
+    // EB-131: the HLC runs on the bus clock so tests inject time
+    // deterministically via `EventBusOptions.now`.
+    this.hlc = new HybridLogicalClock(busId, () => this.now());
     const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
     if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
       throw new RangeError(
@@ -11582,20 +11663,47 @@ export class EventBus {
         loopsPrevented: 0,
       };
       const sub = source.subscribe(rule.srcPattern, (msg: BusMessage) => {
+        // EB-131: merge the source write's HLC into this bus's clock
+        // first — a local write made after seeing this message must
+        // order after it even under clock skew. A message without an
+        // HLC (built outside the publish fan-out) draws a local tick
+        // as its write timestamp.
+        const remoteHlc = msg.hlc;
+        const writeHlc = remoteHlc !== undefined && isHlcTimestamp(remoteHlc) ? remoteHlc : this.hlc.tick();
+        if (remoteHlc !== undefined && isHlcTimestamp(remoteHlc)) this.hlc.receive(remoteHlc);
         const trail = msg.mirror?.trail ?? [];
-        if (trail.includes(this.busId)) {
+        const isLoop = trail.includes(this.busId);
+        if (isLoop) {
           info.loopsPrevented += 1;
-          return;
         }
         const dstTopic = rule.apply(msg.topic);
         // Defensive: the subscription matched, so the rule must match
         // too — a null here would mean the two matchers disagreed.
         if (dstTopic === null) return;
+        // EB-131: per-key last-writer-wins arbitration. Runs even for
+        // loop-dropped messages ("环内仍仲裁") — a loop must not
+        // resurrect a stale write, and a looped-back write is itself a
+        // stale (already-seen) write. Stale writes are dropped and
+        // counted; they never reach admission. Arbitration keys off the
+        // alias-resolved topic, matching the register that local
+        // publishes update post-resolution in `fanOut`.
+        const resolvedDst = this.resolvePublishTopic(dstTopic).topic;
+        if (msg.key !== undefined) {
+          if (!this.arbitrateMirrorWrite(resolvedDst, msg.key, writeHlc)) {
+            this.countMirrorConflict(resolvedDst);
+            return;
+          }
+        }
+        if (isLoop) return;
         info.mirrored += 1;
         const origin = msg.mirror;
         this.receiveForward({
           topic: dstTopic,
           payload: msg.payload,
+          // The application key rides the frame so per-key order (EB-36)
+          // and per-key LWW arbitration (EB-131) survive the hop; the
+          // destination draws its own per-key sequence numbers.
+          ...(msg.key === undefined ? {} : { key: msg.key }),
           ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
           ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
           ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
@@ -11603,6 +11711,11 @@ export class EventBus {
           // destination bus stays byte-oriented (same-class access to
           // the source's bus-side marker — never reinterpreted as JSON).
           ...(source.binaryMessages.has(msg) ? { binary: true } : {}),
+          // The origin write's HLC rides verbatim (EB-131): the
+          // destination preserves it on the admitted envelope instead
+          // of drawing a fresh tick, so downstream mirrors arbitrate
+          // against the origin write.
+          ...(msg.hlc === undefined ? {} : { hlc: msg.hlc }),
           // Origin fields survive multi-hop mirrors verbatim; only the
           // trail grows — downstream gap detection always sees the first
           // bus's sequence space.
@@ -11635,6 +11748,37 @@ export class EventBus {
         if (i >= 0) this.mirrorRegistrations.splice(i, 1);
       },
     };
+  }
+
+  /**
+   * Records a write's HLC in the per-(topic, key) last-writer-wins
+   * register (EB-131): keeps the greatest timestamp seen, so the mirror
+   * receive side can tell a stale write from a fresh one. Local
+   * publishes and non-mirror ingress call this at admission; mirror
+   * ingress goes through the mirror callback's arbitration instead.
+   */
+  private arbitrateMirrorWrite(topic: string, key: string, hlc: HlcTimestamp): boolean {
+    // Composite key on NUL — the `keyOrderKey` convention (EB-36): neither
+    // a topic nor a key may contain a NUL in practice.
+    const mapKey = `${topic}\0${key}`;
+    const latest = this.mirrorWriteHlc.get(mapKey);
+    // Stale when the write does not beat the register: an equal HLC is
+    // the *same* write seen twice (node ids make distinct writes
+    // unequal), so `<=` drops both old and duplicate writes.
+    if (latest !== undefined && compareHlc(hlc, latest) <= 0) return false;
+    this.mirrorWriteHlc.set(mapKey, hlc);
+    return true;
+  }
+
+  /**
+   * Counts one mirror write discarded as stale by per-key LWW
+   * arbitration (EB-131): the incoming write's HLC did not beat the
+   * register. Feeds `BusStats.mirrorConflicts` and the per-topic
+   * Prometheus series.
+   */
+  private countMirrorConflict(topic: string): void {
+    this.totalMirrorConflicts += 1;
+    this.mirrorConflictTopics.set(topic, (this.mirrorConflictTopics.get(topic) ?? 0) + 1);
   }
 
   /**
@@ -11689,6 +11833,11 @@ export class EventBus {
       undefined, // priority: cross-bus frames land in the normal lane
       undefined, // confirm: only publishWithConfirmation passes one
       mirror, // mirrorProvenance: stamped onto the message (EB-37)
+      undefined, // critical: cross-bus frames are always non-critical
+      // EB-131: the origin write's HLC rides verbatim on mirror frames;
+      // a malformed value falls back to a fresh local tick (never trust
+      // a frame the mirror registration did not build).
+      isHlcTimestamp(frame.hlc) ? frame.hlc : undefined,
     );
     this.scheduleFlush();
   }
@@ -23135,6 +23284,15 @@ export class EventBus {
     // undefined and are always non-critical — the sampling decision is
     // re-taken per admission.
     critical?: boolean,
+    // Write HLC for mirror ingress (EB-131): set only by
+    // `receiveForward` for frames built by a mirror registration. The
+    // admitted envelope preserves the origin write's HLC verbatim
+    // (instead of drawing a fresh local tick) so downstream mirrors
+    // arbitrate against the origin write and multi-path topologies do
+    // not double-deliver the same logical write. `fanOut` never
+    // validates it — the mirror registration built it. Last so
+    // existing positional call sites are unaffected.
+    mirrorHlc?: HlcTimestamp,
   ): {
     matched: number;
     accepted: number;
@@ -23379,6 +23537,17 @@ export class EventBus {
       // gap detection, replay and the durable log key off one field.
       seq: this.nextSeq(topic, resolvedPartition),
       partition: resolvedPartition,
+      // Hybrid logical timestamp of the write (EB-131): a fresh tick for
+      // local publishes and non-mirror ingress; mirror ingress preserves
+      // the origin write's HLC verbatim (see `mirrorHlc`) so downstream
+      // mirrors arbitrate against the origin write and multi-path
+      // topologies do not double-deliver the same logical write.
+      hlc: mirrorHlc ?? this.hlc.tick(),
+      // The application key rides the envelope so it survives mirror
+      // hops — the mirror receive side needs it for per-key
+      // last-writer-wins arbitration (EB-131). Absent for unkeyed
+      // publishes, which never participate in the arbitration.
+      ...(key === undefined ? {} : { key }),
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
       // The producer label rides the envelope so attribution survives
       // durable-log replay, delayed schedules and cross-bus forwards.
@@ -23433,6 +23602,16 @@ export class EventBus {
     // this line. Anonymous publishes move no per-publisher counter.
     if (publisherId !== undefined) {
       this.publisherCounts.set(publisherId, (this.publisherCounts.get(publisherId) ?? 0) + 1);
+    }
+    // EB-131: record the write HLC in the per-(topic, key) LWW register
+    // for local publishes and non-mirror ingress (forward/bridge/...),
+    // whose envelopes carry a fresh local tick. Mirror ingress is
+    // recorded by the mirror callback's arbitration instead — the
+    // origin HLC, not the destination's admission stamp — so this bus's
+    // register always holds the newest write this bus has *seen*,
+    // whichever path it arrived on.
+    if (key !== undefined && mirrorHlc === undefined && msg.hlc !== undefined) {
+      this.arbitrateMirrorWrite(topic, key, msg.hlc);
     }
     // A delayed fan-out carries the per-key sequence number assigned at
     // schedule time (publish order) — it is used verbatim below, and it is
@@ -24459,6 +24638,11 @@ export class EventBus {
       mirrors: this.mirrorRegistrations.flatMap((registration) =>
         registration.rules.map(({ info }) => ({ ...info })),
       ),
+      mirrorConflicts: this.totalMirrorConflicts,
+      mirrorConflictsByTopic: [...this.mirrorConflictTopics.entries()].map(([topic, conflicts]) => ({
+        topic,
+        conflicts,
+      })),
       filteredMessages: this.totalFiltered,
       signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
