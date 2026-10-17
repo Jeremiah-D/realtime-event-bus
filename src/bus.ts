@@ -4256,6 +4256,13 @@ export interface BusStats {
    */
   diagnosticEvents: number;
   /**
+   * Total admission-DLQ diagnostic records emitted (EB-139, see
+   * `EventBus.setTopicDeadLetterTopic`). Counted on emission, not
+   * delivery — the record exists even when nothing subscribes to the
+   * DLQ topic yet.
+   */
+  admissionDlqEvents: number;
+  /**
    * Total messages delivered with a compressed payload — the sum of every
    * topic's `compressedMessages`. See `TopicStats.compressedMessages` for
    * the exact counting rules.
@@ -7659,6 +7666,73 @@ export interface AdmissionRejectionEvent {
 export type AdmissionRejectionCallback = (event: AdmissionRejectionEvent) => void;
 
 /**
+ * Which loss an admission dead-letter record (EB-139) describes. The
+ * admission-phase reasons reuse the `AdmissionRejectReason` vocabulary
+ * verbatim, so they reconcile 1:1 against the `onAdmissionRejected` hook
+ * and the stats counters behind it:
+ * - `'schema'` | `'message-too-big'` | `'acl'` → `rejectedMessages`
+ * - `'rate-limit'` → `rateLimitedMessages`
+ *
+ * `'ttl-expired'` is the drain-phase extension: a queued message whose
+ * TTL deadline passed before the drain could hand it to a handler. It
+ * reconciles against `TopicStats.expiredMessages` /
+ * `BusStats.expiredMessages` — no admission gate fired for it, so it
+ * never appears on the admission hook.
+ */
+export type AdmissionDlqReason = 'schema' | 'rate-limit' | 'message-too-big' | 'acl' | 'ttl-expired';
+
+/**
+ * The diagnostic record fanned out to a topic's admission dead-letter
+ * topic (EB-139, see `EventBus.setTopicDeadLetterTopic`). Carries the
+ * rejected or expired publish's metadata — never the payload itself — so
+ * operators can investigate losses by subscribing to (or replaying) the
+ * DLQ topic like any other topic.
+ */
+export interface AdmissionDlqRecord {
+  /**
+   * The concrete topic the rejected publish targeted (post-alias
+   * resolution), or the topic the TTL-expired message belonged to.
+   */
+  originalTopic: string;
+  /** Which gate or phase produced the record (see `AdmissionDlqReason`). */
+  reason: AdmissionDlqReason;
+  /**
+   * End-to-end trace id when the publish carried one
+   * (`PublishOptions.traceparent`) or the bus had a sampled trace span
+   * for it. Absent otherwise.
+   */
+  traceId?: string;
+  /**
+   * Publisher identity the rejected publish carried
+   * (`PublishOptions.publisherId`), when it carried one. Absent for
+   * anonymous publishes and for drain expiries of anonymous messages.
+   */
+  publisherId?: string;
+  /**
+   * UTF-8 JSON byte size of the rejected payload (`payloadByteSize` —
+   * the same yardstick the message-size gates use). 0 when the payload
+   * has no JSON encoding.
+   */
+  payloadBytes: number;
+  /** Bus-clock timestamp of the rejection or expiry (`EventBusOptions.now`). */
+  at: number;
+}
+
+/**
+ * Options for `EventBus.setTopicDeadLetterTopic` (EB-139).
+ */
+export interface AdmissionDlqOptions {
+  /**
+   * Independent retention for this rule's DLQ diagnostic records, in
+   * milliseconds: a record older than this is dropped at drain time,
+   * exactly like a `setTopicTtl` deadline — but scoped to records
+   * emitted under this rule, independent of any TTL rule on the DLQ
+   * topic itself. Absent means records never expire on their own.
+   */
+  retentionMs?: number;
+}
+
+/**
  * Snapshot delivered to `EventBusOptions.onUnregisteredTopic` when a
  * message is published to a topic with no live registration (EB-77). The
  * publish is not blocked — this is the observability channel for typo'd
@@ -9047,6 +9121,16 @@ function payloadByteSize(payload: unknown): number {
 }
 
 /**
+ * Derives the end-to-end trace id from a W3C `traceparent` publish
+ * option (EB-139): the DLQ record's `traceId` correlation. Returns
+ * `undefined` when the publish carried no (or an unparsable)
+ * traceparent.
+ */
+function traceIdOfTraceparent(traceparent: string | undefined): string | undefined {
+  return traceparent === undefined ? undefined : parseTraceparent(traceparent)?.traceId;
+}
+
+/**
  * The canonical wire bytes of a payload (EB-92): a binary message's
  * raw bytes (zero-copy view over the published buffer), or the UTF-8
  * JSON encoding for ordinary messages. Returns `undefined` for
@@ -10308,6 +10392,33 @@ export class EventBus {
    * yet. Admission rejections (ACL/schema) do not count.
    */
   private totalDiagnosticEvents = 0;
+  /**
+   * Admission dead-letter topic rules (EB-139), keyed by the exact
+   * `topicPattern` passed to `setTopicDeadLetterTopic` — either a concrete
+   * topic name or a wildcard pattern. Match resolution mirrors
+   * `setTopicTtl`: an exact-topic rule wins over any pattern; between
+   * patterns the earliest-registered rule wins.
+   */
+  private readonly admissionDlqRules = new Map<string, { dlqTopic: string; retentionMs?: number }>();
+  /**
+   * Compiled matchers for the wildcard entries in `admissionDlqRules`,
+   * kept apart from the subscriber pattern cache so DLQ configuration
+   * never inflates `patternCacheSize`.
+   */
+  private readonly admissionDlqMatcherCache = new Map<string, RegExp>();
+  /**
+   * Messages flagged as admission-DLQ diagnostics at creation (EB-139,
+   * the `diagnosticMessages` convention). A drained DLQ diagnostic
+   * record never emits a second DLQ record — the recursion cut. The mark
+   * is bus-side so a user payload can never collide with it.
+   */
+  private readonly admissionDlqMessages = new WeakSet<BusMessage>();
+  /**
+   * Total admission-DLQ diagnostic records emitted (EB-139). Counted on
+   * emission, not delivery: the record exists even when nobody
+   * subscribes to the DLQ topic yet.
+   */
+  private totalAdmissionDlqEvents = 0;
   /**
    * Per-topic payload compression rules, keyed by the exact string passed
    * to `setTopicCompression` — either a concrete topic name or a wildcard
@@ -13049,6 +13160,95 @@ export class EventBus {
    */
   clearTopicMaxPayloadBytes(topicPattern: string): boolean {
     return this.maxPayloadBytesRules.delete(topicPattern);
+  }
+
+  /**
+   * Routes admission-phase losses to a dead-letter topic (EB-139,
+   * real-time systems reliability): when a publish to a topic matching
+   * `topicPattern` is rejected at admission — schema validation
+   * (EB-20), per-topic rate-limit shed (EB-19), message-too-big
+   * (EB-64), or broker-level ACL deny (EB-41) — or when an admitted
+   * message expires in a subscriber queue before the drain delivers it
+   * (TTL drain expiry), the bus fans one diagnostic record out to
+   * `dlqTopic`:
+   * `{ originalTopic, reason, traceId?, publisherId?, payloadBytes, at }`
+   * (see `AdmissionDlqRecord`). The record carries metadata only — never
+   * the rejected payload itself — and is consumed by subscribing to (or
+   * replaying) the DLQ topic like any other topic.
+   *
+   * The record is bus-internal health traffic: it bypasses every
+   * admission gate (ACL, schema, rate limits) via an internal marker, so
+   * a DLQ record can never be rejected and re-emitted — the recursion is
+   * cut at the source — and it is skipped by the publish audit journal
+   * (EB-138). A DLQ record that itself expires in a queue never emits a
+   * second record (bus-side `WeakSet` mark, the EB-57 convention).
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or
+   * an exact topic name); match resolution mirrors `setTopicTtl` — an
+   * exact-topic rule wins over any pattern, the earliest-registered
+   * matching pattern wins. Re-setting a rule replaces it. DLQ topics are
+   * plain topics: their retention is independently configurable with
+   * `options.retentionMs` (a per-record drain deadline, independent of
+   * any `setTopicTtl` rule on the DLQ topic itself) or with
+   * `setTopicTtl(dlqTopic, ms)`; no namespace resolution applies to the
+   * DLQ topic name.
+   *
+   * This is orthogonal to `DeadLetterOptions.diagnosticTopic` (EB-57):
+   * that one reports delivery-phase poison messages (per-subscriber DLQ
+   * moves); this one reports admission-phase rejections and TTL drain
+   * expiries. Opt-in — unset by default, fully backward compatible.
+   * Throws `RangeError` when `topicPattern` or `dlqTopic` is empty, or
+   * when `options.retentionMs` is not a positive finite number of
+   * milliseconds.
+   */
+  setTopicDeadLetterTopic(
+    topicPattern: string,
+    dlqTopic: string,
+    options?: AdmissionDlqOptions,
+  ): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (typeof dlqTopic !== 'string' || dlqTopic.length === 0) {
+      throw new RangeError('dlqTopic must be a non-empty string');
+    }
+    const retentionMs = options?.retentionMs;
+    if (retentionMs !== undefined && (!Number.isFinite(retentionMs) || retentionMs <= 0)) {
+      throw new RangeError('retentionMs must be a positive finite number of milliseconds');
+    }
+    this.admissionDlqRules.set(topicPattern, {
+      dlqTopic,
+      ...(retentionMs === undefined ? {} : { retentionMs }),
+    });
+  }
+
+  /**
+   * Removes the admission dead-letter topic rule previously registered
+   * for `topicPattern`. Returns true when a rule existed and was
+   * removed.
+   */
+  clearTopicDeadLetterTopic(topicPattern: string): boolean {
+    return this.admissionDlqRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the admission dead-letter rule applying to `topic`, or
+   * `undefined` when none matches. An exact-topic rule wins over
+   * patterns; between patterns the earliest-registered matching rule
+   * wins.
+   */
+  private admissionDlqRuleFor(topic: string): { dlqTopic: string; retentionMs?: number } | undefined {
+    const exact = this.admissionDlqRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, rule] of this.admissionDlqRules) {
+      let matcher = this.admissionDlqMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.admissionDlqMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return rule;
+    }
+    return undefined;
   }
 
   /**
@@ -19365,7 +19565,7 @@ export class EventBus {
     // slot and reports `{ duplicate: false, accepted: 0 }` — it was
     // denied, not deduplicated, and its retry stays a fresh publish.
     if (!this.aclAllowsPublish(topic)) {
-      this.countAclDenied(topic, payload, publisherId);
+      this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       this.recordPublishAudit(topic, {
         admitted: false,
         reason: 'acl',
@@ -19824,15 +20024,18 @@ export class EventBus {
         // durable-log writes.
         const reason = verdict.reason;
         const publisherId = entries[index].publisherId;
-        if (reason === 'schema') this.countSchemaRejection(topic, payload, publisherId);
-        else if (reason === 'acl') this.countAclDenied(topic, payload, publisherId);
+        // EB-139: the DLQ record correlates with the failing entry's own
+        // traceparent when it carried one.
+        const entryTraceId = traceIdOfTraceparent(entries[index].traceparent);
+        if (reason === 'schema') this.countSchemaRejection(topic, payload, publisherId, entryTraceId);
+        else if (reason === 'acl') this.countAclDenied(topic, payload, publisherId, entryTraceId);
         else if (reason === 'alias-retired') this.countAliasRetired(topic, payload, publisherId);
-        else if (reason === 'message-too-big') this.countMessageTooBig(topic, payload, publisherId);
+        else if (reason === 'message-too-big') this.countMessageTooBig(topic, payload, publisherId, entryTraceId);
         else if (reason === 'payload-too-large') this.countPayloadTooLarge(topic, payload, publisherId);
         else if (reason === 'publisher-rate-limit')
           this.countPublisherRateLimited(topic, payload, publisherId);
         else if (reason === 'topic-paused') this.countTopicPaused(topic, payload, publisherId);
-        else this.countRateLimited(topic, payload, publisherId);
+        else this.countRateLimited(topic, payload, publisherId, entryTraceId);
         return { published: 0, rejected: { index, topic, reason } };
       }
       if (key !== undefined) {
@@ -20132,7 +20335,7 @@ export class EventBus {
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
     if (!this.aclAllowsPublish(topic)) {
-      this.countAclDenied(topic, payload, publisherId);
+      this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       return undefined;
     }
     // Fail fast on schema: a rejected payload never becomes a scheduled
@@ -20141,7 +20344,7 @@ export class EventBus {
     // deprecated-version admission is counted now (the due-time fan-out
     // is pre-admitted and never recounts). Counted the same way a
     // `publish` rejection is.
-    if (!this.applySchemaVerdict(topic, payload, opts?.schemaVersion, publisherId)) {
+    if (!this.applySchemaVerdict(topic, payload, opts?.schemaVersion, publisherId, traceIdOfTraceparent(opts?.traceparent))) {
       return undefined;
     }
     // Fail fast on the per-topic message-size cap: an oversized payload
@@ -20149,7 +20352,7 @@ export class EventBus {
     // as the schema fail-fast above.
     const maxBytes = this.maxMessageBytesForTopic(topic);
     if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
-      this.countMessageTooBig(topic, payload, publisherId);
+      this.countMessageTooBig(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       return undefined;
     }
     // Fail fast on the per-topic payload-size cap (EB-120): an oversized
@@ -21710,10 +21913,10 @@ export class EventBus {
    * sequence number is consumed (subscribers see no gap), the durable log
    * never sees it, and it does not burn rate-limit budget.
    */
-  private countSchemaRejection(topic: string, payload: unknown, publisherId?: string): void {
+  private countSchemaRejection(topic: string, payload: unknown, publisherId?: string, traceId?: string): void {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
-    this.emitAdmissionRejected(topic, 'schema', payload, publisherId);
+    this.emitAdmissionRejected(topic, 'schema', payload, publisherId, traceId);
   }
 
   /**
@@ -21767,10 +21970,11 @@ export class EventBus {
     payload: unknown,
     schemaVersion: number | undefined,
     publisherId?: string,
+    traceId?: string,
   ): boolean {
     const verdict = this.schemaVerdict(topic, payload, schemaVersion);
     if (!verdict.admitted) {
-      this.countSchemaRejection(topic, payload, publisherId);
+      this.countSchemaRejection(topic, payload, publisherId, traceId);
       return false;
     }
     if (verdict.deprecated) this.countDeprecatedSchema(topic);
@@ -21818,10 +22022,10 @@ export class EventBus {
    * counter with schema rejections, distinguished by the `'message-too-big'`
    * hook reason.
    */
-  private countMessageTooBig(topic: string, payload: unknown, publisherId?: string): void {
+  private countMessageTooBig(topic: string, payload: unknown, publisherId?: string, traceId?: string): void {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
-    this.emitAdmissionRejected(topic, 'message-too-big', payload, publisherId);
+    this.emitAdmissionRejected(topic, 'message-too-big', payload, publisherId, traceId);
   }
 
   /**
@@ -21854,10 +22058,10 @@ export class EventBus {
    * caller stamps it before this runs, so the stats entry must already
    * exist here.
    */
-  private countRateLimited(topic: string, payload: unknown, publisherId?: string): void {
+  private countRateLimited(topic: string, payload: unknown, publisherId?: string, traceId?: string): void {
     this.statsFor(topic).rateLimitedMessages += 1;
     this.totalRateLimited += 1;
-    this.emitAdmissionRejected(topic, 'rate-limit', payload, publisherId);
+    this.emitAdmissionRejected(topic, 'rate-limit', payload, publisherId, traceId);
   }
 
   /**
@@ -22065,10 +22269,10 @@ export class EventBus {
    * the admission-rejection hook with reason `'acl'`, and additionally
    * fires the authz audit hook.
    */
-  private countAclDenied(topic: string, payload: unknown, publisherId?: string): void {
+  private countAclDenied(topic: string, payload: unknown, publisherId?: string, traceId?: string): void {
     this.statsFor(topic).rejectedMessages += 1;
     this.totalRejected += 1;
-    this.emitAdmissionRejected(topic, 'acl', payload, publisherId);
+    this.emitAdmissionRejected(topic, 'acl', payload, publisherId, traceId);
     this.emitAuthzDenied('publish', topic, undefined);
   }
 
@@ -22595,30 +22799,158 @@ export class EventBus {
    * `getStats()` stay exactly reconcilable. Error-isolated: a throwing
    * hook is swallowed — a broken observer must never disturb the publish
    * path. No-op when no hook is configured.
+   *
+   * After the hook, routes the rejection to the admission dead-letter
+   * topic (EB-139) when a rule matches — the DLQ channel is independent
+   * of the hook, so a bus with no hook still gets DLQ records.
    */
   private emitAdmissionRejected(
     topic: string,
     reason: AdmissionRejectReason,
     payload: unknown,
     publisherId?: string,
+    traceId?: string,
   ): void {
     const hook = this.onAdmissionRejected;
-    if (hook === undefined) return;
-    const serialized = serializeToJson(payload);
-    const payloadBytes = serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
-    try {
-      hook({
-        topic,
-        reason,
-        payloadBytes,
-        at: this.now(),
-        // The rejected publish's producer label, when the publish carried
-        // one — so admission rejections stay attributable to their source.
-        ...(publisherId === undefined ? {} : { publisher: publisherId }),
-      });
-    } catch {
-      // Swallowed: the hook is an observer, not part of the publish path.
+    if (hook !== undefined) {
+      const serialized = serializeToJson(payload);
+      const payloadBytes = serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+      try {
+        hook({
+          topic,
+          reason,
+          payloadBytes,
+          at: this.now(),
+          // The rejected publish's producer label, when the publish carried
+          // one — so admission rejections stay attributable to their source.
+          ...(publisherId === undefined ? {} : { publisher: publisherId }),
+        });
+      } catch {
+        // Swallowed: the hook is an observer, not part of the publish path.
+      }
     }
+    this.emitAdmissionDlq(topic, reason, payload, publisherId, traceId);
+  }
+
+  /**
+   * Emits one admission-DLQ diagnostic record (EB-139) for an
+   * admission-phase rejection. Only the admission-phase subset of
+   * reasons feeds the DLQ (`schema`, `rate-limit`, `message-too-big`,
+   * `acl` — see `AdmissionDlqReason`); drain-phase TTL expiries enter
+   * through `noteDrainedExpired` instead. No-op when no
+   * `setTopicDeadLetterTopic` rule matches `topic`.
+   *
+   * Error-isolated: DLQ emission is best-effort — a failure here must
+   * never disturb the publish path whose rejection triggered it.
+   */
+  private emitAdmissionDlq(
+    topic: string,
+    reason: AdmissionRejectReason,
+    payload: unknown,
+    publisherId?: string,
+    traceId?: string,
+  ): void {
+    if (reason !== 'schema' && reason !== 'rate-limit' && reason !== 'message-too-big' && reason !== 'acl') {
+      return;
+    }
+    const rule = this.admissionDlqRuleFor(topic);
+    if (rule === undefined) return;
+    this.emitAdmissionDlqRecord(rule, {
+      originalTopic: topic,
+      reason,
+      ...(traceId === undefined ? {} : { traceId }),
+      ...(publisherId === undefined ? {} : { publisherId }),
+      payloadBytes: payloadByteSize(payload),
+    });
+  }
+
+  /**
+   * Publishes one admission-DLQ diagnostic record to the rule's DLQ
+   * topic (EB-139). The record goes through `fanOut` with the internal
+   * `admissionDlq` marker: it bypasses every admission gate (so it can
+   * never be rejected and re-emitted — the recursion cut) and is marked
+   * `diagnostic` (so the publish audit journal skips it, like the EB-57
+   * diagnostics). `scheduleFlush` follows the EB-57 pattern — the record
+   * is queued for the next flush turn.
+   *
+   * Error-isolated: a throwing DLQ publish is swallowed — a broken DLQ
+   * topic (or a misbehaving transport) must never disturb the publish or
+   * drain path that produced the record.
+   */
+  private emitAdmissionDlqRecord(
+    rule: { dlqTopic: string; retentionMs?: number },
+    record: Omit<AdmissionDlqRecord, 'at'>,
+  ): void {
+    try {
+      const nowMs = this.now();
+      const { admitted } = this.fanOut(
+        rule.dlqTopic,
+        { ...record, at: nowMs },
+        false, // preAdmitted
+        undefined, // delayed
+        undefined, // key
+        undefined, // preassignedKeySeq
+        undefined, // traceparent
+        undefined, // messageId
+        false, // routed
+        undefined, // routedExpiresAt
+        false, // fromBridge
+        true, // diagnostic: internal health traffic — skips the publish audit journal (EB-138)
+        undefined, // eventTime
+        undefined, // causal
+        undefined, // publisherId
+        undefined, // schemaVersion
+        undefined, // retain
+        undefined, // pausedExpiresAt
+        undefined, // partitionKey
+        undefined, // partition
+        false, // binary
+        undefined, // priority
+        undefined, // confirm
+        undefined, // mirrorProvenance
+        undefined, // critical
+        undefined, // mirrorHlc
+        true, // admissionDlq: bypass every admission gate (recursion cut at the source)
+        // The rule's independent retention deadline wins over the DLQ
+        // topic's own TTL rules.
+        rule.retentionMs === undefined ? undefined : nowMs + rule.retentionMs, // admissionDlqExpiresAt
+      );
+      this.scheduleFlush();
+      if (admitted) this.totalAdmissionDlqEvents += 1;
+    } catch {
+      // Swallowed: DLQ emission is best-effort, never part of the
+      // publish/drain path.
+    }
+  }
+
+  /**
+   * Notes a subscriber-queue drain expiry (EB-139): the message's TTL
+   * deadline passed before the drain could hand it to a handler. When an
+   * admission dead-letter rule matches the message's topic, emits the
+   * drain-phase DLQ record (reason `'ttl-expired'`). A drained DLQ
+   * diagnostic record itself is marked at creation (see
+   * `admissionDlqMessages`) and never emits a second record — the
+   * recursion cut.
+   *
+   * The expiry accounting (`recordExpired`) always runs, DLQ or not.
+   */
+  private noteDrainedExpired(msg: BusMessage, lane?: MessageLane): void {
+    if (!this.admissionDlqMessages.has(msg)) {
+      const rule = this.admissionDlqRuleFor(msg.topic);
+      if (rule !== undefined) {
+        // The end-to-end trace id when the bus traced this message
+        // (opt-in tracing); absent otherwise.
+        const traceId = this.trace?.traceIdOf(msg);
+        this.emitAdmissionDlqRecord(rule, {
+          originalTopic: msg.topic,
+          reason: 'ttl-expired',
+          ...(traceId === undefined ? {} : { traceId }),
+          ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
+          payloadBytes: payloadByteSize(msg.payload),
+        });
+      }
+    }
+    this.recordExpired(msg.topic, lane);
   }
 
   /**
@@ -24237,10 +24569,12 @@ export class EventBus {
    * deadline); when undefined the destination's own TTL rules apply
    * normally. Only the route forwarder sets it.
    *
-   * `diagnostic` marks a message published by the DLQ diagnostic emitter
-   * (see `DeadLetterOptions.diagnosticTopic`): a dead-lettered diagnostic
+   * `diagnostic` marks a message published by a bus-internal diagnostic
+   * emitter (see `DeadLetterOptions.diagnosticTopic`, EB-57, and the
+   * admission dead-letter emitter, EB-139): a dead-lettered diagnostic
    * message never emits a second diagnostic, cutting the recursion at the
-   * source. Only the bus's own diagnostic emitter sets it.
+   * source, and diagnostic publishes are skipped by the publish audit
+   * journal (EB-138). Only the bus's own diagnostic emitters set it.
    */
   /**
    * Slim fan-out for barrier control messages (EB-98): a barrier is
@@ -24385,6 +24719,17 @@ export class EventBus {
     // validates it — the mirror registration built it. Last so
     // existing positional call sites are unaffected.
     mirrorHlc?: HlcTimestamp,
+    // Admission dead-letter record (EB-139): set only by the bus's own
+    // DLQ emitter. The record bypasses every admission gate (ACL,
+    // schema, size caps, rate limits, sampling, pause) so a DLQ record
+    // can never be rejected and re-emitted — the recursion cut. The
+    // admitted path still runs in full: alias resolution, sequence
+    // number, TTL stamping, durable log, fan-out. `admissionDlqExpiresAt`
+    // is the rule's independent retention deadline (`retentionMs`,
+    // see `setTopicDeadLetterTopic`) and wins over the topic TTL rules.
+    // Last so existing positional call sites are unaffected.
+    admissionDlq = false,
+    admissionDlqExpiresAt?: number,
   ): {
     matched: number;
     accepted: number;
@@ -24482,8 +24827,9 @@ export class EventBus {
     // rate-limit shed does below). In queue mode the publish is held in
     // the rule's durable-side buffer instead: no sequence number, no
     // schema verdict, no rate-limit budget — the message gets its full
-    // admission when it fans out at resume.
-    if (!preAdmitted) {
+    // admission when it fans out at resume. Skipped for admission-DLQ
+    // records (EB-139): internal health traffic bypasses every gate.
+    if (!preAdmitted && !admissionDlq) {
       const pauseRule = this.pauseForTopic(topic);
       if (pauseRule !== undefined) {
         if (pauseRule.mode === 'shed') {
@@ -24533,8 +24879,12 @@ export class EventBus {
     // (subscribers see no gap), the durable log never sees it, and it
     // does not burn rate-limit budget. Rejection is counted on the
     // topic's stats entry, which is created here when the topic has never
-    // published anything valid yet.
-    if (!preAdmitted) {
+    // published anything valid yet. Skipped for admission-DLQ records
+    // (EB-139): internal health traffic bypasses every gate.
+    // EB-139: the end-to-end trace id for the admission-DLQ record,
+    // derived once from the publish's traceparent when it carried one.
+    const admissionTraceId = traceIdOfTraceparent(traceparent);
+    if (!preAdmitted && !admissionDlq) {
       // Per-publisher rate limiting (EB-79) is the first admission gate:
       // a cheap pre-filter that protects the bus from a single hot
       // publisher, so an over-budget publish is shed before the ACL, the
@@ -24565,7 +24915,7 @@ export class EventBus {
       // the durable log, and burns no rate-limit budget. Counted as a
       // rejection with reason 'acl' (see countAclDenied).
       if (!this.aclAllowsPublish(topic)) {
-        this.countAclDenied(topic, payload, publisherId);
+        this.countAclDenied(topic, payload, publisherId, admissionTraceId);
         auditPublish(false, undefined, 'acl');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'acl' };
       }
@@ -24576,7 +24926,7 @@ export class EventBus {
       // resolve the requested version here; admissions under a
       // superseded-but-graced version are counted in
       // `deprecatedSchemaVersions`.
-      if (!this.applySchemaVerdict(topic, payload, schemaVersion, publisherId)) {
+      if (!this.applySchemaVerdict(topic, payload, schemaVersion, publisherId, admissionTraceId)) {
         auditPublish(false, undefined, 'schema');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'schema' };
       }
@@ -24589,7 +24939,7 @@ export class EventBus {
       // reason 'message-too-big'.
       const maxBytes = this.maxMessageBytesForTopic(topic);
       if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
-        this.countMessageTooBig(topic, payload, publisherId);
+        this.countMessageTooBig(topic, payload, publisherId, admissionTraceId);
         auditPublish(false, undefined, 'message-too-big');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'message-too-big' };
       }
@@ -24702,6 +25052,10 @@ export class EventBus {
     // is bus-side, so a user's payload can never collide with it) — a
     // dead-lettered diagnostic message must not emit a second diagnostic.
     if (diagnostic) this.diagnosticMessages.add(msg);
+    // EB-139: mark admission-DLQ diagnostic records at creation — a
+    // drained DLQ record never emits a second DLQ record. The mark is
+    // bus-side so a user payload can never collide with it.
+    if (admissionDlq) this.admissionDlqMessages.add(msg);
     // Binary payload passthrough (EB-92): bus-side marker driving every
     // binary-aware branch downstream — byte-size measurement, compression
     // input, signature wire bytes, durable-log v2 encoding, and
@@ -24744,14 +25098,17 @@ export class EventBus {
     // entry is updated above the shed so `publishedMessages` and `lastSeq`
     // stay consistent with what `getStats` reports for accepted traffic.
     const limit = this.rateLimitForTopic(topic);
-    if (limit !== undefined) {
+    // Admission-DLQ records (EB-139) bypass the topic rate-limit budget:
+    // internal health traffic must never be shed by the load it reports
+    // on, and a shed here would re-enter the DLQ emitter.
+    if (limit !== undefined && !admissionDlq) {
       let bucket = this.rateLimitBuckets.get(topic);
       if (bucket == null) {
         bucket = new TokenBucket(limit.burst, limit.messagesPerSec, this.now);
         this.rateLimitBuckets.set(topic, bucket);
       }
       if (!bucket.take()) {
-        this.countRateLimited(topic, payload, publisherId);
+        this.countRateLimited(topic, payload, publisherId, admissionTraceId);
         // The keySeq was consumed at schedule time but the message never
         // fans out: release every subscriber's expectation past it, or a
         // subscriber buffering a later keySeq for the same key would wait
@@ -24905,9 +25262,14 @@ export class EventBus {
     // deadline, the destination's rules apply normally. A pause-buffer
     // drain (EB-88) carries the deadline stamped at pause admission the
     // same way — the message was "published" at pause time and only
-    // delivered at resume — so it wins over every other source.
+    // delivered at resume — so it wins over every other source. An
+    // admission-DLQ record (EB-139) carries its rule's independent
+    // retention deadline (`admissionDlqExpiresAt`), which wins over the
+    // DLQ topic's own TTL rules.
     const expiresAt =
-      pausedExpiresAt !== undefined
+      admissionDlqExpiresAt !== undefined
+        ? admissionDlqExpiresAt
+        : pausedExpiresAt !== undefined
         ? pausedExpiresAt
         : routedExpiresAt !== undefined
           ? routedExpiresAt
@@ -25815,6 +26177,7 @@ export class EventBus {
       ackBatches: this.totalAckBatches,
       nackBatches: this.totalNackBatches,
       diagnosticEvents: this.totalDiagnosticEvents,
+      admissionDlqEvents: this.totalAdmissionDlqEvents,
       compressedMessages: this.totalCompressed,
       compressedBytesBefore: this.totalCompressedBytesBefore,
       compressedBytesAfter: this.totalCompressedBytesAfter,
@@ -27295,7 +27658,7 @@ export class EventBus {
       // deliberately discarded — the loss stays visible as a sequence
       // gap, exactly like a backpressure shed.
       const { live: chaosLive, expired } = subscriber.queue.drainLive(nowMs);
-      for (const msg of expired) this.recordExpired(msg.topic, msg.lane ?? 'normal');
+      for (const msg of expired) this.noteDrainedExpired(msg, msg.lane ?? 'normal');
       // The discarded live backlog leaves its lanes' backlogs and counts
       // as lane sheds — the same visibility a backpressure shed gets.
       for (const msg of chaosLive) this.countLaneShed(msg.topic, msg.lane ?? 'normal', 1);
@@ -27459,7 +27822,7 @@ export class EventBus {
         }
       }
       for (const msg of expired) {
-        this.recordExpired(msg.topic, msg.lane ?? 'normal');
+        this.noteDrainedExpired(msg, msg.lane ?? 'normal');
       }
       const health = subscriber.health;
       if (health == null) {
@@ -27706,7 +28069,7 @@ export class EventBus {
           }
         }
         for (const msg of expired) {
-          this.recordExpired(msg.topic, msg.lane ?? 'normal');
+          this.noteDrainedExpired(msg, msg.lane ?? 'normal');
         }
         batch.pending.push(...live);
       }
@@ -27780,7 +28143,7 @@ export class EventBus {
     for (const msg of pending) {
       const deadline = this.messageDeadlines.get(msg);
       if (deadline !== undefined && nowMs >= deadline) {
-        this.recordExpired(msg.topic, msg.lane ?? 'normal');
+        this.noteDrainedExpired(msg, msg.lane ?? 'normal');
       } else {
         live.push(msg);
       }

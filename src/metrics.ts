@@ -382,6 +382,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.diagnosticEvents ?? 0,
   );
   counter(
+    'eventbus_admission_dlq_events_total',
+    'Total admission-DLQ diagnostic records emitted to dead-letter topics (EB-139).',
+    stats.admissionDlqEvents ?? 0,
+  );
+  counter(
     'eventbus_sequence_gaps_total',
     'Total sequence numbers observed missing by subscribers.',
     stats.sequenceGaps,

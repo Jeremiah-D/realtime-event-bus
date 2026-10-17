@@ -941,6 +941,29 @@ library.
   itself), and is error-isolated — a throwing hook is swallowed so it can
   never disturb the publish path. Unset by default (stats counting only —
   fully backward compatible).
+- **Admission dead-letter topics** (in `src/bus.ts`, via
+  `setTopicDeadLetterTopic(topicPattern, dlqTopic, { retentionMs })` /
+  `clearTopicDeadLetterTopic(topicPattern)`): opt-in dead-lettering for
+  admission-phase losses. When a publish to a matching topic is rejected
+  at admission — schema validation, per-topic rate-limit shed,
+  message-too-big, or ACL deny — or an admitted message expires in a
+  subscriber queue before the drain delivers it, the bus fans one
+  diagnostic record `{ originalTopic, reason, traceId?, publisherId?,
+  payloadBytes, at }` out to the DLQ topic (metadata only, never the
+  payload body), consumable via a normal `subscribe` or replay. The
+  record bypasses every admission gate through an internal marker and is
+  `WeakSet`-marked at creation, so it can never be rejected and
+  re-emitted (recursion cut at the source — the EB-57 convention); the
+  rule's `retentionMs` gives the DLQ topic an independent retention,
+  separate from any `setTopicTtl` rule on the DLQ topic itself. The
+  admission-phase `reason` reuses the EB-39 vocabulary verbatim (so it
+  reconciles with `onAdmissionRejected` and
+  `rejectedMessages`/`rateLimitedMessages`); `'ttl-expired'` reconciles
+  with `expiredMessages`. Orthogonal to
+  `DeadLetterOptions.diagnosticTopic` (EB-57), which reports
+  delivery-phase poison messages. `getStats().admissionDlqEvents` and
+  `eventbus_admission_dlq_events_total` count the records. Unset by
+  default — fully backward compatible.
 - **Broker-level topic ACL** (in `src/bus.ts`, via `EventBusOptions.acl` /
   `setAclRules(rules)`): per-topic publish/subscribe permissions with
   allow/deny decisions on wildcard patterns (`{ pattern: 'admin.**',
@@ -3136,6 +3159,51 @@ Details:
   bridge/cluster ingress, and pause-buffer drains. Pre-admitted
   re-fan-outs and diagnostic publishes are not.
 
+## Admission dead-letter topics (EB-139)
+
+`setTopicDeadLetterTopic(topicPattern, dlqTopic, options?)` opts a topic
+(or topic pattern) into an admission-phase dead-letter topic: whenever a
+publish to a matching topic is rejected at admission — schema validation
+(EB-20), per-topic rate-limit shed (EB-19), message-too-big (EB-64), or
+broker-level ACL deny (EB-41) — or an admitted message expires in a
+subscriber queue before the drain delivers it (TTL drain expiry), the bus
+fans one diagnostic record out to the DLQ topic:
+
+```ts
+bus.setTopicDeadLetterTopic('orders.*', 'dlq.orders.admission', { retentionMs: 7 * 24 * 3600_000 });
+bus.subscribe('dlq.orders.admission', (msg) => alertOn(msg.payload));
+// record: { originalTopic: 'orders.us', reason: 'schema',
+//           traceId?, publisherId?, payloadBytes, at }
+```
+
+Details:
+
+- **Record shape** — `AdmissionDlqRecord { originalTopic, reason,
+  traceId?, publisherId?, payloadBytes, at }`: the rejected payload's
+  metadata, never the payload body (the `payloadByteSize` yardstick, same
+  as the message-size gates). `reason` reuses the EB-39
+  `AdmissionRejectReason` vocabulary verbatim for the admission-phase
+  gates (`'schema' | 'rate-limit' | 'message-too-big' | 'acl'` — so it
+  reconciles 1:1 with `onAdmissionRejected` and
+  `rejectedMessages`/`rateLimitedMessages`); `'ttl-expired'` is the
+  drain-phase extension, reconciling with `expiredMessages`.
+- **Recursion cut** — the record is bus-internal health traffic: it
+  bypasses every admission gate via an internal marker (so it can never
+  be rejected and re-emitted), and a drained DLQ record never emits a
+  second record (bus-side `WeakSet` mark, the EB-57 convention). A
+  rejecting schema or a full rate-limit budget on the DLQ topic itself
+  does not stop the records.
+- **Independent retention** — `options.retentionMs` stamps a per-record
+  drain deadline on the DLQ topic's records, independent of any
+  `setTopicTtl` rule on the DLQ topic itself (which remains available as
+  an alternative). `clearTopicDeadLetterTopic(pattern)` removes a rule.
+- **Orthogonal to EB-57** — `DeadLetterOptions.diagnosticTopic` reports
+  *delivery*-phase poison messages (per-subscriber DLQ moves); this
+  reports *admission*-phase rejections and TTL drain expiries.
+- **Observability** — `getStats().admissionDlqEvents` counts every
+  emitted record; `eventbus_admission_dlq_events_total` exposes it to
+  Prometheus. Opt-in — unset by default, fully backward compatible.
+
 ## Prometheus metrics
 
 `src/metrics.ts` renders a `getStats()` snapshot as Prometheus text
@@ -3176,6 +3244,7 @@ Exported series:
 | `eventbus_dedup_dropped_messages_total` | counter | `dedupDropped` — subscriber exactly-once dedup suppressions |
 | `eventbus_dead_lettered_messages_total` | counter | `deadLetteredMessages` |
 | `eventbus_diagnostic_events_total` | counter | `diagnosticEvents` — admitted DLQ diagnostic events |
+| `eventbus_admission_dlq_events_total` | counter | `admissionDlqEvents` — admission-DLQ diagnostic records emitted (EB-139) |
 | `eventbus_sequence_gaps_total` | counter | `sequenceGaps` |
 | `eventbus_expiring_soon_alerts_total` | counter | `expiringSoonAlerts` — TTL expiring-soon warnings fired for subscriber queue heads (EB-110) |
 | `eventbus_consumer_lag_slo_breach_total` | counter | `lagSloBreaches` — consumer-group lag SLO breach episodes fired (EB-112) |
