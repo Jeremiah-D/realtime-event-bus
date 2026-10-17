@@ -3221,6 +3221,20 @@ export interface EventBusOptions {
    * Invalid scenarios throw `RangeError` from the constructor.
    */
   chaos?: ChaosOptions;
+  /**
+   * Injectable random source for publish-side adaptive sampling (see
+   * `EventBus.setTopicSampleRate`, EB-38): the bus calls it once per
+   * sampled-topic publish that reached the sampling gate and drops the
+   * message when the returned value falls below the topic's sample rate
+   * (`random() < rate`). It must return a number in `[0, 1)`; anything
+   * outside that range makes the sampling decision undefined-behaving
+   * (a value `>= 1` never samples, a negative value always samples — the
+   * bus does not clamp, so callers own the contract). The default is
+   * `Math.random`. Inject a seeded PRNG (or a scripted sequence) in tests
+   * to make sampling decisions deterministic and reproducible. Must be a
+   * function; anything else throws `RangeError` from the constructor.
+   */
+  samplingRandom?: () => number;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -3277,6 +3291,21 @@ export interface TopicStats {
    * consumes no sequence number and subscribers see no gap.
    */
   publisherRateLimited: number;
+  /**
+   * Messages on this topic shed by publish-side adaptive sampling (see
+   * `EventBus.setTopicSampleRate`, EB-38): the topic's sampling rule won
+   * the random draw and the publish was not marked critical, so it was
+   * dropped in the admission phase — after schema validation and the
+   * idempotency-dedup gate (EB-27), before sequence-number assignment and
+   * the topic's hard rate-limit budget (EB-19). The shed consumes no
+   * sequence number (subscribers see no gap), writes nothing to the
+   * durable log, and burns no rate-limit token — it is the deliberate
+   * tail-latency guard that complements the hard rate limit (which caps
+   * the admitted rate; sampling drops load before the admitted path ever
+   * pays fan-out cost). `publish` returns 0 for a sampled message, and
+   * the shed surfaces on `onAdmissionRejected` with reason `'sampled'`.
+   */
+  sampledMessages: number;
   /**
    * Publishes to this topic shed by a topic pause in shed mode (see
    * `EventBus.pauseTopic`, EB-88): the topic was paused when the message
@@ -3643,6 +3672,12 @@ export interface BusStats {
    * `TopicStats.publisherRateLimited` for the exact counting rules.
    */
   publisherRateLimited: number;
+  /**
+   * Total messages shed by publish-side adaptive sampling — the sum of
+   * every topic's `sampledMessages`. See `TopicStats.sampledMessages` for
+   * the exact counting rules.
+   */
+  sampledMessages: number;
   /**
    * Total publishes shed by topic pauses in shed mode — the sum of every
    * topic's `pausedMessages`. See `TopicStats.pausedMessages` for the
@@ -5221,6 +5256,7 @@ function zeroedTopicStats(): {
   sequenceGaps: number;
   rateLimitedMessages: number;
   publisherRateLimited: number;
+  sampledMessages: number;
   pausedMessages: number;
   circuitBrokenMessages: number;
   rejectedMessages: number;
@@ -5250,6 +5286,7 @@ function zeroedTopicStats(): {
     sequenceGaps: 0,
     rateLimitedMessages: 0,
     publisherRateLimited: 0,
+    sampledMessages: 0,
     pausedMessages: 0,
     circuitBrokenMessages: 0,
     rejectedMessages: 0,
@@ -5375,6 +5412,19 @@ function validateSchemaVersion(schemaVersion: number | undefined, caller: string
   if (schemaVersion === undefined) return;
   if (!Number.isInteger(schemaVersion) || schemaVersion < 0) {
     throw new RangeError(`${caller}: schemaVersion must be a non-negative integer`);
+  }
+}
+
+/**
+ * Validates `PublishOptions.critical` (EB-38): absent is fine, otherwise
+ * it must be a boolean — anything else throws `RangeError` before the
+ * publish mutates any state, matching the other publish-option
+ * validations.
+ */
+function validateCritical(critical: boolean | undefined, caller: string): void {
+  if (critical === undefined) return;
+  if (typeof critical !== 'boolean') {
+    throw new RangeError(`${caller}: critical must be a boolean`);
   }
 }
 
@@ -6950,6 +7000,13 @@ interface PauseBufferEntry {
  *   threw `CircuitBreakerOpenError` instead of admitting; the refusal is
  *   pre-admission, consumes no sequence number, and is invisible to gap
  *   detection, EB-116)
+ * - `'sampled'` → `TopicStats.sampledMessages` /
+ *   `BusStats.sampledMessages` (publish-side adaptive sampling shed the
+ *   non-critical message under a `setTopicSampleRate` rule, EB-38; shed in
+ *   the admission phase — before sequence-number assignment and before the
+ *   topic rate-limit budget — so like a `'publisher-rate-limit'` shed it
+ *   consumes no sequence number and is invisible to gap detection, and it
+ *   burns no rate-limit token)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
@@ -6968,7 +7025,8 @@ export type AdmissionRejectReason =
   | 'duplicate'
   | 'alias-retired'
   | 'topic-paused'
-  | 'circuit-breaker';
+  | 'circuit-breaker'
+  | 'sampled';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -7598,6 +7656,35 @@ export interface PublishOptions {
    */
   partitionKey?: string;
   partition?: number;
+  /**
+   * Critical-publish marker for adaptive sampling (EB-38, see
+   * `EventBus.setTopicSampleRate`): a publish with `critical: true` is
+   * exempt from the publish-side sampling gate — it is always admitted
+   * past sampling (it still passes every other admission gate, including
+   * the hard rate limit). Everything else — absent or `false` — is
+   * non-critical and may be sampled away when a sampling rule matches
+   * the topic.
+   *
+   * The "non-critical" criterion is producer-declared and opt-out: the bus
+   * cannot know a payload's business value, so the producer marks what
+   * must not be dropped. The intended split is expendable traffic
+   * (telemetry, heartbeats, bulk analytics, best-effort notifications)
+   * left non-critical, and must-deliver traffic (control signals,
+   * financial transactions, alert pages) marked critical. Marking
+   * everything critical defeats sampling — and an always-sampled topic
+   * drops must-deliver traffic silently, so the default stays
+   * non-critical and producers opt out explicitly.
+   *
+   * Admission-scoped only: the flag is never stamped on the envelope or
+   * the durable-log record (a replayed critical message re-runs
+   * admission under the destination's live rules). Only `publish`,
+   * `publishIdempotent`, and `publishWithConfirmation` accept it; batch,
+   * atomic, and delayed publishes carry no per-message critical flag and
+   * are always non-critical where sampling applies to them. Must be a
+   * boolean when provided; anything else throws `RangeError` from the
+   * publish entry point before anything is mutated.
+   */
+  critical?: boolean;
   /**
    * Binary payload passthrough (EB-92, opt-in): the payload is raw bytes
    * (`Uint8Array`, or an `ArrayBuffer` which is wrapped in a zero-copy
@@ -9021,6 +9108,30 @@ export class EventBus {
   private rateLimitBuckets = new Map<string, TokenBucket>();
   private totalRateLimited = 0;
   /**
+   * Per-topic publish sampling rates (EB-38), keyed by the exact string
+   * passed to `setTopicSampleRate` — either a concrete topic name or a
+   * wildcard pattern. The value is the fraction of non-critical publishes
+   * to drop (`0` = keep everything, `1` = sample everything non-critical).
+   * Match resolution mirrors the TTL rules: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins.
+   */
+  private sampleRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in `sampleRules`, kept
+   * apart from the subscriber pattern cache and the other rule caches so
+   * sampling configuration never inflates `patternCacheSize`.
+   */
+  private sampleMatcherCache = new Map<string, RegExp>();
+  /** Global total of messages shed by publish-side adaptive sampling. */
+  private totalSampled = 0;
+  /**
+   * Injectable random source for the sampling gate (see
+   * `EventBusOptions.samplingRandom`): defaults to `Math.random`, drawn
+   * once per publish that reaches the gate. Injected callers own the
+   * `[0, 1)` contract — the bus never clamps.
+   */
+  private readonly samplingRandom: () => number;
+  /**
    * Per-publisher publish rate limits (EB-79), keyed by the cleaned
    * publisher identity (`cleanPublisherId`). Unlike the per-topic rules
    * there are no wildcards: a publisher either has a configured budget or
@@ -9920,6 +10031,16 @@ export class EventBus {
       throw new RangeError('onAdmissionRejected must be a function');
     }
     this.onAdmissionRejected = onAdmissionRejected;
+    // Publish-side adaptive sampling (EB-38): the random source is
+    // validated fail-fast — a non-function must never half-arm a bus —
+    // and defaults to Math.random. The injected source owns the [0, 1)
+    // contract; the bus never clamps (see `sampleRateForTopic` call site
+    // in `fanOut`).
+    const samplingRandom = options?.samplingRandom;
+    if (samplingRandom !== undefined && typeof samplingRandom !== 'function') {
+      throw new RangeError('samplingRandom must be a function');
+    }
+    this.samplingRandom = samplingRandom ?? Math.random;
     const onAuthzDenied = options?.onAuthzDenied;
     if (onAuthzDenied !== undefined && typeof onAuthzDenied !== 'function') {
       throw new RangeError('onAuthzDenied must be a function');
@@ -10699,6 +10820,81 @@ export class EventBus {
     const removed = this.rateLimitRules.delete(topicPattern);
     if (removed) this.rateLimitBuckets.clear();
     return removed;
+  }
+
+  /**
+   * Arms publish-side adaptive sampling for topics matching
+   * `topicPattern` (EB-38, real-time systems / backend engineering): a
+   * load-shedding gate that complements the hard rate limit (EB-19). The
+   * hard limit caps the admitted rate with a token bucket — it protects
+   * the ceiling. Sampling protects the tail: each non-critical publish to
+   * a matching topic is dropped with probability `rate` BEFORE
+   * sequence-number assignment, fan-out, and the durable log, so a hot
+   * topic sheds load before it ever pays delivery cost.
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or an
+   * exact topic name). `rate` is the fraction of non-critical publishes to
+   * drop: `0` keeps everything (a no-op rule), `1` drops every
+   * non-critical publish. A sampled publish is never fanned out, never
+   * written to the durable log, never queued — `publish` returns 0 for
+   * it, exactly like the EB-20/EB-27 zero-return convention for
+   * non-admitted publishes. The shed consumes no sequence number (so
+   * subscribers see no gap), burns no topic rate-limit token (sampling
+   * runs before the hard rate-limit gate), and is counted in
+   * `TopicStats.sampledMessages` (and the global total, also rendered as
+   * `eventbus_sampled_messages_total`), surfacing on
+   * `onAdmissionRejected` with reason `'sampled'`.
+   *
+   * Critical publishes (`PublishOptions.critical: true`) are exempt: they
+   * always pass the sampling gate (they still pass every other admission
+   * gate, including the hard rate limit). The random draw comes from the
+   * injectable `EventBusOptions.samplingRandom` (default `Math.random`) —
+   * inject a seeded PRNG in tests for deterministic, reproducible
+   * sampling decisions.
+   *
+   * Pipeline position, and why: the gate runs inside `fanOut`'s admission
+   * block — after schema validation (an invalid payload is rejected with
+   * reason `'schema'`, never silently sampled) and after the
+   * idempotency-dedup gate (a duplicate retry is reported as
+   * `'duplicate'` instead of consuming a sampling decision, and only an
+   * admitted first attempt claims a dedup slot), but before
+   * sequence-number assignment and the hard rate limit (EB-19). Sampling
+   * after the hard limit would burn rate-limit tokens on messages that
+   * are then dropped — the shed must not consume the budget it protects.
+   *
+   * Scope: the gate applies to `publish`, `publishIdempotent`, and
+   * `publishBatch` (per entry — batch entries carry no `critical` flag,
+   * so they are always non-critical). `publishAtomic` skips sampling:
+   * the batch's all-or-nothing contract is incompatible with a
+   * probabilistic per-entry shed (use the deterministic EB-19 shadow
+   * budget for atomic backpressure). Delayed messages are admitted at
+   * schedule time, so they skip the gate too. `previewPublish` does not
+   * consult sampling: a preview cannot draw from the random stream
+   * without disturbing the sequence of real publish decisions.
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * patterns, the earliest-registered matching pattern wins. Re-setting a
+   * rule replaces it. Throws `RangeError` when `topicPattern` is empty or
+   * when `rate` is not a finite number in `[0, 1]`.
+   */
+  setTopicSampleRate(topicPattern: string, rate: number): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > 1) {
+      throw new RangeError('rate must be a finite number in [0, 1]');
+    }
+    this.sampleRules.set(topicPattern, rate);
+  }
+
+  /**
+   * Removes the sampling rule previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed. Already-sampled
+   * messages stay counted — only future publishes resolve against the
+   * remaining rules.
+   */
+  clearTopicSampleRate(topicPattern: string): boolean {
+    return this.sampleRules.delete(topicPattern);
   }
 
   /**
@@ -11548,6 +11744,27 @@ export class EventBus {
         this.rateLimitMatcherCache.set(pattern, matcher);
       }
       if (matcher.test(topic)) return limit;
+    }
+    return undefined;
+  }
+
+  /**
+   * Returns the sampling rate (fraction of non-critical publishes to
+   * drop) that applies to `topic`, or `undefined` when no rule matches.
+   * An exact-topic rule wins over patterns; between patterns the
+   * earliest-registered matching rule wins — the same resolution as
+   * `setTopicTtl`.
+   */
+  private sampleRateForTopic(topic: string): number | undefined {
+    const exact = this.sampleRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, rate] of this.sampleRules) {
+      let matcher = this.sampleMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.sampleMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return rate;
     }
     return undefined;
   }
@@ -17533,6 +17750,9 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, caller);
     validateSchemaVersion(opts?.schemaVersion, caller);
     validatePartitionOptions(opts?.partitionKey, opts?.partition, caller);
+    // Adaptive sampling exemption (EB-38): fail-fast, before anything is
+    // mutated.
+    validateCritical(opts?.critical, caller);
     // Barrier cut marker (EB-98): fail-fast, before anything is mutated.
     validateBarrier(opts?.barrier, caller);
     // Priority lane (EB-122): fail-fast, before anything is mutated.
@@ -17618,6 +17838,10 @@ export class EventBus {
       // Publisher confirmation (EB-125): the admitted path records the
       // receipt's content fields here.
       confirm,
+      undefined, // mirrorProvenance: only `receiveForward` passes one
+      // Adaptive sampling exemption (EB-38): validated above; `fanOut`
+      // consults it in the sampling gate. Absent means non-critical.
+      opts?.critical,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -17934,6 +18158,9 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'publishIdempotent');
     validateSchemaVersion(opts?.schemaVersion, 'publishIdempotent');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishIdempotent');
+    // Adaptive sampling exemption (EB-38): fail-fast, before anything is
+    // mutated.
+    validateCritical(opts?.critical, 'publishIdempotent');
     // Priority lane (EB-122): fail-fast, before anything is mutated —
     // `IdempotentPublishOptions` inherits `priority` from `PublishOptions`.
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishIdempotent');
@@ -17984,6 +18211,11 @@ export class EventBus {
         opts?.partition,
         binary,
         opts?.priority,
+        undefined, // confirm: only `publishCore` passes one
+        undefined, // mirrorProvenance: only `receiveForward` passes one
+        // Adaptive sampling exemption (EB-38): validated above; `fanOut`
+        // consults it in the sampling gate. Absent means non-critical.
+        opts?.critical,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -18029,6 +18261,11 @@ export class EventBus {
       opts?.partition,
       binary,
       opts?.priority,
+      undefined, // confirm: only `publishCore` passes one
+      undefined, // mirrorProvenance: only `receiveForward` passes one
+      // Adaptive sampling exemption (EB-38): validated above; `fanOut`
+      // consults it in the sampling gate. Absent means non-critical.
+      opts?.critical,
     );
     // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
     // and the per-publisher rate-limit gate lives inside `fanOut` — so a
@@ -18099,6 +18336,13 @@ export class EventBus {
    *   real `publishIdempotent` after the preview still admits once, and a
    *   second preview still reports `admitted`. The verdict is identical;
    *   the registration is skipped.
+   * - Adaptive sampling (EB-38) is not consulted: the gate is
+   *   probabilistic, and a preview cannot draw from the injected random
+   *   stream without disturbing the sequence of real publish decisions —
+   *   a preview that reported "sampled" would change what the next real
+   *   publish does. `setTopicSampleRate` rules are therefore invisible to
+   *   previews; treat a preview verdict on a sampled topic as "admitted
+   *   if it survives the sampling draw".
    * - Chaos faults (EB-103) are not evaluated: they are one-shot test
    *   injections, and evaluating one here would consume the fault.
    * - The advisory topic-registry check (EB-77) is skipped: it moves a
@@ -18299,7 +18543,12 @@ export class EventBus {
    *    state. Rate-limit
    *    tokens are charged against a per-batch shadow balance, so a batch
    *    cannot overdraft the bucket with its own entries. The first entry
-   *    that would be rejected or shed aborts the whole batch.
+   *    that would be rejected or shed aborts the whole batch. Adaptive
+   *    sampling (EB-38) is intentionally NOT consulted: the batch's
+   *    all-or-nothing contract is incompatible with a probabilistic
+   *    per-entry shed — a random draw aborting a whole batch would violate
+   *    least surprise — so atomic batches keep the deterministic EB-19
+   *    shadow budget as their only publish-side load shed.
    * 2. Commit: the admitted batch runs through the normal `fanOut` path
    *    (per-topic seq stamping, compression, durable log, fan-out, stats),
    *    then one flush is scheduled for the whole batch — like
@@ -20437,6 +20686,24 @@ export class EventBus {
     this.statsFor(topic).publisherRateLimited += 1;
     this.totalPublisherRateLimited += 1;
     this.emitAdmissionRejected(topic, 'publisher-rate-limit', payload, publisherId);
+  }
+
+  /**
+   * Counts one publish shed by publish-side adaptive sampling (EB-38)
+   * against the topic and the global total, then fires the
+   * admission-rejection hook. The shed happens in the admission phase —
+   * after schema validation and the idempotency-dedup gate, before
+   * sequence-number assignment and the topic rate-limit budget — so the
+   * payload never became a message: no sequence number is consumed
+   * (subscribers see no gap), the durable log never sees it, and no
+   * rate-limit token is burned. The per-topic stats entry is created here
+   * when the topic has never published anything yet (see
+   * `countSchemaRejection`).
+   */
+  private countSampled(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).sampledMessages += 1;
+    this.totalSampled += 1;
+    this.emitAdmissionRejected(topic, 'sampled', payload, publisherId);
   }
 
   /**
@@ -22779,6 +23046,15 @@ export class EventBus {
     // and rides the `mirror:<busId>` sequence epoch; `fanOut` never
     // validates it — the mirror registration built it.
     mirrorProvenance?: MirrorProvenance,
+    // Adaptive sampling exemption (EB-38): already validated by the
+    // publish entry points — `fanOut` never validates. `true` exempts the
+    // publish from the sampling gate below; absent (the default) means
+    // non-critical. Admission-scoped: it is never stamped on the envelope
+    // or the durable-log record. Internal paths that are a new admission
+    // (route forwards, bridge/cluster ingress, diagnostic events) leave it
+    // undefined and are always non-critical — the sampling decision is
+    // re-taken per admission.
+    critical?: boolean,
   ): {
     matched: number;
     accepted: number;
@@ -22977,6 +23253,37 @@ export class EventBus {
       if (maxPayloadBytes !== undefined && payloadByteSize(payload) > maxPayloadBytes) {
         this.countPayloadTooLarge(topic, payload, publisherId);
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'payload-too-large' };
+      }
+      // Publish-side adaptive sampling (EB-38): the load-shedding gate
+      // that complements the hard rate limit (EB-19). Position in the
+      // admission order, and why:
+      // - AFTER schema validation and the size caps: an invalid payload is
+      //   rejected with its own reason, never silently sampled away.
+      // - AFTER the idempotency-dedup gate: `publishIdempotent` consulted
+      //   the dedup table before `fanOut`, so a duplicate retry is
+      //   reported as 'duplicate' instead of consuming a sampling
+      //   decision — and only an admitted first attempt claims a dedup
+      //   slot, so a sampled first attempt's retry stays a fresh publish.
+      // - BEFORE sequence-number assignment: the envelope below stamps
+      //   `seq` with `nextSeq`, so a shed here never touches the counter
+      //   and subscribers see no gap.
+      // - BEFORE the hard rate limit: sampling must not burn the
+      //   rate-limit budget it protects — the shed must never consume a
+      //   token for a message that is then dropped.
+      // Critical publishes (`critical: true`) are exempt; the random draw
+      // comes from the injectable `EventBusOptions.samplingRandom`. A
+      // rate of 0 short-circuits before drawing — the disabled path pays
+      // one comparison and never consumes the random stream.
+      if (critical !== true && this.sampleRules.size > 0) {
+        const sampleRate = this.sampleRateForTopic(topic);
+        if (
+          sampleRate !== undefined &&
+          sampleRate > 0 &&
+          this.samplingRandom() < sampleRate
+        ) {
+          this.countSampled(topic, payload, publisherId);
+          return { matched: 0, accepted: 0, admitted: false, rejectReason: 'sampled' };
+        }
       }
     }
     // The message identity rides the envelope end to end (durable log,
@@ -24001,6 +24308,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
+      sampledMessages: this.totalSampled,
       pausedMessages: this.totalPaused,
       circuitBrokenMessages: this.totalCircuitBroken,
       circuitBreakerTrips: this.totalCircuitBreakerTrips,
@@ -24220,6 +24528,7 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         publisherRateLimited: stats.publisherRateLimited,
+        sampledMessages: stats.sampledMessages,
         pausedMessages: stats.pausedMessages,
         circuitBrokenMessages: stats.circuitBrokenMessages,
         rejectedMessages: stats.rejectedMessages,

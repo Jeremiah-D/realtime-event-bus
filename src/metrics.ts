@@ -30,6 +30,9 @@
  *   event time older than their topic's event-time watermark (EB-59).
  * - `eventbus_rate_limited_messages_total`: messages shed by publish-side
  *   per-topic rate limiting.
+ * - `eventbus_sampled_messages_total`: non-critical publishes shed by
+ *   publish-side adaptive sampling (EB-38) — no sequence number
+ *   consumed, no rate-limit token burned.
  * - `eventbus_paused_messages_total`: publishes shed by topic pauses in
  *   shed mode (EB-88).
  * - `eventbus_circuit_broken_messages_total`: publishes refused by
@@ -308,6 +311,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_publisher_rate_limited_messages_total',
     'Total messages shed by per-publisher publish-side rate limiting (EB-79).',
     stats.publisherRateLimited,
+  );
+  counter(
+    'eventbus_sampled_messages_total',
+    'Total non-critical publishes shed by publish-side adaptive sampling (EB-38): sampled before sequence-number assignment, so subscribers see no gap, and before the topic rate-limit budget, so no token is burned.',
+    stats.sampledMessages ?? 0,
   );
   counter(
     'eventbus_paused_messages_total',

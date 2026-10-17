@@ -711,6 +711,49 @@ library.
   rule wins over patterns, the earliest-registered matching pattern wins, and
   re-setting a rule resets the topic's budget. `clearTopicRateLimit` removes
   a rule. Invalid configurations throw `RangeError`.
+- **Per-topic adaptive sampling** (in `src/bus.ts`, via
+  `setTopicSampleRate(pattern, rate)`): a probabilistic load-shedding gate
+  that complements the hard rate limit above. The hard limit caps the
+  admitted rate with a token bucket — it protects the ceiling. Sampling
+  protects the tail: each non-critical publish to a matching topic is
+  dropped with probability `rate` (`0` keeps everything, `1` drops every
+  non-critical publish) *before* sequence-number assignment, fan-out, and
+  the durable log, so a hot topic sheds load before it ever pays delivery
+  cost. A sampled publish is never fanned out, never written to the durable
+  log, never queued; `publish` returns 0 for it. The shed consumes no
+  sequence number (subscribers see no gap — unlike a rate-limit shed) and
+  burns no rate-limit token (the gate runs before the hard rate-limit
+  gate). It is counted in `TopicStats.sampledMessages` (and the global
+  total, also rendered as `eventbus_sampled_messages_total`) and surfaces
+  on `onAdmissionRejected` with reason `'sampled'`.
+  Critical publishes (`PublishOptions.critical: true`) are exempt — they
+  always pass the sampling gate (but still pass every other admission
+  gate, including the hard rate limit). "Non-critical" is
+  producer-declared and opt-out: the bus cannot know a payload's business
+  value, so producers mark must-deliver traffic (control signals,
+  financial transactions) critical and leave expendable traffic
+  (telemetry, heartbeats, bulk analytics) non-critical.
+  Admission order: schema validation → idempotency-dedup (EB-27) →
+  **sampling** → hard rate limit (EB-19). Sampling after schema means an
+  invalid payload is rejected with reason `'schema'`, never silently
+  sampled; after dedup means a duplicate retry is reported as
+  `'duplicate'` and only an admitted first attempt claims a dedup slot;
+  before the rate limit means a shed never consumes the budget it
+  protects. The random draw comes from the injectable
+  `EventBusOptions.samplingRandom` (default `Math.random`) — inject a
+  seeded PRNG in tests for deterministic, reproducible sampling
+  decisions. Rule matching mirrors `setTopicTtl`: an exact-topic rule
+  wins over patterns, the earliest-registered matching pattern wins, and
+  re-setting a rule replaces it. `clearTopicSampleRate` removes a rule.
+  `rate` must be a finite number in `[0, 1]`; anything else throws
+  `RangeError`. Sampling applies to `publish`, `publishIdempotent`, and
+  `publishBatch` (per entry — batch entries carry no `critical` flag);
+  `publishAtomic` and delayed publishes skip it (documented in the API
+  docs: all-or-nothing batches are incompatible with a probabilistic
+  shed), and `previewPublish` intentionally does not preview it (a
+  preview cannot draw from the random stream without disturbing real
+  publish decisions). No performance claims are made for sampling — its
+  effect is workload-dependent and unmeasured here.
 - **Per-publisher publish rate limiting** (in `src/bus.ts`, via
   `setPublisherRateLimit(publisherId, { messagesPerSec, burst })`): a token
   bucket per publisher identity (refilled from the bus clock, so tests stay
@@ -2758,7 +2801,11 @@ idempotent-dedup suppression gate (EB-27) is consulted where
 `publishIdempotent` consults it (after the ACL, before the remaining
 gates). The verdict is computed by the same pure shadow decider
 (`admissionVerdict`) that `publishAtomic`'s phase-1 admission uses, so a
-preview and the real path agree gate-for-gate.
+preview and the real path agree gate-for-gate. One intentional exception:
+adaptive sampling (EB-38) is not previewed — the gate is probabilistic,
+and a preview cannot draw from the injected random stream without
+disturbing the sequence of real publish decisions, so a preview on a
+sampled topic reports "admitted" whenever every other gate passes.
 
 Zero side effects means: no sequence number consumed (no downstream
 gap), no durable-log writes, no rate-limit tokens taken (budgets are
