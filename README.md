@@ -77,7 +77,19 @@ library.
   original payload plus `{ subscriberId, pattern, seq, lastError,
   redeliveries, traceId, deadLetteredAt }` metadata — so operators consume
   and alert on every poison message from a single topic instead of polling
-  per-subscriber DLQs. High-throughput in-order consumers can call
+  per-subscriber DLQs. Opt-in `deadLetter.autoReplay` (EB-134) re-enqueues
+  dead-lettered messages automatically after an exponential backoff
+  (`initialDelayMs` default 1000, `maxDelayMs` default 60000,
+  `backoffMultiplier` default 2) instead of waiting for a manual
+  `replayDeadLetter`: the replay preserves the original `messageId` and
+  bypasses the dedup window, cooperating with `deduplicateMessages`, and
+  each replay gets a fresh redelivery budget. After
+  `maxAutoReplayAttempts` (default 3) the message is marked `poisoned`
+  and `onPoisoned` fires — permanently isolated, no further automatic
+  replays. Unsubscribing cancels pending replays; a manual
+  `replayDeadLetter` supersedes the scheduled one. `getStats()` exposes
+  `autoReplayed` / `autoReplayExhausted` / `poisoned`. Disabled by
+  default. High-throughput in-order consumers can call
   `ackUpTo(subId, seq)` (EB-76) to cumulatively acknowledge every
   outstanding delivery with `seq <= seq` in one call instead of acking
   each `Delivery` handle: it returns the number actually acked, skips

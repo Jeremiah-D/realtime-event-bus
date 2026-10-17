@@ -2311,6 +2311,67 @@ export interface DeadLetterOptions {
    * string when given.
    */
   diagnosticTopic?: string;
+  /**
+   * Opt-in dead-letter auto-replay (EB-134): when a message is
+   * dead-lettered, the bus automatically re-enqueues it after an
+   * exponential backoff instead of leaving it in the DLQ for a manual
+   * `replayDeadLetter`. `true` enables it with the defaults below; an
+   * object tunes the backoff. Each auto-replay preserves the original
+   * `messageId` and bypasses the dedup window (like `replayDeadLetter`),
+   * so it cooperates with `deduplicateMessages`. When the attempts are
+   * exhausted the message is marked poisoned and `onPoisoned` fires —
+   * no further automatic replays. Disabled by default (backward
+   * compatible).
+   */
+  autoReplay?: boolean | AutoReplayOptions;
+  /**
+   * Fired when a message exhausts its auto-replay budget and is marked
+   * poisoned (see `autoReplay`) — once per message, synchronously with
+   * the poisoning. Only fires when `autoReplay` is enabled.
+   */
+  onPoisoned?: (event: PoisonedMessageEvent) => void;
+}
+
+/**
+ * Backoff tuning for `DeadLetterOptions.autoReplay` (EB-134).
+ */
+export interface AutoReplayOptions {
+  /**
+   * Delay before the first auto-replay, in milliseconds. Defaults to
+   * 1000. Must be a non-negative finite number.
+   */
+  initialDelayMs?: number;
+  /**
+   * Upper bound for the backoff delay, in milliseconds. Defaults to
+   * 60000. Must be a positive finite number.
+   */
+  maxDelayMs?: number;
+  /**
+   * Multiplier applied to the delay after each attempt. Defaults to 2.
+   * Must be >= 1 and finite.
+   */
+  backoffMultiplier?: number;
+  /**
+   * How many times a dead-lettered message is automatically replayed
+   * before it is marked poisoned. Defaults to 3. Must be a
+   * non-negative integer — `0` means the message is marked poisoned
+   * immediately on dead-lettering (no automatic replays).
+   */
+  maxAutoReplayAttempts?: number;
+}
+
+/**
+ * Snapshot delivered to `DeadLetterOptions.onPoisoned` (EB-134).
+ */
+export interface PoisonedMessageEvent {
+  /** The subscriber whose DLQ poisoned the message. */
+  subscriberId: string;
+  /** The subscriber's topic pattern. */
+  pattern: string;
+  /** The DLQ entry, now marked poisoned. */
+  entry: DeadLetterEntry;
+  /** How many auto-replay attempts were made before poisoning. */
+  autoReplayAttempts: number;
 }
 
 /**
@@ -2366,6 +2427,17 @@ export interface DeadLetterEntry {
    * the message had no TTL.
    */
   expiresAt?: number;
+  /**
+   * How many times this entry has been auto-replayed (EB-134). 0 when
+   * auto-replay is disabled or the entry was never replayed.
+   */
+  autoReplayAttempts: number;
+  /**
+   * True when the entry exhausted its auto-replay budget and was marked
+   * poisoned (EB-134) — permanently isolated, no further automatic
+   * replays. Always false when auto-replay is disabled.
+   */
+  poisoned: boolean;
 }
 
 /** Snapshot delivered to `DeadLetterOptions.onDeadLetter`. */
@@ -3973,6 +4045,21 @@ export interface BusStats {
    */
   deadLetteredMessages: number;
   /**
+   * Total dead-letter auto-replays fired (EB-134, see
+   * `DeadLetterOptions.autoReplay`).
+   */
+  autoReplayed: number;
+  /**
+   * Total messages that exhausted their auto-replay budget and were
+   * marked poisoned (EB-134).
+   */
+  autoReplayExhausted: number;
+  /**
+   * Total messages marked poisoned (EB-134). Currently equals
+   * `autoReplayExhausted`.
+   */
+  poisoned: number;
+  /**
    * Total cumulative-ack calls (`ackUpTo`, EB-76) on known reliable
    * subscribers — one per call, regardless of how many deliveries the
    * range actually acked.
@@ -5330,6 +5417,28 @@ interface SubscriberDeadLetter {
   nextSeq: number;
   onDeadLetter?: (event: DeadLetterEvent) => void;
   diagnosticTopic?: string;
+  /**
+   * Resolved auto-replay config (EB-134), or undefined when
+   * `DeadLetterOptions.autoReplay` is disabled.
+   */
+  autoReplay?: {
+    initialDelayMs: number;
+    maxDelayMs: number;
+    backoffMultiplier: number;
+    maxAutoReplayAttempts: number;
+  };
+  onPoisoned?: (event: PoisonedMessageEvent) => void;
+  /**
+   * Pending auto-replay timers by DLQ seq (EB-134). Cleared on
+   * unsubscribe — a replay must never fire for a gone subscriber.
+   */
+  pendingAutoReplays: Map<number, ReturnType<typeof setTimeout>>;
+  /**
+   * Auto-replay attempts in flight by message (EB-134): when a
+   * replayed message is dead-lettered again, its attempt count carries
+   * over to the new DLQ entry instead of resetting.
+   */
+  autoReplayAttemptsInFlight: Map<BusMessage, number>;
 }
 
 /**
@@ -5619,7 +5728,7 @@ function thrownErrorMessage(err: unknown): string {
 function normalizeDeadLetterOptions(
   opt: boolean | DeadLetterOptions | undefined,
   caller: string,
-): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'onDeadLetter' | 'diagnosticTopic'> | null {
+): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned'> | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError(`${caller}: deadLetter must be true or a DeadLetterOptions object`);
@@ -5640,7 +5749,45 @@ function normalizeDeadLetterOptions(
   if (diagnosticTopic !== undefined && (typeof diagnosticTopic !== 'string' || diagnosticTopic.length === 0)) {
     throw new RangeError(`${caller}: deadLetter.diagnosticTopic must be a non-empty string`);
   }
-  return { maxRedeliveries, maxEntries, onDeadLetter: o.onDeadLetter, diagnosticTopic };
+  // EB-134: resolve the auto-replay config. `true` enables the defaults;
+  // an object tunes the backoff. Invalid values throw before anything is
+  // mutated, matching the other validations above.
+  let autoReplay: SubscriberDeadLetter['autoReplay'];
+  const ar = o.autoReplay;
+  if (ar !== undefined && ar !== false) {
+    if (ar !== true && (typeof ar !== 'object' || ar === null)) {
+      throw new TypeError(`${caller}: deadLetter.autoReplay must be true or an AutoReplayOptions object`);
+    }
+    const aro: AutoReplayOptions = ar === true ? {} : ar;
+    const initialDelayMs = aro.initialDelayMs ?? 1000;
+    const maxDelayMs = aro.maxDelayMs ?? 60000;
+    const backoffMultiplier = aro.backoffMultiplier ?? 2;
+    const maxAutoReplayAttempts = aro.maxAutoReplayAttempts ?? 3;
+    if (!Number.isFinite(initialDelayMs) || initialDelayMs < 0) {
+      throw new RangeError(`${caller}: deadLetter.autoReplay.initialDelayMs must be a non-negative finite number`);
+    }
+    if (!Number.isFinite(maxDelayMs) || maxDelayMs <= 0) {
+      throw new RangeError(`${caller}: deadLetter.autoReplay.maxDelayMs must be a positive finite number`);
+    }
+    if (!Number.isFinite(backoffMultiplier) || backoffMultiplier < 1) {
+      throw new RangeError(`${caller}: deadLetter.autoReplay.backoffMultiplier must be a finite number >= 1`);
+    }
+    if (!Number.isInteger(maxAutoReplayAttempts) || maxAutoReplayAttempts < 0) {
+      throw new RangeError(`${caller}: deadLetter.autoReplay.maxAutoReplayAttempts must be a non-negative integer`);
+    }
+    autoReplay = { initialDelayMs, maxDelayMs, backoffMultiplier, maxAutoReplayAttempts };
+  }
+  if (o.onPoisoned !== undefined && typeof o.onPoisoned !== 'function') {
+    throw new TypeError(`${caller}: deadLetter.onPoisoned must be a function`);
+  }
+  return {
+    maxRedeliveries,
+    maxEntries,
+    onDeadLetter: o.onDeadLetter,
+    diagnosticTopic,
+    autoReplay,
+    onPoisoned: o.onPoisoned,
+  };
 }
 
 /**
@@ -9842,6 +9989,22 @@ export class EventBus {
    * including replays that failed again.
    */
   private totalDeadLettered = 0;
+  /**
+   * Total dead-letter auto-replays fired (EB-134). Counts each time a
+   * scheduled auto-replay re-enqueues a message.
+   */
+  private totalAutoReplayed = 0;
+  /**
+   * Total messages that exhausted their auto-replay budget and were
+   * marked poisoned (EB-134).
+   */
+  private totalAutoReplayExhausted = 0;
+  /**
+   * Total messages marked poisoned (EB-134). Currently equals
+   * `totalAutoReplayExhausted` — the only poisoning path is budget
+   * exhaustion — kept separate for future poisoning sources.
+   */
+  private totalPoisoned = 0;
   /**
    * Total SLO-miss excursions fired across all latency-SLO subscribers
    * (EB-133). Counts only when `EventBusOptions.processingLatencySloAlert`
@@ -14088,6 +14251,16 @@ export class EventBus {
           this.clearRateLimitTimer(subscriber);
           this.clearBatchTimer(subscriber);
           this.clearWindowTimer(subscriber);
+          // EB-134: pending dead-letter auto-replays must not outlive
+          // the subscriber — a replay for a gone subscriber is dropped.
+          const dlq = subscriber.deadLetter;
+          if (dlq !== undefined) {
+            for (const timer of dlq.pendingAutoReplays.values()) {
+              clearTimeout(timer);
+            }
+            dlq.pendingAutoReplays.clear();
+            dlq.autoReplayAttemptsInFlight.clear();
+          }
           const bucket = this.prefixIndex.get(indexKey);
           if (bucket != null) {
             bucket.delete(id);
@@ -15385,7 +15558,13 @@ export class EventBus {
         // `fromRedelivery`: a redelivery is already-admitted work, so it
         // bypasses the graceful-drain admission gate (EB-128) — refusing
         // it here would break at-least-once and wedge the drain.
-        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), false, true);
+        // `skipDedup`: a redelivery is already-admitted work too — it
+        // bypasses the dedup window like `requeueUndelivered` and
+        // `replayDeadLetter` do. Without this, a nacked message on a
+        // `deduplicateMessages` subscriber would be suppressed as a
+        // duplicate and never redelivered, silently breaking
+        // at-least-once (EB-134).
+        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
         this.scheduleFlush();
         // The requeue re-armed the backlog: re-evaluate the drain — a
         // drain whose queue just refilled stays open, and one whose last
@@ -15399,7 +15578,14 @@ export class EventBus {
     // reliable subscriptions carry them; plain subscriptions never do.
     subscriber.nackReasons = { handler_throw: 0, explicit_nack: 0, ack_timeout: 0 };
     if (dlq != null) {
-      subscriber.deadLetter = { entries: [], nextSeq: 0, ...dlq };
+      subscriber.deadLetter = {
+        entries: [],
+        nextSeq: 0,
+        ...dlq,
+        // EB-134: auto-replay bookkeeping starts empty per subscriber.
+        pendingAutoReplays: new Map(),
+        autoReplayAttemptsInFlight: new Map(),
+      };
     }
     // Tracks one delivery, wrapping the handle so the ack-latency tracker
     // (when enabled) samples when ack() finishes. Each message contributes
@@ -25005,6 +25191,9 @@ export class EventBus {
       filteredMessages: this.totalFiltered,
       signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
+      autoReplayed: this.totalAutoReplayed,
+      autoReplayExhausted: this.totalAutoReplayExhausted,
+      poisoned: this.totalPoisoned,
       ackedRanges: this.totalAckedRanges,
       ackBatches: this.totalAckBatches,
       nackBatches: this.totalNackBatches,
@@ -25397,9 +25586,27 @@ export class EventBus {
     if (dlq == null) return;
     let evictedOldest = false;
     if (dlq.entries.length >= dlq.maxEntries) {
-      dlq.entries.shift();
+      const evicted = dlq.entries.shift();
+      // EB-134: an evicted entry's pending auto-replay is cancelled —
+      // replaying a message the DLQ already dropped would resurrect it.
+      if (evicted !== undefined) {
+        const timer = dlq.pendingAutoReplays.get(evicted.seq);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          dlq.pendingAutoReplays.delete(evicted.seq);
+        }
+        dlq.autoReplayAttemptsInFlight.delete(evicted.msg);
+      }
       evictedOldest = true;
     }
+    // EB-134: carry the auto-replay attempt count when a replayed
+    // message is dead-lettered again — the budget is per message, not
+    // per DLQ entry.
+    const autoReplayAttempts = dlq.autoReplayAttemptsInFlight.get(msg) ?? 0;
+    dlq.autoReplayAttemptsInFlight.delete(msg);
+    const autoReplay = dlq.autoReplay;
+    const poisoned =
+      autoReplay !== undefined && autoReplayAttempts >= autoReplay.maxAutoReplayAttempts;
     const entry: DeadLetterEntry = {
       seq: ++dlq.nextSeq,
       topic: msg.topic,
@@ -25409,6 +25616,8 @@ export class EventBus {
       lastError,
       traceId: this.trace?.traceIdOf(msg),
       expiresAt: this.messageDeadlines.get(msg),
+      autoReplayAttempts,
+      poisoned,
     };
     dlq.entries.push({ ...entry, msg });
     this.totalDeadLettered += 1;
@@ -25464,6 +25673,72 @@ export class EventBus {
       this.scheduleFlush();
       if (admitted) this.totalDiagnosticEvents += 1;
     }
+    // EB-134: dead-letter auto-replay. A poisoned entry (budget
+    // exhausted) is permanently isolated — fire onPoisoned and never
+    // schedule. Otherwise arm an unref'd backoff timer; the timer
+    // revalidates the subscriber and the entry before replaying, so an
+    // unsubscribe or a manual replay in between safely cancels it.
+    if (autoReplay !== undefined) {
+      if (poisoned) {
+        this.totalPoisoned += 1;
+        this.totalAutoReplayExhausted += 1;
+        const onPoisoned = dlq.onPoisoned;
+        if (onPoisoned !== undefined) {
+          try {
+            onPoisoned({
+              subscriberId: subscriber.id,
+              pattern: subscriber.pattern,
+              entry,
+              autoReplayAttempts,
+            });
+          } catch {
+            // Advisory-only: a throwing poison callback must never
+            // disturb the DLQ move.
+          }
+        }
+      } else {
+        const delayMs = Math.min(
+          autoReplay.maxDelayMs,
+          autoReplay.initialDelayMs * Math.pow(autoReplay.backoffMultiplier, autoReplayAttempts),
+        );
+        const timer = setTimeout(() => this.fireAutoReplay(subscriber, entry.seq), delayMs);
+        unrefTimer(timer);
+        dlq.pendingAutoReplays.set(entry.seq, timer);
+      }
+    }
+  }
+
+  /**
+   * Fires a scheduled dead-letter auto-replay (EB-134): removes the
+   * entry from the DLQ and re-enqueues the original message with its
+   * messageId preserved and the dedup window bypassed (like
+   * `replayDeadLetter`). The attempt count travels in
+   * `autoReplayAttemptsInFlight` so a re-dead-lettering carries it to
+   * the next entry. No-ops when the subscriber is gone, the entry was
+   * already replayed/evicted, or auto-replay was disabled after the
+   * timer was armed.
+   */
+  private fireAutoReplay(subscriber: Subscriber, seq: number): void {
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) return;
+    // The subscriber may have unsubscribed between arming and firing —
+    // a replay for a gone subscriber is dropped silently.
+    if (this.subscribers.get(subscriber.id) !== subscriber) return;
+    dlq.pendingAutoReplays.delete(seq);
+    const idx = dlq.entries.findIndex((e) => e.seq === seq);
+    if (idx === -1) return;
+    const [record] = dlq.entries.splice(idx, 1);
+    // Fresh redelivery budget for the replayed message (like
+    // `replayDeadLetter`): the auto-replay is a new chance, not a
+    // continuation of the poison run.
+    subscriber.reliable?.redeliveries.delete(record.msg);
+    subscriber.reliable?.lastFailure.delete(record.msg);
+    // The attempt count travels with the message: if it dead-letters
+    // again, `moveToDeadLetter` carries it to the next entry.
+    dlq.autoReplayAttemptsInFlight.set(record.msg, record.autoReplayAttempts + 1);
+    this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg), true);
+    this.scheduleFlush();
+    this.totalAutoReplayed += 1;
   }
 
   /**
@@ -25517,6 +25792,15 @@ export class EventBus {
     const idx = dlq.entries.findIndex((e) => e.seq === seq);
     if (idx === -1) return false;
     const [record] = dlq.entries.splice(idx, 1);
+    // EB-134: a manual replay supersedes any pending auto-replay for
+    // the same entry — cancel the timer so the message is not replayed
+    // twice.
+    const pendingTimer = dlq.pendingAutoReplays.get(seq);
+    if (pendingTimer !== undefined) {
+      clearTimeout(pendingTimer);
+      dlq.pendingAutoReplays.delete(seq);
+    }
+    dlq.autoReplayAttemptsInFlight.delete(record.msg);
     // Fresh retry budget: the operator's replay is a new chance, not a
     // continuation of the poison run — and it bypasses the dedup window
     // for the same reason: an explicit operator replay is deliberate

@@ -114,14 +114,16 @@ test('maxEntries bounds the window: the oldest identity is evicted first', async
   assert.equal(bus.getStats().dedupDropped, 1);
 });
 
-test('ack-timeout redelivery is suppressed within the window', async () => {
+test('ack-timeout redelivery is not suppressed within the window', async () => {
   const bus = new EventBus();
   const deliveries: Array<Delivery<BusMessage>> = [];
   bus.subscribeReliable(
     't',
     (d) => {
       deliveries.push(d);
-      // Never ack: the delivery times out and would be requeued.
+      // Ack the redelivery so it doesn't time out again.
+      if (deliveries.length > 1) d.ack();
+      // The first delivery is never acked: it times out and is requeued.
     },
     { ackTimeoutMs: 30, deduplicateMessages: true },
   );
@@ -130,13 +132,14 @@ test('ack-timeout redelivery is suppressed within the window', async () => {
   assert.equal(deliveries.length, 1);
   await sleep(60);
   await flush();
-  // The redelivery was suppressed: exactly-once within the window wins
-  // over at-least-once.
-  assert.equal(deliveries.length, 1);
-  assert.equal(bus.getStats().dedupDropped, 1);
+  // The redelivery is delivered: at-least-once wins over the dedup
+  // window for already-admitted work (EB-134). The dedup window still
+  // suppresses duplicate *publishes*, not redeliveries.
+  assert.equal(deliveries.length, 2);
+  assert.equal(bus.getStats().dedupDropped, 0);
 });
 
-test('nack redelivery is suppressed within the window', async () => {
+test('nack redelivery is not suppressed within the window', async () => {
   const bus = new EventBus();
   const deliveries: Array<Delivery<BusMessage>> = [];
   let nacked = false;
@@ -156,8 +159,9 @@ test('nack redelivery is suppressed within the window', async () => {
   bus.publish('t', 'a', { messageId: 'm1' });
   await flush();
   await flush();
-  assert.equal(deliveries.length, 1);
-  assert.equal(bus.getStats().dedupDropped, 1);
+  // The nack redelivery is delivered, then acked (EB-134).
+  assert.equal(deliveries.length, 2);
+  assert.equal(bus.getStats().dedupDropped, 0);
 });
 
 test('durable window: a restarted bus does not double-deliver on resume', async () => {
