@@ -537,6 +537,176 @@ export class LaneQueue<T> {
   }
 
   /**
+   * Topic-fair drain (EB-135): like `drainLiveUpTo`, but the
+   * budget-counting entries are selected by deficit round-robin across
+   * `groupOf(item)` groups (the message topic) instead of the lane
+   * weighted rotation alone — see `deficitRoundRobinSelect` in
+   * src/fair.ts. `deficits` is the caller's persistent per-group
+   * carryover map, shared across lanes within one drain round.
+   *
+   * When at most one lane holds messages this delegates verbatim to that
+   * lane's `BoundedQueue.drainLiveUpToFair` — traffic that never uses
+   * priorities keeps the zero-cost opt-in semantics. Otherwise every lane
+   * is expiry-swept first (the existing idiom), then the weighted
+   * rotation serves each lane up to its weight in budget-counting
+   * messages, each lane's share taken with the fair drain — so lane
+   * precedence still wins across lanes (urgent before bulk) while topics
+   * share fairly within each lane's share. Bulk starvation protection,
+   * `maybeFireDrained`, byte accounting and per-lane expiry counting are
+   * preserved exactly as in `drainLiveUpTo`.
+   *
+   * `onlyGroup`, when given, restricts the whole drain to that group —
+   * the batch path (EB-135) passes the winner from `peekFairWinner` so a
+   * collected batch never mixes topics, across lanes included.
+   */
+  drainLiveUpToFair(
+    nowMs: number,
+    maxLive: number,
+    groupOf: (item: T) => string,
+    weightOf: (group: string) => number,
+    deficits: Map<string, number>,
+    countAgainstBudget?: (item: T) => boolean,
+    onlyGroup?: string,
+  ): { live: T[]; expired: T[] } {
+    let occupied = 0;
+    let only: MessageLane = 'normal';
+    for (const lane of MESSAGE_LANES) {
+      if (this.lanes[lane].size > 0) {
+        occupied += 1;
+        only = lane;
+      }
+    }
+    if (occupied <= 1) {
+      const result = this.lanes[only].drainLiveUpToFair(
+        nowMs,
+        maxLive,
+        groupOf,
+        weightOf,
+        deficits,
+        countAgainstBudget,
+        onlyGroup,
+      );
+      for (let i = 0; i < result.expired.length; i += 1) this.recordExpired(only);
+      this.subtractBytes(result.live);
+      this.subtractBytes(result.expired);
+      this.maybeFireDrained();
+      if (only === 'bulk' || this.lanes.bulk.size === 0) this.bulkStarvedRounds = 0;
+      return result;
+    }
+    const live: T[] = [];
+    const expired: T[] = [];
+    // Sweep TTL expiry in every lane first — a message must not sit past
+    // its deadline only because its lane was not scheduled this round.
+    // The existing idiom: `drainLiveUpTo(nowMs, 0)` with no predicate, so
+    // the sweep is expiry-only and `live` stays empty by construction.
+    for (const lane of MESSAGE_LANES) {
+      const swept = this.lanes[lane].drainLiveUpTo(nowMs, 0);
+      expired.push(...swept.expired);
+      for (let i = 0; i < swept.expired.length; i += 1) this.recordExpired(lane);
+      this.subtractBytes(swept.expired);
+    }
+    let remaining = maxLive;
+    let bulkDrained = 0;
+    const bulkLane = this.lanes.bulk;
+    const bulkWaiting = bulkLane.size > 0;
+    if (bulkWaiting && remaining >= 1 && this.bulkStarvedRounds + 1 >= this.bulkStarvationRounds) {
+      // Starved long enough: force-interleave one bulk message ahead of
+      // the rotation, taken fairly like any other share — the guard
+      // reorders within the budget, it never exceeds it.
+      const forced = bulkLane.drainLiveUpToFair(
+        nowMs,
+        1,
+        groupOf,
+        weightOf,
+        deficits,
+        countAgainstBudget,
+        onlyGroup,
+      );
+      live.push(...forced.live);
+      expired.push(...forced.expired);
+      for (let i = 0; i < forced.expired.length; i += 1) this.recordExpired('bulk');
+      this.subtractBytes(forced.live);
+      this.subtractBytes(forced.expired);
+      remaining -= this.countedOf(forced.live, countAgainstBudget);
+      bulkDrained += forced.live.length;
+    }
+    // Weighted rotation: one pass serves urgent, then normal, then bulk,
+    // up to each lane's weight in budget-counting messages; passes repeat
+    // while budget remains and some lane still yields messages. The first
+    // pass always runs — even at zero budget — so budget-exempt messages
+    // (EB-117 replay bypass) keep flowing.
+    let progress = true;
+    let firstPass = true;
+    while (progress && (remaining > 0 || firstPass)) {
+      firstPass = false;
+      progress = false;
+      for (const lane of MESSAGE_LANES) {
+        const share = Math.min(this.weights[lane], Math.max(0, remaining));
+        const taken = this.lanes[lane].drainLiveUpToFair(
+          nowMs,
+          share,
+          groupOf,
+          weightOf,
+          deficits,
+          countAgainstBudget,
+          onlyGroup,
+        );
+        if (taken.live.length > 0 || taken.expired.length > 0) progress = true;
+        live.push(...taken.live);
+        expired.push(...taken.expired);
+        for (let i = 0; i < taken.expired.length; i += 1) this.recordExpired(lane);
+        this.subtractBytes(taken.live);
+        this.subtractBytes(taken.expired);
+        remaining -= this.countedOf(taken.live, countAgainstBudget);
+        if (lane === 'bulk') bulkDrained += taken.live.length;
+      }
+    }
+    if (!bulkWaiting || bulkDrained > 0) {
+      this.bulkStarvedRounds = 0;
+    } else {
+      this.bulkStarvedRounds += 1;
+    }
+    this.maybeFireDrained();
+    return { live, expired };
+  }
+
+  /**
+   * Topic-fair batch winner probe (EB-135): the group a deficit
+   * round-robin drain would dequeue first right now, without removing
+   * anything. The batch path resolves the winner once per collection
+   * round and drains with it as `onlyGroup`, so a collected batch never
+   * mixes topics.
+   *
+   * The winner is the head group: a DRR round credits every backlogged
+   * group with its (positive) weight, so the first group in rotation
+   * order always has deficit >= 1 and is served first — the deficits only
+   * decide how many each group takes after that. Concretely: the first
+   * budget-counting live entry's group across lanes in drain precedence
+   * order (urgent → normal → bulk); the first budget-exempt entry's group
+   * when no budget-counting entry is live; `undefined` when nothing is
+   * live.
+   *
+   * Cross-collection ordering consequence: collections serve the queue
+   * head's topic first, so a continuously backlogged head topic fills
+   * consecutive batches before later topics are touched — batches stay
+   * single-topic and per-topic FIFO, while the weight ratio governs the
+   * plain (non-batch) drain at message granularity.
+   */
+  peekFairWinner(
+    nowMs: number,
+    groupOf: (item: T) => string,
+    countAgainstBudget?: (item: T) => boolean,
+  ): string | undefined {
+    let firstExempt: T | undefined;
+    for (const lane of MESSAGE_LANES) {
+      const part = this.lanes[lane].peekLivePartition(nowMs, countAgainstBudget);
+      if (part.counting.length > 0) return groupOf(part.counting[0]);
+      if (firstExempt === undefined && part.exempt.length > 0) firstExempt = part.exempt[0];
+    }
+    return firstExempt === undefined ? undefined : groupOf(firstExempt);
+  }
+
+  /**
    * Counts how many of `items` consume budget under `countAgainstBudget`
    * (`items.length` when no predicate is given).
    */

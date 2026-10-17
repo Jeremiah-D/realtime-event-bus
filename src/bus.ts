@@ -109,6 +109,11 @@ import {
   type SubscriptionAuditQuery,
 } from './subaudit.ts';
 import {
+  resolveTopicFairnessOptions,
+  type ResolvedTopicFairnessOptions,
+  type TopicFairnessOptions,
+} from './fair.ts';
+import {
   resolveMirrorRules,
   type MirrorHandle,
   type MirrorProvenance,
@@ -1046,6 +1051,44 @@ export interface SubscribeOptions {
    * `subscribe`. Disabled by default.
    */
   rateLimit?: RateLimitOptions;
+  /**
+   * Opt-in topic-level fair scheduling for this subscriber (EB-135):
+   * instead of draining its queue in plain FIFO order, the drain serves
+   * the queued topics in deficit round-robin — each drain round credits
+   * every topic with its weight and dequeues one message per unit of
+   * deficit, so a `{ hot: 1, cold: 3 }` subscription drains one `hot`
+   * message for every three `cold` ones, interleaved at single-message
+   * granularity, while each topic's own messages stay in publish order.
+   *
+   * The scheduler only decides *which* queued messages the round's
+   * budget covers — the budget itself is still the minimum of the
+   * delivery gates (`deliveryShaping`, `rateLimit`, `maxInflight`,
+   * `slowStart`, credits), exactly as for the plain drain, so fairness
+   * composes orthogonally with all of them. The EB-117 replay bypass
+   * still flows freely, consuming neither budget nor deficit. Per-topic
+   * order is preserved, so per-topic gap detection is unaffected.
+   *
+   * With `batch`, fairness additionally guarantees single-topic batches:
+   * each collection round resolves the round-robin winner (the queue
+   * head's topic — the group a DRR round always serves first) once and
+   * fills only from that topic in per-topic FIFO order, debiting deficits
+   * per message taken. Across collections the head topic is served first,
+   * so a continuously backlogged head topic fills consecutive batches
+   * before later topics are touched; the weight ratio governs the plain
+   * (non-batch) drain at message granularity.
+   *
+   * `getStats().topicFairness` aggregates the per-topic scheduled counts
+   * and live deficit balances bus-wide, and `src/metrics.ts` renders
+   * `eventbus_fair_scheduled_messages_total{topic}`.
+   *
+   * Pass `true` for fair scheduling with every topic at weight 1, or a
+   * `TopicFairnessOptions` object to tune per-topic weights. A topic
+   * absent from `weights` drains at weight 1. Every weight must be a
+   * positive integer — anything else throws `RangeError` from
+   * `subscribe`. Cannot be combined with `shadow` (throws `RangeError`).
+   * Disabled by default.
+   */
+  topicFairness?: boolean | TopicFairnessOptions;
   /**
    * Opt-in per-subscriber delivery-latency sampling. When enabled, the bus
    * stamps every message enqueued for this subscriber with the bus clock
@@ -3725,6 +3768,21 @@ export interface BusStats {
     dropped: LaneCounts;
   };
   /**
+   * Topic-level fair-scheduling counters (EB-135): bus-level aggregates
+   * across every live subscriber that opted into
+   * `SubscribeOptions.topicFairness`. `scheduledByTopic` counts, per
+   * topic, the messages the fair scheduler dequeued for delivery —
+   * "scheduled", not "delivered": a message requeued by a mid-drain
+   * health trip is counted again when the scheduler picks it up a second
+   * time. `deficits` sums the live per-(subscriber, topic) deficit
+   * balances — the DRR carryover between drain rounds. Both are empty
+   * objects when no subscriber uses fair scheduling.
+   */
+  topicFairness: {
+    scheduledByTopic: Record<string, number>;
+    deficits: Record<string, number>;
+  };
+  /**
    * Total messages shed at the publish side by adaptive publish-side
    * throttling (see `SubscribeOptions.throttle`) — the sum of every
    * subscriber's `throttledCount`. Counted separately from queue drops.
@@ -5054,6 +5112,19 @@ interface Subscriber {
    * Absent when shaping is disabled for this subscriber.
    */
   deliveryShaping?: DeliveryShapingState;
+  /**
+   * Topic-level fair scheduling state (see
+   * `SubscribeOptions.topicFairness`, EB-135). Present only when the
+   * subscriber opted in: the validated options, the per-topic deficit
+   * carryover map persisted across drain rounds (debited per scheduled
+   * message), and the per-topic count of messages the fair scheduler
+   * dequeued. `getStats()` aggregates both maps bus-wide.
+   */
+  topicFairness?: {
+    options: ResolvedTopicFairnessOptions;
+    deficits: Map<string, number>;
+    scheduledByTopic: Map<string, number>;
+  };
   /**
    * Slow-start ramp gate (see `SubscribeOptions.slowStart`). Present only
    * while the ramp window has not elapsed — once the ramp completes the
@@ -13800,6 +13871,7 @@ export class EventBus {
         ['keyHotspot', opts?.keyHotspot],
         ['ackLatency', opts?.ackLatency],
         ['maxInflight', opts?.maxInflight],
+        ['topicFairness', opts?.topicFairness],
       ];
       for (const [name, value] of incompatible) {
         if (value !== undefined && value !== false) {
@@ -13866,6 +13938,9 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const rateLimit = resolveRateLimitOptions(opts?.rateLimit);
+    // Topic-level fair scheduling (EB-135): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const topicFairness = resolveTopicFairnessOptions(opts?.topicFairness, 'subscribe');
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
@@ -14088,6 +14163,13 @@ export class EventBus {
       // use, so a never-granted subscriber pays nothing for it.
       onCreditExhausted,
       deliveryShaping,
+      // Topic-level fair scheduling (EB-135): the per-topic deficit
+      // carryover and scheduled counters start empty; the drain debits
+      // them from the first flush round on.
+      topicFairness:
+        topicFairness === undefined
+          ? undefined
+          : { options: topicFairness, deficits: new Map(), scheduledByTopic: new Map() },
       slowStart,
       maxInflight: maxInflight == null ? undefined : { max: maxInflight, inFlight: 0 },
       // Idle auto-reclamation (EB-72): the mode marker doubles as the
@@ -24876,6 +24958,11 @@ export class EventBus {
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const inFlightUsage: BusStats['inFlightUsage'] = [];
     const nackReasons: BusStats['nackReasons'] = [];
+    // Topic-level fair scheduling (EB-135): bus-level aggregates across
+    // every live subscriber that opted in — per-topic scheduled counts
+    // and summed per-(subscriber, topic) deficit balances.
+    const fairScheduledByTopic = new Map<string, number>();
+    const fairDeficits = new Map<string, number>();
     const shadows: BusStats['shadows'] = [];
     const replayProgress: BusStats['replayProgress'] = [];
     const hotKeys: HotKeyStat[] = [];
@@ -24944,6 +25031,18 @@ export class EventBus {
             ? subscriber.queue.size + (subscriber.batch?.pending.length ?? 0)
             : 0,
         });
+      }
+      // Topic-fair scheduling aggregation (EB-135): one row per live
+      // opted-in subscriber, summed per topic — a pure read of the live
+      // counters, so the accounting is never disturbed.
+      const fair = subscriber.topicFairness;
+      if (fair !== undefined) {
+        for (const [topic, count] of fair.scheduledByTopic) {
+          fairScheduledByTopic.set(topic, (fairScheduledByTopic.get(topic) ?? 0) + count);
+        }
+        for (const [topic, deficit] of fair.deficits) {
+          fairDeficits.set(topic, (fairDeficits.get(topic) ?? 0) + deficit);
+        }
       }
       // In-flight cap usage (see `SubscribeOptions.maxInflight`): only
       // subscribers that opted in appear — a pure read of the live
@@ -25096,6 +25195,13 @@ export class EventBus {
         queued: { ...this.laneQueued },
         delivered: { ...this.laneDelivered },
         dropped: { ...this.laneDropped },
+      },
+      // Topic-level fair-scheduling counters (EB-135): bus-level
+      // aggregates across every live opted-in subscriber; empty objects
+      // when no subscriber uses fair scheduling.
+      topicFairness: {
+        scheduledByTopic: Object.fromEntries(fairScheduledByTopic),
+        deficits: Object.fromEntries(fairDeficits),
       },
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
@@ -26808,11 +26914,38 @@ export class EventBus {
           }
         }
       }
-      const { live, expired } = subscriber.queue.drainLiveUpTo(
-        nowMs,
-        Math.min(shapingMaxLive, rateLimitMaxLive, inflightMaxLive, slowStartMaxLive, creditBudget),
-        credits == null ? undefined : (msg) => !this.isReplayBypass(msg),
+      // Topic-level fair scheduling (EB-135): when the subscriber opted
+      // in, the fair drain replaces the plain FIFO drain — the budget is
+      // still the gates' minimum computed above, the scheduler only
+      // decides which queued messages the budget covers.
+      const fair = subscriber.topicFairness;
+      const drainBudget = Math.min(
+        shapingMaxLive,
+        rateLimitMaxLive,
+        inflightMaxLive,
+        slowStartMaxLive,
+        creditBudget,
       );
+      const countPredicate =
+        credits == null ? undefined : (msg: BusMessage) => !this.isReplayBypass(msg);
+      const { live, expired } =
+        fair === undefined
+          ? subscriber.queue.drainLiveUpTo(nowMs, drainBudget, countPredicate)
+          : subscriber.queue.drainLiveUpToFair(
+              nowMs,
+              drainBudget,
+              (msg) => msg.topic,
+              (topic) => fair.options.weightOf(topic),
+              fair.deficits,
+              countPredicate,
+            );
+      if (fair !== undefined) {
+        // The scheduler's per-topic dequeue counts — "scheduled", not
+        // "delivered" (see `BusStats.topicFairness`).
+        for (const msg of live) {
+          fair.scheduledByTopic.set(msg.topic, (fair.scheduledByTopic.get(msg.topic) ?? 0) + 1);
+        }
+      }
       for (const msg of expired) {
         this.recordExpired(msg.topic, msg.lane ?? 'normal');
       }
@@ -27022,11 +27155,44 @@ export class EventBus {
       this.isReplayBypass(subscriber.queue.peekOldest());
     if (budget >= 1 || creditFreeFlow) {
       if (room > 0) {
-        const { live, expired } = subscriber.queue.drainLiveUpTo(
-          nowMs,
-          Math.min(room, budget),
-          credits == null ? undefined : (msg) => !this.isReplayBypass(msg),
-        );
+        // Topic-level fair scheduling (EB-135): a fair batch never mixes
+        // topics — the round-robin winner (the queue head's topic) is
+        // resolved once for the whole queue, then the drain fills only
+        // from that topic in per-topic FIFO order, debiting deficits per
+        // message taken.
+        const fair = subscriber.topicFairness;
+        const countPredicate =
+          credits == null ? undefined : (msg: BusMessage) => !this.isReplayBypass(msg);
+        let live: BusMessage[];
+        let expired: BusMessage[];
+        if (fair === undefined) {
+          ({ live, expired } = subscriber.queue.drainLiveUpTo(
+            nowMs,
+            Math.min(room, budget),
+            countPredicate,
+          ));
+        } else {
+          const winner = subscriber.queue.peekFairWinner(
+            nowMs,
+            (msg) => msg.topic,
+            countPredicate,
+          );
+          ({ live, expired } = subscriber.queue.drainLiveUpToFair(
+            nowMs,
+            Math.min(room, budget),
+            (msg) => msg.topic,
+            (topic) => fair.options.weightOf(topic),
+            fair.deficits,
+            countPredicate,
+            winner,
+          ));
+          for (const msg of live) {
+            fair.scheduledByTopic.set(
+              msg.topic,
+              (fair.scheduledByTopic.get(msg.topic) ?? 0) + 1,
+            );
+          }
+        }
         for (const msg of expired) {
           this.recordExpired(msg.topic, msg.lane ?? 'normal');
         }

@@ -1,3 +1,5 @@
+import { deficitRoundRobinSelect } from './fair.ts';
+
 export type DropPolicy = 'drop-oldest' | 'drop-newest';
 
 /**
@@ -370,6 +372,132 @@ export class BoundedQueue<T> {
     this.bytesTotal -= removedBytes;
     this.maybeFireDrained();
     this.expired += expired.length;
+    return { live, expired };
+  }
+
+  /**
+   * Returns the live entries in FIFO order WITHOUT removing them,
+   * partitioned into budget-counting and budget-exempt entries under
+   * `countAgainstBudget` (see `drainLiveUpTo`). Entries past their TTL at
+   * `nowMs` are excluded but NOT counted as expired and NOT removed — the
+   * caller owns the expiry decision; this is a read-only probe for the
+   * topic-fair scheduler's batch winner selection (EB-135).
+   */
+  peekLivePartition(
+    nowMs: number,
+    countAgainstBudget?: (item: T) => boolean,
+  ): { counting: T[]; exempt: T[] } {
+    const counting: T[] = [];
+    const exempt: T[] = [];
+    for (const entry of this.entries) {
+      if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) continue;
+      if (countAgainstBudget !== undefined && !countAgainstBudget(entry.item)) {
+        exempt.push(entry.item);
+      } else {
+        counting.push(entry.item);
+      }
+    }
+    return { counting, exempt };
+  }
+
+  /**
+   * Topic-fair drain (EB-135): like `drainLiveUpTo`, but the
+   * budget-counting live entries are selected by deficit round-robin
+   * across `groupOf(item)` groups (the message topic) instead of plain
+   * FIFO — see `deficitRoundRobinSelect` in src/fair.ts. Expiry semantics
+   * are unchanged: every entry is evaluated, expirations are counted and
+   * removed exactly as in `drainLiveUpTo`. Budget-exempt entries
+   * (`countAgainstBudget` false) flow freely in FIFO order ahead of the
+   * scheduled ones, consuming neither budget nor deficit.
+   *
+   * `deficits` is the caller's persistent per-group carryover map (see
+   * `Subscriber.topicFairness`): groups that still hold entries keep
+   * their leftover deficit for the next round; groups absent from the
+   * remaining backlog are pruned from the map.
+   *
+   * `onlyGroup`, when given, restricts the whole drain to that group —
+   * the batch path (EB-135) uses it so a collected batch never mixes
+   * topics: budget-exempt entries of other groups stay queued for a later
+   * round instead of flowing freely.
+   *
+   * Entries the scheduler does not select stay queued in their original
+   * FIFO order — the queue is never reordered, so a later drain resumes
+   * exactly where this one stopped.
+   */
+  drainLiveUpToFair(
+    nowMs: number,
+    maxLive: number,
+    groupOf: (item: T) => string,
+    weightOf: (group: string) => number,
+    deficits: Map<string, number>,
+    countAgainstBudget?: (item: T) => boolean,
+    onlyGroup?: string,
+  ): { live: T[]; expired: T[] } {
+    const live: T[] = [];
+    const expired: T[] = [];
+    const counting: QueueEntry<T>[] = [];
+    const exempt: QueueEntry<T>[] = [];
+    const rest: QueueEntry<T>[] = [];
+    let removedBytes = 0;
+    for (const entry of this.entries) {
+      if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) {
+        expired.push(entry.item);
+        removedBytes += entry.bytes;
+        continue;
+      }
+      if (onlyGroup !== undefined && groupOf(entry.item) !== onlyGroup) {
+        // Another group under `onlyGroup`: stays queued untouched.
+        rest.push(entry);
+        continue;
+      }
+      if (countAgainstBudget !== undefined && !countAgainstBudget(entry.item)) {
+        exempt.push(entry);
+      } else {
+        counting.push(entry);
+      }
+    }
+    // Phase 1: budget-exempt entries flow freely in FIFO order, ahead of
+    // the scheduled ones — consuming neither budget nor deficit.
+    for (const entry of exempt) {
+      live.push(entry.item);
+      removedBytes += entry.bytes;
+    }
+    // Phase 2: deficit round-robin over the budget-counting entries.
+    const selected = deficitRoundRobinSelect(
+      counting.map((entry) => entry.item),
+      groupOf,
+      weightOf,
+      deficits,
+      maxLive,
+    );
+    const selectedCounts = new Map<T, number>();
+    for (const item of selected) {
+      selectedCounts.set(item, (selectedCounts.get(item) ?? 0) + 1);
+      live.push(item);
+    }
+    for (const entry of counting) {
+      const remaining = selectedCounts.get(entry.item) ?? 0;
+      if (remaining > 0) {
+        selectedCounts.set(entry.item, remaining - 1);
+        removedBytes += entry.bytes;
+      } else {
+        // Not selected: stays queued in its original FIFO position —
+        // the queue is never reordered.
+        rest.push(entry);
+      }
+    }
+    this.entries = rest;
+    this.bytesTotal -= removedBytes;
+    this.maybeFireDrained();
+    this.expired += expired.length;
+    // Prune deficits for groups with no remaining backlog (classic DRR:
+    // an absent group rejoins at zero). Groups that kept entries — taken
+    // or not, in scope or out — keep their carryover.
+    const backlogGroups = new Set<string>();
+    for (const entry of rest) backlogGroups.add(groupOf(entry.item));
+    for (const group of [...deficits.keys()]) {
+      if (!backlogGroups.has(group)) deficits.delete(group);
+    }
     return { live, expired };
   }
 

@@ -4194,6 +4194,59 @@ Semantics:
   and shadow traffic keep their existing semantics (shadow drains never
   touch lane stats).
 
+## Topic-level fair scheduling (EB-135)
+
+`SubscribeOptions.topicFairness` opts a subscription into deficit
+round-robin across the topics queued for it — instead of draining its
+queue in plain FIFO order, the drain serves the queued topics in
+weighted rotation. Opt-in: without it the drain behaves exactly as
+before.
+
+```ts
+bus.subscribe('*', handler, {
+  topicFairness: { weights: { hot: 1, cold: 3 } },
+});
+// drains one `hot` message for every three `cold` ones,
+// interleaved at single-message granularity
+```
+
+Semantics:
+
+- **Deficit round-robin, quantum = 1 message.** Each drain round walks
+  the live backlog's topics in first-appearance order, credits every
+  topic with its weight, and dequeues one message per unit of deficit —
+  so the long-run service ratio matches the weight ratio, and each
+  topic's own messages stay in publish order. A topic absent from
+  `weights` drains at weight 1.
+- **The scheduler only picks *which* messages the budget covers.** The
+  drain budget is still the minimum of the delivery gates
+  (`deliveryShaping`, `rateLimit`, `maxInflight`, `slowStart`, credits),
+  exactly as for the plain drain — fairness composes orthogonally with
+  all of them. The EB-117 replay bypass still flows freely, consuming
+  neither budget nor deficit.
+- **Deficits carry across rounds.** A topic that still holds messages
+  keeps its leftover deficit for the next drain round; a topic that
+  drained completely rejoins at zero. The per-(subscriber, topic)
+  deficits are aggregated bus-wide in
+  `getStats().topicFairness.deficits`.
+- **Per-topic order is preserved.** Gap detection runs per topic, so
+  fair reordering across topics never reads as a sequence gap.
+- **Batch subscribers get single-topic batches.** With `batch`, each
+  collection round resolves the round-robin winner (the queue head's
+  topic — the group a DRR round always serves first) once and fills
+  only from that topic in per-topic FIFO order, so a delivered batch
+  never mixes topics. Across collections the head topic is served first;
+  the weight ratio governs the plain (non-batch) drain at message
+  granularity.
+- **Validation.** Every weight must be a positive integer — anything
+  else throws `RangeError` from `subscribe`. Cannot be combined with
+  `shadow` (throws `RangeError`).
+- **Metrics.** `getStats().topicFairness.scheduledByTopic` counts, per
+  topic, the messages the fair scheduler dequeued ("scheduled", not
+  "delivered"), and `src/metrics.ts` renders them as
+  `eventbus_fair_scheduled_messages_total{topic}` — only for topics with
+  at least one scheduled message.
+
 ## Subscription filter expressions (EB-123)
 
 `SubscribeOptions.filterExpr` attaches a declarative, compile-time-checked

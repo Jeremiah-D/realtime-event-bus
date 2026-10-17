@@ -66,6 +66,11 @@
  *   `commitOffset`, so the offset journal and the `OffsetStore`
  *   write-through saw exactly the same writes as manual commits.
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
+ * - `eventbus_fair_scheduled_messages_total{topic}`: messages per topic
+ *   dequeued by the topic-fair scheduler (EB-135; "scheduled", not
+ *   "delivered" — see `BusStats.topicFairness`); only emitted for topics
+ *   with at least one scheduled message, so buses without fair
+ *   scheduling render no series at all.
  * - `eventbus_topic_partition_published_total{topic,partition}`: admitted
  *   publishes per topic partition (EB-90; only emitted for topics with
  *   more than one configured partition — single-partition topics render
@@ -642,6 +647,26 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_signature_failures_total{${label}} ${t.signatureFailures ?? 0}`);
     if (t.watermark !== undefined) {
       lines.push(`eventbus_topic_event_time_watermark{${label}} ${t.watermark}`);
+    }
+  }
+
+  // Topic-fair scheduling (EB-135): per-topic scheduled-message counts,
+  // in first-scheduled order (same as BusStats.topicFairness). Only
+  // topics with at least one scheduled message render a series — a bus
+  // with no fair-scheduling subscriber emits just the HELP/TYPE block.
+  // `?? {}` keeps the renderer tolerant of a stats object that predates
+  // the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_fair_scheduled_messages_total Messages dequeued by the topic-fair scheduler for the topic (EB-135; "scheduled", not "delivered" — see BusStats.topicFairness).',
+  );
+  lines.push('# TYPE eventbus_fair_scheduled_messages_total counter');
+  const fairScheduled = stats.topicFairness?.scheduledByTopic ?? {};
+  for (const topic of Object.keys(fairScheduled)) {
+    const scheduled = fairScheduled[topic];
+    if (scheduled > 0) {
+      lines.push(
+        `eventbus_fair_scheduled_messages_total{topic="${escapeLabelValue(topic)}"} ${scheduled}`,
+      );
     }
   }
 
