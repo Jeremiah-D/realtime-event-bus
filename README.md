@@ -4278,6 +4278,49 @@ Semantics:
   `eventbus_fair_scheduled_messages_total{topic}` — only for topics with
   at least one scheduled message.
 
+## Multi-pattern aggregate subscriptions (EB-137)
+
+`subscribe` accepts an array of topic patterns for a single subscriber
+handle with OR semantics — one subscription matching when ANY of its
+patterns matches:
+
+```ts
+const sub = bus.subscribe(['orders.*', 'payments.**'], handler);
+// delivers orders.created AND payments.eu.settled through one queue
+```
+
+Semantics:
+
+- **One subscriber, not N.** A single shared queue, backpressure tier
+  and dedup window across all patterns; a message matching several
+  patterns is still delivered exactly once; one `unsubscribe` tears the
+  whole aggregate down.
+- **Validation.** The array must be non-empty and hold only non-empty
+  pattern strings (duplicates are dropped) — anything else throws
+  `TypeError`/`RangeError` before anything registers. Each pattern is
+  compiled through the usual `compilePattern` path, so wildcard semantics
+  are identical to single-pattern subscribes.
+- **Not the EB-70 composite.** The composite (`SubscribeOptions.patterns`)
+  is include/exclude layering with an all/any mode; the aggregate is
+  several independent patterns sharing one subscriber — no exclude, no
+  mode. The two features coexist and stay distinct.
+- **Per-pattern stats.** Every pattern keeps its own
+  `getStats().subscribersByPattern` entry and its own prefix-index
+  bucket (the no-miss invariant holds per pattern);
+  `getStats().multiPatternSubscriptions` counts live aggregates once
+  each.
+- **Per-pattern ACL.** Broker ACL (EB-41) is evaluated per pattern — any
+  single deny rejects the whole call with `AclDeniedError` and registers
+  nothing.
+- **Group subscribe rejects arrays.** `subscribeToGroup` throws
+  `TypeError` for an array: consumer-group watermark and partition
+  semantics (EB-16) are defined per single pattern.
+- **Pass-through unchanged.** `traceparent`/`key`/`messageId`/TTL
+  deadlines ride the publish path exactly as for single-pattern
+  subscribes; `updateSubscriptionPattern` refuses aggregates
+  (`RangeError`); migration snapshots carry `patterns` so
+  `exportSubscription`/`importSubscription` rebuild the aggregate.
+
 ## Subscription filter expressions (EB-123)
 
 `SubscribeOptions.filterExpr` attaches a declarative, compile-time-checked

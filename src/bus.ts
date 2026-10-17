@@ -1946,6 +1946,14 @@ function assertValidSubscriptionSnapshot(snap: unknown): asserts snap is Subscri
     fail('bad handoffToken');
   }
   if (typeof s.pattern !== 'string' || s.pattern.length === 0) fail('bad pattern');
+  if (
+    s.patterns !== undefined &&
+    (!Array.isArray(s.patterns) ||
+      s.patterns.length === 0 ||
+      !s.patterns.every((p) => typeof p === 'string' && (p as string).length > 0))
+  ) {
+    fail('bad patterns');
+  }
   if (s.namespace !== undefined && (typeof s.namespace !== 'string' || s.namespace.length === 0)) {
     fail('bad namespace');
   }
@@ -2899,6 +2907,15 @@ export interface SubscriptionSnapshot {
    * the target re-registers it through the same namespace rules.
    */
   pattern: string;
+  /**
+   * Every registered pattern of a multi-pattern aggregate subscription
+   * (EB-137), before namespace translation — present only when the
+   * source subscription was multi-pattern. The target re-subscribes
+   * with the array form, so the aggregate survives migration intact.
+   * `pattern` above still names the first of them for readers that
+   * only understand single patterns.
+   */
+  patterns?: string[];
   /** Namespace name when the source subscription was namespaced. */
   namespace?: string;
   /** True when the source subscription was reliable (`subscribeReliable`). */
@@ -3871,6 +3888,13 @@ export interface BusStats {
    * subscriptions surface in the cache stats.
    */
   compositeSubscriptions: number;
+  /**
+   * Currently active multi-pattern aggregate subscriptions (EB-137):
+   * one subscriber handle matching several patterns with OR
+   * semantics. Counted once per aggregate; per-pattern membership is
+   * visible in `subscribersByPattern`.
+   */
+  multiPatternSubscriptions: number;
   /**
    * Currently active subscriptions paused for cross-instance migration
    * (see `exportSubscription`, EB-82): delivery is paused but the
@@ -5019,6 +5043,16 @@ export interface NackReasonCounts {
 interface Subscriber {
   id: string;
   pattern: string;
+  /**
+   * Multi-pattern aggregate subscription (EB-137): every registered
+   * pattern (the namespace-translated form when namespaced). Present
+   * only for multi-pattern subscriptions — then `pattern` names the
+   * first of them and `matcher` is the OR-union of the per-pattern
+   * matchers. The subscriber keeps ONE queue, ONE backpressure tier
+   * and ONE dedup window across all patterns; a single `unsubscribe`
+   * tears the whole aggregate down.
+   */
+  multiPatterns?: string[];
   /** Compiled form of `pattern`, shared with every subscriber on the pattern. */
   matcher: RegExp;
   /**
@@ -6215,6 +6249,71 @@ function resolveCompositeOptions(
     );
   }
   return { patterns: [...patterns], exclude: [...resolvedExclude], mode: resolvedMode };
+}
+
+/**
+ * One namespace-resolved topic pattern of a subscribe call (EB-137):
+ * the registered (translated) form, its publish-side prefix-index key,
+ * and the namespace scope when one was given. `subscribe` resolves
+ * every pattern through this shape — a single pattern is just the
+ * one-element case — so matching, the prefix index and replays share
+ * one code path for both forms.
+ */
+interface ResolvedSubscribePattern {
+  /** Registered pattern: `<prefix>/<pattern>` when namespaced. */
+  internalPattern: string;
+  /** Publish-side prefix-index key (EB-15 no-miss invariant). */
+  indexKey: string;
+  /** Namespace prefix; undefined for global patterns. */
+  prefix?: string;
+  /** Namespace's child durable log; undefined for global patterns. */
+  log?: DurableTopicLog;
+  /** Compiled matcher when namespaced (bypasses the pattern cache). */
+  namespacedMatcher?: RegExp;
+  /** Raw pattern, for the shared compiled-matcher cache. */
+  raw: string;
+}
+
+/**
+ * Validates a multi-pattern subscribe array (EB-137): it must be a
+ * non-empty array of non-empty pattern strings; duplicates are dropped
+ * (first occurrence wins). Throws `TypeError` for non-string entries
+ * and `RangeError` for an empty array or empty pattern strings — always
+ * before anything registers. Each entry still goes through
+ * `compilePattern` (via the shared cache) at subscriber creation, so an
+ * uncompilable pattern can never slip through either.
+ */
+function normalizeMultiPatterns(raw: readonly unknown[]): string[] {
+  if (raw.length === 0) {
+    throw new RangeError('subscribe: patterns must be a non-empty array of topic patterns');
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== 'string') {
+      throw new TypeError('subscribe: patterns must contain only topic pattern strings');
+    }
+    if (entry.length === 0) {
+      throw new RangeError('subscribe: patterns must contain only non-empty pattern strings');
+    }
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * Builds the OR-union matcher for a multi-pattern subscription
+ * (EB-137) from the per-pattern compiled matchers. Every matcher the
+ * bus builds is anchored and flagless, so the union
+ * `(?:^a$)|(?:^b$)` keeps each pattern's exact semantics and stays
+ * flagless. The union is per-subscription (never cached): the
+ * per-pattern matchers themselves still come from the shared pattern
+ * cache.
+ */
+function unionPatternMatchers(matchers: RegExp[]): RegExp {
+  return new RegExp(matchers.map((m) => `(?:${m.source})`).join('|'));
 }
 
 /**
@@ -9304,6 +9403,13 @@ export class EventBus {
   /** Live subscriptions with `SubscribeOptions.patterns` (EB-70). */
   private compositeSubscriptionCount = 0;
   /**
+   * Live multi-pattern aggregate subscriptions (EB-137): one subscriber
+   * handle matching several patterns with OR semantics. Counted once
+   * per aggregate, not per pattern — per-pattern membership is visible
+   * in `getStats().subscribersByPattern`.
+   */
+  private multiPatternSubscriptionCount = 0;
+  /**
    * Publish-side prefix inverted index: maps a pattern's literal-segment
    * prefix to the ids of the subscribers registered on patterns with that
    * prefix (see `patternPrefixKey`). `fanOut` consults it to prune the
@@ -11713,7 +11819,10 @@ export class EventBus {
     const max = this.subscriberLimitRules.get(ruleKey) as number;
     let current = 0;
     for (const sub of this.subscribers.values()) {
-      if (this.subscriberLimitRuleFor(sub.pattern) === ruleKey) current += 1;
+      // A multi-pattern aggregate (EB-137) occupies one slot under
+      // every one of its patterns.
+      const patterns = sub.multiPatterns ?? [sub.pattern];
+      if (patterns.some((p) => this.subscriberLimitRuleFor(p) === ruleKey)) current += 1;
     }
     if (current >= max) {
       throw new SubscriptionLimitError(pattern, max, current);
@@ -13855,6 +13964,14 @@ export class EventBus {
    * `market.btc` and `market.btc.trades`); a bare `*` or `**` matches every
    * topic.
    *
+   * Pass an array of patterns for a multi-pattern aggregate subscription
+   * (EB-137): one subscriber handle matching when ANY pattern matches
+   * (OR semantics), with one shared queue, backpressure tier and dedup
+   * window, per-pattern stats in `getStats().subscribersByPattern`, and
+   * one `unsubscribe` tearing the whole aggregate down. Distinct from
+   * the EB-70 composite (`SubscribeOptions.patterns`) — no
+   * include/exclude, no all/any mode.
+   *
    * Pass `onBackpressure` in `opts` to be notified when this subscriber falls
    * behind (its queue reaches the high-water mark); `droppedCount` reports how
    * many of its messages were shed.
@@ -13869,19 +13986,61 @@ export class EventBus {
     handler: BatchMessageHandler,
     opts: SubscribeOptions & { batch: true | BatchDeliveryOptions },
   ): Subscription;
+  /**
+   * Multi-pattern aggregate subscription (EB-137): `topicPatterns` is a
+   * non-empty array of topic patterns (deduplicated). One subscriber
+   * handle matches when ANY pattern matches (OR semantics) — one
+   * shared queue, backpressure tier and dedup window across all
+   * patterns, per-pattern entries in `getStats().subscribersByPattern`,
+   * per-pattern broker ACL (any deny rejects the whole call), and one
+   * `unsubscribe` tears the aggregate down. This is NOT the EB-70
+   * composite (`SubscribeOptions.patterns`): no include/exclude, no
+   * all/any mode — just several independent patterns sharing one
+   * subscriber. The two features coexist and stay distinct.
+   */
+  subscribe(topicPatterns: string[], handler: MessageHandler, opts?: SubscribeOptions): Subscription;
+  /**
+   * Batched overload of the multi-pattern form (EB-137).
+   */
   subscribe(
-    topicPattern: string,
+    topicPatterns: string[],
+    handler: BatchMessageHandler,
+    opts: SubscribeOptions & { batch: true | BatchDeliveryOptions },
+  ): Subscription;
+  subscribe(
+    topicPattern: string | string[],
     handler: MessageHandler | BatchMessageHandler,
     opts?: SubscribeOptions,
   ): Subscription {
+    // Multi-pattern aggregate subscription (EB-137): validate and
+    // normalize the array first — non-empty, string-only, deduplicated —
+    // so an illegal array fails fast before anything else runs. A
+    // single pattern is the one-element case below; both forms resolve
+    // through the same namespace / compile / ACL path.
+    const multi = Array.isArray(topicPattern);
+    const rawPatterns: string[] = multi ? normalizeMultiPatterns(topicPattern) : [topicPattern];
     // Multi-tenant namespace (EB-52): resolve the scope first — unknown
     // namespaces, disallowed actions and escape attempts throw here, so
     // a throw leaves no half-registered subscriber behind. The
     // registered pattern becomes the translated `<prefix>/<pattern>`
     // form; matching, the prefix index and replays all operate on the
-    // concrete namespaced topic space.
-    const ns = this.resolveNamespaceForSubscribe(opts?.namespace, topicPattern);
-    if (ns !== undefined) topicPattern = ns.internalPattern;
+    // concrete namespaced topic space. Every pattern of a multi-pattern
+    // subscription resolves under the same namespace.
+    const resolved: ResolvedSubscribePattern[] = rawPatterns.map((p) => {
+      const scope = this.resolveNamespaceForSubscribe(opts?.namespace, p);
+      return {
+        internalPattern: scope?.internalPattern ?? p,
+        indexKey: scope?.indexKey ?? EventBus.patternPrefixKey(p),
+        prefix: scope?.prefix,
+        log: scope?.log,
+        namespacedMatcher: scope?.matcher,
+        raw: p,
+      };
+    });
+    // The primary pattern: every downstream single-pattern usage (lease
+    // and idle arms, ack-latency labels, audits) keeps working for both
+    // forms — for a multi-pattern subscription it is the first pattern.
+    topicPattern = resolved[0].internalPattern;
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const resumeFromSeq = opts?.resumeFromSeq;
@@ -13900,10 +14059,14 @@ export class EventBus {
     // rejected with a clear error before anything registers — the caller
     // must not mistake silence for success. Applies to the subscribe
     // family uniformly (subscribeReliable, consumer groups, ...), since
-    // they all funnel through here.
-    if (!this.aclAllowsSubscribe(topicPattern)) {
-      this.emitAuthzDenied('subscribe', undefined, topicPattern);
-      throw new AclDeniedError('subscribe', topicPattern);
+    // they all funnel through here. A multi-pattern subscription (EB-137)
+    // is evaluated per pattern: any single deny rejects the whole call
+    // (EB-41 convention).
+    for (const r of resolved) {
+      if (!this.aclAllowsSubscribe(r.internalPattern)) {
+        this.emitAuthzDenied('subscribe', undefined, r.internalPattern);
+        throw new AclDeniedError('subscribe', r.internalPattern);
+      }
     }
     const id = `sub-${++this.nextId}`;
     // Shadow traffic mirroring (EB-63): validated before anything
@@ -14185,15 +14348,17 @@ export class EventBus {
     // Per-topic subscriber caps (EB-81): enforced after every other
     // subscribe-time validation and before anything registers — a throw
     // leaves no half-registered subscriber behind, and in particular
-    // runs before the composite refcounts below are acquired.
-    this.checkSubscriberLimit(topicPattern);
+    // runs before the composite refcounts below are acquired. A
+    // multi-pattern subscription (EB-137) counts toward every one of
+    // its patterns' caps.
+    for (const r of resolved) this.checkSubscriberLimit(r.internalPattern);
     // Composite patterns (EB-70): translated under the namespace exactly
     // like the base pattern, then compiled through the dedicated
     // composite cache (reference-counted; released on unsubscribe). Like
     // `compiledMatcher` above, the refs are acquired before registration —
     // nothing between here and `subscribers.set` throws.
     const composite =
-      compositeOpts === undefined ? undefined : this.acquireComposite(compositeOpts, ns?.prefix);
+      compositeOpts === undefined ? undefined : this.acquireComposite(compositeOpts, resolved[0].prefix);
     // Subscription migration (EB-82): capture the serializable subset of
     // the subscribe options now — after every validation above ran, so a
     // rejected subscribe never captures anything. Function-valued options
@@ -14203,11 +14368,19 @@ export class EventBus {
     const subscriber: Subscriber = {
       id,
       pattern: topicPattern,
+      // Multi-pattern aggregate (EB-137): every registered pattern; the
+      // single-pattern form leaves this undefined.
+      multiPatterns: multi ? resolved.map((r) => r.internalPattern) : undefined,
       // Namespaced subscriptions (EB-52) match with the compiled
-      // namespace matcher; everything else shares the pattern cache.
-      matcher: ns?.matcher ?? this.compiledMatcher(topicPattern),
-      namespacePrefix: ns?.prefix,
-      durableLog: ns?.log,
+      // namespace matcher; everything else shares the pattern cache. A
+      // multi-pattern subscription (EB-137) matches when ANY of its
+      // per-pattern matchers accepts — the OR-union below — while each
+      // per-pattern matcher still comes from the shared cache.
+      matcher: multi
+        ? unionPatternMatchers(resolved.map((r) => r.namespacedMatcher ?? this.compiledMatcher(r.raw)))
+        : (resolved[0].namespacedMatcher ?? this.compiledMatcher(resolved[0].raw)),
+      namespacePrefix: resolved[0].prefix,
+      durableLog: resolved[0].log,
       // A batched handler receives an array per call; the cast is safe —
       // drainSubscriber only ever passes an array to batched subscribers.
       handler: handler as MessageHandler,
@@ -14295,13 +14468,15 @@ export class EventBus {
     };
     this.subscribers.set(id, subscriber);
     if (composite !== undefined) this.compositeSubscriptionCount += 1;
+    // Multi-pattern aggregate (EB-137): one live aggregate, counted once.
+    if (multi) this.multiPatternSubscriptionCount += 1;
     // Durable dedup window: rehydrate the subscriber's window from the
     // journal before any replay runs, so a resumed consumer does not
     // double-deliver messages it already saw before the restart. Entries
     // that aged out of the window are "unknown" — dropped here, never
     // rehydrated. Namespaced subscribers (EB-52) rehydrate from their
     // namespace's child log.
-    const replaySource = ns?.log ?? this.durableLog;
+    const replaySource = resolved[0].log ?? this.durableLog;
     if (dedup?.consumerId !== undefined && replaySource != null) {
       const nowMs = this.now();
       for (const entry of replaySource.dedupWindowFor(dedup.consumerId)) {
@@ -14315,18 +14490,27 @@ export class EventBus {
         dedup.table.delete(oldest.value);
       }
     }
-    this.subscribersByPattern.set(topicPattern, (this.subscribersByPattern.get(topicPattern) ?? 0) + 1);
-    // File the subscriber in the publish-side prefix index under its
-    // pattern's literal prefix (see `patternPrefixKey`) — or the
+    // Per-pattern registration (EB-137): a multi-pattern subscription files
+    // under every one of its patterns — each pattern keeps its own
+    // `subscribersByPattern` entry (per-pattern stats stay visible in
+    // `getStats()`) and its own prefix-index bucket, so the no-miss
+    // invariant holds for every pattern independently. File the
+    // subscriber in the publish-side prefix index under each pattern's
+    // literal prefix (see `patternPrefixKey`) — or the
     // namespace-computed key for namespaced subscriptions, which keeps
     // the no-miss invariant over concrete `<prefix>/…` topics.
-    const indexKey = ns?.indexKey ?? EventBus.patternPrefixKey(topicPattern);
-    let indexBucket = this.prefixIndex.get(indexKey);
-    if (indexBucket == null) {
-      indexBucket = new Set<string>();
-      this.prefixIndex.set(indexKey, indexBucket);
+    for (const r of resolved) {
+      this.subscribersByPattern.set(
+        r.internalPattern,
+        (this.subscribersByPattern.get(r.internalPattern) ?? 0) + 1,
+      );
+      let indexBucket = this.prefixIndex.get(r.indexKey);
+      if (indexBucket == null) {
+        indexBucket = new Set<string>();
+        this.prefixIndex.set(r.indexKey, indexBucket);
+      }
+      indexBucket.add(id);
     }
-    indexBucket.add(id);
     // A new pattern changes what this node advertises to the cluster hub.
     this.advertiseClusterPatterns();
 
@@ -14407,25 +14591,35 @@ export class EventBus {
             dlq.pendingAutoReplays.clear();
             dlq.autoReplayAttemptsInFlight.clear();
           }
-          const bucket = this.prefixIndex.get(indexKey);
-          if (bucket != null) {
-            bucket.delete(id);
-            // Evict emptied keys so a churn of short-lived patterns cannot
-            // grow the index without bound.
-            if (bucket.size === 0) this.prefixIndex.delete(indexKey);
-          }
-          const remaining = (this.subscribersByPattern.get(topicPattern) ?? 1) - 1;
-          if (remaining <= 0) {
-            this.subscribersByPattern.delete(topicPattern);
-            this.patternCache.delete(topicPattern);
-          } else {
-            this.subscribersByPattern.set(topicPattern, remaining);
+          // Per-pattern teardown (EB-137): one unsubscribe removes the
+          // aggregate from every pattern it registered under — prefix
+          // index buckets, pattern counts and the shared compile cache
+          // all unwind per pattern, exactly mirroring registration.
+          for (const r of resolved) {
+            const bucket = this.prefixIndex.get(r.indexKey);
+            if (bucket != null) {
+              bucket.delete(id);
+              // Evict emptied keys so a churn of short-lived patterns cannot
+              // grow the index without bound.
+              if (bucket.size === 0) this.prefixIndex.delete(r.indexKey);
+            }
+            const remaining = (this.subscribersByPattern.get(r.internalPattern) ?? 1) - 1;
+            if (remaining <= 0) {
+              this.subscribersByPattern.delete(r.internalPattern);
+              this.patternCache.delete(r.internalPattern);
+            } else {
+              this.subscribersByPattern.set(r.internalPattern, remaining);
+            }
           }
           // Composite subscriptions (EB-70): release the composite-cache
           // references and drop the live count.
           if (subscriber.composite !== undefined) {
             this.releaseComposite(subscriber.composite);
             this.compositeSubscriptionCount -= 1;
+          }
+          // Multi-pattern aggregate (EB-137): drop the live count.
+          if (subscriber.multiPatterns !== undefined) {
+            this.multiPatternSubscriptionCount -= 1;
           }
           // The advertised pattern set may have shrunk.
           this.advertiseClusterPatterns();
@@ -14457,7 +14651,15 @@ export class EventBus {
     // Subscription lifecycle audit (EB-78): the subscriber is fully
     // registered — record the (translated) pattern the matcher actually
     // uses, so a namespaced subscription audits under its concrete form.
-    this.auditSubscription({ action: 'subscribe', subId: id, pattern: topicPattern, actor });
+    // A multi-pattern aggregate (EB-137) names its first pattern in
+    // `pattern` and lists every registered pattern in `detail.patterns`.
+    this.auditSubscription({
+      action: 'subscribe',
+      subId: id,
+      pattern: topicPattern,
+      actor,
+      ...(multi ? { detail: { patterns: resolved.map((r) => r.internalPattern) } } : {}),
+    });
     return subscription;
   }
 
@@ -14719,6 +14921,16 @@ export class EventBus {
         prefix === undefined || !subscriber.pattern.startsWith(prefix)
           ? subscriber.pattern
           : subscriber.pattern.slice(prefix.length),
+      // Multi-pattern aggregate (EB-137): export every registered
+      // pattern (same namespace stripping), so the target can rebuild
+      // the aggregate through the array form of `subscribe`.
+      ...(subscriber.multiPatterns === undefined
+        ? {}
+        : {
+            patterns: subscriber.multiPatterns.map((p) =>
+              prefix === undefined || !p.startsWith(prefix) ? p : p.slice(prefix.length),
+            ),
+          }),
       ...(namespace === undefined ? {} : { namespace }),
       reliable: reliable !== undefined,
       options: { ...(subscriber.migrationOptions ?? {}) },
@@ -14794,13 +15006,24 @@ export class EventBus {
     // denials and invalid option values throw before anything registers —
     // a throw leaves no half-imported subscription behind, and the token
     // stays unconsumed so the caller can fix the cause and retry.
+    // Multi-pattern aggregate (EB-137): rebuild through the array form of
+    // `subscribe` — the snapshot's `patterns` are the namespace-relative
+    // originals and `importOpts.namespace` re-applies the translation.
+    // A multi-pattern aggregate is never reliable (reliable subscriptions
+    // are single-pattern only), so a snapshot claiming both is rejected
+    // as malformed input.
+    if (snapshot.patterns !== undefined && snapshot.reliable) {
+      throw new RangeError('importSubscription: multi-pattern snapshots are never reliable');
+    }
     const subscription = snapshot.reliable
       ? this.subscribeReliable(
           snapshot.pattern,
           handler as ReliableMessageHandler,
           importOpts as ReliableSubscribeOptions,
         )
-      : this.subscribe(snapshot.pattern, handler as MessageHandler, importOpts as SubscribeOptions);
+      : snapshot.patterns !== undefined
+        ? this.subscribe(snapshot.patterns, handler as MessageHandler, importOpts as SubscribeOptions)
+        : this.subscribe(snapshot.pattern, handler as MessageHandler, importOpts as SubscribeOptions);
     const subscriber = this.subscribers.get(subscription.id);
     if (subscriber === undefined) {
       throw new Error(`importSubscription: subscription ${subscription.id} vanished after subscribe`);
@@ -15148,6 +15371,14 @@ export class EventBus {
   updateSubscriptionPattern(subId: string, newPattern: string): boolean {
     const subscriber = this.subscribers.get(subId);
     if (subscriber === undefined) return false;
+    // A multi-pattern aggregate (EB-137) has several independent
+    // patterns — rewriting "the" pattern in place is undefined, so fail
+    // fast instead of silently keeping all but the first.
+    if (subscriber.multiPatterns !== undefined) {
+      throw new RangeError(
+        'updateSubscriptionPattern: cannot rewrite the pattern of a multi-pattern (EB-137) subscription — unsubscribe and re-subscribe instead',
+      );
+    }
     if (typeof newPattern !== 'string' || newPattern.length === 0) {
       throw new RangeError('updateSubscriptionPattern: newPattern must be a non-empty string');
     }
@@ -15944,6 +16175,16 @@ export class EventBus {
   ): Subscription {
     if (groupId.length === 0) {
       throw new RangeError('groupId must be a non-empty string');
+    }
+    // Multi-pattern aggregates (EB-137) can never join a consumer group:
+    // a group's watermark, rebalance and partition semantics (EB-16)
+    // are defined per single pattern — an OR-aggregate would silently
+    // change what "the group's pattern" means. Rejected before anything
+    // registers (runtime guard; the type signature already says string).
+    if (Array.isArray(topicPattern)) {
+      throw new TypeError(
+        'subscribeToGroup: topicPattern must be a single pattern string — a multi-pattern (EB-137) subscription cannot join a consumer group',
+      );
     }
     // Shadow mirroring (EB-63) can never be a competing consumer: a shadow
     // must not steal a group's copy, advance the assignment watermark, or
@@ -25304,6 +25545,7 @@ export class EventBus {
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       compositeSubscriptions: this.compositeSubscriptionCount,
+      multiPatternSubscriptions: this.multiPatternSubscriptionCount,
       migratingSubscribers,
       drainingSubscribers,
       indexSize: this.prefixIndex.size,
