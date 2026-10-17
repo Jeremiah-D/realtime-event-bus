@@ -107,6 +107,14 @@ import {
   type SubscriptionAuditQuery,
 } from './subaudit.ts';
 import {
+  resolveMirrorRules,
+  type MirrorHandle,
+  type MirrorProvenance,
+  type MirrorRule,
+  type MirrorRuleInfo,
+  type ResolvedMirrorRule,
+} from './mirror.ts';
+import {
   TopicRegistry,
   assertValidTopicRegistration,
   type TopicInfo,
@@ -505,6 +513,20 @@ export interface BusMessage {
    * counting a phantom gap across the local/cluster sequence spaces.
    */
   epoch?: string;
+  /**
+   * Cross-instance mirror provenance (see `EventBus.mirror`, EB-37):
+   * present exactly on messages admitted through the mirror path. The
+   * destination bus draws its own per-topic `seq` above (its topic
+   * stream must stay monotonic), but the origin bus id, origin topic and
+   * origin `seq` ride here so downstream consumers can run gap detection
+   * against the origin stream, and the hop `trail` lets every mirror in
+   * the path drop messages that already visited it (loop detection).
+   * A mirrored message also rides the `mirror:<busId>` sequence epoch,
+   * so the built-in gap detector re-baselines on the mirror stream
+   * instead of counting a phantom gap across the local/mirror sequence
+   * spaces. Absent for locally published messages.
+   */
+  mirror?: MirrorProvenance;
   /**
    * Application-level message identity, set when the publish carried one
    * (`PublishOptions.messageId`, always set by `publishIdempotent` when
@@ -2808,6 +2830,15 @@ export interface EventBusOptions {
    */
   now?: () => number;
   /**
+   * Stable identity of this bus instance for cross-bus features
+   * (EB-37 mirror loop detection). Must be a non-empty string; every
+   * bus in a mirror topology needs a distinct id, otherwise the loop
+   * detector cannot tell the buses apart. Defaults to `bus-<n>` with a
+   * process-wide counter — fine for tests and single-process
+   * topologies, but pass explicit ids for anything long-lived.
+   */
+  busId?: string;
+  /**
    * Enables the durable topic log: every published message is appended to
    * an append-only per-topic JSONL log under this directory (created when
    * missing), so a restarted process — a new `EventBus` pointed at the same
@@ -3776,6 +3807,20 @@ export interface BusStats {
    * mutating it does not affect the bus.
    */
   forwards: ForwardRuleInfo[];
+  /**
+   * Total messages handed to this bus's admission pipeline through the
+   * cross-instance mirror path (`EventBus.mirror`, EB-37).
+   * Loop-prevented drops never reach this counter; destination-side
+   * admission rejections still count, mirroring the `forwards`
+   * convention. Zero when no mirror is registered.
+   */
+  mirroredMessages: number;
+  /**
+   * Live mirror registrations (see `EventBus.mirror`), in registration
+   * order — one row per rule with its mirror and loop-prevention
+   * counters. A snapshot — mutating it does not affect the mirrors.
+   */
+  mirrors: MirrorRuleInfo[];
   /**
    * Total messages skipped by subscriber content filters and composite
    * include/exclude patterns — the sum of every topic's
@@ -7118,7 +7163,7 @@ export interface ForwardRuleInfo {
  * The envelope carried across a cross-bus forward registration (EB-56),
  * from the source bus's forward rule to the destination bus's
  * `receiveForward`. INTERNAL USE ONLY — constructed solely by forward
- * registrations; application code must not build or send it.
+ * and mirror registrations; application code must not build or send it.
  */
 export interface ForwardFrame {
   /** Destination topic on the destination bus. */
@@ -7161,6 +7206,14 @@ export interface ForwardFrame {
    * byte-oriented.
    */
   binary?: boolean;
+  /**
+   * Mirror provenance (EB-37): present exactly when the frame was built
+   * by a mirror registration (`EventBus.mirror`). The destination bus
+   * stamps it onto the admitted message (`BusMessage.mirror`) and rides
+   * the `mirror:<busId>` sequence epoch; absent on plain forward
+   * frames, which draw no provenance.
+   */
+  mirror?: MirrorProvenance;
 }
 
 /**
@@ -8564,7 +8617,22 @@ export interface SubscribeManyEntry {
   opts?: SubscribeOptions & { group?: string };
 }
 
+/**
+ * Process-wide counter backing the default `EventBusOptions.busId`
+ * (`bus-<n>`). Uniqueness is per process, which is exactly the mirror
+ * use case (same-process multi-instance topologies); pass explicit ids
+ * for anything that must stay stable across restarts.
+ */
+let nextBusId = 0;
+
 export class EventBus {
+  /**
+   * Stable identity of this bus instance (see `EventBusOptions.busId`):
+   * the loop detector stamps it on every mirrored message's trail, so a
+   * message that has already visited this bus is dropped instead of
+   * mirrored again.
+   */
+  readonly busId: string;
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
   /**
@@ -9283,6 +9351,28 @@ export class EventBus {
     Map<string, { srcPattern: string; matcher: RegExp; dstTopic?: string; forwarded: number }>
   >();
   /**
+   * Live cross-instance mirror registrations (EB-37, see
+   * `EventBus.mirror`): one entry per `mirror()` call, each holding its
+   * per-rule counters and source-side subscriptions. Entries are
+   * removed when their handle's `close()` runs.
+   */
+  private mirrorRegistrations: Array<{
+    source: EventBus;
+    rules: Array<{
+      info: MirrorRuleInfo;
+      sub: Subscription;
+      apply: (topic: string) => string | null;
+    }>;
+  }> = [];
+  /**
+   * Messages handed to this bus's admission pipeline through the mirror
+   * path (see `BusStats.mirroredMessages`). Incremented in
+   * `receiveForward` when the frame carries mirror provenance —
+   * loop-prevented drops never reach it; destination-side admission
+   * rejections still count, mirroring the `forwards` convention.
+   */
+  private mirrorIngressCount = 0;
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -9802,6 +9892,11 @@ export class EventBus {
 
   constructor(options?: EventBusOptions) {
     this.now = options?.now ?? Date.now;
+    const busId = options?.busId ?? `bus-${++nextBusId}`;
+    if (typeof busId !== 'string' || busId.length === 0) {
+      throw new RangeError('busId must be a non-empty string');
+    }
+    this.busId = busId;
     const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
     if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
       throw new RangeError(
@@ -11164,10 +11259,113 @@ export class EventBus {
   }
 
   /**
+   * Registers a cross-instance topic mirror (EB-37): this bus opts in to
+   * tap `source`'s topics into its own topic space. Each rule subscribes
+   * this bus to `rule.srcPattern` on the source bus; every message the
+   * subscription delivers is re-published here on the rule's rename
+   * template (or the source topic when `rename` is omitted), carrying
+   * its origin bus id, origin topic and origin per-topic sequence
+   * number (`BusMessage.mirror`) for downstream gap detection.
+   *
+   * The pull counterpart to `forward` (which pushes from the source
+   * side): a bus only ever receives mirrored traffic it explicitly
+   * asked for. Mirror-ingressed messages run this bus's full admission
+   * pipeline (ACL, schema, rate-limit, TTL, ...) with this bus's own
+   * sequence numbers, stamped `routed` so they never trigger this bus's
+   * routes or forwards again — one hop per message. They do not carry
+   * the source's TTL deadline (the tap happens post-admission); this
+   * bus's TTL rules apply.
+   *
+   * Loop detection is provenance-based and runs per message: a mirror
+   * drops any message whose trail already contains this bus's `busId`
+   * (counted per rule as `loopsPrevented`), so mirror cycles —
+   * A→B→A, A→B→C→A, or a self-mirror whose rename feeds its own source
+   * pattern — terminate after one pass instead of amplifying forever.
+   *
+   * The returned handle's `close()` unsubscribes every rule; the rules
+   * stay live until then. `getStats().mirrors` exposes the live rule
+   * table and `getStats().mirroredMessages` the ingress total.
+   *
+   * Throws before anything is subscribed: `TypeError` when `source` is
+   * not an `EventBus`; `RangeError` on a non-array rule table or any
+   * invalid rule (empty `srcPattern`, empty or dangling `rename`
+   * template, `$n` referencing a capture the pattern does not yield).
+   */
+  mirror(source: EventBus, rules: MirrorRule[]): MirrorHandle {
+    if (!(source instanceof EventBus)) {
+      throw new TypeError('mirror: source must be an EventBus instance');
+    }
+    const resolved = resolveMirrorRules(rules, 'EventBus.mirror');
+    // All rules validated before the first subscribe, so a throw leaves
+    // no half-registered mirror behind.
+    const entries = (resolved ?? []).map((rule) => {
+      const info: MirrorRuleInfo = {
+        srcPattern: rule.srcPattern,
+        dstTemplate: rule.dstTemplate,
+        mirrored: 0,
+        loopsPrevented: 0,
+      };
+      const sub = source.subscribe(rule.srcPattern, (msg: BusMessage) => {
+        const trail = msg.mirror?.trail ?? [];
+        if (trail.includes(this.busId)) {
+          info.loopsPrevented += 1;
+          return;
+        }
+        const dstTopic = rule.apply(msg.topic);
+        // Defensive: the subscription matched, so the rule must match
+        // too — a null here would mean the two matchers disagreed.
+        if (dstTopic === null) return;
+        info.mirrored += 1;
+        const origin = msg.mirror;
+        this.receiveForward({
+          topic: dstTopic,
+          payload: msg.payload,
+          ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
+          ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
+          ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
+          // Binary payloads cross as bytes with the marker, so the
+          // destination bus stays byte-oriented (same-class access to
+          // the source's bus-side marker — never reinterpreted as JSON).
+          ...(source.binaryMessages.has(msg) ? { binary: true } : {}),
+          // Origin fields survive multi-hop mirrors verbatim; only the
+          // trail grows — downstream gap detection always sees the first
+          // bus's sequence space.
+          mirror:
+            origin === undefined
+              ? { busId: source.busId, topic: msg.topic, seq: msg.seq, trail: [...trail, source.busId] }
+              : {
+                  busId: origin.busId,
+                  topic: origin.topic,
+                  seq: origin.seq,
+                  trail: [...trail, source.busId],
+                },
+        });
+      });
+      return { info, sub, apply: rule.apply };
+    });
+    const registration = { source, rules: entries };
+    this.mirrorRegistrations.push(registration);
+    let closed = false;
+    return {
+      get closed() {
+        return closed;
+      },
+      rules: () => entries.map(({ info }) => ({ ...info })),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        for (const entry of entries) entry.sub.unsubscribe();
+        const i = this.mirrorRegistrations.indexOf(registration);
+        if (i >= 0) this.mirrorRegistrations.splice(i, 1);
+      },
+    };
+  }
+
+  /**
    * Receives one forwarded message from another bus's forward rule
    * (EB-56) — the destination-side half of `forward()`. INTERNAL USE
-   * ONLY: only forward registrations call this; producers must use
-   * `publish()`.
+   * ONLY: only forward and mirror registrations call this; producers
+   * must use `publish()`.
    *
    * The frame goes through this bus's full publish admission pipeline
    * (alias resolution, ACL, schema, rate-limit, TTL, ...) with this
@@ -11175,14 +11373,19 @@ export class EventBus {
    * it never triggers this bus's routes or forwards again (one hop per
    * message). The source TTL deadline rides verbatim (never reset by a
    * forward); when the source message had none, this bus's TTL rules
-   * apply normally. A malformed frame is dropped silently — admission
-   * rejections are a normal, counted outcome, never an exception.
+   * apply normally. A frame carrying `mirror` provenance (EB-37) is
+   * stamped onto the admitted message (`BusMessage.mirror`) and counted
+   * in `getStats().mirroredMessages`. A malformed frame is dropped
+   * silently — admission rejections are a normal, counted outcome,
+   * never an exception.
    */
   receiveForward(frame: ForwardFrame): void {
     if (frame === null || typeof frame !== 'object') return;
     const topic = frame.topic;
     if (typeof topic !== 'string' || topic.length === 0) return;
     validateEventTime(frame.eventTime, 'receiveForward');
+    const mirror = frame.mirror;
+    if (mirror !== undefined) this.mirrorIngressCount += 1;
     this.fanOut(
       topic,
       frame.payload,
@@ -11207,6 +11410,9 @@ export class EventBus {
       undefined, // partitionKey
       undefined, // partition
       frame.binary ?? false,
+      undefined, // priority: cross-bus frames land in the normal lane
+      undefined, // confirm: only publishWithConfirmation passes one
+      mirror, // mirrorProvenance: stamped onto the message (EB-37)
     );
     this.scheduleFlush();
   }
@@ -22567,6 +22773,12 @@ export class EventBus {
     // after admission-time redaction, so every other caller (which
     // passes nothing) pays zero hashing cost.
     confirm?: ConfirmationCapture,
+    // Cross-instance mirror provenance (EB-37): set only by
+    // `receiveForward` for frames built by a mirror registration. The
+    // admitted message is stamped with the provenance (`BusMessage.mirror`)
+    // and rides the `mirror:<busId>` sequence epoch; `fanOut` never
+    // validates it — the mirror registration built it.
+    mirrorProvenance?: MirrorProvenance,
   ): {
     matched: number;
     accepted: number;
@@ -22794,6 +23006,24 @@ export class EventBus {
       // sequence number above stays publish-order and monotonic — lanes
       // never renumber.
       ...(priority === undefined || priority === 'normal' ? {} : { lane: priority }),
+      // Cross-instance mirror provenance (EB-37): the destination's own
+      // `seq` above stays untouched (the topic stream must stay
+      // monotonic), while the origin bus id / topic / seq ride here for
+      // downstream gap detection. The `mirror:<busId>` epoch makes the
+      // built-in gap detector re-baseline on the mirror stream instead
+      // of counting a phantom gap across the local/mirror sequence
+      // spaces — the same epoch mechanism the cluster hub uses.
+      ...(mirrorProvenance === undefined
+        ? {}
+        : {
+            mirror: {
+              busId: mirrorProvenance.busId,
+              topic: mirrorProvenance.topic,
+              seq: mirrorProvenance.seq,
+              trail: [...mirrorProvenance.trail],
+            },
+            epoch: `mirror:${mirrorProvenance.busId}`,
+          }),
     };
     // EB-57: mark DLQ diagnostic messages at creation (the envelope marker
     // is bus-side, so a user's payload can never collide with it) — a
@@ -23836,6 +24066,10 @@ export class EventBus {
           ...(rule.dstTopic === undefined ? {} : { dstTopic: rule.dstTopic }),
           forwarded: rule.forwarded,
         })),
+      ),
+      mirroredMessages: this.mirrorIngressCount,
+      mirrors: this.mirrorRegistrations.flatMap((registration) =>
+        registration.rules.map(({ info }) => ({ ...info })),
       ),
       filteredMessages: this.totalFiltered,
       signatureFailures: this.totalSignatureFailures,
