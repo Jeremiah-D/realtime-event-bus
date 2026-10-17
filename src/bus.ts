@@ -8712,6 +8712,86 @@ export interface SubscribeManyEntry {
  */
 let nextBusId = 0;
 
+/**
+ * Target for `EventBus.seek` (EB-130): where one subscriber's consumption
+ * position moves.
+ *
+ * - `'earliest'`: rewind to the beginning of retained history (position
+ *   0) on every topic feeding the subscription.
+ * - `'latest'`: skip to the head — only messages published after the
+ *   seek are delivered.
+ * - `{ seq, topic? }`: move to the per-topic sequence number `seq`
+ *   (exclusive — messages with a higher `seq` are (re)delivered).
+ * - `{ timestamp, topic? }`: move to just before the first message
+ *   published after `timestamp` (bus clock), resolved against the
+ *   durable log.
+ *
+ * `topic` selects one concrete topic of the subscription. It defaults
+ * to the subscription pattern when the pattern is a concrete topic, and
+ * is required for `{ seq }` / `{ timestamp }` when the pattern matches
+ * several topics (`'earliest'` / `'latest'` then fan out to every
+ * matching topic).
+ */
+export type SubscriberSeekTarget =
+  | 'earliest'
+  | 'latest'
+  | { seq: number; topic?: string }
+  | { timestamp: number; topic?: string };
+
+/** Options for `EventBus.seek` (EB-130). */
+export interface SubscriberSeekOptions {
+  /**
+   * Who performed the seek, recorded in the subscription audit log.
+   * Defaults to `'system'`; must be a non-empty string when given.
+   */
+  actor?: string;
+}
+
+/** Per-topic outcome of `EventBus.seek` (EB-130). */
+export interface SubscriberSeekTopicResult {
+  /** Concrete topic the position was moved on. */
+  topic: string;
+  /** Consumption position before the seek (highest per-topic baseline). */
+  from: number;
+  /** Requested position, resolved from the seek target. */
+  requested: number;
+  /**
+   * Effective position after the EB-127 committed-offset clamp: a seek
+   * never regresses a confirmed (manually or auto-committed) offset —
+   * highest-seq-wins.
+   */
+  position: number;
+  /**
+   * The committed offset that clamped the seek, when the requested
+   * position sat below it (consumer-group members only).
+   */
+  clampedByCommitted?: number;
+  /** Messages replayed from the durable log for this topic. */
+  replayed: number;
+  /** Queued messages dropped for this topic (stale under the new position). */
+  droppedQueued: number;
+}
+
+/** Result of `EventBus.seek` (EB-130). */
+export interface SubscriberSeekResult {
+  /** The seeked subscription. */
+  subscriberId: string;
+  /** One outcome per affected concrete topic. */
+  topics: SubscriberSeekTopicResult[];
+  /**
+   * In-flight reliable deliveries invalidated by the seek: their ack
+   * timers were cancelled without requeueing, and stale consumer-held
+   * handles settle to silent no-ops.
+   */
+  invalidatedInflight: number;
+}
+
+/** `EventBus.seek` target after validation (EB-130). */
+type ParsedSeekTarget =
+  | { mode: 'earliest' | 'latest'; topic?: string }
+  | { mode: 'seq'; seq: number; topic?: string }
+  | { mode: 'timestamp'; timestamp: number; topic?: string };
+
 export class EventBus {
   /**
    * Stable identity of this bus instance (see `EventBusOptions.busId`):
@@ -24989,6 +25069,401 @@ export class EventBus {
     });
     this.scheduleFlush();
     return true;
+  }
+
+  /**
+   * Repositions one subscriber's consumption position (EB-130): a manual
+   * consumer-offset seek, the operator counterpart to the subscribe-time
+   * `resumeFromSeq` / `resumeFromTime` replays.
+   *
+   * The position is exclusive: after the seek, messages with a per-topic
+   * `seq` above the new position are (re)delivered and everything at or
+   * below it counts as consumed.
+   *
+   * Durable-log aware (EB-32): when the bus (or the subscriber's
+   * namespace) has a durable log, the new position replays from it — the
+   * same `readSince` + `admitReplayRecords` path the subscribe-time
+   * resume uses, so filters, TTL expiry, keyed ordering and signature
+   * verification behave identically. Without a log the seek is
+   * forward-only: a backward move throws `RangeError`, because there is
+   * no history to replay from — the new position then simply takes
+   * effect for subsequent live messages.
+   *
+   * Outbox aware (EB-102): outbox records are pre-publish — they carry
+   * no per-topic `seq` yet — so a seek never touches them. When the
+   * attached relay later publishes them (`publishAtomic`), they draw
+   * fresh sequence numbers and flow to the seeked subscriber as ordinary
+   * live messages past any seek position.
+   *
+   * Reliable in-flight (EB-11): outstanding unacked deliveries are
+   * invalidated by the new position — their ack timers are cancelled
+   * without requeueing (`AckTracker.takePending`), live-handle guards
+   * are retired and trace ack spans abandoned, so a stale consumer-held
+   * handle settles to a silent no-op and can never sample against the
+   * restarted round or fabricate a gap. Messages the new position
+   * replays are tracked as fresh deliveries.
+   *
+   * Auto-commit idempotence (EB-127): for consumer-group members the
+   * seek never regresses a confirmed offset — highest-seq-wins. A
+   * requested position below the group's committed offset for the topic
+   * is clamped up to it (reported as `clampedByCommitted`); the
+   * committed checkpoint itself is never moved by a seek. Replayed
+   * deliveries re-enter auto-commit tracking, and `flushAutoCommits`
+   * keeps its highest-seq-wins guard, so the checkpoint still only ever
+   * moves forward.
+   *
+   * Already-queued backlog on the affected topics is dropped as stale
+   * under the new position (with a log the replay is authoritative;
+   * without one only messages at or below the new position are
+   * dropped) — other topics' backlog is preserved untouched via the
+   * internal queue rebuild. Gap baselines are repositioned, never
+   * counted: a seek itself never surfaces as a sequence gap.
+   *
+   * Throws `Error` on an unknown subscriber id, `RangeError` on an
+   * illegal target (negative `seq`, future `timestamp`, `{ timestamp }`
+   * without a durable log, a `topic` outside the subscription pattern,
+   * or a backward move without log history). Audited as
+   * `subscriber_seek`. A seek on a draining (EB-128) subscriber still
+   * repositions, but the replayed messages are dropped by the drain
+   * gate like any other fresh arrival.
+   */
+  seek(
+    subId: string,
+    target: SubscriberSeekTarget,
+    opts?: SubscriberSeekOptions,
+  ): SubscriberSeekResult {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'seek');
+    // Phase 1 — pure planning. Every RangeError below throws before
+    // anything mutates, so a rejected seek leaves the subscriber
+    // exactly as it was.
+    const parsed = this.parseSeekTarget(target);
+    const topics = this.resolveSeekTopics(subscriber, parsed);
+    const log = subscriber.durableLog ?? this.durableLog;
+    const plans = topics.map((topic) => {
+      const from = this.seekTopicFrom(subscriber, topic);
+      const requested = this.resolveSeekPosition(topic, parsed, log);
+      if (log === undefined && requested < from) {
+        throw new RangeError(
+          `seek: cannot move ${topic} backwards from ${from} to ${requested} without durableLogDir history to replay`,
+        );
+      }
+      let position = requested;
+      let clampedByCommitted: number | undefined;
+      const groupId = subscriber.groupId;
+      if (groupId !== undefined) {
+        // EB-127 idempotence: highest-seq-wins against the confirmed
+        // offset — the seek never regresses it.
+        const committed = this.committedOffsets.get(groupId)?.get(topic) ?? 0;
+        if (position < committed) {
+          position = committed;
+          clampedByCommitted = committed;
+        }
+      }
+      return { topic, from, requested, position, clampedByCommitted };
+    });
+    const positionByTopic = new Map(plans.map((p) => [p.topic, p.position] as const));
+    // Phase 2 — mutate. In-flight first: their timers must die before
+    // the replay re-tracks the same messages as fresh deliveries. A seek
+    // that moves nothing (no feed topics) invalidates nothing.
+    let invalidatedInflight = 0;
+    const reliable = subscriber.reliable;
+    if (reliable !== undefined && plans.length > 0) {
+      const taken = reliable.tracker.takePending();
+      invalidatedInflight = taken.length;
+      for (const msg of taken) {
+        const live = reliable.liveDeliveries.get(msg);
+        if (live !== undefined) live.live = false;
+        this.trace?.abandonAckSpan(msg);
+        reliable.lastFailure.delete(msg);
+      }
+    }
+    // Drop the queued backlog that is stale under the new position. With
+    // a log the replay below is authoritative for everything past the
+    // position, so the whole topic backlog goes; without one only
+    // messages at or below the position are stale — newer ones have no
+    // replay to cover them and must be kept. Untouched topics keep their
+    // backlog via the internal rebuild (cf. `requeueUndelivered`).
+    const topicSet = new Set(topics);
+    const droppedByTopic = new Map<string, number>();
+    const queue = subscriber.queue;
+    if (queue.size > 0) {
+      const rest = queue.drain();
+      for (const msg of rest) {
+        const position = positionByTopic.get(msg.topic);
+        const stale =
+          position !== undefined && (log !== undefined || msg.seq <= position);
+        if (stale) {
+          droppedByTopic.set(msg.topic, (droppedByTopic.get(msg.topic) ?? 0) + 1);
+          continue;
+        }
+        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
+      }
+    }
+    // Reposition the per-(topic, partition) gap baselines directly: this
+    // is a deliberate reposition, not a delivery, and it must never
+    // count as a sequence gap in either direction.
+    for (const plan of plans) {
+      for (const partition of this.seekTopicPartitions(subscriber, plan.topic)) {
+        subscriber.lastDeliveredSeq.set(EventBus.gapKey(plan.topic, partition), plan.position);
+      }
+    }
+    const replayedByTopic = new Map<string, number>();
+    if (log !== undefined) {
+      for (const plan of plans) {
+        replayedByTopic.set(
+          plan.topic,
+          this.replaySeekTopic(subscriber, plan.topic, parsed, plan.position, log),
+        );
+      }
+    }
+    const topicResults: SubscriberSeekTopicResult[] = plans.map((plan) => ({
+      topic: plan.topic,
+      from: plan.from,
+      requested: plan.requested,
+      position: plan.position,
+      ...(plan.clampedByCommitted === undefined
+        ? {}
+        : { clampedByCommitted: plan.clampedByCommitted }),
+      replayed: replayedByTopic.get(plan.topic) ?? 0,
+      droppedQueued: droppedByTopic.get(plan.topic) ?? 0,
+    }));
+    this.auditSubscription({
+      action: 'subscriber_seek',
+      actor,
+      subId,
+      pattern: subscriber.pattern,
+      detail: {
+        mode: parsed.mode,
+        topics: topicResults.map((r) => ({
+          topic: r.topic,
+          from: r.from,
+          requested: r.requested,
+          position: r.position,
+          ...(r.clampedByCommitted === undefined
+            ? {}
+            : { clampedByCommitted: r.clampedByCommitted }),
+          replayed: r.replayed,
+          droppedQueued: r.droppedQueued,
+        })),
+        invalidatedInflight,
+      },
+    });
+    this.scheduleFlush();
+    return { subscriberId: subId, topics: topicResults, invalidatedInflight };
+  }
+
+  /**
+   * Validates an `EventBus.seek` target (EB-130). Fail-fast: nothing is
+   * resolved or mutated before the target is known good.
+   */
+  private parseSeekTarget(target: SubscriberSeekTarget): ParsedSeekTarget {
+    if (target === 'earliest' || target === 'latest') return { mode: target };
+    if (typeof target !== 'object' || target === null || Array.isArray(target)) {
+      throw new RangeError(
+        "seek: target must be 'earliest', 'latest', { seq, topic? } or { timestamp, topic? }",
+      );
+    }
+    const raw = target as Record<string, unknown>;
+    for (const key of Object.keys(raw)) {
+      if (key !== 'seq' && key !== 'timestamp' && key !== 'topic') {
+        throw new RangeError(`seek: unknown target option ${JSON.stringify(key)}`);
+      }
+    }
+    const { seq, timestamp, topic } = raw;
+    if (topic !== undefined && (typeof topic !== 'string' || topic.length === 0)) {
+      throw new RangeError('seek: topic must be a non-empty string');
+    }
+    const hasSeq = seq !== undefined;
+    const hasTimestamp = timestamp !== undefined;
+    if (hasSeq === hasTimestamp) {
+      throw new RangeError('seek: target must carry exactly one of seq or timestamp');
+    }
+    if (hasSeq) {
+      if (!Number.isInteger(seq) || (seq as number) < 0) {
+        throw new RangeError('seek: seq must be a non-negative integer');
+      }
+      return { mode: 'seq', seq: seq as number, topic: topic as string | undefined };
+    }
+    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp < 0) {
+      throw new RangeError('seek: timestamp must be a finite non-negative millisecond timestamp');
+    }
+    if (timestamp > this.now()) {
+      throw new RangeError('seek: timestamp is in the future');
+    }
+    return { mode: 'timestamp', timestamp, topic: topic as string | undefined };
+  }
+
+  /**
+   * Resolves which concrete topics an `EventBus.seek` (EB-130) moves.
+   * An explicit `topic` is alias-resolved and must feed the
+   * subscription, otherwise the seek is meaningless and throws. Without
+   * one, a concrete pattern seeks its own topic; `{ seq }` /
+   * `{ timestamp }` on a multi-topic pattern are ambiguous and throw,
+   * while `'earliest'` / `'latest'` fan out to every concrete topic
+   * currently feeding the subscription.
+   */
+  private resolveSeekTopics(subscriber: Subscriber, parsed: ParsedSeekTarget): string[] {
+    const matcher = subscriber.matcher;
+    const log = subscriber.durableLog ?? this.durableLog;
+    const matches = (topic: string): boolean =>
+      this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic));
+    if (parsed.topic !== undefined) {
+      const anchor = this.resolveLiveTopic(parsed.topic);
+      const candidates = new Set<string>([parsed.topic]);
+      if (log !== undefined) for (const t of log.topics()) candidates.add(t);
+      const out: string[] = [];
+      for (const t of candidates) {
+        if (this.resolveLiveTopic(t) !== anchor) continue;
+        if (!matches(t)) continue;
+        out.push(t);
+      }
+      if (out.length === 0) {
+        throw new RangeError(
+          `seek: topic ${JSON.stringify(parsed.topic)} does not match the subscription pattern`,
+        );
+      }
+      return out;
+    }
+    const pattern = subscriber.pattern;
+    if (!/\*/.test(pattern)) {
+      return this.resolveSeekTopics(subscriber, { ...parsed, topic: pattern });
+    }
+    if (parsed.mode === 'seq' || parsed.mode === 'timestamp') {
+      throw new RangeError(
+        'seek: topic is required when the subscription pattern matches multiple topics',
+      );
+    }
+    const out = new Set<string>();
+    if (log !== undefined) {
+      for (const t of log.topics()) {
+        if (matches(t)) out.add(t);
+      }
+    }
+    for (const key of subscriber.lastDeliveredSeq.keys()) {
+      const sep = key.indexOf('\0');
+      const t = sep === -1 ? key : key.slice(0, sep);
+      if (matches(t)) out.add(t);
+    }
+    return [...out];
+  }
+
+  /**
+   * The subscriber's current consumption position on a topic (EB-130):
+   * the highest per-(topic, partition) gap baseline, 0 when the topic
+   * was never delivered to it.
+   */
+  private seekTopicFrom(subscriber: Subscriber, topic: string): number {
+    let from = 0;
+    const prefix = `${topic}\0`;
+    for (const [key, value] of subscriber.lastDeliveredSeq) {
+      if (key.startsWith(prefix) && value > from) from = value;
+    }
+    return from;
+  }
+
+  /**
+   * Every partition of a topic an `EventBus.seek` (EB-130) repositions:
+   * partitions the subscriber has baselines for plus partitions the bus
+   * has numbered, defaulting to partition 0. Baselines only ever move
+   * on delivery, so a partition the subscriber never saw needs no entry
+   * — but repositioning it too is harmless and keeps `'latest'`
+   * explicit.
+   */
+  private seekTopicPartitions(subscriber: Subscriber, topic: string): number[] {
+    const parts = new Set<number>();
+    const prefix = `${topic}\0`;
+    const collect = (keys: IterableIterator<string>): void => {
+      for (const key of keys) {
+        if (!key.startsWith(prefix)) continue;
+        const p = Number(key.slice(prefix.length));
+        if (Number.isInteger(p) && p >= 0) parts.add(p);
+      }
+    };
+    collect(subscriber.lastDeliveredSeq.keys());
+    collect(this.topicSeq.keys());
+    if (parts.size === 0) parts.add(0);
+    return [...parts];
+  }
+
+  /**
+   * Resolves an `EventBus.seek` (EB-130) target to one exclusive
+   * per-topic position: messages with a higher `seq` are (re)delivered.
+   * `'latest'` is the highest sequence number published so far (the
+   * bus's `topicSeq`, corroborated against the log); `{ timestamp }`
+   * needs the durable log — wall-clock positioning without history is
+   * unresolvable and throws.
+   */
+  private resolveSeekPosition(
+    topic: string,
+    parsed: ParsedSeekTarget,
+    log: DurableTopicLog | undefined,
+  ): number {
+    switch (parsed.mode) {
+      case 'earliest':
+        return 0;
+      case 'seq':
+        return parsed.seq;
+      case 'latest': {
+        let max = 0;
+        const prefix = `${topic}\0`;
+        for (const [key, value] of this.topicSeq) {
+          if (key.startsWith(prefix) && value > max) max = value;
+        }
+        if (log !== undefined) {
+          for (const rec of log.readSince(topic, 0)) {
+            if (rec.seq > max) max = rec.seq;
+          }
+        }
+        return max;
+      }
+      case 'timestamp': {
+        if (log === undefined) {
+          throw new RangeError('seek: { timestamp } needs a durable log (durableLogDir) to resolve');
+        }
+        let max = 0;
+        for (const rec of log.readSince(topic, 0)) {
+          if (rec.at <= parsed.timestamp && rec.seq > max) max = rec.seq;
+        }
+        return max;
+      }
+    }
+  }
+
+  /**
+   * Replays one seek topic from the durable log (EB-130): every record
+   * past the new position — or, for `{ timestamp }`, every record
+   * published after it — walks the shared `admitReplayRecords` path, so
+   * a seek replay is indistinguishable from a subscribe-time resume.
+   * Returns how many records the pass admitted.
+   */
+  private replaySeekTopic(
+    subscriber: Subscriber,
+    topic: string,
+    parsed: ParsedSeekTarget,
+    position: number,
+    log: DurableTopicLog,
+  ): number {
+    let records: ReplayRecord[];
+    if (parsed.mode === 'timestamp') {
+      records = [];
+      for (const rec of log.readSince(topic, 0)) {
+        if (rec.at > parsed.timestamp) records.push(rec);
+      }
+    } else {
+      records = [...log.readSince(topic, position)];
+    }
+    if (records.length === 0) return 0;
+    // Deterministic order, mirroring `replayLog`'s cross-topic sort
+    // (single topic here, so effectively at-then-seq).
+    records.sort(
+      (a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0),
+    );
+    this.admitReplayRecords(subscriber, records, { trackProgress: true });
+    this.scheduleFlush();
+    return subscriber.replayProgress?.replayed ?? 0;
   }
 
   /**

@@ -3849,6 +3849,71 @@ Semantics:
 `getStats().pausedSubscribers` counts live manual pauses and the
 Prometheus exposition carries `eventbus_paused_subscribers`.
 
+## Consumer offset seek (EB-130)
+
+`bus.seek(subId, target, { actor? }?)` repositions one subscriber's
+consumption position — the manual counterpart to the subscribe-time
+`resumeFromSeq` / `resumeFromTime` replays:
+
+```ts
+const sub = bus.subscribe('orders.eu', handle);
+// Reprocess everything after seq 120:
+bus.seek(sub.id, { seq: 120 });
+// Or jump to the head and skip the backlog:
+bus.seek(sub.id, 'latest');
+```
+
+Targets: `'earliest'` (position 0), `'latest'` (skip to the head),
+`{ seq, topic? }` (exclusive — messages with a higher per-topic `seq`
+are (re)delivered), `{ timestamp, topic? }` (just before the first
+message published after the bus-clock timestamp, resolved against the
+durable log). `topic` selects one concrete topic; it defaults to the
+subscription pattern when the pattern is concrete, and is required for
+`{ seq }` / `{ timestamp }` on multi-topic patterns.
+
+Semantics:
+
+- **Durable-log aware.** With a durable log the new position replays
+  from it via the same `readSince` + admission path as subscribe-time
+  resume, so filters, TTL expiry, keyed ordering and signature
+  verification behave identically. Without a log the seek is
+  forward-only — a backward move throws `RangeError`, and the new
+  position takes effect for subsequent live messages.
+- **Outbox aware.** Outbox records (EB-102) are pre-publish and carry
+  no per-topic `seq`, so a seek never touches them; when the relay
+  publishes them they draw fresh sequence numbers and flow as ordinary
+  live messages.
+- **Reliable in-flight invalidated.** Outstanding unacked deliveries
+  have their ack timers cancelled without requeueing; stale
+  consumer-held handles settle to silent no-ops and can never fabricate
+  a gap. Replayed messages are tracked as fresh deliveries.
+- **Auto-commit idempotent (EB-127).** For consumer-group members the
+  seek never regresses a confirmed offset — highest-seq-wins: a
+  requested position below the group's committed offset is clamped up
+  to it (reported as `clampedByCommitted`), and the checkpoint itself
+  is never moved by a seek.
+- **No fake gaps.** The reposition moves the per-topic gap baselines
+  directly; a seek itself never counts into `sequenceGaps`.
+- **Stale backlog dropped.** Queued messages that are stale under the
+  new position are dropped (with a log the replay is authoritative;
+  without one only messages at or below the position go) — other
+  topics' backlog is preserved.
+- **Illegal positions throw `RangeError`**: negative `seq`, future
+  `timestamp`, `{ timestamp }` without a durable log, a `topic`
+  outside the subscription pattern, or a backward move without log
+  history. Unknown subscriber ids throw `Error`.
+- **Audited.** Every seek lands in the subscription audit log as
+  `subscriber_seek` (`{ mode, topics: [{ topic, from, requested,
+  position, replayed, droppedQueued, clampedByCommitted? }],
+  invalidatedInflight }`), queryable via
+  `getSubscriptionAudit({ action: 'subscriber_seek' })`.
+
+The call returns a `SubscriberSeekResult` with one per-topic outcome
+(`{ topic, from, requested, position, replayed, droppedQueued }`) plus
+the `invalidatedInflight` count. Clocks are injectable
+(`EventBusOptions.now`), so timestamp seeks stay deterministic in
+tests.
+
 ## Publish circuit breaker (EB-116)
 
 `bus.setPublishCircuitBreaker(topic, opts?)` arms an opt-in publish-side

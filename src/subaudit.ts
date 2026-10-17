@@ -12,7 +12,8 @@
  * `delayed_cancelled`) / publish-side partition-count rule changes (EB-90,
  * `partition_rule_set` / `partition_rule_cleared`) / out-of-order barrier
  * discards (EB-98, `barrier_dropped`) / manual subscriber pause-resume
- * (EB-113, `subscriber_paused` / `subscriber_resumed`).
+ * (EB-113, `subscriber_paused` / `subscriber_resumed`) / manual
+ * consumer-offset seek (EB-130, `subscriber_seek`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -67,7 +68,8 @@ export type SubscriptionAuditAction =
   | 'segment_checksum_failed'
   | 'barrier_dropped'
   | 'subscriber_paused'
-  | 'subscriber_resumed';
+  | 'subscriber_resumed'
+  | 'subscriber_seek';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -114,6 +116,11 @@ export type SubscriptionAuditAction =
  *   identify the subscription
  * - `subscriber_resumed`: no detail — a manual subscriber pause (EB-113)
  *   was cleared; `subId`/`pattern` identify the subscription
+ * - `subscriber_seek`: `{ mode: 'earliest'|'latest'|'seq'|'timestamp',
+ *   topics: [{ topic, from, requested, position, replayed, droppedQueued,
+ *   clampedByCommitted? }], invalidatedInflight }` — a manual
+ *   consumer-offset seek (EB-130) repositioned the subscriber's
+ *   consumption position; `subId`/`pattern` identify the subscription
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -178,6 +185,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'barrier_dropped',
   'subscriber_paused',
   'subscriber_resumed',
+  'subscriber_seek',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {
