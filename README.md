@@ -3951,6 +3951,51 @@ Semantics:
 Invalid options throw fail-fast from `subscribe` (`RangeError` for a
 negative/non-finite threshold, `TypeError` for a non-function callback).
 
+## Per-message TTL (EB-149)
+
+`PublishOptions.ttlMs` is the opt-in per-message lifetime in milliseconds,
+measured on the bus clock (`EventBusOptions.now`). When given, it
+OVERRIDES the topic-level TTL rules (`setTopicTtl`) for that message —
+the matching topic rule is ignored; when absent, the existing topic-TTL
+behavior is unchanged:
+
+```ts
+bus.setTopicTtl('orders.**', 30_000); // topic rule: 30s for everyone
+bus.publish('orders.eu', quote, { ttlMs: 500 }); // this message: 500ms, rule ignored
+bus.publish('orders.eu', quote); // this one: the 30s topic rule
+```
+
+Semantics:
+
+- **Stamped at admission.** The deadline is `now + ttlMs`, stamped once
+  when the message is admitted, and rides the durable-log record — a
+  replay keeps the original deadline verbatim and never extends the
+  message's life.
+- **Drain-time expiry.** A message past its deadline is dropped before
+  delivery and counted in `expiredMessages` (per-topic and global),
+  exactly like topic-TTL expiry. It is not an admission rejection, so
+  `onAdmissionRejected` never fires for it. `ttlMs: 0` means the message
+  expires immediately — admitted, never delivered.
+- **Delayed deliveries count from fan-out time** (EB-24):
+  `PublishDelayedOptions.ttlMs` carries the TTL duration on the schedule
+  (the topic rule is ignored for the schedule), and the due-time fan-out
+  stamps `fanOutTime + ttlMs` — the wait never eats the message's life.
+  The duration rides the durable-log schedule record, so a restart
+  rebuilds the timer with the TTL intact.
+- **Batch/atomic entries** carry it as `BatchMessage.ttlMs`, validated
+  per entry — an invalid value throws `RangeError` and rejects the whole
+  batch with zero side effects, the same convention as the schema
+  rejection (no sequence number consumed, nothing written to the durable
+  log, no rate-limit budget burned).
+- **Composes.** Keyed ordering (EB-36) is untouched — the deadline rides
+  the envelope and an expired keyed message never wedges its key stream;
+  topic routes keep the source message's deadline verbatim (routing never
+  resets it); `publishIdempotent` / `publishDedupedByContent` honor it
+  like any `PublishOptions` field.
+
+Invalid values (non-integer, negative, `NaN`, infinite) throw `RangeError`
+from the publish entry point before anything is mutated.
+
 ## Pull-mode consumption (long-polling) (EB-111)
 
 `bus.pull(topic, { maxMessages, waitMs?, fromOffset? })` is the opt-in

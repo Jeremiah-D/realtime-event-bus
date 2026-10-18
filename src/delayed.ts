@@ -25,9 +25,21 @@ export interface DelayedEntry {
   /**
    * TTL expiry deadline stamped at schedule time (bus clock), when a TTL
    * rule matched the topic. A message whose deadline passes before its due
-   * time is dropped as expired at sweep time, never delivered.
+   * time is dropped as expired at sweep time, never delivered. Absent when
+   * a per-message TTL (`PublishDelayedOptions.ttlMs`) was given — that
+   * overrides the topic rule and counts from fan-out time instead (see
+   * `ttlMs` below), so the schedule carries no schedule-time deadline.
    */
   expiresAt?: number;
+  /**
+   * Per-message TTL duration in milliseconds (EB-149): set exactly when
+   * the schedule was created with `PublishDelayedOptions.ttlMs`. The
+   * schedule carries the duration, not a deadline — the due-time fan-out
+   * stamps `fanOutTime + ttlMs`, so the message's life starts when it is
+   * delivered, not when it was scheduled. Carried on the durable-log
+   * schedule record so a restart rebuilds the timer with the TTL intact.
+   */
+  ttlMs?: number;
   /** Set by `cancelDelayed`; the heap skips marked entries lazily. */
   cancelled: boolean;
   /**

@@ -72,6 +72,15 @@ export interface DurableLogRecord {
   /** TTL expiry deadline in milliseconds, when a TTL rule matched at publish. */
   expiresAt?: number;
   /**
+   * Per-message TTL duration in milliseconds (EB-149): present on a
+   * delayed-delivery schedule record created with
+   * `PublishDelayedOptions.ttlMs`. The schedule carries the duration, not
+   * a deadline — the due-time fan-out stamps `fanOutTime + ttlMs`, so the
+   * message's life starts at delivery, not at schedule time. Never
+   * present on delivery records: those carry the stamped `expiresAt`.
+   */
+  ttlMs?: number;
+  /**
    * Delayed-delivery due time in milliseconds (bus clock), present on the
    * schedule record written by `publishDelayed` and copied onto the
    * delivery record when the message fans out at its due time.
@@ -460,6 +469,11 @@ interface LogLine {
   topic: string;
   at: number;
   expiresAt?: number;
+  /**
+   * Per-message TTL duration in milliseconds (EB-149): present on
+   * delayed-delivery schedule records — see `DurableLogRecord.ttlMs`.
+   */
+  ttlMs?: number;
   deliverAt?: number;
   delayId?: string;
   cancelled?: boolean;
@@ -3859,6 +3873,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
       }
     : { v: 1, seq: record.seq, topic: record.topic, at: record.at, payload: record.payload };
   if (record.expiresAt !== undefined) line.expiresAt = record.expiresAt;
+  if (record.ttlMs !== undefined) line.ttlMs = record.ttlMs;
   if (record.deliverAt !== undefined) line.deliverAt = record.deliverAt;
   if (record.delayId !== undefined) line.delayId = record.delayId;
   if (record.cancelled !== undefined) line.cancelled = record.cancelled;
@@ -4029,6 +4044,14 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   if (o['expiresAt'] !== undefined) {
     if (typeof o['expiresAt'] !== 'number' || !Number.isFinite(o['expiresAt'])) return null;
     record.expiresAt = o['expiresAt'] as number;
+  }
+  if (o['ttlMs'] !== undefined) {
+    // The writer only ever persists a validated per-message TTL; a
+    // non-finite or negative value on disk means the line was tampered
+    // with or miswritten — reject the line rather than silently
+    // resurrecting or mis-timing a schedule.
+    if (typeof o['ttlMs'] !== 'number' || !Number.isFinite(o['ttlMs']) || o['ttlMs'] < 0) return null;
+    record.ttlMs = o['ttlMs'] as number;
   }
   if (o['delayId'] !== undefined) {
     if (typeof o['delayId'] !== 'string' || (o['delayId'] as string).length === 0) return null;

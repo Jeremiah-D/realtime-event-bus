@@ -6101,6 +6101,24 @@ function validateSchemaVersion(schemaVersion: number | undefined, caller: string
 }
 
 /**
+ * Validates `PublishOptions.ttlMs` (and its batch/atomic/delayed twins),
+ * the per-message TTL override (EB-149). Absent (`undefined`) means "no
+ * per-message TTL — the topic TTL rules apply"; otherwise it must be a
+ * non-negative integer — `0` means the message expires immediately.
+ * Anything else (non-integer, negative, NaN, infinite, non-number)
+ * throws `RangeError` before the publish mutates any state — the same
+ * zero-side-effect convention as the schema rejection: no sequence
+ * number consumed, nothing written to the durable log, no rate-limit
+ * budget burned.
+ */
+function validateTtlMs(ttlMs: number | undefined, caller: string): void {
+  if (ttlMs === undefined) return;
+  if (typeof ttlMs !== 'number' || !Number.isInteger(ttlMs) || ttlMs < 0) {
+    throw new RangeError(`${caller}: ttlMs must be a non-negative integer number of milliseconds`);
+  }
+}
+
+/**
  * Validates `PublishOptions.critical` (EB-38): absent is fine, otherwise
  * it must be a boolean — anything else throws `RangeError` before the
  * publish mutates any state, matching the other publish-option
@@ -8727,6 +8745,28 @@ export interface PublishOptions {
    * point, before anything is mutated.
    */
   priority?: MessageLane;
+  /**
+   * Per-message TTL (EB-149, opt-in): this message's lifetime in
+   * milliseconds, measured on the bus clock (`EventBusOptions.now`).
+   * When given, it OVERRIDES the topic-level TTL rules
+   * (`EventBus.setTopicTtl`) for this message — the matching topic rule
+   * is ignored; when absent, the existing topic-TTL behavior is
+   * unchanged. The deadline is stamped at admission (`now + ttlMs`),
+   * rides the durable-log record, and is kept verbatim on replay (a
+   * replay never extends the message's life). Drain-time expiry counts
+   * into `expiredMessages` (per-topic and global) exactly like
+   * topic-TTL expiry — it is drain-time, not an admission rejection, so
+   * `onAdmissionRejected` never fires for it. `0` means the message
+   * expires immediately — admitted, never delivered. Delayed deliveries
+   * carry it as `PublishDelayedOptions.ttlMs` and stamp the deadline at
+   * fan-out time, not schedule time (EB-24). Must be a non-negative
+   * integer when provided; anything else (non-integer, negative, NaN,
+   * infinite) throws `RangeError` from the publish entry point before
+   * anything is mutated — the same zero-side-effect convention as the
+   * schema rejection: no sequence number consumed, nothing written to
+   * the durable log, no rate-limit budget burned.
+   */
+  ttlMs?: number;
 }
 
 /**
@@ -8753,6 +8793,14 @@ export type BatchMessage = Omit<BusMessage, 'seq'> & {
    * entry point (`publishBatch`, `publishAtomic`).
    */
   schemaVersion?: number;
+  /**
+   * Per-message TTL (see `PublishOptions.ttlMs`, EB-149): this entry's
+   * lifetime in milliseconds, overriding the topic TTL rules for the
+   * entry — validated per entry at the publish entry point
+   * (`publishBatch`, `publishAtomic`), same zero-side-effect
+   * convention as the other per-entry validations.
+   */
+  ttlMs?: number;
 };
 
 /**
@@ -8819,6 +8867,20 @@ export interface PublishDelayedOptions {
    * `publish`.
    */
   priority?: MessageLane;
+  /**
+   * Per-message TTL for this delayed publish (EB-149, opt-in): the
+   * message's lifetime in milliseconds, overriding the topic TTL rules
+   * (`EventBus.setTopicTtl`) for this message — a matching topic rule is
+   * ignored for the schedule. The TTL counts from FAN-OUT time (EB-24):
+   * the schedule carries the TTL duration, not a schedule-time deadline,
+   * and the due-time fan-out stamps `fanOutTime + ttlMs` — the wait
+   * never eats the message's life. Validated fail-fast at schedule time
+   * (same `RangeError`, same zero-side-effect convention as `publish`);
+   * carried on the schedule record so a restart rebuilds the timer with
+   * the TTL intact. Must be a non-negative integer when provided;
+   * `0` means the message expires the moment it fans out.
+   */
+  ttlMs?: number;
 }
 
 /**
@@ -8837,9 +8899,19 @@ interface DelayedFanOut {
   /**
    * TTL deadline stamped at schedule time, when a TTL rule matched — or
    * `undefined` when no rule matched then. A rule added between schedule
-   * and fan-out does not retroactively expire the message.
+   * and fan-out does not retroactively expire the message. Absent when
+   * the schedule carries a per-message TTL (`ttlMs` below): that
+   * overrides the topic rule and stamps the deadline at fan-out.
    */
   expiresAt?: number;
+  /**
+   * Per-message TTL duration in milliseconds (EB-149), carried from the
+   * delayed schedule into its fan-out: the fan-out stamps
+   * `fanOutTime + ttlMs` instead of reusing a schedule-time deadline —
+   * the TTL counts from fan-out time (EB-24). Present exactly when the
+   * schedule was created with `PublishDelayedOptions.ttlMs`.
+   */
+  ttlMs?: number;
   /**
    * Compaction key carried from the delayed schedule into its fan-out
    * (see `PublishDelayedOptions.key`): stamped onto the delivery's
@@ -19886,6 +19958,9 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, caller);
     validateSchemaVersion(opts?.schemaVersion, caller);
     validatePartitionOptions(opts?.partitionKey, opts?.partition, caller);
+    // Per-message TTL override (EB-149): fail-fast, before anything is
+    // mutated — same zero-side-effect convention as the schema rejection.
+    validateTtlMs(opts?.ttlMs, caller);
     // Adaptive sampling exemption (EB-38): fail-fast, before anything is
     // mutated.
     validateCritical(opts?.critical, caller);
@@ -19978,6 +20053,12 @@ export class EventBus {
       // Adaptive sampling exemption (EB-38): validated above; `fanOut`
       // consults it in the sampling gate. Absent means non-critical.
       opts?.critical,
+      undefined, // mirrorHlc: only `receiveForward` passes one
+      undefined, // admissionDlq: only the bus's own DLQ emitter passes true
+      undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+      // Per-message TTL (EB-149): validated above; `fanOut` stamps
+      // `nowMs + ttlMs`, overriding the topic TTL rules for this message.
+      opts?.ttlMs,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -20379,6 +20460,10 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'publishIdempotent');
     validateSchemaVersion(opts?.schemaVersion, 'publishIdempotent');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishIdempotent');
+    // Per-message TTL override (EB-149): fail-fast, before anything is
+    // mutated — `IdempotentPublishOptions` inherits it from
+    // `PublishOptions`.
+    validateTtlMs(opts?.ttlMs, 'publishIdempotent');
     // Adaptive sampling exemption (EB-38): fail-fast, before anything is
     // mutated.
     validateCritical(opts?.critical, 'publishIdempotent');
@@ -20445,6 +20530,12 @@ export class EventBus {
         // Adaptive sampling exemption (EB-38): validated above; `fanOut`
         // consults it in the sampling gate. Absent means non-critical.
         opts?.critical,
+        undefined, // mirrorHlc: only `receiveForward` passes one
+        undefined, // admissionDlq: only the bus's own DLQ emitter passes true
+        undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+        // Per-message TTL (EB-149): validated above; `fanOut` stamps
+        // `nowMs + ttlMs`, overriding the topic TTL rules for this message.
+        opts?.ttlMs,
       );
       this.scheduleFlush();
       return { duplicate: false, accepted };
@@ -20513,6 +20604,12 @@ export class EventBus {
       // Adaptive sampling exemption (EB-38): validated above; `fanOut`
       // consults it in the sampling gate. Absent means non-critical.
       opts?.critical,
+      undefined, // mirrorHlc: only `receiveForward` passes one
+      undefined, // admissionDlq: only the bus's own DLQ emitter passes true
+      undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+      // Per-message TTL (EB-149): validated above; `fanOut` stamps
+      // `nowMs + ttlMs`, overriding the topic TTL rules for this message.
+      opts?.ttlMs,
     );
     // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
     // and the per-publisher rate-limit gate lives inside `fanOut` — so a
@@ -20617,6 +20714,10 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'publishDedupedByContent');
     validateSchemaVersion(opts?.schemaVersion, 'publishDedupedByContent');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishDedupedByContent');
+    // Per-message TTL override (EB-149): fail-fast, before anything is
+    // mutated — `ContentDedupPublishOptions` inherits it from
+    // `PublishOptions`.
+    validateTtlMs(opts?.ttlMs, 'publishDedupedByContent');
     validateCritical(opts?.critical, 'publishDedupedByContent');
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishDedupedByContent');
     // Binary payload passthrough (EB-92): same contract as `publish`.
@@ -20719,6 +20820,12 @@ export class EventBus {
       // Adaptive sampling exemption (EB-38): validated above; `fanOut`
       // consults it in the sampling gate. Absent means non-critical.
       opts?.critical,
+      undefined, // mirrorHlc: only `receiveForward` passes one
+      undefined, // admissionDlq: only the bus's own DLQ emitter passes true
+      undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+      // Per-message TTL (EB-149): validated above; `fanOut` stamps
+      // `nowMs + ttlMs`, overriding the topic TTL rules for this message.
+      opts?.ttlMs,
     );
     // Same EB-27/EB-79 interaction as `publishIdempotent`: the content
     // gate runs before `fanOut`, and the per-publisher rate-limit gate
@@ -20830,6 +20937,10 @@ export class EventBus {
     validatePublisherId(opts?.publisherId, 'previewPublish');
     validateSchemaVersion(opts?.schemaVersion, 'previewPublish');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'previewPublish');
+    // Per-message TTL override (EB-149): the dry run validates what a
+    // real publish would validate — it never fans out, so the TTL is
+    // never stamped here.
+    validateTtlMs(opts?.ttlMs, 'previewPublish');
     validateBarrier(opts?.barrier, 'previewPublish');
     // Binary payload passthrough (EB-92): same contract as `publish` — a
     // non-bytes payload with `binary: true` throws `TypeError`.
@@ -20943,6 +21054,9 @@ export class EventBus {
       validatePublisherId(msg.publisherId, 'publishBatch');
       validateSchemaVersion(msg.schemaVersion, 'publishBatch');
       validatePartitionOptions(msg.partitionKey, msg.partition, 'publishBatch');
+      // Per-message TTL override (EB-149): validated per entry, like the
+      // other per-entry options — the commit phase stamps it into fanOut.
+      validateTtlMs(msg.ttlMs, 'publishBatch');
       // Priority lane (EB-122): a batch entry carries its lane on the
       // inherited `BusMessage.lane` field — validated per entry, like the
       // other per-entry options.
@@ -20978,6 +21092,15 @@ export class EventBus {
         // Priority lane (EB-122): the entry's inherited `BusMessage.lane`,
         // validated per entry above.
         msg.lane,
+        undefined, // confirm: only `publishCore` passes one
+        undefined, // mirrorProvenance: only `receiveForward` passes one
+        undefined, // critical: batch entries carry no critical flag
+        undefined, // mirrorHlc: only `receiveForward` passes one
+        undefined, // admissionDlq: only the bus's own DLQ emitter passes true
+        undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+        // Per-message TTL (EB-149): validated per entry above; `fanOut`
+        // stamps `nowMs + ttlMs`, overriding the topic TTL rules.
+        msg.ttlMs,
       ).accepted;
     }
     this.scheduleFlush();
@@ -21049,6 +21172,11 @@ export class EventBus {
       validatePublisherId(entry.publisherId, 'publishAtomic');
       validateSchemaVersion(entry.schemaVersion, 'publishAtomic');
       validatePartitionOptions(entry.partitionKey, entry.partition, 'publishAtomic');
+      // Per-message TTL override (EB-149): an invalid value throws here —
+      // the whole batch is rejected with zero side effects, exactly like
+      // the other per-entry validations; the commit phase stamps the
+      // deadline into fanOut per entry.
+      validateTtlMs(entry.ttlMs, 'publishAtomic');
       // Priority lane (EB-122): validated per entry, like the other
       // per-entry options; the commit phase carries it into `fanOut`.
       if (entry.lane !== undefined) assertValidMessageLane(entry.lane, 'publishAtomic');
@@ -21153,7 +21281,7 @@ export class EventBus {
     // publish path in one synchronous turn, then flush once.
     for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
-      const { key, traceparent, messageId, eventTime, publisherId, schemaVersion, partitionKey, partition } =
+      const { key, traceparent, messageId, eventTime, publisherId, schemaVersion, partitionKey, partition, ttlMs } =
         entries[index];      // Deprecated-schema accounting (EB-86): the shadow admission ran
       // the validator, so the commit only re-resolves the version
       // bookkeeping — an aborted batch never reaches here, so every
@@ -21192,6 +21320,15 @@ export class EventBus {
         // Priority lane (EB-122): the entry's inherited `BusMessage.lane`,
         // validated per entry in the key-validation loop above.
         entries[index].lane,
+        undefined, // confirm: only `publishCore` passes one
+        undefined, // mirrorProvenance: only `receiveForward` passes one
+        undefined, // critical: atomic entries carry no critical flag
+        undefined, // mirrorHlc: only `receiveForward` passes one
+        undefined, // admissionDlq: only the bus's own DLQ emitter passes true
+        undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+        // Per-message TTL (EB-149): validated per entry in the
+        // key-validation loop above; the commit stamps it per entry.
+        ttlMs,
       );
     }
     this.scheduleFlush();
@@ -21390,6 +21527,10 @@ export class EventBus {
     // must leave zero state behind — no schedule, no counted rejection.
     validatePublisherId(opts?.publisherId, 'publishDelayed');
     validateSchemaVersion(opts?.schemaVersion, 'publishDelayed');
+    // Per-message TTL override (EB-149): fail-fast, before anything is
+    // mutated — same zero-side-effect convention as the other delayed
+    // fail-fast gates.
+    validateTtlMs(opts.ttlMs, 'publishDelayed');
     // Priority lane (EB-122): fail-fast, before anything is mutated.
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishDelayed');
     const priority = opts?.priority;
@@ -21480,8 +21621,16 @@ export class EventBus {
       this.countPayloadTooLarge(topic, payload, publisherId);
       return undefined;
     }
-    const ttlMs = this.ttlForTopic(topic);
-    const expiresAt = ttlMs === undefined ? undefined : nowMs + ttlMs;
+    // Per-message TTL (EB-149): when `PublishDelayedOptions.ttlMs` is
+    // given it overrides the topic TTL rule for this schedule — the rule
+    // is ignored — and the TTL counts from fan-out time (EB-24): the
+    // schedule carries the TTL duration (`ttlMs`), not a schedule-time
+    // deadline, and the due-time fan-out stamps `fanOutTime + ttlMs` —
+    // the wait never eats the message's life. `validateTtlMs` already
+    // ran fail-fast with the other option validations above.
+    const messageTtlMs = opts.ttlMs;
+    const topicTtlMs = messageTtlMs === undefined ? this.ttlForTopic(topic) : undefined;
+    const expiresAt = topicTtlMs === undefined ? undefined : nowMs + topicTtlMs;
     validateMessageKey(opts.key, 'publishDelayed');
     validateTraceparent(opts.traceparent, 'publishDelayed');
     const key = opts.key;
@@ -21497,6 +21646,9 @@ export class EventBus {
       payload,
       deliverAt,
       expiresAt,
+      // The per-message TTL duration rides the schedule (EB-149): the
+      // due-time fan-out stamps `fanOutTime + ttlMs` — see `DelayedFanOut`.
+      ttlMs: messageTtlMs,
       cancelled: false,
       key,
       keySeq,
@@ -21524,6 +21676,10 @@ export class EventBus {
         at: nowMs,
         deliverAt,
         expiresAt,
+        // The per-message TTL duration rides the schedule record (EB-149)
+        // so a restart rebuilds the timer with the TTL intact — the
+        // due-time fan-out stamps the deadline, not the schedule.
+        ...(messageTtlMs === undefined ? {} : { ttlMs: messageTtlMs }),
         delayId: id,
         key,
         keySeq,
@@ -22112,6 +22268,11 @@ export class EventBus {
             // The schedule-time deadline rides along verbatim — the
             // message was "published" at schedule time, not at deferral.
             expiresAtOverride: top.expiresAt,
+            // A per-message TTL (EB-149) rides as a duration instead: it
+            // counts from this fan-out (the due time), so the pause
+            // admission stamps pause-time + ttlMs — the same deadline the
+            // unpaused sweep would stamp.
+            ttlMs: top.ttlMs,
             // The schedule-time lane rides along too (EB-122).
             priority: top.priority,
           });
@@ -22129,6 +22290,10 @@ export class EventBus {
           delayId: top.id,
           deliverAt: top.deliverAt,
           expiresAt: top.expiresAt,
+          // The per-message TTL duration (EB-149): the fan-out stamps
+          // `fanOutTime + ttlMs` — the TTL counts from fan-out time,
+          // not schedule time.
+          ttlMs: top.ttlMs,
           key: top.key,
           keySeq: top.keySeq,
           messageId: top.messageId,
@@ -22283,6 +22448,13 @@ export class EventBus {
       fromBridge?: boolean;
       diagnostic?: boolean;
       expiresAtOverride?: number;
+      /**
+       * Per-message TTL (see `PublishOptions.ttlMs`, EB-149): wins over
+       * the topic TTL rules at pause admission — the pause admission is
+       * the admission, and the resume fan-out keeps this deadline verbatim
+       * (`pausedExpiresAt`).
+       */
+      ttlMs?: number;
       /** Binary-payload marker (EB-92), propagated to the buffer entry. */
       binary?: boolean;
       /**
@@ -22294,7 +22466,12 @@ export class EventBus {
     },
   ): void {
     const nowMs = this.now();
-    const ttlMs = this.ttlForTopic(topic);
+    const topicTtlMs = this.ttlForTopic(topic);
+    // Per-message TTL (EB-149) wins over the topic rule here too: pause
+    // admission is an admission, and the resume fan-out keeps this
+    // deadline verbatim (`pausedExpiresAt`) — so stamping `nowMs + ttlMs`
+    // preserves the producer's per-message lifetime across the pause.
+    const pauseTtlMs = opts.ttlMs !== undefined ? opts.ttlMs : topicTtlMs;
     // Only non-empty message ids participate in dedup, mirroring
     // `fanOut`'s `cleanMessageId` normalization.
     const messageId =
@@ -22307,9 +22484,9 @@ export class EventBus {
       expiresAt:
         opts.expiresAtOverride !== undefined
           ? opts.expiresAtOverride
-          : ttlMs === undefined
+          : pauseTtlMs === undefined
             ? undefined
-            : nowMs + ttlMs,
+            : nowMs + pauseTtlMs,
       ...(opts.key === undefined ? {} : { key: opts.key }),
       ...(opts.traceparent === undefined ? {} : { traceparent: opts.traceparent }),
       ...(messageId === undefined ? {} : { messageId }),
@@ -22817,7 +22994,7 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const nowMs = this.now();
-    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; payload: unknown; key?: string; keySeq?: number; messageId?: string; publisherId?: string; lane?: MessageLane }>();
+    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; ttlMs?: number; payload: unknown; key?: string; keySeq?: number; messageId?: string; publisherId?: string; lane?: MessageLane }>();
     const closed = new Set<string>();
     // `readSince(topic, -1)`: the exclusive bound sits below every real
     // seq, so seq-0 schedule records and tombstones come along too.
@@ -22835,6 +23012,10 @@ export class EventBus {
             // (the log parser rejects it otherwise).
             deliverAt: rec.deliverAt as number,
             expiresAt: rec.expiresAt,
+            // The per-message TTL duration rides the schedule record
+            // (EB-149): the rebuilt timer's fan-out stamps the deadline
+            // at fan-out time — never a schedule-time deadline.
+            ttlMs: rec.ttlMs,
             payload: rec.payload,
             key: rec.key,
             keySeq: rec.keySeq,
@@ -22864,6 +23045,8 @@ export class EventBus {
         payload: rec.payload,
         deliverAt: rec.deliverAt,
         expiresAt: rec.expiresAt,
+        // The per-message TTL duration rides the rebuilt timer (EB-149).
+        ttlMs: rec.ttlMs,
         cancelled: false,
         key: rec.key,
         // The schedule consumed its keySeq before the restart; the bus's
@@ -26263,6 +26446,17 @@ export class EventBus {
     // Last so existing positional call sites are unaffected.
     admissionDlq = false,
     admissionDlqExpiresAt?: number,
+    // Per-message TTL (see `PublishOptions.ttlMs`, EB-149): already
+    // validated by the publish entry points — `fanOut` never validates.
+    // When set, stamps `nowMs + messageTtlMs` at admission, overriding
+    // the topic TTL rules for this message; absent means the topic
+    // rules apply normally. The internal deadline carriers above
+    // (`admissionDlqExpiresAt`, `pausedExpiresAt`, `routedExpiresAt`,
+    // `delayed`) already embody any per-message TTL they were admitted
+    // with, so they keep winning — the override only applies where a
+    // fresh admission-time stamp happens. Last so existing positional
+    // call sites are unaffected.
+    messageTtlMs?: number,
   ): {
     matched: number;
     accepted: number;
@@ -26412,6 +26606,10 @@ export class EventBus {
           fromBridge,
           diagnostic,
           binary,
+          // The per-message TTL (EB-149) rides along so the pause
+          // admission stamps `nowMs + ttlMs` — it wins over the topic TTL
+          // rules exactly like the unpaused path.
+          ttlMs: messageTtlMs,
           // The pause-time lane rides the buffer entry so the resume
           // fan-out re-admits the message into its original lane.
           priority,
@@ -26818,16 +27016,23 @@ export class EventBus {
     // `delayed !== undefined` check instead of `??`: an explicit "no
     // deadline" from schedule time must not fall through to the rules in
     // effect now (a rule added in between does not retroactively expire
-    // the message). A routed forward carries the source message's deadline
-    // verbatim — routing never resets it — so it wins over the
-    // destination's own TTL rules; when the source message had no
-    // deadline, the destination's rules apply normally. A pause-buffer
-    // drain (EB-88) carries the deadline stamped at pause admission the
-    // same way — the message was "published" at pause time and only
-    // delivered at resume — so it wins over every other source. An
-    // admission-DLQ record (EB-139) carries its rule's independent
-    // retention deadline (`admissionDlqExpiresAt`), which wins over the
-    // DLQ topic's own TTL rules.
+    // the message). A delayed schedule carrying a per-message TTL
+    // (`delayed.ttlMs`, EB-149) stamps `nowMs + delayed.ttlMs` instead:
+    // the per-message TTL counts from fan-out time, and overrides the
+    // topic rule the schedule ignored at schedule time. A routed forward
+    // carries the source message's deadline verbatim — routing never
+    // resets it — so it wins over the destination's own TTL rules; when
+    // the source message had no deadline, the destination's rules apply
+    // normally. A pause-buffer drain (EB-88) carries the deadline stamped
+    // at pause admission the same way — the message was "published" at
+    // pause time and only delivered at resume — so it wins over every
+    // other source. An admission-DLQ record (EB-139) carries its rule's
+    // independent retention deadline (`admissionDlqExpiresAt`), which
+    // wins over the DLQ topic's own TTL rules. The per-message override
+    // (`PublishOptions.ttlMs`, `messageTtlMs`) stamps `nowMs + ttlMs`,
+    // winning over the topic rules for this message only — the internal
+    // carriers above already embody any per-message TTL they were
+    // admitted with.
     const expiresAt =
       admissionDlqExpiresAt !== undefined
         ? admissionDlqExpiresAt
@@ -26836,10 +27041,14 @@ export class EventBus {
         : routedExpiresAt !== undefined
           ? routedExpiresAt
           : delayed !== undefined
-            ? delayed.expiresAt
-            : ttlMs === undefined
-              ? undefined
-              : nowMs + ttlMs;
+            ? delayed.ttlMs !== undefined
+              ? nowMs + delayed.ttlMs
+              : delayed.expiresAt
+            : messageTtlMs !== undefined
+              ? nowMs + messageTtlMs
+              : ttlMs === undefined
+                ? undefined
+                : nowMs + ttlMs;
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
     // MQTT-style retained messages (EB-87): the message above cleared
     // every admission gate and is fully stamped (wire payload, signature,
