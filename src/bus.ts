@@ -9369,6 +9369,17 @@ function confirmationPayloadHash(payload: unknown, binary: boolean): string {
 }
 
 /**
+ * Journal marker for content-hash dedup claims (EB-146):
+ * `publishDedupedByContent` journals admitted claims to the same
+ * `__publish_dedup.jsonl` file EB-66 uses, with the messageId slot
+ * holding this prefix plus the SHA-256 content hex — so one journal
+ * covers both dedup identities and restart rehydration routes each claim
+ * to the right in-memory table. Message ids starting with this prefix
+ * are reserved; do not use them as `PublishOptions.messageId`.
+ */
+const CONTENT_DEDUP_JOURNAL_PREFIX = 'content:';
+
+/**
  * Validates `PublishOptions.binary` at the publish entry points:
  * `binary: true` requires a `Uint8Array` payload (`ArrayBuffer` is
  * wrapped in a zero-copy view); anything else throws `TypeError` before
@@ -9516,6 +9527,29 @@ export interface IdempotentPublishResult {
    * retry.
    */
   accepted: number;
+}
+
+/**
+ * Options for `EventBus.publishDedupedByContent`: `PublishOptions` plus
+ * the content-dedup window.
+ *
+ * The dedup identity is `(topic, sha256(payload))` — the SHA-256 hex of
+ * the canonical payload bytes (see `EventBus.publishDedupedByContent`),
+ * so two publishes of byte-identical content hash identically even when
+ * the upstream retry carries no stable `messageId`. A `messageId`
+ * in `opts` is still allowed: it rides the message envelope (so
+ * subscriber-side `deduplicateMessages` can use it) but does NOT claim
+ * an EB-27 messageId dedup slot — the content gate and the messageId
+ * gate are independent identities.
+ */
+export interface ContentDedupPublishOptions extends PublishOptions {
+  /**
+   * How long an admitted content claim suppresses identical content, in
+   * milliseconds, measured on the bus clock (`EventBusOptions.now`).
+   * Defaults to `EventBusOptions.idempotencyWindowMs`. Must be a
+   * positive finite number when given.
+   */
+  windowMs?: number;
 }
 
 /**
@@ -10396,6 +10430,22 @@ export class EventBus {
    * suppress its retry.
    */
   private dedup = new Map<string, number>();
+  /**
+   * Content-hash dedup table for `publishDedupedByContent` (EB-146):
+   * `${topic}\\0${sha256(payload)}` -> `{ at, windowMs }` of the admitted
+   * publish that claimed it. A SEPARATE map from the EB-27 messageId
+   * table, so a 64-hex messageId can never collide with a content hash
+   * and the two identities compose without interference. The map is
+   * insertion-ordered for the bounded eviction; each claim carries its
+   * own window (the `windowMs` the claiming call passed), so per-key
+   * expiry is always re-checked against the claim's window on lookup
+   * (an injected clock may move non-monotonically).
+   *
+   * Only admitted messages (past schema validation and the rate-limit
+   * budgets) occupy slots: a rejected or shed first attempt must not
+   * suppress its retry.
+   */
+  private contentDedup = new Map<string, { at: number; windowMs: number }>();
   /**
    * Dedup window in milliseconds (`EventBusOptions.idempotencyWindowMs`):
    * a retry within this long of the admitted publish is a duplicate.
@@ -11417,17 +11467,31 @@ export class EventBus {
       // never rehydrated. Bounded to `idempotencyMaxEntries`: the journal
       // yields claims in claim order, so taking the tail keeps the most
       // recently claimed identities — the exact analog of the live
-      // table's insertion-ordered eviction.
+      // table's insertion-ordered eviction. EB-146: content-hash claims
+      // (journaled with the reserved `content:` messageId prefix) are
+      // routed back to the content-dedup table with the bus-level window —
+      // a per-call custom window is an in-process refinement.
       {
         const nowMs = this.now();
         const live: Array<{ key: string; at: number }> = [];
+        const liveContent: Array<{ key: string; at: number }> = [];
         for (const entry of log.recoveredPublishDedup()) {
           if (nowMs - entry.at < this.idempotencyWindowMs) {
-            live.push({ key: `${entry.topic}\0${entry.messageId}`, at: entry.at });
+            if (entry.messageId.startsWith(CONTENT_DEDUP_JOURNAL_PREFIX)) {
+              liveContent.push({
+                key: `${entry.topic}\0${entry.messageId.slice(CONTENT_DEDUP_JOURNAL_PREFIX.length)}`,
+                at: entry.at,
+              });
+            } else {
+              live.push({ key: `${entry.topic}\0${entry.messageId}`, at: entry.at });
+            }
           }
         }
         for (const { key, at } of live.slice(-this.idempotencyMaxEntries)) {
           this.dedup.set(key, at);
+        }
+        for (const { key, at } of liveContent.slice(-this.idempotencyMaxEntries)) {
+          this.contentDedup.set(key, { at, windowMs: this.idempotencyWindowMs });
         }
       }
       // Recover numbering continuity and per-key cursors from the log —
@@ -20174,6 +20238,215 @@ export class EventBus {
   }
 
   /**
+   * Content-hash idempotent publish (EB-146, backend engineering): within
+   * the content window, `(topic, sha256(payload))` is published at most
+   * once. A retry carrying the same payload on the same topic — the
+   * payment-callback pattern where the upstream has no stable
+   * `messageId` — returns `{ duplicate: true, accepted: 0 }` instead of
+   * publishing again, so a duplicated webhook or settlement callback can
+   * never double-execute downstream.
+   *
+   * The dedup identity is the SHA-256 hex of the canonical payload bytes
+   * — the same `wireBytesOfPayload` measure EB-125's
+   * `confirmationPayloadHash` uses, so "content" means one thing
+   * everywhere: JSON payloads hash by their JSON encoding (key insertion
+   * order, as published), binary payloads by their raw bytes. A payload
+   * with no encoding (`undefined`, functions, `BigInt`, circular) hashes
+   * as the empty byte string, exactly like EB-125.
+   *
+   * Gate order mirrors `publishIdempotent`: chaos → option validation →
+   * binary normalization → namespace → topic-alias resolution →
+   * broker-level ACL → content-dedup gate → `fanOut`. The dedup gate runs
+   * before admission, so a suppressed duplicate is a zero-side-effect
+   * suppression: no sequence number, no durable-log write, no
+   * rate-limit budget. Suppressed duplicates are counted in
+   * `TopicStats.duplicateMessages` (and the global total) and journaled
+   * as `'duplicate'` admission rejections, exactly like EB-27's.
+   *
+   * Window semantics:
+   * - Each admitted claim carries its own window — the `windowMs` the
+   *   claiming call passed (default `EventBusOptions.idempotencyWindowMs`).
+   *   A later call with a different `windowMs` does not shorten an
+   *   already-claimed window: the claim defines the protection.
+   * - The window is measured on the bus clock (`EventBusOptions.now`),
+   *   so content dedup is deterministic in tests.
+   * - The table is bounded by `EventBusOptions.idempotencyMaxEntries`:
+   *   when full, the oldest claim is evicted. Expired claims are pruned
+   *   on every content-dedup publish.
+   * - With `EventBusOptions.durableLogDir` admitted claims survive
+   *   restarts: they are journaled to the same `__publish_dedup.jsonl`
+   *   EB-66 uses, with the messageId slot holding
+   *   `content:<sha256hex>` (a reserved prefix — do not use it as a real
+   *   `messageId`), and a bus opened over the same directory rehydrates
+   *   them with the bus-level `idempotencyWindowMs` (a per-call custom
+   *   window is an in-process refinement).
+   *
+   * Composition with EB-27 / EB-66: the content table is separate from
+   * the `(topic, messageId)` table, so the two identities never collide —
+   * a publish can be protected by content hash, by messageId, or by both
+   * (a `messageId` in `opts` still rides the envelope for
+   * subscriber-side `deduplicateMessages`). Journaled content claims fold
+   * independently of messageId claims in the durable log.
+   *
+   * Like `publishIdempotent`, a first attempt that the schema validator
+   * rejected or a rate limiter shed claims no dedup slot — its retry is a
+   * fresh publish.
+   */
+  publishDedupedByContent(
+    topic: string,
+    payload: unknown,
+    opts?: ContentDedupPublishOptions,
+  ): IdempotentPublishResult {
+    // Chaos (EB-103): see publishIdempotent — a 'drop' reports a fresh
+    // (non-duplicate) zero-accept publish, exactly like an admission shed
+    // would.
+    if (this.checkChaosAdmission()) return { duplicate: false, accepted: 0 };
+    validateMessageKey(opts?.key, 'publishDedupedByContent');
+    validateTraceparent(opts?.traceparent, 'publishDedupedByContent');
+    validateEventTime(opts?.eventTime, 'publishDedupedByContent');
+    validateCausal(opts?.causal, 'publishDedupedByContent');
+    validatePublisherId(opts?.publisherId, 'publishDedupedByContent');
+    validateSchemaVersion(opts?.schemaVersion, 'publishDedupedByContent');
+    validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishDedupedByContent');
+    validateCritical(opts?.critical, 'publishDedupedByContent');
+    if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishDedupedByContent');
+    // Binary payload passthrough (EB-92): same contract as `publish`.
+    payload = normalizeBinaryPayload(payload, opts?.binary, 'publishDedupedByContent');
+    const binary = opts?.binary === true;
+    const publisherId = opts?.publisherId;
+    const windowMs = opts?.windowMs ?? this.idempotencyWindowMs;
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new RangeError('publishDedupedByContent: windowMs must be a positive finite number of milliseconds');
+    }
+    // Multi-tenant namespace (EB-52): the `(topic, contentHash)` dedup
+    // identity is scoped to the concrete `<namespace>/<topic>`, exactly
+    // like EB-27's `(topic, messageId)` identity.
+    topic = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    // Topic aliases (EB-44) resolve before the dedup gate: the resolved
+    // topic is the real publish topic — the ACL check, the dedup
+    // identity, and `fanOut` all see it. A publish to a retired old topic
+    // claims no dedup slot and reports `{ duplicate: false, accepted: 0 }`
+    // — it was refused, not deduplicated, and its retry stays a fresh
+    // publish.
+    const aliasResolution = this.resolvePublishTopic(topic);
+    if (aliasResolution.retired) {
+      this.countAliasRetired(topic, payload, publisherId);
+      this.recordPublishAudit(topic, {
+        admitted: false,
+        reason: 'alias-retired',
+        key: opts?.key,
+        traceparent: opts?.traceparent,
+        messageId: opts?.messageId,
+        publisherId,
+      });
+      return { duplicate: false, accepted: 0 };
+    }
+    topic = aliasResolution.topic;
+    // Authorization precedes identity: a denied publish claims no dedup
+    // slot and reports `{ duplicate: false, accepted: 0 }` — it was
+    // denied, not deduplicated, and its retry stays a fresh publish.
+    if (!this.aclAllowsPublish(topic)) {
+      this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
+      this.recordPublishAudit(topic, {
+        admitted: false,
+        reason: 'acl',
+        key: opts?.key,
+        traceparent: opts?.traceparent,
+        messageId: opts?.messageId,
+        publisherId,
+      });
+      return { duplicate: false, accepted: 0 };
+    }
+    const nowMs = this.now();
+    // The content identity: SHA-256 hex of the canonical payload bytes
+    // (see `confirmationPayloadHash`, EB-125). The key keeps the
+    // `${topic}\0<identity>` shape EB-27 uses, in the SEPARATE
+    // content-dedup table — the two identities never collide.
+    const contentHash = confirmationPayloadHash(payload, binary);
+    const contentDedupKey = `${topic}\0${contentHash}`;
+    this.pruneContentDedup(nowMs);
+    const claim = this.contentDedup.get(contentDedupKey);
+    if (claim !== undefined && nowMs - claim.at < claim.windowMs) {
+      // Suppressed duplicate: dropped before admission — no sequence
+      // number, no durable-log write, no rate-limit budget. Counted for
+      // observability only, and surfaced on the admission-rejection hook
+      // with the EB-39 'duplicate' reason, like EB-27.
+      this.countDuplicate(topic, payload, publisherId);
+      this.recordPublishAudit(topic, {
+        admitted: false,
+        reason: 'duplicate',
+        key: opts?.key,
+        traceparent: opts?.traceparent,
+        messageId: opts?.messageId,
+        publisherId,
+      });
+      return { duplicate: true, accepted: 0 };
+    }
+    const { accepted, admitted } = this.fanOut(
+      topic,
+      payload,
+      false,
+      undefined,
+      opts?.key,
+      undefined,
+      opts?.traceparent,
+      opts?.messageId,
+      opts?.routed ?? false,
+      undefined,
+      false,
+      false,
+      opts?.eventTime,
+      opts?.causal,
+      publisherId,
+      opts?.schemaVersion,
+      undefined, // retain: publishDedupedByContent carries no retain flag
+      undefined, // pausedExpiresAt: only the pause-buffer drain passes this
+      opts?.partitionKey,
+      opts?.partition,
+      binary,
+      opts?.priority,
+      undefined, // confirm: only `publishCore` passes one
+      undefined, // mirrorProvenance: only `receiveForward` passes one
+      // Adaptive sampling exemption (EB-38): validated above; `fanOut`
+      // consults it in the sampling gate. Absent means non-critical.
+      opts?.critical,
+    );
+    // Same EB-27/EB-79 interaction as `publishIdempotent`: the content
+    // gate runs before `fanOut`, and the per-publisher rate-limit gate
+    // lives inside `fanOut` — a suppressed duplicate never reaches the
+    // gate, and retries burn no publisher budget. A publisher-shed first
+    // attempt is not admitted, so it claims no dedup slot — its retry
+    // stays a fresh publish.
+    this.scheduleFlush();
+    if (admitted) {
+      // Only an admitted message claims a dedup slot: the window starts at
+      // its publish time. Deleting before re-inserting refreshes the
+      // entry's position so the bounded eviction tracks last-publish
+      // order, and stores the claim's own window.
+      this.contentDedup.delete(contentDedupKey);
+      this.contentDedup.set(contentDedupKey, { at: nowMs, windowMs });
+      while (this.contentDedup.size > this.idempotencyMaxEntries) {
+        const oldest = this.contentDedup.keys().next();
+        if (oldest.done) break;
+        this.contentDedup.delete(oldest.value);
+      }
+      // Publish-side content-dedup journal (EB-66): persist the claim so
+      // a restart keeps suppressing within-window retries. Best-effort —
+      // the in-memory table is the source of truth, so a failed journal
+      // write never fails the publish. The identity is already namespaced
+      // to the concrete topic above, so the single root journal covers
+      // every namespace. The reserved `content:` prefix routes the claim
+      // back to the content table on rehydration.
+      this.durableLog?.appendPublishDedup({
+        topic,
+        messageId: `${CONTENT_DEDUP_JOURNAL_PREFIX}${contentHash}`,
+        at: nowMs,
+      });
+    }
+    return { duplicate: false, accepted };
+  }
+
+  /**
    * Admission dry-run (EB-108, backend engineering): walks the FULL
    * publish-side admission gate sequence for `(topic, payload, opts)`
    * with ZERO side effects and reports the verdict — `{ admitted: true }`
@@ -23886,6 +24159,20 @@ export class EventBus {
     for (const [key, firstAt] of this.dedup) {
       if (nowMs - firstAt < this.idempotencyWindowMs) break;
       this.dedup.delete(key);
+    }
+  }
+
+  /**
+   * Drops content-hash claims whose per-claim window has elapsed
+   * (EB-146). Unlike `pruneDedup` there is no head-break: claims carry
+   * heterogeneous windows, so expiry order is not claim order — the
+   * table is bounded by `idempotencyMaxEntries`, so the full scan stays
+   * cheap.
+   */
+  private pruneContentDedup(nowMs: number): void {
+    for (const [key, claim] of this.contentDedup) {
+      if (nowMs - claim.at < claim.windowMs) continue;
+      this.contentDedup.delete(key);
     }
   }
 
