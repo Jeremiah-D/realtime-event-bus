@@ -3803,6 +3803,20 @@ export interface TopicStats {
    */
   redactedFields: number;
   /**
+   * Publish-side transform middleware invocations on this topic (see
+   * `setTopicTransforms`, EB-147): one per transform function applied to
+   * one publish. Counted at admission — a transform that ran on a publish
+   * a later gate then rejected still counts. 0 when no transform chain
+   * matches the topic.
+   */
+  transformCalls: number;
+  /**
+   * Publish-side transform middleware throws on this topic (EB-147). A
+   * throw propagates to the publish caller (the EB-20 validator
+   * convention) and the publish fails fast with zero side effects.
+   */
+  transformErrors: number;
+  /**
    * Messages on this topic delivered with a compressed payload (see
    * `setTopicCompression`): the payload's serialized size exceeded the
    * topic's `thresholdBytes` and deflate produced a smaller encoding.
@@ -4418,6 +4432,17 @@ export interface BusStats {
    * for the exact counting rules.
    */
   redactedFields: number;
+  /**
+   * Total publish-side transform middleware invocations — the sum of
+   * every topic's `transformCalls`. See `TopicStats.transformCalls` for
+   * the exact counting rules.
+   */
+  transformCalls: number;
+  /**
+   * Total publish-side transform middleware throws — the sum of every
+   * topic's `transformErrors`.
+   */
+  transformErrors: number;
   /**
    * Subscriptions currently under adaptive publish-side throttling (see
    * `SubscribeOptions.throttle`): their queues crossed the high-water mark
@@ -5875,6 +5900,10 @@ function zeroedTopicStats(): {
   compressedBytesBefore: number;
   compressedBytesAfter: number;
   compressionTimeMs: number;
+  /** Publish-side transform middleware invocations on this topic (EB-147). */
+  transformCalls: number;
+  /** Publish-side transform middleware throws on this topic (EB-147). */
+  transformErrors: number;
   /** Live payload-size histogram accumulator (EB-143); undefined until the first sampled publish. */
   payloadHistogram: PayloadHistogramAccumulator | undefined;
   lanes: {
@@ -5908,6 +5937,8 @@ function zeroedTopicStats(): {
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,
     compressionTimeMs: 0,
+    transformCalls: 0,
+    transformErrors: 0,
     payloadHistogram: undefined,
     lanes: {
       queued: zeroedLaneCounts(),
@@ -7359,6 +7390,19 @@ function resolveDeduplicateMessagesOptions(
  * message, so a throw never leaves a half-published message behind.
  */
 export type SchemaValidator = (payload: unknown, topic: string) => boolean;
+
+/**
+ * One publish-side payload transform (EB-147): receives the payload as
+ * admitted so far and the concrete topic being published to (never a
+ * pattern), and returns the payload to continue the pipeline with —
+ * typically a normalized, redacted, or field-completed variant. Returning
+ * the input unchanged is a valid no-op. A transform that throws propagates
+ * the error to the publish caller, exactly like a throwing schema
+ * validator (EB-20): the publish fails fast in the admission phase with
+ * zero side effects (no sequence number consumed, nothing written to the
+ * durable log, no rate-limit budget burned).
+ */
+export type TopicTransformFn = (payload: unknown, topic: string) => unknown;
 
 /**
  * Options for one versioned schema registration (see
@@ -10325,6 +10369,21 @@ export class EventBus {
    */
   private schemaMatcherCache = new Map<string, RegExp>();
   /**
+   * Publish-side transform middleware chains (see `setTopicTransforms`,
+   * EB-147), keyed by the exact string passed at registration — either a
+   * concrete topic name or a wildcard pattern. Match resolution mirrors
+   * the schema rules: an exact-topic chain wins over any pattern; between
+   * patterns the earliest-registered chain wins. Re-setting a pattern
+   * replaces its chain.
+   */
+  private transformRules = new Map<string, TopicTransformFn[]>();
+  /**
+   * Compiled matchers for the wildcard entries in `transformRules`, kept
+   * apart from the subscriber pattern cache so transform configuration
+   * never inflates `patternCacheSize`.
+   */
+  private transformMatcherCache = new Map<string, RegExp>();
+  /**
    * Versioned schema validators (see `setTopicSchemaVersion`), keyed by
    * the exact string passed at registration — either a concrete topic
    * name or a wildcard pattern — to that key's version map. Match
@@ -10390,6 +10449,20 @@ export class EventBus {
    * later gate then rejects still counts — the replacement happened.
    */
   private totalRedactedFields = 0;
+  /**
+   * Total publish-side transform middleware invocations across all topics
+   * (global total) — one per transform function applied to one publish.
+   * Counted at admission: a transform that ran on a publish a later gate
+   * then rejected still counts — the invocation happened.
+   */
+  private totalTransformCalls = 0;
+  /**
+   * Total publish-side transform middleware throws across all topics
+   * (global total). A throw propagates to the publish caller (the EB-20
+   * validator convention) — the publish fails fast with zero side
+   * effects.
+   */
+  private totalTransformErrors = 0;
   /**
    * Messages rejected by schema validation (global total). A rejection
    * happens before admission: the payload never becomes a message, so it
@@ -13409,6 +13482,52 @@ export class EventBus {
   }
 
   /**
+   * Registers a publish-side transform middleware chain for `topicPattern`
+   * (EB-147): a concrete topic name or a wildcard pattern. Every publish
+   * admitted on a matching topic runs its payload through the chain — in
+   * array order — after admission-time redaction (EB-68) and before every
+   * admission gate, so schema validation (EB-20), sequence-number
+   * assignment, the durable log, and compression (EB-22) all see the
+   * transformed payload. Typical uses: payload normalization, PII
+   * scrubbing beyond field redaction, and default-field completion.
+   *
+   * Match resolution mirrors `setTopicSchema`: an exact-topic chain wins
+   * over patterns; the earliest-registered matching pattern wins.
+   * Re-setting a pattern replaces its chain. This is the publish-side
+   * counterpart to the subscriber-side message projection (EB-144):
+   * transforms mutate what is stored and delivered, projections only
+   * change what one subscriber's handler sees.
+   *
+   * A transform that throws propagates to the publish caller — the EB-20
+   * validator convention — and the publish fails fast with zero side
+   * effects (no sequence number consumed, nothing written to the durable
+   * log, no rate-limit budget burned). The chain also runs in the
+   * `publishAtomic` shadow admission and at `publishDelayed` schedule
+   * time, so their fail-fast gates see the transformed payload too; the
+   * commit/due-time fan-outs are pre-admitted and never re-run it.
+   *
+   * Throws `RangeError` when `topicPattern` is empty, when `fns` is not a
+   * non-empty array, or when any element of `fns` is not a function.
+   */
+  setTopicTransforms(topicPattern: string, fns: TopicTransformFn[]): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Array.isArray(fns) || fns.length === 0 || fns.some((fn) => typeof fn !== 'function')) {
+      throw new RangeError('fns must be a non-empty array of transform functions');
+    }
+    this.transformRules.set(topicPattern, [...fns]);
+  }
+
+  /**
+   * Removes the transform chain previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed.
+   */
+  clearTopicTransforms(topicPattern: string): boolean {
+    return this.transformRules.delete(topicPattern);
+  }
+
+  /**
    * Changes the durable log's time-based retention bound at runtime
    * (EB-85): records older than `now - maxAgeMs` (bus clock) are evicted
    * at the next compact of each topic. Pass `undefined` to clear the age
@@ -14008,6 +14127,40 @@ export class EventBus {
   }
 
   /**
+   * Runs the topic's publish-side transform middleware chain over a
+   * publish payload at admission time (see `setTopicTransforms`, EB-147).
+   * Each transform receives the previous transform's output and the
+   * concrete topic, in registration order; the final output continues
+   * down the pipeline. A no-op returning the input untouched when no
+   * chain matches the topic.
+   *
+   * Counts every transform invocation on the topic's stats entry and the
+   * global total (`TopicStats.transformCalls` /
+   * `BusStats.transformCalls`). A throwing transform is counted in
+   * `transformErrors` and then rethrown — the EB-20 validator convention —
+   * so the publish fails fast with zero side effects: the throw happens
+   * before sequence-number assignment, the durable log, and the
+   * rate-limit budget, and none of them is touched.
+   */
+  private applyTopicTransforms(topic: string, payload: unknown): unknown {
+    const fns = this.transformsForTopic(topic);
+    if (fns === undefined) return payload;
+    const stats = this.statsFor(topic);
+    for (const fn of fns) {
+      stats.transformCalls += 1;
+      this.totalTransformCalls += 1;
+      try {
+        payload = fn(payload, topic);
+      } catch (err) {
+        stats.transformErrors += 1;
+        this.totalTransformErrors += 1;
+        throw err;
+      }
+    }
+    return payload;
+  }
+
+  /**
    * Returns the per-message byte cap that applies to `topic`, or `undefined`
    * when no rule matches. Same precedence as `ttlForTopic`.
    */
@@ -14114,6 +14267,26 @@ export class EventBus {
         this.schemaMatcherCache.set(pattern, matcher);
       }
       if (matcher.test(topic)) return validator;
+    }
+    return undefined;
+  }
+
+  /**
+   * Returns the transform chain that applies to `topic`, or `undefined`
+   * when no transform rule matches. Same precedence as `schemaForTopic`:
+   * an exact-topic chain wins over patterns, the earliest-registered
+   * matching pattern wins.
+   */
+  private transformsForTopic(topic: string): TopicTransformFn[] | undefined {
+    const exact = this.transformRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, fns] of this.transformRules) {
+      let matcher = this.transformMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.transformMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return fns;
     }
     return undefined;
   }
@@ -20757,11 +20930,13 @@ export class EventBus {
     // Alias-resolved topics, one per entry: the commit phase publishes the
     // resolved topics, never the raw entry topics.
     const resolvedTopics: string[] = new Array(entries.length);
-    // Redacted payloads, one per entry: shadow admission redacts on the
-    // resolved topic before the schema gate (EB-68); the commit phase
-    // fans out these redacted bytes through pre-admitted fanOut, so the
-    // redaction count moves exactly once per entry.
-    const redactedPayloads: unknown[] = new Array(entries.length);
+    // Admitted payloads, one per entry: shadow admission redacts (EB-68)
+    // and then runs the transform chain (EB-147) on the resolved topic
+    // before the schema gate; the commit phase fans out these bytes
+    // through pre-admitted fanOut, so redaction and transform counts move
+    // exactly once per entry. A throwing transform aborts the batch with
+    // zero side effects, exactly like a throwing schema validator.
+    const admittedPayloads: unknown[] = new Array(entries.length);
     for (let index = 0; index < entries.length; index++) {
       const { topic, key } = entries[index];
       let payload: unknown = entries[index].payload;
@@ -20794,7 +20969,13 @@ export class EventBus {
       // the resolved topic, before the schema gate: the schema verdict,
       // the size cap, and the commit phase all see the redacted bytes.
       payload = this.redactAdmissionPayload(resolvedTopic, payload);
-      redactedPayloads[index] = payload;
+      // Publish-side transform chain (EB-147) runs in shadow admission,
+      // right after redaction and before the schema gate: the schema
+      // verdict, the size caps, and the commit phase all see the
+      // transformed bytes. A throwing transform aborts the batch before
+      // anything is mutated — zero side effects, the EB-20 convention.
+      payload = this.applyTopicTransforms(resolvedTopic, payload);
+      admittedPayloads[index] = payload;
       const verdict = this.admissionVerdict(
         resolvedTopic,
         payload,
@@ -20846,9 +21027,10 @@ export class EventBus {
       }
       this.fanOut(
         resolvedTopics[index],
-        // The shadow-admission redacted bytes: the commit phase is
-        // pre-admitted and must not redact again (EB-68).
-        redactedPayloads[index],
+        // The shadow-admission redacted + transformed bytes: the commit
+        // phase is pre-admitted and must run neither again (EB-68,
+        // EB-147).
+        admittedPayloads[index],
         true,
         undefined,
         key,
@@ -21097,6 +21279,13 @@ export class EventBus {
     // not redact again. Redacting at schedule time (rather than at
     // fan-out) is what keeps the persisted bytes redacted.
     payload = this.redactAdmissionPayload(topic, payload);
+    // Publish-side transform chain (EB-147) at schedule time: the
+    // fail-fast gates below, the in-memory schedule, and the persisted
+    // schedule record all see the transformed payload, and the due-time
+    // fan-out (pre-admitted) does not transform again. A throwing
+    // transform fails the schedule fast — no id, nothing in the heap,
+    // nothing on disk — the EB-20 validator convention.
+    payload = this.applyTopicTransforms(topic, payload);
     // Topic pause (EB-88): the first schedule-time gate, before the
     // per-publisher rate limiter. In shed mode the schedule is refused
     // fail-fast — no id, nothing in the heap, nothing on disk — counted
@@ -26031,6 +26220,23 @@ export class EventBus {
     if (!preAdmitted && !binary) {
       payload = this.redactAdmissionPayload(topic, payload);
     }
+    // Publish-side transform middleware chain (EB-147): admission-time,
+    // after redaction and before every gate — schema validation, the size
+    // caps, sequence-number assignment, the durable log, and compression
+    // all see the transformed payload. A throwing transform propagates to
+    // the publish caller (the EB-20 validator convention); it runs before
+    // anything is mutated for the message, so the publish fails fast with
+    // zero side effects. Skipped on pre-admitted re-fan-outs (the
+    // `publishAtomic` commit phase and delayed due-time fan-outs already
+    // transformed at their own admission) and for admission-DLQ records
+    // (EB-139), which bypass every admission gate. Unlike redaction,
+    // transforms also run on binary payloads (EB-92): a transform is an
+    // opaque user function with no field-path assumptions, so there is
+    // nothing structural to skip — a chain registered for a binary topic
+    // is the operator's explicit choice.
+    if (!preAdmitted && !admissionDlq) {
+      payload = this.applyTopicTransforms(topic, payload);
+    }
     // Topic pause (EB-88): the FIRST admission gate — before the
     // per-publisher rate limiter (EB-79), the ACL, the schema validator
     // and the size cap. In shed mode the publish is rejected outright:
@@ -27443,6 +27649,8 @@ export class EventBus {
       meanCompressionMs:
         this.totalCompressed > 0 ? this.totalCompressionTimeMs / this.totalCompressed : 0,
       redactedFields: this.totalRedactedFields,
+      transformCalls: this.totalTransformCalls,
+      transformErrors: this.totalTransformErrors,
       throttledSubscribers,
       degradedSubscribers,
       pausedSubscribers,
@@ -27602,6 +27810,8 @@ export class EventBus {
         duplicateMessages: stats.duplicateMessages,
         aliasRetiredMessages: stats.aliasRetiredMessages,
         redactedFields: stats.redactedFields,
+        transformCalls: stats.transformCalls,
+        transformErrors: stats.transformErrors,
         filteredMessages: stats.filteredMessages,
         signatureFailures: stats.signatureFailures,
         // Per-topic HMAC signing state (EB-84): present only when a

@@ -926,6 +926,30 @@ library.
   bytes), and `publishDelayed` redacts at schedule time — the persisted
   schedule record is already redacted, so the due-time fan-out does not
   redact again.
+- **Publish-side transform middleware chain** (in `src/bus.ts`, via
+  `setTopicTransforms(pattern, fns)`): per-topic pluggable transform
+  functions for payload normalization, PII scrubbing, and default-field
+  completion (real-time/backend systems). Every admitted publish to a
+  matching topic runs its payload through the chain in registration order
+  — after admission-time redaction and before every admission gate — so
+  schema validation, sequence-number assignment, the durable log, and
+  compression all see the transformed payload. The chain also runs in the
+  `publishAtomic` shadow admission and at `publishDelayed` schedule time;
+  the commit/due-time fan-outs are pre-admitted and never re-run it. A
+  throwing transform propagates to the publish caller (the schema-validator
+  convention) and the publish fails fast with zero side effects: no
+  sequence number consumed, nothing written to the durable log, no
+  rate-limit budget burned. This is the publish-side counterpart to the
+  subscriber-side message projection (EB-144): transforms mutate what is
+  stored and delivered, projections only change what one subscriber's
+  handler sees. `getStats()` exposes per-topic and global
+  `transformCalls`/`transformErrors`. Rule matching mirrors
+  `setTopicTtl`: an exact-topic chain wins over patterns, the
+  earliest-registered matching pattern wins (independent matcher cache —
+  never inflates `patternCacheSize`), and re-setting a pattern replaces
+  its chain; `clearTopicTransforms` removes a chain. Unset by default
+  (fully backward compatible). Empty patterns, non-array/empty `fns`, and
+  non-function elements throw `RangeError` at registration.
 - **Unified admission-rejection hook** (in `src/bus.ts`, via
   `EventBusOptions.onAdmissionRejected`): every publish-side admission
   rejection — schema-validation rejections, per-topic message-size
