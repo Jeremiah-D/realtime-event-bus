@@ -4806,3 +4806,48 @@ Sampling point and rules:
 Orthogonal to `SubscribeOptions.queueMaxBytes` (live queue byte
 waterline) and `setTopicMaxMessageBytes` (per-message hard cap): the
 histogram observes, the caps enforce.
+
+## Message projection (EB-144)
+
+`SubscribeOptions.project(payload => ...)` opts a subscription into a
+subscriber-side payload mapping — field masking, redaction, or shape
+narrowing per subscriber — evaluated just before the handler runs:
+
+```ts
+bus.subscribe('orders', (msg) => store(msg.payload), {
+  project: (payload) => {
+    const { ssn, ...safe } = payload;
+    return safe; // the handler never sees `ssn`
+  },
+});
+```
+
+Evaluation point and semantics:
+
+- **Evaluated in `drainSubscriber`, after the content `filter` and
+  before the handler** — a filtered message is never projected. The
+  projection sees the inflated (decompressed) payload.
+- **A delivery-time view, not a mutation**: the queue entry, the
+  durable log, sequence numbers and every other subscriber on the same
+  topic see the original payload. A second subscription without
+  `project` receives the message untouched.
+- **Throwing projections ride the handler's failure path**: health-probe
+  `consecutiveFailures` accounting and degradation, DLQ nack on
+  reliable subscriptions — the drain itself is never interrupted.
+- **Batch**: each message in the batch is projected independently.
+- **Reliable**: the at-least-once machinery (ack tracker, redelivery
+  counters, DLQ entries, requeues) stays keyed on the original
+  envelope; only the consumer-held `Delivery.msg` carries the projected
+  view. Redeliveries re-project, so the projection should be
+  deterministic for stable redelivery views.
+- **Stats**: `BusStats.projectedMessages` counts every invocation
+  (including ones that threw), `BusStats.projectErrors` counts the
+  throws, and `BusStats.projections` carries one row per live
+  projecting subscription.
+- **Validation**: a non-function `project` throws `TypeError` from
+  `subscribe`.
+
+Composes orthogonally with `filter` (narrow first, then shape),
+`verifySignature` (verified before projection, on the wire bytes),
+and admission-time `setTopicRedaction` (redaction already applied at
+publish; projection shapes the redacted payload per subscriber).

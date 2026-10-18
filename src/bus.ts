@@ -1428,6 +1428,32 @@ export interface SubscribeOptions {
    */
   filterExpr?: string;
   /**
+   * Opt-in subscriber-side message projection (EB-144): maps the
+   * payload just before it reaches the handler — field masking,
+   * redaction, or shape narrowing per subscriber. Evaluated in
+   * `drainSubscriber`, after the content `filter` (a filtered message is
+   * never projected) and before the handler, once per delivery: batched
+   * subscribers project each message independently, reliable
+   * subscribers re-project on every redelivery (the projection should
+   * be deterministic for stable redelivery views).
+   *
+   * The projection is a delivery-time view, not a mutation: the queue
+   * entry, the durable log, sequence numbers and every other
+   * subscriber (including one without `project` on the same topic) see
+   * the original payload. A throwing projection rides the same failure
+   * path as a throwing handler — health-probe `consecutiveFailures`
+   * accounting and degradation, DLQ nack on reliable subscriptions —
+   * without interrupting the drain.
+   *
+   * Counts into `BusStats.projectedMessages` (every invocation) and
+   * `BusStats.projectErrors` (throws), plus the per-subscriber
+   * `projections` rows. Must be a function when provided; anything else
+   * throws `TypeError` from `subscribe`. Disabled by default: a
+   * non-projecting subscriber pays a single undefined check per
+   * delivery.
+   */
+  project?: (payload: unknown) => unknown;
+  /**
    * Opt-in envelope signature verification (EB-84, backend security).
    * When true, every message fanned out to this subscriber is checked
    * against the topic's HMAC signing rules (`setTopicSigningKey`)
@@ -1892,6 +1918,18 @@ export interface ShadowSubscriberStat {
   dropped: number;
   /** Current depth of the shadow queue. */
   queueSize: number;
+}
+
+/** One per-subscriber message-projection counter row (EB-144). */
+export interface ProjectionStat {
+  /** The projecting subscription this row describes. */
+  subscriberId: string;
+  /** The topic pattern the subscriber registered. */
+  pattern: string;
+  /** Projection invocations on this subscription, including ones that threw. */
+  projectedMessages: number;
+  /** Projection throws on this subscription. */
+  projectErrors: number;
 }
 
 /**
@@ -4229,6 +4267,24 @@ export interface BusStats {
    */
   filteredMessages: number;
   /**
+   * Total message-projection invocations across all subscribers (see
+   * `SubscribeOptions.project`, EB-144). Counts every evaluation,
+   * including ones that threw.
+   */
+  projectedMessages: number;
+  /**
+   * Total message-projection throws across all subscribers (EB-144). A
+   * throwing projection rides the same failure path as a throwing
+   * handler.
+   */
+  projectErrors: number;
+  /**
+   * Per-subscriber projection counters (EB-144), in subscription order —
+   * one row per live subscription with `project` configured. Empty when
+   * no subscriber uses message projection.
+   */
+  projections: ProjectionStat[];
+  /**
    * Total messages discarded by `verifySignature` subscribers because the
    * envelope's HMAC signature was missing or invalid — the sum of every
    * topic's `signatureFailures`. See `TopicStats.signatureFailures` for
@@ -5417,6 +5473,19 @@ interface Subscriber {
    * Absent when the subscriber has no filter.
    */
   filter?: MessageFilter;
+  /**
+   * Subscriber-side message projection (see `SubscribeOptions.project`,
+   * EB-144): the delivery-time view mapping applied to the payload
+   * after the content filter and just before the handler. Absent when
+   * the subscriber has no projection. `projected`/`errors` count
+   * invocations and throws on this subscription (surfaced on
+   * `BusStats.projections`).
+   */
+  project?: {
+    fn: (payload: unknown) => unknown;
+    projected: number;
+    errors: number;
+  };
   /**
    * Compiled subscription filter expression (see
    * `SubscribeOptions.filterExpr`, EB-123). Absent when the subscriber
@@ -10493,6 +10562,18 @@ export class EventBus {
    */
   private totalFiltered = 0;
   /**
+   * Message-projection invocations across all subscribers (global
+   * total, see `SubscribeOptions.project`, EB-144). Counts every
+   * evaluation — including ones that threw.
+   */
+  private totalProjectedMessages = 0;
+  /**
+   * Message-projection throws across all subscribers (global total,
+   * EB-144). A throwing projection rides the same failure path as a
+   * throwing handler.
+   */
+  private totalProjectErrors = 0;
+  /**
    * Total messages suppressed by subscriber-side exactly-once dedup
    * (global total, see `SubscribeOptions.deduplicateMessages`). A
    * suppressed duplicate was already delivered once — it never re-enters
@@ -14863,6 +14944,13 @@ export class EventBus {
     if (filter !== undefined && typeof filter !== 'function') {
       throw new TypeError('filter must be a function');
     }
+    // Subscriber-side message projection (EB-144): validated before
+    // anything registers, so a throw leaves no half-registered
+    // subscriber behind.
+    const project = opts?.project;
+    if (project !== undefined && typeof project !== 'function') {
+      throw new TypeError('project must be a function');
+    }
     // Declarative filter expression (EB-123): compiled here — an
     // illegal expression throws RangeError from subscribe, before
     // anything registers, so a throw leaves no half-registered
@@ -15066,6 +15154,9 @@ export class EventBus {
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
       filter,
+      // Subscriber-side message projection (EB-144): the per-subscriber
+      // invocation/error counters start at zero with the function.
+      project: project === undefined ? undefined : { fn: project, projected: 0, errors: 0 },
       // Declarative filter expression (EB-123): the compiled form is
       // stored on the subscriber and evaluated at fan-out, right after
       // the predicate filter (see deliverUnkeyed / deliverShadow).
@@ -16671,7 +16762,13 @@ export class EventBus {
           // at-least-once envelope, so without a DLQ a fault 'error'
           // behaves exactly like a throwing handler (it escapes, like a
           // real throw would).
-          this.invokeChaosHandler(null, () => batchHandler(deliveries));
+          this.invokeChaosHandler(
+            null,
+            // Message projection (EB-144): each delivery's consumer view
+            // is projected independently — the tracked envelopes stay
+            // original, so the nack path below requeues originals.
+            () => batchHandler(this.projectReliableBatch(subscriber, deliveries)),
+          );
           // EB-72: the batch handler returned without throwing — idle
           // activity. The drain-level hooks skip reliable subscribers
           // (their wrapper can swallow throws via the DLQ nack path), so
@@ -16687,7 +16784,12 @@ export class EventBus {
           // Chaos (EB-103): see the dlq==null branch above — with a DLQ,
           // a fault 'error' is caught here and nacks the whole batch,
           // driving the deterministic redelivery-then-dead-letter path.
-          this.invokeChaosHandler(null, () => batchHandler(deliveries));
+          // A throwing projection is caught here too, nacking the whole
+          // batch exactly like a throwing batch handler.
+          this.invokeChaosHandler(
+            null,
+            () => batchHandler(this.projectReliableBatch(subscriber, deliveries)),
+          );
           // A nacked batch is a failed delivery, not activity — only the
           // clean return counts.
           this.recordIdleActivity(subscriber, 'deliver');
@@ -16704,8 +16806,13 @@ export class EventBus {
       if (dlq == null) {
         // Chaos (EB-103): the fault hits the user handler inside the
         // at-least-once envelope — a fault 'error' without a DLQ escapes
-        // exactly like a real throwing handler would.
-        this.invokeChaosHandler(null, () => singleHandler(delivery));
+        // exactly like a real throwing handler would. Message projection
+        // (EB-144): the consumer-held handle carries the projected view
+        // while the tracked envelope stays original.
+        this.invokeChaosHandler(
+          null,
+          () => singleHandler(this.projectReliableDelivery(subscriber, delivery)),
+        );
         // EB-72: the handler returned without throwing — idle activity
         // (see the batch path above for why this lives in the wrapper).
         this.recordIdleActivity(subscriber, 'deliver');
@@ -16721,8 +16828,13 @@ export class EventBus {
       try {
         // Chaos (EB-103): with a DLQ, a fault 'error' is caught here and
         // nacks the delivery — the deterministic path to redelivery and,
-        // past the budget, the dead-letter queue (EB-28 reproduction).
-        this.invokeChaosHandler(null, () => singleHandler(delivery));
+        // past the budget, the dead-letter queue (EB-28 reproduction). A
+        // throwing projection is caught here too and nacks the delivery
+        // exactly like a throwing handler.
+        this.invokeChaosHandler(
+          null,
+          () => singleHandler(this.projectReliableDelivery(subscriber, delivery)),
+        );
         // A nacked delivery is a failed delivery, not activity — only
         // the clean return counts.
         this.recordIdleActivity(subscriber, 'deliver');
@@ -26616,6 +26728,7 @@ export class EventBus {
     const fairScheduledByTopic = new Map<string, number>();
     const fairDeficits = new Map<string, number>();
     const shadows: BusStats['shadows'] = [];
+    const projections: BusStats['projections'] = [];
     const replayProgress: BusStats['replayProgress'] = [];
     const hotKeys: HotKeyStat[] = [];
     let causalBufferDepth = 0;
@@ -26646,6 +26759,18 @@ export class EventBus {
           shadowed: shadow.delivered,
           dropped: shadow.dropped,
           queueSize: subscriber.queue.size,
+        });
+      }
+      // Message projection counters (EB-144): one row per live
+      // projecting subscriber, in subscription order — a pure read of
+      // the live counters, so the accounting is never disturbed.
+      const projection = subscriber.project;
+      if (projection !== undefined) {
+        projections.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          projectedMessages: projection.projected,
+          projectErrors: projection.errors,
         });
       }
       // Durable-log replay progress (EB-71): one row per subscription
@@ -26967,6 +27092,9 @@ export class EventBus {
       })),
       opsAlert: this.opsAlerter?.getStats() ?? { sent: 0, failed: 0, suppressed: 0 },
       filteredMessages: this.totalFiltered,
+      projectedMessages: this.totalProjectedMessages,
+      projectErrors: this.totalProjectErrors,
+      projections,
       signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
       autoReplayed: this.totalAutoReplayed,
@@ -28581,6 +28709,102 @@ export class EventBus {
   }
 
   /**
+   * Applies the subscriber's message projection (EB-144): returns the
+   * original envelope when no projection is configured, otherwise a
+   * shallow copy whose `payload` is the projected value. The queue
+   * entry, the durable log, sequence numbers and every other subscriber
+   * are untouched — the projection is an in-memory delivery-time view,
+   * never a mutation. Counts the invocation (per-subscriber and
+   * global); on throw, counts the error and lets it propagate so the
+   * caller runs the same failure path a throwing handler would
+   * (health-probe accounting, DLQ nack, mid-drain requeue semantics).
+   */
+  private projectMessageView(subscriber: Subscriber, msg: BusMessage): BusMessage {
+    const project = subscriber.project;
+    // Reliable subscribers project inside the at-least-once wrapper
+    // (`projectReliableDelivery`), where the ack tracker can stay keyed
+    // on the original envelope — projecting here would re-key the
+    // tracker, the redelivery counters and the DLQ on the projected
+    // view, and requeues would double-project.
+    if (project === undefined || subscriber.reliable != null) return msg;
+    return this.applyProjection(project, msg);
+  }
+
+  /**
+   * The projection evaluation shared by the plain and reliable paths:
+   * counts the invocation, evaluates, counts a throw and rethrows.
+   */
+  private applyProjection(
+    project: NonNullable<Subscriber['project']>,
+    msg: BusMessage,
+  ): BusMessage {
+    project.projected += 1;
+    this.totalProjectedMessages += 1;
+    let projected: unknown;
+    try {
+      projected = project.fn(msg.payload);
+    } catch (err) {
+      project.errors += 1;
+      this.totalProjectErrors += 1;
+      throw err;
+    }
+    return { ...msg, payload: projected };
+  }
+
+  /**
+   * Batch variant of `projectMessageView` (EB-144): each message is
+   * projected independently, so one bad payload aborts only via the
+   * same path a throwing batch handler would take. Returns the input
+   * array untouched when no projection is configured.
+   */
+  private projectBatchView(subscriber: Subscriber, batch: BusMessage[]): BusMessage[] {
+    if (subscriber.project === undefined) return batch;
+    return batch.map((msg) => this.projectMessageView(subscriber, msg));
+  }
+
+  /**
+   * Applies the subscriber's message projection to a reliable delivery
+   * (EB-144): the tracked delivery keeps the ORIGINAL envelope — the
+   * ack tracker, redelivery counters, DLQ entries and requeues all key
+   * off it — while the consumer-held handle carries the projected view.
+   * The batch-handle ownership registry (EB-107) is re-pointed at the
+   * consumer-held object so `ackBatch`/`nackBatch` keep resolving. A
+   * projection throw propagates to the caller, riding the same path a
+   * throwing handler would (DLQ nack, health-probe accounting).
+   */
+  private projectReliableDelivery(
+    subscriber: Subscriber,
+    delivery: Delivery<BusMessage>,
+  ): Delivery<BusMessage> {
+    const project = subscriber.project;
+    if (project === undefined) return delivery;
+    const projected = this.applyProjection(project, delivery.msg);
+    const view: Delivery<BusMessage> = { ...delivery, msg: projected };
+    const reliable = subscriber.reliable;
+    if (reliable !== undefined) {
+      const entry = reliable.batchHandles.get(delivery);
+      if (entry !== undefined) {
+        reliable.batchHandles.delete(delivery);
+        reliable.batchHandles.set(view, entry);
+      }
+    }
+    return view;
+  }
+
+  /**
+   * Batch variant of `projectReliableDelivery` (EB-144): each delivery
+   * is projected independently; a throw aborts the batch exactly like a
+   * throwing batch handler.
+   */
+  private projectReliableBatch(
+    subscriber: Subscriber,
+    deliveries: Array<Delivery<BusMessage>>,
+  ): Array<Delivery<BusMessage>> {
+    if (subscriber.project === undefined) return deliveries;
+    return deliveries.map((delivery) => this.projectReliableDelivery(subscriber, delivery));
+  }
+
+  /**
    * Drains one subscriber's queue and delivers the dequeued messages,
    * honoring delivery-side rate shaping when enabled. A shaped subscriber
    * dequeues at most what its token budget allows this round (whole tokens
@@ -28760,13 +28984,21 @@ export class EventBus {
             let result: unknown;
             if (invocationSlo == null) {
               result = this.deliverTraced(subscriber, msg, () =>
-                this.invokeChaosHandler(subscriber, () => subscriber.handler(msg)),
+                this.invokeChaosHandler(
+                  subscriber,
+                  // Message projection (EB-144): the handler sees the
+                  // projected view; a throwing projection propagates
+                  // exactly like a throwing handler.
+                  () => subscriber.handler(this.projectMessageView(subscriber, msg)),
+                ),
               );
             } else {
               const processingStartedAtMs = this.now();
               try {
                 result = this.deliverTraced(subscriber, msg, () =>
-                  this.invokeChaosHandler(subscriber, () => subscriber.handler(msg)),
+                  this.invokeChaosHandler(subscriber, () =>
+                    subscriber.handler(this.projectMessageView(subscriber, msg)),
+                  ),
                 );
               } finally {
                 this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
@@ -29082,7 +29314,16 @@ export class EventBus {
         this.deliverBatchTraced(subscriber, live, () =>
           // Chaos (EB-103): one fault evaluation per batch invocation —
           // a throwing batch counts once, mirroring the health accounting.
-          this.invokeChaosHandler(subscriber, () => subscriber.handler(live as unknown as BusMessage)),
+          // Message projection (EB-144): each message is projected
+          // independently before the batch handler runs; a throwing
+          // projection propagates exactly like a throwing batch handler.
+          this.invokeChaosHandler(
+            subscriber,
+            () =>
+              subscriber.handler(
+                this.projectBatchView(subscriber, live) as unknown as BusMessage,
+              ),
+          ),
         );
         // EB-72: the batch handler returned without throwing — idle
         // activity. Reliable batches record inside their at-least-once
@@ -29140,7 +29381,14 @@ export class EventBus {
     try {
       // Chaos (EB-103): a handler-target fault throws here and is counted
       // as one batch failure below — mirroring deliverWithHealth.
-      this.invokeChaosHandler(subscriber, () => subscriber.handler(batch as unknown as BusMessage));
+      // Message projection (EB-144): each message is projected
+      // independently inside this try, so a throwing projection counts
+      // as one batch failure exactly like a throwing batch handler.
+      this.invokeChaosHandler(
+        subscriber,
+        () =>
+          subscriber.handler(this.projectBatchView(subscriber, batch) as unknown as BusMessage),
+      );
     } catch {
       failed = true;
     }
@@ -29623,8 +29871,14 @@ export class EventBus {
       try {
         // Chaos (EB-103): a handler-target fault throws here and is
         // counted as a handler failure by the accounting below —
-        // exactly like a real throwing handler.
-        result = this.invokeChaosHandler(subscriber, () => subscriber.handler(msg));
+        // exactly like a real throwing handler. Message projection
+        // (EB-144) is evaluated inside this try for the same reason: a
+        // throwing projection counts as a handler failure (consecutive
+        // failures, degradation) without interrupting the drain.
+        result = this.invokeChaosHandler(
+          subscriber,
+          () => subscriber.handler(this.projectMessageView(subscriber, msg)),
+        );
       } catch {
         failed = true;
       }
