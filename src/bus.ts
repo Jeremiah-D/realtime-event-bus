@@ -2399,6 +2399,21 @@ export interface DeadLetterOptions {
    */
   maxEntries?: number;
   /**
+   * Opt-in time-to-live for DLQ entries, in milliseconds (EB-145). When
+   * set, an entry expires `maxAgeMs` after its `deadLetteredAt`,
+   * measured on the bus clock (`EventBusOptions.now`), and is lazily
+   * dropped — at `getDeadLetterMessages` / `replayDeadLetter` time, and
+   * before the `maxEntries` bounded eviction runs when a new message is
+   * dead-lettered. Expired entries are counted in
+   * `BusStats.dlqExpiredMessages`, never replayed (replaying an expired
+   * entry is a no-op returning false, and a pending auto-replay for one
+   * is dropped instead of resurrecting it), and shed before any
+   * non-expired entry when the DLQ is full (expire-first, then oldest).
+   * Must be a positive finite number when given. Disabled by default
+   * (backward compatible).
+   */
+  maxAgeMs?: number;
+  /**
    * Fired when a message enters the subscriber's DLQ — once per
    * dead-lettering, synchronously with the move.
    */
@@ -4298,6 +4313,13 @@ export interface BusStats {
    */
   deadLetteredMessages: number;
   /**
+   * Total DLQ entries dropped by the opt-in per-entry TTL (EB-145, see
+   * `DeadLetterOptions.maxAgeMs`). Each expired entry is counted once,
+   * when the lazy sweep removes it. Always 0 when no DLQ has
+   * `maxAgeMs` configured.
+   */
+  dlqExpiredMessages: number;
+  /**
    * Total dead-letter auto-replays fired (EB-134, see
    * `DeadLetterOptions.autoReplay`).
    */
@@ -5725,6 +5747,13 @@ interface SubscriberDeadLetter {
   entries: Array<DeadLetterEntry & { msg: BusMessage }>;
   maxRedeliveries: number;
   maxEntries: number;
+  /**
+   * Opt-in per-entry TTL in milliseconds (EB-145), or undefined when
+   * disabled. An entry expires `maxAgeMs` after its `deadLetteredAt` on
+   * the bus clock and is lazily dropped at query/replay/dead-letter
+   * time.
+   */
+  maxAgeMs?: number;
   nextSeq: number;
   onDeadLetter?: (event: DeadLetterEvent) => void;
   diagnosticTopic?: string;
@@ -6070,7 +6099,7 @@ function thrownErrorMessage(err: unknown): string {
 function normalizeDeadLetterOptions(
   opt: boolean | DeadLetterOptions | undefined,
   caller: string,
-): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned'> | null {
+): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned'> | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError(`${caller}: deadLetter must be true or a DeadLetterOptions object`);
@@ -6078,11 +6107,15 @@ function normalizeDeadLetterOptions(
   const o: DeadLetterOptions = opt === true ? {} : opt;
   const maxRedeliveries = o.maxRedeliveries ?? 5;
   const maxEntries = o.maxEntries ?? 1000;
+  const maxAgeMs = o.maxAgeMs;
   if (!Number.isInteger(maxRedeliveries) || maxRedeliveries < 0) {
     throw new RangeError(`${caller}: deadLetter.maxRedeliveries must be a non-negative integer`);
   }
   if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
     throw new RangeError(`${caller}: deadLetter.maxEntries must be a positive integer`);
+  }
+  if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
+    throw new RangeError(`${caller}: deadLetter.maxAgeMs must be a positive finite number of milliseconds`);
   }
   if (o.onDeadLetter !== undefined && typeof o.onDeadLetter !== 'function') {
     throw new TypeError(`${caller}: deadLetter.onDeadLetter must be a function`);
@@ -6125,6 +6158,7 @@ function normalizeDeadLetterOptions(
   return {
     maxRedeliveries,
     maxEntries,
+    maxAgeMs,
     onDeadLetter: o.onDeadLetter,
     diagnosticTopic,
     autoReplay,
@@ -10587,6 +10621,12 @@ export class EventBus {
    * including replays that failed again.
    */
   private totalDeadLettered = 0;
+  /**
+   * Total DLQ entries dropped by the opt-in per-entry TTL (EB-145, see
+   * `DeadLetterOptions.maxAgeMs`). Counts each expired entry exactly
+   * once, at the moment the lazy sweep removes it.
+   */
+  private totalDlqExpired = 0;
   /**
    * Total dead-letter auto-replays fired (EB-134). Counts each time a
    * scheduled auto-replay re-enqueues a message.
@@ -27097,6 +27137,7 @@ export class EventBus {
       projections,
       signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
+      dlqExpiredMessages: this.totalDlqExpired,
       autoReplayed: this.totalAutoReplayed,
       autoReplayExhausted: this.totalAutoReplayExhausted,
       poisoned: this.totalPoisoned,
@@ -27491,7 +27532,9 @@ export class EventBus {
    * `ReliableSubscribeOptions.deadLetter`). The original message object
    * is kept — replay requeues the identical object, so its per-topic
    * `seq` and TTL deadline survive the round trip. The DLQ is bounded by
-   * `maxEntries`: the oldest entry is evicted when full.
+   * `maxEntries`: the oldest entry is evicted when full; when
+   * `maxAgeMs` is configured, expired entries are shed first
+   * (expire-first, then oldest — see EB-145).
    */
   private moveToDeadLetter(
     subscriber: Subscriber,
@@ -27501,6 +27544,10 @@ export class EventBus {
   ): void {
     const dlq = subscriber.deadLetter;
     if (dlq == null) return;
+    // EB-145: expired entries are shed before the bounded eviction runs
+    // — expire-first, then oldest — so a full DLQ drops its dead entries
+    // before shedding live ones.
+    this.sweepExpiredDlqEntries(dlq);
     let evictedOldest = false;
     if (dlq.entries.length >= dlq.maxEntries) {
       const evicted = dlq.entries.shift();
@@ -27645,6 +27692,12 @@ export class EventBus {
     const idx = dlq.entries.findIndex((e) => e.seq === seq);
     if (idx === -1) return;
     const [record] = dlq.entries.splice(idx, 1);
+    // EB-145: an entry that aged out of its TTL is never resurrected by
+    // a pending auto-replay — count it as expired and stop.
+    if (this.dlqEntryExpired(dlq, record)) {
+      this.totalDlqExpired += 1;
+      return;
+    }
     // Fresh redelivery budget for the replayed message (like
     // `replayDeadLetter`): the auto-replay is a new chance, not a
     // continuation of the poison run.
@@ -27656,6 +27709,43 @@ export class EventBus {
     this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg), true);
     this.scheduleFlush();
     this.totalAutoReplayed += 1;
+  }
+
+  /**
+   * Lazily drops DLQ entries past `DeadLetterOptions.maxAgeMs` (EB-145):
+   * an entry expires `maxAgeMs` after its `deadLetteredAt`, measured on
+   * the bus clock. Expired entries are removed in place and each one is
+   * counted in `totalDlqExpired`; a pending auto-replay for a dropped
+   * entry is cancelled — an expired entry must never be resurrected by
+   * EB-134. No-op when `maxAgeMs` is unset: the TTL is strictly
+   * opt-in. Returns the number of entries dropped.
+   */
+  private sweepExpiredDlqEntries(dlq: SubscriberDeadLetter): number {
+    const maxAgeMs = dlq.maxAgeMs;
+    if (maxAgeMs === undefined) return 0;
+    const nowMs = this.now();
+    let expired = 0;
+    for (let i = 0; i < dlq.entries.length; i += 1) {
+      const record = dlq.entries[i];
+      if (record.deadLetteredAt + maxAgeMs > nowMs) continue;
+      dlq.entries.splice(i, 1);
+      i -= 1;
+      const timer = dlq.pendingAutoReplays.get(record.seq);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        dlq.pendingAutoReplays.delete(record.seq);
+      }
+      dlq.autoReplayAttemptsInFlight.delete(record.msg);
+      expired += 1;
+    }
+    if (expired > 0) this.totalDlqExpired += expired;
+    return expired;
+  }
+
+  /** True when a DLQ entry is past its `maxAgeMs` TTL (EB-145). */
+  private dlqEntryExpired(dlq: SubscriberDeadLetter, record: DeadLetterEntry): boolean {
+    const maxAgeMs = dlq.maxAgeMs;
+    return maxAgeMs !== undefined && record.deadLetteredAt + maxAgeMs <= this.now();
   }
 
   /**
@@ -27671,6 +27761,10 @@ export class EventBus {
    * `opts.limit` caps the result to the most recently dead-lettered
    * entries — poison-message triage usually wants the newest failures
    * first. Must be a positive integer when given.
+   *
+   * EB-145: when the subscriber's DLQ has `maxAgeMs` configured, entries
+   * past their TTL are lazily dropped here (counted in
+   * `BusStats.dlqExpiredMessages`) before the result is built.
    */
   getDeadLetterMessages(subId: string, opts?: { limit?: number }): DeadLetterEntry[] {
     const subscriber = this.subscribers.get(subId);
@@ -27681,6 +27775,7 @@ export class EventBus {
         throw new RangeError('getDeadLetterMessages: limit must be a positive integer');
       }
     }
+    if (subscriber.deadLetter !== undefined) this.sweepExpiredDlqEntries(subscriber.deadLetter);
     const entries = subscriber.deadLetter?.entries ?? [];
     const windowed =
       opts?.limit === undefined ? entries : entries.slice(-opts.limit);
@@ -27700,12 +27795,17 @@ export class EventBus {
    * Returns true when the entry was found and requeued, false when the
    * subscriber has no DLQ or no entry with that `seq`. Throws on an
    * unknown subscriber id.
+   *
+   * EB-145: with `maxAgeMs` configured, an expired entry is not
+   * resurrected — the lazy sweep drops it first (counted in
+   * `BusStats.dlqExpiredMessages`) and the call returns false.
    */
   replayDeadLetter(subId: string, seq: number): boolean {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     const dlq = subscriber.deadLetter;
     if (dlq == null) return false;
+    this.sweepExpiredDlqEntries(dlq);
     const idx = dlq.entries.findIndex((e) => e.seq === seq);
     if (idx === -1) return false;
     const [record] = dlq.entries.splice(idx, 1);
