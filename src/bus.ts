@@ -4665,6 +4665,11 @@ export interface BusStats {
    */
   consumerGroups: Array<{ groupId: string; pattern: string; members: number; partitions?: number }>;
   /**
+   * Operator-paused consumer groups (EB-141): groupIds currently held by
+   * `pauseGroup`, sorted. Empty when no group is paused.
+   */
+  pausedGroups: string[];
+  /**
    * Per-topic subscriber caps (EB-81): one entry per registered
    * `setTopicMaxSubscribers` rule, in registration order — the rule key,
    * its cap, and the live subscriber count currently resolved against
@@ -10510,6 +10515,16 @@ export class EventBus {
    */
   private groupMembers = new Map<string, string[]>();
   /**
+   * Operator-paused consumer groups (EB-141): groupIds whose delivery is
+   * held. While a groupId is present here `drainSubscriber` skips every
+   * member of every competing set under that groupId — per-member
+   * backlogs stay queued under their normal backpressure policies until
+   * `resumeGroup`. The pause is sticky across member churn: a groupId
+   * paused and later re-created stays paused until resumed. Deleted only
+   * by `resumeGroup`.
+   */
+  private pausedGroups = new Set<string>();
+  /**
    * Round-robin cursor per group key. Monotonic — the modulo is applied at
    * use — so join/leave churn never repeats or skips an assignment
    * position. Deleted when the group's last member leaves.
@@ -15396,6 +15411,7 @@ export class EventBus {
     this.scheduleFlush();
     return true;
   }
+
   /**
    * Subscription migration (EB-82): point-in-time backlog reading for
    * one subscriber. `unackedCount` is passed in because an export
@@ -26272,6 +26288,7 @@ export class EventBus {
           ...(partitions === undefined ? {} : { partitions }),
         };
       }),
+      pausedGroups: [...this.pausedGroups].sort(),
       groupLag: this.groupLagRowsFor(undefined),
       lagSloBreaches: this.groupLagMonitor.lagSloBreaches(),
       replayProgress,
@@ -26890,6 +26907,76 @@ export class EventBus {
     });
     this.scheduleFlush();
     return true;
+  }
+
+  /**
+   * Pauses delivery to a whole consumer group (EB-141): an
+   * operator-controlled, group-level hold, the group counterpart to
+   * `pauseSubscriber` (EB-113). While paused, every competing set under
+   * `groupId` keeps assigning and enqueueing — per-member backlogs stay
+   * queued under their normal backpressure policies — but the drain
+   * skips every member, so nothing is delivered until `resumeGroup`.
+   *
+   * Membership changes are unaffected: joins and leaves still fire
+   * `rebalance` and invalidate the assignment; the new assignment simply
+   * accumulates instead of delivering. The pause is sticky across churn:
+   * a group re-created under a paused groupId stays paused until
+   * resumed.
+   *
+   * Returns true when the group was newly paused, false when it was
+   * already paused (idempotent — no duplicate audit). Audited as
+   * `group_paused`. Throws `RangeError` on an empty groupId and on a
+   * groupId with no live competing set.
+   */
+  pauseGroup(groupId: string): boolean {
+    this.assertKnownGroupId(groupId, 'pauseGroup');
+    if (this.pausedGroups.has(groupId)) return false;
+    this.pausedGroups.add(groupId);
+    this.auditSubscription({
+      action: 'group_paused',
+      actor: 'system',
+      groupId,
+    });
+    return true;
+  }
+
+  /**
+   * Resumes delivery to a paused consumer group (see `pauseGroup`):
+   * clears the group hold and schedules a flush so the preserved
+   * per-member backlogs are delivered promptly, in queue order — the
+   * group picks up exactly where delivery paused.
+   *
+   * Returns true when the group was paused and is now resumed, false
+   * when it was not paused (idempotent — no duplicate audit). Audited
+   * as `group_resumed`. Throws `RangeError` on an empty groupId and on
+   * a groupId with no live competing set.
+   */
+  resumeGroup(groupId: string): boolean {
+    this.assertKnownGroupId(groupId, 'resumeGroup');
+    if (!this.pausedGroups.delete(groupId)) return false;
+    this.auditSubscription({
+      action: 'group_resumed',
+      actor: 'system',
+      groupId,
+    });
+    this.scheduleFlush();
+    return true;
+  }
+
+  /**
+   * Shared validation for the group pause/resume operators: the groupId
+   * must be a non-empty string and must name at least one live competing
+   * set (`groupMembers` entry). Throws `RangeError`.
+   */
+  private assertKnownGroupId(groupId: string, caller: string): void {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError(`${caller}: groupId must be a non-empty string`);
+    }
+    const prefix = `${groupId}\0`;
+    for (const key of this.groupMembers.keys()) {
+      if (key.startsWith(prefix)) return;
+    }
+    throw new RangeError(`${caller}: unknown consumer group "${groupId}"`);
   }
 
   /**
@@ -27741,6 +27828,14 @@ export class EventBus {
     // backpressure policy until `resumeSubscriber`. Orthogonal to the
     // health probe: degraded recovery never clears a manual pause.
     if (subscriber.manuallyPaused === true) return;
+    // Consumer-group operator pause (EB-141): the same skip semantics —
+    // every member of a paused group keeps its backlog queued under its
+    // normal backpressure policy until `resumeGroup(groupId)`. Join/leave
+    // still rebalances (assignment keeps moving), but nothing is
+    // delivered while the group is paused. Orthogonal to the per-member
+    // gates above: a member that is both degraded and group-paused stays
+    // paused until both clear.
+    if (subscriber.groupId !== undefined && this.pausedGroups.has(subscriber.groupId)) return;
     // Batched subscribers collect messages across flush rounds instead of
     // delivering one message per handler call (see drainBatchedSubscriber).
     if (subscriber.batch != null) {

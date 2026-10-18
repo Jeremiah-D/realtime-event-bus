@@ -47,6 +47,8 @@ export type SubscriptionAuditAction =
   | 'group_join'
   | 'group_leave'
   | 'group_session_expired'
+  | 'group_paused'
+  | 'group_resumed'
   | 'rebalance'
   | 'topic_register'
   | 'topic_deregister'
@@ -166,6 +168,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'update_pattern',
   'group_join',
   'group_leave',
+  'group_paused',
+  'group_resumed',
   'rebalance',
   'topic_register',
   'topic_deregister',

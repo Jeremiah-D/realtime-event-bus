@@ -2774,6 +2774,50 @@ How it works:
   the subscription audit log as `topic_paused` (`{ mode }`) and
   `topic_resumed` (`{ mode, drainedMessages }`).
 
+## Consumer group pause / resume (ops window)
+
+`pauseGroup` / `resumeGroup` (`src/bus.ts`, EB-141 — real-time systems /
+operability): the group-level counterpart to `pauseSubscriber` (EB-113)
+and `pauseTopic` (EB-88). Hold a whole consumer group during a deploy or
+incident — delivery stops, the backlog is retained, resume picks up
+exactly where delivery paused:
+
+```ts
+bus.pauseGroup('workers'); // -> true; members stop receiving
+bus.publish('jobs.email', job); // admitted, assigned, queued — not delivered
+bus.getStats().pausedGroups; // ['workers']
+bus.resumeGroup('workers'); // -> true; queued backlog drains in order
+```
+
+How it works:
+
+- **Hold semantics** — pausing is delivery-side only. Publishing,
+  admission, group assignment (round-robin cursor or deterministic
+  partition ownership) and per-member enqueueing all continue normally;
+  only the drain skips members of a paused group. Each member's backlog
+  stays queued under its normal backpressure policy (`backpressure` /
+  `dropPolicy` / `queueMaxBytes` behave exactly as unpaused), so a long
+  pause sheds per the member's own policy — the pause itself drops
+  nothing. Resume schedules a flush; every member drains its preserved
+  backlog in queue order.
+- **Membership churn** — joins and leaves still fire `rebalance` and
+  invalidate the assignment while paused; the new assignment simply
+  accumulates instead of delivering. The pause is sticky: a groupId that
+  is paused, fully drained of members, and re-created stays paused until
+  `resumeGroup`.
+- **Scope** — one call pauses every competing set under the groupId (the
+  same groupId on two patterns pauses both). Other groups and plain
+  subscribers are unaffected. Orthogonal to the per-member gates: a
+  member that is degraded (EB-18) or manually paused (EB-113) stays held
+  until that gate clears too.
+- **Validation** — empty groupIds and groupIds with no live competing
+  set throw `RangeError`. Both calls are idempotent: pausing an already
+  paused group (or resuming a non-paused one) returns `false` and emits
+  no duplicate audit entry.
+- **Observability** — `getStats().pausedGroups` lists the paused groupIds
+  (sorted). Pauses and resumes are recorded in the subscription audit log
+  as `group_paused` / `group_resumed` (both carrying `groupId`).
+
 ## Cancelling delayed deliveries by topic
 
 `cancelDelayedByTopic(topicPattern)` (`src/bus.ts`, EB-89) cancels every
