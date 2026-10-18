@@ -1856,6 +1856,43 @@ export interface PullOptions {
 }
 
 /**
+ * Options for `EventBus.poll` (EB-148), the synchronous cursor-based
+ * poll. Unlike `pull`'s long-polling `PullOptions`, this is a pure
+ * snapshot read: the call returns immediately with the messages available
+ * at call time.
+ */
+export interface SyncPollOptions {
+  /**
+   * Maximum number of messages to return. Required; must be an integer
+   * `>= 1`, otherwise `poll` throws `RangeError`.
+   */
+  maxMessages: number;
+  /**
+   * Exclusive per-topic cursor (default `0`): only messages with
+   * `seq > cursor` are returned. The cursor space is the topic's own
+   * sequence numbers (EB-13) — the same numbers push subscribers see on
+   * `BusMessage.seq` and `pull` sees as `fromOffset`. `poll` returns
+   * `nextCursor` for the next page; an empty page returns the input
+   * cursor unchanged. Must be an integer `>= 0`, otherwise `RangeError`.
+   */
+  cursor?: number;
+  /**
+   * Accepted and validated (finite number `>= 0`, otherwise `RangeError`)
+   * for API forward-compatibility, but the synchronous poll never blocks
+   * on it — it returns the messages available at call time. For
+   * long-polling, use `pull` with `waitMs`.
+   */
+  timeoutMs?: number;
+  /**
+   * Tenant namespace: resolved to the concrete `<namespace>/<topic>`
+   * exactly like `pull`/`publish`/`subscribe`, with the same
+   * unknown-namespace (`RangeError`) and subscribe-disallowed
+   * (`NamespaceDeniedError`) failures.
+   */
+  namespace?: string;
+}
+
+/**
  * One message returned by `EventBus.pull` (EB-111). The `payload` is the
  * application payload — the same value a push subscriber's handler
  * receives (compressed payloads are inflated, binary payloads stay
@@ -4198,6 +4235,17 @@ export interface BusStats {
     pulls: number;
     pulledMessages: number;
     longPollTimeouts: number;
+  };
+  /**
+   * Synchronous poll-mode consumption counters (EB-148): `polls` counts
+   * `poll()` calls, `polledMessages` the messages those calls returned.
+   * Independent of both the push delivery metrics and `pull`'s
+   * `pullStats` — polled messages never enter the delivery counters.
+   * Always present, so readers never need a fallback.
+   */
+  syncPollStats: {
+    polls: number;
+    polledMessages: number;
   };
   /**
    * Total publish/subscribe operations denied by the broker-level ACL
@@ -11139,6 +11187,9 @@ export class EventBus {
   private totalPulls = 0;
   private totalPulledMessages = 0;
   private totalLongPollTimeouts = 0;
+  /** Synchronous-poll counters surfaced as `getStats().syncPollStats` (EB-148). */
+  private totalSyncPolls = 0;
+  private totalSyncPolledMessages = 0;
   /**
    * Attached outbox relay (EB-102), present only after
    * `attachOutboxRelay`. Its lag feeds `getStats()` (`outboxPending` /
@@ -20067,6 +20118,91 @@ export class EventBus {
   }
 
   /**
+   * Synchronous cursor-based poll (EB-148): the batch/ETL counterpart to
+   * the async long-poll `pull` (EB-111). Returns up to `opts.maxMessages`
+   * messages on the exact topic with `seq > (opts.cursor ?? 0)`, in
+   * ascending `seq` order, as `{ messages, nextCursor }` — pass
+   * `nextCursor` back as `cursor` to walk the topic's history one page at
+   * a time (`while ((page = bus.poll(t, { maxMessages: 1000, cursor })).messages.length > 0) { cursor = page.nextCursor; }`),
+   * the natural shape for batch backfill, ETL export, and disaster
+   * recovery (complementing the push-side resume of EB-42).
+   *
+   * Semantics, and how they differ from `pull`:
+   * - **Synchronous, no waiting.** `poll` returns immediately with the
+   *   messages available at call time — it never long-polls. For
+   *   long-polling, use `pull`. `opts.timeoutMs` is accepted and
+   *   validated for API forward-compatibility but the synchronous poll
+   *   never blocks on it.
+   * - **Server-returned cursor.** Unlike `pull`'s caller-owned
+   *   `fromOffset`, `poll` returns `nextCursor` — the last returned
+   *   message's `seq`, or the input cursor when nothing was returned —
+   *   so the caller never computes offsets itself.
+   * - **Same read path as `pull`.** With `EventBusOptions.durableLogDir`
+   *   the source is the durable log (`readSince`); otherwise the
+   *   per-topic in-memory pull ring. Compressed payloads are inflated,
+   *   TTL-expired records are skipped, and pulling never touches push
+   *   subscriber progress or committed offsets (EB-32) — pull and push
+   *   are independent consumption contracts on the same stream, and
+   *   pulled messages never enter the `AckTracker`.
+   * - **Independent counters.** Polls are counted in
+   *   `getStats().syncPollStats` (`polls`/`polledMessages`), separate
+   *   from both the push delivery metrics and `pull`'s `pullStats`.
+   *
+   * Validation throws `RangeError` before anything is read: an empty
+   * topic, a pattern topic, `maxMessages < 1`, a negative/non-finite
+   * `timeoutMs`, or a negative/non-integer `cursor`. A denied namespace
+   * or an unauthorized topic throws exactly like `pull`/`subscribe` do.
+   */
+  poll(topic: string, opts: SyncPollOptions): { messages: PulledMessage[]; nextCursor: number } {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('poll: topic must be a non-empty string');
+    }
+    if (topic.includes('*')) {
+      throw new RangeError(
+        'poll: topic must be an exact topic name — patterns are not supported ' +
+          "(poll offsets live in one topic's sequence space; a pattern fan-out would mix sequence spaces)",
+      );
+    }
+    const maxMessages = opts.maxMessages;
+    if (!Number.isInteger(maxMessages) || maxMessages < 1) {
+      throw new RangeError('poll: maxMessages must be an integer >= 1');
+    }
+    const cursor = opts.cursor ?? 0;
+    if (!Number.isInteger(cursor) || cursor < 0) {
+      throw new RangeError('poll: cursor must be an integer >= 0');
+    }
+    // Accepted and validated for API forward-compatibility (see
+    // `SyncPollOptions.timeoutMs`): the synchronous poll never blocks.
+    const timeoutMs = opts.timeoutMs ?? 0;
+    if (
+      typeof timeoutMs !== 'number' ||
+      !Number.isFinite(timeoutMs) ||
+      timeoutMs < 0 ||
+      timeoutMs > 2147483647
+    ) {
+      throw new RangeError('poll: timeoutMs must be a finite number >= 0');
+    }
+    // Multi-tenant namespace (EB-52): resolved exactly like `pull` /
+    // `subscribe` — the concrete `<namespace>/<topic>` is the poll topic.
+    const scope = this.resolveNamespaceForSubscribe(opts.namespace, topic);
+    if (scope !== undefined) topic = scope.internalPattern;
+    // Broker-level ACL: same verdict as `pull` / `subscribe` — an
+    // unauthorized poll is audited and rejected, never answered with
+    // silence.
+    if (!this.aclAllowsSubscribe(topic)) {
+      this.emitAuthzDenied('subscribe', undefined, topic);
+      throw new AclDeniedError('subscribe', topic);
+    }
+    this.totalSyncPolls += 1;
+    const messages = this.readPullAvailable(topic, cursor, maxMessages);
+    this.totalSyncPolledMessages += messages.length;
+    return {
+      messages,
+      nextCursor: messages.length > 0 ? messages[messages.length - 1].seq : cursor,
+    };
+  }
+
+  /**
    * Reads the messages available for a pull (EB-111): up to `maxMessages`
    * messages on `topic` with `seq > fromOffset`, ascending. With a durable
    * log the source is the log (`readSince`); otherwise the in-memory pull
@@ -27576,6 +27712,10 @@ export class EventBus {
         pulls: this.totalPulls,
         pulledMessages: this.totalPulledMessages,
         longPollTimeouts: this.totalLongPollTimeouts,
+      },
+      syncPollStats: {
+        polls: this.totalSyncPolls,
+        polledMessages: this.totalSyncPolledMessages,
       },
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,

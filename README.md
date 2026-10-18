@@ -4014,6 +4014,46 @@ longPollTimeouts }` bus-wide. Validation throws `RangeError` fail-fast
 unauthorized topic throws exactly like `subscribe` does
 (`NamespaceDeniedError` / `AclDeniedError`).
 
+## Synchronous cursor-based poll (EB-148)
+
+`bus.poll(topic, { maxMessages, cursor?, timeoutMs? })` is the
+synchronous, cursor-based counterpart to the long-polling `pull` above —
+the batch/ETL shape for walking a topic's history one page at a time. It
+returns `{ messages, nextCursor }` immediately (never blocks, never
+long-polls): `nextCursor` is the last returned message's `seq`, or the
+input cursor when the page is empty — feed it back as `cursor` to advance.
+
+```ts
+let cursor = 0;
+for (;;) {
+  const page = bus.poll('orders', { maxMessages: 1000, cursor });
+  if (page.messages.length === 0) break;   // caught up
+  await exportBatch(page.messages);        // your ETL code
+  cursor = page.nextCursor;                // advance
+}
+```
+
+Semantics:
+
+- **Same read path as `pull`.** With `EventBusOptions.durableLogDir`
+  the source is the durable log (`readSince`); otherwise the per-topic
+  in-memory pull ring. Compressed payloads are inflated, TTL-expired
+  records are skipped, and polling never touches push subscriber progress
+  or committed offsets (EB-32) — pulled messages never enter the
+  `AckTracker`.
+- **Synchronous snapshot.** The call returns the messages available at
+  call time. `timeoutMs` is accepted and validated for API
+  forward-compatibility but never blocks; for long-polling use `pull`.
+- **Independent counters.** `getStats().syncPollStats` reports
+  `{ polls, polledMessages }`, separate from both the push delivery
+  metrics and `pull`'s `pullStats`.
+
+Validation throws `RangeError` fail-fast (empty topic, pattern topic,
+`maxMessages < 1`, negative/non-integer `cursor`,
+negative/non-finite `timeoutMs`); a denied namespace or an unauthorized
+topic throws exactly like `pull`/`subscribe` does
+(`NamespaceDeniedError` / `AclDeniedError`).
+
 ## Consumer-lag SLO alerting (EB-112)
 
 `EventBusOptions.groupLag.slo` layers opt-in SLO alerting on top of the
