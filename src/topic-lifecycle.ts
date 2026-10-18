@@ -273,4 +273,19 @@ export class TopicLifecycleRegistry {
       ? undefined
       : { ...info, metadata: info.metadata === undefined ? undefined : { ...info.metadata, tags: info.metadata.tags === undefined ? undefined : [...info.metadata.tags] } };
   }
+
+  /**
+   * Renames a topic's lifecycle record (EB-142): the provisioning or
+   * tombstone moves to the new name with every field preserved (a live
+   * provisioning stays live, a tombstone stays a tombstone). Returns
+   * `true` when a record existed and was moved.
+   */
+  renameTopic(oldTopic: string, newTopic: string): boolean {
+    const info = this.topics.get(oldTopic);
+    if (info === undefined) return false;
+    this.topics.delete(oldTopic);
+    info.topic = newTopic;
+    this.topics.set(newTopic, info);
+    return true;
+  }
 }

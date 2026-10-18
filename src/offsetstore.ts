@@ -70,6 +70,14 @@ export interface OffsetStore {
    * backends. Absent means the store offers no recovery.
    */
   entries?(): OffsetStoreEntry[] | Promise<OffsetStoreEntry[]>;
+  /**
+   * Optional topic-rename hook (EB-142): moves every checkpoint filed
+   * under `oldTopic` to `newTopic`. The bus calls it when present;
+   * stores without it keep serving their old entries (the bus's own
+   * in-memory checkpoints are still renamed, so the live process reads
+   * the new name). Must never throw on normal inputs.
+   */
+  renameTopic?(oldTopic: string, newTopic: string): void;
 }
 
 /**
@@ -112,6 +120,18 @@ export class InMemoryOffsetStore implements OffsetStore {
       for (const [topic, seq] of byTopic) out.push({ groupId, topic, seq });
     }
     return out;
+  }
+
+  /** Moves every checkpoint filed under `oldTopic` to `newTopic` (EB-142). */
+  renameTopic(oldTopic: string, newTopic: string): void {
+    if (oldTopic === newTopic) return;
+    for (const byTopic of this.offsets.values()) {
+      const seq = byTopic.get(oldTopic);
+      if (seq !== undefined && !byTopic.has(newTopic)) {
+        byTopic.delete(oldTopic);
+        byTopic.set(newTopic, seq);
+      }
+    }
   }
 }
 

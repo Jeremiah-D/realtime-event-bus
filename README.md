@@ -4703,3 +4703,51 @@ Names: empty strings, non-strings, and anything containing `*` throw
 `topic_deleted` in the subscription lifecycle audit log. Deleting an
 unknown topic is a no-op returning `{ deleted: false }`; a soft-deleted
 topic deleted again with `purge: true` purges the retained history then.
+
+## Topic rename (EB-142)
+
+`renameTopic(oldTopic, newTopic)` (`src/bus.ts`) moves a topic's entire
+runtime state to a new concrete name, synchronously and atomically:
+
+```ts
+bus.subscribe('market.btc', handler);
+bus.publish('market.btc', tick); // seq 1..3
+const r = bus.renameTopic('market.btc', 'market.btc.v2');
+// r.subscribersRewritten === 1, r.seqContinuedFrom === 3
+bus.publish('market.btc.v2', tick); // seq 4 — numbering never restarts
+```
+
+What moves with the topic:
+
+- **Sequence counters** — per-topic (and per-partition) seq numbering
+  continues; subscribers observe no gap.
+- **Exact-name policy rules** — TTL, retained, partitions, rate limits,
+  subscriber caps, schemas, size caps, redaction, lateness, pause rules,
+  signing keys, compression rules. Pattern keys are left alone (they may
+  match other topics).
+- **Subscriptions on the exact old topic** — rewritten via
+  `updateSubscriptionPattern`, so queues, ACK state, leases and
+  consumer-group membership survive. Wildcard subscriptions are not
+  touched; multi-pattern subscriptions (EB-137) get the matching entry
+  rewritten in place.
+- **Pending delayed schedules and recurring jobs** — retargeted, never
+  dropped or re-timed.
+- **Consumer checkpoints** — the bus's in-memory offsets, the pluggable
+  `OffsetStore` (when it implements the optional `renameTopic` hook),
+  and the durable offset journal.
+- **The durable log** — the live `<topic>.log` file moves with every
+  record's topic field rewritten; archived segments are re-written and
+  their checksum chain re-hashed so archived replay stays verifiable;
+  archive-index, segment-chain manifest, offset and dedup journals follow.
+- **Topic stats and the lifecycle record** (provisioning or tombstone).
+
+The call is audited as `topic_renamed` (queryable via
+`getSubscriptionAudit({ action: 'topic_renamed' })`).
+
+Rules: only concrete topics can be renamed — a pattern (anything
+containing `*`), an unknown old name, an already-used new name, and
+namespaced (`/`-containing) names throw `RangeError`. During the
+synchronous call, publishes to either name fail fast with
+`TopicRenameInProgressError` (a re-entrant publish from e.g. a rebalance
+callback cannot land on a half-moved topic). After the rename the old
+name is free again — publishing to it starts a fresh topic.

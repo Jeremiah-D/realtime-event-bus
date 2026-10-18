@@ -221,4 +221,19 @@ export class PublishRateTable {
   remove(topic: string): boolean {
     return this.rings.delete(topic);
   }
+
+  /**
+   * Renames a topic's rate ring (EB-142): the publish-rate history moves
+   * to the new name so rate windows (`hotTopics`, `ratesFor`) continue
+   * seamlessly across the rename. Returns `false` when the old topic had
+   * no ring or the new name already has one (no move then).
+   */
+  renameTopic(oldTopic: string, newTopic: string): boolean {
+    if (oldTopic === newTopic) return false;
+    const ring = this.rings.get(oldTopic);
+    if (ring === undefined || this.rings.has(newTopic)) return false;
+    this.rings.delete(oldTopic);
+    this.rings.set(newTopic, ring);
+    return true;
+  }
 }

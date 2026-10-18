@@ -8024,6 +8024,25 @@ export interface AclOptions {
 }
 
 /**
+ * Thrown by the publish entry points when a `renameTopic` (EB-142) is
+ * in flight for the target topic. The rename runs synchronously and
+ * atomically — publishing to either the old or the new name mid-rename
+ * would land on a half-moved topic — so the publish fails fast instead
+ * of corrupting the switch. Retry after the rename returns; the window
+ * is exactly the synchronous rename call.
+ */
+export class TopicRenameInProgressError extends Error {
+  /** The topic the publish targeted. */
+  readonly topic: string;
+
+  constructor(topic: string) {
+    super(`publish: topic "${topic}" is being renamed right now; retry after renameTopic returns`);
+    this.name = 'TopicRenameInProgressError';
+    this.topic = topic;
+  }
+}
+
+/**
  * Thrown by `subscribe` (and the subscribe-family wrappers) when the
  * broker-level ACL denies the subscription. The denial is audited via
  * `EventBusOptions.onAuthzDenied` before the throw, so observers see it
@@ -9481,6 +9500,41 @@ type ParsedSeekTarget =
   | { mode: 'seq'; seq: number; topic?: string }
   | { mode: 'timestamp'; timestamp: number; topic?: string };
 
+/** Options for `EventBus.renameTopic` (EB-142). */
+export interface RenameTopicOptions {
+  /**
+   * Who performed the rename, recorded on the `topic_renamed` audit
+   * event. Defaults to `'system'`.
+   */
+  actor?: string;
+}
+
+/** The outcome of `EventBus.renameTopic` (EB-142). */
+export interface TopicRenameResult {
+  /** The old concrete topic name, as passed in. */
+  oldTopic: string;
+  /** The new concrete topic name, as passed in. */
+  newTopic: string;
+  /** Exact-topic subscriptions rewritten to the new name. */
+  subscribersRewritten: number;
+  /** Exact-name policy rules moved to the new name. */
+  rulesMoved: number;
+  /** Pending delayed schedules retargeted to the new name. */
+  delayedRetargeted: number;
+  /** Recurring jobs retargeted to the new name. */
+  recurringRetargeted: number;
+  /**
+   * Highest per-topic sequence number carried over — the next publish to
+   * the new name takes `seqContinuedFrom + 1`. `0` when the topic never
+   * published.
+   */
+  seqContinuedFrom: number;
+  /** `true` when a lifecycle provisioning/tombstone moved with the topic. */
+  lifecycleMoved: boolean;
+  /** `true` when the durable log migrated the topic's files. */
+  durableLogMigrated: boolean;
+}
+
 export class EventBus {
   /**
    * Stable identity of this bus instance (see `EventBusOptions.busId`):
@@ -9743,6 +9797,14 @@ export class EventBus {
   private readonly publishRates = new PublishRateTable();
   private nextId = 0;
   private flushScheduled = false;
+  /**
+   * Topics currently inside a synchronous `renameTopic` (EB-142): the old
+   * and the new name. The publish entry points refuse these topics while
+   * the set is non-empty so a re-entrant publish (e.g. from a rebalance
+   * callback fired mid-rename) cannot land on a half-moved topic. The
+   * set is empty outside the rename call itself.
+   */
+  private readonly renameFrozen = new Set<string>();
   /**
    * Per-topic message TTLs in milliseconds, keyed by the exact string passed
    * to `setTopicTtl` — either a concrete topic name or a wildcard pattern.
@@ -20314,6 +20376,10 @@ export class EventBus {
       return undefined;
     }
     topic = aliasResolution.topic;
+    // Topic rename (EB-142): fail fast while a rename is in flight for
+    // this topic — a schedule filed mid-rename would land on a half-moved
+    // topic. The due-time fan-out is covered by fanOut's own check.
+    this.assertTopicNotRenaming(topic);
     // Sensitive-field redaction (EB-68) at schedule time: the fail-fast
     // gates below, the in-memory schedule, and the persisted schedule
     // record all see the redacted payload — the original values never
@@ -22780,6 +22846,408 @@ export class EventBus {
   }
 
   /**
+   * The publish-side guard for `renameTopic` (EB-142): throws
+   * `TopicRenameInProgressError` when `topic` is currently inside a
+   * rename. Called by `fanOut` (the single choke point every publish
+   * path funnels through) and by `publishDelayed` at schedule time.
+   */
+  private assertTopicNotRenaming(topic: string): void {
+    if (this.renameFrozen.size !== 0 && this.renameFrozen.has(topic)) {
+      throw new TopicRenameInProgressError(topic);
+    }
+  }
+
+  /**
+   * Whether `renameTopic` would find anything to rename: any per-topic
+   * state filed under `name` — stats, sequence counters, retained
+   * messages, exact-name policy rules, exact-topic subscriptions, rate
+   * buckets, circuit breakers, delayed/recurring schedules, consumer
+   * checkpoints, lifecycle records, or durable-log data. Used for both
+   * the old-name (must exist) and new-name (must be unused) validation.
+   */
+  private topicHasState(name: string): boolean {
+    if (this.topicStats.has(name)) return true;
+    for (const key of this.topicSeq.keys()) {
+      if (key.startsWith(`${name}\0`)) return true;
+    }
+    if (this.retainedMessages.has(name)) return true;
+    if (this.rateLimitBuckets.has(name)) return true;
+    if (this.publishCircuitBreakers.has(name)) return true;
+    if (this.partitionPublished.has(name)) return true;
+    if (this.pauseRules.has(name)) return true;
+    if (this.compressionRules.has(name)) return true;
+    if (this.signingRules.has(name)) return true;
+    const ruleMaps: Array<Map<string, unknown>> = [
+      this.ttlRules,
+      this.retainedRules,
+      this.partitionRules,
+      this.rateLimitRules,
+      this.subscriberLimitRules,
+      this.schemaRules,
+      this.schemaVersionRules,
+      this.maxMessageBytesRules,
+      this.maxPayloadBytesRules,
+      this.redactionRules,
+      this.allowedLatenessRules,
+    ];
+    for (const rules of ruleMaps) {
+      if (rules.has(name)) return true;
+    }
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.pattern === name) return true;
+      if (subscriber.multiPatterns !== undefined && subscriber.multiPatterns.includes(name)) return true;
+    }
+    for (const entry of this.delayedById.values()) {
+      if (!entry.cancelled && entry.topic === name) return true;
+    }
+    for (const job of this.recurringById.values()) {
+      if (!job.cancelled && job.topic === name) return true;
+    }
+    for (const byTopic of this.groupOffsets.values()) {
+      if (byTopic.has(name)) return true;
+    }
+    for (const byTopic of this.committedOffsets.values()) {
+      if (byTopic.has(name)) return true;
+    }
+    if (this.topicLifecycle.get(name) !== undefined) return true;
+    const log = this.durableLogForTopic(name);
+    if (log !== undefined && log.topics().includes(name)) return true;
+    return false;
+  }
+
+  /**
+   * Renames a topic (EB-142): `renameTopic('market.btc', 'market.btc.v2')`
+   * moves the topic's entire runtime state to the new name, atomically and
+   * synchronously:
+   *
+   * - Per-topic sequence counters keep counting — no renumbering; the
+   *   first publish to the new name takes the next seq, and subscribers
+   *   observe no gap.
+   * - Exact-name policy rules move with the topic (TTL, retained, rate
+   *   limits, schemas, compression, signing, size caps, redaction,
+   *   lateness, pause rules, subscriber caps, partition rules). Pattern
+   *   keys are left alone — they may match other topics.
+   * - Subscriptions on the exact old topic are rewritten to the new name
+   *   (queues, ACK state, leases, consumer-group membership and per-topic
+   *   seq baselines survive untouched, via `updateSubscriptionPattern`).
+   *   Wildcard subscriptions are not touched — they never named the
+   *   topic. Multi-pattern subscriptions (EB-137) get the matching entry
+   *   rewritten in place.
+   * - Pending delayed schedules and recurring jobs are retargeted; the
+   *   durable log migrates the topic's files atomically (live log,
+   *   segments, archive index, chain manifest, offset/dedup journals).
+   * - Consumer-group checkpoints filed under the old name move to the new
+   *   one (in-memory maps, the pluggable offset store when it supports
+   *   `renameTopic`, and the durable offset journal).
+   * - Audited as `topic_renamed`.
+   *
+   * The rename is synchronous: no publish can interleave it. Re-entrant
+   * publishes to either name during the call (e.g. from a rebalance
+   * callback) fail fast with `TopicRenameInProgressError`.
+   *
+   * Only concrete topics can be renamed: a pattern (anything containing
+   * `*`) throws `RangeError`, as do an unknown old name, an already-used
+   * new name, and namespaced (`/`-containing) names. After the rename the
+   * old name is free again — publishing to it starts a fresh topic.
+   */
+  renameTopic(oldTopic: string, newTopic: string, opts?: RenameTopicOptions): TopicRenameResult {
+    assertValidLifecycleTopicName(oldTopic, 'renameTopic');
+    assertValidLifecycleTopicName(newTopic, 'renameTopic');
+    if (oldTopic.includes('/')) {
+      throw new RangeError('renameTopic: oldTopic must be a concrete global topic name, not a namespaced topic');
+    }
+    if (newTopic.includes('/')) {
+      throw new RangeError('renameTopic: newTopic must be a concrete global topic name, not a namespaced topic');
+    }
+    if (oldTopic === newTopic) {
+      throw new RangeError('renameTopic: oldTopic and newTopic must differ');
+    }
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'renameTopic');
+    if (!this.topicHasState(oldTopic)) {
+      throw new RangeError(`renameTopic: unknown topic "${oldTopic}"`);
+    }
+    if (this.topicHasState(newTopic)) {
+      throw new RangeError(`renameTopic: target topic "${newTopic}" is already in use`);
+    }
+    // Fail fast before anything mutates: the broker-level ACL check the
+    // subscriber rewrite would hit, once, for the shared target.
+    const exactSubs: Subscriber[] = [];
+    const multiSubs: Subscriber[] = [];
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.pattern === oldTopic && subscriber.multiPatterns === undefined) {
+        exactSubs.push(subscriber);
+      } else if (subscriber.multiPatterns !== undefined && subscriber.multiPatterns.includes(oldTopic)) {
+        multiSubs.push(subscriber);
+      }
+    }
+    if ((exactSubs.length > 0 || multiSubs.length > 0) && !this.aclAllowsSubscribe(newTopic)) {
+      this.emitAuthzDenied('subscribe', undefined, newTopic);
+      throw new AclDeniedError('subscribe', newTopic);
+    }
+    // Durable-log precheck (its own validation would throw mid-rename
+    // otherwise): the log must know the old topic and not the new one.
+    const log = this.durableLogForTopic(oldTopic);
+    const logHasOld = log !== undefined && log.topics().includes(oldTopic);
+    if (log !== undefined && log.topics().includes(newTopic)) {
+      throw new RangeError(`renameTopic: target topic "${newTopic}" is already in use`);
+    }
+
+    this.renameFrozen.add(oldTopic);
+    this.renameFrozen.add(newTopic);
+    try {
+      // 0. Durable log first: it re-validates and throws before mutating
+      // on any file failure, so a failed migration leaves the bus
+      // untouched. (Its in-memory re-key is part of the same
+      // all-or-nothing call.)
+      let durableLogMigrated = false;
+      let durableReport: { filesRenamed: number } | undefined;
+      if (logHasOld && log !== undefined) {
+        durableReport = log.renameTopic(oldTopic, newTopic);
+        durableLogMigrated = true;
+      }
+
+      // 1. Subscriptions: exact-topic subscribers move through the same
+      // path as a manual pattern update (EB-74) — queue, ACK state,
+      // leases, group membership and seq baselines survive. The ACL was
+      // prechecked above, so no throw is expected mid-loop.
+      let subscribersRewritten = 0;
+      for (const subscriber of exactSubs) {
+        // Per-(subscriber, topic) seq baselines follow the rename so the
+        // continued numbering is not misread as a gap.
+        const lastSeq = subscriber.lastDeliveredSeq.get(oldTopic);
+        const lastEpoch = subscriber.lastEpoch.get(oldTopic);
+        if (this.updateSubscriptionPattern(subscriber.id, newTopic)) {
+          subscribersRewritten += 1;
+          if (lastSeq !== undefined) {
+            subscriber.lastDeliveredSeq.delete(oldTopic);
+            subscriber.lastDeliveredSeq.set(newTopic, lastSeq);
+          }
+          if (lastEpoch !== undefined) {
+            subscriber.lastEpoch.delete(oldTopic);
+            subscriber.lastEpoch.set(newTopic, lastEpoch);
+          }
+        }
+      }
+      // Multi-pattern aggregates (EB-137): rewrite the matching entry in
+      // place and rebuild the OR-union matcher, mirroring subscribe's
+      // registration for every touched pattern.
+      for (const subscriber of multiSubs) {
+        const patterns = subscriber.multiPatterns as string[];
+        const idx = patterns.indexOf(oldTopic);
+        if (idx === -1) continue;
+        const remaining = (this.subscribersByPattern.get(oldTopic) ?? 1) - 1;
+        if (remaining <= 0) {
+          this.subscribersByPattern.delete(oldTopic);
+          this.patternCache.delete(oldTopic);
+        } else {
+          this.subscribersByPattern.set(oldTopic, remaining);
+        }
+        this.subscribersByPattern.set(newTopic, (this.subscribersByPattern.get(newTopic) ?? 0) + 1);
+        const oldIndexKey = EventBus.patternPrefixKey(oldTopic);
+        const oldBucket = this.prefixIndex.get(oldIndexKey);
+        if (oldBucket !== undefined) {
+          oldBucket.delete(subscriber.id);
+          if (oldBucket.size === 0) this.prefixIndex.delete(oldIndexKey);
+        }
+        const newIndexKey = EventBus.patternPrefixKey(newTopic);
+        let newBucket = this.prefixIndex.get(newIndexKey);
+        if (newBucket === undefined) {
+          newBucket = new Set<string>();
+          this.prefixIndex.set(newIndexKey, newBucket);
+        }
+        newBucket.add(subscriber.id);
+        patterns[idx] = newTopic;
+        subscriber.matcher = unionPatternMatchers(patterns.map((p) => this.compiledMatcher(p)));
+        subscribersRewritten += 1;
+        const lastSeq = subscriber.lastDeliveredSeq.get(oldTopic);
+        if (lastSeq !== undefined) {
+          subscriber.lastDeliveredSeq.delete(oldTopic);
+          subscriber.lastDeliveredSeq.set(newTopic, lastSeq);
+        }
+        const lastEpoch = subscriber.lastEpoch.get(oldTopic);
+        if (lastEpoch !== undefined) {
+          subscriber.lastEpoch.delete(oldTopic);
+          subscriber.lastEpoch.set(newTopic, lastEpoch);
+        }
+      }
+
+      // 2. Exact-name policy rules move; pattern keys stay. Matcher caches
+      // are dropped for the old key (they compile the old string) and
+      // rebuild lazily for the new one.
+      const ruleMaps: Array<Map<string, unknown>> = [
+        this.ttlRules,
+        this.retainedRules,
+        this.partitionRules,
+        this.rateLimitRules,
+        this.subscriberLimitRules,
+        this.schemaRules,
+        this.schemaVersionRules,
+        this.maxMessageBytesRules,
+        this.maxPayloadBytesRules,
+        this.redactionRules,
+        this.allowedLatenessRules,
+      ];
+      const matcherCaches: Array<Map<string, RegExp>> = [
+        this.ttlMatcherCache,
+        this.retainedMatcherCache,
+        this.partitionMatcherCache,
+        this.rateLimitMatcherCache,
+        this.subscriberLimitMatcherCache,
+        this.schemaMatcherCache,
+        this.schemaVersionMatcherCache,
+        this.maxMessageBytesMatcherCache,
+        this.maxPayloadBytesMatcherCache,
+        this.redactionMatcherCache,
+        this.allowedLatenessMatcherCache,
+      ];
+      let rulesMoved = 0;
+      for (const rules of ruleMaps) {
+        if (rules.has(oldTopic)) {
+          rules.set(newTopic, rules.get(oldTopic));
+          rules.delete(oldTopic);
+          rulesMoved += 1;
+        }
+      }
+      for (const cache of matcherCaches) cache.delete(oldTopic);
+      if (this.signingRules.has(oldTopic)) {
+        this.signingRules.set(newTopic, this.signingRules.get(oldTopic) as { keys: StoredSigningKey[]; graceMs: number });
+        this.signingRules.delete(oldTopic);
+        rulesMoved += 1;
+      }
+      this.signingMatcherCache.delete(oldTopic);
+      if (this.compressionRules.has(oldTopic)) {
+        this.compressionRules.set(newTopic, this.compressionRules.get(oldTopic) as ResolvedCompressionRule);
+        this.compressionRules.delete(oldTopic);
+        rulesMoved += 1;
+      }
+      this.compressionMatcherCache.delete(oldTopic);
+      const pauseRule = this.pauseRules.get(oldTopic);
+      if (pauseRule !== undefined) {
+        for (const entry of pauseRule.buffer) entry.topic = newTopic;
+        this.pauseRules.delete(oldTopic);
+        this.pauseRules.set(newTopic, pauseRule);
+        rulesMoved += 1;
+      }
+      this.pauseMatcherCache.delete(oldTopic);
+
+      // 3. Per-topic runtime state: seq counters (inherited, never
+      // renumbered), rate buckets (budget preserved), circuit breakers,
+      // retained messages, per-partition publish counters.
+      let seqContinuedFrom = 0;
+      for (const key of [...this.topicSeq.keys()]) {
+        if (key.startsWith(`${oldTopic}\0`)) {
+          const value = this.topicSeq.get(key) as number;
+          if (value > seqContinuedFrom) seqContinuedFrom = value;
+          this.topicSeq.delete(key);
+          this.topicSeq.set(`${newTopic}${key.slice(oldTopic.length)}`, value);
+        }
+      }
+      if (this.partitionPublished.has(oldTopic)) {
+        this.partitionPublished.set(newTopic, this.partitionPublished.get(oldTopic) as Map<number, { publishedMessages: number; lastSeq: number }>);
+        this.partitionPublished.delete(oldTopic);
+      }
+      this.publishRates.renameTopic(oldTopic, newTopic);
+      if (this.publishCircuitBreakers.has(oldTopic)) {
+        this.publishCircuitBreakers.set(newTopic, this.publishCircuitBreakers.get(oldTopic) as PublishCircuitBreaker);
+        this.publishCircuitBreakers.delete(oldTopic);
+      }
+      const retained = this.retainedMessages.get(oldTopic);
+      if (retained !== undefined) {
+        this.retainedMessages.delete(oldTopic);
+        retained.topic = newTopic;
+        this.retainedMessages.set(newTopic, retained);
+      }
+      if (this.rateLimitBuckets.has(oldTopic)) {
+        this.rateLimitBuckets.set(newTopic, this.rateLimitBuckets.get(oldTopic) as TokenBucket);
+        this.rateLimitBuckets.delete(oldTopic);
+      }
+
+      // 4. Topic stats move with the topic (getStats names topics from
+      // the map key, so no field rewrite is needed).
+      if (this.topicStats.has(oldTopic)) {
+        this.topicStats.set(newTopic, this.topicStats.get(oldTopic) as ReturnType<typeof zeroedTopicStats>);
+        this.topicStats.delete(oldTopic);
+      }
+
+      // 5. Pending delayed schedules and recurring jobs are retargeted —
+      // nothing is dropped or re-timed. (Due entries are not swept here:
+      // the rename is synchronous and runs no handlers; they fan out at
+      // their due time under the new name.)
+      let delayedRetargeted = 0;
+      for (const entry of this.delayedById.values()) {
+        if (!entry.cancelled && entry.topic === oldTopic) {
+          entry.topic = newTopic;
+          delayedRetargeted += 1;
+        }
+      }
+      let recurringRetargeted = 0;
+      for (const job of this.recurringById.values()) {
+        if (!job.cancelled && job.topic === oldTopic) {
+          job.topic = newTopic;
+          recurringRetargeted += 1;
+        }
+      }
+
+      // 6. Consumer checkpoints follow the topic.
+      const moveCheckpoints = (byGroup: Map<string, Map<string, number>>): void => {
+        for (const byTopic of byGroup.values()) {
+          if (byTopic.has(oldTopic)) {
+            byTopic.set(newTopic, byTopic.get(oldTopic) as number);
+            byTopic.delete(oldTopic);
+          }
+        }
+      };
+      moveCheckpoints(this.groupOffsets);
+      moveCheckpoints(this.committedOffsets);
+      const renameHook = (this.offsetStore as OffsetStore).renameTopic;
+      if (typeof renameHook === 'function') {
+        try {
+          renameHook.call(this.offsetStore, oldTopic, newTopic);
+        } catch {
+          // Error-isolated like every offset-store write: the bus's own
+          // maps above are authoritative for the live process.
+          this.totalOffsetStoreWriteErrors += 1;
+        }
+      }
+
+      // 7. Lifecycle record.
+      const lifecycleMoved = this.topicLifecycle.renameTopic(oldTopic, newTopic);
+
+      this.auditSubscription({
+        action: 'topic_renamed',
+        actor,
+        topic: newTopic,
+        detail: {
+          from: oldTopic,
+          subscribersRewritten,
+          rulesMoved,
+          delayedRetargeted,
+          recurringRetargeted,
+          seqContinuedFrom,
+          lifecycleMoved,
+          durableLogMigrated,
+          ...(durableReport === undefined ? {} : { durableFilesRenamed: durableReport.filesRenamed }),
+        },
+      });
+      return {
+        oldTopic,
+        newTopic,
+        subscribersRewritten,
+        rulesMoved,
+        delayedRetargeted,
+        recurringRetargeted,
+        seqContinuedFrom,
+        lifecycleMoved,
+        durableLogMigrated,
+      };
+    } finally {
+      this.renameFrozen.delete(oldTopic);
+      this.renameFrozen.delete(newTopic);
+    }
+  }
+
+  /**
    * A topic's lifecycle record (EB-126), tombstones included —
    * `undefined` when the topic was never provisioned or deleted.
    * `provisioned: false` marks a deletion tombstone (publishes refused).
@@ -24755,6 +25223,12 @@ export class EventBus {
     /** The refusing gate (`AdmissionRejectReason` vocabulary) — present only when refused. */
     rejectReason?: AdmissionRejectReason;
   } {
+    // Topic rename (EB-142): a rename runs synchronously and atomically —
+    // a publish landing on either the old or the new name mid-rename would
+    // hit a half-moved topic — so it fails fast here, the single choke
+    // point every publish path (publish, publishBatch, publishAtomic,
+    // delayed/recurring sweeps, pause drains) funnels through.
+    this.assertTopicNotRenaming(topic);
     // Delivery tracing (EB-45): one clock read for the publish span, taken
     // only when tracing is enabled — the disabled path pays this single
     // branch and nothing else (no allocation, no WeakMap lookup).

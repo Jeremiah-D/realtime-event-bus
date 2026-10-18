@@ -2833,6 +2833,379 @@ export class DurableTopicLog {
   }
 
   /**
+   * Renames a topic's durable state (EB-142): the live log file and every
+   * archived segment (checksum sidecars included) move atomically via
+   * `backend.rename`; the archive-index and segment-chain manifest lines
+   * are rewritten to the new name; and every in-memory index keyed by
+   * topic is re-keyed — sequence cursors (`lastSeqs`, per-partition seqs),
+   * entry/message counts, key indexes, archives, chain entries, and the
+   * offset / dedup / publish-dedup journals (rewritten from the re-keyed
+   * in-memory state, serialized exactly the way their compactors write).
+   *
+   * All-or-nothing: validation runs before any mutation; the file moves
+   * run before the in-memory re-key, and a failed move rolls the
+   * completed moves back and throws with in-memory state untouched.
+   * Sequence numbering continues under the new name — a bus reopening this
+   * log recovers `lastSeqs` for the new topic, so no seq is ever reused.
+   *
+   * Throws `RangeError` when `oldTopic` is unknown to the log or
+   * `newTopic` is already in use (a known topic or an existing file).
+   */
+  renameTopic(
+    oldTopic: string,
+    newTopic: string,
+  ): {
+    filesRenamed: number;
+    indexLinesRewritten: number;
+    chainLinesRewritten: number;
+    offsetCommitsMoved: number;
+    dedupEntriesMoved: number;
+    publishDedupEntriesMoved: number;
+  } {
+    if (!this.topicsSeen.has(oldTopic)) {
+      throw new RangeError(`renameTopic: unknown topic "${oldTopic}"`);
+    }
+    if (this.topicsSeen.has(newTopic)) {
+      throw new RangeError(`renameTopic: target topic "${newTopic}" is already in use`);
+    }
+    const oldEnc = encodeURIComponent(oldTopic);
+    const newEnc = encodeURIComponent(newTopic);
+    const liveKey = `${oldEnc}.log`;
+    const newLiveKey = `${newEnc}.log`;
+    const segmentPrefix = `${oldEnc}.seg-`;
+    const newSegmentPrefix = `${newEnc}.seg-`;
+    // The target must not collide with an existing file either (a topic
+    // the log never saw could still have a stray file on disk).
+    const keys = this.backend.list();
+    if (keys.includes(newLiveKey) || keys.some((k) => k.startsWith(newSegmentPrefix))) {
+      throw new RangeError(`renameTopic: target topic "${newTopic}" already has log files`);
+    }
+    // --- File phase: transform contents in memory, write the new files,
+    // then delete the old ones. Nothing in memory is touched until every
+    // new file has landed: a throw before the delete phase leaves the old
+    // files intact, and the catch removes the new files already written —
+    // the directory is never left half-renamed.
+    const renamedKey = (key: string): string =>
+      key.startsWith(segmentPrefix) ? `${newSegmentPrefix}${key.slice(segmentPrefix.length)}` : key;
+    // Rewrites one topic file's JSONL records to the new topic name.
+    // Sealed lines are opened and re-sealed (the log holds the
+    // encryptor); unparseable lines pass through verbatim — recovery
+    // already skips them, never fatal.
+    const rewriteRecords = (text: string): string => {
+      const out: string[] = [];
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue;
+        let inner: string | null;
+        try {
+          inner = this.openLine(line);
+        } catch {
+          // A sealed line without an encryptor configured: keep it
+          // verbatim rather than corrupting what we cannot read.
+          out.push(line);
+          continue;
+        }
+        if (inner == null) {
+          out.push(line);
+          continue;
+        }
+        let obj: Record<string, unknown>;
+        try {
+          obj = JSON.parse(inner) as Record<string, unknown>;
+        } catch {
+          out.push(line);
+          continue;
+        }
+        if (obj['topic'] === oldTopic) obj['topic'] = newTopic;
+        out.push(this.sealLine(`${JSON.stringify(obj)}\n`));
+      }
+      return out.join('');
+    };
+    // Phase A (pure compute): transform every file's contents and work
+    // out the new chain hashes. No file is written and no in-memory
+    // state is touched here.
+    interface SegmentPlan {
+      entry: SegmentChainEntry;
+      newPath: string;
+      gz: Uint8Array;
+      hash: string;
+    }
+    const segmentPlans: SegmentPlan[] = [];
+    let prevHash = 'genesis';
+    const topicChain = this.chainEntries
+      .filter((e) => e.topic === oldTopic)
+      .sort((a, b) => a.seqStart - b.seqStart || a.seqEnd - b.seqEnd);
+    for (const entry of topicChain) {
+      const raw = this.backend.read(entry.path);
+      if (raw === undefined) throw new Error(`renameTopic: missing segment file "${entry.path}"`);
+      let text: string;
+      try {
+        text = gunzipSync(raw).toString('utf8');
+      } catch (err) {
+        throw new Error(`renameTopic: cannot decompress segment "${entry.path}": ${(err as Error).message}`);
+      }
+      const gz = gzipSync(rewriteRecords(text));
+      const hash = createHash('sha256').update(gz).digest('hex');
+      segmentPlans.push({ entry, newPath: renamedKey(entry.path), gz, hash });
+      prevHash = hash;
+    }
+    // The planned chain entries: the old lines are replaced by these
+    // (new bytes, new hashes, unbroken prevHash links).
+    prevHash = 'genesis';
+    const plannedChain: SegmentChainEntry[] = segmentPlans.map((p) => {
+      const planned: SegmentChainEntry = {
+        ...p.entry,
+        topic: newTopic,
+        path: p.newPath,
+        sha256: p.hash,
+        prevHash,
+        bytes: p.gz.length,
+      };
+      prevHash = p.hash;
+      return planned;
+    });
+    // Pending (rotated but not yet gzipped) segments are plaintext JSONL:
+    // same record rewrite, no re-hash.
+    const pendingPlans: Array<{ oldKey: string; newKey: string; text: string }> = [];
+    for (const key of keys) {
+      if (!key.startsWith(segmentPrefix) || key === liveKey) continue;
+      if (key.endsWith('.jsonl.gz') || key.endsWith('.sha256')) continue;
+      const text = this.readText(key);
+      if (text === undefined) throw new Error(`renameTopic: cannot read segment "${key}"`);
+      pendingPlans.push({ oldKey: key, newKey: renamedKey(key), text: rewriteRecords(text) });
+    }
+    // The live log file.
+    let livePlan: { newKey: string; text: string } | null = null;
+    if (keys.includes(liveKey)) {
+      const text = this.readText(liveKey);
+      if (text === undefined) throw new Error(`renameTopic: cannot read log file "${liveKey}"`);
+      livePlan = { newKey: newLiveKey, text: rewriteRecords(text) };
+    }
+    // Archive-index lines: the topic's lines are rewritten (new name, new
+    // paths); every other topic's lines pass through verbatim.
+    const rewriteArchiveIndex = (): { text: string; rewritten: number } => {
+      const text = this.readText(this.archiveIndexKey);
+      if (text === undefined) return { text: '', rewritten: 0 };
+      const kept: string[] = [];
+      let rewritten = 0;
+      for (const line of text.split('\n')) {
+        if (line.trim() === '') continue;
+        const entry = parseArchiveIndexLine(line);
+        if (entry === null || entry.topic !== oldTopic) {
+          kept.push(line);
+          continue;
+        }
+        entry.topic = newTopic;
+        if (entry.path.startsWith(segmentPrefix)) entry.path = renamedKey(entry.path);
+        kept.push(JSON.stringify(archiveIndexLineOf(entry)));
+        rewritten += 1;
+      }
+      return { text: kept.length === 0 ? '' : `${kept.join('\n')}\n`, rewritten };
+    };
+    // Chain-manifest lines: the topic's lines are replaced by the planned
+    // (re-hashed) entries; every other topic's lines pass through.
+    const rewriteChainManifest = (): { text: string; rewritten: number } => {
+      const text = this.readText(CHAIN_MANIFEST_NAME);
+      const kept: string[] = [];
+      if (text !== undefined) {
+        for (const line of text.split('\n')) {
+          if (line.trim() === '') continue;
+          const entry = parseChainManifestLine(line);
+          if (entry === null || entry.topic !== oldTopic) {
+            kept.push(line);
+            continue;
+          }
+        }
+      }
+      for (const planned of plannedChain) kept.push(JSON.stringify(chainManifestLineOf(planned)));
+      return {
+        text: kept.length === 0 ? '' : `${kept.join('\n')}\n`,
+        rewritten: plannedChain.length,
+      };
+    };
+    const index = rewriteArchiveIndex();
+    const chain = rewriteChainManifest();
+    // Phase B (file writes): every new file lands before any old file is
+    // deleted. On failure the written files are removed and the throw
+    // propagates with the old files — and all in-memory state — intact.
+    const written: string[] = [];
+    const stale: string[] = [];
+    try {
+      for (const plan of segmentPlans) {
+        this.backend.write(plan.newPath, plan.gz);
+        written.push(plan.newPath);
+        this.backend.write(this.checksumKey(plan.newPath), plan.hash);
+        written.push(this.checksumKey(plan.newPath));
+        stale.push(plan.entry.path, this.checksumKey(plan.entry.path));
+      }
+      for (const plan of pendingPlans) {
+        this.backend.write(plan.newKey, plan.text);
+        written.push(plan.newKey);
+        stale.push(plan.oldKey);
+      }
+      if (livePlan !== null) {
+        this.backend.write(livePlan.newKey, livePlan.text);
+        written.push(livePlan.newKey);
+        stale.push(liveKey);
+      }
+      this.backend.write(this.archiveIndexKey, index.text);
+      this.backend.write(CHAIN_MANIFEST_NAME, chain.text);
+      for (const key of stale) {
+        try {
+          this.backend.delete(key);
+        } catch {
+          // Best effort: the new files are all in place; a leftover old
+          // file is orphaned data, never served (nothing references the
+          // old name anymore).
+        }
+      }
+    } catch (err) {
+      for (const key of written) {
+        try {
+          this.backend.delete(key);
+        } catch {
+          // Best effort: the throw below still reports the original
+          // failure, and the caller (the bus) aborts the rename.
+        }
+      }
+      throw err;
+    }
+    // Phase C (in-memory): apply the planned chain mutations, then re-key
+    // every topic-keyed index. Only runs after every file write
+    // succeeded.
+    for (let i = 0; i < segmentPlans.length; i++) {
+      const plan = segmentPlans[i];
+      const planned = plannedChain[i];
+      plan.entry.topic = planned.topic;
+      plan.entry.path = planned.path;
+      plan.entry.sha256 = planned.sha256;
+      plan.entry.prevHash = planned.prevHash;
+      plan.entry.bytes = planned.bytes;
+    }
+    const filesRenamed = written.length;
+    // --- All file work done; re-key the in-memory state. ---
+    const moveValue = <K, V>(map: Map<K, V>, from: K, to: K): void => {
+      if (map.has(from)) {
+        map.set(to, map.get(from) as V);
+        map.delete(from);
+      }
+    };
+    this.topicsSeen.delete(oldTopic);
+    this.topicsSeen.add(newTopic);
+    moveValue(this.entryCounts, oldTopic, newTopic);
+    moveValue(this.messageCounts, oldTopic, newTopic);
+    moveValue(this.lastSeqs, oldTopic, newTopic);
+    moveValue(this.maxPartitionSeqs, oldTopic, newTopic);
+    moveValue(this.keyIndex, oldTopic, newTopic);
+    // `maxKeySeqs` is keyed by message key, not topic — a cross-topic
+    // publish-order space (mirrors the bus's keyCursors), so renaming one
+    // topic must not touch it. Same reasoning as `purgeTopic`.
+    moveValue(this.supersededCounts, oldTopic, newTopic);
+    moveValue(this.segmentEntries, oldTopic, newTopic);
+    moveValue(this.segmentStartSeq, oldTopic, newTopic);
+    moveValue(this.segmentStartAt, oldTopic, newTopic);
+    moveValue(this.topicBytes, oldTopic, newTopic);
+    moveValue(this.archivesByTopic, oldTopic, newTopic);
+    moveValue(this.chainTails, oldTopic, newTopic);
+    for (const entry of this.archives) {
+      if (entry.topic === oldTopic) {
+        entry.topic = newTopic;
+        if (entry.path.startsWith(segmentPrefix)) {
+          entry.path = `${newSegmentPrefix}${entry.path.slice(segmentPrefix.length)}`;
+        }
+      }
+    }
+    for (const entry of this.chainEntries) {
+      if (entry.topic === oldTopic) {
+        entry.topic = newTopic;
+        if (entry.path.startsWith(segmentPrefix)) {
+          entry.path = `${newSegmentPrefix}${entry.path.slice(segmentPrefix.length)}`;
+        }
+      }
+    }
+    for (const path of [...this.checksumRejected]) {
+      if (path.startsWith(segmentPrefix)) {
+        this.checksumRejected.delete(path);
+        this.checksumRejected.add(`${newSegmentPrefix}${path.slice(segmentPrefix.length)}`);
+      }
+    }
+    // Offset checkpoints follow the topic: re-key the commits and rewrite
+    // the journal from the re-keyed state (the same serialization the
+    // compactor uses).
+    let offsetCommitsMoved = 0;
+    for (const [key, commit] of [...this.offsetCommits]) {
+      if (commit.topic !== oldTopic) continue;
+      const renamed: DurableOffsetCommit = { ...commit, topic: newTopic };
+      const newKey = offsetKey(
+        renamed.groupId,
+        newTopic,
+        renamed.partition,
+        renamed.pattern,
+        renamed.instanceId,
+      );
+      this.offsetCommits.delete(key);
+      this.offsetCommits.set(newKey, renamed);
+      offsetCommitsMoved += 1;
+    }
+    if (offsetCommitsMoved > 0) {
+      const text = [...this.offsetCommits.values()]
+        .map((c) => `${JSON.stringify(offsetLineOf(c))}\n`)
+        .join('');
+      try {
+        this.backend.write(this.offsetKey, text);
+      } catch {
+        // Best effort, mirroring the compactors: the in-memory commits
+        // are authoritative and a later compaction rewrites the journal.
+      }
+      this.offsetEntries = this.offsetCommits.size;
+    }
+    // Dedup journals follow the same pattern.
+    let dedupEntriesMoved = 0;
+    for (const [key, entry] of [...this.dedupSeen]) {
+      if (entry.topic !== oldTopic) continue;
+      const renamed: DedupEntry = { ...entry, topic: newTopic };
+      this.dedupSeen.delete(key);
+      this.dedupSeen.set(dedupKey(renamed.consumer, newTopic, renamed.messageId), renamed);
+      dedupEntriesMoved += 1;
+    }
+    if (dedupEntriesMoved > 0) {
+      const text = [...this.dedupSeen.values()].map((e) => `${JSON.stringify(dedupLineOf(e))}\n`).join('');
+      try {
+        this.backend.write(this.dedupKey, text);
+      } catch {
+        // Best effort, mirroring `compactDedup`.
+      }
+      this.dedupEntries = this.dedupSeen.size;
+    }
+    let publishDedupEntriesMoved = 0;
+    for (const [key, entry] of [...this.publishDedupSeen]) {
+      if (entry.topic !== oldTopic) continue;
+      const renamed: PublishDedupEntry = { ...entry, topic: newTopic };
+      this.publishDedupSeen.delete(key);
+      this.publishDedupSeen.set(publishDedupKey(newTopic, renamed.messageId), renamed);
+      publishDedupEntriesMoved += 1;
+    }
+    if (publishDedupEntriesMoved > 0) {
+      const text = [...this.publishDedupSeen.values()]
+        .map((e) => `${JSON.stringify(publishDedupLineOf(e))}\n`)
+        .join('');
+      try {
+        this.backend.write(this.publishDedupKey, text);
+      } catch {
+        // Best effort, mirroring `compactDedup`.
+      }
+      this.publishDedupEntries = this.publishDedupSeen.size;
+    }
+    return {
+      filesRenamed,
+      indexLinesRewritten: index.rewritten,
+      chainLinesRewritten: chain.rewritten,
+      offsetCommitsMoved,
+      dedupEntriesMoved,
+      publishDedupEntriesMoved,
+    };
+  }
+
+  /**
    * Scans the offset journal and rebuilds the in-memory checkpoint index:
    * the highest committed seq per (group, topic) wins, so a restarted bus
    * resumes from where its consumers committed, not from zero. Corrupt
