@@ -151,7 +151,11 @@ test('sampled messages are never written to the durable log', () => {
 });
 
 test('sampling runs before the hard rate limit and burns no budget', () => {
-  const bus = new EventBus({ samplingRandom: () => 0 });
+  // Injected clock: the token bucket refills on the bus clock, so the
+  // test is deterministic under load — wall-clock stalls must not refill
+  // the bucket mid-test.
+  const clock = makeClock();
+  const bus = new EventBus({ now: clock.now, samplingRandom: () => 0 });
   bus.setTopicRateLimit('t', 1000, { burst: 2 });
   bus.setTopicSampleRate('t', 1);
   bus.subscribe('t', () => {});

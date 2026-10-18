@@ -1124,6 +1124,19 @@ export interface PublishDedupEntry {
   messageId: string;
   /** First-admission timestamp in milliseconds (the bus clock). */
   at: number;
+  /**
+   * Canonical payload hash (EB-151): present on explicit
+   * idempotency-key claims (`key:` messageId prefix) — the SHA-256 of the
+   * first claim's canonical payload bytes, for post-restart conflict
+   * detection. Absent on messageId and content-hash claims.
+   */
+  hash?: string;
+  /**
+   * First publish's accepted-delivery count (EB-151): present on explicit
+   * idempotency-key claims — returned to within-window retries after a
+   * restart. Absent on messageId and content-hash claims.
+   */
+  accepted?: number;
 }
 
 /** On-disk envelope for one publish-dedup-journal line. `v` pins the format. */
@@ -1132,6 +1145,8 @@ interface PublishDedupLine {
   topic: string;
   messageId: string;
   at: number;
+  hash?: string;
+  accepted?: number;
 }
 
 /**
@@ -1150,13 +1165,16 @@ function publishDedupLineOf(entry: PublishDedupEntry): PublishDedupLine {
     topic: entry.topic,
     messageId: entry.messageId,
     at: entry.at,
+    ...(entry.hash === undefined ? {} : { hash: entry.hash }),
+    ...(entry.accepted === undefined ? {} : { accepted: entry.accepted }),
   };
 }
 
 /**
  * Parses one publish-dedup-journal line. Returns `null` for anything
- * malformed — wrong version, an empty topic/messageId, or a non-finite
- * timestamp. Corrupt lines are skipped, never fatal.
+ * malformed — wrong version, an empty topic/messageId, a non-finite
+ * timestamp, or a non-string `hash` / non-finite `accepted` when those
+ * optional fields are present. Corrupt lines are skipped, never fatal.
  */
 function parsePublishDedupLine(line: string): PublishDedupEntry | null {
   let parsed: unknown;
@@ -1171,10 +1189,15 @@ function parsePublishDedupLine(line: string): PublishDedupEntry | null {
   if (typeof o['topic'] !== 'string' || (o['topic'] as string).length === 0) return null;
   if (typeof o['messageId'] !== 'string' || (o['messageId'] as string).length === 0) return null;
   if (typeof o['at'] !== 'number' || !Number.isFinite(o['at'])) return null;
+  if (o['hash'] !== undefined && typeof o['hash'] !== 'string') return null;
+  if (o['accepted'] !== undefined && (typeof o['accepted'] !== 'number' || !Number.isFinite(o['accepted'])))
+    return null;
   return {
     topic: o['topic'] as string,
     messageId: o['messageId'] as string,
     at: o['at'] as number,
+    ...(typeof o['hash'] === 'string' ? { hash: o['hash'] as string } : {}),
+    ...(typeof o['accepted'] === 'number' ? { accepted: o['accepted'] as number } : {}),
   };
 }
 

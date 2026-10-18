@@ -66,6 +66,15 @@
  *   `commitOffset`, so the offset journal and the `OffsetStore`
  *   write-through saw exactly the same writes as manual commits.
  * - `eventbus_topic_published_messages_total{topic}`: publishes per topic.
+ * - `eventbus_idempotent_hits_total{topic}`: publishes per topic
+ *   suppressed by explicit idempotency keys (`PublishOptions.idempotencyKey`,
+ *   EB-151) — the retry arrived with a `(topic, idempotencyKey)` pair
+ *   already claimed within the idempotency window, so it returned the
+ *   first publish's result instead of publishing again. Distinct from
+ *   `eventbus_duplicate_messages_total` (EB-27/EB-146). Activity-gated:
+ *   the series (and its HELP/TYPE block) render only when at least one
+ *   topic has a hit, so a bus without idempotency-key traffic renders
+ *   byte-identical exposition to before.
  * - `eventbus_fair_scheduled_messages_total{topic}`: messages per topic
  *   dequeued by the topic-fair scheduler (EB-135; "scheduled", not
  *   "delivered" — see `BusStats.topicFairness`); only emitted for topics
@@ -686,6 +695,24 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_signature_failures_total{${label}} ${t.signatureFailures ?? 0}`);
     if (t.watermark !== undefined) {
       lines.push(`eventbus_topic_event_time_watermark{${label}} ${t.watermark}`);
+    }
+  }
+
+  // Explicit idempotency-key hits (EB-151): per-topic suppression counts.
+  // Activity-gated — the HELP/TYPE block and the series render only when
+  // at least one topic has a hit, so a bus without idempotency-key
+  // traffic renders byte-identical exposition to before. `?? 0` keeps
+  // the renderer tolerant of a stats object that predates the field
+  // (hand-built fixtures included), mirroring the per-topic idiom above.
+  const idempotentHitTopics = stats.topics.filter((t) => (t.idempotentHits ?? 0) > 0);
+  if (idempotentHitTopics.length > 0) {
+    lines.push(
+      '# HELP eventbus_idempotent_hits_total Publishes suppressed by explicit idempotency keys (EB-151): the retry arrived with a (topic, idempotencyKey) pair already claimed within the idempotency window, so it returned the first publish result instead of publishing again.',
+    );
+    lines.push('# TYPE eventbus_idempotent_hits_total counter');
+    for (const t of stats.topics) {
+      const label = `topic="${escapeLabelValue(t.topic)}"`;
+      lines.push(`eventbus_idempotent_hits_total{${label}} ${t.idempotentHits ?? 0}`);
     }
   }
 

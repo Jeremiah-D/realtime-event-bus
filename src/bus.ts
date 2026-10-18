@@ -3797,6 +3797,18 @@ export interface TopicStats {
    */
   duplicateMessages: number;
   /**
+   * Publishes to this topic suppressed by an explicit idempotency key
+   * (see `PublishOptions.idempotencyKey`, EB-151): the retry arrived with
+   * a `(topic, idempotencyKey)` pair already claimed within the
+   * idempotency window and the same payload, so it returned the first
+   * publish's result instead of publishing again — no sequence number
+   * consumed (subscribers see no gap), nothing written to the durable
+   * log, no rate-limit budget burned. Distinct from `duplicateMessages`
+   * (EB-27/EB-146): the two suppression identities are observable
+   * separately.
+   */
+  idempotentHits: number;
+  /**
    * Messages fanned out on this topic that a subscriber's content filter
    * rejected (see `SubscribeOptions.filter`), or that a composite
    * subscription's include/exclude patterns rejected (see
@@ -4284,6 +4296,14 @@ export interface BusStats {
    * for the exact counting rules.
    */
   duplicateMessages: number;
+  /**
+   * Total publishes suppressed by explicit idempotency keys — the sum of
+   * every topic's `idempotentHits`. See `TopicStats.idempotentHits` for
+   * the exact counting rules. Distinct from `duplicateMessages`
+   * (EB-27/EB-146): the two suppression identities are observable
+   * separately.
+   */
+  idempotentHits: number;
   /**
    * Total messages suppressed by subscriber-side exactly-once dedup —
    * the sum of every topic's `dedupDropped`. See
@@ -5961,6 +5981,7 @@ function zeroedTopicStats(): {
   deprecatedSchemaVersions: number;
   lateMessages: number;
   duplicateMessages: number;
+  idempotentHits: number;
   filteredMessages: number;
   signatureFailures: number;
   dedupDropped: number;
@@ -5998,6 +6019,7 @@ function zeroedTopicStats(): {
     deprecatedSchemaVersions: 0,
     lateMessages: 0,
     duplicateMessages: 0,
+    idempotentHits: 0,
     filteredMessages: 0,
     signatureFailures: 0,
     dedupDropped: 0,
@@ -6030,6 +6052,33 @@ function validateMessageKey(key: string | undefined, caller: string): void {
     throw new RangeError(`${caller}: key must be a non-empty string`);
   }
 }
+
+/**
+ * Validates `PublishOptions.idempotencyKey` (EB-151): absent is fine,
+ * otherwise it must be 1–128 visible ASCII characters (no spaces, no
+ * control characters, no DEL) — a producer-chosen opaque token that is
+ * safe to embed in journal lines and metric labels. Anything else
+ * (non-string, empty, too long, non-ASCII) throws `RangeError` before
+ * anything is mutated, matching the other publish-option validations.
+ */
+function validateIdempotencyKey(idempotencyKey: string | undefined, caller: string): void {
+  if (idempotencyKey === undefined) return;
+  if (typeof idempotencyKey !== 'string' || !IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    throw new RangeError(
+      `${caller}: idempotencyKey must be 1-128 visible ASCII characters`,
+    );
+  }
+}
+
+/**
+ * Explicit idempotency-key alphabet (EB-151): 1–128 visible ASCII
+ * characters (`!` through `~`). The key is embedded verbatim in the
+ * publish-dedup journal's reserved `key:` slot and in the in-memory
+ * claim table, so the alphabet excludes whitespace, control characters
+ * and DEL — anything that could confuse a line-oriented journal or a
+ * label value.
+ */
+const IDEMPOTENCY_KEY_PATTERN = /^[!-~]{1,128}$/;
 
 /**
  * Fail-fast type validation for `PublishOptions.partitionKey` /
@@ -7571,7 +7620,8 @@ export type AtomicRejectReason =
   | 'rate-limit'
   | 'publisher-rate-limit'
   | 'alias-retired'
-  | 'topic-paused';
+  | 'topic-paused'
+  | 'idempotency-conflict';
 
 /**
  * Which publish-side admission gate decided a `previewPublish` call — the
@@ -8375,6 +8425,36 @@ export class AclDeniedError extends Error {
 }
 
 /**
+ * Thrown by the publish entry points when an explicit idempotency key
+ * (see `PublishOptions.idempotencyKey`, EB-151) is reused on the same
+ * topic with a DIFFERENT payload while the first claim is still inside
+ * the idempotency window: the key names one logical publish, so a
+ * second, different payload under the same key is a producer bug, not a
+ * retry. Fail-fast and loud — never a silent overwrite and never a
+ * second delivery. A retry carrying the same payload is not a conflict:
+ * it is suppressed as a duplicate and returns the first publish's
+ * result instead.
+ */
+export class IdempotencyKeyConflictError extends Error {
+  /** The conflicting idempotency key. */
+  readonly key: string;
+  /** The concrete topic the key was claimed on. */
+  readonly topic: string;
+  /** Always `'IDEMPOTENCY_KEY_CONFLICT'`. */
+  readonly code = 'IDEMPOTENCY_KEY_CONFLICT';
+
+  constructor(key: string, topic: string) {
+    super(
+      `idempotency key "${key}" on topic "${topic}" was already claimed with a different payload — ` +
+        `refusing publish (IDEMPOTENCY_KEY_CONFLICT)`,
+    );
+    this.name = 'IdempotencyKeyConflictError';
+    this.key = key;
+    this.topic = topic;
+  }
+}
+
+/**
  * Thrown by `publish` when the topic's publish circuit breaker (see
  * `setPublishCircuitBreaker`, EB-116) is open: every subscriber of the
  * topic has been degraded (health-probe auto-pause, EB-18) or shedding at
@@ -8823,6 +8903,17 @@ export type BatchMessage = Omit<BusMessage, 'seq'> & {
    * convention as the other per-entry validations.
    */
   ttlMs?: number;
+  /**
+   * Explicit idempotency key (see `PublishOptions.idempotencyKey`,
+   * EB-151): validated per entry at the publish entry point
+   * (`publishBatch`, `publishAtomic`). `publishBatch` enforces it per
+   * entry like `publish` (a hit contributes the first publish's
+   * accepted count to the batch total; a payload conflict throws
+   * `IdempotencyKeyConflictError`); `publishAtomic` checks it in shadow
+   * admission — a batch reusing one key twice is a whole-batch conflict
+   * — and claims the admitted entries' keys at commit.
+   */
+  idempotencyKey?: string;
 };
 
 /**
@@ -8903,6 +8994,47 @@ export interface PublishDelayedOptions {
    * `0` means the message expires the moment it fans out.
    */
   ttlMs?: number;
+  /**
+   * Explicit idempotency key for this publish (EB-151, opt-in): within
+   * the bus idempotency window (`EventBusOptions.idempotencyWindowMs`,
+   * measured on the bus clock), the `(topic, idempotencyKey)` pair is
+   * published at most once. A retry carrying the same key on the same
+   * topic returns the first publish's result (its accepted-delivery
+   * count) with zero side effects — no sequence number consumed, nothing
+   * written to the durable log, no rate-limit budget burned, no fan-out,
+   * no stats moved except the idempotent-hit counter — while a retry
+   * carrying the same key with a DIFFERENT payload throws
+   * `IdempotencyKeyConflictError` instead of silently overwriting or
+   * double-delivering. The payload identity is the SHA-256 of the
+   * canonical payload bytes (the same measure EB-146's content hash
+   * uses), compared against the first claim's recorded hash.
+   *
+   * Gate order mirrors `publishIdempotent` / `publishDedupedByContent`:
+   * the key is validated fail-fast at the publish entry point
+   * (`RangeError` for anything but 1–128 visible ASCII characters), then
+   * checked after the broker-level ACL and before every other admission
+   * gate — the duplicate decision looks at identity alone. Only an
+   * *admitted* publish claims a key slot: a denied, rejected or shed
+   * first attempt leaves the retry free, and a retry that arrives after
+   * the window expired is a fresh publish that overwrites the old claim.
+   * Claims are journaled to the same `__publish_dedup.jsonl` EB-66 uses
+   * (messageId slot `key:<idempotencyKey>`, a reserved prefix — do not
+   * use it as a real `messageId`), so the window survives restarts, and
+   * share the `idempotencyMaxEntries` bound with the EB-146 content
+   * claims. Suppressed retries are counted in
+   * `TopicStats.idempotentHits` / `BusStats.idempotentHits` (the
+   * `eventbus_idempotent_hits_total` series) — distinct from EB-146's
+   * `duplicateMessages`.
+   *
+   * Composes with `publishDedupedByContent`: the explicit key is checked
+   * first and wins over the content hash — a key hit suppresses even
+   * when the content differs from any content claim, and an admitted
+   * keyed content publish claims both the key slot and the content slot.
+   * `publishAtomic` shadow admission rejects a batch that reuses one key
+   * twice (whole-batch conflict, no partial claims); `previewPublish`
+   * validates the key but never consults or claims the table.
+   */
+  idempotencyKey?: string;
 }
 
 /**
@@ -9566,6 +9698,18 @@ function confirmationPayloadHash(payload: unknown, binary: boolean): string {
 const CONTENT_DEDUP_JOURNAL_PREFIX = 'content:';
 
 /**
+ * Journal marker for explicit idempotency-key claims (EB-151):
+ * keyed publishes journal their admitted claims to the same
+ * `__publish_dedup.jsonl` file EB-66 uses, with the messageId slot
+ * holding this prefix plus the idempotency key — so the one journal
+ * covers all three publish-side dedup identities (messageId, content
+ * hash, explicit key) and restart rehydration routes each claim to the
+ * right in-memory table. Message ids starting with this prefix are
+ * reserved; do not use them as `PublishOptions.messageId`.
+ */
+const KEY_DEDUP_JOURNAL_PREFIX = 'key:';
+
+/**
  * Validates `PublishOptions.binary` at the publish entry points:
  * `binary: true` requires a `Uint8Array` payload (`ArrayBuffer` is
  * wrapped in a zero-copy view); anything else throws `TypeError` before
@@ -10032,6 +10176,7 @@ export class EventBus {
       circuitBrokenMessages: number;
       rejectedMessages: number;
       duplicateMessages: number;
+      idempotentHits: number;
       filteredMessages: number;
       dedupDropped: number;
       aliasRetiredMessages: number;
@@ -10655,6 +10800,13 @@ export class EventBus {
    */
   private totalDuplicates = 0;
   /**
+   * Publishes suppressed by explicit idempotency keys (global total, EB-151).
+   * A key hit is dropped before admission — no sequence number, no
+   * durable-log write, no rate-limit budget — and counted here and on the
+   * topic's `idempotentHits` stat only, separately from `totalDuplicates`.
+   */
+  private totalIdempotentHits = 0;
+  /**
    * Idempotency dedup table for `publishIdempotent`: dedup key ->
    * bus-clock timestamp of the admitted publish that claimed it. The
    * dedup key is `${topic}\0${messageId}`, so the same messageId on
@@ -10679,11 +10831,21 @@ export class EventBus {
    * expiry is always re-checked against the claim's window on lookup
    * (an injected clock may move non-monotonically).
    *
+   * EB-151 reuses this table for explicit idempotency-key claims: the
+   * slot is `${topic}\\0key:<idempotencyKey>` (the reserved `key:`
+   * journal prefix, which a content hash can never collide with — hex
+   * has no colon) and the value additionally carries the first claim's
+   * canonical payload `hash` (for payload-conflict detection) and
+   * `accepted` count (the first publish's result, returned to retries).
+   * Key claims share the table's `idempotencyMaxEntries` bound and the
+   * journal with the content claims — the two identities are orthogonal
+   * but budgeted together.
+   *
    * Only admitted messages (past schema validation and the rate-limit
    * budgets) occupy slots: a rejected or shed first attempt must not
    * suppress its retry.
    */
-  private contentDedup = new Map<string, { at: number; windowMs: number }>();
+  private contentDedup = new Map<string, { at: number; windowMs: number; hash?: string; accepted?: number }>();
   /**
    * Dedup window in milliseconds (`EventBusOptions.idempotencyWindowMs`):
    * a retry within this long of the admitted publish is a duplicate.
@@ -11719,17 +11881,40 @@ export class EventBus {
       // table's insertion-ordered eviction. EB-146: content-hash claims
       // (journaled with the reserved `content:` messageId prefix) are
       // routed back to the content-dedup table with the bus-level window —
-      // a per-call custom window is an in-process refinement.
+      // a per-call custom window is an in-process refinement. EB-151:
+      // explicit idempotency-key claims (journaled with the reserved
+      // `key:` prefix) are routed back to the key slots of the same
+      // table, restoring the first claim's payload hash (for conflict
+      // detection) and first result (returned to retries); a `key:` line
+      // without a hash is not a valid key claim and is skipped.
       {
         const nowMs = this.now();
         const live: Array<{ key: string; at: number }> = [];
-        const liveContent: Array<{ key: string; at: number }> = [];
+        // Content-hash (EB-146) and explicit-key (EB-151) claims share the
+        // one in-memory table, so they share one tail slice here too: the
+        // journal yields claims in claim order, and taking the tail keeps
+        // the most recently claimed identities — the exact analog of the
+        // live table's insertion-ordered eviction.
+        const liveTable: Array<{ key: string; at: number; hash?: string; accepted?: number }> = [];
         for (const entry of log.recoveredPublishDedup()) {
           if (nowMs - entry.at < this.idempotencyWindowMs) {
             if (entry.messageId.startsWith(CONTENT_DEDUP_JOURNAL_PREFIX)) {
-              liveContent.push({
+              liveTable.push({
                 key: `${entry.topic}\0${entry.messageId.slice(CONTENT_DEDUP_JOURNAL_PREFIX.length)}`,
                 at: entry.at,
+              });
+            } else if (entry.messageId.startsWith(KEY_DEDUP_JOURNAL_PREFIX)) {
+              if (typeof entry.hash !== 'string') continue;
+              // The in-memory key slot keeps the `key:` prefix (it is
+              // what distinguishes key slots from content-hash slots in
+              // the shared table), so the journal messageId is used
+              // verbatim — unlike the `content:` prefix, it is not
+              // stripped.
+              liveTable.push({
+                key: `${entry.topic}\0${entry.messageId}`,
+                at: entry.at,
+                hash: entry.hash,
+                accepted: entry.accepted ?? 0,
               });
             } else {
               live.push({ key: `${entry.topic}\0${entry.messageId}`, at: entry.at });
@@ -11739,8 +11924,8 @@ export class EventBus {
         for (const { key, at } of live.slice(-this.idempotencyMaxEntries)) {
           this.dedup.set(key, at);
         }
-        for (const { key, at } of liveContent.slice(-this.idempotencyMaxEntries)) {
-          this.contentDedup.set(key, { at, windowMs: this.idempotencyWindowMs });
+        for (const { key, at, hash, accepted } of liveTable.slice(-this.idempotencyMaxEntries)) {
+          this.contentDedup.set(key, { at, windowMs: this.idempotencyWindowMs, hash, accepted });
         }
       }
       // Recover numbering continuity and per-key cursors from the log —
@@ -15115,6 +15300,7 @@ export class EventBus {
         rejectedMessages: 0,
         lateMessages: 0,
         duplicateMessages: 0,
+        idempotentHits: 0,
         aliasRetiredMessages: 0,
         redactedFields: 0,
         filteredMessages: 0,
@@ -20039,6 +20225,9 @@ export class EventBus {
     validateBarrier(opts?.barrier, caller);
     // Priority lane (EB-122): fail-fast, before anything is mutated.
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, caller);
+    // Explicit idempotency key (EB-151): fail-fast, before anything is
+    // mutated — `publish` and `publishWithConfirmation` share this path.
+    validateIdempotencyKey(opts?.idempotencyKey, caller);
     // Binary payload passthrough (EB-92): validated and normalized here
     // — `binary: true` with a non-bytes payload throws `TypeError`
     // before anything is mutated.
@@ -20067,6 +20256,53 @@ export class EventBus {
       }
       this.scheduleFlush();
       return { ...barrier, seq: barrier.admitted ? 0 : undefined };
+    }
+    // Explicit idempotency key (EB-151): after namespace resolution and
+    // the barrier slim path, after the broker-level ACL, before every
+    // other admission gate — mirroring `publishIdempotent`'s gate order,
+    // so the duplicate decision looks at identity alone. A live
+    // in-window claim with the same payload returns the first publish's
+    // result with zero side effects (no sequence number, no durable-log
+    // write, no rate-limit budget, no fan-out); a live claim with a
+    // different payload throws `IdempotencyKeyConflictError`. A retired
+    // alias or an ACL denial falls through to `fanOut`, which reports it
+    // normally — a denied publish claims no key slot and suppresses
+    // nothing, so its retry stays a fresh publish. The circuit-breaker
+    // gate below still runs for a fresh keyed publish; a duplicate hit
+    // returns before it, because the retry is answered from the recorded
+    // claim and never becomes a new admission.
+    const idempotencyKey = opts?.idempotencyKey;
+    let keyClaim: { topic: string; key: string; nowMs: number } | undefined;
+    if (idempotencyKey !== undefined) {
+      const aliasResolution = this.resolvePublishTopic(topic);
+      if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic)) {
+        const nowMs = this.now();
+        const firstAccepted = this.idempotencyKeyHit(
+          aliasResolution.topic,
+          idempotencyKey,
+          confirmationPayloadHash(payload, binary),
+          nowMs,
+        );
+        if (firstAccepted !== undefined) {
+          // Suppressed duplicate: the retry gets the first publish's
+          // accepted count — no sequence number consumed (subscribers
+          // see no gap), nothing written to the durable log, no
+          // rate-limit budget burned. Counted in `idempotentHits` and
+          // journaled as a 'duplicate' admission decision, like every
+          // other suppressed duplicate.
+          this.countIdempotentHit(aliasResolution.topic, payload, opts?.publisherId);
+          this.recordPublishAudit(aliasResolution.topic, {
+            admitted: false,
+            reason: 'duplicate',
+            key: opts?.key,
+            traceparent: opts?.traceparent,
+            messageId: opts?.messageId,
+            publisherId: opts?.publisherId,
+          });
+          return { accepted: firstAccepted, admitted: false, rejectReason: 'duplicate', topic };
+        }
+        keyClaim = { topic: aliasResolution.topic, key: idempotencyKey, nowMs };
+      }
     }
     // Publish circuit breaker (EB-116): the fail-fast gate for topics
     // whose every subscriber is degraded or shedding. Opt-in per topic —
@@ -20135,6 +20371,20 @@ export class EventBus {
       // Trip/close evaluation: trips open after enough consecutive
       // all-degraded/shedding publishes; resolves a half-open probe.
       this.updatePublishCircuitBreaker(breakerTopic);
+    }
+    // Explicit idempotency key (EB-151): only an admitted publish claims
+    // a key slot — the window starts at its publish time, and a denied,
+    // rejected or shed first attempt leaves the retry free. The claim
+    // records the payload hash (for conflict detection) and the first
+    // result (returned to retries).
+    if (keyClaim !== undefined && admitted) {
+      this.claimIdempotencyKey(
+        keyClaim.topic,
+        keyClaim.key,
+        confirmationPayloadHash(payload, binary),
+        accepted,
+        keyClaim.nowMs,
+      );
     }
     this.scheduleFlush();
     return { accepted, admitted, rejectReason, seq, topic };
@@ -20538,6 +20788,10 @@ export class EventBus {
     // Adaptive sampling exemption (EB-38): fail-fast, before anything is
     // mutated.
     validateCritical(opts?.critical, 'publishIdempotent');
+    // Explicit idempotency key (EB-151): validated fail-fast like every
+    // other option, but not consulted here — `publishIdempotent`'s
+    // identity is `(topic, messageId)`; use `publish` for the key gate.
+    validateIdempotencyKey(opts?.idempotencyKey, 'publishIdempotent');
     // Priority lane (EB-122): fail-fast, before anything is mutated —
     // `IdempotentPublishOptions` inherits `priority` from `PublishOptions`.
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishIdempotent');
@@ -20791,6 +21045,10 @@ export class EventBus {
     validateTtlMs(opts?.ttlMs, 'publishDedupedByContent');
     validateCritical(opts?.critical, 'publishDedupedByContent');
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishDedupedByContent');
+    // Explicit idempotency key (EB-151): fail-fast, before anything is
+    // mutated — `ContentDedupPublishOptions` inherits it from
+    // `PublishOptions`.
+    validateIdempotencyKey(opts?.idempotencyKey, 'publishDedupedByContent');
     // Binary payload passthrough (EB-92): same contract as `publish`.
     payload = normalizeBinaryPayload(payload, opts?.binary, 'publishDedupedByContent');
     const binary = opts?.binary === true;
@@ -20839,13 +21097,44 @@ export class EventBus {
       return { duplicate: false, accepted: 0 };
     }
     const nowMs = this.now();
+    // Explicit idempotency key (EB-151): checked after the ACL and
+    // before the content gate — the explicit key wins over the content
+    // hash. A live key claim with the same payload suppresses the
+    // publish (counted in `idempotentHits`, not `duplicateMessages`); a
+    // live claim with a different payload throws
+    // `IdempotencyKeyConflictError`. With no key the content gate below
+    // runs exactly as before.
+    const idempotencyKey = opts?.idempotencyKey;
     // The content identity: SHA-256 hex of the canonical payload bytes
     // (see `confirmationPayloadHash`, EB-125). The key keeps the
     // `${topic}\0<identity>` shape EB-27 uses, in the SEPARATE
     // content-dedup table — the two identities never collide.
     const contentHash = confirmationPayloadHash(payload, binary);
+    if (idempotencyKey !== undefined) {
+      const firstAccepted = this.idempotencyKeyHit(topic, idempotencyKey, contentHash, nowMs);
+      if (firstAccepted !== undefined) {
+        // Key-hit suppression: dropped before admission — no sequence
+        // number, no durable-log write, no rate-limit budget — and the
+        // content gate is never consulted. Counted in `idempotentHits`
+        // (not `duplicateMessages`) and surfaced on the
+        // admission-rejection hook with the EB-39 'duplicate' reason,
+        // like every other suppressed duplicate.
+        this.countIdempotentHit(topic, payload, publisherId);
+        this.recordPublishAudit(topic, {
+          admitted: false,
+          reason: 'duplicate',
+          key: opts?.key,
+          traceparent: opts?.traceparent,
+          messageId: opts?.messageId,
+          publisherId,
+        });
+        return { duplicate: true, accepted: 0 };
+      }
+    }
     const contentDedupKey = `${topic}\0${contentHash}`;
-    this.pruneContentDedup(nowMs);
+    // The key gate above already pruned when a key was present; prune
+    // here only for the keyless path.
+    if (idempotencyKey === undefined) this.pruneContentDedup(nowMs);
     const claim = this.contentDedup.get(contentDedupKey);
     if (claim !== undefined && nowMs - claim.at < claim.windowMs) {
       // Suppressed duplicate: dropped before admission — no sequence
@@ -20929,6 +21218,15 @@ export class EventBus {
         messageId: `${CONTENT_DEDUP_JOURNAL_PREFIX}${contentHash}`,
         at: nowMs,
       });
+      // Explicit idempotency key (EB-151): an admitted keyed content
+      // publish claims the key slot too — a later `publish` (or
+      // `publishDedupedByContent`) with the same key hits the key gate
+      // first, even when its payload differs from every content claim.
+      // The key claim records the same payload hash the key gate
+      // compared, so conflict detection stays exact.
+      if (idempotencyKey !== undefined) {
+        this.claimIdempotencyKey(topic, idempotencyKey, contentHash, accepted, nowMs);
+      }
     }
     return { duplicate: false, accepted };
   }
@@ -20970,6 +21268,12 @@ export class EventBus {
    *   real `publishIdempotent` after the preview still admits once, and a
    *   second preview still reports `admitted`. The verdict is identical;
    *   the registration is skipped.
+   * - Explicit idempotency keys (EB-151): a preview validates
+   *   `PublishOptions.idempotencyKey` (fail-fast `RangeError`, like
+   *   `publish`) but never consults the key table and never claims a key
+   *   slot — idempotency is not previewed. A real `publish` after the
+   *   preview still admits once, and the preview verdict is identical
+   *   with or without a live claim for the key.
    * - Adaptive sampling (EB-38) is not consulted: the gate is
    *   probabilistic, and a preview cannot draw from the injected random
    *   stream without disturbing the sequence of real publish decisions —
@@ -21013,6 +21317,9 @@ export class EventBus {
     // never stamped here.
     validateTtlMs(opts?.ttlMs, 'previewPublish');
     validateBarrier(opts?.barrier, 'previewPublish');
+    // Explicit idempotency key (EB-151): validated fail-fast like every
+    // other option — but never consulted (see the divergences above).
+    validateIdempotencyKey(opts?.idempotencyKey, 'previewPublish');
     // Binary payload passthrough (EB-92): same contract as `publish` — a
     // non-bytes payload with `binary: true` throws `TypeError`.
     payload = normalizeBinaryPayload(payload, opts?.binary, 'previewPublish');
@@ -21128,6 +21435,9 @@ export class EventBus {
       // Per-message TTL override (EB-149): validated per entry, like the
       // other per-entry options — the commit phase stamps it into fanOut.
       validateTtlMs(msg.ttlMs, 'publishBatch');
+      // Explicit idempotency key (EB-151): validated per entry, like the
+      // other per-entry options — enforced per entry below.
+      validateIdempotencyKey(msg.idempotencyKey, 'publishBatch');
       // Priority lane (EB-122): a batch entry carries its lane on the
       // inherited `BusMessage.lane` field — validated per entry, like the
       // other per-entry options.
@@ -21135,7 +21445,41 @@ export class EventBus {
     }
     let accepted = 0;
     for (const msg of messages) {
-      accepted += this.fanOut(
+      // Explicit idempotency key (EB-151): enforced per entry like
+      // `publish` — after alias resolution and the ACL, before the
+      // remaining admission gates. A hit contributes the first publish's
+      // accepted count to the batch total without fanning out; a payload
+      // conflict throws `IdempotencyKeyConflictError`, failing the whole
+      // batch call like any other per-entry throw. A denied or retired
+      // entry falls through to `fanOut`, which reports it normally.
+      let keyClaim: { topic: string; key: string; nowMs: number } | undefined;
+      if (msg.idempotencyKey !== undefined) {
+        const aliasResolution = this.resolvePublishTopic(msg.topic);
+        if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic)) {
+          const nowMs = this.now();
+          const firstAccepted = this.idempotencyKeyHit(
+            aliasResolution.topic,
+            msg.idempotencyKey,
+            confirmationPayloadHash(msg.payload, false),
+            nowMs,
+          );
+          if (firstAccepted !== undefined) {
+            this.countIdempotentHit(aliasResolution.topic, msg.payload, msg.publisherId);
+            this.recordPublishAudit(aliasResolution.topic, {
+              admitted: false,
+              reason: 'duplicate',
+              key: msg.key,
+              traceparent: msg.traceparent,
+              messageId: msg.messageId,
+              publisherId: msg.publisherId,
+            });
+            accepted += firstAccepted;
+            continue;
+          }
+          keyClaim = { topic: aliasResolution.topic, key: msg.idempotencyKey, nowMs };
+        }
+      }
+      const outcome = this.fanOut(
         msg.topic,
         msg.payload,
         false,
@@ -21172,7 +21516,19 @@ export class EventBus {
         // Per-message TTL (EB-149): validated per entry above; `fanOut`
         // stamps `nowMs + ttlMs`, overriding the topic TTL rules.
         msg.ttlMs,
-      ).accepted;
+      );
+      accepted += outcome.accepted;
+      // Explicit idempotency key (EB-151): only an admitted entry claims
+      // a key slot — a rejected or shed entry leaves its retry free.
+      if (keyClaim !== undefined && outcome.admitted) {
+        this.claimIdempotencyKey(
+          keyClaim.topic,
+          keyClaim.key,
+          confirmationPayloadHash(msg.payload, false),
+          outcome.accepted,
+          keyClaim.nowMs,
+        );
+      }
     }
     this.scheduleFlush();
     return accepted;
@@ -21248,6 +21604,9 @@ export class EventBus {
       // the other per-entry validations; the commit phase stamps the
       // deadline into fanOut per entry.
       validateTtlMs(entry.ttlMs, 'publishAtomic');
+      // Explicit idempotency key (EB-151): validated per entry, like the
+      // other per-entry options — enforced in shadow admission below.
+      validateIdempotencyKey(entry.idempotencyKey, 'publishAtomic');
       // Priority lane (EB-122): validated per entry, like the other
       // per-entry options; the commit phase carries it into `fanOut`.
       if (entry.lane !== undefined) assertValidMessageLane(entry.lane, 'publishAtomic');
@@ -21265,6 +21624,11 @@ export class EventBus {
     // Alias-resolved topics, one per entry: the commit phase publishes the
     // resolved topics, never the raw entry topics.
     const resolvedTopics: string[] = new Array(entries.length);
+    // Explicit idempotency-key slots claimed by this batch's shadow
+    // admission (EB-151): a second claim of the same (topic, key) inside
+    // one batch is a whole-batch conflict — the set is discarded with
+    // the shadow state on rejection, so a rejected batch claims nothing.
+    const shadowIdempotencyKeys = new Set<string>();
     // Admitted payloads, one per entry: shadow admission redacts (EB-68)
     // and then runs the transform chain (EB-147) on the resolved topic
     // before the schema gate; the commit phase fans out these bytes
@@ -21347,6 +21711,42 @@ export class EventBus {
         shadowKeyCursors.set(key, keySeq);
         keySeqs[index] = keySeq;
       }
+      // Explicit idempotency keys (EB-151): shadow-checked after the
+      // entry clears the other admission gates — the ACL ran inside
+      // `admissionVerdict`, so the key check sits after it, like the live
+      // path. A second claim of the same (topic, key) inside this batch,
+      // or a live in-window claim from an earlier publish, aborts the
+      // whole batch: atomicity forbids suppressing one entry while
+      // publishing the rest, so a duplicate-or-conflict entry is a
+      // batch-level conflict, not a per-entry suppression. Nothing is
+      // claimed in shadow — the admitted entries claim their keys at
+      // commit — so a rejected batch leaves the key window exactly
+      // untouched. The lookup does not prune: pruning only drops expired
+      // entries, and the per-key expiry re-check gives the identical
+      // verdict without mutating the table.
+      const entryIdempotencyKey = entries[index].idempotencyKey;
+      if (entryIdempotencyKey !== undefined) {
+        const slot = this.idempotencyKeySlot(resolvedTopic, entryIdempotencyKey);
+        const nowMs = this.now();
+        const liveClaim = this.contentDedup.get(slot);
+        const live =
+          liveClaim !== undefined &&
+          nowMs - liveClaim.at < liveClaim.windowMs &&
+          liveClaim.hash !== undefined;
+        if (shadowIdempotencyKeys.has(slot) || live) {
+          // Whole-batch idempotency conflict: counted once against the
+          // failing entry's rejection counters and surfaced on the
+          // admission-rejection hook with the 'duplicate' reason (never a
+          // DLQ record — a key conflict is producer-side, not a poison
+          // message), so the rejection stays reconcilable with stats like
+          // any other atomic rejection.
+          this.statsFor(topic).rejectedMessages += 1;
+          this.totalRejected += 1;
+          this.emitAdmissionRejected(topic, 'duplicate', payload, entries[index].publisherId);
+          return { published: 0, rejected: { index, topic, reason: 'idempotency-conflict' } };
+        }
+        shadowIdempotencyKeys.add(slot);
+      }
     }
     // Phase 2: everything was admitted — commit through the normal
     // publish path in one synchronous turn, then flush once.
@@ -21360,7 +21760,7 @@ export class EventBus {
       if (this.isDeprecatedSchemaAdmission(resolvedTopics[index], schemaVersion)) {
         this.countDeprecatedSchema(resolvedTopics[index]);
       }
-      this.fanOut(
+      const commitOutcome = this.fanOut(
         resolvedTopics[index],
         // The shadow-admission redacted + transformed bytes: the commit
         // phase is pre-admitted and must run neither again (EB-68,
@@ -21401,6 +21801,23 @@ export class EventBus {
         // key-validation loop above; the commit stamps it per entry.
         ttlMs,
       );
+      // Explicit idempotency key (EB-151): the admitted entries claim
+      // their key slots at commit — the shadow phase claimed nothing, so
+      // a rejected batch leaves the key window exactly untouched. The
+      // claim records the RAW entry payload's hash (the same bytes the
+      // shadow check and the live `publish` path hash), so a later keyed
+      // publish compares identical measures. The accepted count is the
+      // commit fan-out's accepted deliveries for the entry.
+      const entryIdempotencyKey = entries[index].idempotencyKey;
+      if (entryIdempotencyKey !== undefined && commitOutcome.admitted) {
+        this.claimIdempotencyKey(
+          resolvedTopics[index],
+          entryIdempotencyKey,
+          confirmationPayloadHash(entries[index].payload, false),
+          commitOutcome.accepted,
+          this.now(),
+        );
+      }
     }
     this.scheduleFlush();
     return { published: entries.length };
@@ -23632,6 +24049,22 @@ export class EventBus {
   }
 
   /**
+   * Counts one publish suppressed by an explicit idempotency key
+   * (EB-151) against the topic and the global totals. Like
+   * `countDuplicate`, a key hit is a suppression before admission — it
+   * consumes no sequence number, never touches the durable log, and
+   * burns no rate-limit budget — but it lands in the separate
+   * `idempotentHits` counters (not `duplicateMessages`), and surfaces on
+   * the admission-rejection hook with the same EB-39 `'duplicate'`
+   * reason, so suppressed retries stay observable, not silent.
+   */
+  private countIdempotentHit(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).idempotentHits += 1;
+    this.totalIdempotentHits += 1;
+    this.emitAdmissionRejected(topic, 'duplicate', payload, publisherId);
+  }
+
+  /**
    * Counts one publish denied by the broker-level ACL against the topic
    * and the global totals. A denial is a rejection before admission — like
    * a schema rejection it consumes no sequence number, never touches the
@@ -24753,6 +25186,119 @@ export class EventBus {
       if (nowMs - claim.at < claim.windowMs) continue;
       this.contentDedup.delete(key);
     }
+  }
+
+  /**
+   * Claim-table slot for an explicit idempotency key (EB-151):
+   * `${topic}\\0key:<idempotencyKey>` — the reserved `key:` prefix keeps
+   * key slots disjoint from content-hash slots (a hex digest never
+   * contains a colon) inside the shared table.
+   */
+  private idempotencyKeySlot(topic: string, idempotencyKey: string): string {
+    return `${topic}\0${KEY_DEDUP_JOURNAL_PREFIX}${idempotencyKey}`;
+  }
+
+  /**
+   * Live in-window claim for `(topic, idempotencyKey)` (EB-151), or
+   * `undefined` when no live claim exists. Prunes expired claims first,
+   * so a claim past its window is "unknown" and the publish is fresh. A
+   * key slot without a recorded payload hash is not a valid key claim
+   * (the writer and the journal rehydration always record one) and is
+   * treated as absent — never a silent suppression, never a false
+   * conflict. Pure except for the prune: it never claims, never counts,
+   * never journals — claiming happens only for an admitted publish (see
+   * `claimIdempotencyKey`).
+   */
+  private liveIdempotencyKeyClaim(
+    topic: string,
+    idempotencyKey: string,
+    nowMs: number,
+  ): { hash: string; accepted: number } | undefined {
+    this.pruneContentDedup(nowMs);
+    const claim = this.contentDedup.get(this.idempotencyKeySlot(topic, idempotencyKey));
+    if (claim === undefined || nowMs - claim.at >= claim.windowMs) return undefined;
+    if (claim.hash === undefined) return undefined;
+    return { hash: claim.hash, accepted: claim.accepted ?? 0 };
+  }
+
+  /**
+   * Explicit idempotency-key gate (EB-151): checks whether the
+   * `(topic, idempotencyKey)` pair already has a live claim. `payloadHash`
+   * is the SHA-256 of the canonical payload bytes of the incoming
+   * publish (the same measure EB-146 uses) — compared against the first
+   * claim's recorded hash.
+   *
+   * Returns the first claim's recorded `accepted` count when the pair is
+   * a live in-window hit with a matching payload; returns `undefined`
+   * when no live claim exists (the publish is fresh). Throws
+   * `IdempotencyKeyConflictError` when a live claim exists with a
+   * different payload hash — the key names one logical publish, so a
+   * different payload under the same key is a producer bug, never a
+   * silent overwrite.
+   */
+  private idempotencyKeyHit(
+    topic: string,
+    idempotencyKey: string,
+    payloadHash: string,
+    nowMs: number,
+  ): number | undefined {
+    const claim = this.liveIdempotencyKeyClaim(topic, idempotencyKey, nowMs);
+    if (claim === undefined) return undefined;
+    if (claim.hash !== payloadHash) {
+      throw new IdempotencyKeyConflictError(idempotencyKey, topic);
+    }
+    return claim.accepted;
+  }
+
+  /**
+   * Claims an explicit idempotency-key slot for an admitted publish
+   * (EB-151): the window starts at the publish time, so a later retry
+   * with the same key and payload returns `accepted` instead of
+   * publishing again, and a retry with a different payload throws
+   * `IdempotencyKeyConflictError`. Deleting before re-inserting refreshes
+   * the entry's position so the bounded eviction tracks last-claim
+   * order, and the claim is journaled (best-effort, EB-66) so a restart
+   * keeps suppressing within-window retries — the journal line carries
+   * the payload hash and the first result, so post-restart conflict
+   * detection and first-result replay keep working.
+   *
+   * Call only for admitted publishes: a denied, rejected or shed first
+   * attempt must not suppress its retry.
+   */
+  private claimIdempotencyKey(
+    topic: string,
+    idempotencyKey: string,
+    payloadHash: string,
+    accepted: number,
+    nowMs: number,
+  ): void {
+    const slot = this.idempotencyKeySlot(topic, idempotencyKey);
+    this.contentDedup.delete(slot);
+    this.contentDedup.set(slot, {
+      at: nowMs,
+      windowMs: this.idempotencyWindowMs,
+      hash: payloadHash,
+      accepted,
+    });
+    while (this.contentDedup.size > this.idempotencyMaxEntries) {
+      const oldest = this.contentDedup.keys().next();
+      if (oldest.done) break;
+      this.contentDedup.delete(oldest.value);
+    }
+    // Publish-side idempotency-key journal (EB-66): persist the claim so
+    // a restart keeps suppressing within-window retries. Best-effort —
+    // the in-memory table is the source of truth, so a failed journal
+    // write never fails the publish. The identity is already namespaced
+    // to the concrete topic, so the single root journal covers every
+    // namespace. The reserved `key:` prefix routes the claim back to the
+    // key slot on rehydration.
+    this.durableLog?.appendPublishDedup({
+      topic,
+      messageId: `${KEY_DEDUP_JOURNAL_PREFIX}${idempotencyKey}`,
+      at: nowMs,
+      hash: payloadHash,
+      accepted,
+    });
   }
 
   /**
@@ -28155,6 +28701,7 @@ export class EventBus {
       },
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
+      idempotentHits: this.totalIdempotentHits,
       dedupDropped: this.totalDedupDropped,
       // Per-publisher publish totals (EB-65), most-published first; ties
       // break on the identity so the ranking is deterministic across
@@ -28384,6 +28931,7 @@ export class EventBus {
         // been admitted on the topic.
         watermark: this.eventWatermarks.get(topic)?.watermarkFor(this.allowedLatenessForTopic(topic)),
         duplicateMessages: stats.duplicateMessages,
+        idempotentHits: stats.idempotentHits,
         aliasRetiredMessages: stats.aliasRetiredMessages,
         redactedFields: stats.redactedFields,
         transformCalls: stats.transformCalls,

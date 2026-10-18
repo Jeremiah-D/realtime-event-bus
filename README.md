@@ -5003,3 +5003,52 @@ Semantics:
   yields performed by chunked fan-outs (one per scheduled step after the
   synchronous first chunk). It is not exported to Prometheus — it is a
   `getStats()`-only diagnostic.
+
+## Explicit idempotency keys (EB-151)
+
+`publish(topic, payload, { idempotencyKey })` opts a publish into
+explicit-key idempotency: within `EventBusOptions.idempotencyWindowMs`
+(measured on the bus clock), the `(topic, idempotencyKey)` pair is
+published at most once. A retry carrying the same key on the same topic
+returns the first publish's result (its accepted-delivery count) with
+zero side effects — no sequence number consumed, nothing written to the
+durable log, no rate-limit budget burned, no fan-out — while a retry
+carrying the same key with a *different* payload throws
+`IdempotencyKeyConflictError` (naming the key and the topic) instead of
+silently overwriting or double-delivering. The payload identity is the
+SHA-256 of the canonical payload bytes, compared against the first
+claim's recorded hash.
+
+Semantics:
+
+- **Opt-in, fail-fast validation.** The key must be 1–128 visible ASCII
+  characters; anything else throws `RangeError` at the publish entry
+  point before anything is mutated. Every publish entry point
+  (`publish`, `publishWithConfirmation`, `publishIdempotent`,
+  `publishDedupedByContent`, `publishBatch` / `publishAtomic` per entry,
+  `previewPublish`) validates it.
+- **Gate order.** The key is checked after the broker-level ACL and
+  before every other admission gate — the duplicate decision looks at
+  identity alone, mirroring `publishIdempotent` / EB-146. Only an
+  *admitted* publish claims a key slot: a denied, rejected or shed first
+  attempt leaves the retry free, and a retry arriving after the window
+  expired is a fresh publish that overwrites the old claim.
+- **Composition with EB-146 content-hash dedup.** The explicit key wins
+  over the content hash: in `publishDedupedByContent` the key gate runs
+  first, and an admitted keyed publish claims both the key slot and the
+  content slot. Key claims reuse EB-146's claim table and the shared
+  `__publish_dedup.jsonl` journal (messageId slot `key:<idempotencyKey>`,
+  a reserved prefix — the `key:` prefix also distinguishes key slots
+  from content-hash slots in the table), so the window survives
+  restarts, bad journal lines are skipped, and the table stays bounded
+  by `idempotencyMaxEntries`.
+- **Atomic batches.** `publishAtomic` shadow admission rejects a batch
+  that claims one key twice — or collides with a live in-window claim —
+  as a whole-batch `idempotency-conflict` (no partial claims); the
+  admitted entries claim their keys at commit. `previewPublish`
+  validates the key but never consults or claims it.
+- **Observability.** Suppressed retries are counted in
+  `TopicStats.idempotentHits` / `BusStats.idempotentHits` — distinct
+  from EB-27/EB-146's `duplicateMessages` — and rendered as the
+  activity-gated `eventbus_idempotent_hits_total{topic}` Prometheus
+  series.
