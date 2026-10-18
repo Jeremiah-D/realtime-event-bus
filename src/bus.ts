@@ -1428,6 +1428,42 @@ export interface SubscribeOptions {
    */
   filterExpr?: string;
   /**
+   * Opt-in subscriber-side delivery sampling (EB-152): deterministic
+   * per-(topic, seq) downsampling for canary consumers and delivery
+   * cost control. A positive integer N keeps the messages whose
+   * per-topic sequence number satisfies `seq % N === 0` and skips the
+   * rest — `1` keeps everything (the default, current behavior
+   * unchanged), `3` delivers every third message starting at the first
+   * multiple of 3. The decision is a pure function of the
+   * publish-assigned `seq` (EB-13), so it is identical across live
+   * fan-out, durable-log replay and reconnects: a resubscribing
+   * consumer sees exactly the subsequence it would have seen live.
+   *
+   * The sampling gate runs at fan-out, after signature verification and
+   * before the content `filter` / `filterExpr` / composite narrowing: a
+   * skipped message is a deliberate skip — never queued (no backpressure
+   * budget), no throttle / shaping / credit budget burned, no ack
+   * obligation on reliable subscriptions (it never reaches the ack
+   * tracker), never the DLQ, the per-topic gap baseline advances over it
+   * (never a sequence gap), and consumer-group offsets are not recorded
+   * for it. Barrier control messages (EB-98) carry no business seq and
+   * bypass the gate.
+   *
+   * Orthogonal to publish-side adaptive sampling (`setTopicSampleRate`,
+   * EB-38): that gate sheds load at the publisher before fan-out, this
+   * one narrows delivery per subscriber after fan-out — the two compose,
+   * and each is counted separately (`TopicStats.sampledMessages` vs
+   * `TopicStats.sampledDeliveries` / `sampleDropped`).
+   *
+   * Adjustable at runtime via `setDeliverySampleRate` (audited as
+   * `delivery_sample_rate_updated`). Applies to live fan-out and
+   * durable-log replay (`resumeFromSeq` / `resumeFromTime`); the
+   * retained snapshot (EB-87) and shadow mirrors bypass it. Must be a
+   * positive integer when given — anything else throws `RangeError`
+   * from `subscribe`.
+   */
+  deliverySampleRate?: number;
+  /**
    * Opt-in subscriber-side message projection (EB-144): maps the
    * payload just before it reaches the handler — field masking,
    * redaction, or shape narrowing per subscriber. Evaluated in
@@ -3819,6 +3855,31 @@ export interface TopicStats {
    */
   filteredMessages: number;
   /**
+   * Messages on this topic admitted by subscriber-side delivery-sampling
+   * gates (see `SubscribeOptions.deliverySampleRate`, EB-152): the
+   * message's `seq` satisfied the subscriber's `seq % N === 0` decision
+   * and it proceeded toward the queue (it may still have been filtered,
+   * throttled or shed downstream). Counts each admitted delivery once,
+   * so a message fanned out to N sampling subscribers that all admit it
+   * contributes N here. Only moves for subscribers with a configured
+   * rate (> 1). Distinct from `sampledMessages` (EB-38): that gate sheds
+   * load at the publisher before fan-out, this one narrows delivery per
+   * subscriber after fan-out.
+   */
+  sampledDeliveries: number;
+  /**
+   * Messages on this topic skipped by subscriber-side delivery-sampling
+   * gates (see `SubscribeOptions.deliverySampleRate`, EB-152): the
+   * message's `seq` failed the subscriber's `seq % N === 0` decision, so
+   * it was deliberately skipped — never queued, no backpressure /
+   * throttle / shaping / credit budget burned, no ack obligation, never
+   * the DLQ, the per-topic gap baseline advanced over it (never a
+   * sequence gap), and no consumer-group offset recorded. Counts each
+   * skipped delivery once, like `filteredMessages`. Only moves for
+   * subscribers with a configured rate (> 1).
+   */
+  sampleDropped: number;
+  /**
    * Messages on this topic discarded by `verifySignature` subscribers
    * (see `SubscribeOptions.verifySignature`, EB-84) because the
    * envelope's HMAC signature was missing or invalid: the message never
@@ -4385,6 +4446,20 @@ export interface BusStats {
    * counting rules.
    */
   filteredMessages: number;
+  /**
+   * Total messages admitted by subscriber-side delivery-sampling gates —
+   * the sum of every topic's `sampledDeliveries`. See
+   * `TopicStats.sampledDeliveries` for the exact counting rules.
+   * Distinct from `sampledMessages` (EB-38, publish-side adaptive
+   * sampling shed before fan-out).
+   */
+  sampledDeliveries: number;
+  /**
+   * Total messages skipped by subscriber-side delivery-sampling gates —
+   * the sum of every topic's `sampleDropped`. See
+   * `TopicStats.sampleDropped` for the exact counting rules.
+   */
+  sampleDropped: number;
   /**
    * Total message-projection invocations across all subscribers (see
    * `SubscribeOptions.project`, EB-144). Counts every evaluation,
@@ -5466,6 +5541,26 @@ interface Subscriber {
   /** Fired once when adaptive throttling engages for this subscriber. */
   onThrottled?: (event: ThrottleEvent) => void;
   /**
+   * Subscriber-side delivery sampling divisor (see
+   * `SubscribeOptions.deliverySampleRate`, EB-152): the positive integer
+   * N keeping messages with `seq % N === 0`. Always present — 1 keeps
+   * everything (the default, zero behavior change) — so the fan-out hot
+   * path pays a single integer comparison per delivery.
+   */
+  deliverySampleRate: number;
+  /**
+   * The most recent message this subscriber's delivery-sampling gate
+   * skipped (EB-152), by identity. The group fan-out checks it right
+   * after `deliverToSubscriber` to suppress offset records for exactly
+   * that message — a sampling skip is not consumption, unlike a filter
+   * skip, which keeps the existing group-offset semantics. Checked by
+   * identity immediately after the delivery call, so a stale value can
+   * never match a different message; `deliverToSubscriber` resets it on
+   * every delivery attempt, so a retry of the same message object after
+   * a hot rate change cannot inherit the old skip either.
+   */
+  sampleSkipMsg?: BusMessage;
+  /**
    * Fired once per credit-exhaustion episode (see
    * `SubscribeOptions.onCreditExhausted`, EB-117): edge-triggered, the
    * latch re-arms on the next `grantCredits` call.
@@ -5983,6 +6078,10 @@ function zeroedTopicStats(): {
   duplicateMessages: number;
   idempotentHits: number;
   filteredMessages: number;
+  /** Subscriber-side delivery-sampling admissions (EB-152). */
+  sampledDeliveries: number;
+  /** Subscriber-side delivery-sampling skips (EB-152). */
+  sampleDropped: number;
   signatureFailures: number;
   dedupDropped: number;
   aliasRetiredMessages: number;
@@ -6021,6 +6120,8 @@ function zeroedTopicStats(): {
     duplicateMessages: 0,
     idempotentHits: 0,
     filteredMessages: 0,
+    sampledDeliveries: 0,
+    sampleDropped: 0,
     signatureFailures: 0,
     dedupDropped: 0,
     aliasRetiredMessages: 0,
@@ -6079,6 +6180,20 @@ function validateIdempotencyKey(idempotencyKey: string | undefined, caller: stri
  * label value.
  */
 const IDEMPOTENCY_KEY_PATTERN = /^[!-~]{1,128}$/;
+
+/**
+ * Validates `SubscribeOptions.deliverySampleRate` (EB-152): absent is
+ * fine (1, keep everything), otherwise it must be a positive integer —
+ * the modulo divisor for the per-(topic, seq) sampling decision.
+ * Throws `RangeError` before anything is mutated, matching the other
+ * subscribe-option validations.
+ */
+function validateDeliverySampleRate(rate: number | undefined, caller: string): void {
+  if (rate === undefined) return;
+  if (!Number.isInteger(rate) || rate < 1) {
+    throw new RangeError(`${caller}: deliverySampleRate must be a positive integer`);
+  }
+}
 
 /**
  * Fail-fast type validation for `PublishOptions.partitionKey` /
@@ -10178,6 +10293,10 @@ export class EventBus {
       duplicateMessages: number;
       idempotentHits: number;
       filteredMessages: number;
+      /** Subscriber-side delivery-sampling admissions (EB-152). */
+      sampledDeliveries: number;
+      /** Subscriber-side delivery-sampling skips (EB-152). */
+      sampleDropped: number;
       dedupDropped: number;
       aliasRetiredMessages: number;
       compressedMessages: number;
@@ -11045,6 +11164,13 @@ export class EventBus {
    * budget consumed, no sequence gap reported.
    */
   private totalFiltered = 0;
+  /**
+   * Global delivery-sampling counters (EB-152): the sums of every
+   * topic's `sampledDeliveries` / `sampleDropped`. Only move for
+   * subscribers with a configured `deliverySampleRate` (> 1).
+   */
+  private totalSampledDeliveries = 0;
+  private totalSampleDropped = 0;
   /**
    * Message-projection invocations across all subscribers (global
    * total, see `SubscribeOptions.project`, EB-144). Counts every
@@ -15304,6 +15430,8 @@ export class EventBus {
         aliasRetiredMessages: 0,
         redactedFields: 0,
         filteredMessages: 0,
+        sampledDeliveries: 0,
+        sampleDropped: 0,
         dedupDropped: 0,
         compressedMessages: 0,
         compressedBytesBefore: 0,
@@ -15481,6 +15609,11 @@ export class EventBus {
     if (leaseMs !== undefined && (!Number.isInteger(leaseMs) || leaseMs <= 0)) {
       throw new RangeError('subscribe: leaseMs must be a positive integer number of milliseconds');
     }
+    // Subscriber-side delivery sampling (EB-152): validated before
+    // anything registers, so a throw leaves no half-registered
+    // subscriber behind.
+    const deliverySampleRate = opts?.deliverySampleRate;
+    validateDeliverySampleRate(deliverySampleRate, 'subscribe');
     // Idle subscriber auto-reclamation (EB-72): validated before
     // anything registers, so a throw leaves no half-registered
     // subscriber behind.
@@ -15766,6 +15899,10 @@ export class EventBus {
       lastEpoch: new Map(),
       throttle,
       onThrottled,
+      // Subscriber-side delivery sampling (EB-152): 1 keeps everything,
+      // the default — a non-sampling subscriber pays one integer
+      // comparison per delivery in `deliverUnkeyed`.
+      deliverySampleRate: deliverySampleRate ?? 1,
       // Credit-based flow control (EB-117): the subscriber starts
       // unlimited — `grantCredits` creates the credit state on first
       // use, so a never-granted subscriber pays nothing for it.
@@ -16198,6 +16335,38 @@ export class EventBus {
       throw new RangeError('renewLease: ms must be a positive integer number of milliseconds');
     }
     return this.leases.renew(subId, ms);
+  }
+
+  /**
+   * Hot-updates a subscriber's delivery-sampling rate (see
+   * `SubscribeOptions.deliverySampleRate`, EB-152): the new divisor
+   * applies to the very next fanned-out message — no drain, no
+   * resubscribe — and is recorded in the subscription audit log as
+   * `delivery_sample_rate_updated` with the old and new rates.
+   *
+   * Returns `false` for an unknown subscription id (paralleling
+   * `renewLease` — nothing to update is not an error). An illegal rate
+   * (non-integer, < 1) throws `RangeError` before anything is touched,
+   * even for an unknown id. Setting the rate back to 1 restores
+   * keep-everything behavior.
+   */
+  setDeliverySampleRate(subId: string, rate: number): boolean {
+    validateDeliverySampleRate(rate, 'setDeliverySampleRate');
+    const subscriber = this.subscribers.get(subId);
+    // Parallels `renewLease`: an unknown id is not an error — there is
+    // simply nothing to update.
+    if (subscriber === undefined) return false;
+    const from = subscriber.deliverySampleRate;
+    if (from === rate) return true;
+    subscriber.deliverySampleRate = rate;
+    this.auditSubscription({
+      action: 'delivery_sample_rate_updated',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { from, to: rate },
+    });
+    return true;
   }
 
   /**
@@ -19814,8 +19983,41 @@ export class EventBus {
     }
     const filter = subscriber.filter;
     const filterExpr = subscriber.filterExpr;
+    const replaySampleRate = subscriber.deliverySampleRate;
     try {
       for (const rec of records) {
+        // Subscriber-side delivery sampling (EB-152) applies to replay
+        // exactly as to live fan-out: the record keeps its publish-time
+        // seq, so the same modulo decision reproduces the live sampled
+        // subsequence across reconnects — a resubscribing consumer sees
+        // the same messages it would have seen live, never the skipped
+        // ones. A skipped record is deliberately skipped: never queued
+        // (no backpressure budget churned on reconnect), the per-topic
+        // gap baseline advances over it (never a gap), and the key/causal
+        // baselines advance past it like a filter skip so ordering gates
+        // never hang on a message that will never arrive. Evaluated
+        // before the content filters, mirroring the live pipeline order;
+        // a record that passes the gate is counted as sampled, like the
+        // live path. A retained duplicate bypasses the gate — it was
+        // already snapshot-delivered (unsampled) at subscribe time, and
+        // the retained check below skips it again here.
+        if (
+          replaySampleRate > 1 &&
+          subscriber.retainedDelivered?.get(rec.topic) !== rec.seq
+        ) {
+          if (rec.seq % replaySampleRate !== 0) {
+            this.countDeliverySampleDropped(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
+            if (rec.key !== undefined && rec.keySeq !== undefined) {
+              this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+            }
+            if (rec.causal !== undefined) {
+              this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+            }
+            countReplaySkipped();
+            continue;
+          }
+          this.countDeliverySampled(rec.topic);
+        }
         // A subscriber content filter applies to replay exactly as it does
         // to live fan-out: a rejected replayed message is never queued (it
         // must not churn the backpressure budget on reconnect) and advances
@@ -25957,6 +26159,14 @@ export class EventBus {
     causal?: { source: string; clock: number },
     barrier?: { epoch: number },
   ): boolean {
+    // Delivery-sampling marker (EB-152): reset on every delivery attempt.
+    // The sampling gate records the skipped message by identity here and
+    // the group fan-out checks it immediately after this call — but if
+    // the SAME message object were skipped once and later delivered on a
+    // retry (e.g. after a hot rate change), the stale marker would wrongly
+    // suppress its consumer-group offset record. Clearing first keeps the
+    // marker a pure "this call skipped this message" signal.
+    subscriber.sampleSkipMsg = undefined;
     // Barrier gate (EB-98) runs FIRST — before the causal gate (EB-62)
     // and the keyed gate. Design intent: the barrier cuts the
     // subscriber's whole delivery stream (cross-topic, which per-source
@@ -26180,6 +26390,30 @@ export class EventBus {
     if (subscriber.verifyPublisher && !this.deliveryPublisherSignatureValid(msg)) {
       this.countSignatureFailure(subscriber, msg, msg.publisherSignature?.kid, 'publisher');
       return false;
+    }
+    const sampleRate = subscriber.deliverySampleRate;
+    if (sampleRate > 1) {
+      // Subscriber-side delivery sampling (EB-152): the deterministic
+      // per-(topic, seq) gate runs after signature verification and
+      // before the content filters — a pure modulo decision on the
+      // publish-assigned seq, identical across live fan-out and replay.
+      // A skipped message is a deliberate skip with filter-like
+      // semantics: never queued (no backpressure budget), no
+      // throttle/shaping/credit budget burned (the gate runs before all
+      // three), never in the ack tracker (no Delivery envelope is
+      // created — reliable subscribers have no ack obligation for it),
+      // never the DLQ, the per-topic gap baseline advances over it
+      // (never a sequence gap), and the group fan-out records no
+      // consumer-group offset for it (see the sampleSkipMsg marker).
+      // Barrier control messages never reach this path — they are
+      // handled in `deliverToSubscriber` before the pipeline — so the
+      // gate only ever sees business messages with a seq.
+      if (msg.seq % sampleRate !== 0) {
+        this.countDeliverySampleDropped(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
+        subscriber.sampleSkipMsg = msg;
+        return false;
+      }
+      this.countDeliverySampled(msg.topic);
     }
     const filter = subscriber.filter;
     if (filter !== undefined && !filter(rawPayload, msg.topic)) {
@@ -26756,6 +26990,56 @@ export class EventBus {
     this.advanceBaseline(subscriber, topic, seq, epoch, partition);
     this.statsFor(topic).filteredMessages += 1;
     this.totalFiltered += 1;
+  }
+
+  /**
+   * Counts one message skipped by a subscriber's delivery-sampling gate
+   * (see `SubscribeOptions.deliverySampleRate`, EB-152) against the
+   * topic and the global total, and advances the subscriber's per-topic
+   * sequence baseline over it so the deliberately skipped message never
+   * counts as a gap. The baseline advance is shared with `countFiltered`
+   * — both are subscriber-side narrowing, invisible to gap detection —
+   * but the counters are separate from `filteredMessages`, and the group
+   * fan-out treats the two skips differently (see `sampleSkipMsg`).
+   */
+  private countDeliverySampleDropped(
+    subscriber: Subscriber,
+    topic: string,
+    seq: number,
+    epoch = '',
+    partition = 0,
+  ): void {
+    this.advanceBaseline(subscriber, topic, seq, epoch, partition);
+    this.statsFor(topic).sampleDropped += 1;
+    this.totalSampleDropped += 1;
+  }
+
+  /**
+   * Counts one message admitted by a subscriber's delivery-sampling gate
+   * (EB-152) — it passed the modulo decision and proceeded toward the
+   * queue (it may still be filtered, throttled or shed downstream).
+   * Only moves for subscribers with a configured rate (> 1): the
+   * default rate of 1 performs no sampling decision, so unconfigured
+   * subscribers add no noise here. Distinct from the EB-38 publish-side
+   * `sampledMessages` — that gate sheds load before fan-out, this one
+   * narrows delivery after fan-out.
+   */
+  private countDeliverySampled(topic: string): void {
+    this.statsFor(topic).sampledDeliveries += 1;
+    this.totalSampledDeliveries += 1;
+  }
+
+  /**
+   * Whether this exact message was skipped by the subscriber's
+   * delivery-sampling gate during the fan-out call that just ran
+   * (EB-152). The gate records the skipped message by identity on the
+   * subscriber (`sampleSkipMsg`); the group fan-out checks it
+   * immediately after `deliverToSubscriber`, so a stale value — from an
+   * earlier, unrelated delivery — can never match the message being
+   * fanned out now.
+   */
+  private deliverySampleSkipped(subscriber: Subscriber, msg: BusMessage): boolean {
+    return subscriber.sampleSkipMsg === msg;
   }
 
   /**
@@ -28289,8 +28573,14 @@ export class EventBus {
       );
       // A barrier control message (EB-98) carries no business seq — it
       // must not move the group's data offsets: recording seq 0 would
-      // regress the committed offset below real deliveries.
-      if (barrier === undefined) {
+      // regress the committed offset below real deliveries. A message
+      // the assignee's delivery-sampling gate skipped (EB-152) is not
+      // consumption either — its seq is deliberately absent from the
+      // member's stream, so recording it would mark unreceived messages
+      // as consumed. Filter-skipped messages keep the existing
+      // semantics (recorded): only the sampling skip suppresses the
+      // offset records.
+      if (barrier === undefined && !this.deliverySampleSkipped(assignee, msg)) {
         this.recordPartitionOffset(key, partition, topic, msg.seq);
         this.recordGroupOffset(hit.groupId, topic, msg.seq);
         this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
@@ -28323,8 +28613,11 @@ export class EventBus {
     }
     const delivered = this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier);
     // Barrier control messages (EB-98) carry no business seq — see the
-    // partitioned branch above: they never move group offsets.
-    if (barrier === undefined) {
+    // partitioned branch above: they never move group offsets. A
+    // delivery-sampling skip (EB-152) suppresses the offset records the
+    // same way — a skipped seq is not consumption — while filter skips
+    // keep the existing semantics.
+    if (barrier === undefined && !this.deliverySampleSkipped(assignee, msg)) {
       this.recordGroupOffset(hit.groupId, topic, msg.seq);
       this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
       // Offset auto-commit (EB-127): the highest seq handed to a
@@ -28748,6 +29041,8 @@ export class EventBus {
       })),
       opsAlert: this.opsAlerter?.getStats() ?? { sent: 0, failed: 0, suppressed: 0 },
       filteredMessages: this.totalFiltered,
+      sampledDeliveries: this.totalSampledDeliveries,
+      sampleDropped: this.totalSampleDropped,
       projectedMessages: this.totalProjectedMessages,
       projectErrors: this.totalProjectErrors,
       projections,
@@ -28937,6 +29232,8 @@ export class EventBus {
         transformCalls: stats.transformCalls,
         transformErrors: stats.transformErrors,
         filteredMessages: stats.filteredMessages,
+        sampledDeliveries: stats.sampledDeliveries,
+        sampleDropped: stats.sampleDropped,
         signatureFailures: stats.signatureFailures,
         // Per-topic HMAC signing state (EB-84): present only when a
         // signing rule currently matches the topic — secrets never leave

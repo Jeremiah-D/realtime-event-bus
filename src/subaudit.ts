@@ -72,7 +72,8 @@ export type SubscriptionAuditAction =
   | 'barrier_dropped'
   | 'subscriber_paused'
   | 'subscriber_resumed'
-  | 'subscriber_seek';
+  | 'subscriber_seek'
+  | 'delivery_sample_rate_updated';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -124,6 +125,10 @@ export type SubscriptionAuditAction =
  *   clampedByCommitted? }], invalidatedInflight }` — a manual
  *   consumer-offset seek (EB-130) repositioned the subscriber's
  *   consumption position; `subId`/`pattern` identify the subscription
+ * - `delivery_sample_rate_updated`: `{ from: <old rate>, to: <new rate> }`
+ *   — a `setDeliverySampleRate` (EB-152) hot-update changed the
+ *   subscriber's delivery-sampling divisor; `subId`/`pattern` identify
+ *   the subscription
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -192,6 +197,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'subscriber_paused',
   'subscriber_resumed',
   'subscriber_seek',
+  'delivery_sample_rate_updated',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

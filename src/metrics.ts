@@ -80,6 +80,19 @@
  *   "delivered" — see `BusStats.topicFairness`); only emitted for topics
  *   with at least one scheduled message, so buses without fair
  *   scheduling render no series at all.
+ * - `eventbus_delivery_sampled_messages_total{topic}`: messages per
+ *   topic admitted by subscriber-side delivery-sampling gates
+ *   (`SubscribeOptions.deliverySampleRate`, EB-152) — the `seq % N === 0`
+ *   decision let them through toward the queue. Activity-gated: the
+ *   series (and its HELP/TYPE block) render only when at least one topic
+ *   has an admission, so a bus without delivery sampling renders
+ *   byte-identical exposition to before. Distinct from
+ *   `eventbus_sampled_messages_total` (EB-38, publish-side adaptive
+ *   sampling shed before fan-out).
+ * - `eventbus_delivery_sample_dropped_total{topic}`: messages per topic
+ *   skipped by subscriber-side delivery-sampling gates (EB-152) —
+ *   deliberately skipped, never queued, never a gap, no group offset
+ *   recorded. Activity-gated like the sampled series above.
  * - `eventbus_topic_partition_published_total{topic,partition}`: admitted
  *   publishes per topic partition (EB-90; only emitted for topics with
  *   more than one configured partition — single-partition topics render
@@ -713,6 +726,37 @@ export function renderPrometheus(stats: BusStats): string {
     for (const t of stats.topics) {
       const label = `topic="${escapeLabelValue(t.topic)}"`;
       lines.push(`eventbus_idempotent_hits_total{${label}} ${t.idempotentHits ?? 0}`);
+    }
+  }
+
+  // Subscriber-side delivery sampling (EB-152): per-topic admitted /
+  // skipped counts. Activity-gated — each HELP/TYPE block and its series
+  // render only when at least one topic has a count, so a bus without
+  // delivery sampling renders byte-identical exposition to before.
+  // `?? 0` keeps the renderer tolerant of a stats object that predates
+  // the field (hand-built fixtures included), mirroring the per-topic
+  // idiom above. The names deliberately avoid the EB-38 publish-side
+  // `eventbus_sampled_messages_total` series.
+  const deliverySampledTopics = stats.topics.filter((t) => (t.sampledDeliveries ?? 0) > 0);
+  if (deliverySampledTopics.length > 0) {
+    lines.push(
+      '# HELP eventbus_delivery_sampled_messages_total Messages admitted by subscriber-side delivery-sampling gates (EB-152): the seq % N decision let them through toward the queue (they may still be filtered, throttled or shed downstream).',
+    );
+    lines.push('# TYPE eventbus_delivery_sampled_messages_total counter');
+    for (const t of stats.topics) {
+      const label = `topic="${escapeLabelValue(t.topic)}"`;
+      lines.push(`eventbus_delivery_sampled_messages_total{${label}} ${t.sampledDeliveries ?? 0}`);
+    }
+  }
+  const deliverySampleDroppedTopics = stats.topics.filter((t) => (t.sampleDropped ?? 0) > 0);
+  if (deliverySampleDroppedTopics.length > 0) {
+    lines.push(
+      '# HELP eventbus_delivery_sample_dropped_total Messages skipped by subscriber-side delivery-sampling gates (EB-152): deliberately skipped — never queued, no backpressure/throttle/shaping/credit budget burned, no ack obligation, never the DLQ, never a sequence gap, no consumer-group offset recorded.',
+    );
+    lines.push('# TYPE eventbus_delivery_sample_dropped_total counter');
+    for (const t of stats.topics) {
+      const label = `topic="${escapeLabelValue(t.topic)}"`;
+      lines.push(`eventbus_delivery_sample_dropped_total{${label}} ${t.sampleDropped ?? 0}`);
     }
   }
 

@@ -5052,3 +5052,61 @@ Semantics:
   from EB-27/EB-146's `duplicateMessages` — and rendered as the
   activity-gated `eventbus_idempotent_hits_total{topic}` Prometheus
   series.
+
+## Subscriber-side delivery sampling (EB-152)
+
+`subscribe(pattern, handler, { deliverySampleRate: N })` opts a
+subscription into deterministic per-message downsampling: a positive
+integer `N` keeps the messages whose per-topic sequence number satisfies
+`seq % N === 0` and skips the rest. `1` keeps everything (the default —
+current behavior is unchanged). The decision is a pure function of the
+publish-assigned `seq` (EB-13), so it is identical across live fan-out,
+durable-log replay and reconnects: a resubscribing consumer replays
+exactly the subsequence it would have seen live.
+
+Semantics:
+
+- **Opt-in, fail-fast validation.** The rate must be a positive integer;
+  anything else throws `RangeError` at subscribe time before anything
+  registers. `setDeliverySampleRate(subId, rate)` hot-updates the divisor
+  — the new rate applies to the very next fanned-out message — returning
+  `false` for an unknown subscription id (the `renewLease` convention)
+  and throwing `RangeError` for an illegal rate. Every change is recorded
+  in the subscription audit log as `delivery_sample_rate_updated` with
+  `{ from, to }`.
+- **Pipeline position.** The gate runs at fan-out, after signature
+  verification and before the content `filter` / `filterExpr` / composite
+  narrowing. A skipped message is a deliberate skip with filter-like
+  semantics: never queued (no backpressure budget), no throttle / shaping
+  / credit budget burned, no ack obligation on reliable subscriptions (it
+  never reaches the ack tracker), never the DLQ, the per-topic gap
+  baseline advances over it (never a sequence gap), and consumer-group
+  offsets are not recorded for it. Barrier control messages (EB-98) carry
+  no business seq and bypass the gate.
+- **Replay.** Durable-log replay (`resumeFromSeq` / `resumeFromTime`)
+  applies the same modulo decision to each record's original seq, so the
+  replayed stream matches the live sampled subsequence — this is what
+  makes the sampling consistent across reconnects. The retained snapshot
+  (EB-87) is not sampled: it is a latest-value snapshot, not stream
+  fan-out. Shadow mirrors bypass the gate (they validate against full
+  production traffic).
+- **Orthogonal to EB-38 publish-side adaptive sampling.**
+  `setTopicSampleRate` sheds load at the *publisher* before fan-out
+  (probabilistic, pre-sequence-assignment, for tail-latency protection);
+  `deliverySampleRate` narrows delivery per *subscriber* after fan-out
+  (deterministic, post-sequence-assignment, for canary consumers and
+  delivery cost control). The two compose — a hot topic can shed at the
+  publisher while a canary subscriber samples what remains — and each is
+  counted separately.
+- **Migration.** The rate is a plain serializable option: it travels in
+  `exportSubscription` snapshots and survives `seek` repositioning
+  untouched. `importSubscription` re-validates it like any subscribe
+  option.
+- **Observability.** Admissions and skips count into
+  `TopicStats.sampledDeliveries` / `TopicStats.sampleDropped` and the
+  `BusStats` globals of the same names — distinct from EB-38's
+  `sampledMessages` — and render as the activity-gated
+  `eventbus_delivery_sampled_messages_total{topic}` /
+  `eventbus_delivery_sample_dropped_total{topic}` Prometheus series (no
+  series at all when nothing is sampled, so idle exposition is
+  byte-identical to before).
