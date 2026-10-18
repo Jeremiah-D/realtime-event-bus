@@ -3192,6 +3192,21 @@ export interface EventBusOptions {
    */
   pullBufferSize?: number;
   /**
+   * Opt-in hot-topic fan-out chunking (EB-150): the maximum number of
+   * subscriber deliveries one synchronous `publish` performs before
+   * yielding. When a publish's matched deliveries exceed this, the first
+   * chunk runs synchronously and the rest run in chained
+   * `queueMicrotask` steps — a 10k-subscriber fan-out stops blocking the
+   * event loop. `publish` stays synchronous; on a chunked publish it
+   * returns the matched subscriber count (every matched subscriber is
+   * visited in order across the chunks — see `publish`). Absent or
+   * `Infinity` (the default) keeps the fully-synchronous fan-out with
+   * zero added per-subscriber overhead. Must be a positive integer —
+   * anything else throws `RangeError` at construction.
+   * `getStats().fanOutYields` counts the microtask yields performed.
+   */
+  fanOutChunkSize?: number;
+  /**
    * Opt-in time-based retention for the durable log (EB-85): records older
    * than `now - durableLogMaxAgeMs` (bus clock, `EventBusOptions.now`) are
    * evicted when their topic compacts, alongside the count bound above —
@@ -3932,6 +3947,13 @@ export interface BusStats {
    * that throws still received the message, and still counts.
    */
   deliveredMessages: number;
+  /**
+   * Total `queueMicrotask` yields performed by chunked fan-outs (see
+   * `EventBusOptions.fanOutChunkSize`). Zero unless chunking is
+   * configured and a publish's matched deliveries exceeded the chunk
+   * size — a fully-synchronous publish never yields.
+   */
+  fanOutYields: number;
   /**
    * Total messages shed by subscriber backpressure queues. Matches the
    * sum of the per-subscriber `droppedCount` values for live subscribers.
@@ -9913,6 +9935,29 @@ export interface TopicRenameResult {
   durableLogMigrated: boolean;
 }
 
+/**
+ * EB-150: one ordered delivery unit collected by the chunked fan-out
+ * scan phase. The scan collects tasks in today's execution order —
+ * shadow and plain deliveries in subscriber-iteration position, group
+ * competing sets after the scan in group-set order — so the execute
+ * phase (synchronous or chunked) replays the exact same sequence.
+ * (Declared as interfaces — a `type` alias is not erasable syntax on
+ * this repo's test runtime.)
+ */
+interface FanOutShadowTask {
+  kind: 'shadow';
+  subscriber: Subscriber;
+}
+interface FanOutPlainTask {
+  kind: 'plain';
+  subscriber: Subscriber;
+}
+interface FanOutGroupTask {
+  kind: 'group';
+  key: string;
+  hit: { groupId: string; members: Subscriber[] };
+}
+
 export class EventBus {
   /**
    * Stable identity of this bus instance (see `EventBusOptions.busId`):
@@ -11255,6 +11300,14 @@ export class EventBus {
   private readonly pullWaiters = new Map<string, Set<PullWaiter>>();
   /** `EventBusOptions.pullBufferSize` as configured (default 1000). */
   private readonly pullBufferSize: number;
+  /**
+   * `EventBusOptions.fanOutChunkSize` as configured (EB-150); `undefined`
+   * means the default fully-synchronous fan-out. `Infinity` is normalized
+   * to `undefined` at construction.
+   */
+  private readonly fanOutChunkSize: number | undefined;
+  /** Chunked fan-out yield counter surfaced as `getStats().fanOutYields` (EB-150). */
+  private fanOutYieldCount = 0;
   /** Pull-mode counters surfaced as `getStats().pullStats` (EB-111). */
   private totalPulls = 0;
   private totalPulledMessages = 0;
@@ -11838,6 +11891,18 @@ export class EventBus {
       throw new RangeError('pullBufferSize must be a positive integer');
     }
     this.pullBufferSize = pullBufferSize ?? 1000;
+    // Hot-topic fan-out chunking (EB-150): validated fail-fast like the
+    // other bounded options above. `Infinity` is the spelled-out
+    // default — normalized to absent below.
+    const fanOutChunkSize = options?.fanOutChunkSize;
+    if (
+      fanOutChunkSize !== undefined &&
+      fanOutChunkSize !== Infinity &&
+      (!Number.isInteger(fanOutChunkSize) || fanOutChunkSize < 1)
+    ) {
+      throw new RangeError('fanOutChunkSize must be a positive integer');
+    }
+    this.fanOutChunkSize = fanOutChunkSize === Infinity ? undefined : fanOutChunkSize;
   }
 
   /**
@@ -19864,6 +19929,12 @@ export class EventBus {
    *
    * `opts.key` opts the message into durable-log keyed compaction (see
    * `PublishOptions.key`).
+   *
+   * EB-150: with `EventBusOptions.fanOutChunkSize` chunking engaged, the
+   * return is the matched subscriber count instead of the accepted count
+   * — the synchronous accepted count is unknowable until the microtask
+   * chunks drain, and every matched subscriber is visited in order
+   * across the chunks.
    */
   publish(topic: string, payload: unknown, opts?: PublishOptions): number {
     return this.publishCore(topic, payload, opts, 'publish').accepted;
@@ -27229,7 +27300,13 @@ export class EventBus {
     // regex stays the final authority, and the no-miss invariant in
     // `candidateIds` keeps matching semantics identical to the old full
     // scan. Iteration order (insertion order) is unchanged.
-    const { matched, accepted } = this.deliverMatched(msg, expiresAt, payload, keyed, causalStamp);
+    const fanout = this.deliverMatched(msg, expiresAt, payload, keyed, causalStamp);
+    const { matched } = fanout;
+    // EB-150: a chunked fan-out returns the matched subscriber count —
+    // later chunks deliver on microtasks, so the synchronous accepted
+    // count is not the whole story; every matched subscriber is visited
+    // in order across the chunks (see `publish`).
+    const accepted = fanout.chunked ? fanout.matched : fanout.accepted;
     stats.subscriberCount = matched;
     if (openTrace !== undefined) {
       // Spans emit in completion order — fanout, then the publish root —
@@ -27382,7 +27459,7 @@ export class EventBus {
     // the subscriber-side barrier gate arms the hold. Data paths leave it
     // undefined.
     barrier?: { epoch: number },
-  ): { matched: number; accepted: number } {
+  ): { matched: number; accepted: number; chunked: boolean } {
     const topic = msg.topic;
     const epoch = msg.epoch ?? '';
     let matched = 0;
@@ -27415,6 +27492,24 @@ export class EventBus {
     // Group members are collected per competing set first; the group's
     // single copy is assigned round-robin after the scan.
     const groupHits = new Map<string, { groupId: string; members: Subscriber[] }>();
+    // EB-150: opt-in hot-topic fan-out chunking. When `fanOutChunkSize` is
+    // finite the scan below collects ordered delivery tasks instead of
+    // delivering inline; the execute phase then runs them synchronously
+    // (at or under the chunk size) or in chunks (first chunk
+    // synchronously, the rest via chained `queueMicrotask`). Barrier
+    // control messages (EB-98) bypass chunking: a cut marker must reach
+    // the subscriber barrier gates in strict publish order relative to
+    // surrounding data publishes — riding chunks could land it after a
+    // later publish's synchronous chunk and break the cut. Barriers are
+    // low-fanout control traffic (barrier-opted-in subscribers only), so
+    // there is no event-loop-blocking problem to solve for them;
+    // diagnostic publishes ride the chunked path like any other data
+    // publish. When chunking is off (`tasks` stays null) the loops below
+    // run exactly as before EB-150 — same calls, same order, zero added
+    // per-subscriber overhead.
+    const chunkSize = this.fanOutChunkSize;
+    const chunking = chunkSize !== undefined && barrier === undefined;
+    const tasks: (FanOutShadowTask | FanOutPlainTask | FanOutGroupTask)[] | null = chunking ? [] : null;
     for (const subscriber of this.subscribers.values()) {
       if (prune && !candidates.has(subscriber.id)) {
         // Pruned by the prefix index: under the no-miss invariant the
@@ -27449,11 +27544,16 @@ export class EventBus {
           // watermarks or committed offsets (EB-32). The shadow copy
           // bypasses the per-subscriber ordering gates (keyed/causal): it
           // mirrors fan-out order into an independent queue.
-          this.deliverShadow(subscriber, msg, expiresAt, rawPayload);
+          if (tasks !== null) tasks.push({ kind: 'shadow', subscriber });
+          else this.deliverShadow(subscriber, msg, expiresAt, rawPayload);
           continue;
         }
         matched += 1;
-        if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed, causal, barrier)) accepted += 1;
+        if (tasks !== null) {
+          tasks.push({ kind: 'plain', subscriber });
+        } else if (this.deliverToSubscriber(subscriber, msg, expiresAt, rawPayload, keyed, causal, barrier)) {
+          accepted += 1;
+        }
         continue;
       }
       const key = EventBus.groupKey(subscriber.groupId, subscriber.pattern);
@@ -27466,92 +27566,186 @@ export class EventBus {
     }
     for (const [key, hit] of groupHits) {
       matched += 1;
-      const partitionCount = this.groupPartitions.get(key);
-      if (partitionCount !== undefined) {
-        // Partitioned competing set: the message belongs to exactly one
-        // partition, consumed exclusively by its owner. The assignment is
-        // deterministic from the roster (rendezvous by default, sticky
-        // balanced when the group opted in — see
-        // `GroupSubscribeOptions.assignment`), so every node agrees on the
-        // owner without coordination.
-        const partition = this.alignedGroupPartition(partitionCount, topic, msg.seq, msg.partition, keyed?.key);
-        const ownerId = this.partitionAssignment(key).get(partition);
-        // Static members (EB-104): the assignment names the roster key
-        // (instanceId), not the subscription id — resolve it to the live
-        // subscription. A member in its session limbo has no live
-        // subscription, so the lookup misses and the previous no-owner
-        // fallback below delivers to a live member instead of losing the
-        // message.
-        const ownerSubId =
-          ownerId === undefined ? undefined : (this.groupStaticSubs.get(key)?.get(ownerId) ?? ownerId);
-        const assignee =
-          (ownerSubId === undefined
-            ? undefined
-            : hit.members.find((m) => m.id === ownerSubId)) ?? hit.members[0];
-        if (keyed !== undefined) {
-          for (const member of hit.members) {
-            if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
-          }
-        }
-        // A causal message assigned to one member will never be fanned
-        // out to the others: their per-source expectations advance past
-        // its clock, exactly like the keyed baseline above — otherwise a
-        // member buffering a later clock for the same source would wait
-        // for a dependency assigned to a different member.
-        if (causal !== undefined) {
-          for (const member of hit.members) {
-            if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
-          }
-        }
-        const delivered = this.deliverToSubscriber(
-          assignee,
-          msg,
-          expiresAt,
-          rawPayload,
-          keyed,
-          causal,
-          barrier,
-        );
-        if (delivered) accepted += 1;
-        // A barrier control message (EB-98) carries no business seq — it
-        // must not move the group's data offsets: recording seq 0 would
-        // regress the committed offset below real deliveries.
-        if (barrier === undefined) {
-          this.recordPartitionOffset(key, partition, topic, msg.seq);
-          this.recordGroupOffset(hit.groupId, topic, msg.seq);
-          this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
-          // Offset auto-commit (EB-127): the highest seq handed to a
-          // member's queue since the last commit is what the member's
-          // commit timer (or the next rebalance/leave flush) checkpoints.
-          if (delivered) this.trackAutoCommitDelivery(hit.groupId, topic, msg.seq);
-        }
+      if (tasks !== null) {
+        tasks.push({ kind: 'group', key, hit });
         continue;
       }
-      const assignee = this.assignGroupMember(key, hit.members);
+      if (this.deliverGroupHit(key, hit, msg, expiresAt, rawPayload, keyed, causal, barrier, epoch)) accepted += 1;
+    }
+    if (tasks === null) return { matched, accepted, chunked: false };
+    // EB-150 execute phase. At or under the chunk size the whole fan-out
+    // still runs synchronously — identical to today.
+    if (chunkSize !== undefined && tasks.length <= chunkSize) {
+      accepted += this.runFanOutTasks(tasks, msg, expiresAt, rawPayload, keyed, causal, epoch);
+      return { matched, accepted, chunked: false };
+    }
+    // Hot fan-out: the first chunk runs synchronously, the rest in
+    // chained `queueMicrotask` steps so a huge subscriber set stops
+    // blocking the event loop. Ordering is preserved: tasks execute in
+    // scan order, and group assignment / round-robin state advances in
+    // the same sequence as the synchronous path. A throwing delivery
+    // callback (user callbacks are expected pure — e.g. a throwing
+    // content filter) aborts the remaining chunks and surfaces as an
+    // uncaught microtask exception instead of a synchronous publish
+    // throw, mirroring the sync path's abort-on-throw.
+    const size = chunkSize as number;
+    accepted += this.runFanOutTasks(tasks.slice(0, size), msg, expiresAt, rawPayload, keyed, causal, epoch);
+    this.scheduleFanOutChunks(tasks, size, msg, expiresAt, rawPayload, keyed, causal, epoch);
+    return { matched, accepted, chunked: true };
+  }
+
+  /**
+   * EB-150: executes one chunked fan-out task — the same delivery call
+   * the synchronous scan would have made, in the same position. Returns
+   * 1 when a production delivery was accepted, 0 otherwise (shadow
+   * deliveries are never counted in accepted).
+   */
+  private runFanOutTask(
+    task: FanOutShadowTask | FanOutPlainTask | FanOutGroupTask,
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+    keyed: { key: string; keySeq: number } | undefined,
+    causal: { source: string; clock: number } | undefined,
+    epoch: string,
+  ): number {
+    switch (task.kind) {
+      case 'shadow':
+        this.deliverShadow(task.subscriber, msg, expiresAt, rawPayload);
+        return 0;
+      case 'plain':
+        return this.deliverToSubscriber(task.subscriber, msg, expiresAt, rawPayload, keyed, causal) ? 1 : 0;
+      case 'group':
+        return this.deliverGroupHit(task.key, task.hit, msg, expiresAt, rawPayload, keyed, causal, undefined, epoch)
+          ? 1
+          : 0;
+    }
+  }
+
+  /**
+   * EB-150: executes a run of chunked fan-out tasks in scan order,
+   * returning the accepted increment. Used for the synchronous first
+   * chunk and for the under-chunk-size fast path.
+   */
+  private runFanOutTasks(
+    tasks: readonly (FanOutShadowTask | FanOutPlainTask | FanOutGroupTask)[],
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+    keyed: { key: string; keySeq: number } | undefined,
+    causal: { source: string; clock: number } | undefined,
+    epoch: string,
+  ): number {
+    let accepted = 0;
+    for (const task of tasks) accepted += this.runFanOutTask(task, msg, expiresAt, rawPayload, keyed, causal, epoch);
+    return accepted;
+  }
+
+  /**
+   * EB-150: schedules the remaining chunks of a hot fan-out. Each
+   * `queueMicrotask` step executes up to `chunkSize` tasks in scan order
+   * and chains the next step while tasks remain; every scheduled step is
+   * counted in `getStats().fanOutYields`. A `scheduleFlush` after each
+   * step wakes the drain for the queues the chunk just filled — the
+   * publish path's own flush only covers the synchronous first chunk.
+   */
+  private scheduleFanOutChunks(
+    tasks: readonly (FanOutShadowTask | FanOutPlainTask | FanOutGroupTask)[],
+    chunkSize: number,
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+    keyed: { key: string; keySeq: number } | undefined,
+    causal: { source: string; clock: number } | undefined,
+    epoch: string,
+  ): void {
+    let index = chunkSize; // the synchronous first chunk already ran
+    const step = (): void => {
+      const end = Math.min(index + chunkSize, tasks.length);
+      while (index < end) {
+        this.runFanOutTask(tasks[index], msg, expiresAt, rawPayload, keyed, causal, epoch);
+        index += 1;
+      }
+      // Wake the drain for the queues this chunk filled.
+      this.scheduleFlush();
+      if (index < tasks.length) {
+        this.fanOutYieldCount += 1;
+        queueMicrotask(step);
+      }
+    };
+    this.fanOutYieldCount += 1;
+    queueMicrotask(step);
+  }
+
+  /**
+   * EB-150: delivers one consumer-group competing set — the old post-scan
+   * group loop body of `deliverMatched`, extracted unchanged so the
+   * synchronous path and the chunked execute phase share it. Returns true
+   * when the assigned member accepted the message.
+   */
+  private deliverGroupHit(
+    key: string,
+    hit: { groupId: string; members: Subscriber[] },
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+    keyed: { key: string; keySeq: number } | undefined,
+    causal: { source: string; clock: number } | undefined,
+    barrier: { epoch: number } | undefined,
+    epoch: string,
+  ): boolean {
+    const topic = msg.topic;
+    const partitionCount = this.groupPartitions.get(key);
+    if (partitionCount !== undefined) {
+      // Partitioned competing set: the message belongs to exactly one
+      // partition, consumed exclusively by its owner. The assignment is
+      // deterministic from the roster (rendezvous by default, sticky
+      // balanced when the group opted in — see
+      // `GroupSubscribeOptions.assignment`), so every node agrees on the
+      // owner without coordination.
+      const partition = this.alignedGroupPartition(partitionCount, topic, msg.seq, msg.partition, keyed?.key);
+      const ownerId = this.partitionAssignment(key).get(partition);
+      // Static members (EB-104): the assignment names the roster key
+      // (instanceId), not the subscription id — resolve it to the live
+      // subscription. A member in its session limbo has no live
+      // subscription, so the lookup misses and the previous no-owner
+      // fallback below delivers to a live member instead of losing the
+      // message.
+      const ownerSubId =
+        ownerId === undefined ? undefined : (this.groupStaticSubs.get(key)?.get(ownerId) ?? ownerId);
+      const assignee =
+        (ownerSubId === undefined
+          ? undefined
+          : hit.members.find((m) => m.id === ownerSubId)) ?? hit.members[0];
       if (keyed !== undefined) {
-        // Consumer-group members compete per message: a keyed message
-        // assigned to one member will never be fanned out to the others,
-        // so their per-key baselines advance past its keySeq — otherwise a
-        // member buffering a later keySeq would wait for a predecessor
-        // that went to a different member. Per-(subscriber, key) ordering
-        // is per member: each member observes an ordered subsequence of
-        // the key's stream.
         for (const member of hit.members) {
           if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
         }
       }
-      // Same for causal clocks: per member, each member observes a
-      // causally ordered subsequence of the source's stream.
+      // A causal message assigned to one member will never be fanned
+      // out to the others: their per-source expectations advance past
+      // its clock, exactly like the keyed baseline above — otherwise a
+      // member buffering a later clock for the same source would wait
+      // for a dependency assigned to a different member.
       if (causal !== undefined) {
         for (const member of hit.members) {
           if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
         }
       }
-      const delivered = this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier);
-      if (delivered) accepted += 1;
-      // Barrier control messages (EB-98) carry no business seq — see the
-      // partitioned branch above: they never move group offsets.
+      const delivered = this.deliverToSubscriber(
+        assignee,
+        msg,
+        expiresAt,
+        rawPayload,
+        keyed,
+        causal,
+        barrier,
+      );
+      // A barrier control message (EB-98) carries no business seq — it
+      // must not move the group's data offsets: recording seq 0 would
+      // regress the committed offset below real deliveries.
       if (barrier === undefined) {
+        this.recordPartitionOffset(key, partition, topic, msg.seq);
         this.recordGroupOffset(hit.groupId, topic, msg.seq);
         this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
         // Offset auto-commit (EB-127): the highest seq handed to a
@@ -27559,8 +27753,40 @@ export class EventBus {
         // commit timer (or the next rebalance/leave flush) checkpoints.
         if (delivered) this.trackAutoCommitDelivery(hit.groupId, topic, msg.seq);
       }
+      return delivered;
     }
-    return { matched, accepted };
+    const assignee = this.assignGroupMember(key, hit.members);
+    if (keyed !== undefined) {
+      // Consumer-group members compete per message: a keyed message
+      // assigned to one member will never be fanned out to the others,
+      // so their per-key baselines advance past its keySeq — otherwise a
+      // member buffering a later keySeq would wait for a predecessor
+      // that went to a different member. Per-(subscriber, key) ordering
+      // is per member: each member observes an ordered subsequence of
+      // the key's stream.
+      for (const member of hit.members) {
+        if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
+      }
+    }
+    // Same for causal clocks: per member, each member observes a
+    // causally ordered subsequence of the source's stream.
+    if (causal !== undefined) {
+      for (const member of hit.members) {
+        if (member !== assignee) this.skipCausalClock(member, causal.source, causal.clock);
+      }
+    }
+    const delivered = this.deliverToSubscriber(assignee, msg, expiresAt, rawPayload, keyed, causal, barrier);
+    // Barrier control messages (EB-98) carry no business seq — see the
+    // partitioned branch above: they never move group offsets.
+    if (barrier === undefined) {
+      this.recordGroupOffset(hit.groupId, topic, msg.seq);
+      this.recordInstanceGroupOffset(hit.groupId, assignee.instanceId ?? assignee.id, topic, msg.seq);
+      // Offset auto-commit (EB-127): the highest seq handed to a
+      // member's queue since the last commit is what the member's
+      // commit timer (or the next rebalance/leave flush) checkpoints.
+      if (delivered) this.trackAutoCommitDelivery(hit.groupId, topic, msg.seq);
+    }
+    return delivered;
   }
 
   /**
@@ -27835,6 +28061,7 @@ export class EventBus {
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
       totalPublished: this.totalPublished,
       deliveredMessages: this.totalDelivered,
+      fanOutYields: this.fanOutYieldCount,
       droppedMessages: this.totalDropped,
       blockedMessages: this.totalBlocked,
       blockedSubscribers: [...this.subscribers.values()].filter((s) => s.blocked).length,

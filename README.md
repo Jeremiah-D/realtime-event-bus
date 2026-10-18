@@ -4960,3 +4960,46 @@ Composes orthogonally with `filter` (narrow first, then shape),
 `verifySignature` (verified before projection, on the wire bytes),
 and admission-time `setTopicRedaction` (redaction already applied at
 publish; projection shapes the redacted payload per subscriber).
+
+## Hot-topic fan-out chunking (EB-150)
+
+`EventBusOptions.fanOutChunkSize` opts a bus into chunked fan-out: the
+maximum number of subscriber deliveries one synchronous `publish`
+performs before yielding. When a publish's matched deliveries exceed
+the chunk size, the first chunk runs synchronously and the rest run in
+chained `queueMicrotask` steps — a 10k-subscriber fan-out stops
+blocking the event loop. Absent or `Infinity` (the default) keeps the
+fully-synchronous fan-out with zero added per-subscriber overhead.
+Any other non-positive-integer value throws `RangeError` at bus
+construction.
+
+Semantics:
+
+- **`publish` stays synchronous and still returns a number** — but on a
+  chunked publish it returns the *matched* subscriber count, not the
+  accepted count. The synchronous accepted count is unknowable until the
+  microtask chunks drain; every matched subscriber is visited in order
+  across the chunks, so the matched count is the honest synchronous
+  answer. On a non-chunked publish (chunking off, or matched deliveries
+  at/below the chunk size) the return is the accepted count exactly as
+  before.
+- **Ordering within one publish is preserved**: the scan collects
+  deliveries in today's order (shadow and plain deliveries in
+  subscriber-iteration position, group competing sets after the scan),
+  and the chunks replay that order — group assignment and
+  `assignGroupMember` round-robin state advance in the same sequence as
+  the synchronous path.
+- **Everything else is unchanged**: per-subscriber FIFO, backpressure,
+  content filters, signing, keyed ordering, causal clocks, and shadow
+  mirrors behave identically — only the timing of later chunks moves to
+  microtasks. Across publishes, deliveries interleave in microtask
+  order; same-topic FIFO with a stable subscriber set is preserved.
+- **Barrier control messages (EB-98) bypass chunking**: a cut marker is
+  control-plane and must reach subscriber barrier gates in strict
+  publish order relative to surrounding data publishes, so it always
+  fans out fully synchronously. Diagnostic publishes ride the chunked
+  path like any other data publish.
+- **Stats**: `getStats().fanOutYields` counts the `queueMicrotask`
+  yields performed by chunked fan-outs (one per scheduled step after the
+  synchronous first chunk). It is not exported to Prometheus — it is a
+  `getStats()`-only diagnostic.
