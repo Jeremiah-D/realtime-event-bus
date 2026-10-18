@@ -86,6 +86,14 @@
  * - `eventbus_topic_event_time_watermark{topic}`: the topic's event-time
  *   watermark in epoch milliseconds (EB-59); emitted only for topics that
  *   have seen at least one event-time publish.
+ * - `eventbus_payload_bytes_bucket{topic,le}`: cumulative payload-size
+ *   histogram of admitted publishes per topic, in bytes (EB-143) —
+ *   `le` from the topic's configured buckets plus `+Inf`; only emitted
+ *   for topics with a matching histogram rule.
+ * - `eventbus_payload_bytes_count{topic}`: total sampled publishes per
+ *   topic (EB-143).
+ * - `eventbus_payload_bytes_sum{topic}`: total sampled payload bytes per
+ *   topic (EB-143).
  * - `eventbus_namespace_published_messages_total{namespace}`: publishes
  *   per namespace (EB-52; only emitted when namespaces are registered).
  * - `eventbus_namespace_subscribers{namespace}`: live namespaced
@@ -678,6 +686,41 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_signature_failures_total{${label}} ${t.signatureFailures ?? 0}`);
     if (t.watermark !== undefined) {
       lines.push(`eventbus_topic_event_time_watermark{${label}} ${t.watermark}`);
+    }
+  }
+
+  // Per-topic payload-size histograms (EB-143): cumulative buckets in
+  // bytes — `le="+Inf"` equals the total sample count — plus the
+  // `_count`/`_sum` pair, the Prometheus histogram convention. Only
+  // topics with a matching histogram rule carry series, so a bus without
+  // histogram rules renders no series at all. `t.payloadHistogram`
+  // stays optional so the renderer tolerates a stats object that
+  // predates the field (hand-built fixtures included).
+  const histogramBuckets: Array<{ topic: string; le: string; count: number }> = [];
+  const histogramTotals: Array<{ topic: string; count: number; sum: number }> = [];
+  for (const t of stats.topics) {
+    const h = t.payloadHistogram;
+    if (h === undefined) continue;
+    for (const b of h.buckets) {
+      histogramBuckets.push({ topic: t.topic, le: String(b.le), count: b.count });
+    }
+    histogramBuckets.push({ topic: t.topic, le: '+Inf', count: h.count });
+    histogramTotals.push({ topic: t.topic, count: h.count, sum: h.sum });
+  }
+  if (histogramBuckets.length > 0) {
+    lines.push(
+      '# HELP eventbus_payload_bytes_bucket Cumulative payload-size histogram of admitted publishes per topic, in bytes (EB-143; opt-in via setTopicPayloadHistogram; le="+Inf" equals the total sample count).',
+    );
+    lines.push('# TYPE eventbus_payload_bytes_bucket histogram');
+    for (const r of histogramBuckets) {
+      lines.push(
+        `eventbus_payload_bytes_bucket{topic="${escapeLabelValue(r.topic)}",le="${r.le}"} ${r.count}`,
+      );
+    }
+    for (const r of histogramTotals) {
+      const label = `topic="${escapeLabelValue(r.topic)}"`;
+      lines.push(`eventbus_payload_bytes_count{${label}} ${r.count}`);
+      lines.push(`eventbus_payload_bytes_sum{${label}} ${r.sum}`);
     }
   }
 

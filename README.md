@@ -3300,6 +3300,9 @@ Exported series:
 | `eventbus_topic_partition_published_total{topic,partition}` | counter | per-partition `publishedMessages` (EB-90); only emitted for topics with more than one configured partition |
 | `eventbus_topic_late_messages_total{topic}` | counter | per-topic `lateMessages` (EB-59) |
 | `eventbus_topic_event_time_watermark{topic}` | gauge | per-topic event-time watermark in epoch ms (EB-59); only emitted for topics with at least one event-time publish |
+| `eventbus_payload_bytes_bucket{topic,le}` | histogram | per-topic cumulative payload-size histogram of admitted publishes in bytes (EB-143); `le` from the topic's configured buckets plus `+Inf`; only topics with a matching histogram rule |
+| `eventbus_payload_bytes_count{topic}` | counter | per-topic sampled publish count (EB-143) |
+| `eventbus_payload_bytes_sum{topic}` | counter | per-topic sampled payload bytes (EB-143) |
 | `eventbus_subscribers` | gauge | `totalSubscribers` |
 | `eventbus_unacked_deliveries` | gauge | `unackedDeliveries` |
 | `eventbus_throttled_subscribers` | gauge | `throttledSubscribers` |
@@ -4751,3 +4754,55 @@ synchronous call, publishes to either name fail fast with
 `TopicRenameInProgressError` (a re-entrant publish from e.g. a rebalance
 callback cannot land on a half-moved topic). After the rename the old
 name is free again — publishing to it starts a fresh topic.
+
+## Payload size histograms (EB-143)
+
+`setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into
+payload-size distribution sampling — the capacity-planning signal for
+which topics carry the bytes and where the oversized-message tail
+lives:
+
+```ts
+bus.setTopicPayloadHistogram('market.*', { buckets: [1024, 65536, 1048576] });
+bus.publish('market.btc', tick);
+const h = bus.getStats().topics.find((t) => t.topic === 'market.btc')?.payloadHistogram;
+// h.buckets -> [{ le: 1024, count: 1 }, { le: 65536, count: 1 }, { le: 1048576, count: 1 }]
+// h.count -> 1, h.sum -> <bytes>, h.mean -> <bytes>, h.p50 -> 1024, h.p99 -> 1024
+```
+
+Sampling point and rules:
+
+- **Sampled once per admitted publish**, after every admission gate
+  (pause, publisher rate limit, ACL, schema, size caps, adaptive
+  sampling, topic rate limit). Rejected and shed publishes are never
+  sampled — the histogram describes the real fan-out distribution.
+- **Sample value** is the `payloadByteSize` estimator: JSON UTF-8 bytes
+  (`Uint8Array` payloads measure as wire bytes); unserializable
+  payloads count as 0.
+- **Rule resolution** mirrors `setTopicTtl`: an exact-topic rule wins
+  over any pattern; between patterns the earliest-registered rule wins
+  (independent matcher cache — never inflates `patternCacheSize`).
+- **Bucket config validation**: `buckets` must be a non-empty array of
+  strictly increasing positive finite numbers (`RangeError` otherwise);
+  the rule stores a defensive copy. Re-setting a rule replaces it and
+  resets the topic's counts; `clearTopicPayloadHistogram(pattern)`
+  stops sampling and drops the per-topic counts (returns whether a rule
+  existed).
+- **Stats**: `TopicStats.payloadHistogram` is present only when a rule
+  currently matches the topic — zero-filled until the first sample.
+  `BusStats.payloadHistogram` is the bus-wide aggregate (exact
+  `count`/`sum`; buckets span the sorted union of every boundary ever
+  sampled), present once at least one payload has been sampled.
+- **Quantile semantics**: bucket counts are cumulative
+  (`count` = samples with size `<= le`); `p50`/`p99` are
+  bucket-boundary estimates by nearest-rank — the smallest `le` whose
+  cumulative count reaches `ceil(q * count)` — so a p50 of 1024 means
+  "at least half the sampled payloads were ≤ 1024 bytes".
+- **Prometheus**: `eventbus_payload_bytes_bucket{topic,le}` (cumulative,
+  `le="+Inf"` included), `eventbus_payload_bytes_count{topic}`,
+  `eventbus_payload_bytes_sum{topic}` — only for topics with a matching
+  rule.
+
+Orthogonal to `SubscribeOptions.queueMaxBytes` (live queue byte
+waterline) and `setTopicMaxMessageBytes` (per-message hard cap): the
+histogram observes, the caps enforce.

@@ -3507,6 +3507,33 @@ export interface EventBusOptions {
 }
 
 /** Per-topic stats kept live by the bus. */
+/**
+ * Per-topic (or bus-wide) payload-size histogram snapshot (EB-143).
+ *
+ * Bucket counts are cumulative: `buckets[i].count` is the number of
+ * sampled publishes whose payload size was `<= buckets[i].le`.
+ * `p50`/`p99` are bucket-boundary estimates by nearest-rank — the
+ * smallest `le` whose cumulative count reaches `ceil(q * count)` — so
+ * a p50 of 1024 means "at least half the sampled payloads were <= 1024
+ * bytes", not "the median payload was 1024 bytes". `mean` is the exact
+ * arithmetic mean (`sum / count`); it is 0 when `count` is 0, and
+ * `p50`/`p99` are `undefined` then.
+ */
+export interface PayloadSizeHistogram {
+  /** Cumulative buckets, in ascending `le` order. */
+  buckets: Array<{ le: number; count: number }>;
+  /** Total samples. Equals the implicit `le="+Inf"` bucket. */
+  count: number;
+  /** Sum of sampled payload sizes in bytes. */
+  sum: number;
+  /** Exact mean payload size in bytes; 0 when `count` is 0. */
+  mean: number;
+  /** Bucket-boundary p50 estimate (nearest-rank); `undefined` when `count` is 0. */
+  p50: number | undefined;
+  /** Bucket-boundary p99 estimate (nearest-rank); `undefined` when `count` is 0. */
+  p99: number | undefined;
+}
+
 export interface TopicStats {
   /** The concrete topic name (as published, never a pattern). */
   topic: string;
@@ -3618,6 +3645,15 @@ export interface TopicStats {
    * size how much producer traffic the cap is shedding.
    */
   payloadRejectedBytes: number;
+  /**
+   * Payload-size histogram for this topic (EB-143): present only when a
+   * `setTopicPayloadHistogram` rule currently matches the topic — without
+   * a rule the key is absent, so histogram-free snapshots are
+   * byte-identical to before. Zero-filled (all counts 0, `p50`/`p99`
+   * `undefined`) until the first admitted publish is sampled. See
+   * `PayloadSizeHistogram` for the bucket/quantile semantics.
+   */
+  payloadHistogram?: PayloadSizeHistogram;
   /**
    * Publishes to this topic admitted under a superseded-but-graced
    * schema version (see `setTopicSchemaVersion`): the payload validated
@@ -4042,6 +4078,16 @@ export interface BusStats {
    * `TopicStats.payloadRejectedBytes` for the exact counting rules.
    */
   payloadRejectedBytes: number;
+  /**
+   * Bus-wide payload-size histogram (EB-143): the same shape as the
+   * per-topic snapshot, accumulated across every sampled topic — `count`
+   * and `sum` are exact; `buckets` span the sorted union of every
+   * boundary ever sampled (a boundary introduced later counts only
+   * samples observed after its introduction). Present once at least one
+   * payload has been sampled; absent on a bus that never sampled, so
+   * histogram-free snapshots are byte-identical to before.
+   */
+  payloadHistogram?: PayloadSizeHistogram;
   /**
    * Total publishes admitted under a superseded-but-graced schema
    * version — the sum of every topic's `deprecatedSchemaVersions` (see
@@ -5679,6 +5725,34 @@ export function escapeRegExp(literal: string): string {
  * creation and the schema-rejection counter so the shape cannot drift
  * between call sites.
  */
+/**
+ * Live per-topic payload-size histogram accumulator (EB-143).
+ * `buckets` aliases the matching rule's boundary array (never mutated);
+ * the accumulator is rebuilt when the rule's boundaries change (see
+ * `samplePayloadHistogram`), so a reconfigured rule never inherits stale
+ * counts. `counts` are cumulative: `counts[i]` = samples with size
+ * `<= buckets[i]`.
+ */
+interface PayloadHistogramAccumulator {
+  buckets: number[];
+  counts: number[];
+  count: number;
+  sum: number;
+}
+
+/**
+ * Nearest-rank quantile over cumulative histogram buckets (EB-143):
+ * the smallest `le` whose cumulative count reaches `ceil(q * total)`.
+ * `total >= 1` always, so the last bucket always qualifies.
+ */
+function histogramQuantile(buckets: number[], counts: number[], q: number, total: number): number {
+  const rank = Math.ceil(q * total);
+  for (let i = 0; i < buckets.length; i += 1) {
+    if (counts[i] >= rank) return buckets[i];
+  }
+  return buckets[buckets.length - 1];
+}
+
 function zeroedTopicStats(): {
   subscriberCount: number;
   publishedMessages: number;
@@ -5703,6 +5777,8 @@ function zeroedTopicStats(): {
   compressedBytesBefore: number;
   compressedBytesAfter: number;
   compressionTimeMs: number;
+  /** Live payload-size histogram accumulator (EB-143); undefined until the first sampled publish. */
+  payloadHistogram: PayloadHistogramAccumulator | undefined;
   lanes: {
     queued: LaneCounts;
     delivered: LaneCounts;
@@ -5734,6 +5810,7 @@ function zeroedTopicStats(): {
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,
     compressionTimeMs: 0,
+    payloadHistogram: undefined,
     lanes: {
       queued: zeroedLaneCounts(),
       delivered: zeroedLaneCounts(),
@@ -9818,6 +9895,31 @@ export class EventBus {
    */
   private ttlMatcherCache = new Map<string, RegExp>();
   /**
+   * Per-topic payload-size histogram bucket boundaries (EB-143), keyed
+   * by the exact string passed to `setTopicPayloadHistogram` — either a
+   * concrete topic name or a wildcard pattern. Insertion order is the
+   * tie-break order when several rules match a topic. The stored arrays
+   * are defensive copies; re-setting a rule replaces it.
+   */
+  private payloadHistogramRules = new Map<string, number[]>();
+  /**
+   * Compiled matchers for the wildcard entries in
+   * `payloadHistogramRules`, kept apart from the subscriber pattern
+   * cache and the other rule caches so histogram configuration never
+   * inflates `patternCacheSize`.
+   */
+  private payloadHistogramMatcherCache = new Map<string, RegExp>();
+  /**
+   * Bus-wide payload-size histogram accumulator (EB-143): the sorted
+   * union of every boundary ever sampled, with cumulative counts.
+   * `count`/`sum` are exact; a boundary introduced later counts only
+   * samples observed after its introduction (see
+   * `samplePayloadHistogram`).
+   */
+  private payloadHistogramGlobal:
+    | { buckets: number[]; counts: number[]; count: number; sum: number }
+    | undefined;
+  /**
    * MQTT-style retained-message rules (EB-87), keyed by the exact string
    * passed to `setTopicRetained` — either a concrete topic name or a
    * wildcard pattern. `true` enables retained publishes for matching
@@ -11389,6 +11491,74 @@ export class EventBus {
   }
 
   /**
+   * Opts topics matching `topicPattern` into payload-size histogram
+   * sampling (EB-143, real-time systems): every admitted publish's
+   * payload size (JSON UTF-8 bytes, unserializable payloads count as 0 —
+   * the `payloadByteSize` estimator) is attributed to the topic's
+   * cumulative bucket counts. Sampling happens once per admitted
+   * publish, after every admission gate (schema, ACL, rate limits, size
+   * caps) — rejected and shed publishes never pollute the histogram —
+   * and feeds both the per-topic snapshot
+   * (`TopicStats.payloadHistogram`) and the bus-wide aggregate
+   * (`BusStats.payloadHistogram`). The distribution is the
+   * capacity-planning signal: which topics carry the bytes, and where
+   * the oversized-message tail lives.
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or
+   * an exact topic name); the rule key is the exact string passed here.
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins
+   * (independent matcher cache — never inflates `patternCacheSize`).
+   * Re-setting a rule replaces it and resets the topic's accumulated
+   * counts; the bus-wide aggregate is cumulative history and never
+   * resets. Clearing a rule stops sampling and drops the per-topic
+   * counts with the rule.
+   *
+   * Throws `RangeError` when `topicPattern` is empty or `buckets` is not
+   * a non-empty array of strictly increasing positive finite numbers.
+   */
+  setTopicPayloadHistogram(topicPattern: string, options: { buckets: number[] }): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    const buckets = options?.buckets;
+    if (!Array.isArray(buckets) || buckets.length === 0) {
+      throw new RangeError('buckets must be a non-empty array of bucket boundaries');
+    }
+    for (const b of buckets) {
+      if (typeof b !== 'number' || !Number.isFinite(b) || b <= 0) {
+        throw new RangeError('buckets must contain only positive finite numbers');
+      }
+    }
+    for (let i = 1; i < buckets.length; i += 1) {
+      if (buckets[i] <= buckets[i - 1]) {
+        throw new RangeError('buckets must be strictly increasing');
+      }
+    }
+    // Defensive copy: later mutation of the caller's array must not
+    // rewrite the rule out from under the accumulator (which aliases
+    // this array by reference — see `samplePayloadHistogram`).
+    this.payloadHistogramRules.set(topicPattern, [...buckets]);
+    // An exact topic name gets its stats row now, so `getStats()`
+    // reports the zero-filled histogram from the moment the rule is
+    // installed — the opt-in is visible before the first publish.
+    // Patterns match unbounded topic sets, so their rows materialize on
+    // first publish (which samples immediately).
+    if (!topicPattern.includes('*')) this.statsFor(topicPattern);
+  }
+
+  /**
+   * Removes the payload-histogram rule previously registered for
+   * `topicPattern`. Returns true when a rule existed and was removed.
+   * Sampling stops immediately; the per-topic accumulated counts are
+   * dropped with the rule, while the bus-wide aggregate keeps its
+   * cumulative history.
+   */
+  clearTopicPayloadHistogram(topicPattern: string): boolean {
+    return this.payloadHistogramRules.delete(topicPattern);
+  }
+
+  /**
    * Sets how many publish-side partitions a topic has (EB-90, real-time
    * systems): the topic's publishes are spread over `n` partitions, each
    * with an independent sequence counter (the EB-13 per-topic seq,
@@ -11815,6 +11985,121 @@ export class EventBus {
       if (matcher.test(topic)) return ttlMs;
     }
     return undefined;
+  }
+
+  /**
+   * Returns the payload-histogram bucket boundaries that apply to
+   * `topic`, or `undefined` when no rule matches. An exact-topic rule
+   * wins over patterns; between patterns the earliest-registered
+   * matching rule wins.
+   */
+  private payloadHistogramBucketsForTopic(topic: string): number[] | undefined {
+    const exact = this.payloadHistogramRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, buckets] of this.payloadHistogramRules) {
+      let matcher = this.payloadHistogramMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.payloadHistogramMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return buckets;
+    }
+    return undefined;
+  }
+
+  /**
+   * Attributes one admitted publish's payload size to the per-topic and
+   * bus-wide payload histograms (EB-143). Called once per admitted
+   * publish, right after the topic rate-limit gate — every admission
+   * gate (pause, publisher rate limit, ACL, schema, size caps, adaptive
+   * sampling, topic rate limit) has passed, so rejected and shed
+   * publishes never reach this line and never pollute the distribution,
+   * exactly like the accepted-for-publish sampling (EB-34) next to it.
+   * A no-op when no histogram rule matches the topic; with no rules
+   * installed at all it is a single map-size check, so unconfigured
+   * buses pay nothing for it.
+   *
+   * The per-topic accumulator aliases the matching rule's boundary
+   * array and is rebuilt when the rule's boundaries change (reference
+   * comparison), so a reconfigured rule never inherits stale counts.
+   * The bus-wide accumulator keeps the sorted union of every boundary
+   * ever sampled: `count`/`sum` are exact, and a boundary introduced
+   * later counts only samples observed after its introduction (earlier
+   * samples cannot be re-attributed exactly).
+   */
+  private samplePayloadHistogram(topic: string, payload: unknown): void {
+    if (this.payloadHistogramRules.size === 0) return;
+    const buckets = this.payloadHistogramBucketsForTopic(topic);
+    if (buckets === undefined) return;
+    const size = payloadByteSize(payload);
+    const stats = this.statsFor(topic);
+    let hist = stats.payloadHistogram;
+    if (hist === undefined || hist.buckets !== buckets) {
+      hist = { buckets, counts: new Array(buckets.length).fill(0), count: 0, sum: 0 };
+      stats.payloadHistogram = hist;
+    }
+    hist.count += 1;
+    hist.sum += size;
+    for (let i = 0; i < buckets.length; i += 1) {
+      if (size <= buckets[i]) hist.counts[i] += 1;
+    }
+    let global = this.payloadHistogramGlobal;
+    if (global === undefined) {
+      global = this.payloadHistogramGlobal = { buckets: [], counts: [], count: 0, sum: 0 };
+    }
+    // Extend the union boundary list, ascending; a new boundary starts
+    // at zero — it counts only this and later samples.
+    for (const b of buckets) {
+      if (!global.buckets.includes(b)) {
+        const insertAt = global.buckets.findIndex((x) => x > b);
+        if (insertAt === -1) {
+          global.buckets.push(b);
+          global.counts.push(0);
+        } else {
+          global.buckets.splice(insertAt, 0, b);
+          global.counts.splice(insertAt, 0, 0);
+        }
+      }
+    }
+    global.count += 1;
+    global.sum += size;
+    for (let i = 0; i < global.buckets.length; i += 1) {
+      if (size <= global.buckets[i]) global.counts[i] += 1;
+    }
+  }
+
+  /**
+   * Builds the `TopicStats.payloadHistogram` snapshot for `topic`
+   * (EB-143): `undefined` when no histogram rule currently matches the
+   * topic. Bucket boundaries come from the matching rule; counts come
+   * from the live accumulator when it was built for these exact
+   * boundaries — otherwise the snapshot is zero-filled (rule set but
+   * nothing sampled yet, or boundaries changed since the last sample;
+   * the next sample rebuilds the accumulator). The snapshot never
+   * aliases live counters.
+   */
+  private payloadHistogramSnapshot(
+    topic: string,
+    stats: ReturnType<typeof zeroedTopicStats>,
+  ): PayloadSizeHistogram | undefined {
+    const buckets = this.payloadHistogramBucketsForTopic(topic);
+    if (buckets === undefined) return undefined;
+    const acc = stats.payloadHistogram;
+    const live = acc !== undefined && acc.buckets === buckets ? acc : undefined;
+    return {
+      buckets: buckets.map((le, i) => ({ le, count: live?.counts[i] ?? 0 })),
+      count: live?.count ?? 0,
+      sum: live?.sum ?? 0,
+      mean: live !== undefined && live.count > 0 ? live.sum / live.count : 0,
+      p50:
+        live !== undefined && live.count > 0
+          ? histogramQuantile(buckets, live.counts, 0.5, live.count)
+          : undefined,
+      p99:
+        live !== undefined && live.count > 0
+          ? histogramQuantile(buckets, live.counts, 0.99, live.count)
+          : undefined,
+    };
   }
 
   /**
@@ -25644,6 +25929,12 @@ export class EventBus {
     // time — keeping the table aligned with real publish load rather than
     // scheduled intent.
     this.publishRates.sample(topic, this.now());
+    // Per-topic payload-size histogram (EB-143): the message cleared
+    // every admission gate above, so its payload size samples the real
+    // fan-out distribution — rejected and shed publishes never reach
+    // this line. Opt-in per topic; unconfigured topics pay a single
+    // map-size check (see `samplePayloadHistogram`).
+    this.samplePayloadHistogram(topic, payload);
     // Event-time watermark (EB-59): observed once per accepted publish —
     // after the admission gates (schema validation, rate-limit budget), so
     // a rejected or shed message never moves the watermark, exactly like
@@ -26601,6 +26892,24 @@ export class EventBus {
       })),
       rejectedMessages: this.totalRejected,
       payloadRejectedBytes: this.totalPayloadRejectedBytes,
+      // Bus-wide payload-size histogram (EB-143): present once at least
+      // one payload has been sampled; absent otherwise, so
+      // histogram-free snapshots are byte-identical to before. The
+      // snapshot never aliases live counters.
+      ...(() => {
+        const g = this.payloadHistogramGlobal;
+        if (g === undefined || g.count === 0) return {};
+        return {
+          payloadHistogram: {
+            buckets: g.buckets.map((le, i) => ({ le, count: g.counts[i] })),
+            count: g.count,
+            sum: g.sum,
+            mean: g.sum / g.count,
+            p50: histogramQuantile(g.buckets, g.counts, 0.5, g.count),
+            p99: histogramQuantile(g.buckets, g.counts, 0.99, g.count),
+          } as PayloadSizeHistogram,
+        };
+      })(),
       deprecatedSchemaVersions: this.totalDeprecatedSchemaVersions,
       unregisteredTopicPublishes: this.unregisteredTopicPublishes,
       lateMessages: this.totalLateMessages,
@@ -26819,6 +27128,14 @@ export class EventBus {
         circuitBrokenMessages: stats.circuitBrokenMessages,
         rejectedMessages: stats.rejectedMessages,
         payloadRejectedBytes: stats.payloadRejectedBytes,
+        // Per-topic payload-size histogram (EB-143): present only when a
+        // histogram rule currently matches the topic — the key is absent
+        // otherwise, so histogram-free snapshots are byte-identical to
+        // before.
+        ...(() => {
+          const histogram = this.payloadHistogramSnapshot(topic, stats);
+          return histogram === undefined ? {} : { payloadHistogram: histogram };
+        })(),
         deprecatedSchemaVersions: stats.deprecatedSchemaVersions,
         lateMessages: stats.lateMessages,
         // Resolved with the currently configured allowed lateness, so a
