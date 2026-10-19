@@ -2095,6 +2095,15 @@ npm test
   `{ limit }` newest-first triage queries, unsubscribe clears the DLQ,
   replay resets the failure record with the budget, and
   `deadLetteredMessages` accounting.
+- `test/retry-ladder.test.ts` — pre-DLQ retry ladder (EB-155):
+  `validateRetryLadder`/`RetryLadder` unit tests (illegal values throw
+  `RangeError`, injectable timers/clock, cancel-before-fire), rung-by-rung
+  delayed redelivery with honored delays before dead-lettering, ack on a
+  rung leaving the ladder, TTL-expired messages dropped at the rung
+  hand-off (never resurrected), unsubscribe clearing armed rungs,
+  degraded-subscriber ladder pause until resume, per-message ladder walks
+  for batch subscriptions, unchanged immediate dead-lettering without the
+  option, and `ladderPending`/`ladderAttempts` stats.
 - `test/health.test.ts` — subscriber health probing: consecutive-error and
   processing-timeout thresholds auto-pause delivery, success resets the
   counter, a mid-drain degradation requeues unattempted messages in order,
@@ -5219,3 +5228,54 @@ Semantics:
 - **Idempotent.** A second `close()` returns the same promise — the same
   result — without re-running anything. An illegal `drainTimeoutMs` throws
   `RangeError` before anything is closed.
+
+## Pre-DLQ retry ladder (EB-155)
+
+```ts
+const sub = bus.subscribeReliable('orders.created', handle, {
+  deadLetter: { maxRedeliveries: 3, retryLadder: [1000, 5000, 30000] },
+});
+```
+
+The instant redelivery budget (`maxRedeliveries`, EB-28) covers messages
+that fail fast — but a downstream that only hiccups for a few seconds
+should not pay the DLQ price for a true poison message. The retry ladder
+is the opt-in middle ground: after the instant budget is exhausted, the
+message walks a ladder of *delayed* single retries — one delivery per
+rung, spaced by the configured rung delays — and only enters the DLQ when
+every rung has failed too.
+
+Semantics:
+
+- **Opt-in, backward compatible.** Absent or an empty array disables the
+  ladder: budget exhaustion dead-letters immediately, the pre-EB-155
+  behavior. Illegal values (non-array, negative/`NaN`/non-finite delays)
+  throw `RangeError` from `subscribeReliable` before anything registers.
+- **Identity preserved.** Each rung requeues the identical message object
+  — original per-topic `seq`, original TTL deadline. A message whose TTL
+  expired while waiting is judged expired at the rung's hand-off and
+  dropped, never resurrected and never dead-lettered.
+- **No budget reset.** The per-message redelivery budget is not reset by
+  the ladder — rungs are extra chances layered on the exhausted budget,
+  not a new one. Batch subscriptions walk the ladder per message: the
+  whole batch retries per rung through the normal batch drain.
+- **DLQ only when spent.** `getDeadLetterMessages` semantics are
+  unchanged — entries appear only via the normal dead-lettering path,
+  with `redeliveries` counting every attempt including the rungs.
+- **In-memory by design.** Rungs arm on unref'd timers (a pending ladder
+  never keeps the process alive); a process restart loses armed rungs.
+  The message itself is never lost — a rung that fired is either acked,
+  requeued, expired, or dead-lettered through the normal paths.
+- **Health-probe pause.** A rung that fires while the subscriber is
+  degraded (EB-18) is re-armed instead of delivering — the ladder pauses
+  while the subscriber is auto-paused and resumes when the probe clears.
+- **Ack exits.** A rung delivery the consumer acks leaves the ladder
+  (each rung gets a fresh ACK envelope, EB-11); a stale handle's no-op
+  ack never cancels a pending rung. Unsubscribing clears armed rungs.
+- **Observability.** `getStats()` exposes `ladderPending` (messages with
+  an armed rung) and `ladderAttempts` (cumulative rung deliveries fired).
+- **Orthogonal to EB-47 hotspot detection.** A rung redelivery re-enters
+  the normal pipeline, so a keyed message that keeps missing its
+  predecessor keeps tripping the hotspot threshold per rung — expected:
+  the hotspot still describes the ordering stall, not the ladder.
+

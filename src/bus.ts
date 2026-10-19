@@ -22,6 +22,7 @@ import {
   type IdleExpiredEvent,
 } from './idle.ts';
 import { AckTracker, type Delivery } from './ack.ts';
+import { validateRetryLadder, RetryLadder, type RetryLadderTimer, type RetryLadderTimerFactory } from './retry-ladder.ts';
 import { TokenBucket } from './throttle.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
@@ -2724,6 +2725,35 @@ export interface DeadLetterOptions {
    */
   autoReplay?: boolean | AutoReplayOptions;
   /**
+   * Opt-in pre-DLQ delayed retry ladder (EB-155): when a message exhausts
+   * its instant redelivery budget (`maxRedeliveries` above), the bus walks
+   * this ladder of delayed single retries — one delivery per rung, spaced
+   * by the rung delays in milliseconds, e.g. `[1000, 5000, 30000]` —
+   * before dead-lettering the message. Only when every rung has failed
+   * does the message enter the DLQ. Each rung requeues the identical
+   * message object, preserving its original per-topic `seq` and TTL
+   * deadline: a message whose TTL expired while waiting is dropped as
+   * expired at the rung's hand-off, never resurrected. The per-message
+   * redelivery budget is not reset by the ladder — rungs are extra chances,
+   * not a new budget. An empty array (or the absent option) disables the
+   * ladder: the message dead-letters immediately on budget exhaustion, the
+   * pre-EB-155 behavior. Must be an array of non-negative finite numbers
+   * when given, otherwise `subscribeReliable` throws `RangeError`.
+   *
+   * The ladder is in-memory: a process restart loses armed rungs (the
+   * message itself is never lost — a rung that fired is either acked,
+   * requeued, expired, or dead-lettered through the normal paths). Rungs
+   * arm on unref'd timers, so a pending ladder never keeps the process
+   * alive. A rung whose timer fires while the subscriber is degraded
+   * (EB-18 health probe) is re-armed instead of delivering — the ladder
+   * pauses while the subscriber is auto-paused. Composes with EB-47 key
+   * hotspot detection orthogonally: a rung redelivery re-enters the
+   * normal pipeline, so a keyed message that keeps missing its
+   * predecessor keeps tripping the hotspot threshold per rung — expected,
+   * the hotspot still describes the ordering stall, not the ladder.
+   */
+  retryLadder?: number[];
+  /**
    * Fired when a message exhausts its auto-replay budget and is marked
    * poisoned (see `autoReplay`) — once per message, synchronously with
    * the poisoning. Only fires when `autoReplay` is enabled.
@@ -4712,6 +4742,21 @@ export interface BusStats {
    */
   deadLetteredMessages: number;
   /**
+   * Messages currently waiting on an armed pre-DLQ retry-ladder rung
+   * (EB-155, see `DeadLetterOptions.retryLadder`): one per message with a
+   * timer armed, across all subscribers. A rung delivery that is
+   * outstanding (fired, awaiting ack/nack) does not count — the timer is
+   * disarmed while the delivery is in flight. Always 0 when no
+   * subscription enables the ladder.
+   */
+  ladderPending: number;
+  /**
+   * Cumulative pre-DLQ retry-ladder rung deliveries fired (EB-155): each
+   * time an armed rung requeues its message. Counts firings, not
+   * successes. Always 0 when no subscription enables the ladder.
+   */
+  ladderAttempts: number;
+  /**
    * Total DLQ entries dropped by the opt-in per-entry TTL (EB-145, see
    * `DeadLetterOptions.maxAgeMs`). Each expired entry is counted once,
    * when the lazy sweep removes it. Always 0 when no DLQ has
@@ -6275,6 +6320,20 @@ interface SubscriberDeadLetter {
   };
   onPoisoned?: (event: PoisonedMessageEvent) => void;
   /**
+   * Resolved pre-DLQ retry ladder (EB-155, see
+   * `DeadLetterOptions.retryLadder`), or undefined when disabled. Armed
+   * per message when the instant redelivery budget is exhausted; only
+   * when every rung has failed does the message dead-letter.
+   */
+  retryLadder?: RetryLadder;
+  /**
+   * Messages currently walking the retry ladder (EB-155), by message.
+   * `rung` is the rung index whose timer is armed; `timer` is undefined
+   * while a rung delivery is outstanding (fired, awaiting ack/nack) —
+   * only armed timers count in `BusStats.ladderPending`.
+   */
+  pendingLadders: Map<BusMessage, { rung: number; timer?: RetryLadderTimer }>;
+  /**
    * Pending auto-replay timers by DLQ seq (EB-134). Cleared on
    * unsubscribe — a replay must never fire for a gone subscriber.
    */
@@ -6679,7 +6738,7 @@ function thrownErrorMessage(err: unknown): string {
 function normalizeDeadLetterOptions(
   opt: boolean | DeadLetterOptions | undefined,
   caller: string,
-): Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned'> | null {
+): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError(`${caller}: deadLetter must be true or a DeadLetterOptions object`);
@@ -6743,6 +6802,10 @@ function normalizeDeadLetterOptions(
     diagnosticTopic,
     autoReplay,
     onPoisoned: o.onPoisoned,
+    // EB-155: validate the pre-DLQ retry ladder. Invalid rungs throw here,
+    // before anything is mutated or subscribed — a rejected option never
+    // leaves a half-registered subscription behind.
+    retryLadder: validateRetryLadder(o.retryLadder, caller),
   };
 }
 
@@ -9786,6 +9849,22 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 }
 
 /**
+ * Timer factory for the pre-DLQ retry ladder (EB-155): rungs arm on
+ * unref'd timers, so a pending ladder never keeps the process alive —
+ * the same convention as the delayed-delivery and auto-replay timers.
+ */
+const retryLadderTimers: RetryLadderTimerFactory = {
+  setTimeout: (callback: () => void, delayMs: number): unknown => {
+    const timer = setTimeout(callback, delayMs);
+    unrefTimer(timer);
+    return timer;
+  },
+  clearTimeout: (handle: unknown): void => {
+    clearTimeout(handle as ReturnType<typeof setTimeout>);
+  },
+};
+
+/**
  * Per-rule automatic dictionary trainer (EB-60). Owns the sample window,
  * the retrain triggers, and the background training pass; the bus owns
  * the rule table and the dictionary registry, reached through `hooks`.
@@ -11573,6 +11652,21 @@ export class EventBus {
    * including replays that failed again.
    */
   private totalDeadLettered = 0;
+  /**
+   * Messages currently waiting on an armed pre-DLQ retry-ladder rung
+   * (EB-155, see `DeadLetterOptions.retryLadder`): one per message with a
+   * timer armed, across all subscribers. A rung delivery that is
+   * outstanding (fired, awaiting ack/nack) does not count — the timer is
+   * disarmed while the delivery is in flight.
+   */
+  private totalLadderPending = 0;
+  /**
+   * Cumulative pre-DLQ retry-ladder rung deliveries fired (EB-155): each
+   * time an armed rung requeues its message. Counts firings, not
+   * successes — a rung that requeues a message which then acks still
+   * counts once here.
+   */
+  private totalLadderAttempts = 0;
   /**
    * Total DLQ entries dropped by the opt-in per-entry TTL (EB-145, see
    * `DeadLetterOptions.maxAgeMs`). Counts each expired entry exactly
@@ -16494,6 +16588,10 @@ export class EventBus {
             }
             dlq.pendingAutoReplays.clear();
             dlq.autoReplayAttemptsInFlight.clear();
+            // EB-155: pending retry-ladder rungs must not outlive the
+            // subscriber either — a retry for a gone subscriber has no
+            // one to deliver to.
+            this.clearAllRetryLadders(subscriber);
           }
           // Per-pattern teardown (EB-137): one unsubscribe removes the
           // aggregate from every pattern it registered under — prefix
@@ -17907,7 +18005,10 @@ export class EventBus {
         // and never settles). Dead-letter it instead of requeueing
         // forever.
         if (dlq != null && count > dlq.maxRedeliveries) {
-          this.moveToDeadLetter(subscriber, msg, count - 1, lastError);
+          // EB-155: with a retry ladder configured the message walks the
+          // ladder's delayed rungs before it may dead-letter; without one
+          // it dead-letters immediately, the pre-EB-155 behavior.
+          this.enterRetryLadderOrDeadLetter(subscriber, msg, count - 1, lastError);
           // A dead-lettered message settles the drain like any other
           // settle: the queue may now be empty with nothing unacked.
           this.checkDrainComplete(subscriber);
@@ -17936,10 +18037,21 @@ export class EventBus {
     // reliable subscriptions carry them; plain subscriptions never do.
     subscriber.nackReasons = { handler_throw: 0, explicit_nack: 0, ack_timeout: 0 };
     if (dlq != null) {
+      // EB-155: the normalized `retryLadder` is rung delays; the record
+      // holds the scheduler instance instead.
+      const { retryLadder: ladderRungs, ...dlqRest } = dlq;
       subscriber.deadLetter = {
         entries: [],
         nextSeq: 0,
-        ...dlq,
+        ...dlqRest,
+        // EB-155: build the per-subscriber ladder scheduler when the
+        // option is enabled — unref'd timers on the bus clock.
+        retryLadder:
+          ladderRungs === undefined
+            ? undefined
+            : new RetryLadder(ladderRungs, { now: this.now, timers: retryLadderTimers }),
+        // EB-155: ladder rung state starts empty per subscriber.
+        pendingLadders: new Map(),
         // EB-134: auto-replay bookkeeping starts empty per subscriber.
         pendingAutoReplays: new Map(),
         autoReplayAttemptsInFlight: new Map(),
@@ -17976,10 +18088,26 @@ export class EventBus {
         this.sampleSloPhases(subscriber, msg, deliveredAtMs);
       }
       if (ackState == null && !ackTraced && sloState === undefined) {
+        // EB-155: wrap the raw handle's ack so a rung delivery the
+        // consumer confirms leaves the retry ladder. The live-only guard
+        // mirrors the wrapped branch above: a stale handle's no-op ack
+        // must never clear pending ladder state. Registering the live
+        // record also retires stale raw handles correctly on redelivery
+        // (previously only wrapped deliveries were tracked).
+        const rawLive = { live: true };
+        liveDeliveries.set(msg, rawLive);
+        const raw = delivery;
+        const uninstrumented: Delivery<BusMessage> = {
+          ...raw,
+          ack: () => {
+            raw.ack();
+            if (rawLive.live) this.clearRetryLadder(subscriber, msg);
+          },
+        };
         // EB-107: register even the raw handle — the consumer holds it
         // directly in this branch, and batch settles must recognize it.
-        batchHandles.set(delivery, { raw: delivery, deliveredAtMs });
-        return delivery;
+        batchHandles.set(uninstrumented, { raw, deliveredAtMs });
+        return uninstrumented;
       }
       const live = { live: true };
       liveDeliveries.set(msg, live);
@@ -17993,6 +18121,9 @@ export class EventBus {
               this.recordProcessingLatency(subscriber, sloState, deliveredAtMs);
             }
             tracer?.closeAckSpan(subscriber, msg, this.now());
+            // EB-155: the consumer confirmed this delivery — a rung
+            // delivery that acks leaves the retry ladder.
+            this.clearRetryLadder(subscriber, msg);
           }
           // A stale handle (acked after nack/timeout already requeued)
           // leaves the trace alone: the redelivery owns the open ack
@@ -29937,6 +30068,8 @@ export class EventBus {
       projections,
       signatureFailures: this.totalSignatureFailures,
       deadLetteredMessages: this.totalDeadLettered,
+      ladderPending: this.totalLadderPending,
+      ladderAttempts: this.totalLadderAttempts,
       dlqExpiredMessages: this.totalDlqExpired,
       autoReplayed: this.totalAutoReplayed,
       autoReplayExhausted: this.totalAutoReplayExhausted,
@@ -30332,6 +30465,164 @@ export class EventBus {
     let depth = 0;
     for (const buffer of gate.buffers.values()) depth += buffer.size;
     return depth;
+  }
+
+  /**
+   * Pre-DLQ retry ladder scheduling (EB-155). Called when a message
+   * exhausts its instant redelivery budget. With `deadLetter.retryLadder`
+   * configured, arms the next rung's delayed single retry — first
+   * exhaustion arms rung 0, a failed rung-i delivery arms rung i+1 —
+   * instead of dead-lettering immediately. When the rungs are spent the
+   * message dead-letters through the normal path (`getDeadLetterMessages`
+   * semantics unchanged). The per-message redelivery budget is never
+   * reset: rungs are extra chances layered on top of the exhausted
+   * budget, not a new one.
+   *
+   * Each rung preserves the message's identity: the identical `BusMessage`
+   * is requeued with its original per-topic `seq` and TTL deadline, so a
+   * message whose TTL expired while waiting is judged expired at the
+   * rung's hand-off and dropped — never resurrected, never dead-lettered.
+   * Batch subscriptions walk the ladder per message: a failed batch
+   * requeues each message, and each message's rung fires through the
+   * normal batch drain — the whole batch retries per rung, one message at
+   * a time through the same pipeline.
+   *
+   * The ladder is in-memory: armed rungs live on unref'd timers and are
+   * lost on process restart (the message itself is never lost — a fired
+   * rung is acked, requeued, expired, or dead-lettered through the normal
+   * paths). Unsubscribing clears every armed rung; a rung that fires for
+   * a gone subscriber is dropped.
+   */
+  private enterRetryLadderOrDeadLetter(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    redeliveries: number,
+    lastError?: string,
+  ): void {
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) return;
+    const ladder = dlq.retryLadder;
+    // No ladder: immediate dead-letter, the pre-EB-155 behavior.
+    if (ladder === undefined) {
+      this.moveToDeadLetter(subscriber, msg, redeliveries, lastError);
+      return;
+    }
+    const pending = dlq.pendingLadders.get(msg);
+    // First exhaustion arms rung 0; a failed rung-i delivery arms rung
+    // i+1. The pending entry survives the rung delivery (timer disarmed
+    // while outstanding) so the rung index carries across the delivery.
+    const nextRung = pending === undefined ? 0 : pending.rung + 1;
+    if (nextRung >= ladder.size) {
+      // The ladder is spent: the message finally dead-letters.
+      dlq.pendingLadders.delete(msg);
+      this.moveToDeadLetter(subscriber, msg, redeliveries, lastError);
+      return;
+    }
+    const entry = pending ?? { rung: nextRung, timer: undefined as RetryLadderTimer | undefined };
+    entry.rung = nextRung;
+    entry.timer = ladder.arm(nextRung, () =>
+      this.fireLadderRung(subscriber, msg, redeliveries, lastError, nextRung),
+    );
+    dlq.pendingLadders.set(msg, entry);
+    this.totalLadderPending += 1;
+  }
+
+  /**
+   * Fires one armed retry-ladder rung (EB-155): requeues the message for
+   * a single delayed delivery. Stale firings (unsubscribed subscriber,
+   * superseded rung) are dropped. A rung that fires while the subscriber
+   * is degraded (EB-18 health probe) is re-armed instead of delivering —
+   * the ladder pauses while the subscriber is auto-paused, and resumes
+   * when the probe clears. A message whose TTL expired while waiting is
+   * judged expired at this hand-off and dropped, never resurrected.
+   *
+   * The requeue is already-admitted at-least-once work — the same shape
+   * as an immediate redelivery (`skipDedup`, `fromRedelivery`) — so the
+   * drain hands it to the handler through the normal pipeline: a fresh
+   * ACK envelope (EB-11) per rung, FIFO order, and the EB-47 key-hotspot
+   * monitor sees the rung like any other redelivery.
+   */
+  private fireLadderRung(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    redeliveries: number,
+    lastError: string | undefined,
+    rung: number,
+  ): void {
+    const dlq = subscriber.deadLetter;
+    // Unsubscribed while armed (or the DLQ record is gone): drop the rung.
+    if (dlq == null || !this.subscribers.has(subscriber.id)) return;
+    const pending = dlq.pendingLadders.get(msg);
+    if (pending === undefined || pending.rung !== rung || pending.timer === undefined) return;
+    // EB-18: a degraded subscriber pauses the ladder — re-arm the same
+    // rung instead of delivering while auto-paused.
+    const ladder = dlq.retryLadder;
+    if (ladder !== undefined && subscriber.health?.degraded === true) {
+      pending.timer = ladder.arm(rung, () =>
+        this.fireLadderRung(subscriber, msg, redeliveries, lastError, rung),
+      );
+      return;
+    }
+    // EB-155: judge TTL expiry at the hand-off — an expired message is
+    // dropped as expired, never resurrected by the ladder.
+    const deadline = this.messageDeadlines.get(msg);
+    if (deadline !== undefined && this.now() >= deadline) {
+      pending.timer.cancel();
+      dlq.pendingLadders.delete(msg);
+      this.totalLadderPending = Math.max(0, this.totalLadderPending - 1);
+      this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+      this.checkDrainComplete(subscriber);
+      return;
+    }
+    pending.timer = undefined;
+    this.totalLadderPending = Math.max(0, this.totalLadderPending - 1);
+    this.totalLadderAttempts += 1;
+    // `fromRedelivery`: a rung is already-admitted work, so it bypasses
+    // the graceful-drain admission gate (EB-128) like an immediate
+    // redelivery — refusing it here would break at-least-once and wedge
+    // the drain. `skipDedup`: same already-admitted reasoning as the
+    // redelivery path — a rung must never be suppressed as a duplicate.
+    this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
+    this.scheduleFlush();
+    this.checkDrainComplete(subscriber);
+  }
+
+  /**
+   * Clears one message's retry-ladder state (EB-155): a rung delivery the
+   * consumer acked leaves the ladder. Only a live handle's ack clears —
+   * a stale handle's no-op ack must never cancel a pending rung.
+   */
+  private clearRetryLadder(subscriber: Subscriber, msg: BusMessage): void {
+    const dlq = subscriber.deadLetter;
+    if (dlq === undefined) return;
+    const pending = dlq.pendingLadders.get(msg);
+    if (pending === undefined) return;
+    if (pending.timer !== undefined) {
+      pending.timer.cancel();
+      this.totalLadderPending = Math.max(0, this.totalLadderPending - 1);
+    }
+    dlq.pendingLadders.delete(msg);
+  }
+
+  /**
+   * Clears every armed retry-ladder rung for a subscriber (EB-155):
+   * unsubscribing drops pending rungs — a retry for a gone subscriber
+   * has no one to deliver to. Runs in the shared unsubscribe teardown,
+   * so it covers immediate unsubscribes, post-drain teardowns, and forced
+   * teardowns alike.
+   */
+  private clearAllRetryLadders(subscriber: Subscriber): void {
+    const dlq = subscriber.deadLetter;
+    if (dlq === undefined) return;
+    let armed = 0;
+    for (const pending of dlq.pendingLadders.values()) {
+      if (pending.timer !== undefined) {
+        pending.timer.cancel();
+        armed += 1;
+      }
+    }
+    dlq.pendingLadders.clear();
+    this.totalLadderPending = Math.max(0, this.totalLadderPending - armed);
   }
 
   /**
