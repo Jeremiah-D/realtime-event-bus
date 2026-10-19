@@ -3968,6 +3968,19 @@ export interface EventBusOptions {
    * function; anything else throws `RangeError` from the constructor.
    */
   samplingRandom?: () => number;
+  /**
+   * Injectable random source for delayed-delivery due-time jitter (see
+   * `PublishDelayedOptions.expiryJitterMs`, EB-160): the bus draws once
+   * per jittered `publishDelayed` schedule and offsets the due time by
+   * `(random() * 2 - 1) * expiryJitterMs`. It must return a number in
+   * `[0, 1)`; the bus does not clamp, so callers own the contract. The
+   * default is `Math.random`. Inject a seeded PRNG (or a scripted
+   * sequence) in tests to make jittered due times deterministic and
+   * reproducible. Schedules without jitter never draw from this source.
+   * Must be a function; anything else throws `RangeError` from the
+   * constructor.
+   */
+  delayJitterRandom?: () => number;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -9754,6 +9767,26 @@ export interface PublishDelayedOptions {
    * validates the key but never consults or claims the table.
    */
   idempotencyKey?: string;
+  /**
+   * Random due-time jitter for this delayed publish (EB-160, opt-in): a
+   * random offset in `[-expiryJitterMs, +expiryJitterMs]` applied to the
+   * due time once, at schedule time — so a burst of schedules sharing one
+   * nominal `deliverAt` fans out spread over a window instead of in
+   * lockstep (thundering-herd protection for expiry-driven workloads).
+   * The jittered due time is what the timer heap, the durable-log
+   * schedule record, and the schedule-skew sampler observe: a restart
+   * rebuilds the same due time, `cancelDelayed` is unaffected, and keyed
+   * schedules keep their schedule-time key sequence numbers (the jitter
+   * changes *when* each schedule fans out, never the per-key order). A
+   * jittered due time in the past is already due and fans out on the next
+   * flush, exactly like `delayMs: 0`. The random draw comes from the
+   * injectable `EventBusOptions.delayJitterRandom` (default
+   * `Math.random`) — inject a scripted sequence in tests for
+   * determinism. Must be a non-negative finite number of milliseconds
+   * when provided; anything else throws `RangeError` at schedule time.
+   * `0`/absent means no jitter and draws nothing from the random source.
+   */
+  expiryJitterMs?: number;
 }
 
 /**
@@ -11343,6 +11376,13 @@ export class EventBus {
    */
   private readonly samplingRandom: () => number;
   /**
+   * Injectable random source for delayed-delivery due-time jitter (see
+   * `EventBusOptions.delayJitterRandom`, EB-160): defaults to
+   * `Math.random`, drawn once per jittered `publishDelayed` schedule.
+   * Injected callers own the `[0, 1)` contract — the bus never clamps.
+   */
+  private readonly delayJitterRandom: () => number;
+  /**
    * Per-publisher publish rate limits (EB-79), keyed by the cleaned
    * publisher identity (`cleanPublisherId`). Unlike the per-topic rules
    * there are no wildcards: a publisher either has a configured budget or
@@ -12555,6 +12595,16 @@ export class EventBus {
       throw new RangeError('samplingRandom must be a function');
     }
     this.samplingRandom = samplingRandom ?? Math.random;
+    // Delayed-delivery due-time jitter (EB-160): the random source is
+    // validated fail-fast — a non-function must never half-arm a bus —
+    // and defaults to Math.random. Schedules without jitter never draw
+    // from it; the injected source owns the [0, 1) contract and the bus
+    // never clamps.
+    const delayJitterRandom = options?.delayJitterRandom;
+    if (delayJitterRandom !== undefined && typeof delayJitterRandom !== 'function') {
+      throw new RangeError('delayJitterRandom must be a function');
+    }
+    this.delayJitterRandom = delayJitterRandom ?? Math.random;
     const onAuthzDenied = options?.onAuthzDenied;
     if (onAuthzDenied !== undefined && typeof onAuthzDenied !== 'function') {
       throw new RangeError('onAuthzDenied must be a function');
@@ -23181,6 +23231,31 @@ export class EventBus {
       deliverAt = opts.deliverAt as number;
       if (!Number.isFinite(deliverAt)) {
         throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
+      }
+    }
+    // Due-time jitter (EB-160): spread the due time by a random
+    // ±expiryJitterMs so schedules sharing one nominal deliverAt do not
+    // fan out in lockstep. Applied once, at schedule time — the jittered
+    // due time is what the heap, the durable-log schedule record, and the
+    // schedule-skew sampler all observe, so a restart rebuilds the same
+    // due time and cancel/key-ordering semantics are untouched. Validated
+    // fail-fast here, before anything is mutated; a zero/absent jitter
+    // draws nothing from the random source. A jittered due time in the
+    // past is already due and fans out on the next flush, exactly like
+    // `delayMs: 0`.
+    const expiryJitterMs = opts.expiryJitterMs;
+    if (expiryJitterMs !== undefined) {
+      if (
+        typeof expiryJitterMs !== 'number' ||
+        !Number.isFinite(expiryJitterMs) ||
+        expiryJitterMs < 0
+      ) {
+        throw new RangeError(
+          'publishDelayed: expiryJitterMs must be a non-negative finite number of milliseconds',
+        );
+      }
+      if (expiryJitterMs > 0) {
+        deliverAt += (this.delayJitterRandom() * 2 - 1) * expiryJitterMs;
       }
     }
     // The producer label is validated before any fail-fast gate: a throw

@@ -1769,7 +1769,18 @@ library.
   and due sweeps also run at the start of every flush, so advancing an
   injected clock past a `deliverAt` and publishing anything delivers
   deterministically in tests. `getStats().pendingDelayed` reports the
-  scheduled count. Invalid timing options throw `RangeError`; with a durable
+  scheduled count. Opt-in due-time jitter (EB-160, via
+  `publishDelayed(..., { expiryJitterMs })`): spreads the due time by a
+  random ±`expiryJitterMs` so a burst of schedules sharing one nominal
+  `deliverAt` fans out over a window instead of in lockstep
+  (thundering-herd protection). The jitter applies once, at schedule time:
+  the timer heap, the durable-log schedule record, and the schedule-skew
+  sampler all observe the jittered due time, so a restart rebuilds it,
+  `cancelDelayed` is unaffected, and keyed schedules keep their
+  schedule-time key order. The random draw comes from the injectable
+  `EventBusOptions.delayJitterRandom` (default `Math.random`) — inject a
+  scripted sequence in tests for determinism; schedules without jitter
+  never draw from it. Invalid timing options throw `RangeError`; with a durable
   log, a non-JSON-serializable payload throws instead of scheduling
   something that could not survive a restart. Opt-in schedule-skew
   observability (EB-136, in `src/scheduleskew.ts`, via `new EventBus({
