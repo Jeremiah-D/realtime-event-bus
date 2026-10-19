@@ -605,6 +605,15 @@ export interface BusMessage {
    */
   publisherId?: string;
   /**
+   * Application message headers (see `PublishOptions.headers`, EB-153):
+   * a string-to-string routing map stamped at admission — tenant,
+   * region, schema version, canary cohort — evaluated by subscriber-side
+   * header filters (`SubscribeOptions.headerFilter`) at fan-out. It
+   * rides the envelope end to end (durable log, replay, redeliveries),
+   * exactly like `publisherId`. Absent for headerless publishes.
+   */
+  headers?: Record<string, string>;
+  /**
    * Business event time of the message in epoch milliseconds, set when the
    * publish carried one (`PublishOptions.eventTime`). Unlike `seq` — the
    * bus-assigned publish-order number (EB-13) — this is the application's
@@ -695,6 +704,159 @@ export type BatchMessageHandler = (messages: BusMessage[]) => void;
  * exactly like a throwing schema validator.
  */
 export type MessageFilter = (payload: unknown, topic: string) => boolean;
+
+/**
+ * Header-filter rule operator (see `SubscribeOptions.headerFilter`,
+ * EB-153): how one rule compares a message header's value.
+ *
+ * - `eq`: the header value must equal `value` exactly.
+ * - `ne`: the header value must differ from `value`.
+ * - `prefix`: the header value must start with `value`.
+ * - `regex`: the header value must match the `value` pattern
+ *   (precompiled at subscribe time; a partial match counts, like the
+ *   `=~` operator of `filterExpr`).
+ */
+export type HeaderFilterOp = 'eq' | 'ne' | 'prefix' | 'regex';
+
+/**
+ * One subscriber-side header-filter rule (see
+ * `SubscribeOptions.headerFilter`, EB-153): routes on message headers
+ * instead of payload content — tenant routing, canary sharding,
+ * schema-version gating. Rules compose with AND: every rule must match
+ * for the message to reach the subscriber.
+ *
+ * Fail-closed: a rule never matches when the header is absent — not even
+ * `ne` — so a message missing a routing header is skipped, never
+ * silently passed. The evaluation never throws: unlike the `filter`
+ * predicate, a header filter can never take down a publish call.
+ */
+export interface HeaderFilterRule {
+  /** Header name to look up on the message (`BusMessage.headers`). */
+  key: string;
+  /** Comparison operator (see `HeaderFilterOp`). */
+  op: HeaderFilterOp;
+  /** Comparison value; the regex source for `op: 'regex'`. */
+  value: string;
+}
+
+/**
+ * A header-filter rule with its regex precompiled (EB-153). Compiled
+ * once per subscription (or per `setHeaderFilter` call); every fan-out
+ * path shares the compiled form, so the hot path never compiles.
+ */
+interface CompiledHeaderFilterRule {
+  key: string;
+  op: HeaderFilterOp;
+  value: string;
+  /** Present exactly for `op: 'regex'` — the precompiled pattern. */
+  pattern?: RegExp;
+}
+
+const HEADER_FILTER_OPS: ReadonlySet<string> = new Set(['eq', 'ne', 'prefix', 'regex']);
+
+/**
+ * Validates and compiles `SubscribeOptions.headerFilter` (EB-153):
+ * every rule needs a non-empty string `key`, a known `op`, and a string
+ * `value`; a `regex` rule's pattern is precompiled here so an illegal
+ * pattern throws `RangeError` from `subscribe` (or `setHeaderFilter`),
+ * before anything registers — never at fan-out time.
+ *
+ * Type errors throw `TypeError` (mirroring the `filter` / `filterExpr`
+ * validation style); bad values throw `RangeError`.
+ */
+function compileHeaderFilterRules(
+  rules: HeaderFilterRule[] | undefined,
+  caller: string,
+): CompiledHeaderFilterRule[] | undefined {
+  if (rules === undefined) return undefined;
+  if (!Array.isArray(rules)) {
+    throw new TypeError(`${caller}: headerFilter must be an array of rules`);
+  }
+  return rules.map((rule, i) => {
+    const where = `${caller}: headerFilter[${i}]`;
+    if (typeof rule !== 'object' || rule === null) {
+      throw new TypeError(`${where} must be an object`);
+    }
+    if (typeof rule.key !== 'string') {
+      throw new TypeError(`${where}.key must be a string`);
+    }
+    if (rule.key.length === 0) {
+      throw new RangeError(`${where}.key must be a non-empty string`);
+    }
+    if (!HEADER_FILTER_OPS.has(rule.op)) {
+      throw new RangeError(
+        `${where}.op must be one of 'eq', 'ne', 'prefix', 'regex'`,
+      );
+    }
+    if (typeof rule.value !== 'string') {
+      throw new TypeError(`${where}.value must be a string`);
+    }
+    let pattern: RegExp | undefined;
+    if (rule.op === 'regex') {
+      try {
+        pattern = new RegExp(rule.value);
+      } catch {
+        throw new RangeError(`${where}.value is not a valid regular expression`);
+      }
+    }
+    return { key: rule.key, op: rule.op, value: rule.value, pattern };
+  });
+}
+
+/**
+ * Pure header-filter evaluation (EB-153): every rule must match (AND).
+ * A missing header never matches — fail-closed, even for `ne` — so a
+ * message missing a routing header is skipped rather than silently
+ * passed. Shared by live fan-out, durable-log replay and the retained
+ * snapshot.
+ */
+function headerFilterMatches(
+  rules: CompiledHeaderFilterRule[],
+  headers: Record<string, string> | undefined,
+): boolean {
+  for (const rule of rules) {
+    const actual = headers?.[rule.key];
+    // Absent header: never a match — the rule cannot judge what the
+    // message did not carry, so it fails closed instead of passing.
+    if (actual === undefined) return false;
+    switch (rule.op) {
+      case 'eq':
+        if (actual !== rule.value) return false;
+        break;
+      case 'ne':
+        if (actual === rule.value) return false;
+        break;
+      case 'prefix':
+        if (!actual.startsWith(rule.value)) return false;
+        break;
+      case 'regex':
+        // Precompiled at subscribe time; cannot throw here.
+        if (!(rule.pattern as RegExp).test(actual)) return false;
+        break;
+    }
+  }
+  return true;
+}
+
+/**
+ * Validates `PublishOptions.headers` (EB-153): a string-to-string map or
+ * absent. A non-string value (or a non-object) throws `RangeError` from
+ * the publish entry point before anything is mutated — the same
+ * zero-side-effect convention as the other publish-option validators.
+ */
+function validateHeaders(headers: Record<string, string> | undefined, caller: string): void {
+  if (headers === undefined) return;
+  if (typeof headers !== 'object' || headers === null || Array.isArray(headers)) {
+    throw new RangeError(`${caller}: headers must be a Record<string, string>`);
+  }
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value !== 'string') {
+      throw new RangeError(
+        `${caller}: headers[${JSON.stringify(key)}] must be a string`,
+      );
+    }
+  }
+}
 
 /**
  * Tuning for subscriber-side exactly-once dedup
@@ -1396,6 +1558,46 @@ export interface SubscribeOptions {
    * from `subscribe`. Disabled by default.
    */
   filter?: MessageFilter;
+  /**
+   * Opt-in subscriber-side header filter (EB-153): routes on message
+   * headers (`PublishOptions.headers`) instead of payload content —
+   * tenant routing, canary sharding, schema-version gating. An array of
+   * `{ key, op, value }` rules with AND semantics: every rule must match
+   * for the message to reach the subscriber. Operators: `eq`, `ne`,
+   * `prefix`, `regex` (see `HeaderFilterRule`).
+   *
+   * Evaluated at fan-out, next to the `filter` predicate: a rejected
+   * message is never queued — it consumes no backpressure budget, burns
+   * no adaptive-throttle token, never counts as a sequence gap (the
+   * per-topic baseline advances over it, exactly like a `filter`
+   * rejection), never consumes delivery credit, never creates an ack
+   * obligation on reliable subscriptions, and never enters a dead-letter
+   * queue. Composes with `filter` (both must accept), with `filterExpr`,
+   * and with `project` (EB-144, orthogonal: projection reshapes the
+   * payload, the header filter decides routing — a projected message is
+   * projected only after its headers admitted it).
+   *
+   * Fail-closed: a rule never matches a missing header — not even
+   * `ne` — so a message missing a routing header is skipped, never
+   * silently passed. Evaluation never throws. Applies to live fan-out,
+   * durable-log replay (`resumeFromSeq` / `resumeFromTime`), the
+   * retained snapshot, and shadow mirrors (uncounted there); for
+   * consumer-group members each member evaluates its own header filter
+   * on the assigned copy.
+   *
+   * Hot-updatable at runtime via `setHeaderFilter` (audited as
+   * `header_filter_updated`). Rejections count into
+   * `getStats().headerFilteredMessages` (global + per-topic) — separate
+   * from `filteredMessages`, so the EB-25 content-filter semantics are
+   * untouched.
+   *
+   * Rules are validated and regex patterns precompiled at subscribe
+   * time: a non-array throws `TypeError`, a non-object rule / non-string
+   * key / non-string value throws `TypeError`, an empty key, an unknown
+   * op or an invalid regex throws `RangeError` — all before anything
+   * registers. Disabled by default.
+   */
+  headerFilter?: HeaderFilterRule[];
   /**
    * Opt-in declarative subscription filter expression (EB-123): a
    * compile-time-checked predicate over the message payload, e.g.
@@ -3855,6 +4057,16 @@ export interface TopicStats {
    */
   filteredMessages: number;
   /**
+   * Messages fanned out on this topic that a subscriber's header filter
+   * rejected (see `SubscribeOptions.headerFilter`, EB-153): the message
+   * never entered that subscriber's queue — no backpressure budget
+   * consumed — and the subscriber's per-topic baseline advanced over it,
+   * so it is invisible to sequence-gap detection. Counted separately
+   * from `filteredMessages`: header routing and content filtering are
+   * independent narrowing decisions and stay observable independently.
+   */
+  headerFilteredMessages: number;
+  /**
    * Messages on this topic admitted by subscriber-side delivery-sampling
    * gates (see `SubscribeOptions.deliverySampleRate`, EB-152): the
    * message's `seq` satisfied the subscriber's `seq % N === 0` decision
@@ -4446,6 +4658,14 @@ export interface BusStats {
    * counting rules.
    */
   filteredMessages: number;
+  /**
+   * Total messages skipped by subscriber header filters — the sum of
+   * every topic's `headerFilteredMessages`. See
+   * `TopicStats.headerFilteredMessages` for the exact counting rules.
+   * Kept separate from `filteredMessages` so content-filter and
+   * header-routing rejections stay independently observable.
+   */
+  headerFilteredMessages: number;
   /**
    * Total messages admitted by subscriber-side delivery-sampling gates —
    * the sum of every topic's `sampledDeliveries`. See
@@ -5187,6 +5407,13 @@ interface RetainedEntry {
   publisherId?: string;
   /** Business event time, when the publish carried one. */
   eventTime?: number;
+  /**
+   * Application message headers (EB-153), when the publish carried
+   * them: restored from the seq-0 record on restart so the retained
+   * snapshot's header-filter evaluation sees the same headers the live
+   * fan-out saw.
+   */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -5728,6 +5955,17 @@ interface Subscriber {
    */
   filterExpr?: CompiledFilterExpression;
   /**
+   * Compiled subscriber-side header-filter rules (see
+   * `SubscribeOptions.headerFilter`, EB-153). Absent when the subscriber
+   * has no header filter. Compiled once at subscribe time (regex
+   * patterns precompiled — evaluation can never throw); every fan-out
+   * path (live delivery, durable-log replay, retained snapshot, shadow
+   * mirror — uncounted there) evaluates it next to the content `filter` —
+   * both must accept for the message to be queued. Hot-updatable via
+   * `setHeaderFilter`.
+   */
+  headerFilter?: { rules: CompiledHeaderFilterRule[] };
+  /**
    * Opt-in envelope signature verification (see
    * `SubscribeOptions.verifySignature`, EB-84). False by default — a
    * non-verifying subscriber pays a single boolean check per delivery.
@@ -6120,6 +6358,7 @@ function zeroedTopicStats(): {
     duplicateMessages: 0,
     idempotentHits: 0,
     filteredMessages: 0,
+    headerFilteredMessages: 0,
     sampledDeliveries: 0,
     sampleDropped: 0,
     signatureFailures: 0,
@@ -8984,6 +9223,24 @@ export interface PublishOptions {
    * the durable log, no rate-limit budget burned.
    */
   ttlMs?: number;
+  /**
+   * Application message headers (EB-153, opt-in): a string-to-string
+   * routing map stamped onto the message envelope (`BusMessage.headers`)
+   * at admission — tenant, region, schema version, canary cohort.
+   * Evaluated by subscriber-side header filters
+   * (`SubscribeOptions.headerFilter`) at fan-out, and carried end to
+   * end: the durable-log record, replay, redeliveries, and the retained
+   * snapshot keep them verbatim. Content addressing is untouched:
+   * headers ride the envelope, never the payload, so dedup hashes,
+   * signatures and projections behave exactly as before.
+   *
+   * Must be a `Record<string, string>` when provided — a non-object or a
+   * non-string value throws `RangeError` from the publish entry point
+   * before anything is mutated (fail-fast, zero side effects, like the
+   * other publish-option validators). Absent means a headerless message:
+   * every header-filter rule fails closed on it.
+   */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -11164,6 +11421,15 @@ export class EventBus {
    * budget consumed, no sequence gap reported.
    */
   private totalFiltered = 0;
+  /**
+   * Messages skipped by subscriber header filters (global total, see
+   * `SubscribeOptions.headerFilter`, EB-153). A header-filtered message
+   * was fanned out but never entered the rejecting subscriber's queue —
+   * no backpressure budget consumed, no sequence gap reported. Kept
+   * separate from `totalFiltered` so the EB-25 content-filter counter
+   * keeps its exact meaning.
+   */
+  private totalHeaderFiltered = 0;
   /**
    * Global delivery-sampling counters (EB-152): the sums of every
    * topic's `sampledDeliveries` / `sampleDropped`. Only move for
@@ -15748,6 +16014,12 @@ export class EventBus {
       }
       filterExpr = compileFilterExpression(filterExprSource);
     }
+    // Subscriber-side header filter (EB-153): rules are validated and
+    // regex patterns precompiled here — an illegal rule throws from
+    // subscribe, before anything registers, so a throw leaves no
+    // half-registered subscriber behind. Compiled once per subscription;
+    // every fan-out path shares the compiled form.
+    const headerFilterRules = compileHeaderFilterRules(opts?.headerFilter, 'subscribe');
     // Envelope signature verification (EB-84): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const verifySignature = opts?.verifySignature ?? false;
@@ -15949,6 +16221,11 @@ export class EventBus {
       // stored on the subscriber and evaluated at fan-out, right after
       // the predicate filter (see deliverUnkeyed / deliverShadow).
       filterExpr,
+      // Subscriber-side header filter (EB-153): the compiled rules are
+      // stored on the subscriber and evaluated at fan-out next to the
+      // content filter — both must accept for the message to be queued.
+      // Hot-updatable via `setHeaderFilter`.
+      headerFilter: headerFilterRules === undefined ? undefined : { rules: headerFilterRules },
       // Envelope signature verification (EB-84): opt-in integrity check
       // at the publish side — a failed check drops the message before
       // any content processing, counted and audited. False by default:
@@ -16365,6 +16642,40 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { from, to: rate },
+    });
+    return true;
+  }
+
+  /**
+   * Hot-updates a subscriber's header filter (see
+   * `SubscribeOptions.headerFilter`, EB-153): the new rules apply to the
+   * very next fanned-out message — no drain, no resubscribe — and are
+   * recorded in the subscription audit log as `header_filter_updated`
+   * with the rule count.
+   *
+   * The rules are validated and regex patterns precompiled exactly like
+   * at subscribe time: an illegal rule throws `RangeError`/`TypeError`
+   * before anything is touched, even for an unknown id. Passing
+   * `undefined` clears the filter (the subscriber accepts everything
+   * again); passing an empty array installs a filter no message can
+   * fail — every rule list is ANDed, and an empty AND accepts all.
+   *
+   * Returns `false` for an unknown subscription id (paralleling
+   * `renewLease` — nothing to update is not an error).
+   */
+  setHeaderFilter(subId: string, rules: HeaderFilterRule[] | undefined): boolean {
+    const compiled = compileHeaderFilterRules(rules, 'setHeaderFilter');
+    const subscriber = this.subscribers.get(subId);
+    // Parallels `renewLease`: an unknown id is not an error — there is
+    // simply nothing to update.
+    if (subscriber === undefined) return false;
+    subscriber.headerFilter = compiled === undefined ? undefined : { rules: compiled };
+    this.auditSubscription({
+      action: 'header_filter_updated',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { rules: rules === undefined ? 0 : rules.length },
     });
     return true;
   }
@@ -20071,6 +20382,27 @@ export class EventBus {
             continue;
           }
         }
+        // A subscriber header filter (EB-153) applies to replay exactly
+        // as it does to live fan-out: judged on the record's headers
+        // (restored onto the envelope above), a rejected record is never
+        // queued (no backpressure budget churned on reconnect), the
+        // per-topic baseline advances over it (never a sequence gap),
+        // and the key/causal baselines advance past it like the live
+        // path does — a filtered record will never arrive, so ordering
+        // gates must not wait for it. Counted separately from content
+        // filter rejections (`headerFilteredMessages`).
+        const headerFilter = subscriber.headerFilter;
+        if (headerFilter !== undefined && !headerFilterMatches(headerFilter.rules, rec.headers)) {
+          this.countHeaderFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
+          if (rec.key !== undefined && rec.keySeq !== undefined) {
+            this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+          }
+          if (rec.causal !== undefined) {
+            this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+          }
+          countReplaySkipped();
+          continue;
+        }
         const composite = subscriber.composite;
         if (composite !== undefined && !this.matchesComposite(composite, rec.topic)) {
           // A composite-rejected replayed message is deliberately skipped,
@@ -20168,6 +20500,12 @@ export class EventBus {
           ...(typeof rec.publisherId === 'string' && rec.publisherId.length > 0
             ? { publisherId: rec.publisherId }
             : {}),
+          // Restores the application headers logged at publish time
+          // (EB-153), so a resumed subscriber's header filter judges a
+          // replayed message on the same headers the live fan-out saw
+          // (see `PublishOptions.headers`). Records written before
+          // header support replay headerless.
+          ...(rec.headers === undefined ? {} : { headers: { ...rec.headers } }),
           // Restores the priority lane logged at publish time (EB-122):
           // the replayed message queues in its original lane. Records
           // written before lanes carry no lane and replay as `normal`.
@@ -20415,6 +20753,10 @@ export class EventBus {
     validateEventTime(opts?.eventTime, caller);
     validateCausal(opts?.causal, caller);
     validatePublisherId(opts?.publisherId, caller);
+    // Application message headers (EB-153): fail-fast, before anything
+    // is mutated — an illegal header map throws RangeError with zero
+    // side effects, like the other publish-option validators.
+    validateHeaders(opts?.headers, caller);
     validateSchemaVersion(opts?.schemaVersion, caller);
     validatePartitionOptions(opts?.partitionKey, opts?.partition, caller);
     // Per-message TTL override (EB-149): fail-fast, before anything is
@@ -20568,6 +20910,9 @@ export class EventBus {
       // Per-message TTL (EB-149): validated above; `fanOut` stamps
       // `nowMs + ttlMs`, overriding the topic TTL rules for this message.
       opts?.ttlMs,
+      // Application message headers (EB-153): validated above; `fanOut`
+      // stamps them onto the envelope and the durable-log record.
+      opts?.headers,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -20981,6 +21326,10 @@ export class EventBus {
     validateEventTime(opts?.eventTime, 'publishIdempotent');
     validateCausal(opts?.causal, 'publishIdempotent');
     validatePublisherId(opts?.publisherId, 'publishIdempotent');
+    // Application message headers (EB-153): fail-fast, before anything
+    // is mutated — `IdempotentPublishOptions` inherits them from
+    // `PublishOptions`.
+    validateHeaders(opts?.headers, 'publishIdempotent');
     validateSchemaVersion(opts?.schemaVersion, 'publishIdempotent');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishIdempotent');
     // Per-message TTL override (EB-149): fail-fast, before anything is
@@ -21137,6 +21486,9 @@ export class EventBus {
       // Per-message TTL (EB-149): validated above; `fanOut` stamps
       // `nowMs + ttlMs`, overriding the topic TTL rules for this message.
       opts?.ttlMs,
+      // Application message headers (EB-153): validated above; `fanOut`
+      // stamps them onto the envelope and the durable-log record.
+      opts?.headers,
     );
     // EB-27/EB-79 interaction: the dedup gate above runs before `fanOut`,
     // and the per-publisher rate-limit gate lives inside `fanOut` — so a
@@ -21239,6 +21591,10 @@ export class EventBus {
     validateEventTime(opts?.eventTime, 'publishDedupedByContent');
     validateCausal(opts?.causal, 'publishDedupedByContent');
     validatePublisherId(opts?.publisherId, 'publishDedupedByContent');
+    // Application message headers (EB-153): fail-fast, before anything
+    // is mutated — `ContentDedupPublishOptions` inherits them from
+    // `PublishOptions`.
+    validateHeaders(opts?.headers, 'publishDedupedByContent');
     validateSchemaVersion(opts?.schemaVersion, 'publishDedupedByContent');
     validatePartitionOptions(opts?.partitionKey, opts?.partition, 'publishDedupedByContent');
     // Per-message TTL override (EB-149): fail-fast, before anything is
@@ -21388,6 +21744,9 @@ export class EventBus {
       // Per-message TTL (EB-149): validated above; `fanOut` stamps
       // `nowMs + ttlMs`, overriding the topic TTL rules for this message.
       opts?.ttlMs,
+      // Application message headers (EB-153): validated above; `fanOut`
+      // stamps them onto the envelope and the durable-log record.
+      opts?.headers,
     );
     // Same EB-27/EB-79 interaction as `publishIdempotent`: the content
     // gate runs before `fanOut`, and the per-publisher rate-limit gate
@@ -23384,6 +23743,10 @@ export class EventBus {
       ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
       ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
       ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
+      // The application headers ride the retained entry (EB-153): the
+      // snapshot keeps the message's routing metadata for header-filter
+      // evaluation.
+      ...(msg.headers === undefined ? {} : { headers: { ...msg.headers } }),
     };
     this.retainedMessages.set(topic, entry);
     this.durableLogForTopic(topic)?.append({
@@ -23407,6 +23770,10 @@ export class EventBus {
       ...(msg.messageId === undefined ? {} : { messageId: msg.messageId }),
       ...(msg.publisherId === undefined ? {} : { publisherId: msg.publisherId }),
       ...(msg.eventTime === undefined ? {} : { eventTime: msg.eventTime }),
+      // The application headers ride the seq-0 retained record (EB-153)
+      // so restart recovery rebuilds the table with the message's
+      // routing metadata intact.
+      ...(msg.headers === undefined ? {} : { headers: { ...msg.headers } }),
     });
   }
 
@@ -23513,6 +23880,10 @@ export class EventBus {
         ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
         ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
         ...(entry.eventTime === undefined ? {} : { eventTime: entry.eventTime }),
+        // Restores the application headers the retained entry carries
+        // (EB-153) so a header-filtered subscriber judges the snapshot
+        // copy on the same headers the live fan-out saw.
+        ...(entry.headers === undefined ? {} : { headers: { ...entry.headers } }),
         ...(entry.signature === undefined
           ? {}
           : { signature: { kid: entry.signature.kid, sig: entry.signature.sig } }),
@@ -23569,6 +23940,18 @@ export class EventBus {
         // skipped — never queued, never a sequence gap, counted as
         // filtered, exactly like a predicate-filter rejection above.
         this.countFiltered(subscriber, msg.topic, msg.seq, '', msg.partition ?? 0);
+        continue;
+      }
+      const snapshotHeaderFilter = subscriber.headerFilter;
+      if (
+        snapshotHeaderFilter !== undefined &&
+        !headerFilterMatches(snapshotHeaderFilter.rules, msg.headers)
+      ) {
+        // Header-filter (EB-153) rejection on the retained snapshot:
+        // seen and deliberately skipped — never queued, never a sequence
+        // gap — counted as header-filtered, exactly like the live
+        // fan-out path. Judged on the entry's headers (restored above).
+        this.countHeaderFiltered(subscriber, msg.topic, msg.seq, '', msg.partition ?? 0);
         continue;
       }
       this.noteMessageDelivered(subscriber, msg);
@@ -23651,6 +24034,10 @@ export class EventBus {
         ...(latest.messageId === undefined ? {} : { messageId: latest.messageId }),
         ...(latest.publisherId === undefined ? {} : { publisherId: latest.publisherId }),
         ...(latest.eventTime === undefined ? {} : { eventTime: latest.eventTime }),
+        // Restores the application headers logged at publish time
+        // (EB-153) so the rebuilt table keeps the message's routing
+        // metadata for snapshot header-filter evaluation.
+        ...(latest.headers === undefined ? {} : { headers: { ...latest.headers } }),
       });
     }
   }
@@ -26425,6 +26812,21 @@ export class EventBus {
       this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
       return false;
     }
+    const headerFilter = subscriber.headerFilter;
+    if (headerFilter !== undefined && !headerFilterMatches(headerFilter.rules, msg.headers)) {
+      // Header-filtered (EB-153): judged on the message's headers, not
+      // its payload — routing, not content. Same deliberate-skip
+      // semantics as a filter rejection: never queued (no backpressure
+      // budget, no throttle token, never the DLQ, no delivery credit),
+      // the per-topic baseline advances over it so it never counts as a
+      // sequence gap, and no ack obligation is created on reliable
+      // subscriptions. Evaluation never throws, so unlike the predicate
+      // filter it can never propagate into the publish call. Orthogonal
+      // to `project` (EB-144): projection reshapes the payload later in
+      // the drain — a header-filtered message never reaches it.
+      this.countHeaderFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
+      return false;
+    }
     const filterExpr = subscriber.filterExpr;
     if (filterExpr !== undefined && !filterExpr.test(rawPayload)) {
       // Filter-expression (EB-123) rejection, evaluated after the
@@ -26502,6 +26904,14 @@ export class EventBus {
       // deliberately skipped, exactly like a predicate-filter rejection
       // above: never queued, never counted anywhere, so the mirror
       // cannot move production stats.
+      return;
+    }
+    const shadowHeaderFilter = subscriber.headerFilter;
+    if (shadowHeaderFilter !== undefined && !headerFilterMatches(shadowHeaderFilter.rules, msg.headers)) {
+      // A header-filter (EB-153) rejected shadow copy is deliberately
+      // skipped, exactly like a filter rejection above: never queued,
+      // never counted anywhere, so the mirror cannot move production
+      // stats.
       return;
     }
     const composite = subscriber.composite;
@@ -26993,6 +27403,28 @@ export class EventBus {
   }
 
   /**
+   * Counts one message skipped by a subscriber's header filter (see
+   * `SubscribeOptions.headerFilter`, EB-153) against the topic and the
+   * global total, and advances the subscriber's per-topic sequence
+   * baseline over it so the deliberately skipped message never counts
+   * as a gap. The baseline advance is shared with `countFiltered` —
+   * both are subscriber-side narrowing, invisible to gap detection —
+   * but the counters are separate from `filteredMessages`: header
+   * routing and content filtering stay independently observable.
+   */
+  private countHeaderFiltered(
+    subscriber: Subscriber,
+    topic: string,
+    seq: number,
+    epoch = '',
+    partition = 0,
+  ): void {
+    this.advanceBaseline(subscriber, topic, seq, epoch, partition);
+    this.statsFor(topic).headerFilteredMessages += 1;
+    this.totalHeaderFiltered += 1;
+  }
+
+  /**
    * Counts one message skipped by a subscriber's delivery-sampling gate
    * (see `SubscribeOptions.deliverySampleRate`, EB-152) against the
    * topic and the global total, and advances the subscriber's per-topic
@@ -27358,6 +27790,17 @@ export class EventBus {
     // fresh admission-time stamp happens. Last so existing positional
     // call sites are unaffected.
     messageTtlMs?: number,
+    // Application message headers (see `PublishOptions.headers`,
+    // EB-153): already validated by the publish entry points —
+    // `fanOut` never validates. Stamped onto the envelope
+    // (`BusMessage.headers`) and the durable-log record below; absent
+    // means a headerless message, on which every header-filter rule
+    // fails closed. Internal re-fan-out paths (route forwards,
+    // bridge/cluster ingress, diagnostic events, delayed/pause drains,
+    // atomic commit) leave it undefined: headers are admission-scoped
+    // routing metadata, carried on the envelope from the admitting
+    // publish. Last so existing positional call sites are unaffected.
+    messageHeaders?: Record<string, string>,
   ): {
     matched: number;
     accepted: number;
@@ -27674,6 +28117,12 @@ export class EventBus {
       // The producer label rides the envelope so attribution survives
       // durable-log replay, delayed schedules and cross-bus forwards.
       ...(publisherId === undefined ? {} : { publisherId }),
+      // Application message headers (EB-153): stamped at admission so
+      // they ride the envelope end to end — durable-log records, replay,
+      // redeliveries — driving subscriber-side header filters. Copied
+      // defensively so the caller's object can never mutate an admitted
+      // envelope; absent for headerless publishes.
+      ...(messageHeaders === undefined ? {} : { headers: { ...messageHeaders } }),
       // Business event time rides the envelope (see `PublishOptions.eventTime`):
       // undefined stays absent, so messages without one never participate in
       // the watermark.
@@ -28075,6 +28524,11 @@ export class EventBus {
       // delayed-schedule rebuild) restores the message's producer
       // attribution instead of losing it across restarts.
       ...(publisherId === undefined ? {} : { publisherId }),
+      // The application headers ride the log record (EB-153) so replay
+      // restores them onto the envelope — a resumed subscriber's header
+      // filter judges a replayed message on the same headers the live
+      // fan-out saw.
+      ...(msg.headers === undefined ? {} : { headers: { ...msg.headers } }),
       // The publish-time HMAC signature rides the log record so replay
       // restores it onto the envelope — a `verifySignature` subscriber
       // checks a replayed message against the same (topic, seq, wire
@@ -29041,6 +29495,7 @@ export class EventBus {
       })),
       opsAlert: this.opsAlerter?.getStats() ?? { sent: 0, failed: 0, suppressed: 0 },
       filteredMessages: this.totalFiltered,
+      headerFilteredMessages: this.totalHeaderFiltered,
       sampledDeliveries: this.totalSampledDeliveries,
       sampleDropped: this.totalSampleDropped,
       projectedMessages: this.totalProjectedMessages,
@@ -29232,6 +29687,7 @@ export class EventBus {
         transformCalls: stats.transformCalls,
         transformErrors: stats.transformErrors,
         filteredMessages: stats.filteredMessages,
+        headerFilteredMessages: stats.headerFilteredMessages,
         sampledDeliveries: stats.sampledDeliveries,
         sampleDropped: stats.sampleDropped,
         signatureFailures: stats.signatureFailures,

@@ -51,6 +51,15 @@ export interface DurableLogRecord {
    */
   publisherId?: string;
   /**
+   * Application message headers (see `PublishOptions.headers`, EB-153),
+   * present when the publish carried them. Replay restores them onto the
+   * envelope so a resumed subscriber's header filter judges the same
+   * headers the live fan-out saw. Also carried on seq-0 retained-message
+   * set records so a restart rebuilds the retained table with the
+   * routing metadata intact.
+   */
+  headers?: Record<string, string>;
+  /**
    * Requested schema version (see `PublishOptions.schemaVersion`),
    * present when the publish carried one. Pause-buffered messages
    * (EB-88) carry it so restart recovery re-validates against the
@@ -545,6 +554,10 @@ interface LogLine {
    * priority lanes existed.
    */
   lane?: MessageLane;
+  /**
+   * Application message headers (see `DurableLogRecord.headers`).
+   */
+  headers?: Record<string, string>;
   /**
    * v1 only: the JSON application payload. Absent on v2 lines, which
    * carry `payload_b64` instead.
@@ -3918,6 +3931,10 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.eventTime !== undefined) line.eventTime = record.eventTime;
   if (record.causal !== undefined) line.causal = { source: record.causal.source, clock: record.causal.clock };
   if (record.publisherId !== undefined) line.publisherId = record.publisherId;
+  // The application headers (EB-153) ride the record so replay restores
+  // them onto the envelope. Copied defensively — the caller may reuse
+  // the record object; the log line must be immutable.
+  if (record.headers !== undefined) line.headers = { ...record.headers };
   if (record.signature !== undefined)
     line.signature = { kid: record.signature.kid, sig: record.signature.sig };
   if (record.publisherSignature !== undefined)
@@ -4213,6 +4230,23 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       return null;
     }
     record.publisherId = o['publisherId'] as string;
+  }
+  if (o['headers'] !== undefined) {
+    // The application headers (EB-153) are routing metadata: the bus
+    // only ever writes a string-to-string map, so a malformed value
+    // means the line was tampered with or miswritten — the line is
+    // corrupt, never silently headerless. Copied defensively so the
+    // returned record cannot alias the parsed line object.
+    const headers = o['headers'] as Record<string, unknown>;
+    if (typeof headers !== 'object' || headers === null || Array.isArray(headers)) {
+      return null;
+    }
+    const copy: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      if (typeof value !== 'string') return null;
+      copy[key] = value;
+    }
+    record.headers = copy;
   }
   if (o['lane'] !== undefined) {
     // The priority lane (EB-122): the bus only ever writes 'urgent' or

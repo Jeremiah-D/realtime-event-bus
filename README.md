@@ -5110,3 +5110,62 @@ Semantics:
   `eventbus_delivery_sample_dropped_total{topic}` Prometheus series (no
   series at all when nothing is sampled, so idle exposition is
   byte-identical to before).
+
+## Subscriber header filters (EB-153)
+
+`publish(topic, payload, { headers })` stamps a string-to-string routing
+map onto the message envelope — tenant, region, schema version, canary
+cohort — and `subscribe(pattern, handler, { headerFilter })` routes on
+it instead of payload content:
+
+```ts
+const sub = bus.subscribe('orders.**', handle, {
+  headerFilter: [
+    { key: 'tenant', op: 'eq', value: 'acme' },
+    { key: 'region', op: 'prefix', value: 'us-' },
+  ],
+});
+bus.publish('orders.created', order, { headers: { tenant: 'acme', region: 'us-west' } });
+```
+
+The four operators are `eq`, `ne`, `prefix`, and `regex`
+(precompiled at subscribe time; a partial match counts, like the `=~`
+operator of `filterExpr`). Rules compose with **AND**: every rule must
+match for the message to reach the subscriber.
+
+Semantics:
+
+- **Fail-closed.** A rule never matches a missing header — not even
+  `ne`. A message missing a routing header is skipped, never silently
+  passed: absence is not a value.
+- **Never throws.** Header-filter evaluation cannot take down a publish
+  call (unlike a throwing `filter` predicate, which propagates by
+  design). An illegal rule (empty key, unknown op, invalid regex)
+  throws `RangeError`/`TypeError` from `subscribe` (or
+  `setHeaderFilter`) before anything registers instead.
+- **Pipeline position.** Evaluated at fan-out, next to the content
+  `filter` — both must accept. Composes with `filterExpr` and
+  composite patterns the same way. A rejected message is never queued
+  (no backpressure budget, no throttle/shaping/credit budget), creates
+  no ack obligation on reliable subscriptions, never enters a DLQ, and
+  never counts as a sequence gap (the per-topic baseline advances over
+  it, exactly like a `filter` rejection).
+- **Orthogonal to EB-144 projection.** The header filter decides
+  *routing*; `project` reshapes the *payload*. A projected subscriber
+  projects only messages its headers admitted — the two share no state.
+- **End to end.** Headers ride the envelope through the durable log,
+  replay (`resumeFromSeq` / `resumeFromTime`), redeliveries and the
+  retained snapshot — a resumed subscriber judges a replayed message on
+  the same headers the live fan-out saw.
+- **Hot-updatable.** `setHeaderFilter(subId, rules)` replaces the rules
+  effective on the very next fanned-out message (`undefined` clears the
+  filter), returns `false` for an unknown subscription id (the
+  `renewLease` convention), and is recorded in the subscription audit
+  log as `header_filter_updated` with the rule count.
+- **Observability.** Rejections count into `TopicStats.headerFilteredMessages`
+  / `BusStats.headerFilteredMessages` — separate from `filteredMessages`,
+  so content-filter and header-routing rejections stay independently
+  observable — and render as `eventbus_header_filtered_messages_total`
+  plus the activity-gated per-topic
+  `eventbus_header_filtered_messages_total{topic="..."}` Prometheus
+  series.

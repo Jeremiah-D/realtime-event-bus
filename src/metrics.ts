@@ -44,6 +44,10 @@
  *   as duplicates.
  * - `eventbus_filtered_messages_total`: messages skipped by subscriber
  *   content filters.
+ * - `eventbus_header_filtered_messages_total`: messages skipped by
+ *   subscriber header filters (EB-153); the per-topic
+ *   `eventbus_header_filtered_messages_total{topic="..."}` series is
+ *   activity-gated (renders only when some topic has a skip).
  * - `eventbus_dead_lettered_messages_total`: reliable messages moved into
  *   subscriber dead-letter queues.
  * - `eventbus_sequence_gaps_total`: sequence numbers observed missing by
@@ -390,6 +394,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_filtered_messages_total',
     "Total messages skipped by subscriber content filters.",
     stats.filteredMessages,
+  );
+  counter(
+    'eventbus_header_filtered_messages_total',
+    'Total messages skipped by subscriber header filters (EB-153).',
+    stats.headerFilteredMessages ?? 0,
   );
   counter(
     'eventbus_signature_failures_total',
@@ -757,6 +766,25 @@ export function renderPrometheus(stats: BusStats): string {
     for (const t of stats.topics) {
       const label = `topic="${escapeLabelValue(t.topic)}"`;
       lines.push(`eventbus_delivery_sample_dropped_total{${label}} ${t.sampleDropped ?? 0}`);
+    }
+  }
+
+  // Subscriber-side header filters (EB-153): per-topic skip counts.
+  // Activity-gated — the series render only when at least one topic has
+  // a header-filtered message, so a bus without header filters renders
+  // byte-identical exposition to before. Shares the
+  // `eventbus_header_filtered_messages_total` name with the global
+  // counter above — same metric, per-topic label set — so no second
+  // HELP/TYPE block is emitted here. `?? 0` keeps the renderer tolerant
+  // of a stats object that predates the field (hand-built fixtures
+  // included), mirroring the per-topic idiom above.
+  const headerFilteredTopics = stats.topics.filter((t) => (t.headerFilteredMessages ?? 0) > 0);
+  if (headerFilteredTopics.length > 0) {
+    for (const t of stats.topics) {
+      const label = `topic="${escapeLabelValue(t.topic)}"`;
+      lines.push(
+        `eventbus_header_filtered_messages_total{${label}} ${t.headerFilteredMessages ?? 0}`,
+      );
     }
   }
 

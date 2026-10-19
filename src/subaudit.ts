@@ -73,7 +73,8 @@ export type SubscriptionAuditAction =
   | 'subscriber_paused'
   | 'subscriber_resumed'
   | 'subscriber_seek'
-  | 'delivery_sample_rate_updated';
+  | 'delivery_sample_rate_updated'
+  | 'header_filter_updated';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -129,6 +130,10 @@ export type SubscriptionAuditAction =
  *   — a `setDeliverySampleRate` (EB-152) hot-update changed the
  *   subscriber's delivery-sampling divisor; `subId`/`pattern` identify
  *   the subscription
+ * - `header_filter_updated`: `{ rules: <rule count after the update> }`
+ *   — a `setHeaderFilter` (EB-153) hot-update replaced the subscriber's
+ *   header-filter rules (`0` when the filter was cleared);
+ *   `subId`/`pattern` identify the subscription
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -198,6 +203,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'subscriber_resumed',
   'subscriber_seek',
   'delivery_sample_rate_updated',
+  'header_filter_updated',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {
