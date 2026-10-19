@@ -5169,3 +5169,53 @@ Semantics:
   plus the activity-gated per-topic
   `eventbus_header_filtered_messages_total{topic="..."}` Prometheus
   series.
+
+## Graceful shutdown (EB-154)
+
+`close({ drainTimeoutMs })` shuts the bus down in order and resolves with a
+`BusCloseResult`:
+
+```ts
+const result = await bus.close({ drainTimeoutMs: 5000 });
+// { drained: true, pendingMessages: 0, unackedDeliveries: 0,
+//   cancelledDelayed: 0, cancelledRecurring: 0 }
+```
+
+Semantics:
+
+- **Admission stops first.** From the moment `close()` is called, every
+  publish entry point (`publish`, `publishWithConfirmation`,
+  `publishIdempotent`, `publishDedupedByContent`, `publishBatch`,
+  `publishAtomic`, `publishDelayed`) and every subscribe-family entry point
+  (`subscribe`, `subscribeMany`, `subscribeReliable`, `subscribeToGroup`)
+  throws `BusClosedError` synchronously — a closed bus never silently
+  queues. `scheduleRecurring` throws as well: a closed bus never arms a
+  new timer.
+- **Subscribers drain.** Every live subscription enters the EB-128 graceful
+  drain: new publishes skip its queue, the backlog pumps to its handlers,
+  and in-flight reliable (at-least-once) deliveries settle
+  (ack / nack / ack-timeout) before its teardown runs. The promise resolves
+  when the last drain completes.
+- **Schedules die.** Pending delayed deliveries are cancelled — a delayed
+  message whose due time has not arrived is cancelled, never published
+  after close (counted in `cancelledDelayed`, tombstoned to the durable
+  log so a restart never resurrects it) — and recurring jobs are cancelled
+  (`cancelledRecurring`). Waiting out arbitrary future due times would make
+  `close()` hang indefinitely, so cancellation (not waiting) is the
+  documented semantic.
+- **Timeout forces.** Past `drainTimeoutMs` (default 30s, the EB-128 bound)
+  every still-draining subscriber is force-torn-down and the result reports
+  `drained: false` with the uncompleted `pendingMessages` /
+  `unackedDeliveries` counts. A forced teardown clears each subscriber's
+  ack tracker without requeueing: a post-close `ack()` / `nack()` on an
+  orphaned delivery handle is a silent no-op — never redelivered, never a
+  throw.
+- **Flush, then release.** Group offset auto-commit checkpoints flush, then
+  the durable log is flushed to stable storage (fsync semantics) before
+  anything else releases resources; buffered OTLP spans export; WebSocket
+  gateways registered via `attachGateway` close last — their connections'
+  subscriptions drained above, so every pending frame reached its client
+  before the sockets drop and the listener stops.
+- **Idempotent.** A second `close()` returns the same promise — the same
+  result — without re-running anything. An illegal `drainTimeoutMs` throws
+  `RangeError` before anything is closed.

@@ -5613,6 +5613,64 @@ interface DrainState {
 }
 
 /**
+ * Options for `EventBus.close` (EB-154, graceful shutdown).
+ */
+export interface BusCloseOptions {
+  /**
+   * Wall-clock milliseconds to wait for subscriber queues to drain and
+   * in-flight reliable deliveries to settle (ack/nack/ack-timeout)
+   * before forcing the close. Defaults to `DEFAULT_DRAIN_TIMEOUT_MS`
+   * (the same bound `unsubscribe({ drain: true })` uses). Must be a
+   * finite number `>= 0`; `0` means "do not wait past the current
+   * microtask round". An illegal value throws `RangeError` before
+   * anything is closed — a failed validation never half-closes a bus.
+   */
+  drainTimeoutMs?: number;
+}
+
+/**
+ * The outcome of `EventBus.close` (EB-154). The promise resolves exactly
+ * once per bus; a second `close()` call returns the same promise (and
+ * therefore the same result) without re-running anything.
+ */
+export interface BusCloseResult {
+  /**
+   * True when every subscriber queue emptied and every in-flight
+   * reliable delivery settled (acked, nacked, or ack-timed-out) before
+   * the drain timeout. False when the timeout forced the close — the
+   * `pendingMessages` / `unackedDeliveries` counts say what was left.
+   */
+  drained: boolean;
+  /**
+   * Messages still sitting in subscriber queues (including a batch
+   * subscriber's collected-but-undelivered pending batch) when the
+   * drain timeout forced the close. Always `0` when `drained` is true.
+   */
+  pendingMessages: number;
+  /**
+   * Reliable (at-least-once) deliveries still outstanding when the drain
+   * timeout forced the close. Always `0` when `drained` is true. The
+   * forced teardown clears each subscriber's ack tracker without
+   * requeueing — a post-close `ack()`/`nack()` on an orphaned delivery
+   * handle is a silent no-op — so these messages are neither delivered
+   * again nor redelivered further.
+   */
+  unackedDeliveries: number;
+  /**
+   * Scheduled delayed deliveries (`publishDelayed`) cancelled at close
+   * instead of fanning out. A delayed schedule whose due time had not
+   * arrived is cancelled, never published after close; the cancellation
+   * is tombstoned to the durable log so a restart never resurrects it.
+   */
+  cancelledDelayed: number;
+  /**
+   * Recurring schedules (`scheduleRecurring`) cancelled at close. They
+   * never fire again — a post-close sweep finds nothing due.
+   */
+  cancelledRecurring: number;
+}
+
+/**
  * Per-subscriber nack-reason diagnostic counters (EB-129): the
  * cumulative, mutually-exclusive classification of every redelivery a
  * reliable subscriber has seen — each redelivery increments exactly one
@@ -8861,6 +8919,37 @@ export class SubscriptionLimitError extends Error {
 }
 
 /**
+ * Thrown by every publish and subscribe-family entry point after
+ * `EventBus.close()` has been called (EB-154): the bus refuses new work
+ * instead of silently queueing it. Publish entries (`publish`,
+ * `publishWithConfirmation`, `publishIdempotent`, `publishDedupedByContent`,
+ * `publishBatch`, `publishAtomic`, `publishDelayed`) throw with action
+ * `'publish'`; the subscribe family (`subscribe`, `subscribeMany`,
+ * `subscribeReliable`, `subscribeToGroup`) with action `'subscribe'`;
+ * `scheduleRecurring` and a post-close `attachGateway` with their own
+ * labels. The throw is synchronous and fail-fast, before any validation
+ * or chaos gate — a closed bus never admits, never queues, never
+ * half-registers.
+ */
+export class BusClosedError extends Error {
+  /** Which entry-point family refused the call. */
+  readonly action: 'publish' | 'subscribe' | 'schedule' | 'gateway';
+  /** The concrete topic or subscription pattern the call targeted. */
+  readonly target: string;
+  /** Always `'BUS_CLOSED'`. */
+  readonly code = 'BUS_CLOSED';
+
+  constructor(action: 'publish' | 'subscribe' | 'schedule' | 'gateway', target: string) {
+    super(
+      `${action}: EventBus is closed — refusing ${action} on "${target}" after close() (BUS_CLOSED)`,
+    );
+    this.name = 'BusClosedError';
+    this.action = action;
+    this.target = target;
+  }
+}
+
+/**
  * Authorization-denial audit event (`EventBusOptions.onAuthzDenied`): one
  * per denied publish or subscribe. Carries the action and the concrete
  * topic (publish) or subscription pattern (subscribe) — never the
@@ -10484,6 +10573,27 @@ export class EventBus {
   readonly busId: string;
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
+  /**
+   * Graceful shutdown (EB-154): set the moment `close()` starts and
+   * never cleared. Every publish/subscribe-family entry point checks it
+   * first and throws `BusClosedError` instead of admitting new work —
+   * a closed bus never silently queues.
+   */
+  private closed = false;
+  /**
+   * The in-flight (or finished) close promise (EB-154). Stored so a
+   * second `close()` call returns the same promise — resolving with the
+   * same result — instead of re-running the shutdown.
+   */
+  private closePromise: Promise<BusCloseResult> | undefined;
+  /**
+   * WebSocket gateways attached via `attachGateway` (EB-154). Closed
+   * orderly after the subscriber drains complete: every connection is
+   * dropped (unsubscribing its bus subscriptions) and the listener
+   * stops. `GatewayServer.close` already implements the connection
+   * teardown; the bus only owns the ordering.
+   */
+  private readonly gateways = new Set<{ close(): Promise<unknown> }>();
   /**
    * Outstanding subscription migrations (EB-82), keyed by handoff token:
    * one entry per `exportSubscription` whose `completeMigration` or
@@ -15770,6 +15880,12 @@ export class EventBus {
     handler: MessageHandler | BatchMessageHandler,
     opts?: SubscribeOptions,
   ): Subscription {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent half-registration.
+    this.assertNotClosed(
+      'subscribe',
+      Array.isArray(topicPattern) ? topicPattern.join(',') : topicPattern,
+    );
     // Multi-pattern aggregate subscription (EB-137): validate and
     // normalize the array first — non-empty, string-only, deduplicated —
     // so an illegal array fails fast before anything else runs. A
@@ -17542,6 +17658,13 @@ export class EventBus {
     entries: SubscribeManyEntry[],
     commonOpts?: SubscribeOptions,
   ): Subscription[] {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent half-registration. The label is best-effort: the array
+    // validation below still owns malformed input.
+    this.assertNotClosed(
+      'subscribe',
+      Array.isArray(entries) ? entries.map((entry) => entry.pattern).join(',') : '<entries>',
+    );
     if (!Array.isArray(entries) || entries.length === 0) {
       throw new RangeError('subscribeMany: entries must be a non-empty array');
     }
@@ -17660,6 +17783,9 @@ export class EventBus {
     handler: ReliableMessageHandler | ReliableBatchMessageHandler,
     opts?: ReliableSubscribeOptions,
   ): Subscription {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent half-registration.
+    this.assertNotClosed('subscribe', topicPattern);
     // The bus flush calls `Subscriber.handler` with bare messages; wrap it
     // so reliable subscribers transparently get tracked deliveries instead.
     // Assigned synchronously here, before any flush microtask can run.
@@ -18049,6 +18175,9 @@ export class EventBus {
     handler: MessageHandler,
     opts?: GroupSubscribeOptions,
   ): Subscription {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent half-registration.
+    this.assertNotClosed('subscribe', topicPattern);
     if (groupId.length === 0) {
       throw new RangeError('groupId must be a non-empty string');
     }
@@ -20663,6 +20792,9 @@ export class EventBus {
    * across the chunks.
    */
   publish(topic: string, payload: unknown, opts?: PublishOptions): number {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', topic);
     return this.publishCore(topic, payload, opts, 'publish').accepted;
   }
 
@@ -20695,6 +20827,9 @@ export class EventBus {
     payload: unknown,
     opts?: PublishConfirmationOptions,
   ): Promise<ConfirmationReceipt> {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', topic);
     if (typeof topic !== 'string' || topic.length === 0) {
       throw new RangeError('publishWithConfirmation: topic must be a non-empty string');
     }
@@ -20744,6 +20879,11 @@ export class EventBus {
     caller: string,
     confirm?: ConfirmationCapture,
   ): PublishOutcome {
+    // EB-154: the shared publish pipeline refuses on a closed bus too —
+    // every internal caller (delayed sweeps, recurring triggers,
+    // retries) funnels through here, so a closed bus can never admit
+    // through a back door.
+    this.assertNotClosed('publish', topic);
     // Chaos (EB-103): an admission fault is evaluated before any
     // validation — a 'drop' sheds the publish (returns 0), an 'error'
     // throws ChaosInjectionError, both with zero side effects.
@@ -21318,6 +21458,9 @@ export class EventBus {
     payload: unknown,
     opts?: IdempotentPublishOptions,
   ): IdempotentPublishResult {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', topic);
     // Chaos (EB-103): see publish — a 'drop' reports a fresh (non-duplicate)
     // zero-accept publish, exactly like an admission shed would.
     if (this.checkChaosAdmission()) return { duplicate: false, accepted: 0 };
@@ -21582,6 +21725,9 @@ export class EventBus {
     payload: unknown,
     opts?: ContentDedupPublishOptions,
   ): IdempotentPublishResult {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', topic);
     // Chaos (EB-103): see publishIdempotent — a 'drop' reports a fresh
     // (non-duplicate) zero-accept publish, exactly like an admission shed
     // would.
@@ -21983,6 +22129,9 @@ export class EventBus {
    * on its own — the rest of the batch still publishes.
    */
   publishBatch(messages: Array<BatchMessage>): number {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', messages.length > 0 ? messages[0].topic : '<batch>');
     // Chaos (EB-103): see publish — evaluated once per batch call.
     if (this.checkChaosAdmission()) return 0;
     if (messages.length === 0) return 0;
@@ -22148,6 +22297,9 @@ export class EventBus {
    * no-op returning `{ published: 0 }` without scheduling a flush.
    */
   publishAtomic(entries: Array<BatchMessage>): AtomicPublishResult {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', entries.length > 0 ? entries[0].topic : '<batch>');
     // Chaos (EB-103): see publish — evaluated once per atomic batch.
     if (this.checkChaosAdmission()) return { published: 0 };
     if (entries.length === 0) return { published: 0 };
@@ -22550,6 +22702,9 @@ export class EventBus {
    * given, or when the given value is not a valid timestamp/duration.
    */
   publishDelayed(topic: string, payload: unknown, opts: PublishDelayedOptions = {}): string | undefined {
+    // EB-154: a closed bus refuses new work synchronously — and never
+    // arms a new timer after close.
+    this.assertNotClosed('publish', topic);
     // Chaos (EB-103): see publish — evaluated at schedule time; a fired
     // delay timer fans out through the normal path, unfaulted.
     if (this.checkChaosAdmission()) return undefined;
@@ -22919,6 +23074,9 @@ export class EventBus {
     cronExpr: string,
     opts: RecurringScheduleOptions = {},
   ): RecurringJobHandle {
+    // EB-154: a closed bus never arms a new timer — refusing the schedule
+    // fail-fast keeps the shutdown terminal.
+    this.assertNotClosed('schedule', topic);
     // Fail-fast admission, before anything is mutated: a throw must
     // leave zero state behind — no job, no timer, no log record.
     if (typeof topic !== 'string' || topic.length === 0) {
@@ -23080,6 +23238,10 @@ export class EventBus {
   }
 
   private armRecurringTimer(): void {
+    // EB-154: a closed bus never re-arms — close() cancelled every
+    // schedule, so the sweep would find nothing due and the timer would
+    // only pin the shutdown.
+    if (this.closed) return;
     if (this.recurringTimer !== undefined) {
       clearTimeout(this.recurringTimer);
       this.recurringTimer = undefined;
@@ -23413,6 +23575,10 @@ export class EventBus {
    * sweep simply finds nothing due and re-arms for the same deadline.
    */
   private armDelayTimer(): void {
+    // EB-154: a closed bus never re-arms — close() cancelled every
+    // pending schedule, so the sweep would find nothing due and the
+    // timer would only pin the shutdown.
+    if (this.closed) return;
     if (this.delayTimer !== undefined) {
       clearTimeout(this.delayTimer);
       this.delayTimer = undefined;
@@ -29093,6 +29259,274 @@ export class EventBus {
   }
 
   /**
+   * Registers a WebSocket gateway for orderly shutdown (EB-154): the
+   * gateway is closed after the subscriber drains complete, so every
+   * connection's bus subscription delivers its pending backlog before
+   * the sockets drop. `GatewayServer` already implements the
+   * connection teardown (`close()` drops every connection — unsubscribing
+   * its bus subscriptions — and stops the listener); the bus only owns
+   * the ordering. Throws `TypeError` for a handle without `close()`,
+   * and `BusClosedError` when the bus is already closed — a gateway
+   * attached to a closed bus would never be shut down.
+   */
+  attachGateway(gateway: { close(): Promise<unknown> }): void {
+    if (gateway == null || typeof (gateway as { close?: unknown }).close !== 'function') {
+      throw new TypeError('attachGateway: gateway must expose close()');
+    }
+    this.assertNotClosed('gateway', 'attachGateway');
+    this.gateways.add(gateway);
+  }
+
+  /**
+   * Removes a gateway previously registered with `attachGateway`
+   * (EB-154): it will no longer be closed by `close()`. Returns `true`
+   * when the gateway was registered. A no-op (not a throw) after close —
+   * there is nothing left to detach from.
+   */
+  detachGateway(gateway: { close(): Promise<unknown> }): boolean {
+    return this.gateways.delete(gateway);
+  }
+
+  /**
+   * Gracefully shuts the bus down (EB-154). The shutdown runs in order:
+   *
+   * 1. **Admission stops.** The `closed` flag is set first: every
+   *    publish and subscribe-family entry point throws `BusClosedError`
+   *    from here on — never a silent queue.
+   * 2. **Schedules die.** Pending delayed deliveries
+   *    (`publishDelayed`) are cancelled — they never fan out after
+   *    close — and recurring jobs (`scheduleRecurring`) are cancelled;
+   *    both counts are reported. Their wall-clock timers are cleared
+   *    and never re-armed.
+   * 3. **Subscribers drain.** Every live subscriber enters the EB-128
+   *    graceful drain: new publishes skip its queue, the backlog pumps
+   *    to its handlers, and in-flight reliable deliveries settle
+   *    (ack/nack/ack-timeout) before its teardown runs. The promise
+   *    resolves when the last drain completes.
+   * 4. **Timeout.** Past `drainTimeoutMs` every still-draining
+   *    subscriber is force-torn-down through the normal forced-drain
+   *    path (its ack tracker is cleared without requeueing — a
+   *    post-close `ack()`/`nack()` on an orphaned delivery handle is a
+   *    silent no-op) and the result reports `drained: false` with the
+   *    uncompleted counts.
+   * 5. **Flush and release.** Group offset auto-commit checkpoints
+   *    flush, bus-level timers (auto-commit intervals, static-session
+   *    holds, long-poll waiters) are cleared, the durable log is
+   *    flushed to stable storage (fsync semantics) before anything
+   *    else releases resources, buffered OTLP spans export, and the
+   *    attached gateways close orderly.
+   *
+   * Idempotent: a second call returns the same promise — and therefore
+   * the same result — without re-running anything. An illegal
+   * `drainTimeoutMs` throws `RangeError` before anything is closed.
+   */
+  close(options?: BusCloseOptions): Promise<BusCloseResult> {
+    // Idempotency first: a second call resolves with the first call's
+    // result, even with different (or illegal) options.
+    if (this.closePromise !== undefined) return this.closePromise;
+    const drainTimeoutMs = options?.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
+    if (!Number.isFinite(drainTimeoutMs) || drainTimeoutMs < 0) {
+      throw new RangeError(
+        'close: drainTimeoutMs must be a non-negative finite number of milliseconds',
+      );
+    }
+    this.closed = true;
+    this.closePromise = this.runClose(drainTimeoutMs);
+    return this.closePromise;
+  }
+
+  /**
+   * The close pipeline behind `close()`: admission is already stopped by
+   * the `closed` flag this method's caller set.
+   */
+  private async runClose(drainTimeoutMs: number): Promise<BusCloseResult> {
+    // Schedules die before the drain starts: nothing new may fan out
+    // while subscribers are draining.
+    const cancelledDelayed = this.cancelAllDelayedForClose();
+    const cancelledRecurring = this.cancelAllRecurringForClose();
+    const drain = await this.drainAllSubscribers(drainTimeoutMs);
+    await this.finalizeClose();
+    return { ...drain, cancelledDelayed, cancelledRecurring };
+  }
+
+  /**
+   * Cancels every pending delayed delivery for the close (EB-154):
+   * reuses `cancelDelayed`, so each schedule is tombstoned to the
+   * durable log (a restart never resurrects it) and keyed schedules
+   * release their subscribers' per-key expectations. Returns how many
+   * schedules were cancelled. A delayed message whose due time had not
+   * arrived is cancelled, never published after close — this is the
+   * documented close semantic, not a wait: waiting out arbitrary future
+   * due times would make `close()` hang indefinitely.
+   */
+  private cancelAllDelayedForClose(): number {
+    // Snapshot the ids: `cancelDelayed` mutates `delayedById`.
+    const ids = [...this.delayedById.keys()];
+    for (const id of ids) this.cancelDelayed(id);
+    if (this.delayTimer !== undefined) {
+      clearTimeout(this.delayTimer);
+      this.delayTimer = undefined;
+    }
+    return ids.length;
+  }
+
+  /**
+   * Cancels every recurring schedule for the close (EB-154): reuses
+   * `cancelRecurring`, so each job is tombstoned to the durable log (a
+   * restart never revives it). Returns how many live jobs were
+   * cancelled. Cancelled jobs never fire again — a post-close sweep
+   * finds nothing due, and the wall-clock timer is cleared and never
+   * re-armed.
+   */
+  private cancelAllRecurringForClose(): number {
+    // Snapshot the ids: `cancelRecurring` mutates `recurringById`.
+    const ids = [...this.recurringById.keys()];
+    let cancelled = 0;
+    for (const id of ids) {
+      if (this.cancelRecurring(id)) cancelled += 1;
+    }
+    if (this.recurringTimer !== undefined) {
+      clearTimeout(this.recurringTimer);
+      this.recurringTimer = undefined;
+    }
+    return cancelled;
+  }
+
+  /**
+   * Enters the EB-128 graceful drain on every live subscriber and
+   * resolves when the last one completes — naturally (its queue emptied
+   * and no reliable delivery still outstanding) or forced by the drain
+   * timeout. Each drain's completion runs the subscriber's outermost
+   * teardown (reliable ack-tracker clear, group leave, then the inner
+   * unsubscribe teardown), so a drained close is indistinguishable from
+   * a drained unsubscribe in every audit and stat except the delay.
+   *
+   * The watchdog is armed BEFORE the per-subscriber drain timers, so at
+   * equal delay it fires first: the uncompleted counts are snapshotted
+   * before any per-subscriber timeout tears its subscriber down, and
+   * each still-draining subscriber is then forced through the normal
+   * forced-drain path (ack tracker cleared without requeueing). The
+   * watchdog is unref'd like every other bus timer — a close that
+   * somehow never settles must not hold the process open.
+   */
+  private drainAllSubscribers(drainTimeoutMs: number): Promise<{
+    drained: boolean;
+    pendingMessages: number;
+    unackedDeliveries: number;
+  }> {
+    const subs = [...this.subscribers.values()];
+    if (subs.length === 0) {
+      return Promise.resolve({ drained: true, pendingMessages: 0, unackedDeliveries: 0 });
+    }
+    return new Promise((resolve) => {
+      const remaining = new Set(subs.map((subscriber) => subscriber.id));
+      let settled = false;
+      // Set by the watchdog before it forces the still-draining
+      // subscribers: their onComplete callbacks must not report a natural
+      // completion — the watchdog's forced result below wins.
+      let forced = false;
+      const finish = (result: {
+        drained: boolean;
+        pendingMessages: number;
+        unackedDeliveries: number;
+      }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        resolve(result);
+      };
+      const watchdog = setTimeout(() => {
+        if (remaining.size === 0) return;
+        forced = true;
+        let pendingMessages = 0;
+        let unackedDeliveries = 0;
+        for (const subscriber of [...this.subscribers.values()]) {
+          if (subscriber.draining === undefined || !remaining.has(subscriber.id)) continue;
+          pendingMessages += subscriber.queue.size + (subscriber.batch?.pending.length ?? 0);
+          unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
+        }
+        // Force every still-draining subscriber through its normal
+        // forced-drain path: `finishDrain` clears its per-subscriber
+        // timer and runs the onComplete below, shrinking `remaining`.
+        // The onCompletes skip `finish` while `forced` is set — the
+        // forced result below is the single resolution.
+        for (const subscriber of [...this.subscribers.values()]) {
+          if (subscriber.draining === undefined || !remaining.has(subscriber.id)) continue;
+          this.forceDrainTimeout(subscriber);
+        }
+        finish({ drained: false, pendingMessages, unackedDeliveries });
+      }, drainTimeoutMs);
+      unrefTimer(watchdog);
+      for (const subscriber of subs) {
+        // A subscriber already mid-drain (e.g. a user-initiated
+        // `unsubscribe({ drain: true })`) must not get a second drain:
+        // `startDrain` would orphan the first drain's timer and teardown.
+        // Abandoning it is safe — the close drain below runs the same
+        // outermost teardown the abandoned drain would have.
+        if (subscriber.draining !== undefined) this.cancelDrain(subscriber);
+        this.startDrain(subscriber, drainTimeoutMs, () => {
+          // `finishDrain` already cleared the draining mark, so this runs
+          // the immediate teardown path — not a nested drain.
+          subscriber.teardown?.();
+          remaining.delete(subscriber.id);
+          if (remaining.size === 0 && !forced) {
+            finish({ drained: true, pendingMessages: 0, unackedDeliveries: 0 });
+          }
+        });
+      }
+    });
+  }
+
+  /**
+   * Releases bus-level resources after every subscriber drain completed
+   * (EB-154), in order: group offset auto-commit checkpoints flush
+   * before their intervals die; static-membership limbo holds (which a
+   * close-time teardown may have armed) are dropped since no rejoin can
+   * follow a close; outstanding long-poll pulls resolve empty since no
+   * new message can arrive; the durable log flushes to stable storage
+   * (fsync semantics) before anything else releases resources; buffered
+   * OTLP spans export; attached gateways close last — their connections'
+   * subscriptions drained above, so every pending frame reached its
+   * client before the sockets drop. One resource's failure never strands
+   * the rest.
+   */
+  private async finalizeClose(): Promise<void> {
+    for (const groupId of [...this.autoCommitGroups.keys()]) {
+      try {
+        this.flushAutoCommits(groupId);
+      } catch {
+        // Best-effort: a failing checkpoint flush must not break the shutdown.
+      }
+    }
+    for (const { timer } of this.autoCommitTimers.values()) clearInterval(timer);
+    this.autoCommitTimers.clear();
+    this.autoCommitGroups.clear();
+    for (const sessions of this.groupStaticSessions.values()) {
+      for (const session of sessions.values()) clearTimeout(session.timer);
+    }
+    this.groupStaticSessions.clear();
+    for (const waiters of this.pullWaiters.values()) {
+      for (const waiter of waiters) waiter.resolve([]);
+    }
+    this.pullWaiters.clear();
+    try {
+      this.durableLog?.flush();
+    } catch {
+      // Best-effort: appends were already synchronous through the
+      // storage backend, so the records are handed to the OS regardless.
+    }
+    await this.flushOtlp();
+    for (const gateway of [...this.gateways]) {
+      try {
+        await gateway.close();
+      } catch {
+        // A failing gateway must not strand the remaining shutdown.
+      }
+    }
+    this.gateways.clear();
+  }
+
+  /**
    * Returns a point-in-time snapshot of live bus metrics: active
    * subscriptions (total and per pattern) plus per-topic fan-out widths and
    * publish counts. The snapshot is a plain-data copy — mutating it does
@@ -31099,6 +31533,21 @@ export class EventBus {
       throw new ChaosInjectionError('chaos: injected admission fault');
     }
     return true;
+  }
+
+  /**
+   * Graceful shutdown admission gate (EB-154): throws `BusClosedError`
+   * when the bus has been closed. Called as the FIRST statement of every
+   * publish and subscribe-family entry point — before the chaos gate
+   * (a 'drop' fault sheds silently, which is exactly what a closed bus
+   * must never do) and before any validation — so a closed bus refuses
+   * new work synchronously, fail-fast, and never silently queues it.
+   */
+  private assertNotClosed(
+    action: 'publish' | 'subscribe' | 'schedule' | 'gateway',
+    target: string,
+  ): void {
+    if (this.closed) throw new BusClosedError(action, target);
   }
 
   /**

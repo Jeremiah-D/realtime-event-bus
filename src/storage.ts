@@ -31,7 +31,10 @@
  */
 import {
   appendFileSync,
+  closeSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -96,6 +99,17 @@ export interface DurableStorageBackend {
    * child logs so one backend serves the root log and every namespace.
    */
   scoped(prefix: string): DurableStorageBackend;
+  /**
+   * Pushes every write so far to stable storage (EB-154, fsync
+   * semantics): after `sync()` returns, data written through this
+   * backend survives a process crash, not just an OS-buffered return.
+   * Optional — backends whose writes are already durable when the write
+   * call returns (e.g. the S3-compatible backend, whose upload completes
+   * before `write`/`append` return) omit it, and callers treat an absent
+   * `sync` as a no-op. Never throws for a backend that has nothing to
+   * flush.
+   */
+  sync?(): void;
 }
 
 /**
@@ -143,6 +157,13 @@ export class FilesystemStorageBackend implements DurableStorageBackend {
   private readonly root: string;
   /** Parent directories already created, so nested keys cost one Set lookup. */
   private readonly dirsMade = new Set<string>();
+  /**
+   * Keys written since the last `sync()` (EB-154): `sync()` fsyncs
+   * exactly these files, then clears the set. Appends and atomic
+   * writes are already synchronous (`appendFileSync` / temp-rename),
+   * so this is only the OS-buffer → stable-storage push.
+   */
+  private readonly dirtyKeys = new Set<string>();
 
   constructor(root: string) {
     if (typeof root !== 'string' || root.length === 0) {
@@ -177,6 +198,7 @@ export class FilesystemStorageBackend implements DurableStorageBackend {
     const bytes = toBytes(data);
     if (opts?.exclusive === true) {
       writeFileSync(path, bytes, { flag: 'wx' });
+      this.dirtyKeys.add(key);
       return;
     }
     // Atomic replace: the temp file lives in the same directory so the
@@ -195,12 +217,47 @@ export class FilesystemStorageBackend implements DurableStorageBackend {
       }
       throw err;
     }
+    this.dirtyKeys.add(key);
   }
 
   append(key: string, data: Uint8Array | string): void {
     const path = this.pathFor(key);
     this.ensureParent(path);
     appendFileSync(path, toBytes(data));
+    this.dirtyKeys.add(key);
+  }
+
+  /**
+   * Pushes every write since the last `sync()` to stable storage
+   * (EB-154, fsync semantics): each dirty file is opened read-only and
+   * fsynced, then the dirty set is cleared. A key deleted after being
+   * written is skipped silently — there is nothing left to sync. Never
+   * throws for an empty dirty set.
+   */
+  sync(): void {
+    if (this.dirtyKeys.size === 0) return;
+    const keys = [...this.dirtyKeys];
+    this.dirtyKeys.clear();
+    for (const key of keys) {
+      let fd: number | undefined;
+      try {
+        fd = openSync(this.pathFor(key), 'r');
+        fsyncSync(fd);
+      } catch {
+        // Best-effort: a key deleted (or never created, e.g. a failed
+        // exclusive write) between the write and the sync has nothing
+        // to push. The write itself already threw at write time when it
+        // failed — a sync must not invent a second failure.
+      } finally {
+        if (fd !== undefined) {
+          try {
+            closeSync(fd);
+          } catch {
+            // Best-effort close; the fsync already ran.
+          }
+        }
+      }
+    }
   }
 
   read(key: string): Uint8Array | undefined {
@@ -311,6 +368,15 @@ export class PrefixedStorageBackend implements DurableStorageBackend {
       this.inner,
       `${this.prefix}${normalizeStoragePrefix(prefix, 'scoped')}`,
     );
+  }
+
+  /**
+   * Delegates to the wrapped backend (EB-154): a scoped view shares its
+   * inner backend's durability, so syncing the inner backend covers every
+   * scope. A no-op when the inner backend has no `sync`.
+   */
+  sync(): void {
+    this.inner.sync?.();
   }
 }
 

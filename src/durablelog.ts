@@ -1683,6 +1683,22 @@ export class DurableTopicLog {
     return this.backend;
   }
 
+  /**
+   * Pushes every write so far to stable storage (EB-154, fsync
+   * semantics): after `flush()` returns, records appended through this
+   * log survive a process crash, not just an OS-buffered return.
+   * Appends were already synchronous through the storage backend (a
+   * record is handed to the OS before `append` returns); `flush()` adds
+   * the OS → disk push the class's durability note always excluded.
+   * Namespace child logs share the root log's backend (EB-96), so
+   * flushing the root log covers every namespace. A no-op for backends
+   * without `sync` (their writes are already durable at write time).
+   * Never throws for a backend with nothing to flush.
+   */
+  flush(): void {
+    this.backend.sync?.();
+  }
+
   /** Storage key for a topic's live log: URL-encoded so any topic string is a safe key. */
   private fileFor(topic: string): string {
     return `${encodeURIComponent(topic)}.log`;
