@@ -3857,7 +3857,10 @@ export interface EventBusOptions {
    * publish/subscribe permissions with allow/deny decisions on wildcard
    * patterns. Rules are evaluated in order; the first matching rule with
    * an explicit decision for the action wins; `defaultPolicy` (default
-   * `'allow'`) covers everything no rule decides. Unauthorized publishes
+   * `'allow'`) covers everything no rule decides. A rule may additionally
+   * constrain publishing by producer identity (`AclRule.publishers`,
+   * EB-165): the `publisherId` allowlist is checked when the rule's
+   * pattern matches, before any fall-through. Unauthorized publishes
    * return 0 and are counted as rejections (reason `'acl'`);
    * unauthorized subscribes throw `AclDeniedError`. Rule changes via
    * `setAclRules` take effect immediately. Default: unset (no ACL — the
@@ -6941,6 +6944,8 @@ interface CompiledAclRule {
   matcher: RegExp;
   publish?: AclDecision;
   subscribe?: AclDecision;
+  /** Publisher allowlist (EB-165), as a set for the hot path. */
+  publishers?: Set<string>;
 }
 
 /**
@@ -6971,11 +6976,32 @@ function normalizeAclRules(rules: AclRule[] | undefined, caller: string): Compil
     if (rule.publish === undefined && rule.subscribe === undefined) {
       throw new RangeError(`${at} must decide at least one of publish/subscribe`);
     }
+    // Publisher allowlist (EB-165): entries must be valid publisher
+    // identities — the same shape `PublishOptions.publisherId` enforces,
+    // so a listed id can actually match a real publish. An invalid entry
+    // fails at configuration time, never mid-publish.
+    let publishers: Set<string> | undefined;
+    if (rule.publishers !== undefined) {
+      if (!Array.isArray(rule.publishers)) {
+        throw new RangeError(`${at}.publishers must be an array of publisher ids`);
+      }
+      publishers = new Set<string>();
+      for (const entry of rule.publishers) {
+        const id = cleanPublisherId(entry);
+        if (id === undefined) {
+          throw new RangeError(
+            `${at}.publishers entries must be 1-64 ASCII alphanumeric, '_' or '-' characters`,
+          );
+        }
+        publishers.add(id);
+      }
+    }
     return {
       pattern: rule.pattern,
       matcher: compilePattern(rule.pattern),
       publish: rule.publish,
       subscribe: rule.subscribe,
+      publishers,
     };
   });
 }
@@ -9236,6 +9262,22 @@ export interface AclRule {
    * `undefined` falls through to later rules.
    */
   subscribe?: AclDecision;
+  /**
+   * Opt-in publisher allowlist (EB-165): when set on a rule whose
+   * `publish` is `'allow'`, only publishes carrying one of these
+   * publisher identities (`PublishOptions.publisherId`, exact match)
+   * are allowed by this rule. A publish whose pattern matches the rule
+   * but whose publisher is not listed — or that carries no publisher
+   * at all (anonymous, see `AclOptions.anonymousPolicy`) — is denied
+   * by this rule, without falling through to later rules. A rule whose
+   * `publish` is `'deny'` denies every publisher regardless of this
+   * list. The subscribe decision is unaffected: publisher identity is
+   * a publish-side dimension only. Each entry must be a valid
+   * publisher id (1–64 ASCII alphanumeric/`_`/`-` characters);
+   * anything else throws `RangeError` at configuration time. An empty
+   * array allows no publisher (deny-all for the matched allow).
+   */
+  publishers?: string[];
 }
 
 /** ACL configuration for `EventBusOptions.acl`. */
@@ -9252,6 +9294,16 @@ export interface AclOptions {
    * into a whitelist.
    */
   defaultPolicy?: AclDecision;
+  /**
+   * Verdict for anonymous publishes — publishes carrying no
+   * `publisherId` — evaluated under a publisher-constrained allow rule
+   * (see `AclRule.publishers`, EB-165). Default `'deny'` (fail-closed:
+   * an allowlist names its publishers, and everyone else, including
+   * anonymous producers, is refused). Applies only when a rule's
+   * pattern matched and the rule names publishers; publishes that match
+   * no rule still fall through to `defaultPolicy` unchanged.
+   */
+  anonymousPolicy?: AclDecision;
 }
 
 /**
@@ -11965,6 +12017,12 @@ export class EventBus {
   /** Verdict when no ACL rule decides an action (default `'allow'`). */
   private aclDefault: AclDecision = 'allow';
   /**
+   * Verdict for anonymous publishes (no `publisherId`) evaluated under
+   * a publisher-constrained allow rule (see `AclOptions.anonymousPolicy`,
+   * EB-165). Fail-closed default: `'deny'`.
+   */
+  private aclAnonymousPolicy: AclDecision = 'deny';
+  /**
    * Registered topic aliases (EB-44), keyed by old topic: while live,
    * publishes to the old topic resolve to `newTopic` before every other
    * admission gate, and fan-out to the resolved topic additionally reaches
@@ -12931,6 +12989,11 @@ export class EventBus {
       throw new RangeError("acl.defaultPolicy must be 'allow' or 'deny'");
     }
     this.aclDefault = aclDefault;
+    const aclAnonymousPolicy = options?.acl?.anonymousPolicy ?? 'deny';
+    if (aclAnonymousPolicy !== 'allow' && aclAnonymousPolicy !== 'deny') {
+      throw new RangeError("acl.anonymousPolicy must be 'allow' or 'deny'");
+    }
+    this.aclAnonymousPolicy = aclAnonymousPolicy;
     this.aclRules = normalizeAclRules(options?.acl?.rules, 'EventBus');
     if (options?.durableLogDir == null && options?.durableLogEncryptor !== undefined) {
       throw new RangeError('durableLogEncryptor requires EventBusOptions.durableLogDir to be set');
@@ -16076,6 +16139,7 @@ export class EventBus {
       pattern: rule.pattern,
       ...(rule.publish !== undefined ? { publish: rule.publish } : {}),
       ...(rule.subscribe !== undefined ? { subscribe: rule.subscribe } : {}),
+      ...(rule.publishers !== undefined ? { publishers: [...rule.publishers] } : {}),
     }));
   }
 
@@ -16084,12 +16148,23 @@ export class EventBus {
    * registration order) whose pattern matches the topic and that carries
    * an explicit publish decision wins; when no rule decides, the default
    * policy applies.
+   *
+   * Publisher dimension (EB-165): when the winning rule names
+   * `publishers` and its decision is `'allow'`, only a publish carrying
+   * one of the listed publisher identities is allowed — an unlisted
+   * publisher, or an anonymous publish (no `publisherId`, verdict from
+   * `AclOptions.anonymousPolicy`), is denied by this rule without
+   * falling through to later rules. A `'deny'` rule denies every
+   * publisher regardless of the list.
    */
-  private aclAllowsPublish(topic: string): boolean {
+  private aclAllowsPublish(topic: string, publisherId?: string): boolean {
     for (const rule of this.aclRules) {
-      if (rule.publish !== undefined && rule.matcher.test(topic)) {
-        return rule.publish === 'allow';
+      if (rule.publish === undefined || !rule.matcher.test(topic)) continue;
+      if (rule.publishers !== undefined && rule.publish === 'allow') {
+        if (publisherId === undefined) return this.aclAnonymousPolicy === 'allow';
+        return rule.publishers.has(publisherId);
       }
+      return rule.publish === 'allow';
     }
     return this.aclDefault === 'allow';
   }
@@ -22128,7 +22203,7 @@ export class EventBus {
     let keyClaim: { topic: string; key: string; nowMs: number } | undefined;
     if (idempotencyKey !== undefined) {
       const aliasResolution = this.resolvePublishTopic(topic);
-      if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic)) {
+      if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic, opts?.publisherId)) {
         const nowMs = this.now();
         const firstAccepted = this.idempotencyKeyHit(
           aliasResolution.topic,
@@ -22731,7 +22806,7 @@ export class EventBus {
     // Authorization precedes identity: a denied publish claims no dedup
     // slot and reports `{ duplicate: false, accepted: 0 }` — it was
     // denied, not deduplicated, and its retry stays a fresh publish.
-    if (!this.aclAllowsPublish(topic)) {
+    if (!this.aclAllowsPublish(topic, publisherId)) {
       this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       this.recordPublishAudit(topic, {
         admitted: false,
@@ -22957,7 +23032,7 @@ export class EventBus {
     // Authorization precedes identity: a denied publish claims no dedup
     // slot and reports `{ duplicate: false, accepted: 0 }` — it was
     // denied, not deduplicated, and its retry stays a fresh publish.
-    if (!this.aclAllowsPublish(topic)) {
+    if (!this.aclAllowsPublish(topic, publisherId)) {
       this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       this.recordPublishAudit(topic, {
         admitted: false,
@@ -23220,7 +23295,7 @@ export class EventBus {
     // gate a control message keeps is the ACL — mirroring `fanOutBarrier`
     // minus its counting, hook, and delivery.
     if (opts?.barrier !== undefined) {
-      if (!this.aclAllowsPublish(topic)) {
+      if (!this.aclAllowsPublish(topic, opts?.publisherId)) {
         return { admitted: false, reason: 'acl', failedGate: 'acl' };
       }
       return { admitted: true };
@@ -23250,7 +23325,7 @@ export class EventBus {
     const messageId =
       typeof opts?.messageId === 'string' && opts.messageId.length > 0 ? opts.messageId : undefined;
     if (messageId !== undefined) {
-      if (!this.aclAllowsPublish(topic)) {
+      if (!this.aclAllowsPublish(topic, opts?.publisherId)) {
         return { admitted: false, reason: 'acl', failedGate: 'acl' };
       }
       const nowMs = this.now();
@@ -23335,7 +23410,7 @@ export class EventBus {
       let keyClaim: { topic: string; key: string; nowMs: number } | undefined;
       if (msg.idempotencyKey !== undefined) {
         const aliasResolution = this.resolvePublishTopic(msg.topic);
-        if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic)) {
+        if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic, msg.publisherId)) {
           const nowMs = this.now();
           const firstAccepted = this.idempotencyKeyHit(
             aliasResolution.topic,
@@ -23825,7 +23900,7 @@ export class EventBus {
     // The ACL is the next admission gate (after topic-alias resolution,
     // which rewrites the topic before the gates), including the atomic
     // batch's shadow admission: an unauthorized entry aborts the batch.
-    if (!this.aclAllowsPublish(topic)) return { reason: 'acl', failedGate: 'acl' };
+    if (!this.aclAllowsPublish(topic, publisherId)) return { reason: 'acl', failedGate: 'acl' };
     // Versioned schema validators (EB-86): the shadow admission runs the
     // pure verdict — no counting here. A rejection is counted once by the
     // caller; a deprecated admission is counted in the commit phase (see
@@ -24045,7 +24120,7 @@ export class EventBus {
     // Fail fast on ACL: an unauthorized publish never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
-    if (!this.aclAllowsPublish(topic)) {
+    if (!this.aclAllowsPublish(topic, publisherId)) {
       this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       return undefined;
     }
@@ -29580,7 +29655,7 @@ export class EventBus {
       // consumes no sequence number (subscribers see no gap), never touches
       // the durable log, and burns no rate-limit budget. Counted as a
       // rejection with reason 'acl' (see countAclDenied).
-      if (!this.aclAllowsPublish(topic)) {
+      if (!this.aclAllowsPublish(topic, publisherId)) {
         this.countAclDenied(topic, payload, publisherId, admissionTraceId);
         auditPublish(false, undefined, 'acl');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'acl' };

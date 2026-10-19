@@ -1047,7 +1047,16 @@ library.
   concrete topic; subscribe checks use overlap semantics (`patternsOverlap`,
   exported): a deny rule covering any part of a subscription's scope denies
   the whole subscription, so a broad pattern cannot slip past a narrow deny.
-  The ACL is the first admission gate everywhere (`publish`,
+  Opt-in publisher dimension (EB-165): a rule with `publish: 'allow'` may
+  name `publishers: ['svc-a', ...]` — a `publisherId` allowlist (exact
+  match) — so only those producers may publish to the matched topics; a
+  matched pattern with an unlisted (or anonymous) publisher is denied by
+  that rule, without falling through to later rules. Publishes with no
+  `publisherId` are anonymous and denied by default under a constrained
+  rule (`anonymousPolicy`, default `'deny'` — set `'allow'` to let
+  anonymous producers through); a `publish: 'deny'` rule denies every
+  publisher regardless of the list. The publisher dimension is publish-side
+  only — subscribe decisions ignore it. The ACL is the first admission gate everywhere (`publish`,
   `publishBatch`, `publishAtomic` shadow admission, `publishDelayed`
   fail-fast, and before the `publishIdempotent` dedup gate): an unauthorized
   publish returns 0, consumes no sequence number, never touches the durable
