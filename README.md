@@ -492,7 +492,40 @@ library.
   and the (synchronous) HTTP transport — the bundled default shells out
   to `curl` — with zero new dependencies; note its documented limits
   (read-modify-write append, best-effort exclusive write) before using it
-  for real.
+  for real. Remote segment offload (EB-163): opt-in S3 upload of sealed
+  (archived) segments via `segmentOffload: { s3, keyPrefix?,
+  namespace?, retainLocalSegments? }` on `DurableTopicLog.open` (the log
+  layer; no new `EventBus` option — namespace child logs pass their
+  prefix as `namespace` explicitly). Every archived segment is uploaded
+  under a deterministic key
+  `<keyPrefix>/[<namespace>/]<urlencoded-topic>.seg-<seqStart>-<seqEnd>.jsonl.gz`
+  (default prefix `durable-log-offload`), and a remote manifest
+  (`<keyPrefix>/[<namespace>/]manifest.json`) records each segment's
+  SHA-256. The S3 client is an injectable minimal synchronous interface
+  (`RemoteSegmentS3Client`: put/get/head/list/delete) — synchronous
+  because the log is synchronous by contract and pulls happen inside
+  the read path, so `node:https`/`fetch` cannot serve; the default
+  `SigV4S3Client` signs with a minimal from-spec SigV4 implementation
+  (pure `node:crypto`, cross-checked against an independent
+  implementation) over the same synchronous `curl` transport, and
+  `DryRunS3Client` rehearses an offload recording intended keys with
+  zero side effects. `retainLocalSegments` (default `Infinity` —
+  current semantics, the remote is a pure replica) keeps only the
+  newest N local copies per topic: older `.jsonl.gz` files and their
+  checksum sidecars are deleted only after the manifest confirms the
+  bytes are remote. A replay that needs a trimmed segment
+  (`resumeFromSeq` / `resumeFromTime`, i.e. `readSince`/`readSinceTime`
+  with `{ includeArchived: true }`) pulls the bytes back down and
+  verifies them against the manifest hash; a segment missing locally
+  and remotely — or failing the hash check — throws explicitly instead
+  of silently truncating the replay. Offload runs on the same
+  background pass as archiving (and via `DurableTopicLog.offloadNow()`
+  for manual/dry-run triggers); failures are counted in
+  `getStats().durableLog.offloadFailed` and retried on the next pass.
+  Requires `durableLogSegmentRotation` (`RangeError` otherwise — only
+  sealed segments are offloaded). `purgeTopic` does not delete remote
+  objects; destroying a topic's remote history is deleting its remote
+  key prefix.
   `getStats().durableLog` additionally reports `archived` (total archived
   entries), `corruptArchives`, and per-topic `segments`
   (`{ live, segments, archived }`). Opt-in at-rest encryption

@@ -48,6 +48,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { Buffer } from 'node:buffer';
+import { createHash, createHmac } from 'node:crypto';
 import {
   PrefixedStorageBackend,
   normalizeStoragePrefix,
@@ -368,4 +369,357 @@ export function createS3CompatibleBackend(
   options: S3CompatibleBackendOptions,
 ): DurableStorageBackend {
   return new S3CompatibleStorageBackend(options);
+}
+
+/* ------------------------------------------------------------------ */
+/* EB-163: durable-log segment offload — a minimal synchronous S3      */
+/* object client, a minimal SigV4 signer, and a dry-run client.       */
+/*                                                                    */
+/* The client is synchronous on purpose: the durable log is           */
+/* synchronous by contract (EB-96 — an append is on stable storage   */
+/* before it returns), and offload pulls happen inside the read path, */
+/* so an async client (`node:https`, `fetch`) cannot serve. The      */
+/* default client signs with the minimal SigV4 below and transports  */
+/* over the same synchronous `curl` trick the EB-96 example uses —   */
+/* zero new dependencies.                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Minimal synchronous S3 object client for durable-log segment
+ * offload (EB-163): PutObject / GetObject / HeadObject / key listing /
+ * delete. Implementations must be synchronous — the log calls them on
+ * the archive pass and inside `readSince`, both synchronous paths.
+ */
+export interface RemoteSegmentS3Client {
+  /** Uploads `body` to `key` (atomic by S3 semantics); throws on failure. */
+  putObject(key: string, body: Uint8Array): void;
+  /** Downloads `key`; `undefined` when absent. Throws on transport failure. */
+  getObject(key: string): Uint8Array | undefined;
+  /** `true` when `key` exists. Throws on transport failure. */
+  headObject(key: string): boolean;
+  /** Every key starting with `prefix`, in lexicographic order. */
+  listObjects(prefix: string): string[];
+  /** Deletes `key`; idempotent (a missing key is not an error). */
+  deleteObject(key: string): void;
+  /**
+   * Brand for rehearsal clients: `true` means the client records
+   * intended keys without side effects (see `DryRunS3Client`). The
+   * durable log skips local trimming and upload accounting for such
+   * clients — a rehearsal must not destroy local data.
+   */
+  readonly isDryRun?: boolean;
+}
+
+/** S3 credentials for the SigV4 signer. Passed at configuration time — never logged. */
+export interface S3Credentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  /** Temporary-credential session token, when using one. */
+  sessionToken?: string;
+}
+
+/** One request to sign with SigV4. */
+export interface SigV4SignRequest {
+  credentials: S3Credentials;
+  /** e.g. `us-east-1`. */
+  region: string;
+  method: string;
+  url: string;
+  /** Extra headers to include (and sign), e.g. `content-type`. */
+  headers?: Record<string, string>;
+  /** Request body bytes; `undefined` for bodyless requests. */
+  body?: Uint8Array;
+  /** Credential-scope service name; default `s3`. */
+  service?: string;
+  /**
+   * Test seam: the `x-amz-date` value. Defaults to the current UTC
+   * time — signatures are only reproducible with a fixed date.
+   */
+  amzDate?: string;
+}
+
+/** Formats a `Date` as the SigV4 `x-amz-date` (`YYYYMMDD'T'HHMMSS'Z'`). */
+function formatAmzDate(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}` +
+    `T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`
+  );
+}
+
+/** SigV4 path encoding: each segment encoded, `/` preserved. */
+function encodeS3Path(pathname: string): string {
+  return pathname
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
+/** SigV4 canonical query string: names sorted, names and values encoded. */
+function canonicalQueryString(searchParams: URLSearchParams): string {
+  const pairs: Array<[string, string]> = [];
+  searchParams.forEach((value, name) => pairs.push([name, value]));
+  pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+  return pairs
+    .map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`)
+    .join('&');
+}
+
+const EMPTY_SHA256 = createHash('sha256').update(new Uint8Array(0)).digest('hex');
+
+function hmacSha256(key: Uint8Array | string, data: string): Uint8Array {
+  return createHmac('sha256', key).update(data, 'utf8').digest();
+}
+
+/**
+ * Minimal AWS Signature Version 4 signer (EB-163) — pure `node:crypto`,
+ * zero new dependencies. Signs one S3 request and returns the headers
+ * to send: `Authorization`, `x-amz-date`, `x-amz-content-sha256`, and
+ * `x-amz-security-token` when the credentials carry a session token.
+ * The payload is always hashed (no `UNSIGNED-PAYLOAD`): the offload
+ * client always has the bytes in hand. Callers that must stream or
+ * avoid buffering sign their own requests via `S3RequestSigner`.
+ */
+export function signS3RequestSigV4(request: SigV4SignRequest): Record<string, string> {
+  const { credentials, region, method, url } = request;
+  if (
+    credentials === undefined ||
+    credentials === null ||
+    typeof credentials.accessKeyId !== 'string' ||
+    credentials.accessKeyId.length === 0 ||
+    typeof credentials.secretAccessKey !== 'string' ||
+    credentials.secretAccessKey.length === 0
+  ) {
+    throw new RangeError('signS3RequestSigV4: credentials need a non-empty accessKeyId and secretAccessKey');
+  }
+  if (typeof region !== 'string' || region.length === 0) {
+    throw new RangeError('signS3RequestSigV4: region must be a non-empty string');
+  }
+  const service = request.service ?? 's3';
+  const parsed = new URL(url);
+  const amzDate = request.amzDate ?? formatAmzDate(new Date());
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash =
+    request.body === undefined ? EMPTY_SHA256 : createHash('sha256').update(request.body).digest('hex');
+  const headers: Record<string, string> = { ...(request.headers ?? {}) };
+  headers['x-amz-date'] = amzDate;
+  headers['x-amz-content-sha256'] = payloadHash;
+  if (credentials.sessionToken !== undefined) {
+    headers['x-amz-security-token'] = credentials.sessionToken;
+  }
+  const names = Object.keys(headers)
+    .map((name) => name.toLowerCase())
+    .sort();
+  const byLower = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers)) byLower.set(name.toLowerCase(), value);
+  const canonicalHeaders = names.map((name) => `${name}:${(byLower.get(name) as string).trim()}\n`).join('');
+  const signedHeaders = names.join(';');
+  const canonicalRequest = [
+    method.toUpperCase(),
+    encodeS3Path(parsed.pathname),
+    canonicalQueryString(parsed.searchParams),
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join('\n');
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    createHash('sha256').update(canonicalRequest, 'utf8').digest('hex'),
+  ].join('\n');
+  const kDate = hmacSha256(`AWS4${credentials.secretAccessKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, region);
+  const kService = hmacSha256(kRegion, service);
+  const kSigning = hmacSha256(kService, 'aws4_request');
+  const signature = createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+  return {
+    ...headers,
+    Authorization:
+      `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${credentialScope}, ` +
+      `SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  };
+}
+
+/** Options for {@link SigV4S3Client}. */
+export interface SigV4S3ClientOptions {
+  /**
+   * Store endpoint, e.g. `https://s3.us-east-1.amazonaws.com` or
+   * `http://localhost:9000` for MinIO. No trailing slash.
+   */
+  endpoint: string;
+  /** Bucket holding the offloaded segments. Must already exist. */
+  bucket: string;
+  /** Region for the SigV4 credential scope, e.g. `us-east-1`. */
+  region: string;
+  /** Credentials used to sign every request. */
+  credentials: S3Credentials;
+  /**
+   * Synchronous HTTP transport. Defaults to the `curl`-based transport
+   * (`curlSyncTransport`) — the binary must be on `PATH`.
+   */
+  transport?: S3HttpTransport;
+}
+
+/**
+ * The default `RemoteSegmentS3Client` (EB-163): signs every request
+ * with the minimal SigV4 signer above and transports it synchronously
+ * (default: `curl`). Keys are flat object names under
+ * `s3://bucket`; there is no key prefixing here — the durable log's
+ * offload key layout (prefix / namespace / topic / seq-range) is owned
+ * by the log, this client only stores bytes under keys.
+ */
+export class SigV4S3Client implements RemoteSegmentS3Client {
+  private readonly endpoint: string;
+  private readonly bucket: string;
+  private readonly region: string;
+  private readonly credentials: S3Credentials;
+  private readonly transport: S3HttpTransport;
+
+  constructor(options: SigV4S3ClientOptions) {
+    const { endpoint, bucket, region, credentials } = options;
+    if (typeof endpoint !== 'string' || endpoint.length === 0 || endpoint.endsWith('/')) {
+      throw new RangeError('SigV4S3Client: endpoint must be a non-empty URL without trailing slash');
+    }
+    if (typeof bucket !== 'string' || bucket.length === 0) {
+      throw new RangeError('SigV4S3Client: bucket must be a non-empty string');
+    }
+    if (typeof region !== 'string' || region.length === 0) {
+      throw new RangeError('SigV4S3Client: region must be a non-empty string');
+    }
+    if (
+      credentials === undefined ||
+      credentials === null ||
+      typeof credentials.accessKeyId !== 'string' ||
+      credentials.accessKeyId.length === 0 ||
+      typeof credentials.secretAccessKey !== 'string' ||
+      credentials.secretAccessKey.length === 0
+    ) {
+      throw new RangeError('SigV4S3Client: credentials need a non-empty accessKeyId and secretAccessKey');
+    }
+    this.endpoint = endpoint;
+    this.bucket = bucket;
+    this.region = region;
+    this.credentials = credentials;
+    this.transport = options.transport ?? curlSyncTransport();
+  }
+
+  private objectUrl(key: string): string {
+    return `${this.endpoint}/${this.bucket}/${encodeKey(key)}`;
+  }
+
+  private signedRequest(
+    method: string,
+    url: string,
+    headers: Record<string, string>,
+    body?: Uint8Array,
+  ): S3HttpResponse {
+    const signed = signS3RequestSigV4({
+      credentials: this.credentials,
+      region: this.region,
+      method,
+      url,
+      headers,
+      body,
+    });
+    return this.transport.request(method, url, signed, body);
+  }
+
+  putObject(key: string, body: Uint8Array): void {
+    const res = this.signedRequest('PUT', this.objectUrl(key), { 'content-length': String(body.length) }, body);
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`s3 PUT ${key}: unexpected status ${res.status}`);
+    }
+  }
+
+  getObject(key: string): Uint8Array | undefined {
+    const res = this.signedRequest('GET', this.objectUrl(key), {});
+    if (res.status === 404) return undefined;
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`s3 GET ${key}: unexpected status ${res.status}`);
+    }
+    return res.body;
+  }
+
+  headObject(key: string): boolean {
+    const res = this.signedRequest('HEAD', this.objectUrl(key), {});
+    if (res.status === 200) return true;
+    if (res.status === 404) return false;
+    throw new Error(`s3 HEAD ${key}: unexpected status ${res.status}`);
+  }
+
+  listObjects(prefix: string): string[] {
+    const out: string[] = [];
+    let token: string | undefined;
+    for (let page = 0; page < S3_LIST_MAX_PAGES; page += 1) {
+      const params = new URLSearchParams({ 'list-type': '2', prefix, 'max-keys': '1000' });
+      if (token !== undefined) params.set('continuation-token', token);
+      const url = `${this.endpoint}/${this.bucket}?${params.toString()}`;
+      const res = this.signedRequest('GET', url, {});
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`s3 LIST prefix=${prefix}: unexpected status ${res.status}`);
+      }
+      const xml = Buffer.from(res.body).toString('utf8');
+      for (const objectKey of parseListObjectsV2Keys(xml)) {
+        if (objectKey.startsWith(prefix)) out.push(objectKey);
+      }
+      token = parseListObjectsV2Continuation(xml);
+      if (token === undefined) return out.sort();
+    }
+    throw new Error(`s3 LIST prefix=${prefix}: exceeded ${S3_LIST_MAX_PAGES} pages`);
+  }
+
+  deleteObject(key: string): void {
+    // S3 DELETE is idempotent: deleting a missing object is 204.
+    const res = this.signedRequest('DELETE', this.objectUrl(key), {});
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`s3 DELETE ${key}: unexpected status ${res.status}`);
+    }
+  }
+}
+
+/** One intended operation recorded by {@link DryRunS3Client}. */
+export interface DryRunOperation {
+  op: 'put' | 'get' | 'head' | 'list' | 'delete';
+  /** The object key for put/get/head/delete, the prefix for list. */
+  key: string;
+}
+
+/**
+ * Dry-run rehearsal client (EB-163): implements
+ * `RemoteSegmentS3Client` but performs zero network I/O — every call
+ * only records its intended operation in `operations`, in call order.
+ * Reads report "absent" (`getObject` → `undefined`, `headObject` →
+ * `false`, `listObjects` → `[]`), writes succeed vacuously. The
+ * durable log treats this client as a rehearsal: it never trims local
+ * segments and never counts uploads for it. Hand the recorded keys to
+ * an operator to review what a real run would have uploaded.
+ */
+export class DryRunS3Client implements RemoteSegmentS3Client {
+  readonly isDryRun = true;
+  readonly operations: DryRunOperation[] = [];
+
+  putObject(key: string, _body: Uint8Array): void {
+    this.operations.push({ op: 'put', key });
+  }
+
+  getObject(key: string): Uint8Array | undefined {
+    this.operations.push({ op: 'get', key });
+    return undefined;
+  }
+
+  headObject(key: string): boolean {
+    this.operations.push({ op: 'head', key });
+    return false;
+  }
+
+  listObjects(prefix: string): string[] {
+    this.operations.push({ op: 'list', key: prefix });
+    return [];
+  }
+
+  deleteObject(key: string): void {
+    this.operations.push({ op: 'delete', key });
+  }
 }

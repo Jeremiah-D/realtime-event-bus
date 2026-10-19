@@ -6,6 +6,7 @@ import {
   FilesystemStorageBackend,
   type DurableStorageBackend,
 } from './storage.ts';
+import type { RemoteSegmentS3Client } from './storage-s3.ts';
 
 /**
  * EB-96: reserved storage-key prefix for namespace child logs. The bus
@@ -415,6 +416,178 @@ export interface DurableLogOptions {
    * unaffected by which backend is in use.
    */
   backend?: DurableStorageBackend;
+  /**
+   * EB-163: opt-in remote offload of sealed (archived) segments to an
+   * S3-compatible object store. When set, every archived segment is
+   * uploaded under a deterministic object key after the archive pass
+   * lands it, a remote manifest records each segment's SHA-256, and the
+   * log keeps only the newest `retainLocalSegments` local copies per
+   * topic (default: all of them — current semantics). Reads of a
+   * locally-trimmed segment (`readSince`/`readSinceTime` with
+   * `{ includeArchived: true }`) pull the bytes back down and verify
+   * them against the manifest hash; a segment missing locally AND
+   * remotely throws instead of silently truncating the replay.
+   * Requires `segmentRotation` — only sealed segments are offloaded.
+   */
+  segmentOffload?: SegmentOffloadOptions;
+}
+
+/**
+ * EB-163: remote offload of sealed (archived) topic segments to an
+ * S3-compatible object store.
+ */
+export interface SegmentOffloadOptions {
+  /**
+   * Minimal synchronous S3 object client (see `RemoteSegmentS3Client` in
+   * `src/storage-s3.ts`): `SigV4S3Client` for real uploads,
+   * `DryRunS3Client` for rehearsals, or a custom implementation (a
+   * memory fake in tests). Required.
+   */
+  s3: RemoteSegmentS3Client;
+  /**
+   * Remote key prefix, e.g. `bus-durable-log`. The deterministic object
+   * key for a segment is
+   * `<keyPrefix>/[<namespace>/]<urlencoded-topic>.seg-<seqStart>-<seqEnd>.jsonl.gz`
+   * and the manifest lives at `<keyPrefix>/[<namespace>/]manifest.json`.
+   * Default `'durable-log-offload'`.
+   */
+  keyPrefix?: string;
+  /**
+   * Namespace component of the remote key. The log itself has no
+   * namespace concept — a namespace child log is a scoped backend view
+   * the log cannot introspect — so a namespace's operator passes its
+   * prefix here explicitly and each namespace offloads under its own
+   * key space. Default `''` (the root log's key space).
+   */
+  namespace?: string;
+  /**
+   * How many of the newest archived segments to keep locally per topic.
+   * Segments beyond the newest N are deleted locally (the `.gz` and its
+   * checksum sidecar) only after their bytes are confirmed on the
+   * remote; the archive index and chain manifest keep their lines, so
+   * the segment stays known and replayable from the remote. Default
+   * `Infinity` — current semantics: every archived segment stays local
+   * and the remote is a pure replica. Must be a non-negative integer or
+   * `Infinity`.
+   *
+   * `purgeTopic` does not delete remote objects: destroying a topic's
+   * remote history is the operator deleting the topic's remote key
+   * prefix.
+   */
+  retainLocalSegments?: number;
+}
+
+/**
+ * EB-163: one line of the remote offload manifest
+ * (`<keyPrefix>/[<namespace>/]manifest.json`) — the remote source of
+ * truth for which segments landed where and what they hash to.
+ */
+export interface RemoteOffloadManifestEntry {
+  /** Manifest line format version. */
+  v: 1;
+  /** Concrete topic the segment belongs to. */
+  topic: string;
+  /** Segment identity: `<seqStart>-<seqEnd>` of the segment's records. */
+  segmentId: string;
+  /** Full remote object key of the segment's `.jsonl.gz`. */
+  key: string;
+  /** First record's `seq` in the segment. */
+  seqStart: number;
+  /** Last record's `seq` in the segment. */
+  seqEnd: number;
+  /** SHA-256 hex of the uploaded `.jsonl.gz` bytes. */
+  sha256: string;
+  /** Records in the segment, including seq-0 schedule records. */
+  entries: number;
+  /** Gzipped archive size in bytes. */
+  bytes: number;
+}
+
+/**
+ * Parses one remote-manifest entry. Returns `null` for anything
+ * malformed — wrong version, an empty topic/segmentId/key, negative
+ * seq bounds, a non-digest `sha256`, a non-positive-integer entry
+ * count, or a negative byte count. A corrupt remote manifest fails the
+ * offload pass closed (never overwritten blindly).
+ */
+function parseRemoteManifestEntry(o: unknown): RemoteOffloadManifestEntry | null {
+  if (typeof o !== 'object' || o === null) return null;
+  const e = o as Record<string, unknown>;
+  if (e['v'] !== 1) return null;
+  for (const field of ['topic', 'segmentId', 'key'] as const) {
+    if (typeof e[field] !== 'string' || (e[field] as string).length === 0) return null;
+  }
+  for (const field of ['seqStart', 'seqEnd'] as const) {
+    if (!Number.isInteger(e[field]) || (e[field] as number) < 0) return null;
+  }
+  if (typeof e['sha256'] !== 'string' || !SHA256_HEX_PATTERN.test(e['sha256'] as string)) return null;
+  if (!Number.isInteger(e['entries']) || (e['entries'] as number) < 1) return null;
+  if (!Number.isInteger(e['bytes']) || (e['bytes'] as number) < 0) return null;
+  return {
+    v: 1,
+    topic: e['topic'] as string,
+    segmentId: e['segmentId'] as string,
+    key: e['key'] as string,
+    seqStart: e['seqStart'] as number,
+    seqEnd: e['seqEnd'] as number,
+    sha256: e['sha256'] as string,
+    entries: e['entries'] as number,
+    bytes: e['bytes'] as number,
+  };
+}
+
+/** EB-163: validated `SegmentOffloadOptions` with defaults applied. */
+interface ResolvedSegmentOffload {
+  s3: RemoteSegmentS3Client;
+  keyPrefix: string;
+  namespace: string;
+  retainLocalSegments: number;
+}
+
+/**
+ * Validates `SegmentOffloadOptions`, returning the resolved
+ * configuration. `undefined` stays `undefined` (offload disabled —
+ * fully backward compatible). Anything else must carry a usable S3
+ * client and, since only sealed segments are offloaded, the log must
+ * have `segmentRotation` enabled — else `RangeError`.
+ */
+function resolveSegmentOffloadOptions(
+  options: SegmentOffloadOptions | undefined,
+  segmentRotation: SegmentRotationOptions | undefined,
+): ResolvedSegmentOffload | undefined {
+  if (options === undefined) return undefined;
+  if (typeof options !== 'object' || options === null) {
+    throw new RangeError('segmentOffload must be an object');
+  }
+  const { s3, keyPrefix, namespace, retainLocalSegments } = options;
+  const methods = ['putObject', 'getObject', 'headObject', 'listObjects', 'deleteObject'] as const;
+  if (
+    typeof s3 !== 'object' ||
+    s3 === null ||
+    !methods.every((m) => typeof (s3 as Record<string, unknown>)[m] === 'function')
+  ) {
+    throw new RangeError(
+      'segmentOffload.s3 must be a RemoteSegmentS3Client (putObject/getObject/headObject/listObjects/deleteObject)',
+    );
+  }
+  if (segmentRotation === undefined) {
+    throw new RangeError(
+      'segmentOffload requires segmentRotation: only sealed (archived) segments are offloaded',
+    );
+  }
+  const resolvedPrefix = keyPrefix ?? 'durable-log-offload';
+  if (typeof resolvedPrefix !== 'string' || resolvedPrefix.length === 0) {
+    throw new RangeError('segmentOffload.keyPrefix must be a non-empty string');
+  }
+  const resolvedNamespace = namespace ?? '';
+  if (typeof resolvedNamespace !== 'string') {
+    throw new RangeError('segmentOffload.namespace must be a string');
+  }
+  const retain = retainLocalSegments ?? Infinity;
+  if (!(retain === Infinity || (Number.isInteger(retain) && retain >= 0))) {
+    throw new RangeError('segmentOffload.retainLocalSegments must be a non-negative integer or Infinity');
+  }
+  return { s3, keyPrefix: resolvedPrefix, namespace: resolvedNamespace, retainLocalSegments: retain };
 }
 
 /**
@@ -1541,6 +1714,16 @@ export class DurableTopicLog {
   private readonly now: () => number;
   /** Records evicted by time-based retention, across compactions. */
   private retentionEvicted = 0;
+  /**
+   * EB-163: resolved remote-offload configuration, `undefined` when
+   * offload is disabled (the default — the log never touches the
+   * network and keeps every archived segment locally).
+   */
+  private readonly offload?: ResolvedSegmentOffload;
+  /** EB-163: archived segments successfully uploaded to the remote. */
+  private offloadUploaded = 0;
+  /** EB-163: offload attempts that failed (upload or manifest write). */
+  private offloadFailed = 0;
 
   private constructor(
     dir: string,
@@ -1554,6 +1737,7 @@ export class DurableTopicLog {
     onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void,
     backend?: DurableStorageBackend,
     maxBytesPerTopic?: number,
+    segmentOffload?: SegmentOffloadOptions,
   ) {
     this.logDir = dir;
     this.maxEntriesPerTopic = maxEntriesPerTopic;
@@ -1565,6 +1749,9 @@ export class DurableTopicLog {
     this.now = now;
     this.onSegmentChecksumFailed = onSegmentChecksumFailed;
     this.maxBytesPerTopic = maxBytesPerTopic;
+    // EB-163: offload needs the resolved rotation — only sealed
+    // segments are ever offloaded.
+    this.offload = resolveSegmentOffloadOptions(segmentOffload, this.segmentRotation);
     // EB-96: every object the log keeps goes through the backend. The
     // default is the local filesystem rooted at `dir` — the exact
     // on-disk layout the log always used — so existing directories keep
@@ -1578,6 +1765,27 @@ export class DurableTopicLog {
     this.recoverOffsets();
     this.recoverDedup();
     this.recoverPublishDedup();
+    // EB-163: one background offload pass on open — segments archived
+    // before this log opened (a crash between archive and offload) get
+    // uploaded without blocking `open` or keeping the process alive.
+    if (this.offload !== undefined) this.scheduleOffload();
+  }
+
+  /**
+   * EB-163: arms a background offload pass on an unref'd timer — the
+   * same fire-and-forget pattern as `scheduleArchive`. Never throws
+   * into the timer: a remote outage only counts failures, the next
+   * pass retries.
+   */
+  private scheduleOffload(): void {
+    const timer = setTimeout(() => {
+      try {
+        this.offloadNow();
+      } catch {
+        // Counted inside `offloadNow` where possible; never fatal.
+      }
+    }, 0);
+    timer.unref();
   }
 
   /**
@@ -1637,11 +1845,12 @@ export class DurableTopicLog {
     ) {
       throw new RangeError('durableLog backend must be a DurableStorageBackend');
     }
+    const segmentRotation = resolveSegmentRotationOptions(options.segmentRotation);
     return new DurableTopicLog(
       dir,
       maxEntriesPerTopic,
       options.keyCompaction ?? false,
-      resolveSegmentRotationOptions(options.segmentRotation),
+      segmentRotation,
       publishDedupMaxEntries,
       encryptor,
       maxAgeMs,
@@ -1649,6 +1858,7 @@ export class DurableTopicLog {
       options.onSegmentChecksumFailed,
       backend,
       maxBytesPerTopic,
+      options.segmentOffload,
     );
   }
 
@@ -2397,6 +2607,269 @@ export class DurableTopicLog {
       if (name.startsWith(NAMESPACE_LOG_KEY_PREFIX)) continue;
       if (name.endsWith('.jsonl.tmp')) this.archiveOne(name);
     }
+    // EB-163: newly archived segments go remote on the same background
+    // pass. Never throws into the timer: a remote outage only counts
+    // failures, the next pass retries.
+    if (this.offload !== undefined) {
+      try {
+        this.offloadNow();
+      } catch {
+        // Counted inside `offloadNow` where possible; the pass itself
+        // must stay non-fatal.
+      }
+    }
+  }
+
+  /**
+   * EB-163: the deterministic remote object key for one archived
+   * segment — `<keyPrefix>/[<namespace>/]<urlencoded-topic>.seg-<seqStart>-<seqEnd>.jsonl.gz`.
+   * The same content always addresses the same key, so re-uploads are
+   * idempotent and two logs can never collide: topic names are
+   * URL-encoded and the seq range is part of the key.
+   */
+  private remoteSegmentKey(entry: ArchiveEntry): string {
+    const offload = this.offload as ResolvedSegmentOffload;
+    const ns = offload.namespace === '' ? '' : `${encodeURIComponent(offload.namespace)}/`;
+    return `${offload.keyPrefix}/${ns}${encodeURIComponent(entry.topic)}.seg-${entry.seqStart}-${entry.seqEnd}.jsonl.gz`;
+  }
+
+  /** EB-163: the remote manifest key — `<keyPrefix>/[<namespace>/]manifest.json`. */
+  private remoteManifestKey(): string {
+    const offload = this.offload as ResolvedSegmentOffload;
+    const ns = offload.namespace === '' ? '' : `${encodeURIComponent(offload.namespace)}/`;
+    return `${offload.keyPrefix}/${ns}manifest.json`;
+  }
+
+  /**
+   * EB-163: loads the remote offload manifest, keyed by
+   * `<topic>\0<segmentId>`. Absent manifest → empty (fresh key space).
+   * `corrupt: true` when the object exists but is not a well-formed
+   * manifest — the offload pass fails closed on that, never overwrites
+   * a manifest it cannot read (that would orphan every segment it
+   * lists). Throws on transport failure.
+   */
+  private loadRemoteManifest(): {
+    entries: Map<string, RemoteOffloadManifestEntry>;
+    corrupt: boolean;
+  } {
+    const offload = this.offload as ResolvedSegmentOffload;
+    const raw = offload.s3.getObject(this.remoteManifestKey());
+    const entries = new Map<string, RemoteOffloadManifestEntry>();
+    if (raw === undefined) return { entries, corrupt: false };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(raw).toString('utf8'));
+    } catch {
+      return { entries, corrupt: true };
+    }
+    if (typeof parsed !== 'object' || parsed === null) return { entries, corrupt: true };
+    const segments = (parsed as { segments?: unknown }).segments;
+    if (!Array.isArray(segments)) return { entries, corrupt: true };
+    for (const item of segments) {
+      const entry = parseRemoteManifestEntry(item);
+      if (entry === null) return { entries, corrupt: true };
+      entries.set(`${entry.topic}\0${entry.segmentId}`, entry);
+    }
+    return { entries, corrupt: false };
+  }
+
+  /**
+   * EB-163: uploads every archived segment the remote manifest does not
+   * know yet, then trims local copies beyond `retainLocalSegments`.
+   * Idempotent: the same bytes always address the same remote key and
+   * the manifest is upserted by (topic, segmentId), so a retry or a
+   * second log over the same key space re-uploads harmlessly. A dry-run
+   * client only records intended keys — no manifest write, no local
+   * trim, no upload accounting. Never throws: per-segment failures are
+   * counted in `stats().offloadFailed` and retried on the next pass.
+   * Returns what this pass did, for operators and tests.
+   */
+  offloadNow(): { uploaded: number; failed: number; keys: string[] } {
+    const offload = this.offload;
+    const result = { uploaded: 0, failed: 0, keys: [] as string[] };
+    if (offload === undefined) return result;
+    const dryRun = offload.s3.isDryRun === true;
+    let manifest: Map<string, RemoteOffloadManifestEntry>;
+    try {
+      const loaded = this.loadRemoteManifest();
+      if (loaded.corrupt) {
+        // Fail closed: overwriting an unreadable manifest would orphan
+        // the segments it lists.
+        this.offloadFailed += 1;
+        result.failed += 1;
+        return result;
+      }
+      manifest = loaded.entries;
+    } catch {
+      this.offloadFailed += 1;
+      result.failed += 1;
+      return result;
+    }
+    let manifestDirty = false;
+    for (const entry of this.archives) {
+      const id = `${entry.topic}\0${entry.segmentId}`;
+      if (manifest.has(id)) continue;
+      const key = this.remoteSegmentKey(entry);
+      let bytes: Uint8Array | undefined;
+      try {
+        bytes = this.backend.read(entry.path);
+      } catch {
+        bytes = undefined;
+      }
+      if (bytes === undefined) {
+        // Locally gone but never manifested (e.g. trimmed by an older
+        // build): nothing to upload — reads of it fail explicitly.
+        continue;
+      }
+      try {
+        offload.s3.putObject(key, bytes);
+      } catch {
+        this.offloadFailed += 1;
+        result.failed += 1;
+        continue;
+      }
+      if (dryRun) {
+        // Rehearsal: the client recorded the intended key; no remote
+        // state changes, no local trim.
+        result.keys.push(key);
+        continue;
+      }
+      manifest.set(id, {
+        v: 1,
+        topic: entry.topic,
+        segmentId: entry.segmentId,
+        key,
+        seqStart: entry.seqStart,
+        seqEnd: entry.seqEnd,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        entries: entry.entries,
+        bytes: bytes.length,
+      });
+      manifestDirty = true;
+      this.offloadUploaded += 1;
+      result.uploaded += 1;
+      result.keys.push(key);
+    }
+    if (manifestDirty) {
+      try {
+        offload.s3.putObject(
+          this.remoteManifestKey(),
+          Buffer.from(JSON.stringify({ v: 1, segments: [...manifest.values()] }), 'utf8'),
+        );
+      } catch {
+        // The segment bytes are safely remote; the manifest write is
+        // retried on the next pass (the segments re-upload idempotently).
+        this.offloadFailed += 1;
+        result.failed += 1;
+      }
+    }
+    if (!dryRun) this.trimLocalSegments(manifest);
+    return result;
+  }
+
+  /**
+   * EB-163: deletes local copies of archived segments beyond the newest
+   * `retainLocalSegments` per topic — the `.gz` and its checksum
+   * sidecar together (a sidecar without its bytes would read as a
+   * checksum failure at recovery). Only trims segments the manifest
+   * confirms as remote; the archive-index and chain-manifest lines stay
+   * — the segment remains known and replayable from the remote.
+   */
+  private trimLocalSegments(manifest: Map<string, RemoteOffloadManifestEntry>): void {
+    const offload = this.offload as ResolvedSegmentOffload;
+    const keep = offload.retainLocalSegments;
+    if (keep === Infinity) return;
+    for (const segments of this.archivesByTopic.values()) {
+      const ordered = [...segments].sort((a, b) => b.seqStart - a.seqStart);
+      for (let i = keep; i < ordered.length; i++) {
+        const entry = ordered[i];
+        if (!manifest.has(`${entry.topic}\0${entry.segmentId}`)) continue;
+        try {
+          this.backend.delete(entry.path);
+          this.backend.delete(this.checksumKey(entry.path));
+        } catch {
+          // Left for the next pass.
+        }
+      }
+    }
+  }
+
+  /**
+   * EB-163: reads one locally-trimmed segment back from the remote and
+   * verifies it against the manifest before returning its records.
+   * Throws explicitly — never silently truncates — when the manifest
+   * does not list the segment, the object is missing remotely, or the
+   * downloaded bytes do not match the manifest hash. Transport errors
+   * propagate as-is: also explicit, never a quiet gap.
+   */
+  private readRemoteSegmentRecords(
+    segment: ArchiveEntry,
+    fromSeqExclusive: number,
+  ): DurableLogRecord[] {
+    const offload = this.offload as ResolvedSegmentOffload;
+    const id = `${segment.topic}\0${segment.segmentId}`;
+    const key = this.remoteSegmentKey(segment);
+    const refuse = (detail: string): Error =>
+      new Error(
+        `durable log S3 offload: segment ${segment.topic} ${segment.segmentId} ${detail} ` +
+          '(refusing to truncate replay)',
+      );
+    const manifestEntry = this.loadRemoteManifest().entries.get(id);
+    if (manifestEntry === undefined) {
+      throw refuse(`is not listed in the remote manifest (key ${key})`);
+    }
+    if (!offload.s3.headObject(key)) {
+      throw refuse(`is missing remotely (key ${key})`);
+    }
+    const bytes = offload.s3.getObject(key);
+    if (bytes === undefined) {
+      throw refuse(`is missing remotely (key ${key})`);
+    }
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    if (actual !== manifestEntry.sha256) {
+      throw refuse(`hash mismatch: manifest ${manifestEntry.sha256}, remote bytes ${actual}`);
+    }
+    let text: string;
+    try {
+      text = gunzipSync(bytes).toString('utf8');
+    } catch (err) {
+      // The bytes are hash-verified: a decompress failure here is a
+      // genuine corruption worth failing on, not a skippable archive.
+      throw refuse(`downloaded bytes failed to decompress: ${(err as Error).message}`);
+    }
+    const out: DurableLogRecord[] = [];
+    this.parseArchivedSegmentText(text, segment.topic, fromSeqExclusive, out);
+    return out;
+  }
+
+  /**
+   * EB-163: parses one decompressed archived segment's lines into
+   * records newer than `fromSeqExclusive`, in file order. Shared by the
+   * local and remote read paths — the bytes differ, the line format does
+   * not.
+   */
+  private parseArchivedSegmentText(
+    text: string,
+    topic: string,
+    fromSeqExclusive: number,
+    out: DurableLogRecord[],
+  ): void {
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      // EB-80: archived record bytes are sealed per line; opened
+      // transparently, undecryptable lines skipped as corrupt.
+      const inner = this.openLine(line);
+      if (inner == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const rec = parseLogLine(inner, topic);
+      if (rec == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      if (rec.seq > fromSeqExclusive) out.push(rec);
+    }
   }
 
   /**
@@ -2694,6 +3167,25 @@ export class DurableTopicLog {
     const segments = this.archivesByTopic.get(topic) ?? [];
     for (const segment of segments) {
       if (segment.seqEnd <= fromSeqExclusive) continue;
+      let bytes: Uint8Array | undefined;
+      try {
+        bytes = this.backend.read(segment.path);
+      } catch {
+        bytes = undefined;
+      }
+      if (bytes === undefined) {
+        if (this.offload !== undefined) {
+          // EB-163: locally trimmed — pull from the remote and verify
+          // against the manifest hash. Throws explicitly on a missing
+          // or tampered remote segment: never a silent gap in replay.
+          for (const rec of this.readRemoteSegmentRecords(segment, fromSeqExclusive)) {
+            out.push(rec);
+          }
+          continue;
+        }
+        this.corruptArchives += 1;
+        continue;
+      }
       // EB-94: a checksum mismatch isolates the segment — skipped and
       // counted (`corruptSegments`), never fatal, exactly like a failed
       // decompress below.
@@ -2703,29 +3195,12 @@ export class DurableTopicLog {
       }
       let text: string;
       try {
-        const bytes = this.backend.read(segment.path);
-        if (bytes === undefined) throw new Error('missing segment');
         text = gunzipSync(bytes).toString('utf8');
       } catch {
         this.corruptArchives += 1;
         continue;
       }
-      for (const line of text.split('\n')) {
-        if (line.length === 0) continue;
-        // EB-80: archived record bytes are sealed per line; opened
-        // transparently, undecryptable lines skipped as corrupt.
-        const inner = this.openLine(line);
-        if (inner == null) {
-          this.corruptLines += 1;
-          continue;
-        }
-        const rec = parseLogLine(inner, topic);
-        if (rec == null) {
-          this.corruptLines += 1;
-          continue;
-        }
-        if (rec.seq > fromSeqExclusive) out.push(rec);
-      }
+      this.parseArchivedSegmentText(text, topic, fromSeqExclusive, out);
     }
     // Pending segments: rotated, awaiting the background archive pass.
     // The rename is atomic, so the object is complete and safe to read.
@@ -3696,6 +4171,16 @@ export class DurableTopicLog {
      * first-seen order.
      */
     segments: Record<string, { live: number; segments: number; archived: number }>;
+    /**
+     * EB-163: archived segments successfully uploaded to the remote.
+     * 0 when offload is disabled.
+     */
+    offloadUploaded: number;
+    /**
+     * EB-163: offload attempts that failed (segment upload or manifest
+     * write). 0 when offload is disabled.
+     */
+    offloadFailed: number;
   } {
     let entries = 0;
     for (const count of this.entryCounts.values()) entries += count;
@@ -3731,6 +4216,8 @@ export class DurableTopicLog {
       archived,
       segments,
       bytes,
+      offloadUploaded: this.offloadUploaded,
+      offloadFailed: this.offloadFailed,
       ...(this.maxBytesPerTopic === undefined ? {} : { bytesLimit: this.maxBytesPerTopic }),
     };
   }
