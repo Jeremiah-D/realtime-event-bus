@@ -233,6 +233,10 @@
  *   side (EB-131, see `BusStats.mirrorConflictsByTopic`) — the signal
  *   that two buses are writing the same key concurrently. Only topics
  *   with at least one conflict carry a series.
+ * - `eventbus_tenant_quota_bytes_total{namespace,pattern}`: admitted
+ *   payload bytes inside the sliding window per namespace tenant-quota
+ *   rule (EB-162, see `BusStats.namespaceQuotas`) — the multi-tenant
+ *   capacity signal; one series per registered rule.
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
@@ -1001,6 +1005,20 @@ export function renderPrometheus(stats: BusStats): string {
     'Total outbox records committed via publishAtomic since the relay was attached.',
     stats.outboxRelayed ?? 0,
   );
+
+  // Namespace tenant quotas (EB-162): admitted payload bytes inside each
+  // rule's sliding window, one series per registered (namespace,
+  // topic-pattern) rule — the multi-tenant capacity signal. The
+  // `?? []` keeps the renderer tolerant of a stats object that predates
+  // the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_tenant_quota_bytes_total Admitted payload bytes inside the sliding window per namespace tenant-quota rule (namespace, pattern).',
+  );
+  lines.push('# TYPE eventbus_tenant_quota_bytes_total gauge');
+  for (const q of stats.namespaceQuotas ?? []) {
+    const label = `namespace="${escapeLabelValue(q.namespace)}",pattern="${escapeLabelValue(q.pattern)}"`;
+    lines.push(`eventbus_tenant_quota_bytes_total{${label}} ${q.usedBytes}`);
+  }
 
   return lines.join('\n') + '\n';
 }

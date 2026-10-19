@@ -76,7 +76,8 @@ export type SubscriptionAuditAction =
   | 'delivery_sample_rate_updated'
   | 'header_filter_updated'
   | 'client_pressure'
-  | 'client_pressure_recovered';
+  | 'client_pressure_recovered'
+  | 'tenant_quota_warning';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -146,6 +147,11 @@ export type SubscriptionAuditAction =
  *   recoveryWatermarkBytes, resumedSubscriptions }` — the same
  *   connection's outbound queue drained back under the recovery
  *   watermark and the pressure-paused subscriptions were resumed
+ * - `tenant_quota_warning`: `{ namespace, pattern, usedMessages,
+ *   usedBytes, softMessages?, softBytes?, windowMs }` — a namespace
+ *   tenant quota (EB-162) reached its soft threshold; latched per
+ *   excursion (the `topic` field carries the concrete topic that
+ *   crossed the threshold)
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -218,6 +224,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'header_filter_updated',
   'client_pressure',
   'client_pressure_recovered',
+  'tenant_quota_warning',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

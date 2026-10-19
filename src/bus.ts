@@ -4381,6 +4381,19 @@ export interface BusStats {
    */
   pendingPressure: number;
   /**
+   * Total publishes shed by namespace tenant quotas (EB-162, see
+   * `setNamespaceQuota`): each shed publish counted once, at the
+   * admission-phase shed. Always 0 when no quota is configured.
+   */
+  tenantQuotaShedMessages: number;
+  /**
+   * Per-rule usage vs. quota for every registered namespace tenant
+   * quota (EB-162, see `setNamespaceQuota`), in registration order —
+   * the multi-tenant capacity view: which tenant's (namespace,
+   * topic-pattern) budget is close to its hard limit.
+   */
+  namespaceQuotas: TenantQuotaUsage[];
+  /**
    * Total messages shed by subscriber backpressure queues. Matches the
    * sum of the per-subscriber `droppedCount` values for live subscribers.
    */
@@ -8295,7 +8308,8 @@ export type AtomicRejectReason =
   | 'alias-retired'
   | 'topic-paused'
   | 'idempotency-conflict'
-  | 'pressure';
+  | 'pressure'
+  | 'tenant-quota';
 
 /**
  * Which publish-side admission gate decided a `previewPublish` call — the
@@ -8336,6 +8350,7 @@ export type PreviewGateName =
   | 'max-message-bytes'
   | 'max-payload-bytes'
   | 'topic-rate-limit'
+  | 'tenant-quota'
   | 'idempotency-dedup';
 
 /**
@@ -8651,6 +8666,14 @@ interface PauseBufferEntry {
  *   `EventBusOptions.maxPendingMessages`; like a `'publisher-rate-limit'`
  *   shed it consumes no sequence number, writes nothing to the durable
  *   log, and burns no rate-limit token)
+ * - `'tenant-quota'` → `BusStats.tenantQuotaShedMessages` (a namespace
+ *   tenant quota's hard limit (EB-162, `setNamespaceQuota`) shed the
+ *   publish in the admission phase — after every semantic gate, so only
+ *   publishes that would otherwise be admitted consume quota, and before
+ *   sequence-number assignment and the per-topic rate-limit budget; like
+ *   a `'publisher-rate-limit'` shed it consumes no sequence number,
+ *   writes nothing to the durable log, burns no rate-limit token, and is
+ *   invisible to gap detection)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
@@ -8672,6 +8695,7 @@ export type AdmissionRejectReason =
   | 'circuit-breaker'
   | 'sampled'
   | 'pressure'
+  | 'tenant-quota'
   | 'webhook-deny'
   | 'maintenance';
 
@@ -8714,6 +8738,86 @@ export interface AdmissionRejectionEvent {
  * the publish path.
  */
 export type AdmissionRejectionCallback = (event: AdmissionRejectionEvent) => void;
+
+/**
+ * Options for `EventBus.setNamespaceQuota` (EB-162): a per-tenant
+ * publish budget over a sliding window, keyed by `(namespace,
+ * topic-pattern)`.
+ *
+ * At least one of `messageLimit` / `byteLimit` / `softMessages` /
+ * `softBytes` is required. The hard limits (`messageLimit`,
+ * `byteLimit`) shed publishes in the admission phase with reason
+ * `'tenant-quota'`; the soft thresholds (`softMessages`, `softBytes`)
+ * only raise a `tenant_quota_warning` event in the subscription audit
+ * log (latched per excursion — it re-arms when usage slides back
+ * under the threshold).
+ */
+export interface TenantQuotaOptions {
+  /**
+   * Hard limit: at most this many admitted publishes per window for the
+   * rule's (namespace, topic-pattern). Past it, publishes shed in the
+   * admission phase (`'tenant-quota'`). Non-negative integer.
+   */
+  messageLimit?: number;
+  /**
+   * Hard limit: at most this many admitted payload bytes per window
+   * (JSON UTF-8 bytes, same estimator as the byte-size admission caps;
+   * unserializable payloads count as 0). Past it, publishes shed in the
+   * admission phase (`'tenant-quota'`). Non-negative integer.
+   */
+  byteLimit?: number;
+  /**
+   * Soft threshold: reaching this many admitted publishes per window
+   * fires one `tenant_quota_warning` audit event (latched — it re-arms
+   * when usage slides back under). Never sheds. Non-negative integer.
+   */
+  softMessages?: number;
+  /**
+   * Soft threshold in bytes: reaching this many admitted payload bytes
+   * per window fires one `tenant_quota_warning` audit event (latched).
+   * Never sheds. Non-negative integer.
+   */
+  softBytes?: number;
+  /**
+   * Sliding window length in milliseconds. Default 60000 (one minute).
+   * Must be a positive finite number.
+   */
+  windowMs?: number;
+}
+
+/**
+ * One namespace tenant quota's live usage, as reported by
+ * `BusStats.namespaceQuotas` (EB-162): usage vs. quota for every
+ * registered `(namespace, topic-pattern)` rule.
+ */
+export interface TenantQuotaUsage {
+  /** The tenant namespace this rule scopes (`'*'` matches every namespace, including the global bus). */
+  namespace: string;
+  /**
+   * The topic pattern this rule matches, against the
+   * namespace-resolved concrete topic (so it includes the namespace
+   * prefix, e.g. `'acme/orders.**'`).
+   */
+  pattern: string;
+  /** Sliding window length in milliseconds. */
+  windowMs: number;
+  /** Admitted publishes inside the current window. */
+  usedMessages: number;
+  /** Admitted payload bytes inside the current window. */
+  usedBytes: number;
+  /** Configured hard message limit, when set. */
+  messageLimit?: number;
+  /** Configured hard byte limit, when set. */
+  byteLimit?: number;
+  /** Configured soft message threshold, when set. */
+  softMessages?: number;
+  /** Configured soft byte threshold, when set. */
+  softBytes?: number;
+  /** Publishes this rule shed (`'tenant-quota'`) — lifetime of the rule. */
+  sheds: number;
+  /** Soft-threshold warnings this rule fired — lifetime of the rule. */
+  warnings: number;
+}
 
 /**
  * Which loss an admission dead-letter record (EB-139) describes. The
@@ -10870,6 +10974,34 @@ interface FanOutGroupTask {
   hit: { groupId: string; members: Subscriber[] };
 }
 
+/**
+ * A registered namespace tenant quota (EB-162): the compiled form of
+ * `TenantQuotaOptions` plus the sliding-window usage accounting. Usage
+ * is tracked in per-second buckets (`buckets`, keyed by
+ * `Math.floor(nowMs / 1000)`) with running totals, so pruning is O(live
+ * buckets) and memory stays bounded by the window length.
+ */
+interface TenantQuotaRule {
+  namespace: string;
+  pattern: string;
+  matcher: RegExp;
+  messageLimit?: number;
+  byteLimit?: number;
+  softMessages?: number;
+  softBytes?: number;
+  windowMs: number;
+  buckets: Map<number, { messages: number; bytes: number }>;
+  usedMessages: number;
+  usedBytes: number;
+  /** Soft-warning latch: set while usage is at/above a soft threshold. */
+  warned: boolean;
+  sheds: number;
+  warnings: number;
+}
+
+/** Hard cap on a quota rule's live second-buckets (clock-jump safety). */
+const TENANT_QUOTA_MAX_BUCKETS = 4096;
+
 export class EventBus {
   /**
    * Stable identity of this bus instance (see `EventBusOptions.busId`):
@@ -12354,6 +12486,18 @@ export class EventBus {
    * `BusStats.pendingPressure`.
    */
   private totalPressureShed = 0;
+  /**
+   * Total publishes shed by namespace tenant quotas (EB-162). Counts
+   * each shed publish once, at the admission-phase shed. Surfaced as
+   * `BusStats.tenantQuotaShedMessages`.
+   */
+  private totalTenantQuotaShed = 0;
+  /**
+   * Namespace tenant quotas (EB-162), keyed by
+   * `${namespace}\0${pattern}` in registration order: the per-tenant
+   * publish budgets consulted by the admission gate.
+   */
+  private readonly tenantQuotaRules = new Map<string, TenantQuotaRule>();
   /** Pull-mode counters surfaced as `getStats().pullStats` (EB-111). */
   private totalPulls = 0;
   private totalPulledMessages = 0;
@@ -13046,6 +13190,308 @@ export class EventBus {
    */
   clearTopicTtl(topicPattern: string): boolean {
     return this.ttlRules.delete(topicPattern);
+  }
+
+  /**
+   * Registers (or replaces) a namespace tenant quota (EB-162): a
+   * per-tenant publish budget over a sliding window, keyed by
+   * `(namespace, topic-pattern)` — the multi-tenant capacity control
+   * for a bus shared by tenants.
+   *
+   * Matching: `pattern` is matched against the namespace-resolved
+   * concrete topic (so it includes the namespace prefix, e.g.
+   * `'acme/orders.**'`), with the same precedence as the other
+   * per-topic rules — an exact `(namespace, topic)` rule wins, and
+   * between patterns the earliest-registered matching rule wins. The
+   * `namespace` additionally scopes the rule: a rule for `'acme'`
+   * applies only to topics under `acme/`, while `'*'` matches every
+   * namespace including the global (namespace-less) bus.
+   *
+   * Enforcement: the hard limits are the last pre-admission gate in
+   * `publish` — after every semantic gate (ACL, schema, size caps), so
+   * only publishes that would otherwise be admitted consume quota, and
+   * before sequence-number assignment and the per-topic rate-limit
+   * budget (a shed consumes no sequence number, writes nothing to the
+   * durable log, and burns no rate-limit token). A shed surfaces on
+   * `onAdmissionRejected` with reason `'tenant-quota'` and counts in
+   * `BusStats.tenantQuotaShedMessages`. The soft thresholds never shed:
+   * reaching one fires a single `tenant_quota_warning` event in the
+   * subscription audit log (latched per excursion — it re-arms when
+   * usage slides back under).
+   *
+   * Replacing a rule keeps its accumulated usage (the window is not
+   * reset) so a tightened limit bites immediately; clearing a rule
+   * drops its usage with it. Usage is attributed once per admitted
+   * publish, including `publishAtomic` commit-phase entries (checked
+   * in the shadow admission, recorded at commit).
+   *
+   * Throws `RangeError` when `namespace` / `pattern` is empty, when
+   * `windowMs` is not a positive finite number, when a limit is not a
+   * non-negative finite number (message counts must be integers), or
+   * when no limit/threshold is set at all.
+   */
+  setNamespaceQuota(namespace: string, pattern: string, options: TenantQuotaOptions): void {
+    if (typeof namespace !== 'string' || namespace.length === 0) {
+      throw new RangeError('setNamespaceQuota: namespace must be a non-empty string');
+    }
+    if (namespace !== '*') validateNamespacePrefix(namespace);
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('setNamespaceQuota: pattern must be a non-empty string');
+    }
+    const opts = options ?? {};
+    const windowMs = opts.windowMs ?? 60000;
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new RangeError('setNamespaceQuota: windowMs must be a positive finite number');
+    }
+    const checkLimit = (value: number | undefined, name: string, integer: boolean): void => {
+      if (value === undefined) return;
+      if (!Number.isFinite(value) || value < 0 || (integer && !Number.isInteger(value))) {
+        throw new RangeError(
+          `setNamespaceQuota: ${name} must be a non-negative finite${integer ? ' integer' : ''} number`,
+        );
+      }
+    };
+    checkLimit(opts.messageLimit, 'messageLimit', true);
+    checkLimit(opts.byteLimit, 'byteLimit', true);
+    checkLimit(opts.softMessages, 'softMessages', true);
+    checkLimit(opts.softBytes, 'softBytes', true);
+    if (
+      opts.messageLimit === undefined &&
+      opts.byteLimit === undefined &&
+      opts.softMessages === undefined &&
+      opts.softBytes === undefined
+    ) {
+      throw new RangeError(
+        'setNamespaceQuota: at least one of messageLimit/byteLimit/softMessages/softBytes is required',
+      );
+    }
+    const key = `${namespace}\0${pattern}`;
+    const existing = this.tenantQuotaRules.get(key);
+    this.tenantQuotaRules.set(key, {
+      namespace,
+      pattern,
+      matcher: existing !== undefined ? existing.matcher : compilePattern(pattern),
+      messageLimit: opts.messageLimit,
+      byteLimit: opts.byteLimit,
+      softMessages: opts.softMessages,
+      softBytes: opts.softBytes,
+      windowMs,
+      buckets: existing?.buckets ?? new Map(),
+      usedMessages: existing?.usedMessages ?? 0,
+      usedBytes: existing?.usedBytes ?? 0,
+      warned: existing?.warned ?? false,
+      sheds: existing?.sheds ?? 0,
+      warnings: existing?.warnings ?? 0,
+    });
+  }
+
+  /**
+   * Removes the tenant quota previously registered for
+   * `(namespace, pattern)` (see `setNamespaceQuota`). Returns true when
+   * a rule existed and was removed; its accumulated usage is dropped
+   * with it.
+   */
+  clearNamespaceQuota(namespace: string, pattern: string): boolean {
+    return this.tenantQuotaRules.delete(`${namespace}\0${pattern}`);
+  }
+
+  /**
+   * Resolves the tenant quota rule for a namespace-resolved concrete
+   * topic, or `undefined` when no rule matches. An exact
+   * `(namespace, topic)` rule wins; between patterns the
+   * earliest-registered matching rule wins (the `setTopicTtl`
+   * precedence). A rule for namespace `'acme'` applies only to topics
+   * under `acme/`; a `'*'`-namespaced rule matches every topic.
+   */
+  private tenantQuotaRuleForTopic(topic: string): TenantQuotaRule | undefined {
+    const slash = topic.indexOf('/');
+    const ns = slash === -1 ? '' : topic.slice(0, slash);
+    if (ns !== '') {
+      const exact = this.tenantQuotaRules.get(`${ns}\0${topic}`);
+      if (exact !== undefined) return exact;
+    }
+    const starExact = this.tenantQuotaRules.get(`*\0${topic}`);
+    if (starExact !== undefined) return starExact;
+    for (const rule of this.tenantQuotaRules.values()) {
+      if (rule.namespace !== '*' && !topic.startsWith(`${rule.namespace}/`)) continue;
+      if (rule.matcher.test(topic)) return rule;
+    }
+    return undefined;
+  }
+
+  /** Drops a quota rule's second-buckets that fell out of its window. */
+  private pruneTenantQuotaBuckets(rule: TenantQuotaRule, nowMs: number): void {
+    const horizon = nowMs - rule.windowMs;
+    for (const [second, usage] of rule.buckets) {
+      if ((second + 1) * 1000 <= horizon) {
+        rule.usedMessages -= usage.messages;
+        rule.usedBytes -= usage.bytes;
+        rule.buckets.delete(second);
+      }
+    }
+    // Clock-jump safety: never let the bucket map grow without bound.
+    while (rule.buckets.size > TENANT_QUOTA_MAX_BUCKETS) {
+      let oldest: number | undefined;
+      for (const second of rule.buckets.keys()) {
+        if (oldest === undefined || second < oldest) oldest = second;
+      }
+      if (oldest === undefined) break;
+      const usage = rule.buckets.get(oldest)!;
+      rule.usedMessages -= usage.messages;
+      rule.usedBytes -= usage.bytes;
+      rule.buckets.delete(oldest);
+    }
+  }
+
+  /**
+   * The tenant-quota admission check (EB-162). Returns the rule when its
+   * hard limit would be exceeded, `undefined` otherwise.
+   *
+   * `mode` decides the accounting: `'record'` checks and attributes the
+   * publish (firing the soft-warning latch on crossing);
+   * `'shadow'` checks against `shadow` (the `publishAtomic` phase-1 /
+   * `previewPublish` path — no mutation, the usage lands in the shadow
+   * map for the caller to account); `'probe'` checks without any
+   * accounting.
+   */
+  private checkTenantQuota(
+    topic: string,
+    payload: unknown,
+    mode: 'record' | 'shadow' | 'probe',
+    shadow?: Map<TenantQuotaRule, { messages: number; bytes: number }>,
+  ): TenantQuotaRule | undefined {
+    const rule = this.tenantQuotaRuleForTopic(topic);
+    if (rule === undefined) return undefined;
+    const nowMs = this.now();
+    this.pruneTenantQuotaBuckets(rule, nowMs);
+    const bytes = payloadByteSize(payload);
+    const pending = shadow?.get(rule);
+    const usedMessages = rule.usedMessages + (pending?.messages ?? 0);
+    const usedBytes = rule.usedBytes + (pending?.bytes ?? 0);
+    if (
+      (rule.messageLimit !== undefined && usedMessages + 1 > rule.messageLimit) ||
+      (rule.byteLimit !== undefined && usedBytes + bytes > rule.byteLimit)
+    ) {
+      return rule;
+    }
+    if (mode === 'record') {
+      this.addTenantQuotaUsage(rule, nowMs, bytes);
+      this.maybeWarnTenantQuota(rule, topic);
+    } else if (mode === 'shadow' && shadow !== undefined) {
+      shadow.set(rule, {
+        messages: (pending?.messages ?? 0) + 1,
+        bytes: (pending?.bytes ?? 0) + bytes,
+      });
+    }
+    return undefined;
+  }
+
+  /** Attributes one admitted publish to a quota rule's window. */
+  private addTenantQuotaUsage(rule: TenantQuotaRule, nowMs: number, bytes: number): void {
+    const second = Math.floor(nowMs / 1000);
+    const bucket = rule.buckets.get(second);
+    if (bucket === undefined) {
+      rule.buckets.set(second, { messages: 1, bytes });
+    } else {
+      bucket.messages += 1;
+      bucket.bytes += bytes;
+    }
+    rule.usedMessages += 1;
+    rule.usedBytes += bytes;
+  }
+
+  /**
+   * Fires the soft-threshold warning latch (EB-162): the first publish
+   * that reaches a soft threshold emits `tenant_quota_warning` into the
+   * subscription audit log; the latch re-arms when usage slides back
+   * under every soft threshold, so one excursion produces exactly one
+   * warning.
+   */
+  private maybeWarnTenantQuota(rule: TenantQuotaRule, topic: string): void {
+    const softHit =
+      (rule.softMessages !== undefined && rule.usedMessages >= rule.softMessages) ||
+      (rule.softBytes !== undefined && rule.usedBytes >= rule.softBytes);
+    if (softHit && !rule.warned) {
+      rule.warned = true;
+      rule.warnings += 1;
+      this.auditSubscription({
+        action: 'tenant_quota_warning',
+        actor: 'system',
+        topic,
+        detail: {
+          namespace: rule.namespace,
+          pattern: rule.pattern,
+          usedMessages: rule.usedMessages,
+          usedBytes: rule.usedBytes,
+          ...(rule.softMessages === undefined ? {} : { softMessages: rule.softMessages }),
+          ...(rule.softBytes === undefined ? {} : { softBytes: rule.softBytes }),
+          windowMs: rule.windowMs,
+        },
+      });
+    } else if (!softHit) {
+      rule.warned = false;
+    }
+  }
+
+  /**
+   * Records quota usage for an already-admitted publish — the
+   * `publishAtomic` commit phase (pre-admitted `fanOut` skips the gate):
+   * the shadow admission already verified the hard limit, so this only
+   * attributes usage and evaluates the soft latch. No-op when no rule
+   * matches.
+   */
+  private recordTenantQuotaUsage(topic: string, payload: unknown): void {
+    const rule = this.tenantQuotaRuleForTopic(topic);
+    if (rule === undefined) return;
+    const nowMs = this.now();
+    this.pruneTenantQuotaBuckets(rule, nowMs);
+    this.addTenantQuotaUsage(rule, nowMs, payloadByteSize(payload));
+    this.maybeWarnTenantQuota(rule, topic);
+  }
+
+  /**
+   * Counts one publish shed by a namespace tenant quota's hard limit
+   * (EB-162) against the bus-wide total, then fires the
+   * admission-rejection hook with reason `'tenant-quota'`. Like the
+   * `'publisher-rate-limit'` shed this consumes no sequence number,
+   * writes nothing to the durable log, burns no rate-limit token, and
+   * is invisible to gap detection.
+   */
+  private countTenantQuotaShed(
+    topic: string,
+    payload: unknown,
+    publisherId: string | undefined,
+    traceId: string | undefined,
+    rule: TenantQuotaRule,
+  ): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
+    this.totalTenantQuotaShed += 1;
+    rule.sheds += 1;
+    this.emitAdmissionRejected(topic, 'tenant-quota', payload, publisherId, traceId);
+  }
+
+  /** Builds the `BusStats.namespaceQuotas` snapshot (pure read). */
+  private tenantQuotaUsageSnapshot(): TenantQuotaUsage[] {
+    const nowMs = this.now();
+    const out: TenantQuotaUsage[] = [];
+    for (const rule of this.tenantQuotaRules.values()) {
+      this.pruneTenantQuotaBuckets(rule, nowMs);
+      out.push({
+        namespace: rule.namespace,
+        pattern: rule.pattern,
+        windowMs: rule.windowMs,
+        usedMessages: rule.usedMessages,
+        usedBytes: rule.usedBytes,
+        ...(rule.messageLimit === undefined ? {} : { messageLimit: rule.messageLimit }),
+        ...(rule.byteLimit === undefined ? {} : { byteLimit: rule.byteLimit }),
+        ...(rule.softMessages === undefined ? {} : { softMessages: rule.softMessages }),
+        ...(rule.softBytes === undefined ? {} : { softBytes: rule.softBytes }),
+        sheds: rule.sheds,
+        warnings: rule.warnings,
+      });
+    }
+    return out;
   }
 
   /**
@@ -22610,6 +23056,7 @@ export class EventBus {
       opts?.publisherId,
       new Map<string, number>(),
       opts?.schemaVersion,
+      new Map<TenantQuotaRule, { messages: number; bytes: number }>(),
     );
     if (verdict !== undefined) {
       return { admitted: false, reason: verdict.reason, failedGate: verdict.failedGate };
@@ -22841,6 +23288,11 @@ export class EventBus {
     // Per-publisher rate-limit reservations for this batch (EB-79): a
     // batch cannot overdraft one publisher's bucket with its own entries.
     const publisherShadowBudget = new Map<string, number>();
+    // Namespace tenant quota reservations for this batch (EB-162): the
+    // shadow admission checks each entry against the rule's live usage
+    // plus the batch's own reservations, and the commit phase attributes
+    // the verified usage.
+    const quotaShadowBudget = new Map<TenantQuotaRule, { messages: number; bytes: number }>();
     // Per-key sequence numbers are drawn in entry order (publish order)
     // against a shadow cursor: a rejected batch leaves the live cursors —
     // and every subscriber's key baseline — exactly untouched.
@@ -22907,6 +23359,7 @@ export class EventBus {
         entries[index].publisherId,
         publisherShadowBudget,
         entries[index].schemaVersion,
+        quotaShadowBudget,
       );
       if (verdict !== undefined) {
         // The batch is rejected on the failing entry: count it once against
@@ -22928,7 +23381,14 @@ export class EventBus {
         else if (reason === 'publisher-rate-limit')
           this.countPublisherRateLimited(topic, payload, publisherId);
         else if (reason === 'topic-paused') this.countTopicPaused(topic, payload, publisherId);
-        else this.countRateLimited(topic, payload, publisherId, entryTraceId);
+        else if (reason === 'tenant-quota') {
+          // The shadow verdict matched the alias-resolved topic; count
+          // the shed against the entry's topic like the other gates.
+          const quotaRule = this.tenantQuotaRuleForTopic(resolvedTopic);
+          if (quotaRule !== undefined) {
+            this.countTenantQuotaShed(topic, payload, publisherId, entryTraceId, quotaRule);
+          }
+        } else this.countRateLimited(topic, payload, publisherId, entryTraceId);
         return { published: 0, rejected: { index, topic, reason } };
       }
       // EB-156: accumulate the batch's conservative fan-out width for the
@@ -23065,6 +23525,13 @@ export class EventBus {
           this.now(),
         );
       }
+      // Namespace tenant quota (EB-162): the shadow admission verified
+      // the hard limit against the batch's reservations; the commit
+      // attributes the usage (pre-admitted `fanOut` skips the gate, so
+      // this is the only accounting point for atomic entries).
+      if (commitOutcome.admitted) {
+        this.recordTenantQuotaUsage(resolvedTopics[index], admittedPayloads[index]);
+      }
     }
     this.scheduleFlush();
     return { published: entries.length };
@@ -23113,6 +23580,7 @@ export class EventBus {
     publisherId: string | undefined,
     publisherShadowBudget: Map<string, number>,
     schemaVersion: number | undefined,
+    quotaShadow: Map<TenantQuotaRule, { messages: number; bytes: number }>,
   ): { reason: AtomicRejectReason; failedGate: PreviewGateName } | undefined {
     // Topic pause (EB-88) is the first shadow gate, mirroring `fanOut`:
     // any paused entry — shed or queue mode — rejects the whole batch. A
@@ -23171,6 +23639,12 @@ export class EventBus {
         return { reason: 'rate-limit', failedGate: 'topic-rate-limit' };
       shadowBudget.set(topic, reserved + 1);
     }
+    // Namespace tenant quota (EB-162): the last shadow gate, mirroring
+    // `fanOut` — checked in shadow mode so a preview or an atomic
+    // batch never mutates usage; the atomic commit phase attributes the
+    // usage it verified here.
+    if (this.checkTenantQuota(topic, payload, 'shadow', quotaShadow) !== undefined)
+      return { reason: 'tenant-quota', failedGate: 'tenant-quota' };
     return undefined;
   }
 
@@ -28993,6 +29467,20 @@ export class EventBus {
           }
         }
       }
+      // Namespace tenant quota (EB-162): the last pre-admission gate —
+      // after every semantic check (so only publishes that would
+      // otherwise be admitted consume quota) and before sequence-number
+      // assignment and the per-topic rate-limit budget below. A shed
+      // consumes no sequence number (invisible to gap detection), writes
+      // nothing to the durable log, and burns no rate-limit token.
+      // Skipped for pre-admitted re-fan-outs and admission-DLQ records,
+      // like the gates above.
+      const quotaRule = this.checkTenantQuota(topic, payload, 'record');
+      if (quotaRule !== undefined) {
+        this.countTenantQuotaShed(topic, payload, publisherId, admissionTraceId, quotaRule);
+        auditPublish(false, undefined, 'tenant-quota');
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'tenant-quota' };
+      }
     }
     // The message identity rides the envelope end to end (durable log,
     // replay, cluster forwarding, redeliveries) for subscriber-side
@@ -30604,6 +31092,8 @@ export class EventBus {
       deliveredMessages: this.totalDelivered,
       fanOutYields: this.fanOutYieldCount,
       pendingPressure: this.totalPressureShed,
+      tenantQuotaShedMessages: this.totalTenantQuotaShed,
+      namespaceQuotas: this.tenantQuotaUsageSnapshot(),
       droppedMessages: this.totalDropped,
       blockedMessages: this.totalBlocked,
       blockedSubscribers: [...this.subscribers.values()].filter((s) => s.blocked).length,

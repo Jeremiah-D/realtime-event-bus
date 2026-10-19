@@ -1889,6 +1889,27 @@ Semantics:
   byte-for-byte identical to before.
 - **Deliveries name the concrete topic** (`t1/orders`): the handle is a
   scope, not a rename.
+- **Tenant quotas (EB-162).** `bus.setNamespaceQuota(namespace, pattern,
+  opts)` installs a per-tenant publish budget over a sliding window
+  (default 60 s), keyed by `(namespace, topic-pattern)` — the
+  multi-tenant capacity control for a bus shared by tenants. Hard
+  limits (`messageLimit`, `byteLimit`) shed publishes in the admission
+  phase with reason `'tenant-quota'` (no sequence number, no
+  durable-log write, no rate-limit budget — invisible to gap
+  detection); soft thresholds (`softMessages`, `softBytes`) fire one
+  latched `tenant_quota_warning` audit event per excursion. Patterns
+  match the namespace-resolved concrete topic with the usual
+  precedence (exact `(namespace, topic)` wins, earliest-registered
+  pattern wins); the `namespace` additionally scopes the rule (`'*'`
+  matches every namespace including the global bus).
+  `bus.clearNamespaceQuota(namespace, pattern)` removes a rule;
+  re-setting one keeps its accumulated usage so a tightened limit
+  bites immediately. `getStats()` gains `tenantQuotaShedMessages` and
+  per-rule `namespaceQuotas` (usage vs. quota); Prometheus exposition
+  adds `eventbus_tenant_quota_bytes_total{namespace,pattern}`. Like
+  the other per-topic rules, write quota patterns against concrete
+  `t1/<topic>` forms (`t1/**` won't match `t1/orders` — see the
+  implementation note below).
 
 Implementation note (deliberate deviation): the bus's wildcard segments
 split on `.` only — `/` is a literal character *inside* a segment. That
