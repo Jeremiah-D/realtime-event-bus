@@ -74,7 +74,9 @@ export type SubscriptionAuditAction =
   | 'subscriber_resumed'
   | 'subscriber_seek'
   | 'delivery_sample_rate_updated'
-  | 'header_filter_updated';
+  | 'header_filter_updated'
+  | 'client_pressure'
+  | 'client_pressure_recovered';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -134,6 +136,16 @@ export type SubscriptionAuditAction =
  *   — a `setHeaderFilter` (EB-153) hot-update replaced the subscriber's
  *   header-filter rules (`0` when the filter was cleared);
  *   `subId`/`pattern` identify the subscription
+ * - `client_pressure`: `{ remoteAddress?, queuedBytes, watermarkBytes,
+ *   pausedSubscriptions }` — a gateway (EB-99) connection's outbound
+ *   queue crossed its client-pressure watermark (EB-161): the
+ *   connection's bus subscriptions were paused so a slow client can no
+ *   longer grow the gateway process's memory; `pausedSubscriptions` is
+ *   the number of subscriptions this event paused
+ * - `client_pressure_recovered`: `{ remoteAddress?, queuedBytes,
+ *   recoveryWatermarkBytes, resumedSubscriptions }` — the same
+ *   connection's outbound queue drained back under the recovery
+ *   watermark and the pressure-paused subscriptions were resumed
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -204,6 +216,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'subscriber_seek',
   'delivery_sample_rate_updated',
   'header_filter_updated',
+  'client_pressure',
+  'client_pressure_recovered',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

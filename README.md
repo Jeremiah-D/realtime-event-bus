@@ -3591,7 +3591,26 @@ Semantics:
   `droppedFrames` — the gateway sheds load instead of growing memory.
   `gw.getStats()` reports
   `{connections, framesReceived, framesSent, droppedFrames, authFailures,
-  protocolErrors}`.
+  protocolErrors, pausedConnections, connectionQueues}`.
+- **Client pressure (EB-161, opt-in).** With
+  `clientPressureWatermarkBytes` set, a connection whose queued bytes
+  reach the watermark pauses its bus subscriptions (delivery-side hold —
+  the subscriber queues keep accumulating under their normal
+  backpressure policies, nothing is dropped) instead of letting the
+  queue keep growing toward `maxPendingBytes`; draining back under
+  `clientPressureRecoveryWatermarkBytes` (default: half the watermark)
+  resumes exactly the subscriptions the pressure paused — an
+  operator's manual pause is never cleared. Both transitions are
+  audited as `client_pressure` / `client_pressure_recovered`
+  (`bus.getSubscriptionAudit()`), and `gw.getStats()` exposes
+  per-connection `queuedBytes` plus the `pausedConnections` count. A
+  slow client can no longer OOM the gateway process.
+- **Drain liveness.** The queued backlog is normally drained by the
+  socket's `drain` event, which only fires after `write()` returns
+  false (past Node's own writable mark). When
+  `sendHighWaterMarkBytes` sits below that mark, a short unref'd poll
+  retries the flush while backlog remains — otherwise a paused
+  connection's queue would stall forever.
 
 Invalid option values throw `RangeError` fail-fast. Inbound frames larger
 than `maxFrameBytes` (default 1 MiB) close the connection with 1009 —

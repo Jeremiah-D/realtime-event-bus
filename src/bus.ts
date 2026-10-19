@@ -14528,6 +14528,34 @@ export class EventBus {
   }
 
   /**
+   * Records one gateway client-pressure transition in the subscription
+   * audit log (EB-161): a `GatewayServer` connection's outbound send
+   * queue crossed its per-connection pressure watermark and the
+   * connection's bus subscriptions were paused (`'pressure'`), or the
+   * queue drained back under the recovery watermark and the
+   * pressure-paused subscriptions were resumed (`'recovered'`).
+   * Audited as `client_pressure` / `client_pressure_recovered` with
+   * `{ remoteAddress?, queuedBytes, watermarkBytes,
+   * pausedSubscriptions }` detail. Fully error-isolated like every
+   * audit site: a broken audit log can never disturb the connection.
+   */
+  noteGatewayClientPressure(
+    kind: 'pressure' | 'recovered',
+    detail: {
+      remoteAddress?: string;
+      queuedBytes: number;
+      watermarkBytes: number;
+      pausedSubscriptions: number;
+    },
+  ): void {
+    this.auditSubscription({
+      action: kind === 'pressure' ? 'client_pressure' : 'client_pressure_recovered',
+      actor: 'system',
+      detail: { ...detail },
+    });
+  }
+
+  /**
    * Receives one forwarded message from another bus's forward rule
    * (EB-56) — the destination-side half of `forward()`. INTERNAL USE
    * ONLY: only forward and mirror registrations call this; producers

@@ -84,7 +84,17 @@
  * counted in `droppedFrames` — the gateway sheds load instead of growing
  * memory without bound. `GatewayServer.getStats()` reports
  * `{connections, framesReceived, framesSent, droppedFrames,
- * authFailures, protocolErrors}`.
+ * authFailures, protocolErrors, pausedConnections, connectionQueues}`.
+ *
+ * Client pressure (EB-161, opt-in): with
+ * `clientPressureWatermarkBytes` set, a connection whose queued bytes
+ * reach the watermark pauses its bus subscriptions (delivery-side hold,
+ * nothing dropped — the subscriber queues keep accumulating under
+ * their normal backpressure policies) instead of letting the queue
+ * keep growing toward `maxPendingBytes`; draining back under
+ * `clientPressureRecoveryWatermarkBytes` resumes them. Both
+ * transitions are audited as `client_pressure` /
+ * `client_pressure_recovered` (`bus.getSubscriptionAudit()`).
  */
 import {
   createServer as createTcpServer,
@@ -306,6 +316,13 @@ export interface GatewayOptions {
   /**
    * Socket-buffer bytes past which a connection pauses pushing frames
    * and queues them locally instead. Default 256 KiB.
+   *
+   * Implementation note: the queued backlog is normally drained by the
+   * socket's `drain` event, which only fires after `write()` returns
+   * false — i.e. past Node's own writable mark. When this option sits
+   * below that mark, a short unref'd poll retries the flush while
+   * backlog remains (see `scheduleDrainPoll`); otherwise a paused
+   * connection's queue would stall forever.
    */
   sendHighWaterMarkBytes?: number;
   /**
@@ -318,6 +335,28 @@ export interface GatewayOptions {
    * closed with 1009. Default 1 MiB.
    */
   maxFrameBytes?: number;
+  /**
+   * Opt-in per-connection send-queue byte watermark (EB-161): while a
+   * connection's queued outbound bytes reach this watermark, the
+   * connection's bus subscriptions are paused (delivery-side pause, no
+   * drops — the subscriber queues keep accumulating under their normal
+   * backpressure policies) so a slow client can no longer grow the
+   * gateway process's memory. When the queued bytes drain back under
+   * `clientPressureRecoveryWatermarkBytes` the paused subscriptions
+   * resume automatically. The transitions are audited as
+   * `client_pressure` / `client_pressure_recovered`
+   * (`bus.getSubscriptionAudit()`). Default: unset (disabled) — the
+   * gateway keeps its historical shed-newest behavior
+   * (`maxPendingBytes`) unchanged.
+   */
+  clientPressureWatermarkBytes?: number;
+  /**
+   * Recovery watermark for `clientPressureWatermarkBytes` (EB-161): the
+   * queued-bytes level at or below which a pressured connection resumes
+   * its paused subscriptions. Must be below the pressure watermark;
+   * defaults to half of it.
+   */
+  clientPressureRecoveryWatermarkBytes?: number;
   /**
    * Opt-in disconnect hook (EB-132): called once per established
    * (handshook) connection teardown — wire it to
@@ -343,6 +382,23 @@ export interface GatewayStats {
   droppedFrames: number;
   authFailures: number;
   protocolErrors: number;
+  /**
+   * Connections currently under client pressure (EB-161): their send
+   * queues crossed `clientPressureWatermarkBytes` and their bus
+   * subscriptions are paused. Zero unless the watermark is configured.
+   */
+  pausedConnections: number;
+  /**
+   * One row per live connection, in connection order: its queued
+   * outbound bytes and whether it is currently pressured (EB-161).
+   */
+  connectionQueues: Array<{
+    remoteAddress?: string;
+    /** Queued (not yet socket-written) outbound bytes. */
+    queuedBytes: number;
+    /** True while the connection's subscriptions are pressure-paused. */
+    pressured: boolean;
+  }>;
 }
 
 interface ConnectionSubscription {
@@ -361,7 +417,24 @@ interface Connection {
   pending: Buffer[];
   pendingBytes: number;
   subscriptions: Map<string, ConnectionSubscription>;
+  /**
+   * Client-pressure state (EB-161): true while the connection's queued
+   * bytes are at or above the pressure watermark and its subscriptions
+   * are paused. `pressurePausedSubs` holds exactly the subscription ids
+   * this connection paused for pressure — recovery resumes only these,
+   * never an operator's manual pause.
+   */
+  pressured: boolean;
+  pressurePausedSubs: Set<string>;
+  /**
+   * Level-triggered drain kick (see `scheduleDrainPoll`): set while a
+   * poll is armed. Unref'd — it never keeps the process alive.
+   */
+  drainPoll: ReturnType<typeof setTimeout> | undefined;
 }
+
+/** Poll interval for the level-triggered drain kick (see `scheduleDrainPoll`). */
+const DRAIN_POLL_MS = 10;
 
 type ErrorCode =
   | 'auth_failed'
@@ -394,6 +467,8 @@ export class GatewayServer {
   private readonly sendHighWaterMarkBytes: number;
   private readonly maxPendingBytes: number;
   private readonly maxFrameBytes: number;
+  private readonly clientPressureWatermarkBytes: number | undefined;
+  private readonly clientPressureRecoveryWatermarkBytes: number;
   private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
   private server: TcpServer | null = null;
   private readonly connections = new Set<Connection>();
@@ -430,6 +505,30 @@ export class GatewayServer {
       fail('maxFrameBytes must be a positive finite number');
     }
     this.maxFrameBytes = maxFrameBytes;
+    const clientPressureWatermarkBytes = options.clientPressureWatermarkBytes;
+    if (clientPressureWatermarkBytes !== undefined) {
+      if (!Number.isFinite(clientPressureWatermarkBytes) || clientPressureWatermarkBytes <= 0) {
+        fail('clientPressureWatermarkBytes must be a positive finite number');
+      }
+    }
+    this.clientPressureWatermarkBytes = clientPressureWatermarkBytes;
+    let clientPressureRecoveryWatermarkBytes =
+      options.clientPressureRecoveryWatermarkBytes ??
+      (clientPressureWatermarkBytes === undefined
+        ? 0
+        : Math.floor(clientPressureWatermarkBytes / 2));
+    if (clientPressureWatermarkBytes !== undefined) {
+      if (
+        !Number.isFinite(clientPressureRecoveryWatermarkBytes) ||
+        clientPressureRecoveryWatermarkBytes <= 0
+      ) {
+        fail('clientPressureRecoveryWatermarkBytes must be a positive finite number');
+      }
+      if (clientPressureRecoveryWatermarkBytes >= clientPressureWatermarkBytes) {
+        fail('clientPressureRecoveryWatermarkBytes must be below clientPressureWatermarkBytes');
+      }
+    }
+    this.clientPressureRecoveryWatermarkBytes = clientPressureRecoveryWatermarkBytes;
     const onDisconnect = options.onDisconnect;
     if (onDisconnect !== undefined && typeof onDisconnect !== 'function') {
       fail('onDisconnect must be a function');
@@ -464,7 +563,18 @@ export class GatewayServer {
   }
 
   getStats(): GatewayStats {
-    return { ...this.stats };
+    const connectionQueues: GatewayStats['connectionQueues'] = [];
+    let pausedConnections = 0;
+    for (const conn of this.connections) {
+      if (conn.pressured) pausedConnections += 1;
+      const remoteAddress = conn.socket.remoteAddress;
+      connectionQueues.push({
+        ...(remoteAddress === undefined ? {} : { remoteAddress }),
+        queuedBytes: conn.pendingBytes,
+        pressured: conn.pressured,
+      });
+    }
+    return { ...this.stats, pausedConnections, connectionQueues };
   }
 
   // --- connection lifecycle ------------------------------------------------
@@ -480,6 +590,9 @@ export class GatewayServer {
       pending: [],
       pendingBytes: 0,
       subscriptions: new Map(),
+      pressured: false,
+      pressurePausedSubs: new Set(),
+      drainPoll: undefined,
     };
     this.connections.add(conn);
     this.stats.connections += 1;
@@ -519,7 +632,6 @@ export class GatewayServer {
     });
     socket.on('drain', () => {
       if (conn.closed || conn.handshook === false) return;
-      conn.paused = false;
       this.flushPending(conn);
     });
     socket.on('error', () => {});
@@ -580,6 +692,10 @@ export class GatewayServer {
     if (conn.closed) return;
     conn.closed = true;
     this.connections.delete(conn);
+    if (conn.drainPoll !== undefined) {
+      clearTimeout(conn.drainPoll);
+      conn.drainPoll = undefined;
+    }
     // EB-132: established-connection teardown feeds the ops alert
     // outlet's storm detector (when wired). Failed handshakes are not
     // disconnects — they are auth/protocol errors, counted separately.
@@ -660,10 +776,110 @@ export class GatewayServer {
     }
     conn.pending.push(frame);
     conn.pendingBytes += frame.length;
+    this.scheduleDrainPoll(conn);
+    this.checkClientPressure(conn);
+  }
+
+  /**
+   * Level-triggered drain kick: `flushPending` is normally driven by the
+   * socket's `drain` event, but `drain` only fires after `write()`
+   * returns false — and `write()` only returns false past Node's own
+   * writable mark. When `sendHighWaterMarkBytes` sits below that mark we
+   * stop writing (and start queueing) before `write()` ever returns
+   * false, so `drain` never fires and a paused connection's queue would
+   * stall forever. In exactly that case this poll retries the flush on
+   * a short interval while backlog remains; it is unref'd, idempotent,
+   * and self-cancelling (no backlog, or connection closed, ends it).
+   * Once one aggressive flush makes `write()` return false, `drain`
+   * arms and sustains the cycle on its own.
+   */
+  private scheduleDrainPoll(conn: Connection): void {
+    if (
+      conn.drainPoll !== undefined ||
+      conn.closed ||
+      this.sendHighWaterMarkBytes >= conn.socket.writableHighWaterMark
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      conn.drainPoll = undefined;
+      if (conn.closed) return;
+      this.flushPending(conn);
+      // flushPending re-arms while backlog remains.
+    }, DRAIN_POLL_MS);
+    if (typeof timer === 'object' && 'unref' in timer) {
+      (timer as { unref(): void }).unref();
+    }
+    conn.drainPoll = timer;
+  }
+
+  /**
+   * Client-pressure transitions (EB-161): called whenever a connection's
+   * queued bytes change. Crossing the pressure watermark pauses the
+   * connection's bus subscriptions (delivery-side hold — the subscriber
+   * queues keep accumulating under their normal backpressure policies,
+   * nothing is dropped), so a slow client stops growing the gateway
+   * process's memory. Draining back under the recovery watermark
+   * resumes exactly the subscriptions this connection paused — an
+   * operator's manual pause is never cleared here. Both transitions are
+   * audited as `client_pressure` / `client_pressure_recovered`
+   * (best-effort: the bus's audit path is infallible).
+   */
+  private checkClientPressure(conn: Connection): void {
+    const watermark = this.clientPressureWatermarkBytes;
+    if (watermark === undefined || conn.closed) return;
+    const remoteAddress = conn.socket.remoteAddress;
+    if (!conn.pressured && conn.pendingBytes >= watermark) {
+      conn.pressured = true;
+      let paused = 0;
+      for (const subId of conn.subscriptions.keys()) {
+        try {
+          if (this.bus.pauseSubscriber(subId, { reason: 'client-pressure' })) {
+            conn.pressurePausedSubs.add(subId);
+            paused += 1;
+          }
+        } catch {
+          // The subscription vanished mid-iteration; nothing to pause.
+        }
+      }
+      this.bus.noteGatewayClientPressure('pressure', {
+        ...(remoteAddress === undefined ? {} : { remoteAddress }),
+        queuedBytes: conn.pendingBytes,
+        watermarkBytes: watermark,
+        pausedSubscriptions: paused,
+      });
+      return;
+    }
+    if (conn.pressured && conn.pendingBytes <= this.clientPressureRecoveryWatermarkBytes) {
+      conn.pressured = false;
+      let resumed = 0;
+      for (const subId of conn.pressurePausedSubs) {
+        try {
+          if (this.bus.resumeSubscriber(subId)) resumed += 1;
+        } catch {
+          // Unsubscribed while pressured; the pause died with it.
+        }
+      }
+      conn.pressurePausedSubs.clear();
+      this.bus.noteGatewayClientPressure('recovered', {
+        ...(remoteAddress === undefined ? {} : { remoteAddress }),
+        queuedBytes: conn.pendingBytes,
+        watermarkBytes: this.clientPressureRecoveryWatermarkBytes,
+        pausedSubscriptions: resumed,
+      });
+    }
   }
 
   private flushPending(conn: Connection): void {
-    while (conn.pending.length > 0 && !conn.paused && !conn.closed) {
+    // Drain aggressively: write until the queue empties or the socket
+    // stops taking data (`write()` returns false — Node's own
+    // backpressure, which arms the `drain` event for the next round).
+    // Our send mark is not consulted mid-flush: it governs the
+    // `sendRaw` fast path, not how much backlog one flush moves —
+    // otherwise a mark below Node's writable mark would stall the queue
+    // forever (`write()` never returning false, so `drain` never
+    // firing; see `scheduleDrainPoll`).
+    while (conn.pending.length > 0 && !conn.closed) {
       const frame = conn.pending.shift()!;
       conn.pendingBytes -= frame.length;
       let ok = true;
@@ -674,8 +890,13 @@ export class GatewayServer {
         return;
       }
       this.stats.framesSent += 1;
-      if (!ok || conn.socket.bufferSize > this.sendHighWaterMarkBytes) conn.paused = true;
+      if (!ok) break;
     }
+    // Recompute the paused flag from our mark: paused while backlog
+    // remains or the socket buffer is still over the mark.
+    conn.paused = conn.pending.length > 0 || conn.socket.bufferSize > this.sendHighWaterMarkBytes;
+    if (conn.pending.length > 0) this.scheduleDrainPoll(conn);
+    this.checkClientPressure(conn);
   }
 
   // --- inbound ---------------------------------------------------------------
@@ -879,6 +1100,18 @@ export class GatewayServer {
     }
     registering = false;
     conn.subscriptions.set(sub.id, { sub, pendingAcks, binary: binaryDelivery });
+    // Client pressure (EB-161): a subscription opened on an already
+    // pressured connection pauses immediately — it must not feed the
+    // queue that is already over the watermark.
+    if (conn.pressured) {
+      try {
+        if (this.bus.pauseSubscriber(sub.id, { reason: 'client-pressure' })) {
+          conn.pressurePausedSubs.add(sub.id);
+        }
+      } catch {
+        // The bus rejected the id; the subscription still works.
+      }
+    }
     for (const item of outbox) emitLive(item, sub.id);
     this.sendJson(conn, { type: 'subscribed', id, subId: sub.id });
   }
@@ -895,6 +1128,7 @@ export class GatewayServer {
       return;
     }
     conn.subscriptions.delete(subId);
+    conn.pressurePausedSubs.delete(subId);
     try {
       entry.sub.unsubscribe();
     } catch (err) {
