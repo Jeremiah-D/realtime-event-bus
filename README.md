@@ -335,7 +335,22 @@ library.
   `resumeFromSeq` are mutually exclusive (one replay cursor), and honest
   about history: only what the log still retains replays — messages already
   compacted away cannot be recovered by time. `resumeFromSeq` without
-  `durableLogDir` throws instead of silently replaying nothing. Hot topics
+  `durableLogDir` throws instead of silently replaying nothing. Opt-in replay
+  rate limiting (`replayThrottle: { messagesPerSec, burst? }`, EB-164) caps
+  a resume replay's admission rate so a large cold-start replay cannot flood
+  a slow handler or downstream: only records actually admitted into the queue
+  burn budget (deliberately skipped records — filter rejections, linger
+  windows, expired TTLs — cost nothing). When the budget runs dry the pass
+  pauses — `done` stays false, nothing is dropped, no sequence gap is
+  created, and the pass is never marked failed — and resumes automatically
+  when the bucket refills: from an armed real timer on an idle bus, and
+  from the flush loop (so an advanced injected clock resumes deterministically
+  — advance the clock, then anything that flushes). `getStats()` exposes
+  paused subscribers as `replayThrottled`, and the EB-71 `onReplayProgress`
+  observer keeps its throttled reporting across the pause. `replayThrottle:
+  true` paces at 1000 msgs/sec; it requires a resume cursor (passing it
+  without one throws `RangeError`); invalid rates throw `RangeError` at
+  `subscribe` time. Hot topics
   compact automatically (`durableLogMaxEntriesPerTopic`, default 10000,
   amortized rewrite at 2x). Opt-in time-based retention
   (`durableLogMaxAgeMs`, EB-85): records older than `now - maxAgeMs` (bus
