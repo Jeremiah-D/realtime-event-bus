@@ -84,6 +84,11 @@
  *   "delivered" — see `BusStats.topicFairness`); only emitted for topics
  *   with at least one scheduled message, so buses without fair
  *   scheduling render no series at all.
+ * - `eventbus_subscriber_priority_dispatch_total{class}`: drain visits
+ *   scheduled per subscriber priority class (EB-166; "scheduled", not
+ *   "delivered" — a paused subscriber's visit still counts); only
+ *   emitted when a non-default priority class has at least one dispatch,
+ *   so buses without drain priorities render no series at all.
  * - `eventbus_delivery_sampled_messages_total{topic}`: messages per
  *   topic admitted by subscriber-side delivery-sampling gates
  *   (`SubscribeOptions.deliverySampleRate`, EB-152) — the `seq % N === 0`
@@ -843,6 +848,29 @@ export function renderPrometheus(stats: BusStats): string {
     if (scheduled > 0) {
       lines.push(
         `eventbus_fair_scheduled_messages_total{topic="${escapeLabelValue(topic)}"} ${scheduled}`,
+      );
+    }
+  }
+
+  // Subscriber drain priority (EB-166): per-class drain-visit counts.
+  // Activity-gated — the HELP/TYPE block and the series render only when
+  // a non-default priority class has at least one dispatch, so a bus
+  // without drain priorities renders byte-identical exposition to before.
+  // `?? {}` keeps the renderer tolerant of a stats object that predates
+  // the field (hand-built fixtures included).
+  const priorityDispatches = stats.subscriberPriority?.dispatches ?? {};
+  const priorityActive =
+    (priorityDispatches.low ?? 0) > 0 ||
+    (priorityDispatches.high ?? 0) > 0 ||
+    (priorityDispatches.custom ?? 0) > 0;
+  if (priorityActive) {
+    lines.push(
+      '# HELP eventbus_subscriber_priority_dispatch_total Drain visits scheduled per subscriber priority class (EB-166; "scheduled", not "delivered" — a visit whose subscriber was paused still counts).',
+    );
+    lines.push('# TYPE eventbus_subscriber_priority_dispatch_total counter');
+    for (const label of ['low', 'normal', 'high', 'custom'] as const) {
+      lines.push(
+        `eventbus_subscriber_priority_dispatch_total{class="${label}"} ${priorityDispatches[label] ?? 0}`,
       );
     }
   }

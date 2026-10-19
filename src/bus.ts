@@ -127,6 +127,13 @@ import {
   type TopicFairnessOptions,
 } from './fair.ts';
 import {
+  DEFAULT_DELIVERY_PRIORITY_WEIGHT,
+  orderDrainVisits,
+  resolveDeliveryPriority,
+  type DrainVisitCandidate,
+  type ResolvedDeliveryPriority,
+} from './subscriber-priority.ts';
+import {
   emptyScheduleSkewSummary,
   resolveScheduleSkewOptions,
   ScheduleSkewTracker,
@@ -1320,6 +1327,29 @@ export interface SubscribeOptions {
    * Disabled by default.
    */
   topicFairness?: boolean | TopicFairnessOptions;
+  /**
+   * Opt-in subscriber drain priority (EB-166): the flush loop visits
+   * subscribers in deficit round-robin order over their drain weights
+   * instead of raw subscription order. Under contention (many backlogged
+   * subscribers) a high-priority subscriber's handlers run earlier in
+   * the round — lower end-to-end latency for the traffic you care about.
+   * Every subscriber is still visited every round: priority reorders
+   * service, it never starves and never changes drain budgets — shaping,
+   * throttling, rate limits, in-flight caps, slow start and credits all
+   * apply exactly as before.
+   *
+   * Orthogonal to `src/lanes.ts` (EB-122): lanes decide *which message*
+   * a subscriber is served next (message-level priority); this decides
+   * *which subscriber* the flush loop serves next (subscriber-level
+   * priority).
+   *
+   * Pass `'low' | 'normal' | 'high'` (weights 1 : 2 : 4) or a positive
+   * integer weight. Defaults to `'normal'`. Anything else throws
+   * `RangeError` from `subscribe`. `getStats().subscriberPriority`
+   * reports per-class drain-visit counts, and `src/metrics.ts` renders
+   * `eventbus_subscriber_priority_dispatch_total{class}`.
+   */
+  deliveryPriority?: 'low' | 'normal' | 'high' | number;
   /**
    * Opt-in per-subscriber delivery-latency sampling. When enabled, the bus
    * stamps every message enqueued for this subscriber with the bus clock
@@ -4511,6 +4541,17 @@ export interface BusStats {
     deficits: Record<string, number>;
   };
   /**
+   * Subscriber drain-priority counters (EB-166): per-class drain-visit
+   * counts — `dispatches` counts, per priority class, how many times the
+   * flush loop scheduled a drain visit for a subscriber of that class
+   * ("scheduled", not "delivered": a visit whose subscriber was paused
+   * still counts). Always present; all zeros on a bus without drain
+   * priorities.
+   */
+  subscriberPriority: {
+    dispatches: Record<'low' | 'normal' | 'high' | 'custom', number>;
+  };
+  /**
    * Total messages shed at the publish side by adaptive publish-side
    * throttling (see `SubscribeOptions.throttle`) — the sum of every
    * subscriber's `throttledCount`. Counted separately from queue drops.
@@ -6160,6 +6201,18 @@ interface Subscriber {
     deficits: Map<string, number>;
     scheduledByTopic: Map<string, number>;
   };
+  /**
+   * Subscriber drain-visit scheduling weight (EB-166, see
+   * `SubscribeOptions.deliveryPriority`): the DRR weight the flush loop
+   * uses to order this subscriber's drain visits. Always resolved —
+   * defaults to 2 (`'normal'`).
+   */
+  priorityWeight: number;
+  /**
+   * The declared drain-priority class, for observability: the named
+   * priority, or `'custom'` for an explicit integer weight.
+   */
+  priorityLabel: 'low' | 'normal' | 'high' | 'custom';
   /**
    * Slow-start ramp gate (see `SubscribeOptions.slowStart`). Present only
    * while the ramp window has not elapsed — once the ramp completes the
@@ -11444,6 +11497,31 @@ export class EventBus {
   private readonly publishRates = new PublishRateTable();
   private nextId = 0;
   private flushScheduled = false;
+  /**
+   * Subscriber drain-priority DRR state (EB-166): the per-subscriber-id
+   * deficit carryover for the flush loop's drain-visit ordering,
+   * persisted across rounds. Entries are dropped on unsubscribe so the
+   * map never outgrows the live subscriber set.
+   */
+  private readonly priorityDeficits = new Map<string, number>();
+  /**
+   * Live subscribers whose drain weight differs from the default
+   * (`'normal'`, weight 2). The `scheduleFlush` fast path: zero means
+   * every subscriber drains in plain subscription order, exactly as
+   * before EB-166.
+   */
+  private nonDefaultPriorityCount = 0;
+  /**
+   * Per-priority-class drain-visit counts (EB-166), exposed via
+   * `getStats().subscriberPriority` and
+   * `eventbus_subscriber_priority_dispatch_total`.
+   */
+  private readonly priorityDispatches: Record<'low' | 'normal' | 'high' | 'custom', number> = {
+    low: 0,
+    normal: 0,
+    high: 0,
+    custom: 0,
+  };
   /**
    * Topics currently inside a synchronous `renameTopic` (EB-142): the old
    * and the new name. The publish entry points refuse these topics while
@@ -17119,6 +17197,9 @@ export class EventBus {
     // Topic-level fair scheduling (EB-135): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const topicFairness = resolveTopicFairnessOptions(opts?.topicFairness, 'subscribe');
+    // Subscriber drain priority (EB-166): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const deliveryPriority = resolveDeliveryPriority(opts?.deliveryPriority, 'subscribe');
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
@@ -17375,6 +17456,10 @@ export class EventBus {
         topicFairness === undefined
           ? undefined
           : { options: topicFairness, deficits: new Map(), scheduledByTopic: new Map() },
+      // Subscriber drain priority (EB-166): the resolved DRR weight and
+      // class label. Always resolved — the default is 'normal'/weight 2.
+      priorityWeight: deliveryPriority?.weight ?? DEFAULT_DELIVERY_PRIORITY_WEIGHT,
+      priorityLabel: deliveryPriority?.label ?? 'normal',
       slowStart,
       maxInflight: maxInflight == null ? undefined : { max: maxInflight, inFlight: 0 },
       // Handler-concurrency gate (EB-159): always armed — the default cap
@@ -17458,6 +17543,11 @@ export class EventBus {
     if (composite !== undefined) this.compositeSubscriptionCount += 1;
     // Multi-pattern aggregate (EB-137): one live aggregate, counted once.
     if (multi) this.multiPatternSubscriptionCount += 1;
+    // Subscriber drain priority (EB-166): arm the scheduleFlush DRR path
+    // when this subscriber's drain weight differs from the default.
+    if (subscriber.priorityWeight !== DEFAULT_DELIVERY_PRIORITY_WEIGHT) {
+      this.nonDefaultPriorityCount += 1;
+    }
     // Durable dedup window: rehydrate the subscriber's window from the
     // journal before any replay runs, so a resumed consumer does not
     // double-deliver messages it already saw before the restart. Entries
@@ -17534,6 +17624,13 @@ export class EventBus {
         // without opts and keep the immediate semantics.
         this.unsubscribeWithDrain(id, opts, () => {
           if (!this.subscribers.delete(id)) return;
+          // Subscriber drain priority (EB-166): drop the deficit
+          // carryover and disarm the DRR path when the last
+          // non-default-weight subscriber leaves.
+          this.priorityDeficits.delete(id);
+          if (subscriber.priorityWeight !== DEFAULT_DELIVERY_PRIORITY_WEIGHT) {
+            this.nonDefaultPriorityCount -= 1;
+          }
           // Priority lanes (EB-122): the subscriber's queued backlog
           // vanishes with it — release its entries from the lane backlog
           // counters so the `queued` gauges don't leak. (Migration teardown
@@ -31412,6 +31509,11 @@ export class EventBus {
         scheduledByTopic: Object.fromEntries(fairScheduledByTopic),
         deficits: Object.fromEntries(fairDeficits),
       },
+      // Subscriber drain-priority counters (EB-166): per-class drain-visit
+      // counts — a copy, so readers cannot disturb the live counters.
+      subscriberPriority: {
+        dispatches: { ...this.priorityDispatches },
+      },
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
       expiredLeases: this.totalExpiredLeases,
@@ -33193,7 +33295,13 @@ export class EventBus {
       // Drains (EB-128) that complete in this flush round are collected
       // here and torn down after the loop below.
       let completedDrains: Subscriber[] | undefined;
-      for (const subscriber of this.subscribers.values()) {
+      // Subscriber drain priority (EB-166): when any subscriber carries a
+      // non-default drain weight, visits run in DRR order (weight-priority,
+      // insertion-stable within a class) instead of raw subscription
+      // order. Every subscriber is still visited every round — priority
+      // reorders service, it never starves and never changes drain
+      // budgets.
+      for (const subscriber of this.drainVisitOrder()) {
         // Durable-log replay throttle (EB-164): a throttled-paused resume
         // replay resumes here when the injected clock advanced — the same
         // deterministic "advance the clock, then anything that flushes"
@@ -33205,6 +33313,9 @@ export class EventBus {
         if (replayRun?.paused === true && replayRun.resume !== undefined) {
           replayRun.resume();
         }
+        // "Scheduled", not "delivered": the visit was scheduled even when
+        // the subscriber's drain short-circuits (paused, degraded, ...).
+        this.priorityDispatches[subscriber.priorityLabel] += 1;
         this.drainSubscriber(subscriber, nowMs);
         // Graceful drain (EB-128): a subscriber whose backlog just
         // emptied completes below, after the loop — teardown mutates the
@@ -33218,6 +33329,41 @@ export class EventBus {
         for (const subscriber of completedDrains) this.finishDrain(subscriber);
       }
     });
+  }
+
+  /**
+   * Drain-visit order for one flush round (EB-166): deficit round-robin
+   * over the subscribers' drain weights. With one drain visit per
+   * subscriber per round the DRR reduces to weight-priority order —
+   * higher weight first, ties by subscription order (stable) — which is
+   * exactly what the ordering below computes via `orderDrainVisits`.
+   *
+   * Fast path: when no subscriber carries a non-default weight the
+   * subscribers iterate in plain subscription order, exactly as before
+   * EB-166 — zero behavior change for buses without drain priorities.
+   */
+  private drainVisitOrder(): Subscriber[] {
+    if (this.nonDefaultPriorityCount === 0) return [...this.subscribers.values()];
+    const candidates: DrainVisitCandidate[] = [];
+    let insertionIndex = 0;
+    for (const subscriber of this.subscribers.values()) {
+      candidates.push({
+        id: subscriber.id,
+        weight: subscriber.priorityWeight,
+        insertionIndex: insertionIndex++,
+      });
+    }
+    const byId = new Map<string, Subscriber>();
+    for (const subscriber of this.subscribers.values()) byId.set(subscriber.id, subscriber);
+    const ordered: Subscriber[] = [];
+    for (const candidate of orderDrainVisits(candidates, this.priorityDeficits)) {
+      const subscriber = byId.get(candidate.id);
+      // The subscriber set cannot change mid-flush (teardown is deferred
+      // to `completedDrains`), so the lookup always hits; the guard keeps
+      // the method total.
+      if (subscriber !== undefined) ordered.push(subscriber);
+    }
+    return ordered;
   }
 
   /**

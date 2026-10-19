@@ -4698,6 +4698,50 @@ Semantics:
   `eventbus_fair_scheduled_messages_total{topic}` — only for topics with
   at least one scheduled message.
 
+## Subscriber drain priority (EB-166)
+
+`SubscribeOptions.deliveryPriority` reorders the flush loop's drain
+visits by deficit round-robin weight — under contention (many backlogged
+subscribers) a high-priority subscriber's handlers run earlier in the
+round, which lowers end-to-end latency for the traffic you care about.
+Opt-in: without it every subscriber drains in plain subscription order,
+exactly as before.
+
+```ts
+bus.subscribe('alerts.**', pageDutyHandler, { deliveryPriority: 'high' });
+bus.subscribe('metrics.**', warehouseHandler, { deliveryPriority: 'low' });
+// each flush serves the paging handler before the warehouse handler
+```
+
+Semantics:
+
+- **Weights.** `'low' | 'normal' | 'high'` map to weights 1 : 2 : 4, or
+  pass a positive integer weight directly. Default `'normal'`.
+  Anything else throws `RangeError` from `subscribe`.
+- **Deficit round-robin over drain visits.** Each flush round credits
+  every live subscriber with its weight, visits in deficit-descending
+  order (stable by subscription order within a class), and debits each
+  visited subscriber by its own weight. With one drain visit per
+  subscriber per round this reduces to weight-priority order — higher
+  weight first, ties by subscription order.
+- **Priority reorders service; it never starves and never changes
+  drain budgets.** Every subscriber is still visited every round — a
+  low-priority subscriber is served later, not skipped. How much a
+  visit drains is still governed solely by the delivery gates
+  (`deliveryShaping`, `rateLimit`, `maxInflight`, `slowStart`, credits),
+  so priority composes orthogonally with all of them.
+- **Orthogonal to message lanes (EB-122).** Lanes decide *which message*
+  a subscriber is served next (message-level priority);
+  `deliveryPriority` decides *which subscriber* the flush loop serves
+  next (subscriber-level priority).
+- **Metrics.** `getStats().subscriberPriority.dispatches` counts drain
+  visits per class (`low` / `normal` / `high` / `custom` — "scheduled",
+  not "delivered": a visit whose subscriber was paused still counts),
+  and `src/metrics.ts` renders
+  `eventbus_subscriber_priority_dispatch_total{class}` — only when a
+  non-default class has at least one dispatch, so buses without drain
+  priorities render byte-identical exposition to before.
+
 ## Multi-pattern aggregate subscriptions (EB-137)
 
 `subscribe` accepts an array of topic patterns for a single subscriber
