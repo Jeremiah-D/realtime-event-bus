@@ -1325,6 +1325,32 @@ library.
   `getStats()` exposes per-subscriber usage via `inFlightUsage`. Must be an
   integer >= 1 — anything else throws `RangeError` from `subscribe`, as do
   combinations with `batch` or `shadow`. Disabled by default.
+- **Per-subscriber handler-concurrency cap** (in `src/bus.ts`, via
+  `subscribe(..., { maxConcurrentDeliveries: N })`, EB-159): caps how many
+  handler invocations may *execute* at once per subscriber. Defaults to 1 —
+  strict serial execution, so even async handlers run one at a time in
+  publish order and per-subscriber message order is preserved exactly. Set
+  higher to let keyless messages' handlers overlap: a message whose handler
+  is still executing holds its slot until the invocation settles (a returned
+  promise settles it; otherwise the synchronous return does), and the drain
+  holds later messages queued in FIFO order — never dropped — until a slot
+  frees. Keyed messages serialize per key on top of the cap: a message with
+  key `k` is not dispatched while any invocation for the same
+  `(subscriber, k)` is still executing, so same-key order holds even when
+  the cap admits parallelism. The cap bounds handler *execution*, not
+  outstanding at-least-once state: for reliable subscriptions the slot
+  releases when the at-least-once wrapper returns (after invoking the user
+  handler), not when the delivery is acked — an unacked delivery never
+  blocks the next dispatch. Composes orthogonally with `maxInflight` (which
+  caps unsettled invocations), delivery-side shaping, health probing,
+  reliable ACK handling, and delivery-latency sampling.
+  `getStats()` exposes per-subscriber usage via `deliveryConcurrency`.
+  When `maxInflight` is set without this option, the concurrency cap
+  defaults to `maxInflight` instead of 1 — an explicit parallelism opt-in
+  is never silently neutered by the new default; an explicit value here
+  always wins.
+  Must be an integer >= 1 — anything else throws `RangeError` from
+  `subscribe`.
 - **Per-subscriber delivery-latency sampling** (in `src/latency.ts`, opt-in
   via `subscribe(..., { deliveryLatency: true })`): measures each delivered
   message's queue dwell — from enqueue into the subscriber's queue to the

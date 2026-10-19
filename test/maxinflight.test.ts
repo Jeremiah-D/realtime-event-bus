@@ -227,7 +227,7 @@ test('maxInflight rejects illegal values and incoherent combinations', () => {
   assert.deepEqual(bus.getStats().inFlightUsage, []);
 });
 
-test('default off: no cap without the option', async () => {
+test('default off: no maxInflight cap without the option (EB-159 serializes by default)', async () => {
   const bus = new EventBus();
   let inFlight = 0;
   let maxObserved = 0;
@@ -246,11 +246,21 @@ test('default off: no cap without the option', async () => {
   });
   for (let n = 1; n <= 5; n += 1) bus.publish('t', { n });
   await flush();
-  // Without the option every queued message is pulled in one round —
-  // concurrency is unbounded, exactly as before.
-  assert.deepEqual(seen, [1, 2, 3, 4, 5]);
-  assert.equal(maxObserved, 5);
+  // EB-159: without maxConcurrentDeliveries the handler-concurrency cap
+  // defaults to 1 — async handler invocations serialize in publish order,
+  // so only the first handler has started after one flush. (Before
+  // EB-159 every queued message was pulled in one round and concurrency
+  // was unbounded; the default is now serial to preserve order.)
+  assert.deepEqual(seen, [1]);
+  assert.equal(maxObserved, 1);
+  // EB-67 itself is still off by default: no in-flight cap rows.
   assert.deepEqual(bus.getStats().inFlightUsage, []);
+  // Releasing each invocation lets the next one dispatch, in order.
+  for (let n = 1; n <= 4; n += 1) {
+    for (const r of resolvers.splice(0)) r();
+    await flush();
+  }
+  assert.deepEqual(seen, [1, 2, 3, 4, 5]);
   for (const r of resolvers.splice(0)) r();
   await flush();
   assert.equal(inFlight, 0);

@@ -1222,6 +1222,42 @@ export interface SubscribeOptions {
    */
   maxInflight?: number;
   /**
+   * Per-subscriber cap on simultaneously *executing* handler invocations
+   * (EB-159): how many handler calls for this subscriber may overlap at
+   * once. Defaults to 1 — strict serial execution, so even async handlers
+   * run one at a time in publish order and per-subscriber message order
+   * is preserved exactly. (When `maxInflight` is set without this option,
+   * the concurrency cap defaults to `maxInflight` instead — an explicit
+   * parallelism opt-in is never silently neutered by the new default; an
+   * explicit value here always wins.) Set higher to let keyless messages' handlers
+   * overlap: a message whose handler is still executing holds its slot
+   * until the invocation settles (a returned promise settles it;
+   * otherwise the synchronous return does), and the drain holds later
+   * messages queued in FIFO order — never dropped — until a slot frees.
+   *
+   * Keyed messages (see `PublishOptions.key`, EB-36) serialize per key on
+   * top of the cap: a message with key `k` is not dispatched while any
+   * invocation for the same `(subscriber, k)` is still executing, so
+   * same-key order holds even when the cap admits parallelism for
+   * keyless messages. A keyed message that cannot acquire holds the drain
+   * line — later messages wait behind it, preserving queue order.
+   *
+   * The cap bounds handler *execution*, not outstanding at-least-once
+   * state: for reliable subscriptions the slot releases when the
+   * at-least-once wrapper returns (after invoking the user handler), not
+   * when the delivery is acked — an unacked delivery never blocks the
+   * next dispatch, and the option composes orthogonally with
+   * `maxInflight` (which caps unsettled invocations), `deliveryShaping`,
+   * `healthProbe`, `subscribeReliable` ACK handling, and the delivery
+   * latency histogram (`deliveryLatency`), each of which keeps its own
+   * semantics. `getStats()` exposes the per-subscriber usage
+   * (`deliveryConcurrency`).
+   *
+   * Must be an integer >= 1 — anything else throws `RangeError` from
+   * `subscribe`.
+   */
+  maxConcurrentDeliveries?: number;
+  /**
    * Opt-in per-subscriber sliding-window delivery rate limit: at most
    * `maxMessages` deliveries per rolling `perWindowMs` window. Unlike
    * `deliveryShaping` (a token bucket that smooths bursts), the window is
@@ -5039,6 +5075,28 @@ export interface BusStats {
     inFlight: number;
   }>;
   /**
+   * Per-subscriber handler-concurrency usage (see
+   * `SubscribeOptions.maxConcurrentDeliveries`): one row per subscriber,
+   * in subscription order, carrying the configured cap
+   * (`maxConcurrentDeliveries`) and how many handler invocations are
+   * currently executing (`inFlight`), plus the per-key breakdown
+   * (`keysInFlight`) for keyed subscribers. Always populated — the
+   * default cap of 1 keeps every subscriber serial unless it opts into
+   * parallelism.
+   */
+  deliveryConcurrency: Array<{
+    /** The subscriber's id (see `Subscription.id`). */
+    subscriberId: string;
+    /** The topic pattern the subscription was registered with. */
+    pattern: string;
+    /** The configured cap on simultaneously executing handler invocations. */
+    maxConcurrentDeliveries: number;
+    /** Handler invocations currently executing. */
+    inFlight: number;
+    /** Currently executing invocations per message key (keyed messages only). */
+    keysInFlight: Record<string, number>;
+  }>;
+  /**
    * Delayed messages currently scheduled (see `publishDelayed`): accepted,
    * not yet due, fanned out, cancelled, or expired. Each one holds a slot
    * in the timer heap until its due time.
@@ -6014,6 +6072,13 @@ interface Subscriber {
    * Absent when the cap is disabled for this subscriber.
    */
   maxInflight?: MaxInflightState;
+  /**
+   * Handler-concurrency state (see
+   * `SubscribeOptions.maxConcurrentDeliveries`). Always present: the
+   * default cap of 1 keeps per-subscriber handler execution serial unless
+   * the subscriber opts into parallelism.
+   */
+  deliveryConcurrency: DeliveryConcurrencyState;
   /**
    * Idle-reclamation activity mode (see `SubscribeOptions.maxIdleMs` /
    * `idleActivity`, EB-72). Present exactly when the subscriber opted
@@ -7353,6 +7418,37 @@ interface DeliveryShapingState {
 interface MaxInflightState {
   max: number;
   inFlight: number;
+}
+
+/**
+ * Per-subscriber handler-concurrency state (see
+ * `SubscribeOptions.maxConcurrentDeliveries`). `max` is the configured cap
+ * on simultaneously executing handler invocations; `inFlight` is how many
+ * invocations are currently executing; `keysInFlight` counts executing
+ * invocations per message key so keyed messages serialize per key even
+ * when the cap admits parallelism.
+ */
+interface DeliveryConcurrencyState {
+  max: number;
+  inFlight: number;
+  keysInFlight: Map<string, number>;
+}
+
+/**
+ * Validates `SubscribeOptions.maxConcurrentDeliveries` and returns the
+ * configured cap. The caller passes the explicit option with the resolved
+ * `maxInflight` as fallback (see `subscribe`): an explicit
+ * `maxConcurrentDeliveries` always wins, otherwise an explicit
+ * `maxInflight` doubles as the default, otherwise the cap is 1 (strict
+ * serial per-subscriber execution). Throws `RangeError` for non-integer
+ * or < 1 values.
+ */
+function resolveDeliveryConcurrencyOptions(opt: number | undefined): number {
+  if (opt == null) return 1;
+  if (!Number.isInteger(opt) || opt < 1) {
+    throw new RangeError('subscribe: maxConcurrentDeliveries must be an integer >= 1');
+  }
+  return opt;
 }
 
 /**
@@ -16322,6 +16418,15 @@ export class EventBus {
     const maxInflight = resolveMaxInflightOptions(opts?.maxInflight);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    // EB-159: an explicit maxInflight already opts the subscriber into
+    // that level of parallelism, so it doubles as the concurrency default
+    // — the new gate never silently neuters an older opt-in. An explicit
+    // maxConcurrentDeliveries always wins.
+    const maxConcurrentDeliveries = resolveDeliveryConcurrencyOptions(
+      opts?.maxConcurrentDeliveries ?? maxInflight,
+    );
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const rateLimit = resolveRateLimitOptions(opts?.rateLimit);
     // Topic-level fair scheduling (EB-135): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
@@ -16584,6 +16689,14 @@ export class EventBus {
           : { options: topicFairness, deficits: new Map(), scheduledByTopic: new Map() },
       slowStart,
       maxInflight: maxInflight == null ? undefined : { max: maxInflight, inFlight: 0 },
+      // Handler-concurrency gate (EB-159): always armed — the default cap
+      // of 1 keeps per-subscriber handler execution serial unless the
+      // subscriber opts into parallelism.
+      deliveryConcurrency: {
+        max: maxConcurrentDeliveries,
+        inFlight: 0,
+        keysInFlight: new Map(),
+      },
       // Idle auto-reclamation (EB-72): the mode marker doubles as the
       // opt-in flag — recordIdleActivity gates on it, so non-opt-in
       // subscribers pay a single property check per delivery.
@@ -30133,6 +30246,7 @@ export class EventBus {
     const lag: BusStats['lag'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const inFlightUsage: BusStats['inFlightUsage'] = [];
+    const deliveryConcurrency: BusStats['deliveryConcurrency'] = [];
     const nackReasons: BusStats['nackReasons'] = [];
     // Topic-level fair scheduling (EB-135): bus-level aggregates across
     // every live subscriber that opted in — per-topic scheduled counts
@@ -30243,6 +30357,22 @@ export class EventBus {
           pattern: subscriber.pattern,
           maxInflight: inflight.max,
           inFlight: inflight.inFlight,
+        });
+      }
+      // Handler-concurrency usage (see
+      // `SubscribeOptions.maxConcurrentDeliveries`): every subscriber
+      // appears — a pure read of the live counters, so the accounting is
+      // never disturbed.
+      {
+        const concurrency = subscriber.deliveryConcurrency;
+        const keysInFlight: Record<string, number> = {};
+        for (const [key, count] of concurrency.keysInFlight) keysInFlight[key] = count;
+        deliveryConcurrency.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          maxConcurrentDeliveries: concurrency.max,
+          inFlight: concurrency.inFlight,
+          keysInFlight,
         });
       }
       // Nack-reason aggregation (EB-129): one row per reliable subscriber
@@ -30564,6 +30694,7 @@ export class EventBus {
       rampingSubscribers,
       rateLimitedWaiting,
       inFlightUsage,
+      deliveryConcurrency,
       nackReasons,
       pendingDelayed: this.delayedById.size,
       delayedScheduleSkew: this.scheduleSkew?.tracker.summary() ?? emptyScheduleSkewSummary(),
@@ -32615,7 +32746,17 @@ export class EventBus {
       }
       const health = subscriber.health;
       if (health == null) {
-        for (const msg of live) {
+        for (let i = 0; i < live.length; i += 1) {
+          const msg = live[i];
+          // EB-159: the handler-concurrency gate runs before any
+          // per-delivery accounting — a message that cannot acquire a
+          // slot holds the drain line: it and everything behind it go
+          // back to the queue front in order, and the drain resumes when
+          // a slot frees (see releaseDeliverySlot).
+          if (!this.tryAcquireDeliverySlot(subscriber, msg)) {
+            this.requeueUndelivered(subscriber, live.slice(i));
+            break;
+          }
           // Guaranteed to succeed: the drain above dequeued at most
           // floor(availableTokens), and nothing else consumes this
           // subscriber's bucket in between.
@@ -32659,42 +32800,55 @@ export class EventBus {
           // EB-67: one in-flight slot per handler invocation; the slot is
           // released when the invocation settles (see
           // invokeWithInflightSlot).
-          this.invokeWithInflightSlot(subscriber, (): unknown => {
-            let result: unknown;
-            if (invocationSlo == null) {
-              result = this.deliverTraced(subscriber, msg, () =>
-                this.invokeChaosHandler(
-                  subscriber,
-                  // Message projection (EB-144): the handler sees the
-                  // projected view; a throwing projection propagates
-                  // exactly like a throwing handler.
-                  () => subscriber.handler(this.projectMessageView(subscriber, msg)),
-                ),
-              );
-            } else {
-              const processingStartedAtMs = this.now();
-              try {
+          // EB-159: the handler executes under one handler-concurrency
+          // slot — the next queued message dispatches when this
+          // invocation settles (see invokeWithDeliverySlot).
+          this.invokeWithDeliverySlot(subscriber, msg, (): unknown =>
+            this.invokeWithInflightSlot(subscriber, (): unknown => {
+              let result: unknown;
+              if (invocationSlo == null) {
                 result = this.deliverTraced(subscriber, msg, () =>
-                  this.invokeChaosHandler(subscriber, () =>
-                    subscriber.handler(this.projectMessageView(subscriber, msg)),
+                  this.invokeChaosHandler(
+                    subscriber,
+                    // Message projection (EB-144): the handler sees the
+                    // projected view; a throwing projection propagates
+                    // exactly like a throwing handler.
+                    () => subscriber.handler(this.projectMessageView(subscriber, msg)),
                   ),
                 );
-              } finally {
-                this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
+              } else {
+                const processingStartedAtMs = this.now();
+                try {
+                  result = this.deliverTraced(subscriber, msg, () =>
+                    this.invokeChaosHandler(subscriber, () =>
+                      subscriber.handler(this.projectMessageView(subscriber, msg)),
+                    ),
+                  );
+                } finally {
+                  this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
+                }
               }
-            }
-            // EB-72: the handler returned without throwing — a successful
-            // delivery counts as idle activity. Not for reliable
-            // subscribers: their at-least-once wrapper can swallow a
-            // throwing handler (the DLQ nack path), so reliable deliveries
-            // record at the user handler's own success point inside the
-            // wrapper instead.
-            if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
-            return result;
-          });
+              // EB-72: the handler returned without throwing — a successful
+              // delivery counts as idle activity. Not for reliable
+              // subscribers: their at-least-once wrapper can swallow a
+              // throwing handler (the DLQ nack path), so reliable deliveries
+              // record at the user handler's own success point inside the
+              // wrapper instead.
+              if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
+              return result;
+            }),
+          );
         }
       } else {
         for (let i = 0; i < live.length; i += 1) {
+          const msg = live[i];
+          // EB-159: the handler-concurrency gate runs before any
+          // per-delivery accounting — see the plain branch above for the
+          // hold-the-line semantics.
+          if (!this.tryAcquireDeliverySlot(subscriber, msg)) {
+            this.requeueUndelivered(subscriber, live.slice(i));
+            break;
+          }
           shaping?.bucket.take();
           slowStart?.take(nowMs);
           rateLimit?.limiter.record(nowMs);
@@ -32702,10 +32856,15 @@ export class EventBus {
           // delivery, mirroring the shaping take — messages requeued by a
           // mid-drain health trip were never attempted and keep their
           // credit.
-          this.consumeDeliveryCredit(subscriber, live[i]);
-          this.inflateMessagePayload(live[i]);
-          this.invokeWithInflightSlot(subscriber, (): unknown =>
-            this.deliverWithHealth(subscriber, live[i], nowMs),
+          this.consumeDeliveryCredit(subscriber, msg);
+          this.inflateMessagePayload(msg);
+          // EB-159: the handler executes under one handler-concurrency
+          // slot — the next queued message dispatches when this
+          // invocation settles (see invokeWithDeliverySlot).
+          this.invokeWithDeliverySlot(subscriber, msg, (): unknown =>
+            this.invokeWithInflightSlot(subscriber, (): unknown =>
+              this.deliverWithHealth(subscriber, msg, nowMs),
+            ),
           );
           if (!health.degraded) continue;
           // The threshold tripped mid-drain: everything not yet attempted
@@ -33601,17 +33760,40 @@ export class EventBus {
    * With the cap disabled the handler runs untouched — zero overhead,
    * zero behavior change.
    */
-  private invokeWithInflightSlot(subscriber: Subscriber, invoke: () => unknown): void {
+  /**
+   * EB-67: invokes the handler for one single-message delivery while
+   * holding one in-flight slot when `SubscribeOptions.maxInflight` is
+   * enabled. The slot is acquired before the handler runs and released
+   * when the invocation settles:
+   * - reliable subscriptions settle through the tracker's single settle
+   *   path (`ack()` / `nack()` / ack-timeout), which releases the slot via
+   *   the tracker's `onSettle` hook (see `subscribeReliable`) — the drain
+   *   must not release it here, or a slow consumer's slot would be freed
+   *   while its delivery is still outstanding;
+   * - plain subscriptions settle when the handler returns: a returned
+   *   thenable holds the slot until it settles (fulfilled or rejected), a
+   *   synchronous return releases it immediately, and a throwing handler
+   *   releases its slot with the error propagating exactly as before.
+   * With the cap disabled the handler runs untouched — zero overhead,
+   * zero behavior change.
+   *
+   * Returns the handler's return value (EB-159): the delivery-concurrency
+   * gate needs the raw result to know when the invocation settles. A
+   * throw propagates to the caller unchanged, exactly as before.
+   */
+  private invokeWithInflightSlot(subscriber: Subscriber, invoke: () => unknown): unknown {
     const cap = subscriber.maxInflight;
     if (cap == null) {
-      invoke();
-      return;
+      return invoke();
     }
     cap.inFlight += 1;
     if (subscriber.reliable != null) {
-      // The tracker's onSettle hook owns the release.
-      invoke();
-      return;
+      // The tracker's onSettle hook owns the release — the slot is NOT
+      // released here, or a slow consumer's slot would be freed while its
+      // delivery is still outstanding. The return value propagates so the
+      // delivery-concurrency gate (EB-159) can observe the invocation's
+      // settlement; a throw propagates unchanged, exactly as before.
+      return invoke();
     }
     // Hoisted before the try (never declared inside it): a Node v24/V8
     // ReferenceError awaits bindings declared in `try` and read in
@@ -33628,6 +33810,96 @@ export class EventBus {
       result.then(release, release);
     } else {
       cap.inFlight -= 1;
+    }
+    return result;
+  }
+
+  /**
+   * EB-159: whether the next queued message may be handed to this
+   * subscriber's handler right now. True when fewer than
+   * `maxConcurrentDeliveries` invocations are executing and — for a keyed
+   * message — no invocation for the same `(subscriber, key)` is
+   * executing. A false verdict holds the drain line: the caller requeues
+   * the message (and everything behind it) in order and the drain resumes
+   * when a slot frees (see `releaseDeliverySlot`).
+   */
+  private tryAcquireDeliverySlot(subscriber: Subscriber, msg: BusMessage): boolean {
+    const state = subscriber.deliveryConcurrency;
+    if (state.inFlight >= state.max) return false;
+    const key = msg.key;
+    if (key !== undefined && (state.keysInFlight.get(key) ?? 0) > 0) return false;
+    return true;
+  }
+
+  /**
+   * EB-159: invokes the handler for one single-message delivery while
+   * holding one handler-concurrency slot (see
+   * `SubscribeOptions.maxConcurrentDeliveries`). The slot is acquired by
+   * the caller via `tryAcquireDeliverySlot` and released here when the
+   * invocation settles:
+   * - a throwing handler releases its slot with the error propagating
+   *   exactly as before — a failed delivery never wedges the subscriber;
+   * - a returned thenable holds the slot until it settles (fulfilled or
+   *   rejected), so async handlers serialize under the default cap of 1;
+   * - otherwise the slot releases on the synchronous return — sync
+   *   handlers drain exactly as they did before this gate existed.
+   * For reliable subscriptions the at-least-once wrapper returns once
+   * the user handler has been invoked, so the slot covers handler
+   * *execution*, not the unacked window — an unacked delivery never
+   * blocks the next dispatch, and ACK handling keeps its own semantics.
+   * A flush is scheduled only when the slot was held across an async
+   * boundary (returned promise): a synchronous release happens inside
+   * the running drain loop, which continues inline — scheduling a flush
+   * there would only queue a redundant drain round.
+   */
+  private invokeWithDeliverySlot(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    invoke: () => unknown,
+  ): void {
+    const state = subscriber.deliveryConcurrency;
+    state.inFlight += 1;
+    const key = msg.key;
+    if (key !== undefined) state.keysInFlight.set(key, (state.keysInFlight.get(key) ?? 0) + 1);
+    // Hoisted before the try (never declared inside it): a Node v24/V8
+    // ReferenceError awaits bindings declared in `try` and read in
+    // `finally`.
+    let result: unknown;
+    try {
+      result = invoke();
+    } catch (err) {
+      this.releaseDeliverySlot(subscriber, msg);
+      throw err;
+    }
+    if (isThenable(result)) {
+      // The invocation settles after this drain round: release the slot
+      // then and schedule a flush so the held-back backlog resumes.
+      const release = (): void => {
+        this.releaseDeliverySlot(subscriber, msg);
+        this.scheduleFlush();
+      };
+      result.then(release, release);
+    } else {
+      this.releaseDeliverySlot(subscriber, msg);
+    }
+  }
+
+  /**
+   * EB-159: releases one handler-concurrency slot. Called when a plain
+   * handler's invocation settles (synchronous return, throw, or returned
+   * promise settling). Idempotent against double-release: the counters
+   * are clamped, never driven negative. Scheduling the resume flush is
+   * the caller's job — only an async settle needs one (see
+   * `invokeWithDeliverySlot`).
+   */
+  private releaseDeliverySlot(subscriber: Subscriber, msg: BusMessage): void {
+    const state = subscriber.deliveryConcurrency;
+    state.inFlight = Math.max(0, state.inFlight - 1);
+    const key = msg.key;
+    if (key !== undefined) {
+      const remaining = (state.keysInFlight.get(key) ?? 1) - 1;
+      if (remaining <= 0) state.keysInFlight.delete(key);
+      else state.keysInFlight.set(key, remaining);
     }
   }
 
