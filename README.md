@@ -2057,6 +2057,14 @@ npm test
   `queueMaxBytes` subscribe option (dropped + sequence-gap parity with count
   evictions, fail-fast validation, `getStats().queueBytes`, the
   `eventbus_queue_bytes` gauge), and zero overhead when the budget is off.
+- `test/pressure.test.ts` — bus-wide fan-out pressure budget (EB-156):
+  atomic shed at the budget boundary (returns 0, no fan-out/log/seq, no
+  sequence gaps), `onAdmissionRejected` reason `'pressure'`, zero-width
+  publishes never shed, unlimited default unchanged, `publishAtomic`
+  all-or-nothing batching, runtime retuning via `setMaxPendingMessages`
+  (lowering drains in-flight backlog naturally), consumer groups counting
+  one assignee delivery, multi-subscriber width sums, option validation,
+  and `pendingPressure` stats.
 - `test/ack.test.ts` — at-least-once delivery: ack suppresses redelivery,
   nack redelivers immediately with a bumped `redeliveries` count, ack timeout
   auto-requeues, double/late settles are no-ops, unsubscribe cancels pending
@@ -5279,3 +5287,45 @@ Semantics:
   predecessor keeps tripping the hotspot threshold per rung — expected:
   the hotspot still describes the ordering stall, not the ladder.
 
+## Bus-wide fan-out pressure budget (EB-156)
+
+```ts
+const bus = new EventBus({ maxPendingMessages: 100_000 });
+```
+
+Per-subscriber queue waterlines (EB-02) bound each slow consumer, and
+per-topic publish rate limits (EB-19) bound each hot producer — but a
+hot topic times a large subscriber base can still pile unbounded backlog
+*bus-wide* and OOM the process. The pressure budget is the third layer of
+the defense: subscriber waterline → topic rate limit → bus budget.
+
+Semantics:
+
+- **Atomic admission shed.** When admitting a publish would push the live
+  subscriber-queue backlog past the budget, the whole publish is shed in
+  the admission phase: it returns 0, fans out to nobody, writes nothing
+  to the durable log, consumes no sequence number (subscribers see no
+  gap), and burns no rate-limit token. Internal health traffic
+  (admission-DLQ records, EB-139) bypasses the budget — it must never be
+  shed by the load it reports on.
+- **Conservative width.** The gate estimates each publish's queue
+  insertions as the matched production deliveries (one per matched
+  subscriber; one per matched consumer group — the assignee takes it, so
+  group/namespace/bridge members count through their assignee's queue;
+  shadow mirrors excluded). Filters and sampling can only reduce the real
+  insertions, so the budget errs on the safe side. A publish that matches
+  nobody is never shed. The live backlog is read off the lane counters —
+  zero scan cost — and the width scan runs only when a budget is
+  configured, so the unlimited default pays nothing.
+- **Atomic batches.** `publishAtomic` checks the batch's total width
+  after shadow admission and before anything commits: the whole batch is
+  admitted or the whole batch is rejected (`rejected.reason 'pressure'`),
+  zero partial fan-out.
+- **Runtime tunable.** `setMaxPendingMessages(n)` retunes live
+  (`undefined` restores unlimited); lowering the budget never discards
+  in-flight backlog — it drains naturally while new publishes shed.
+  Illegal values throw `RangeError`.
+- **Reconcilable.** The shed counts in the topic's `rejectedMessages` and
+  in `BusStats.pendingPressure`, and fires `onAdmissionRejected` with
+  reason `'pressure'` — the EB-39 reconciliation channel, with its own
+  vocabulary entry alongside the other admission gates.

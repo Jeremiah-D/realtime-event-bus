@@ -3475,6 +3475,32 @@ export interface EventBusOptions {
    */
   fanOutChunkSize?: number;
   /**
+   * Opt-in bus-wide fan-out pressure budget (EB-156): the maximum total
+   * number of messages that may sit in subscriber backpressure queues
+   * across the whole bus. A hot topic times a large subscriber base can
+   * otherwise pile unbounded backlog bus-wide and OOM the process even
+   * when every per-subscriber waterline (EB-02) and per-topic publish
+   * rate limit (EB-19) is behaving as designed — this is the third layer
+   * of the defense: subscriber waterline → topic rate limit → bus
+   * budget.
+   *
+   * When admitting a publish would push the live backlog past the
+   * budget, the whole publish is shed in the admission phase: it returns
+   * 0, fans out to nobody, writes nothing to the durable log, consumes no
+   * sequence number (subscribers see no gap) and burns no rate-limit
+   * token. The shed counts in the topic's `rejectedMessages` and in
+   * `BusStats.pendingPressure`, and fires `onAdmissionRejected` with
+   * reason `'pressure'` (the EB-39 reconciliation channel). `publishAtomic`
+   * checks the batch atomically: the whole batch is admitted or the whole
+   * batch is rejected — zero partial fan-out. Lowering the budget at
+   * runtime (see `setMaxPendingMessages`) never discards in-flight
+   * backlog; it drains naturally. Absent (the default) means unlimited —
+   * fully backward compatible. Must be a non-negative integer when given
+   * (`0` sheds every publish that would queue anything), otherwise
+   * `RangeError` at construction.
+   */
+  maxPendingMessages?: number;
+  /**
    * Opt-in time-based retention for the durable log (EB-85): records older
    * than `now - durableLogMaxAgeMs` (bus clock, `EventBusOptions.now`) are
    * evicted when their topic compacts, alongside the count bound above —
@@ -4269,6 +4295,13 @@ export interface BusStats {
    * size — a fully-synchronous publish never yields.
    */
   fanOutYields: number;
+  /**
+   * Total publishes shed by the bus-wide fan-out pressure budget
+   * (EB-156, see `EventBusOptions.maxPendingMessages`): each shed publish
+   * counted once, at the admission-phase shed. Always 0 when no budget is
+   * configured.
+   */
+  pendingPressure: number;
   /**
    * Total messages shed by subscriber backpressure queues. Matches the
    * sum of the per-subscriber `droppedCount` values for live subscribers.
@@ -8096,7 +8129,8 @@ export type AtomicRejectReason =
   | 'publisher-rate-limit'
   | 'alias-retired'
   | 'topic-paused'
-  | 'idempotency-conflict';
+  | 'idempotency-conflict'
+  | 'pressure';
 
 /**
  * Which publish-side admission gate decided a `previewPublish` call — the
@@ -8446,11 +8480,17 @@ interface PauseBufferEntry {
  *   topic rate-limit budget — so like a `'publisher-rate-limit'` shed it
  *   consumes no sequence number and is invisible to gap detection, and it
  *   burns no rate-limit token)
+ * - `'pressure'` → `BusStats.pendingPressure` (the bus-wide fan-out
+ *   pressure budget shed the publish in the admission phase, EB-156 —
+ *   admitting it would have pushed the live subscriber-queue backlog past
+ *   `EventBusOptions.maxPendingMessages`; like a `'publisher-rate-limit'`
+ *   shed it consumes no sequence number, writes nothing to the durable
+ *   log, and burns no rate-limit token)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
  * `'payload-too-large'` | `'rate-limit'` | `'publisher-rate-limit'` |
- * `'alias-retired'` | `'topic-paused'`); the batch rejection
+ * `'alias-retired'` | `'topic-paused'` | `'pressure'`); the batch rejection
  * is counted once against that entry's topic, so it stays reconcilable
  * too.
  */
@@ -8465,7 +8505,8 @@ export type AdmissionRejectReason =
   | 'alias-retired'
   | 'topic-paused'
   | 'circuit-breaker'
-  | 'sampled';
+  | 'sampled'
+  | 'pressure';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -12064,8 +12105,23 @@ export class EventBus {
    * to `undefined` at construction.
    */
   private readonly fanOutChunkSize: number | undefined;
+  /**
+   * Bus-wide fan-out pressure budget (EB-156): the maximum total number
+   * of messages that may sit in subscriber backpressure queues across
+   * the whole bus. `undefined` (the default) means unlimited. Tunable at
+   * runtime via `setMaxPendingMessages` — lowering it never discards
+   * in-flight backlog, it drains naturally.
+   */
+  private maxPendingMessages: number | undefined;
   /** Chunked fan-out yield counter surfaced as `getStats().fanOutYields` (EB-150). */
   private fanOutYieldCount = 0;
+  /**
+   * Total publishes shed by the bus-wide fan-out pressure budget (EB-156,
+   * see `EventBusOptions.maxPendingMessages`). Counts each shed publish
+   * once, at the admission-phase shed. Surfaced as
+   * `BusStats.pendingPressure`.
+   */
+  private totalPressureShed = 0;
   /** Pull-mode counters surfaced as `getStats().pullStats` (EB-111). */
   private totalPulls = 0;
   private totalPulledMessages = 0;
@@ -12684,6 +12740,35 @@ export class EventBus {
       throw new RangeError('fanOutChunkSize must be a positive integer');
     }
     this.fanOutChunkSize = fanOutChunkSize === Infinity ? undefined : fanOutChunkSize;
+    // Bus-wide fan-out pressure budget (EB-156): absent means unlimited
+    // (backward compatible); a configured budget is enforced atomically
+    // in the fan-out admission phase.
+    const maxPendingMessages = options?.maxPendingMessages;
+    if (
+      maxPendingMessages !== undefined &&
+      (!Number.isInteger(maxPendingMessages) || maxPendingMessages < 0)
+    ) {
+      throw new RangeError('maxPendingMessages must be a non-negative integer');
+    }
+    this.maxPendingMessages = maxPendingMessages;
+  }
+
+  /**
+   * Retunes the bus-wide fan-out pressure budget at runtime (EB-156, see
+   * `EventBusOptions.maxPendingMessages`). `undefined` restores the
+   * unlimited default. Lowering the budget never discards in-flight
+   * backlog — publishes shed only once admitting them would push the
+   * live backlog past the new budget, so the existing pile-up drains
+   * naturally. Throws `RangeError` for a negative or non-integer value.
+   */
+  setMaxPendingMessages(maxPendingMessages: number | undefined): void {
+    if (
+      maxPendingMessages !== undefined &&
+      (!Number.isInteger(maxPendingMessages) || maxPendingMessages < 0)
+    ) {
+      throw new RangeError('maxPendingMessages must be a non-negative integer');
+    }
+    this.maxPendingMessages = maxPendingMessages;
   }
 
   /**
@@ -22457,6 +22542,11 @@ export class EventBus {
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
+    // Bus-wide pressure-budget width for this batch (EB-156): the sum of
+    // every entry's conservative fan-out width, checked atomically after
+    // the loop — the whole batch is admitted or the whole batch is
+    // rejected, zero partial fan-out.
+    let batchWidth = 0;
     // Per-publisher rate-limit reservations for this batch (EB-79): a
     // batch cannot overdraft one publisher's bucket with its own entries.
     const publisherShadowBudget = new Map<string, number>();
@@ -22550,6 +22640,12 @@ export class EventBus {
         else this.countRateLimited(topic, payload, publisherId, entryTraceId);
         return { published: 0, rejected: { index, topic, reason } };
       }
+      // EB-156: accumulate the batch's conservative fan-out width for the
+      // atomic pressure check after the loop. Only when a budget is
+      // configured — the unlimited default skips the scan.
+      if (this.maxPendingMessages !== undefined) {
+        batchWidth += this.estimateFanOutWidth(resolvedTopic);
+      }
       if (key !== undefined) {
         const keySeq = (shadowKeyCursors.get(key) ?? this.keyCursors.get(key) ?? 0) + 1;
         shadowKeyCursors.set(key, keySeq);
@@ -22590,6 +22686,22 @@ export class EventBus {
           return { published: 0, rejected: { index, topic, reason: 'idempotency-conflict' } };
         }
         shadowIdempotencyKeys.add(slot);
+      }
+    }
+    // EB-156: the batch-wide pressure check runs after every entry passed
+    // shadow admission and before anything commits — atomicity demands the
+    // whole batch fit the remaining budget or the whole batch is rejected:
+    // zero partial fan-out. Counted once against the first entry's topic
+    // and surfaced on the admission-rejection hook with reason
+    // `'pressure'`, like any other atomic rejection. The commit phase runs
+    // pre-admitted fan-outs, so this is the only place the budget can gate
+    // a batch.
+    if (this.maxPendingMessages !== undefined && batchWidth > 0) {
+      const pending = this.laneQueued.urgent + this.laneQueued.normal + this.laneQueued.bulk;
+      if (pending + batchWidth > this.maxPendingMessages) {
+        const first = entries[0];
+        this.countPressureShed(first.topic, first.payload, first.publisherId);
+        return { published: 0, rejected: { index: 0, topic: first.topic, reason: 'pressure' } };
       }
     }
     // Phase 2: everything was admitted — commit through the normal
@@ -24770,6 +24882,60 @@ export class EventBus {
     this.statsFor(topic).sampledMessages += 1;
     this.totalSampled += 1;
     this.emitAdmissionRejected(topic, 'sampled', payload, publisherId);
+  }
+
+  /**
+   * Conservative fan-out width estimate for the bus-wide pressure budget
+   * (EB-156): how many production queue insertions this publish would add
+   * if every matched subscriber accepted it. Each matched plain
+   * subscriber counts 1; each matched consumer group counts 1 — one
+   * member takes the message (group/namespace/bridge members land on
+   * their assignee's queue through the normal path, so they count like
+   * any plain subscriber). Shadow mirrors are excluded: their queues are
+   * independent and never touch the production backlog counters. This is
+   * an upper bound — content filters, header filters, delivery sampling,
+   * and publish-side throttling can only reduce the real insertions — so
+   * the budget errs on the safe side. Only runs when a budget is
+   * configured; the unlimited default pays nothing.
+   */
+  private estimateFanOutWidth(topic: string): number {
+    const effectiveTopic = this.resolveLiveTopic(topic);
+    let width = 0;
+    const groupKeys = new Set<string>();
+    for (const subscriber of this.subscribers.values()) {
+      if (!this.topicMatchesWithAliases(subscriber.matcher, topic, effectiveTopic)) continue;
+      if (subscriber.shadow !== undefined) continue;
+      if (subscriber.groupId == null) {
+        width += 1;
+      } else {
+        groupKeys.add(EventBus.groupKey(subscriber.groupId, subscriber.pattern));
+      }
+    }
+    return width + groupKeys.size;
+  }
+
+  /**
+   * Counts one publish shed by the bus-wide fan-out pressure budget
+   * (EB-156) against the topic and the global total, then fires the
+   * admission-rejection hook with reason `'pressure'`. The shed happens
+   * in the admission phase — before sequence-number assignment — so the
+   * payload never became a message: no sequence number is consumed
+   * (subscribers see no gap), the durable log never sees it, and no
+   * rate-limit token is burned. Counted in `rejectedMessages` (shared
+   * with the other pre-admission rejections) plus the dedicated
+   * `BusStats.pendingPressure` total, so the shed stays reconcilable
+   * through the EB-39 channel like every other admission rejection.
+   */
+  private countPressureShed(
+    topic: string,
+    payload: unknown,
+    publisherId?: string,
+    traceId?: string,
+  ): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
+    this.totalPressureShed += 1;
+    this.emitAdmissionRejected(topic, 'pressure', payload, publisherId, traceId);
   }
 
   /**
@@ -28385,6 +28551,33 @@ export class EventBus {
           return { matched: 0, accepted: 0, admitted: false, rejectReason: 'sampled' };
         }
       }
+      // Bus-wide fan-out pressure budget (EB-156): the last admission
+      // gate, after every per-topic check and before sequence-number
+      // assignment — the third layer of defense after the per-subscriber
+      // queue waterline (EB-02) and the per-topic publish rate limit
+      // (EB-19). The check is atomic per publish: when admitting this
+      // publish would push the live subscriber-queue backlog past the
+      // budget, the whole publish is shed — it returns 0, fans out to
+      // nobody, writes nothing to the durable log, consumes no sequence
+      // number (subscribers see no gap), and burns no rate-limit token.
+      // The width is a conservative upper bound (matched production
+      // deliveries; filters and sampling can only reduce the real
+      // insertions), so the budget errs on the safe side. A publish that
+      // matches nobody queues nothing and is never shed. Skipped for
+      // admission-DLQ records (EB-139): internal health traffic must never
+      // be shed by the load it reports on.
+      if (this.maxPendingMessages !== undefined) {
+        const width = this.estimateFanOutWidth(topic);
+        if (width > 0) {
+          const pending =
+            this.laneQueued.urgent + this.laneQueued.normal + this.laneQueued.bulk;
+          if (pending + width > this.maxPendingMessages) {
+            this.countPressureShed(topic, payload, publisherId, admissionTraceId);
+            auditPublish(false, undefined, 'pressure');
+            return { matched: 0, accepted: 0, admitted: false, rejectReason: 'pressure' };
+          }
+        }
+      }
     }
     // The message identity rides the envelope end to end (durable log,
     // replay, cluster forwarding, redeliveries) for subscriber-side
@@ -29920,6 +30113,7 @@ export class EventBus {
       totalPublished: this.totalPublished,
       deliveredMessages: this.totalDelivered,
       fanOutYields: this.fanOutYieldCount,
+      pendingPressure: this.totalPressureShed,
       droppedMessages: this.totalDropped,
       blockedMessages: this.totalBlocked,
       blockedSubscribers: [...this.subscribers.values()].filter((s) => s.blocked).length,
