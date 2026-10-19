@@ -23,6 +23,18 @@ import {
 } from './idle.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { validateRetryLadder, RetryLadder, type RetryLadderTimer, type RetryLadderTimerFactory } from './retry-ladder.ts';
+import {
+  validateAdmissionWebhookOptions,
+  decideAdmission,
+  type AdmissionWebhookOptions,
+  type AdmissionWebhookRequest,
+} from './admission-webhook.ts';
+
+export type {
+  AdmissionWebhookOptions,
+  AdmissionWebhookRequest,
+  AdmissionWebhookDecision,
+} from './admission-webhook.ts';
 import { TokenBucket } from './throttle.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
@@ -3732,6 +3744,23 @@ export interface EventBusOptions {
    */
   onAdmissionRejected?: AdmissionRejectionCallback;
   /**
+   * External admission webhook (EB-157): K8s-admission-style allow/deny
+   * for publishes. When set, every fresh publish admission POSTs a JSON
+   * decision request to `url` and honors `{"allowed": boolean}`:
+   * denied publishes shed with admission reason `'webhook-deny'` — no
+   * sequence number, no durable-log write, no rate-limit budget — and
+   * surface on `onAdmissionRejected` with the same reason. A timeout or
+   * transport error applies `failureMode` (`'fail-closed'` denies,
+   * `'fail-open'` admits). The check runs after the topic-pause gate and
+   * before schema validation; pre-admitted re-fan-outs (atomic commit,
+   * delayed due-time) and admission-DLQ records skip it. The publish
+   * pipeline is synchronous, so the HTTP call blocks the publishing
+   * thread for at most `timeoutMs` — keep the webhook fast or use
+   * `'fail-open'`. Default: unset (no webhook — the bus behaves exactly
+   * as before).
+   */
+  admissionWebhook?: AdmissionWebhookOptions;
+  /**
    * Opt-in hook fired when a message is published to a topic with no live
    * registration in the topic catalog (EB-77). The publish is never
    * blocked — the hook is an observability channel for typo'd topic names
@@ -4552,6 +4581,33 @@ export interface BusStats {
    * `TopicStats.payloadRejectedBytes` for the exact counting rules.
    */
   payloadRejectedBytes: number;
+  /**
+   * Publishes denied by the external admission webhook (EB-157, see
+   * `EventBusOptions.admissionWebhook`): the webhook answered
+   * `{"allowed": false}` or the call failed with `failureMode:
+   * 'fail-closed'`. Subset of `rejectedMessages` (reason
+   * `'webhook-deny'`). Always present, 0 when no webhook is configured.
+   */
+  webhookDeniedMessages: number;
+  /**
+   * Webhook denials caused by a timeout, transport error, or malformed
+   * response with `failureMode: 'fail-closed'` (EB-157) — as opposed to
+   * an explicit `{"allowed": false}`. Subset of
+   * `webhookDeniedMessages`.
+   */
+  webhookErrorMessages: number;
+  /**
+   * Maintenance mode state (EB-158, see `enterMaintenance()`):
+   * `active` mirrors `isInMaintenance()`; `reason` is the
+   * operator-supplied reason (absent when not in maintenance);
+   * `rejectedMessages` counts publishes shed with reason
+   * `'maintenance'` (subset of `rejectedMessages`).
+   */
+  maintenance: {
+    active: boolean;
+    reason?: string;
+    rejectedMessages: number;
+  };
   /**
    * Bus-wide payload-size histogram (EB-143): the same shape as the
    * per-topic snapshot, accumulated across every sampled topic — `count`
@@ -8506,7 +8562,9 @@ export type AdmissionRejectReason =
   | 'topic-paused'
   | 'circuit-breaker'
   | 'sampled'
-  | 'pressure';
+  | 'pressure'
+  | 'webhook-deny'
+  | 'maintenance';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -10701,6 +10759,26 @@ export class EventBus {
    */
   private closed = false;
   /**
+   * External admission webhook config (EB-157): `undefined` when the
+   * operator did not configure one — the webhook gate is a single
+   * undefined check and publish behaves exactly as before.
+   */
+  private readonly admissionWebhook: AdmissionWebhookOptions | undefined;
+  /**
+   * Maintenance mode flag (EB-158): set by `enterMaintenance()`,
+   * cleared by `exitMaintenance()`. While set, fresh publishes shed
+   * with admission reason `'maintenance'` — in-flight deliveries and
+   * subscriptions drain normally. Distinct from `closed` (EB-154),
+   * which is terminal.
+   */
+  private maintenanceMode = false;
+  /**
+   * Operator-supplied reason for the current maintenance window
+   * (EB-158), exposed via `getStats().maintenance`. `undefined` when
+   * not in maintenance mode.
+   */
+  private maintenanceReason: string | undefined;
+  /**
    * The in-flight (or finished) close promise (EB-154). Stored so a
    * second `close()` call returns the same promise — resolving with the
    * same result — instead of re-running the shutdown.
@@ -11386,6 +11464,24 @@ export class EventBus {
    * never reaches a subscriber queue.
    */
   private totalRejected = 0;
+  /**
+   * Total publishes denied by the external admission webhook (EB-157).
+   * Subset of `totalRejected`; the per-topic split lives in each
+   * topic's `rejectedMessages` (reason `'webhook-deny'`).
+   */
+  private webhookDeniedMessages = 0;
+  /**
+   * Total webhook denials caused by a timeout/transport error applying
+   * `failureMode: 'fail-closed'` (EB-157), as opposed to an explicit
+   * `{"allowed": false}`. Subset of `webhookDeniedMessages`.
+   */
+  private webhookErrorMessages = 0;
+  /**
+   * Total publishes shed by maintenance mode (EB-158). Subset of
+   * `totalRejected`; the per-topic split lives in each topic's
+   * `rejectedMessages` (reason `'maintenance'`).
+   */
+  private maintenanceRejectedMessages = 0;
   /**
    * Bus-wide sum of the JSON UTF-8 byte sizes of every publish rejected
    * by the per-topic payload-size cap (EB-120) — the global
@@ -12349,6 +12445,10 @@ export class EventBus {
       throw new RangeError('onAdmissionRejected must be a function');
     }
     this.onAdmissionRejected = onAdmissionRejected;
+    // External admission webhook (EB-157): validated fail-fast — a bad
+    // URL, timeout, or failure mode must never half-wire a bus.
+    validateAdmissionWebhookOptions(options?.admissionWebhook, 'EventBus');
+    this.admissionWebhook = options?.admissionWebhook;
     // Publish-side adaptive sampling (EB-38): the random source is
     // validated fail-fast — a non-function must never half-arm a bus —
     // and defaults to Math.random. The injected source owns the [0, 1)
@@ -24706,6 +24806,69 @@ export class EventBus {
   }
 
   /**
+   * Counts one publish denied by the external admission webhook (EB-157)
+   * against the topic and the global total, then fires the
+   * admission-rejection hook with reason `'webhook-deny'`. The shed is
+   * zero-side-effect: no sequence number (subscribers see no gap), no
+   * durable-log write, no rate-limit budget.
+   */
+  private countWebhookDenial(topic: string, payload: unknown, publisherId?: string, error?: string): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
+    this.webhookDeniedMessages += 1;
+    if (error !== undefined) {
+      this.webhookErrorMessages += 1;
+    }
+    this.emitAdmissionRejected(topic, 'webhook-deny', payload, publisherId);
+  }
+
+  /**
+   * Counts one publish shed by maintenance mode (EB-158) against the
+   * topic and the global total, then fires the admission-rejection hook
+   * with reason `'maintenance'`. The shed is zero-side-effect: no
+   * sequence number, no durable-log write, no rate-limit budget.
+   * In-flight deliveries and live subscriptions are unaffected.
+   */
+  private countMaintenanceRejection(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
+    this.maintenanceRejectedMessages += 1;
+    this.emitAdmissionRejected(topic, 'maintenance', payload, publisherId);
+  }
+
+  /**
+   * Consults the external admission webhook (EB-157) for one publish.
+   * Builds the decision request from the admission context (topic,
+   * payload hash, sizes, identities — never the payload body) and
+   * interprets the webhook's allow/deny. Never throws: a timeout,
+   * transport error, or malformed response applies the configured
+   * `failureMode` and is reported via `error`.
+   */
+  private checkAdmissionWebhook(
+    topic: string,
+    payload: unknown,
+    ctx: { publisherId?: string; messageId?: string; traceparent?: string; binary: boolean },
+  ): { allowed: boolean; error?: string; webhookReason?: string } {
+    const options = this.admissionWebhook;
+    if (options === undefined) {
+      return { allowed: true };
+    }
+    const serialized = serializeToJson(payload);
+    const payloadBytes = serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+    const request: AdmissionWebhookRequest = {
+      topic,
+      payloadSha256: confirmationPayloadHash(payload, ctx.binary),
+      payloadBytes,
+      ...(ctx.publisherId === undefined ? {} : { publisherId: ctx.publisherId }),
+      ...(ctx.messageId === undefined ? {} : { messageId: ctx.messageId }),
+      ...(ctx.traceparent === undefined
+        ? {}
+        : { traceId: parseTraceparent(ctx.traceparent)?.traceId }),
+    };
+    return decideAdmission(options, request);
+  }
+
+  /**
    * Pure schema verdict for one publish (EB-86): resolves the versioned
    * rule set for `topic` (falling back to the legacy validator), selects
    * the requested version (`schemaVersion`, default latest), and runs its
@@ -28430,6 +28593,42 @@ export class EventBus {
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'topic-paused' };
       }
     }
+    // Maintenance mode (EB-158): the bus-level admission gate — a bus
+    // in maintenance refuses fresh publishes outright, before any
+    // topic-scoped gate. The shed is zero-side-effect (no sequence
+    // number, no durable-log write, no rate-limit budget) and surfaces
+    // on `onAdmissionRejected` with reason `'maintenance'`. In-flight
+    // deliveries and live subscriptions are unaffected — only new
+    // admissions stop. Skipped for pre-admitted re-fan-outs and
+    // admission-DLQ records, like the topic-pause gate.
+    if (!preAdmitted && !admissionDlq && this.maintenanceMode) {
+      this.countMaintenanceRejection(topic, payload, publisherId);
+      auditPublish(false, undefined, 'maintenance');
+      return { matched: 0, accepted: 0, admitted: false, rejectReason: 'maintenance' };
+    }
+    // External admission webhook (EB-157): K8s-admission-style
+    // allow/deny, consulted after the topic-pause gate and before
+    // schema validation — cheap local gates first, so the webhook is
+    // never called for a publish that would be rejected anyway. A deny
+    // sheds the publish with reason `'webhook-deny'`: no sequence
+    // number (subscribers see no gap), no durable-log write, no
+    // rate-limit budget. A timeout or transport error applies the
+    // configured `failureMode`. Skipped for pre-admitted re-fan-outs
+    // (they were admitted at their own admission) and admission-DLQ
+    // records (internal health traffic bypasses every gate).
+    if (!preAdmitted && !admissionDlq && this.admissionWebhook !== undefined) {
+      const webhookDecision = this.checkAdmissionWebhook(topic, payload, {
+        publisherId,
+        messageId,
+        traceparent,
+        binary,
+      });
+      if (!webhookDecision.allowed) {
+        this.countWebhookDenial(topic, payload, publisherId, webhookDecision.error);
+        auditPublish(false, undefined, 'webhook-deny');
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: 'webhook-deny' };
+      }
+    }
     // Causal clock (see `PublishOptions.causal`): validated by the
     // publishing entry point; the source defaults to the resolved topic,
     // so alias resolution keeps the stream identity stable.
@@ -29644,6 +29843,64 @@ export class EventBus {
    * the same result — without re-running anything. An illegal
    * `drainTimeoutMs` throws `RangeError` before anything is closed.
    */
+  /**
+   * Enters maintenance mode (EB-158): a reversible, bus-wide admission
+   * gate for planned operations (deployments, downstream cutovers,
+   * incident response). While in maintenance mode, fresh publishes shed
+   * with admission reason `'maintenance'` — zero side effects, surfaced
+   * on `onAdmissionRejected` — while in-flight deliveries and live
+   * subscriptions drain normally. Distinct from `close()` (EB-154),
+   * which is terminal: maintenance mode can be exited with
+   * `exitMaintenance()`, and a bus in maintenance still accepts
+   * subscribes, gateway attachments, and operator reads.
+   *
+   * The transition is audited (`maintenance_entered`, with the optional
+   * reason). Entering maintenance on a closed bus throws
+   * `BusClosedError`; entering when already in maintenance is a no-op
+   * (the reason is updated).
+   */
+  enterMaintenance(reason?: string): void {
+    this.assertNotClosed('publish', '*');
+    if (typeof reason !== 'undefined' && typeof reason !== 'string') {
+      throw new TypeError('enterMaintenance: reason must be a string');
+    }
+    const wasActive = this.maintenanceMode;
+    this.maintenanceMode = true;
+    this.maintenanceReason = reason;
+    if (!wasActive) {
+      this.auditSubscription({
+        action: 'maintenance_entered',
+        actor: 'system',
+        detail: reason === undefined ? {} : { reason },
+      });
+    }
+  }
+
+  /**
+   * Exits maintenance mode (EB-158): publishes are admitted normally
+   * again. Audited as `maintenance_exited`. A no-op when not in
+   * maintenance mode.
+   */
+  exitMaintenance(): void {
+    this.assertNotClosed('publish', '*');
+    if (!this.maintenanceMode) return;
+    this.maintenanceMode = false;
+    this.maintenanceReason = undefined;
+    this.auditSubscription({
+      action: 'maintenance_exited',
+      actor: 'system',
+      detail: {},
+    });
+  }
+
+  /**
+   * Whether the bus is currently in maintenance mode (EB-158). The
+   * same flag is exposed as `getStats().maintenance.active`.
+   */
+  isInMaintenance(): boolean {
+    return this.maintenanceMode;
+  }
+
   close(options?: BusCloseOptions): Promise<BusCloseResult> {
     // Idempotency first: a second call resolves with the first call's
     // result, even with different (or illegal) options.
@@ -30174,6 +30431,20 @@ export class EventBus {
       })),
       rejectedMessages: this.totalRejected,
       payloadRejectedBytes: this.totalPayloadRejectedBytes,
+      // External admission webhook (EB-157): denial counters. Present
+      // always (0 when no webhook is configured) so dashboards can
+      // chart them without existence checks.
+      webhookDeniedMessages: this.webhookDeniedMessages,
+      webhookErrorMessages: this.webhookErrorMessages,
+      // Maintenance mode (EB-158): the live maintenance state plus the
+      // cumulative shed counter. `active` mirrors `isInMaintenance()`;
+      // `reason` is the operator-supplied reason, absent when not in
+      // maintenance.
+      maintenance: {
+        active: this.maintenanceMode,
+        ...(this.maintenanceReason === undefined ? {} : { reason: this.maintenanceReason }),
+        rejectedMessages: this.maintenanceRejectedMessages,
+      },
       // Bus-wide payload-size histogram (EB-143): present once at least
       // one payload has been sampled; absent otherwise, so
       // histogram-free snapshots are byte-identical to before. The
