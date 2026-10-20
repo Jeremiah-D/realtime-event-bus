@@ -16,6 +16,11 @@ import {
 } from './lanes.ts';
 import { LeaseManager, type LeaseExpiredCallback, type LeaseExpiredEvent } from './lease.ts';
 import {
+  RebalanceDebouncer,
+  type DebouncedRebalanceChange,
+  type DebouncedRebalanceFlush,
+} from './rebounce.ts';
+import {
   IdleReclaimer,
   type IdleActivityMode,
   type IdleExpiredCallback,
@@ -3099,6 +3104,15 @@ export interface GroupRebalanceEvent {
    * the post-change partition assignment and which partitions migrated.
    */
   partitionRebalance?: PartitionRebalanceInfo;
+  /**
+   * Rebalance storm protection (EB-169): present on every event for a
+   * group that opted into `GroupSubscribeOptions.rebalanceDebounceMs` —
+   * the number of membership changes absorbed into the debounce window
+   * after the window-opening change. `0` when the window saw a single
+   * change. Absent when the group did not opt in: non-debounced events
+   * are byte-identical to before.
+   */
+  suppressedRebalances?: number;
 }
 
 /**
@@ -3296,6 +3310,35 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * wrote.
    */
   autoCommit?: { intervalMs: number };
+  /**
+   * Opt-in rebalance storm protection (EB-169, see `src/rebounce.ts`):
+   * a Kafka-style rebalance delay for the competing set. The first
+   * membership change opens a window of this many milliseconds; further
+   * changes inside the window are absorbed (counted, not fired); when
+   * the window ends a single merged rebalance event fires, built from
+   * the then-current roster. Rolling restarts and deploy waves stop
+   * costing one full assignment re-derivation per member flap.
+   *
+   * The merged event's `trigger`/`memberId` name the latest absorbed
+   * change (its linger window rides along when the latest change was a
+   * leave that opened one), and `suppressedRebalances` counts the
+   * changes absorbed after the window-opening one (`0` for a lone
+   * change).
+   *
+   * The window only merges the event stream: roster mutation, partition
+   * assignment recomputation, backlog replay and handoff-linger windows
+   * still run eagerly per change, so the final assignment is identical
+   * to sequential rebalances. A static member's session-takeover reclaim
+   * (EB-104) fires no rebalance and is never counted as churn.
+   *
+   * Group-level, fixed by the first member that specifies it: a later
+   * member specifying a different value throws `RangeError` and its
+   * subscription is rolled back; members that omit it inherit the
+   * group's window. The timer is unref'd wall-clock time — it still
+   * fires while the bus is idle and never keeps the process alive.
+   * Must be a finite number `>= 0`; `0` (default) disables the window.
+   */
+  rebalanceDebounceMs?: number;
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -12511,6 +12554,23 @@ export class EventBus {
    */
   private groupMembers = new Map<string, string[]>();
   /**
+   * Rebalance storm protection (EB-169, see `src/rebounce.ts`): the
+   * per-group debounce windows. Configured per competing set via
+   * `GroupSubscribeOptions.rebalanceDebounceMs`; every membership change
+   * is offered to it from `fireRebalance` and the merged event is emitted
+   * from the flush callback. Absent windows mean no debounce — zero
+   * behavior change.
+   */
+  private readonly rebalancer: RebalanceDebouncer;
+  /**
+   * Rebalance debounce baselines (EB-169): groupKey -> the partition
+   * assignment as of the last emitted rebalance. The merged event's
+   * `partitionRebalance.migrated` is the net diff from this baseline to
+   * the assignment at window end. Tracked only for debounced partitioned
+   * groups; dropped when the group's generation ends.
+   */
+  private rebounceBaselines = new Map<string, Map<number, string>>();
+  /**
    * Operator-paused consumer groups (EB-141): groupIds whose delivery is
    * held. While a groupId is present here `drainSubscriber` skips every
    * member of every competing set under that groupId — per-member
@@ -13037,6 +13097,11 @@ export class EventBus {
     }
     this.onIdleExpired = onIdleExpired;
     this.idleReclaimer = new IdleReclaimer((expired) => this.handleIdleExpiry(expired));
+    // Rebalance storm protection (EB-169): the flush callback emits the
+    // merged rebalance event for the window that just ended.
+    this.rebalancer = new RebalanceDebouncer((groupKey, flush) =>
+      this.flushDebouncedRebalance(groupKey, flush),
+    );
     const allowedLatenessMs = options?.allowedLatenessMs ?? 0;
     validateAllowedLatenessMs(allowedLatenessMs, 'EventBus');
     this.allowedLatenessMs = allowedLatenessMs;
@@ -18774,6 +18839,9 @@ export class EventBus {
     const newKey = EventBus.groupKey(groupId, newPattern);
     this.checkPartitionConfig(newKey, undefined);
     this.checkAssignmentConfig(newKey, undefined, undefined);
+    // A moved member cannot dictate the target set's debounce window
+    // either — the target group's configuration stands.
+    this.checkDebounceConfig(newKey, undefined);
     let members = this.groupMembers.get(newKey);
     if (members == null) {
       members = [];
@@ -19483,8 +19551,9 @@ export class EventBus {
    *
    * All queue options (`queueSize`, `dropPolicy`, `onBackpressure`,
    * `throttle`, ...) behave per member exactly as in `subscribe`. Throws
-   * `RangeError` when `groupId` is empty or `handoffLingerMs` is not a
-   * finite number `>= 0`.
+   * `RangeError` when `groupId` is empty, when `handoffLingerMs` is not a
+   * finite number `>= 0`, or when `rebalanceDebounceMs` is not a finite
+   * number `>= 0`.
    */
   subscribeToGroup(
     groupId: string,
@@ -19520,6 +19589,13 @@ export class EventBus {
     const handoffLingerMs = opts?.handoffLingerMs ?? 0;
     if (!Number.isFinite(handoffLingerMs) || handoffLingerMs < 0) {
       throw new RangeError('handoffLingerMs must be a finite number of milliseconds >= 0');
+    }
+    // Rebalance storm protection (EB-169): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    // `0` (default) disables the window, like `handoffLingerMs`.
+    const rebalanceDebounceMs = opts?.rebalanceDebounceMs ?? 0;
+    if (!Number.isFinite(rebalanceDebounceMs) || rebalanceDebounceMs < 0) {
+      throw new RangeError('rebalanceDebounceMs must be a finite number of milliseconds >= 0');
     }
     const partitions = opts?.partitions;
     if (partitions !== undefined && (!Number.isInteger(partitions) || partitions < 1)) {
@@ -19572,7 +19648,7 @@ export class EventBus {
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
-    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, assignor: _assignor, instanceId: _instanceId, sessionTimeoutMs: _sessionTimeoutMs, onReplayProgress: replayObserver, progressInterval: replayInterval, replayThrottle: replayThrottleOpt, ...restOpts } = opts ?? {};
+    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, assignor: _assignor, instanceId: _instanceId, sessionTimeoutMs: _sessionTimeoutMs, rebalanceDebounceMs: _rebalanceDebounceMs, onReplayProgress: replayObserver, progressInterval: replayInterval, replayThrottle: replayThrottleOpt, ...restOpts } = opts ?? {};
     this.validateResumeFromSeq(resumeFromSeq);
     this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
     // Durable-log replay progress (EB-71): validated before anything
@@ -19597,6 +19673,7 @@ export class EventBus {
     try {
       this.checkPartitionConfig(key, partitions);
       this.checkAssignmentConfig(key, assignment, assignor);
+      this.checkDebounceConfig(key, rebalanceDebounceMs > 0 ? rebalanceDebounceMs : undefined);
       // Pluggable assignor fail-fast (EB-106): a custom assignor's result
       // is validated against the post-join roster before the roster is
       // touched, so an invalid assignment throws here with nothing to
@@ -19838,6 +19915,12 @@ export class EventBus {
       // departed members — the sticky assignor starts fresh. The strategy
       // itself is retained, mirroring `groupPartitions`.
       this.previousPartitionAssignment.delete(key);
+      // Rebalance debounce (EB-169): a pending window must never fire
+      // into the next generation's roster — drop it without flushing.
+      // The window configuration itself is retained and re-fixed by the
+      // next generation's first member (`checkDebounceConfig`).
+      this.rebalancer.clearGroup(key);
+      this.rebounceBaselines.delete(key);
     }
   }
 
@@ -19956,6 +20039,10 @@ export class EventBus {
       this.groupStaticSubs.delete(key);
       this.groupStaticTimeouts.delete(key);
       this.groupStaticSessions.delete(key);
+      // Rebalance debounce (EB-169): drop a pending window without
+      // flushing — it must never fire into the next generation.
+      this.rebalancer.clearGroup(key);
+      this.rebounceBaselines.delete(key);
     }
     this.auditSubscription({
       action: 'group_session_expired',
@@ -19980,6 +20067,14 @@ export class EventBus {
    * the departed member, so the event observes the no-duplicate handoff.
    * `partitionRebalance` (partitioned groups only) carries the new
    * partition assignment and which partitions migrated.
+   *
+   * Rebalance storm protection (EB-169): when the group opted into
+   * `GroupSubscribeOptions.rebalanceDebounceMs`, the change is absorbed
+   * into the group's debounce window instead of emitting now — the
+   * merged event fires from `flushDebouncedRebalance` at window end.
+   * Roster mutation, assignment recomputation, backlog replay and linger
+   * windows all ran eagerly before this point, so deferring only the
+   * event never changes the final assignment.
    */
   private fireRebalance(
     groupId: string,
@@ -19990,8 +20085,33 @@ export class EventBus {
     linger?: { until: number; windows: LingerWindow[] },
     partitionRebalance?: PartitionRebalanceInfo,
   ): void {
+    if (this.rebalancer.record(key, groupId, pattern, { trigger, memberId, linger })) return;
+    this.emitRebalance(groupId, pattern, key, trigger, memberId, linger, partitionRebalance, 0);
+  }
+
+  /**
+   * Emits one rebalance event for a group: the offset pre-flush, the
+   * per-member notification, the audit entry and the lag re-check.
+   * `suppressed` is the EB-169 debounce count — `0` for an immediate
+   * (non-debounced) emission. The `suppressedRebalances` event field is
+   * only present for debounced groups; without the opt-in the event and
+   * the audit entry are byte-identical to before EB-169.
+   */
+  private emitRebalance(
+    groupId: string,
+    pattern: string,
+    key: string,
+    trigger: 'join' | 'leave',
+    memberId: string,
+    linger: { until: number; windows: LingerWindow[] } | undefined,
+    partitionRebalance: PartitionRebalanceInfo | undefined,
+    suppressed: number,
+  ): void {
     const members = this.groupMembers.get(key);
     if (members == null) return;
+    // The group opted into rebalance debounce (EB-169): the event
+    // carries how many membership changes were absorbed into the window.
+    const debounced = this.rebalancer.getWindowMs(key) !== undefined;
     // Offset auto-commit (EB-127): every rebalance — join or leave —
     // checkpoints the group's pending offsets first, before ownership
     // moves: the Kafka revoke-hook analogue. Idempotent with the
@@ -20010,6 +20130,7 @@ export class EventBus {
         members: [...members],
         trigger,
         memberId,
+        ...(debounced ? { suppressedRebalances: suppressed } : {}),
         ...(linger == null
           ? {}
           : {
@@ -20033,6 +20154,7 @@ export class EventBus {
         trigger,
         memberId,
         members: members.length,
+        ...(debounced ? { suppressedRebalances: suppressed } : {}),
         ...(partitionRebalance == null
           ? {}
           : {
@@ -20048,6 +20170,44 @@ export class EventBus {
     // the held backlog is excluded and the rebalance itself never
     // false-alarms.
     this.checkGroupLagForGroup(groupId);
+    // Rebalance debounce baseline (EB-169): the next window's merged
+    // event diffs its net partition migration from this assignment.
+    // Tracked only for debounced partitioned groups.
+    if (debounced && this.groupPartitions.get(key) !== undefined) {
+      this.rebounceBaselines.set(key, new Map(this.partitionAssignment(key)));
+    }
+  }
+
+  /**
+   * Emits the merged rebalance event when a debounce window ends
+   * (EB-169). The event is built from the then-current roster; its
+   * trigger/memberId/linger come from the latest absorbed change, and
+   * for partitioned groups `partitionRebalance` carries the post-window
+   * assignment plus the net migration since the previous emission.
+   */
+  private flushDebouncedRebalance(groupKey: string, flush: DebouncedRebalanceFlush): void {
+    const partitioned = this.groupPartitions.get(groupKey) !== undefined;
+    let partitionRebalance: PartitionRebalanceInfo | undefined;
+    if (partitioned) {
+      const before = this.rebounceBaselines.get(groupKey) ?? new Map<number, string>();
+      const after = this.partitionAssignment(groupKey);
+      const migrated = this.diffPartitionAssignment(groupKey, before, after);
+      partitionRebalance = {
+        assignment: Object.fromEntries(after),
+        migrated,
+        strategy: this.groupAssignorName(groupKey),
+      };
+    }
+    this.emitRebalance(
+      flush.groupId,
+      flush.pattern,
+      groupKey,
+      flush.trigger,
+      flush.memberId,
+      flush.linger,
+      partitionRebalance,
+      flush.suppressed,
+    );
   }
 
   /**
@@ -20439,6 +20599,42 @@ export class EventBus {
     }
     out.sort((a, b) => a.partition - b.partition);
     return out;
+  }
+
+  /**
+   * Validates a joining member's `rebalanceDebounceMs` option against
+   * the group's fixed configuration (EB-169, see `src/rebounce.ts`). The
+   * window is a group-level contract — mixed windows would make the
+   * event timing nondeterministic — so the first member that specifies
+   * one fixes it for the group; a later member that specifies a
+   * different value throws `RangeError` and its subscription is rolled
+   * back. Members that omit it inherit the group's window. A later
+   * member may opt a non-debounced group in (nothing was ever debounced,
+   * so there is no in-flight window to contradict). Called before the
+   * member joins the competing set, so the caller can roll back the
+   * subscription.
+   */
+  private checkDebounceConfig(groupKey: string, windowMs: number | undefined): void {
+    if (!this.groupMembers.has(groupKey)) {
+      // New (or fully drained and recreated) group: the first member
+      // re-fixes the mode — a stale window from a dead generation is
+      // dropped, and any leftover debounce state with it (belt and
+      // braces: the generation-end paths already clear it).
+      this.rebalancer.configure(groupKey, windowMs);
+      this.rebounceBaselines.delete(groupKey);
+      return;
+    }
+    const configured = this.rebalancer.getWindowMs(groupKey);
+    if (windowMs === undefined) return;
+    if (configured === undefined) {
+      this.rebalancer.configure(groupKey, windowMs);
+      return;
+    }
+    if (windowMs !== configured) {
+      throw new RangeError(
+        `rebalance debounce window mismatch: group uses ${configured}ms, got ${windowMs}ms`,
+      );
+    }
   }
 
   /**
@@ -31164,6 +31360,9 @@ export class EventBus {
     // while subscribers are draining.
     const cancelledDelayed = this.cancelAllDelayedForClose();
     const cancelledRecurring = this.cancelAllRecurringForClose();
+    // Rebalance debounce (EB-169): drop pending windows without
+    // flushing — no merged event may fire after the bus is closed.
+    this.rebalancer.close();
     const drain = await this.drainAllSubscribers(drainTimeoutMs);
     await this.finalizeClose();
     return { ...drain, cancelledDelayed, cancelledRecurring };

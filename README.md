@@ -131,7 +131,9 @@ library.
   groups on the same pattern each receive a copy. A slow member never
   blocks the group: assignment does not skip full queues, the member's own
   drop policy applies. Membership changes rebalance implicitly
-  (`onRebalance` fires on affected members with the new roster). The bus
+  (`onRebalance` fires on affected members with the new roster); opt-in
+  `rebalanceDebounceMs` (EB-169) merges a burst of membership changes
+  into one rebalance event for storm protection. The bus
   tracks the per-group assignment watermark (`getGroupOffsets`: highest
   per-topic `seq` handed to any member) and consumer checkpoints
   (`commitOffset` / `getCommittedOffsets`); `getStats().consumerGroups`
@@ -2156,6 +2158,15 @@ npm test
   cooperative no-stop-the-world, strategy mismatch rolls back the join,
   invalid value rejected before registration, rendezvous stays the
   default, fully drained groups start fresh without pinning).
+- `test/rebalance-debounce.test.ts` — rebalance storm protection
+  (EB-169): `rebalanceDebounceMs` validation with subscriber rollback,
+  rapid joins merged into one event with `suppressedRebalances`, lone
+  change fires with count 0, non-debounced events carry no new field,
+  mixed join+leave windows name the latest change, final partition
+  assignment identical to sequential rebalances (net migration only),
+  static-member reclaim never counted as churn, window mismatch rolls
+  back the join, fully drained groups drop the pending window, and a
+  later member may opt a non-debounced group in.
 - `test/durablelog.test.ts` — durable topic log: append/readSince round-trip,
   reopen recovery of topics/seqs/counts, corrupt-line tolerance, amortized
   compaction, option validation; bus integration: per-publish logging with
@@ -5619,3 +5630,55 @@ Semantics notes:
   `bus.close()`. Disabled by default: without `bridge.health` the mirror
   path is byte-for-byte the EB-51 behavior. Invalid options throw
   `RangeError` from the constructor.
+
+## Rebalance debounce: storm protection for consumer groups (EB-169)
+
+**Opt-in.** A group whose members flap — rolling restarts, deploy waves,
+autoscaler churn — fires one rebalance event per membership change, and
+every event makes each member re-derive its local assignment state. Pass
+`rebalanceDebounceMs` in `GroupSubscribeOptions` (`src/rebounce.ts`) and
+the window merges them, Kafka-`rebalance-delay`-style:
+
+```ts
+const member = bus.subscribeToGroup('orders', 'orders.events', onOrder, {
+  rebalanceDebounceMs: 500, // merge changes within 500ms into one rebalance
+  onRebalance: (e) => {
+    // e.suppressedRebalances: how many changes were absorbed into this window
+  },
+});
+```
+
+The first change opens the window; further changes inside it are
+absorbed (counted, not fired); when the window ends a single merged
+rebalance event fires, built from the then-current roster. The merged
+event's `trigger`/`memberId` name the latest absorbed change, and
+`suppressedRebalances` counts the changes absorbed after the
+window-opening one (`0` for a lone change).
+
+Semantics notes:
+
+- Only the event stream is merged. Roster mutation, partition-assignment
+  recomputation, backlog replay to new owners and handoff-linger windows
+  still run eagerly per change — the final assignment after a window is
+  identical to what sequential rebalances would have produced. For
+  partitioned groups the merged event's `partitionRebalance` carries the
+  post-window assignment plus the *net* migration since the previous
+  emission.
+- Static membership (EB-104) composes cleanly: a static member's
+  session-takeover reclaim fires no rebalance at all, so it is never
+  counted as churn. Static session *expiry* is a real leave and is
+  debounced like any other.
+- The window is group-level, fixed by the first member that specifies
+  it: a later member specifying a different value throws `RangeError`
+  and its subscription is rolled back (members that omit it inherit the
+  group's window). A non-finite or negative value throws `RangeError` at
+  `subscribeToGroup`, before anything registers.
+- If the group fully drains mid-window, the pending window is dropped
+  without flushing — a window never fires into the next generation's
+  roster. The membership facts remain in the per-change
+  `group_join`/`group_leave` audit entries.
+- The window timer is unref'd wall-clock time (same rationale as
+  `sessionTimeoutMs`: a liveness bound must fire while the bus is idle)
+  and is dropped on `bus.close()`. Without the opt-in, rebalance events
+  and their audit entries are byte-identical to before — the
+  `suppressedRebalances` field is only present on debounced events.
