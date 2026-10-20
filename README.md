@@ -5682,3 +5682,51 @@ Semantics notes:
   and is dropped on `bus.close()`. Without the opt-in, rebalance events
   and their audit entries are byte-identical to before — the
   `suppressedRebalances` field is only present on debounced events.
+
+## CEP sequence detection (EB-170)
+
+Flink-CEP-style sequence patterns over admitted publishes:
+
+```ts
+bus.defineSequence({
+  id: 'login-flow',
+  steps: [{ topic: 'user.login' }, { topic: 'user.purchase' }],
+  withinMs: 10_000,
+});
+bus.subscribe('cep.login-flow', (msg) => {
+  const { patternId, key, events, durationMs, at } = msg.payload;
+  // events: the matched messages in step order
+});
+```
+
+Semantics notes:
+
+- Steps match against the alias-resolved concrete topic (`*` one segment,
+  `**` any run of segments, other segments literal).
+- Correlation defaults to the publish key (`msg.key ?? ''`), so "the same
+  key saw A then B" is the primitive; pass `keyOf` to correlate on a
+  payload field or a header instead.
+- One observation per admitted publish — after the admission gates and
+  sequence assignment, before compression rewrites the envelope — so the
+  engine sees the raw application payload with a final sequence number.
+  Rejected or shed publishes never feed pattern detection.
+- A partial older than `withinMs` can never complete: it is dropped lazily
+  on the next observation (no background timer — an idle bus burns no
+  CPU). Memory is bounded per pattern by `maxPartialMatches` (default
+  1000): the oldest partial is evicted first.
+- A completed match is emitted on `cep.<patternId>` as a first-class
+  admitted publish (sequence number, durable log, subscriber fan-out).
+  Match events never re-enter pattern detection (`cepDerived`) — a match
+  can never trigger itself, and patterns never observe each other's
+  derived traffic. A *direct* publish to `cep.<id>` is ordinary traffic
+  and matches normally.
+- `defineSequence` validates eagerly: fewer than two steps, a non-positive
+  `withinMs`, an invalid id (must match `/^[A-Za-z0-9_-]{1,64}$/` so the
+  derived topic stays one dot-segment) or a duplicate id throw `RangeError`
+  before anything is registered. `clearSequence(id)` removes a pattern and
+  drops its partials.
+- `getStats().cep` → `{ activePatterns, partialMatches, matches }`
+  (present once a pattern was defined; the engine persists for the bus's
+  lifetime, so clearing every pattern leaves zero counts).
+- Prometheus: `eventbus_cep_patterns`, `eventbus_cep_partial_matches`,
+  `eventbus_cep_matches_total` — rendered only once a pattern was defined.

@@ -208,6 +208,12 @@ import {
   type PartitionAssignor,
 } from './assignor.ts';
 import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
+import {
+  CepEngine,
+  type SequencePatternOptions,
+  type SequenceMatchEvent,
+  type CepStats,
+} from './cep.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
@@ -5747,6 +5753,14 @@ export interface BusStats {
    * shape too.
    */
   chaos?: ChaosStats;
+  /**
+   * CEP sequence-detection counters (EB-170): present once at least one
+   * pattern has been defined (the engine persists for the bus's
+   * lifetime; clearing every pattern leaves zero counts) — absent
+   * otherwise, so buses that never used CEP render a byte-identical
+   * stats shape.
+   */
+  cep?: CepStats;
 }
 
 /**
@@ -9771,6 +9785,18 @@ export interface PublishOptions {
    */
   routed?: boolean;
   /**
+   * Internal-only: marks this publish as CEP-derived (see
+   * `EventBus.defineSequence`, EB-170). A CEP-derived message never
+   * re-enters sequence-pattern detection — a completed match can never
+   * trigger itself, and match events never feed other patterns — while
+   * still running the full normal admission pipeline (ACL, schema,
+   * rate-limit, TTL, durable log). The bus sets this on the match
+   * publishes it emits itself; setting it on a direct publish opts that
+   * publish out of pattern detection (an escape hatch for producers that
+   * already handled derived traffic themselves).
+   */
+  cepDerived?: boolean;
+  /**
    * Multi-tenant namespace (EB-52, see `EventBus.createNamespace`): the
    * publish is scoped to the namespace — `topic` resolves to the
    * concrete topic `<namespace>/<topic>` and runs the full normal
@@ -12833,6 +12859,13 @@ export class EventBus {
    */
   private outboxRelay?: OutboxRelay;
   /**
+   * CEP sequence detection (EB-170), created on the first
+   * `defineSequence` call. Observes every admitted publish (see
+   * `observeAdmittedPublish`) and feeds `getStats().cep` plus the
+   * Prometheus exposition when present.
+   */
+  private cep?: CepEngine;
+  /**
    * `durableLogMaxEntriesPerTopic` as configured — namespace child logs
    * (EB-52) open with the same per-topic budget as the root log.
    */
@@ -14859,6 +14892,80 @@ export class EventBus {
    */
   clearTopicAllowedLateness(topicPattern: string): boolean {
     return this.allowedLatenessRules.delete(topicPattern);
+  }
+
+  /**
+   * Defines a CEP sequence pattern (EB-170): declares that the `steps`
+   * topics — in order, on the same correlation key — within `withinMs`
+   * milliseconds constitute a match. Returns the pattern id.
+   *
+   * Steps match against the message's alias-resolved concrete topic
+   * (`compilePattern` semantics: `*` one segment, `**` any run of
+   * segments). The correlation key defaults to the publish key
+   * (`msg.key ?? ''`); pass `keyOf` to correlate on something else (a
+   * payload field, a header).
+   *
+   * When a partial reaches the last step inside the window, the bus emits
+   * a match event on `cep.<patternId>` — a first-class admitted publish
+   * (sequence number, durable log, subscriber fan-out) carrying
+   * `{ patternId, key, events, durationMs, at }`. Match events never
+   * re-enter pattern detection (`cepDerived`), so a match can never
+   * trigger itself and patterns never observe each other's derived
+   * traffic.
+   *
+   * Throws `RangeError` before anything is registered on invalid options
+   * or a duplicate id. `getStats().cep` exposes the live counters
+   * (activePatterns / partialMatches / matches).
+   */
+  defineSequence(opts: SequencePatternOptions): string {
+    if (this.cep === undefined) {
+      this.cep = new CepEngine({
+        now: this.now,
+        compile: compilePattern,
+        emitMatch: (patternId, match) => this.emitCepMatch(patternId, match),
+      });
+    }
+    return this.cep.define(opts);
+  }
+
+  /**
+   * Removes a sequence pattern and drops its partial matches. Returns
+   * true when a pattern with that id existed.
+   */
+  clearSequence(patternId: string): boolean {
+    return this.cep?.clear(patternId) ?? false;
+  }
+
+  /**
+   * Emits one completed sequence match back onto the bus (EB-170): a
+   * `cep.<patternId>` publish through the normal pipeline, marked
+   * cep-derived so it never re-enters pattern detection.
+   */
+  private emitCepMatch(patternId: string, match: SequenceMatchEvent): void {
+    this.publish(
+      CepEngine.matchTopic(patternId),
+      {
+        patternId: match.patternId,
+        key: match.key,
+        events: match.events,
+        durationMs: match.durationMs,
+        at: match.at,
+      },
+      { cepDerived: true },
+    );
+  }
+
+  /**
+   * Single observation point for admitted publishes (EB-170), called from
+   * `fanOut` once per admitted publish — after the admission gates and
+   * sequence assignment, before compression rewrites the envelope — so
+   * the observer sees the raw application payload with a final sequence
+   * number.
+   */
+  private observeAdmittedPublish(msg: BusMessage, cepDerived: boolean): void {
+    if (!cepDerived && this.cep !== undefined) {
+      this.cep.observe(msg);
+    }
   }
 
   /**
@@ -22685,6 +22792,9 @@ export class EventBus {
       // Application message headers (EB-153): validated above; `fanOut`
       // stamps them onto the envelope and the durable-log record.
       opts?.headers,
+      // CEP-derived marker (EB-170): the bus's own match publishes carry
+      // it (see `PublishOptions.cepDerived`); direct publishes never do.
+      opts?.cepDerived ?? false,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -29831,8 +29941,14 @@ export class EventBus {
     // bridge/cluster ingress, diagnostic events, delayed/pause drains,
     // atomic commit) leave it undefined: headers are admission-scoped
     // routing metadata, carried on the envelope from the admitting
-    // publish. Last so existing positional call sites are unaffected.
+    // publish.
     messageHeaders?: Record<string, string>,
+    // CEP-derived marker (EB-170): set only by `publishCore` for the
+    // bus's own match publishes (see `PublishOptions.cepDerived`). Every
+    // other path leaves it false, so a match event never re-enters
+    // pattern detection. Last so existing positional call sites are
+    // unaffected.
+    cepDerived = false,
   ): {
     matched: number;
     accepted: number;
@@ -30373,6 +30489,14 @@ export class EventBus {
     // this line. Opt-in per topic; unconfigured topics pay a single
     // map-size check (see `samplePayloadHistogram`).
     this.samplePayloadHistogram(topic, payload);
+    // CEP sequence detection (EB-170): observed once per admitted
+    // publish — after the admission gates and sequence assignment,
+    // before compression rewrites the envelope — so the engine sees the
+    // raw application payload with a final sequence number. Rejected and
+    // shed publishes never reach this line. CEP-derived match events
+    // never re-enter pattern detection (`cepDerived`), so a match can
+    // never trigger itself.
+    this.observeAdmittedPublish(msg, cepDerived);
     // Event-time watermark (EB-59): observed once per accepted publish —
     // after the admission gates (schema validation, rate-limit budget), so
     // a rejected or shed message never moves the watermark, exactly like
@@ -32299,6 +32423,10 @@ export class EventBus {
       // scenarios were configured — absent otherwise, so a chaos-free
       // bus reports exactly the stats shape it always did.
       ...(this.chaos === undefined ? {} : { chaos: this.chaos.snapshot() }),
+      // CEP sequence detection (EB-170): present only once a pattern is
+      // defined — absent otherwise, so a CEP-free bus reports exactly
+      // the stats shape it always did.
+      ...(this.cep === undefined ? {} : { cep: this.cep.snapshot() }),
     };
   }
 

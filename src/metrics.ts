@@ -134,6 +134,8 @@
  *   publishes per publisher identity (EB-65; only emitted when at least
  *   one publisher has admitted a publish — anonymous publishes move no
  *   per-publisher counter).
+ * - `eventbus_cep_matches_total`: sequence matches completed and emitted
+ *   (EB-170; only emitted once a pattern was defined).
  *
  * Gauges (point-in-time):
  * - `eventbus_subscribers`: currently active subscriptions.
@@ -242,6 +244,10 @@
  *   payload bytes inside the sliding window per namespace tenant-quota
  *   rule (EB-162, see `BusStats.namespaceQuotas`) — the multi-tenant
  *   capacity signal; one series per registered rule.
+ * - `eventbus_cep_patterns`: sequence patterns currently defined
+ *   (EB-170; only emitted once a pattern was defined).
+ * - `eventbus_cep_partial_matches`: partial sequence matches currently
+ *   tracked (EB-170; only emitted once a pattern was defined).
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
@@ -1046,6 +1052,27 @@ export function renderPrometheus(stats: BusStats): string {
   for (const q of stats.namespaceQuotas ?? []) {
     const label = `namespace="${escapeLabelValue(q.namespace)}",pattern="${escapeLabelValue(q.pattern)}"`;
     lines.push(`eventbus_tenant_quota_bytes_total{${label}} ${q.usedBytes}`);
+  }
+
+  // CEP sequence detection (EB-170): pattern/partial/match counters.
+  // Rendered only when a pattern was defined — a CEP-free bus renders
+  // exactly what it always did.
+  if (stats.cep !== undefined) {
+    gauge(
+      'eventbus_cep_patterns',
+      'Sequence patterns currently defined (EB-170).',
+      stats.cep.activePatterns,
+    );
+    gauge(
+      'eventbus_cep_partial_matches',
+      'Partial sequence matches currently tracked (EB-170).',
+      stats.cep.partialMatches,
+    );
+    counter(
+      'eventbus_cep_matches_total',
+      'Sequence matches completed and emitted (EB-170).',
+      stats.cep.matches,
+    );
   }
 
   return lines.join('\n') + '\n';
