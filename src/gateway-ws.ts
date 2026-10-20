@@ -326,6 +326,15 @@ export interface GatewayOptions {
    */
   sendHighWaterMarkBytes?: number;
   /**
+   * Opt-in per-connection subscription cap (EB-173): when a connection
+   * already holds this many live bus subscriptions, further `subscribe`
+   * frames fail with a `subscribe_denied` error frame — the connection
+   * stays open. Defends the gateway against subscription fan-out abuse.
+   * Must be a positive integer when given; unset means unlimited
+   * (historical behavior).
+   */
+  maxSubscriptionsPerConnection?: number;
+  /**
    * Cap on the per-connection local queue while paused; past it the
    * newest frame is dropped and counted. Default 1 MiB.
    */
@@ -390,7 +399,8 @@ export interface GatewayStats {
   pausedConnections: number;
   /**
    * One row per live connection, in connection order: its queued
-   * outbound bytes and whether it is currently pressured (EB-161).
+   * outbound bytes, whether it is currently pressured (EB-161), and its
+   * live bus-subscription count (EB-173).
    */
   connectionQueues: Array<{
     remoteAddress?: string;
@@ -398,6 +408,8 @@ export interface GatewayStats {
     queuedBytes: number;
     /** True while the connection's subscriptions are pressure-paused. */
     pressured: boolean;
+    /** Live bus subscriptions on this connection (EB-173). */
+    subscriptions: number;
   }>;
 }
 
@@ -468,6 +480,8 @@ export class GatewayServer {
   private readonly maxPendingBytes: number;
   private readonly maxFrameBytes: number;
   private readonly clientPressureWatermarkBytes: number | undefined;
+  /** Opt-in per-connection subscription cap (EB-173); undefined = unlimited. */
+  private readonly maxSubscriptionsPerConnection: number | undefined;
   private readonly clientPressureRecoveryWatermarkBytes: number;
   private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
   private server: TcpServer | null = null;
@@ -512,7 +526,17 @@ export class GatewayServer {
       }
     }
     this.clientPressureWatermarkBytes = clientPressureWatermarkBytes;
-    let clientPressureRecoveryWatermarkBytes =
+    // EB-173: opt-in per-connection subscription cap — positive integer
+    // or unset (unlimited, the historical behavior). Invalid values fail
+    // fast with RangeError at construction, matching every other option.
+    const maxSubscriptionsPerConnection = options.maxSubscriptionsPerConnection;
+    if (
+      maxSubscriptionsPerConnection !== undefined &&
+      (!Number.isInteger(maxSubscriptionsPerConnection) || maxSubscriptionsPerConnection <= 0)
+    ) {
+      fail('maxSubscriptionsPerConnection must be a positive integer when given');
+    }
+    this.maxSubscriptionsPerConnection = maxSubscriptionsPerConnection;  let clientPressureRecoveryWatermarkBytes =
       options.clientPressureRecoveryWatermarkBytes ??
       (clientPressureWatermarkBytes === undefined
         ? 0
@@ -572,6 +596,7 @@ export class GatewayServer {
         ...(remoteAddress === undefined ? {} : { remoteAddress }),
         queuedBytes: conn.pendingBytes,
         pressured: conn.pressured,
+        subscriptions: conn.subscriptions.size,
       });
     }
     return { ...this.stats, pausedConnections, connectionQueues };
@@ -989,6 +1014,21 @@ export class GatewayServer {
     }
     if (opts !== undefined && !isRecord(opts)) {
       this.sendError(conn, 'invalid_request', 'subscribe opts must be an object', id);
+      return;
+    }
+    // EB-173: per-connection subscription cap. Over-cap subscribes get a
+    // `subscribe_denied` error frame — the connection stays open, so a
+    // well-behaved client can unsubscribe and retry.
+    if (
+      this.maxSubscriptionsPerConnection !== undefined &&
+      conn.subscriptions.size >= this.maxSubscriptionsPerConnection
+    ) {
+      this.sendError(
+        conn,
+        'subscribe_denied',
+        `subscription limit reached (maxSubscriptionsPerConnection=${this.maxSubscriptionsPerConnection})`,
+        id,
+      );
       return;
     }
     const wireOpts = (opts ?? {}) as GatewaySubscribeOptions;

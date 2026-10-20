@@ -3713,6 +3713,16 @@ Semantics:
   (`bus.getSubscriptionAudit()`), and `gw.getStats()` exposes
   per-connection `queuedBytes` plus the `pausedConnections` count. A
   slow client can no longer OOM the gateway process.
+- **Subscription cap (EB-173, opt-in).** With
+  `maxSubscriptionsPerConnection` set, a connection that already holds
+  that many live bus subscriptions gets an error frame with
+  `code: 'subscribe_denied'` for further `subscribe` frames — the
+  connection stays open, so a well-behaved client can unsubscribe and
+  retry. Defends the gateway against subscription fan-out abuse.
+  Non-integer or non-positive values fail fast with `RangeError` at
+  construction; unset means unlimited (the historical behavior).
+  `gw.getStats()` exposes the live count per connection in
+  `connectionQueues[].subscriptions`.
 - **Drain liveness.** The queued backlog is normally drained by the
   socket's `drain` event, which only fires after `write()` returns
   false (past Node's own writable mark). When
