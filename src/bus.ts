@@ -15454,7 +15454,15 @@ export class EventBus {
         dstTemplate: rule.dstTemplate,
         mirrored: 0,
         loopsPrevented: 0,
+        mirroredThrottled: 0,
       };
+      // EB-172: per-rule mirror throttle. The token bucket rides the
+      // destination bus's injected clock, so mirror throttle timing is
+      // deterministic in tests like every other bus clock consumer.
+      const throttleBucket =
+        rule.throttle === undefined
+          ? undefined
+          : new TokenBucket(rule.throttle.burst, rule.throttle.messagesPerSec, () => this.now());
       const sub = source.subscribe(rule.srcPattern, (msg: BusMessage) => {
         // EB-131: merge the source write's HLC into this bus's clock
         // first — a local write made after seeing this message must
@@ -15488,6 +15496,16 @@ export class EventBus {
           }
         }
         if (isLoop) return;
+        // EB-172: per-rule mirror throttle. The gate sits after loop
+        // prevention and per-key LWW arbitration, so frames that never
+        // reach admission (loops, stale writes) neither consume throttle
+        // budget nor count as mirrored — only frames that would otherwise
+        // be handed to admission can be shed here.
+        if (throttleBucket !== undefined && !throttleBucket.take()) {
+          info.mirroredThrottled += 1;
+          this.auditMirrorThrottled(rule, msg.topic);
+          return;
+        }
         info.mirrored += 1;
         const origin = msg.mirror;
         this.receiveForward({
@@ -26960,6 +26978,26 @@ export class EventBus {
       pattern: subscriber.pattern,
       topic: msg.topic,
       detail: { policy, dropped, queueSize: subscriber.queue.size },
+    });
+  }
+
+  /**
+   * Records one `mirror_throttled` audit event (EB-172): a mirror frame
+   * shed by its rule's traffic throttle before reaching this bus's
+   * admission pipeline. Fully error-isolated like all audit emission: a
+   * throttled mirror must never throw for observability.
+   */
+  private auditMirrorThrottled(rule: ResolvedMirrorRule, topic: string): void {
+    this.auditSubscription({
+      action: 'mirror_throttled',
+      actor: 'system',
+      pattern: rule.srcPattern,
+      topic,
+      detail: {
+        srcPattern: rule.srcPattern,
+        dstTemplate: rule.dstTemplate,
+        messagesPerSec: rule.throttle?.messagesPerSec,
+      },
     });
   }
 

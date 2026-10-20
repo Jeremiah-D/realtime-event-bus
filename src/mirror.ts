@@ -44,6 +44,23 @@
  * `EventBus` type): the bus wires the rules up in `EventBus.mirror`.
  */
 
+/**
+ * Per-rule mirror traffic throttle (EB-172): an opt-in rate ceiling for
+ * the mirror path, defending cross-datacenter mirror bandwidth from a hot
+ * source topic. The throttle is a token bucket — one token per mirrored
+ * frame — so a burst up to `burst` frames passes and the sustained rate
+ * converges on `messagesPerSec`.
+ */
+export interface MirrorThrottleOptions {
+  /** Sustained mirror frames per second for this rule. Must be > 0. */
+  messagesPerSec: number;
+  /**
+   * Burst capacity in frames. Defaults to one second of budget
+   * (`messagesPerSec`). Must be > 0 when given.
+   */
+  burst?: number;
+}
+
 /** One cross-instance mirror rule (see `EventBus.mirror`). */
 export interface MirrorRule {
   /**
@@ -60,6 +77,14 @@ export interface MirrorRule {
    * topic unchanged.
    */
   rename?: string;
+  /**
+   * Opt-in per-rule throttle (EB-172): mirror frames beyond the token
+   * budget are shed before reaching this bus's admission pipeline and
+   * counted in `mirroredThrottled` — local delivery on both buses is
+   * unaffected. Unset means unlimited, matching the historical mirror
+   * behavior.
+   */
+  throttle?: MirrorThrottleOptions;
 }
 
 /**
@@ -94,6 +119,12 @@ export interface MirrorRuleInfo {
   mirrored: number;
   /** Messages dropped because their trail already held this bus's id. */
   loopsPrevented: number;
+  /**
+   * Mirror frames shed by this rule's throttle (EB-172): over-budget
+   * frames dropped before reaching admission. Zero unless the rule sets
+   * `MirrorRule.throttle`.
+   */
+  mirroredThrottled: number;
 }
 
 /**
@@ -114,6 +145,11 @@ export interface MirrorHandle {
 export interface ResolvedMirrorRule {
   srcPattern: string;
   dstTemplate: string;
+  /**
+   * Validated throttle config (EB-172): `burst` is fully resolved (no
+   * optionals), or `undefined` when the rule is unthrottled.
+   */
+  throttle?: { messagesPerSec: number; burst: number };
   /** The destination topic for `topic`, or `null` when it does not match. */
   apply(topic: string): string | null;
 }
@@ -214,6 +250,35 @@ function validateTemplate(template: string, captureCount: number, where: string)
 }
 
 /**
+ * Validates a mirror throttle option the way `EventBus.mirror` would:
+ * throws `RangeError` on the first problem — a broken rule fails at
+ * registration time, never mid-mirror. Returns the fully-resolved config
+ * (burst defaulted to one second of budget).
+ */
+export function validateMirrorThrottle(
+  throttle: unknown,
+  where: string,
+): { messagesPerSec: number; burst: number } {
+  if (typeof throttle !== 'object' || throttle === null) {
+    throw new RangeError(`${where}: throttle must be an object`);
+  }
+  const { messagesPerSec, burst } = throttle as {
+    messagesPerSec?: unknown;
+    burst?: unknown;
+  };
+  if (!Number.isFinite(messagesPerSec) || (messagesPerSec as number) <= 0) {
+    throw new RangeError(`${where}: throttle.messagesPerSec must be a positive finite number`);
+  }
+  if (burst !== undefined && (!Number.isFinite(burst) || (burst as number) <= 0)) {
+    throw new RangeError(`${where}: throttle.burst must be a positive finite number when given`);
+  }
+  return {
+    messagesPerSec: messagesPerSec as number,
+    burst: (burst ?? (messagesPerSec as number)) as number,
+  };
+}
+
+/**
  * Validates one mirror rule the way `EventBus.mirror` would: throws
  * `RangeError` on the first problem — a broken rule fails at
  * registration time, never mid-mirror.
@@ -222,7 +287,7 @@ export function resolveMirrorRule(rule: MirrorRule, where: string): ResolvedMirr
   if (typeof rule !== 'object' || rule === null) {
     throw new RangeError(`${where}: mirror rule must be an object`);
   }
-  const { srcPattern, rename } = rule;
+  const { srcPattern, rename, throttle } = rule;
   if (typeof srcPattern !== 'string' || srcPattern.length === 0) {
     throw new RangeError(`${where}: srcPattern must be a non-empty string`);
   }
@@ -235,6 +300,7 @@ export function resolveMirrorRule(rule: MirrorRule, where: string): ResolvedMirr
   return {
     srcPattern,
     dstTemplate: rename ?? '(source topic)',
+    throttle: throttle === undefined ? undefined : validateMirrorThrottle(throttle, where),
     apply(topic: string): string | null {
       const captures = matchCaptures(patternSegs, topic.split('.'));
       if (captures === null) return null;

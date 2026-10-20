@@ -79,7 +79,8 @@ export type SubscriptionAuditAction =
   | 'client_pressure_recovered'
   | 'tenant_quota_warning'
   | 'bridge_unhealthy'
-  | 'bridge_recovered';
+  | 'bridge_recovered'
+  | 'mirror_throttled';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -161,6 +162,9 @@ export type SubscriptionAuditAction =
  * - `bridge_recovered`: `{ transport, consecutiveFailures,
  *   lastProbeAt? }` — a later probe or mirror succeeded and outbound
  *   mirroring resumed
+ * - `mirror_throttled`: `{ srcPattern, dstTemplate, messagesPerSec }` —
+ *   a mirror frame shed by its rule's traffic throttle (EB-172) before
+ *   reaching admission; the `pattern` field carries the source pattern
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -236,6 +240,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'tenant_quota_warning',
   'bridge_unhealthy',
   'bridge_recovered',
+  'mirror_throttled',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

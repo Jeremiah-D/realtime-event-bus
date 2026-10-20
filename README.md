@@ -4564,6 +4564,26 @@ write. The application key now rides the envelope end to end
 (`BusMessage.key`), so the mirror frame carries it and the destination
 draws its own per-key sequence numbers for the mirrored write.
 
+## Mirror traffic throttling (EB-172)
+
+Per-mirror-rule traffic throttle, opt-in: `mirror(src, [{ srcPattern,
+rename, throttle: { messagesPerSec, burst? } }])`. Each throttled rule
+gets a token bucket clocked by the destination bus's injected clock —
+the sustained mirror rate converges on `messagesPerSec`, with a burst up
+to `burst` frames (defaults to one second of budget). Frames beyond the
+budget are dropped *before* reaching this bus's admission pipeline:
+they count in the new `mirroredThrottled` rule counter (visible in
+`getStats().mirrors`) and are audited as `mirror_throttled` events
+(`bus.getSubscriptionAudit()`), so a hot source topic cannot flood
+cross-datacenter mirror bandwidth silently. The gate sits after loop
+prevention and per-key LWW arbitration — frames that never reach
+admission (loops, stale writes) consume neither throttle budget nor
+mirror counters. Local delivery on both buses is unaffected, and with
+no `throttle` set the rule is unlimited (the historical behavior). An
+invalid throttle fails fast with `RangeError` at `mirror()` time.
+Prometheus exposition carries the activity-gated per-rule series
+`eventbus_mirror_throttled_total{src_pattern,dst_template}`.
+
 ## Publish circuit breaker (EB-116)
 
 `bus.setPublishCircuitBreaker(topic, opts?)` arms an opt-in publish-side

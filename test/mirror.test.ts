@@ -51,6 +51,7 @@ test('basic mirror: rename rule, provenance, and stats', async () => {
       dstTemplate: 'mirror.orders.raw',
       mirrored: 2,
       loopsPrevented: 0,
+      mirroredThrottled: 0,
     },
   ]);
   assert.deepEqual(handle.rules(), stats.mirrors);

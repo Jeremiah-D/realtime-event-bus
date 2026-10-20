@@ -1025,6 +1025,24 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_mirror_conflicts_total{${label}} ${row.conflicts}`);
   }
 
+  // Mirror traffic throttling (EB-172): per-rule shed frames from the
+  // mirror receive path. Only rules with at least one shed carry a
+  // series, so cardinality tracks throttle activity, not the rule
+  // space. The `?? 0` keeps the renderer tolerant of a stats object
+  // that predates the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_mirror_throttled_total Mirror frames shed by per-rule traffic throttling on the mirror receive path.',
+  );
+  lines.push('# TYPE eventbus_mirror_throttled_total counter');
+  for (const row of stats.mirrors ?? []) {
+    const throttled = row.mirroredThrottled ?? 0;
+    if (throttled === 0) continue;
+    const label =
+      `src_pattern="${escapeLabelValue(row.srcPattern)}",` +
+      `dst_template="${escapeLabelValue(row.dstTemplate)}"`;
+    lines.push(`eventbus_mirror_throttled_total{${label}} ${throttled}`);
+  }
+
   // Transactional outbox relay lag (EB-102). Always rendered — zeros when
   // no relay is attached — so the alert rule `eventbus_outbox_lag_ms > X`
   // exists from the first scrape. The `?? 0` keeps the renderer tolerant
