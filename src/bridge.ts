@@ -1,3 +1,10 @@
+import {
+  resolveBridgeHealthOptions,
+  type BridgeHealthOptions,
+  type BridgeHealthStats,
+  type ResolvedBridgeHealthOptions,
+} from './bridgehealth.ts';
+
 /**
  * Cross-process fan-out bridge (EB-51).
  *
@@ -113,6 +120,13 @@ export interface BridgeTransport {
    * throw or a rejected promise never reaches the publish path.
    */
   publish(envelope: BridgeEnvelope): void | Promise<void>;
+  /**
+   * Optional health probe for the EB-168 bridge health monitor: return
+   * (or resolve) `true` when the broker is reachable, `false` — or a
+   * throw — when it is not. When absent, the monitor falls back to an
+   * envelope round-trip through `publish` (see `src/bridgehealth.ts`).
+   */
+  probe?(): boolean | Promise<boolean>;
   /** Release transport resources (sockets, clients). Optional. */
   close?(): void | Promise<void>;
 }
@@ -125,6 +139,15 @@ export interface BridgeOptions {
    * positive integer. Default 1024.
    */
   maxInboundQueue?: number;
+  /**
+   * Opt-in transport health monitoring (see `src/bridgehealth.ts`,
+   * EB-168): periodic probes plus mirror-outcome accounting; at
+   * `failureThreshold` consecutive failures outbound mirroring pauses
+   * (local delivery is unaffected) until a probe or mirror succeeds
+   * again. Disabled by default — without it the mirror path is
+   * byte-for-byte the EB-51 behavior.
+   */
+  health?: BridgeHealthOptions;
 }
 
 /** `getStats().bridge`: the bridge counters. */
@@ -140,6 +163,14 @@ export interface BridgeStats {
   outbound: number;
   /** Inbound envelopes shed because the ingress buffer was full. */
   dropped: number;
+  /**
+   * Transport health (EB-168): `state` is `'disabled'` when no health
+   * monitoring was configured, otherwise `'healthy'`/`'unhealthy'`;
+   * `lastProbeAt` is the bus-clock time of the last probe run (absent
+   * before the first probe); `consecutiveFailures` counts consecutive
+   * mirror/probe failures and resets on any success.
+   */
+  health: BridgeHealthStats;
 }
 
 /** Why `receiveFromBridge` refused an envelope. */
@@ -169,6 +200,7 @@ export const DEFAULT_BRIDGE_MAX_INBOUND_QUEUE = 1024;
 export interface ResolvedBridgeOptions {
   transport: BridgeTransport;
   maxInboundQueue: number;
+  health: ResolvedBridgeHealthOptions | undefined;
 }
 
 const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -188,18 +220,26 @@ export function resolveBridgeOptions(
   if (typeof options !== 'object' || options === null) {
     throw new RangeError(`${where}: bridge must be an object`);
   }
-  const { transport, maxInboundQueue } = options;
+  const { transport, maxInboundQueue, health } = options;
   if (typeof transport !== 'object' || transport === null) {
     throw new RangeError(`${where}: bridge.transport must be an object`);
   }
   if (typeof (transport as BridgeTransport).publish !== 'function') {
     throw new RangeError(`${where}: bridge.transport.publish must be a function`);
   }
+  const probe = (transport as BridgeTransport).probe;
+  if (probe !== undefined && typeof probe !== 'function') {
+    throw new RangeError(`${where}: bridge.transport.probe must be a function`);
+  }
   const queue = maxInboundQueue ?? DEFAULT_BRIDGE_MAX_INBOUND_QUEUE;
   if (!Number.isInteger(queue) || queue < 1) {
     throw new RangeError(`${where}: bridge.maxInboundQueue must be a positive integer`);
   }
-  return { transport: transport as BridgeTransport, maxInboundQueue: queue };
+  return {
+    transport: transport as BridgeTransport,
+    maxInboundQueue: queue,
+    health: resolveBridgeHealthOptions(health, where),
+  };
 }
 
 export interface ValidatedBridgeEnvelope {

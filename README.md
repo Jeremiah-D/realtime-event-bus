@@ -310,8 +310,13 @@ library.
   the envelope. Inbound envelopes queue in a bounded ingress buffer
   (`maxInboundQueue`, default 1024) drained on a microtask — a full buffer
   sheds the newest envelope and counts it. `getStats().bridge` reports
-  `{ inbound, outbound, dropped }`, and the Prometheus exposition carries
-  `eventbus_bridge_{outbound,inbound,dropped}_total`.
+  `{ inbound, outbound, dropped, health }`, and the Prometheus exposition carries
+  `eventbus_bridge_{outbound,inbound,dropped}_total`. Opt-in transport
+  health monitoring (`bridge.health`, EB-168): periodic probes (custom
+  `transport.probe()` or an envelope round-trip) plus mirror-outcome
+  accounting — at `failureThreshold` consecutive failures outbound
+  mirroring pauses (local delivery unaffected) until a probe succeeds
+  again, with `bridge_unhealthy` / `bridge_recovered` audit events.
 - **`src/durablelog.ts` — `DurableTopicLog`**: opt-in append-only per-topic
   JSONL log (`new EventBus({ durableLogDir })`). Every published message is
   appended as one line (`{v, seq, topic, at, expiresAt?, payload}`, one file
@@ -2119,6 +2124,15 @@ npm test
   `bridgeDropped` counting, malformed envelopes reported never thrown,
   `not-configured`, constructor validation, throwing/rejecting transports
   never breaking publishing, and the bridge Prometheus series.
+- `test/bridge-health.test.ts` — bridge transport health monitor (EB-168):
+  `resolveBridgeHealthOptions` validation/defaults, monitor state machine
+  (trip at threshold, success resets, recovery transitions fire once),
+  custom-probe vs. envelope-round-trip probing, throwing probes and
+  rejected publishes as failures, injected-timer start/stop, disabled by
+  default (failures never pause mirroring), consecutive mirror failures
+  pausing outbound mirroring while local delivery continues,
+  probe-driven recovery resuming mirroring, rejected mirror promises
+  feeding the monitor, and `close()` stopping the probe timer.
 - `test/partitions.test.ts` — partitioned consumer groups: deterministic
   rendezvous assignment, exclusive per-partition delivery for keyed messages
   (key→partition→owner mapping verified independently), deterministic spread
@@ -5556,3 +5570,52 @@ Semantics:
   in `BusStats.pendingPressure`, and fires `onAdmissionRejected` with
   reason `'pressure'` — the EB-39 reconciliation channel, with its own
   vocabulary entry alongside the other admission gates.
+
+## Bridge transport health probe (EB-168)
+
+**Opt-in.** The cross-process bridge (EB-51) swallows mirror failures by
+design — the bus keeps serving locally — which leaves operators blind: a
+dead transport looks exactly like a healthy one until the peer stops
+receiving. The health monitor adds the signal:
+
+```ts
+const bus = new EventBus({
+  bridge: {
+    transport,
+    health: {
+      intervalMs: 30_000, // probe interval (default 30000)
+      failureThreshold: 3, // consecutive failures before pausing (default 3)
+    },
+  },
+});
+```
+
+Every mirror outcome feeds the monitor (success resets the
+consecutive-failure counter, failure increments it), and a periodic probe
+runs on top: the transport's own `probe()` when it implements one, else an
+envelope round-trip — a real probe envelope published through
+`transport.publish`, where the transport's accept vs. reject is the
+signal. At the threshold the bridge is marked `unhealthy` and outbound
+mirroring pauses; the next successful probe marks it `healthy` again and
+mirroring resumes for new publishes. `getStats().bridge.health` reports
+`{ state, lastProbeAt?, consecutiveFailures }` (`'disabled'` when
+unconfigured), and the transitions are audited as `bridge_unhealthy` /
+`bridge_recovered` in the subscription audit log.
+
+Semantics notes:
+
+- Pausing is outbound-only: local delivery is unaffected, and paused
+  mirrors are not queued — mirroring is best-effort, so the outage window
+  simply is not mirrored. Recovery is probe-driven (a paused bridge
+  attempts no mirrors).
+- Probe envelopes are real envelopes on the `__bridge.probe` topic: peers
+  admit them through the normal path and fan them out to zero subscribers
+  (a `**` subscriber would observe them — the topic name is the
+  contract). With a custom `probe()` no envelope is ever sent.
+- Honesty note: the envelope round-trip only measures the transport's
+  publish path — a transport that swallows broker failures internally will
+  always look healthy. Production transports should implement `probe()`.
+- The probe timer is unref'd (never holds the process open) and stops on
+  `bus.close()`. Disabled by default: without `bridge.health` the mirror
+  path is byte-for-byte the EB-51 behavior. Invalid options throw
+  `RangeError` from the constructor.

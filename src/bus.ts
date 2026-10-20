@@ -249,6 +249,11 @@ import {
   type ResolvedBridgeOptions,
 } from './bridge.ts';
 import {
+  BridgeHealthMonitor,
+  type BridgeHealthOptions,
+  type BridgeHealthStats,
+} from './bridgehealth.ts';
+import {
   EventTimeWatermark,
   validateAllowedLatenessMs,
   validateEventTime,
@@ -300,6 +305,11 @@ export type {
   BridgeStats,
   BridgeTransport,
 } from './bridge.ts';
+export type {
+  BridgeHealthOptions,
+  BridgeHealthState,
+  BridgeHealthStats,
+} from './bridgehealth.ts';
 export type {
   DeliveryLatencyOptions,
   DeliveryLatencySummaryStats,
@@ -3998,7 +4008,12 @@ export interface EventBusOptions {
    * node-local sequence numbers, and are never mirrored back — the bridge
    * stays loop-free. `key` (with its publish-order `keySeq`), `messageId`,
    * the end-to-end `traceId`, and the source TTL deadline ride the
-   * envelope. Disabled by default; an invalid config throws `RangeError`
+   * envelope. Opt-in transport health monitoring via `BridgeOptions.health`
+   * (see `src/bridgehealth.ts`, EB-168): periodic probes plus
+   * mirror-outcome accounting; at the failure threshold outbound mirroring
+   * pauses (local delivery is unaffected) until a probe or mirror succeeds
+   * again, with `bridge_unhealthy` / `bridge_recovered` audit events.
+   * Disabled by default; an invalid config throws `RangeError`
    * from the constructor.
    */
   bridge?: BridgeOptions;
@@ -5510,7 +5525,8 @@ export interface BusStats {
    * `outbound` local publishes mirrored to the transport, `inbound`
    * bridge envelopes admitted and fanned out locally, `dropped` inbound
    * envelopes shed on a full ingress buffer. All zero when no bridge is
-   * configured.
+   * configured. `health` is the EB-168 transport health monitor state
+   * (`'disabled'` when unconfigured).
    */
   bridge: BridgeStats;
   /**
@@ -12897,6 +12913,12 @@ export class EventBus {
    * the bus never closes it.
    */
   private readonly bridge: ResolvedBridgeOptions | undefined;
+  /**
+   * Bridge transport health monitor (EB-168), present only when
+   * `EventBusOptions.bridge.health` was configured. Gates outbound
+   * mirroring and records every mirror outcome.
+   */
+  private readonly bridgeHealth: BridgeHealthMonitor | undefined;
   /** Envelopes mirrored to the bridge transport (see `BridgeStats`). */
   private bridgeOutbound = 0;
   /** Bridge envelopes admitted and fanned out locally. */
@@ -13080,6 +13102,27 @@ export class EventBus {
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.traceArchive = traceArchive;
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
+    // Bridge transport health monitor (EB-168): opt-in via
+    // `EventBusOptions.bridge.health`. Watches every mirror outcome
+    // and runs periodic probes; at the failure threshold the bus pauses
+    // outbound mirroring until a probe or mirror succeeds again. The
+    // monitor's timer is unref'd and stopped on close().
+    const bridgeHealthOpt = this.bridge?.health;
+    if (bridgeHealthOpt !== undefined && this.bridge !== undefined) {
+      const bridge = this.bridge;
+      this.bridgeHealth = new BridgeHealthMonitor(
+        bridge.transport,
+        bridgeHealthOpt,
+        this.now,
+        {
+          onUnhealthy: () => this.auditBridgeHealth('bridge_unhealthy'),
+          onRecovered: () => this.auditBridgeHealth('bridge_recovered'),
+        },
+      );
+      this.bridgeHealth.start();
+    } else {
+      this.bridgeHealth = undefined;
+    }
     const resolvedGroupLag = resolveGroupLagOptions(options?.groupLag, 'EventBus');
     // EB-132: the ops alert outlet sits on top of the EB-112 lag-SLO
     // in-process callback — a breach fires the user's hook first, then
@@ -26484,6 +26527,27 @@ export class EventBus {
   }
 
   /**
+   * Records one bridge health transition audit event (EB-168):
+   * `bridge_unhealthy` when consecutive mirror/probe failures reach the
+   * threshold and outbound mirroring pauses, `bridge_recovered` when a
+   * later probe or mirror succeeds and mirroring resumes. Fully
+   * error-isolated like all audit emission: the health monitor never
+   * throws for observability.
+   */
+  private auditBridgeHealth(action: 'bridge_unhealthy' | 'bridge_recovered'): void {
+    const health = this.bridgeHealth?.getStats();
+    this.auditSubscription({
+      action,
+      actor: 'system',
+      detail: {
+        transport: this.bridge?.transport.name ?? 'unknown',
+        consecutiveFailures: health?.consecutiveFailures ?? 0,
+        ...(health?.lastProbeAt === undefined ? {} : { lastProbeAt: health.lastProbeAt }),
+      },
+    });
+  }
+
+  /**
    * Queries the subscription lifecycle audit log (EB-78): the bounded
    * in-memory index of every subscribe / unsubscribe / pattern
    * hot-update / group join-leave / rebalance / topic-registry change /
@@ -30270,8 +30334,15 @@ export class EventBus {
     // path. Envelopes arriving FROM the bridge (`receiveFromBridge`) are
     // never mirrored back — that is what keeps a multi-node bridge
     // loop-free.
+    //
+    // Bridge health (EB-168): when the health monitor marks the
+    // transport unhealthy, outbound mirroring pauses — the publish still
+    // fans out locally, but no mirror is attempted and nothing is
+    // counted. Paused mirrors are not queued (mirroring is best-effort);
+    // mirroring resumes for new publishes once a probe succeeds again
+    // (recovery is probe-driven: a paused bridge attempts no mirrors).
     const bridge = this.bridge;
-    if (bridge !== undefined && !fromBridge) {
+    if (bridge !== undefined && !fromBridge && (this.bridgeHealth?.healthy() ?? true)) {
       this.bridgeOutbound += 1;
       const traceId = this.trace?.traceIdOf(msg);
       const envelope: BridgeEnvelope = {
@@ -30305,15 +30376,23 @@ export class EventBus {
           return { signature: { kid: bridgeSig.kid, sig: bridgeSig.sig, seq: msg.seq } };
         })(),
       };
+      const health = this.bridgeHealth;
       try {
         const result = bridge.transport.publish(envelope);
-        if (result !== undefined && typeof (result as Promise<void>).catch === 'function') {
-          (result as Promise<void>).catch(() => {
-            // Swallowed: a failing transport must never break publishing.
-          });
+        if (result !== undefined && typeof (result as Promise<void>).then === 'function') {
+          (result as Promise<void>).then(
+            () => health?.recordSuccess(),
+            () => {
+              // Swallowed: a failing transport must never break publishing.
+              health?.recordFailure();
+            },
+          );
+        } else {
+          health?.recordSuccess();
         }
       } catch {
         // Swallowed: see above.
+        health?.recordFailure();
       }
     }
     // Durable log (opt-in): persist the stamped message before fan-out, so a
@@ -31232,6 +31311,9 @@ export class EventBus {
    * the rest.
    */
   private async finalizeClose(): Promise<void> {
+    // Bridge health monitor (EB-168): stop probing — a closed bus
+    // mirrors nothing, so there is nothing left to probe.
+    this.bridgeHealth?.stop();
     for (const groupId of [...this.autoCommitGroups.keys()]) {
       try {
         this.flushAutoCommits(groupId);
@@ -31684,6 +31766,10 @@ export class EventBus {
         inbound: this.bridgeInbound,
         outbound: this.bridgeOutbound,
         dropped: this.bridgeDropped,
+        health: this.bridgeHealth?.getStats() ?? {
+          state: 'disabled',
+          consecutiveFailures: 0,
+        },
       },
       aliases: [...this.topicAliases.entries()].map(([oldTopic, entry]) => ({
         oldTopic,

@@ -77,7 +77,9 @@ export type SubscriptionAuditAction =
   | 'header_filter_updated'
   | 'client_pressure'
   | 'client_pressure_recovered'
-  | 'tenant_quota_warning';
+  | 'tenant_quota_warning'
+  | 'bridge_unhealthy'
+  | 'bridge_recovered';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -152,6 +154,13 @@ export type SubscriptionAuditAction =
  *   tenant quota (EB-162) reached its soft threshold; latched per
  *   excursion (the `topic` field carries the concrete topic that
  *   crossed the threshold)
+ * - `bridge_unhealthy`: `{ transport, consecutiveFailures,
+ *   lastProbeAt? }` — the bridge transport health monitor (EB-168)
+ *   reached its consecutive-failure threshold and paused outbound
+ *   mirroring; local delivery is unaffected
+ * - `bridge_recovered`: `{ transport, consecutiveFailures,
+ *   lastProbeAt? }` — a later probe or mirror succeeded and outbound
+ *   mirroring resumed
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -225,6 +234,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'client_pressure',
   'client_pressure_recovered',
   'tenant_quota_warning',
+  'bridge_unhealthy',
+  'bridge_recovered',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {
