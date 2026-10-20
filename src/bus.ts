@@ -7154,6 +7154,21 @@ function validateLookbackOptions(opts: LookbackOptions | undefined, caller: stri
 }
 
 /**
+ * Validates a per-message absolute delivery deadline (EB-177,
+ * `PublishOptions.deadlineAt`/`deadlineMs`): absent is fine, otherwise
+ * it must be a finite number — an absolute millisecond timestamp on the
+ * bus clock. A timestamp already in the past is legal (the message is
+   * admitted, then dropped as expired at the first drain); non-numbers,
+ * NaN and infinities throw `RangeError` before anything is mutated.
+ */
+function validateDeadline(value: number | undefined, name: string, caller: string): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new RangeError(`${caller}: ${name} must be a finite millisecond timestamp`);
+  }
+}
+
+/**
  * Validates `PublishOptions.critical` (EB-38): absent is fine, otherwise
  * it must be a boolean — anything else throws `RangeError` before the
  * publish mutates any state, matching the other publish-option
@@ -10062,6 +10077,40 @@ export interface PublishOptions {
    */
   ttlMs?: number;
   /**
+   * Per-message absolute delivery deadline (EB-177, opt-in): the latest
+   * instant, in milliseconds on the bus clock (`EventBusOptions.now`),
+   * at which the message may still be delivered — the end-to-end
+   * counterpart of the relative `ttlMs` above. The deadline is absolute,
+   * so it rides every hop verbatim: fan-out, backpressure queues,
+   * redeliveries, delayed fan-out, the pre-DLQ retry ladder, durable-log
+   * replay, and the bridge/cluster forwards all enforce the same
+   * instant. A message past its deadline is dropped before delivery and
+   * counted in `expiredMessages` (per-topic and global), exactly like
+   * TTL expiry — drain-time, not an admission rejection, so
+   * `onAdmissionRejected` never fires for it, and the drop is visible
+   * as a sequence gap.
+   *
+   * Orthogonal to the topic-level TTL rules (`EventBus.setTopicTtl`):
+   * when both apply, the earlier instant wins. `deadlineAt` wins over
+   * `deadlineMs` when both are given. A deadline already in the past is
+   * legal — the message is admitted, then dropped as expired at the
+   * first drain. Delayed deliveries carry it as
+   * `PublishDelayedOptions.deadlineAt`/`deadlineMs`; unlike `ttlMs` it
+   * is NOT re-stamped at fan-out time — the wait eats the message's
+   * life, which is the point of an absolute deadline.
+   *
+   * Must be a finite number when provided; anything else (non-number,
+   * NaN, infinite) throws `RangeError` from the publish entry point
+   * before anything is mutated.
+   */
+  deadlineAt?: number;
+  /**
+   * Alias spelling of `deadlineAt` (EB-177): the same absolute delivery
+   * deadline in milliseconds on the bus clock. `deadlineAt` takes
+   * precedence when both are given. Same validation.
+   */
+  deadlineMs?: number;
+  /**
    * Application message headers (EB-153, opt-in): a string-to-string
    * routing map stamped onto the message envelope (`BusMessage.headers`)
    * at admission — tenant, region, schema version, canary cohort.
@@ -10204,6 +10253,26 @@ export interface PublishDelayedOptions {
    * `0` means the message expires the moment it fans out.
    */
   ttlMs?: number;
+  /**
+   * Per-message absolute delivery deadline for this delayed publish
+   * (EB-177, opt-in): the latest instant, in milliseconds on the bus
+   * clock, at which the message may still be delivered. Unlike `ttlMs`
+   * above it is NOT re-stamped at fan-out time — the schedule carries
+   * the absolute instant, and the wait eats the message's life, which is
+   * the point of an absolute deadline. A schedule whose deadline passes
+   * before its due time is dropped as expired at sweep time, never
+   * delivered. Carried on the schedule record so a restart rebuilds the
+   * timer with the deadline intact. Validated fail-fast at schedule time
+   * (same `RangeError`, same zero-side-effect convention as `publish`).
+   * Must be a finite millisecond timestamp when provided.
+   */
+  deadlineAt?: number;
+  /**
+   * Alias spelling of `deadlineAt` (EB-177): the same absolute delivery
+   * deadline in milliseconds on the bus clock. `deadlineAt` takes
+   * precedence when both are given. Same validation.
+   */
+  deadlineMs?: number;
   /**
    * Explicit idempotency key for this publish (EB-151, opt-in): within
    * the bus idempotency window (`EventBusOptions.idempotencyWindowMs`,
@@ -23082,6 +23151,10 @@ export class EventBus {
     // Per-message TTL override (EB-149): fail-fast, before anything is
     // mutated — same zero-side-effect convention as the schema rejection.
     validateTtlMs(opts?.ttlMs, caller);
+    // Per-message absolute delivery deadline (EB-177): fail-fast, before
+    // anything is mutated — same zero-side-effect convention.
+    validateDeadline(opts?.deadlineAt, 'deadlineAt', caller);
+    validateDeadline(opts?.deadlineMs, 'deadlineMs', caller);
     // Adaptive sampling exemption (EB-38): fail-fast, before anything is
     // mutated.
     validateCritical(opts?.critical, caller);
@@ -23236,6 +23309,9 @@ export class EventBus {
       // CEP-derived marker (EB-170): the bus's own match publishes carry
       // it (see `PublishOptions.cepDerived`); direct publishes never do.
       opts?.cepDerived ?? false,
+      // Per-message absolute delivery deadline (EB-177): validated above;
+      // `deadlineAt` wins over `deadlineMs` when both are given.
+      opts?.deadlineAt ?? opts?.deadlineMs,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -24998,6 +25074,10 @@ export class EventBus {
     // mutated — same zero-side-effect convention as the other delayed
     // fail-fast gates.
     validateTtlMs(opts.ttlMs, 'publishDelayed');
+    // Per-message absolute delivery deadline (EB-177): fail-fast, before
+    // anything is mutated — same zero-side-effect convention.
+    validateDeadline(opts.deadlineAt, 'deadlineAt', 'publishDelayed');
+    validateDeadline(opts.deadlineMs, 'deadlineMs', 'publishDelayed');
     // Priority lane (EB-122): fail-fast, before anything is mutated.
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishDelayed');
     const priority = opts?.priority;
@@ -25098,6 +25178,11 @@ export class EventBus {
     const messageTtlMs = opts.ttlMs;
     const topicTtlMs = messageTtlMs === undefined ? this.ttlForTopic(topic) : undefined;
     const expiresAt = topicTtlMs === undefined ? undefined : nowMs + topicTtlMs;
+    // Per-message absolute delivery deadline (EB-177): the schedule
+    // carries the absolute instant — unlike `ttlMs` it is NOT re-stamped
+    // at fan-out time, so the wait eats the message's life. `deadlineAt`
+    // wins over `deadlineMs` when both are given.
+    const deadline = opts.deadlineAt ?? opts.deadlineMs;
     validateMessageKey(opts.key, 'publishDelayed');
     validateTraceparent(opts.traceparent, 'publishDelayed');
     const key = opts.key;
@@ -25116,6 +25201,11 @@ export class EventBus {
       // The per-message TTL duration rides the schedule (EB-149): the
       // due-time fan-out stamps `fanOutTime + ttlMs` — see `DelayedFanOut`.
       ttlMs: messageTtlMs,
+      // The per-message absolute delivery deadline rides the schedule
+      // (EB-177): the due-time sweep drops the schedule as expired when
+      // the deadline passes first, and the fan-out enforces the earlier
+      // of it and the TTL-derived deadline.
+      ...(deadline === undefined ? {} : { deadline }),
       cancelled: false,
       key,
       keySeq,
@@ -25147,6 +25237,10 @@ export class EventBus {
         // so a restart rebuilds the timer with the TTL intact — the
         // due-time fan-out stamps the deadline, not the schedule.
         ...(messageTtlMs === undefined ? {} : { ttlMs: messageTtlMs }),
+        // The per-message absolute delivery deadline rides the schedule
+        // record (EB-177) so a restart rebuilds the timer with the
+        // deadline intact — the absolute instant, never re-stamped.
+        ...(deadline === undefined ? {} : { deadline }),
         delayId: id,
         key,
         keySeq,
@@ -25693,7 +25787,17 @@ export class EventBus {
       if (top.deliverAt > nowMs) break;
       this.delayHeap.pop();
       this.delayedById.delete(top.id);
-      if (top.expiresAt !== undefined && nowMs >= top.expiresAt) {
+      // The schedule's effective deadline is the earlier of the
+      // schedule-time TTL deadline and the per-message absolute
+      // deadline (EB-177) — a deadline that passed while delayed drops
+      // the schedule here, never delivered.
+      const sweepDeadline =
+        top.deadline === undefined
+          ? top.expiresAt
+          : top.expiresAt === undefined
+            ? top.deadline
+            : Math.min(top.expiresAt, top.deadline);
+      if (sweepDeadline !== undefined && nowMs >= sweepDeadline) {
         this.recordExpired(top.topic);
         this.appendDelayTombstone(top.id, top.topic);
         // A keyed schedule that expired while delayed never fans out:
@@ -25747,6 +25851,10 @@ export class EventBus {
             // admission stamps pause-time + ttlMs — the same deadline the
             // unpaused sweep would stamp.
             ttlMs: top.ttlMs,
+            // The per-message absolute delivery deadline (EB-177) rides
+            // along verbatim — the pause admission keeps the earlier of
+            // it and the TTL-derived deadline.
+            deadline: top.deadline,
             // The schedule-time lane rides along too (EB-122).
             priority: top.priority,
           });
@@ -25792,6 +25900,19 @@ export class EventBus {
         // The schedule-time lane (EB-122): the due-time fan-out queues
         // the message in its original lane.
         top.priority,
+        undefined, // confirm: delayed schedules carry no confirmation capture
+        undefined, // mirrorProvenance: delayed schedules carry no mirror provenance
+        undefined, // critical: delayed schedules carry no sampling exemption
+        undefined, // mirrorHlc: delayed schedules carry no mirror HLC
+        false, // admissionDlq: a delayed fan-out is not a DLQ record
+        undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+        undefined, // messageTtlMs: carried on the `delayed` object above, not here
+        undefined, // messageHeaders: delayed schedules carry no headers
+        false, // cepDerived: a delayed fan-out never re-enters pattern detection
+        // The per-message absolute delivery deadline (EB-177): the
+        // fan-out enforces the earlier of it and the TTL-derived
+        // deadline — the absolute instant, never re-stamped.
+        top.deadline,
       );
       // EB-136: schedule-skew sampling — this is the only sampling point.
       // It sits on the true fan-out path: cancelled, expired,
@@ -25933,6 +26054,14 @@ export class EventBus {
        * (`pausedExpiresAt`).
        */
       ttlMs?: number;
+      /**
+       * Per-message absolute delivery deadline (see
+       * `PublishOptions.deadlineAt`/`deadlineMs`, EB-177): the pause
+       * admission keeps the earlier of this and the TTL-derived deadline,
+       * exactly like the unpaused path — the absolute instant rides the
+       * buffer entry verbatim.
+       */
+      deadline?: number;
       /** Binary-payload marker (EB-92), propagated to the buffer entry. */
       binary?: boolean;
       /**
@@ -25954,17 +26083,27 @@ export class EventBus {
     // `fanOut`'s `cleanMessageId` normalization.
     const messageId =
       typeof opts.messageId === 'string' && opts.messageId.length > 0 ? opts.messageId : undefined;
+    // Per-message absolute delivery deadline (EB-177): orthogonal to the
+    // TTL-derived deadline above — the earlier instant wins, exactly
+    // like the unpaused `fanOut` path.
+    const pauseBaseExpiresAt =
+      opts.expiresAtOverride !== undefined
+        ? opts.expiresAtOverride
+        : pauseTtlMs === undefined
+          ? undefined
+          : nowMs + pauseTtlMs;
+    const pauseExpiresAt =
+      opts.deadline === undefined
+        ? pauseBaseExpiresAt
+        : pauseBaseExpiresAt === undefined
+          ? opts.deadline
+          : Math.min(pauseBaseExpiresAt, opts.deadline);
     const entry: PauseBufferEntry = {
       pauseId: `paused-${++this.nextPauseId}`,
       pauseOrder: ++this.nextPauseOrder,
       topic,
       payload,
-      expiresAt:
-        opts.expiresAtOverride !== undefined
-          ? opts.expiresAtOverride
-          : pauseTtlMs === undefined
-            ? undefined
-            : nowMs + pauseTtlMs,
+      expiresAt: pauseExpiresAt,
       ...(opts.key === undefined ? {} : { key: opts.key }),
       ...(opts.traceparent === undefined ? {} : { traceparent: opts.traceparent }),
       ...(messageId === undefined ? {} : { messageId }),
@@ -26500,7 +26639,7 @@ export class EventBus {
     const log = this.durableLog;
     if (log == null) return;
     const nowMs = this.now();
-    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; ttlMs?: number; payload: unknown; key?: string; keySeq?: number; messageId?: string; publisherId?: string; lane?: MessageLane }>();
+    const scheduled = new Map<string, { topic: string; deliverAt: number; expiresAt?: number; ttlMs?: number; deadline?: number; payload: unknown; key?: string; keySeq?: number; messageId?: string; publisherId?: string; lane?: MessageLane }>();
     const closed = new Set<string>();
     // `readSince(topic, -1)`: the exclusive bound sits below every real
     // seq, so seq-0 schedule records and tombstones come along too.
@@ -26522,6 +26661,10 @@ export class EventBus {
             // (EB-149): the rebuilt timer's fan-out stamps the deadline
             // at fan-out time — never a schedule-time deadline.
             ttlMs: rec.ttlMs,
+            // The per-message absolute delivery deadline rides the
+            // schedule record (EB-177): the rebuilt timer keeps the
+            // absolute instant verbatim.
+            deadline: rec.deadline,
             payload: rec.payload,
             key: rec.key,
             keySeq: rec.keySeq,
@@ -26540,7 +26683,17 @@ export class EventBus {
     }
     for (const [delayId, rec] of scheduled) {
       if (closed.has(delayId)) continue;
-      if (rec.expiresAt !== undefined && nowMs >= rec.expiresAt) {
+      // The schedule's effective deadline is the earlier of the
+      // schedule-time TTL deadline and the per-message absolute
+      // deadline (EB-177) — a deadline that passed while the process
+      // was down expires the schedule here, never resurrecting it.
+      const recoverDeadline =
+        rec.deadline === undefined
+          ? rec.expiresAt
+          : rec.expiresAt === undefined
+            ? rec.deadline
+            : Math.min(rec.expiresAt, rec.deadline);
+      if (recoverDeadline !== undefined && nowMs >= recoverDeadline) {
         this.recordExpired(rec.topic);
         this.appendDelayTombstone(delayId, rec.topic);
         continue;
@@ -26553,6 +26706,9 @@ export class EventBus {
         expiresAt: rec.expiresAt,
         // The per-message TTL duration rides the rebuilt timer (EB-149).
         ttlMs: rec.ttlMs,
+        // The per-message absolute delivery deadline rides the rebuilt
+        // timer (EB-177).
+        deadline: rec.deadline,
         cancelled: false,
         key: rec.key,
         // The schedule consumed its keySeq before the restart; the bus's
@@ -30410,6 +30566,17 @@ export class EventBus {
     // pattern detection. Last so existing positional call sites are
     // unaffected.
     cepDerived = false,
+    // Per-message absolute delivery deadline (see
+    // `PublishOptions.deadlineAt`/`deadlineMs`, EB-177): already
+    // validated by the publish entry points — `fanOut` never validates.
+    // When set, the effective deadline is the earlier of this and the
+    // TTL chain computed below; absent means the TTL chain alone
+    // decides. The deadline is absolute, so it rides the durable-log
+    // record and the bridge/cluster frames verbatim — delayed fan-out,
+    // pause-buffer resume, retry-ladder requeues and replays all enforce
+    // the same instant. Last so existing positional call sites are
+    // unaffected.
+    messageDeadline?: number,
   ): {
     matched: number;
     accepted: number;
@@ -30563,6 +30730,10 @@ export class EventBus {
           // admission stamps `nowMs + ttlMs` — it wins over the topic TTL
           // rules exactly like the unpaused path.
           ttlMs: messageTtlMs,
+          // The per-message absolute delivery deadline (EB-177) rides
+          // along verbatim — the pause admission keeps the earlier of it
+          // and the TTL-derived deadline, exactly like the unpaused path.
+          deadline: messageDeadline,
           // The pause-time lane rides the buffer entry so the resume
           // fan-out re-admits the message into its original lane.
           priority,
@@ -31077,7 +31248,7 @@ export class EventBus {
     // winning over the topic rules for this message only — the internal
     // carriers above already embody any per-message TTL they were
     // admitted with.
-    const expiresAt =
+    const baseExpiresAt =
       admissionDlqExpiresAt !== undefined
         ? admissionDlqExpiresAt
         : pausedExpiresAt !== undefined
@@ -31093,6 +31264,17 @@ export class EventBus {
               : ttlMs === undefined
                 ? undefined
                 : nowMs + ttlMs;
+    // Per-message absolute delivery deadline (EB-177): orthogonal to the
+    // TTL chain above — when both apply, the earlier instant wins. The
+    // deadline is absolute, so no re-stamping is ever needed; the single
+    // `messageDeadlines` entry below carries it through every downstream
+    // path (drain, redelivery, retry ladder, replay, bridge/cluster).
+    const expiresAt =
+      messageDeadline === undefined
+        ? baseExpiresAt
+        : baseExpiresAt === undefined
+          ? messageDeadline
+          : Math.min(baseExpiresAt, messageDeadline);
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
     // MQTT-style retained messages (EB-87): the message above cleared
     // every admission gate and is fully stamped (wire payload, signature,

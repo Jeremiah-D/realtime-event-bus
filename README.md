@@ -5888,3 +5888,47 @@ reference, bounded per topic by the rule — but topic cardinality is
 unbounded, so a broad rule (e.g. `**`) retains up to `lookbackCount`
 messages for every distinct topic ever published. Size the rule for the
 topics you actually backfill.
+
+## Per-message delivery deadline (EB-177)
+
+`PublishOptions.deadlineAt` / `deadlineMs` set an absolute delivery
+deadline for one message, in milliseconds on the bus clock
+(`EventBusOptions.now`) — the end-to-end counterpart of the relative
+`ttlMs` (EB-149). The deadline is absolute, so it rides every hop
+verbatim: fan-out, backpressure queues, redeliveries, delayed fan-out,
+the pre-DLQ retry ladder, durable-log replay, and the bridge/cluster
+forwards all enforce the same instant. A message past its deadline is
+dropped before delivery and counted in `expiredMessages` (per-topic and
+global), exactly like TTL expiry — drain-time, not an admission
+rejection, so `onAdmissionRejected` never fires for it, and the drop
+surfaces as a sequence gap on the next delivery.
+
+```ts
+// A market quote that is worthless after 500ms, wherever it travels:
+bus.publish('market.btc', quote, { deadlineAt: Date.now() + 500 });
+```
+
+Semantics:
+
+- **Absolute, never re-stamped.** Unlike `ttlMs`, the deadline is not
+  recomputed at any hop — a delayed delivery's wait eats the message's
+  life, which is the point. A schedule whose deadline passes before its
+  due time is dropped as expired at sweep time, never delivered.
+- **Orthogonal to topic TTL.** When both a deadline and a topic TTL
+  rule (or a per-message `ttlMs`) apply, the earlier instant wins.
+  `deadlineAt` wins over `deadlineMs` when both are given.
+- **A past deadline is legal.** The message is admitted, then dropped
+  as expired at the first drain — useful for callers computing
+  deadlines that may already have passed.
+- **Durable.** The effective deadline rides the durable-log record, so
+  replay enforces it and a restart never resurrects an expired
+  message. Delayed schedules persist it on the schedule record.
+- **Composes.** Keyed ordering, compression, filters, and the
+  in-memory lookback (EB-176) all see the same deadline; the retry
+  ladder requeues the identical message object, so its deadline
+  survives redelivery.
+
+Invalid values (non-number, `NaN`, infinite) throw `RangeError` from
+the publish entry point before anything is mutated — the same
+zero-side-effect convention as the schema rejection. `publishDelayed`
+validates `deadlineAt`/`deadlineMs` the same way at schedule time.

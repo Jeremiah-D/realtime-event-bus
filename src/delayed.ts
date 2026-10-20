@@ -40,6 +40,17 @@ export interface DelayedEntry {
    * schedule record so a restart rebuilds the timer with the TTL intact.
    */
   ttlMs?: number;
+  /**
+   * Per-message absolute delivery deadline in milliseconds on the bus
+   * clock (EB-177): set exactly when the schedule was created with
+   * `PublishDelayedOptions.deadlineAt`/`deadlineMs`. Unlike `ttlMs` the
+   * schedule carries the absolute instant — the due-time sweep drops the
+   * schedule as expired when the deadline passes first, and the fan-out
+   * enforces the earlier of it and the TTL-derived deadline. Carried on
+   * the durable-log schedule record so a restart rebuilds the timer with
+   * the deadline intact.
+   */
+  deadline?: number;
   /** Set by `cancelDelayed`; the heap skips marked entries lazily. */
   cancelled: boolean;
   /**
