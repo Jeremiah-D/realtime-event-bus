@@ -2389,6 +2389,11 @@ npm test
   (nack/timeout abandon, stale-handle ack emits nothing, redelivery opens a
   fresh span), ring-buffer oldest-first eviction, batch/delayed publish
   paths, and snapshot isolation of `getStats().traceSpans`.
+- `test/trace-archive.test.ts` — trace span archive journal (EB-167):
+  `trace.archive` option normalization in `resolveTraceOptions`, journal
+  line parse/validation, record/query/corrupt-line counting, byte-budget
+  rotation, disk-failure error isolation, `durableLogDir` requirement,
+  restart recovery back-fill, and `getTraceArchive` query validation.
 - `test/watermark.test.ts` — event-time watermarks (EB-59): `src/watermark.ts`
   unit tests (peak tracking, pre-fold lateness judgement, boundary on-time,
   monotone watermark, validation helpers), watermark advancement with the
@@ -3999,6 +4004,50 @@ Semantics notes:
 - `bus.flushOtlp()` drains the buffer deterministically — the hook for
   tests and graceful shutdown. Invalid options throw `RangeError` from
   the constructor.
+
+## Trace span archive journal (EB-167)
+
+**Opt-in.** The trace pipeline's in-memory ring (`getStats().traceSpans`)
+dies with the process; the archive journal persists every sampled span to
+an append-only JSONL journal under the bus's `durableLogDir` so
+post-incident analysis can reconstruct traces after a restart:
+
+```ts
+const bus = new EventBus({
+  durableLogDir: '/var/lib/bus-log',
+  trace: {
+    sampleRate: 1,
+    archive: true, // or { maxEntries: 20000, maxBytes: 32 * 1024 * 1024 }
+  },
+});
+
+// Later — same process or after a restart:
+const spans = bus.getTraceArchive({ traceId }); // one publish's full span chain
+const recent = bus.getTraceArchive({ since: hourAgo, limit: 500 });
+```
+
+The live file is `__trace_spans.jsonl`, rotated (renamed, never deleted —
+the EB-61 archive convention) to `__trace_spans.<YYYY-MM-DD>.<n>.jsonl`
+on UTC-day rollover or past the byte budget (default 64 MiB). On
+construction the in-memory read view (default 10000 spans, oldest evicted)
+back-fills from archived files first, then the live file — corrupt lines
+are skipped and counted. Each line is `{ v: 1, traceId, spanId, parentId?,
+name, at, durationMs, attrs }`: no payload bodies, only span metadata.
+
+Semantics notes:
+
+- Decoupled from the publish audit journal (EB-138): the publish audit
+  records admission *decisions* (one per publish, queried by topic /
+  publisher); the trace archive records pipeline *spans* (several per
+  publish, queried by trace id / time).
+- Best-effort, never in the delivery path: the journal rides the trace
+  pipeline's span fan-out behind `onTraceSpan`/the OTLP exporter (if
+  configured). A failed append or rotation never throws — it is counted in
+  `getStats().traceArchiveWriteErrors`; corrupt lines skipped on recovery
+  surface in `getStats().traceArchiveCorruptLines`.
+- `archive` requires `durableLogDir` (constructor `RangeError`
+  otherwise). Disabled by default; `getTraceArchive()` returns `[]` when
+  the journal is off.
 
 ## Pluggable partition assignors (EB-106)
 

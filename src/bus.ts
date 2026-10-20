@@ -224,6 +224,12 @@ import {
   type PublishAuditQuery,
 } from './publishaudit.ts';
 import {
+  TraceSpanJournal,
+  type TraceArchiveEntry,
+  type TraceArchiveOptions,
+  type TraceArchiveQuery,
+} from './tracearchive.ts';
+import {
   OtlpSpanExporter,
   resolveOtlpOptions,
   type OtlpSpanExporterOptions,
@@ -4619,6 +4625,19 @@ export interface BusStats {
    * instead. Always 0 when the journal is disabled.
    */
   publishAuditWriteErrors: number;
+  /**
+   * Trace span archive journal (EB-167) disk write/rotation failures
+   * since the bus started. Best-effort like the publish audit journal:
+   * a failed append or rotation never throws into the span pipeline —
+   * it is counted here instead. Always 0 when the archive is disabled.
+   */
+  traceArchiveWriteErrors: number;
+  /**
+   * Trace span archive journal (EB-167) corrupt JSONL lines skipped
+   * while back-filling the in-memory read view from disk on
+   * construction. Always 0 when the archive is disabled.
+   */
+  traceArchiveCorruptLines: number;
   /**
    * Currently active subscriptions paused for cross-instance migration
    * (see `exportSubscription`, EB-82): delivery is paused but the
@@ -12081,6 +12100,13 @@ export class EventBus {
    */
   private readonly trace: TraceRecorder | undefined;
   /**
+   * Trace span archive journal (`EventBusOptions.trace.archive`,
+   * EB-167), or `undefined` when the archive is disabled — every
+   * sampled span lands here (via the trace pipeline's span fan-out)
+   * for post-restart reconstruction.
+   */
+  private readonly traceArchive: TraceSpanJournal | undefined;
+  /**
    * OTLP span exporter (`EventBusOptions.otlp`), or `undefined` when
    * export is not configured (EB-105). Fed through the trace pipeline's
    * span fan-out, so it only ever sees spans of sampled traces.
@@ -13026,7 +13052,33 @@ export class EventBus {
     } else {
       this.otlpExporter = undefined;
     }
+    // Trace span archive journal (EB-167): the journal rides the trace
+    // pipeline's span fan-out behind the OTLP exporter (if any) — one
+    // more composition point, still no changes to TraceRecorder. Every
+    // sampled span lands in the journal for post-restart
+    // reconstruction; the journal never throws into the span pipeline.
+    const traceArchiveOpt = resolvedTrace?.archive;
+    let traceArchive: TraceSpanJournal | undefined;
+    if (traceArchiveOpt !== undefined && resolvedTrace !== undefined) {
+      if (options?.durableLogDir == null) {
+        throw new RangeError('trace.archive requires EventBusOptions.durableLogDir to be set');
+      }
+      const journal = new TraceSpanJournal(options.durableLogDir, {
+        ...traceArchiveOpt,
+        now: traceArchiveOpt.now ?? this.now,
+      });
+      const spanHook = resolvedTrace.onTraceSpan;
+      resolvedTrace.onTraceSpan =
+        spanHook === undefined
+          ? (span) => journal.record(span)
+          : (span) => {
+              spanHook(span);
+              journal.record(span);
+            };
+      traceArchive = journal;
+    }
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
+    this.traceArchive = traceArchive;
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
     const resolvedGroupLag = resolveGroupLagOptions(options?.groupLag, 'EventBus');
     // EB-132: the ops alert outlet sits on top of the EB-112 lag-SLO
@@ -26497,6 +26549,22 @@ export class EventBus {
   }
 
   /**
+   * Queries the trace span archive journal (EB-167): the bounded
+   * in-memory read view of every sampled delivery-pipeline trace span
+   * (`{ v, traceId, spanId, parentId?, name, at, durationMs, attrs }`),
+   * back-filled from the on-disk journal on construction. Filters by
+   * exact `traceId` and by span-start time window; `limit` keeps the
+   * most recent matches. Spans come back oldest-first.
+   *
+   * Returns `[]` when the journal is disabled (no
+   * `EventBusOptions.trace.archive`). Throws `RangeError` on illegal
+   * query values.
+   */
+  getTraceArchive(query?: TraceArchiveQuery): TraceArchiveEntry[] {
+    return this.traceArchive?.query(query ?? {}) ?? [];
+  }
+
+  /**
    * Registers a topic in the operator-side catalog (EB-77): the concrete
    * topic name plus optional ownership metadata (`owner`, `description`,
    * `schemaVersion`, `tags`). Registering an already-registered topic
@@ -31524,6 +31592,8 @@ export class EventBus {
       compositeSubscriptions: this.compositeSubscriptionCount,
       multiPatternSubscriptions: this.multiPatternSubscriptionCount,
       publishAuditWriteErrors: this.publishAudit?.writeErrors() ?? 0,
+      traceArchiveWriteErrors: this.traceArchive?.writeErrors() ?? 0,
+      traceArchiveCorruptLines: this.traceArchive?.corruptLineCount() ?? 0,
       migratingSubscribers,
       drainingSubscribers,
       indexSize: this.prefixIndex.size,

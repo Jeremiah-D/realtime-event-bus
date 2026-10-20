@@ -44,6 +44,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import type { TraceArchiveOptions } from './tracearchive.ts';
 
 /** One span of a sampled delivery trace. */
 export interface TraceSpan {
@@ -124,6 +125,21 @@ export interface TraceOptions {
    * 1024.
    */
   bufferSize?: number;
+  /**
+   * Opt-in trace span archive journal (EB-167): every sampled span is
+   * also appended to an append-only JSONL journal under the bus's
+   * `durableLogDir` (`__trace_spans.jsonl`, rotated per UTC day / byte
+   * budget like the EB-138 publish audit journal), so trace history
+   * survives process restarts. Query it with
+   * `getTraceArchive({ traceId?, since?, until?, limit? })`.
+   *
+   * Requires `EventBusOptions.durableLogDir` — the bus constructor
+   * throws `RangeError` without it. Pass `true` for the defaults or a
+   * `TraceArchiveOptions` object to tune the in-memory read view and
+   * the live-file byte budget. `false` (or omitting) disables the
+   * journal; the trace pipeline is untouched.
+   */
+  archive?: boolean | TraceArchiveOptions;
 }
 
 /** Normalized trace options; `undefined` (from the resolver) means disabled. */
@@ -132,6 +148,13 @@ export interface ResolvedTraceOptions {
   sampler?: TraceSampler;
   onTraceSpan?: (span: TraceSpan) => void;
   bufferSize: number;
+  /**
+   * Normalized trace span archive options. Present only when
+   * `TraceOptions.archive` was given (`true` normalizes to `{}`); the
+   * bus resolves the journal against it. Never present on the
+   * `raw === true` fast path.
+   */
+  archive?: TraceArchiveOptions;
 }
 
 /**
@@ -228,8 +251,25 @@ export function resolveTraceOptions(
   if (!Number.isInteger(bufferSize) || bufferSize < 1) {
     throw new RangeError(`${where}: trace.bufferSize must be a positive integer`);
   }
+  // Trace span archive journal (EB-167): normalized here, resolved by
+  // the bus against `durableLogDir`. `true` means "archive with the
+  // defaults"; the key is only set when the option was given, so the
+  // `raw === true` fast path keeps its exact resolved shape.
+  const archiveRaw = raw.archive;
+  let archive: TraceArchiveOptions | undefined;
+  if (archiveRaw !== undefined && archiveRaw !== false) {
+    if (archiveRaw === true) {
+      archive = {};
+    } else if (typeof archiveRaw === 'object' && archiveRaw !== null && !Array.isArray(archiveRaw)) {
+      archive = { ...archiveRaw };
+    } else {
+      throw new RangeError(`${where}: trace.archive must be a boolean or a TraceArchiveOptions object`);
+    }
+  }
   if (enabled === false) return undefined;
-  return { sampleRate, sampler, onTraceSpan, bufferSize };
+  const resolved: ResolvedTraceOptions = { sampleRate, sampler, onTraceSpan, bufferSize };
+  if (archive !== undefined) resolved.archive = archive;
+  return resolved;
 }
 
 /** Per-message trace record, keyed by the `BusMessage` in a `WeakMap`. */
