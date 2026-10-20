@@ -173,7 +173,13 @@ test('CEP: clearSequence removes the pattern', async () => {
   await flush();
   assert.equal(seen.length, 0);
   // The engine stays (its counters survive), but no pattern is active.
-  assert.deepEqual(bus.getStats().cep, { activePatterns: 0, partialMatches: 0, matches: 0 });
+  assert.deepEqual(bus.getStats().cep, {
+    activePatterns: 0,
+    partialMatches: 0,
+    matches: 0,
+    absencePatterns: 0,
+    absenceMatches: 0,
+  });
 });
 
 test('CEP: validation fails fast', () => {

@@ -14934,9 +14934,20 @@ export class EventBus {
    * trigger itself and patterns never observe each other's derived
    * traffic.
    *
+   * Absence steps (EB-174): a step with `absence: true` is a negation —
+   * the partial advances only if NO message matching the step's topic
+   * arrives for the key within `absenceMs` (default: `withinMs`) after
+   * the previous step matched; a matching arrival kills the partial. A
+   * satisfied absence records `{ stepIndex, topic, windowMs }` and the
+   * derived match carries `absences` (absent for purely positive
+   * matches). The deadline timer is unref'd and re-checks the pattern
+   * window on fire, so an idle bus never derives a stale absence. The
+   * first step can never be an absence step.
+   *
    * Throws `RangeError` before anything is registered on invalid options
    * or a duplicate id. `getStats().cep` exposes the live counters
-   * (activePatterns / partialMatches / matches).
+   * (activePatterns / partialMatches / matches / absencePatterns /
+   * absenceMatches).
    */
   defineSequence(opts: SequencePatternOptions): string {
     if (this.cep === undefined) {
@@ -14971,6 +14982,9 @@ export class EventBus {
         events: match.events,
         durationMs: match.durationMs,
         at: match.at,
+        // Present only when the match completed through absence steps
+        // (EB-174); a purely positive match omits the field.
+        ...(match.absences === undefined ? {} : { absences: match.absences }),
       },
       { cepDerived: true },
     );

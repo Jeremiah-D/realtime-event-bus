@@ -135,6 +135,7 @@
  *   one publisher has admitted a publish — anonymous publishes move no
  *   per-publisher counter).
  * - `eventbus_cep_matches_total`: sequence matches completed and emitted
+ * - `eventbus_cep_absence_matches_total`: absence steps satisfied (EB-174)
  *   (EB-170; only emitted once a pattern was defined).
  * - `eventbus_statestore_evicted_keys_total`: keys evicted by the
  *   materialized state store's `maxKeys` bound (EB-171; only emitted when
@@ -251,6 +252,11 @@
  *   (EB-170; only emitted once a pattern was defined).
  * - `eventbus_cep_partial_matches`: partial sequence matches currently
  *   tracked (EB-170; only emitted once a pattern was defined).
+ * - `eventbus_cep_absence_patterns`: sequence patterns with at least one
+ *   absence step (EB-174; only emitted once a pattern was defined).
+ * - `eventbus_cep_absence_matches_total`: absence steps satisfied —
+ *   deadline passed with no matching event for the key (EB-174; only
+ *   emitted once a pattern was defined).
  * - `eventbus_statestore_keys`: keys currently tracked by the
  *   materialized state store (EB-171; only emitted when the store is
  *   enabled).
@@ -1096,6 +1102,16 @@ export function renderPrometheus(stats: BusStats): string {
       'eventbus_cep_matches_total',
       'Sequence matches completed and emitted (EB-170).',
       stats.cep.matches,
+    );
+    gauge(
+      'eventbus_cep_absence_patterns',
+      'Sequence patterns with at least one absence step (EB-174).',
+      stats.cep.absencePatterns,
+    );
+    counter(
+      'eventbus_cep_absence_matches_total',
+      'Absence steps satisfied — deadline passed with no matching event for the key (EB-174).',
+      stats.cep.absenceMatches,
     );
   }
 

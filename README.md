@@ -5750,16 +5750,52 @@ Semantics notes:
   can never trigger itself, and patterns never observe each other's
   derived traffic. A *direct* publish to `cep.<id>` is ordinary traffic
   and matches normally.
+- **Absence / negation steps (EB-174)** — a step with `absence: true`
+  fires when the awaited event does *not* arrive. Order placed but never
+  paid:
+
+  ```ts
+  bus.defineSequence({
+    id: 'unpaid-order',
+    steps: [
+      { topic: 'order.placed' },
+      { topic: 'order.paid', absence: true, absenceMs: 3_600_000 },
+    ],
+    withinMs: 3_600_000,
+  });
+  bus.subscribe('cep.unpaid-order', (msg) => {
+    const { patternId, key, absences } = msg.payload;
+    // absences: [{ stepIndex: 1, topic: 'order.paid', windowMs: 3600000 }]
+  });
+  ```
+
+  When a partial reaches an absence step, the engine arms an unref'd
+  deadline timer (`absenceMs`, default: the pattern's `withinMs`). If a
+  message matching the step's topic arrives for the key first, the
+  partial is killed — the absence can never fire. If the deadline
+  passes event-free, the absence is recorded and the partial advances
+  (completing the pattern when the absence step was last); the derived
+  match carries `absences` (absent for purely positive matches).
+  Absence steps compose with positive steps mid-pattern (`A, NOT B, C`)
+  and chain (`A, NOT B, NOT C`); per-key state machines keep keys
+  isolated. The timer re-checks the pattern window on fire, so a partial
+  that outlived `withinMs` while the bus was idle is dropped instead of
+  deriving a stale absence. The first step can never be an absence step
+  (`RangeError` — there is no anchor to start the window from), and a
+  non-positive `absenceMs` throws `RangeError`.
 - `defineSequence` validates eagerly: fewer than two steps, a non-positive
   `withinMs`, an invalid id (must match `/^[A-Za-z0-9_-]{1,64}$/` so the
   derived topic stays one dot-segment) or a duplicate id throw `RangeError`
-  before anything is registered. `clearSequence(id)` removes a pattern and
-  drops its partials.
-- `getStats().cep` → `{ activePatterns, partialMatches, matches }`
-  (present once a pattern was defined; the engine persists for the bus's
-  lifetime, so clearing every pattern leaves zero counts).
+  before anything is registered. `clearSequence(id)` removes a pattern,
+  drops its partials, and disarms pending absence deadlines.
+- `getStats().cep` → `{ activePatterns, partialMatches, matches,
+  absencePatterns, absenceMatches }` (present once a pattern was
+  defined; the engine persists for the bus's lifetime, so clearing every
+  pattern leaves zero counts).
 - Prometheus: `eventbus_cep_patterns`, `eventbus_cep_partial_matches`,
-  `eventbus_cep_matches_total` — rendered only once a pattern was defined.
+  `eventbus_cep_matches_total`, `eventbus_cep_absence_patterns`,
+  `eventbus_cep_absence_matches_total` — rendered only once a pattern was
+  defined.
 
 ## Materialized state store / KTable (EB-171)
 
