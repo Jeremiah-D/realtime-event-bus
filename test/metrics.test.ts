@@ -167,6 +167,7 @@ test('renderPrometheus escapes label values per the exposition format', () => {
     rampingSubscribers: 0,
     pendingDelayed: 0,
     recurringJobs: { active: 0, jobs: [] },
+    lookbackBuffers: { rules: 0, topics: 0, messages: 0 },
     deliveryLatency: [],
     slowestSubscribers: [],
     lag: [],

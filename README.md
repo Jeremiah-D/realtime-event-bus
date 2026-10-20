@@ -5841,3 +5841,50 @@ Semantics notes:
   enabled).
 - Prometheus: `eventbus_statestore_keys`,
   `eventbus_statestore_evicted_keys_total` (rendered only when enabled).
+
+## In-memory lookback for late joiners (EB-176)
+
+`setTopicLookback(topicPattern, { lookbackCount?, lookbackMs? })` retains
+the most recent admitted messages per matching topic in a bounded
+in-memory ring buffer — no `durableLogDir` needed. A subscriber that
+joins later immediately receives the retained history at subscribe time,
+in true publish order:
+
+```ts
+bus.setTopicLookback('market.*', { lookbackCount: 100 }); // last 100 per topic
+bus.setTopicLookback('alerts', { lookbackMs: 60_000 }); // last 60s
+bus.publish('market.btc', tick); // ... ticks flow ...
+// A consumer joining now gets the last 100 ticks instantly:
+bus.subscribe('market.*', onTick);
+```
+
+Semantics:
+
+- **Opt-in per topic.** Only topics matching a rule retain anything;
+  unconfigured topics pay a single map-size check per publish. At least
+  one bound is required; illegal values (`lookbackCount` not a positive
+  integer, `lookbackMs` not a positive finite number, empty pattern)
+  throw `RangeError` before anything is mutated.
+- **Match resolution mirrors `setTopicTtl`**: an exact-topic rule wins
+  over any pattern; between patterns the earliest-registered rule wins.
+  Re-setting a rule replaces it and immediately re-trims (or drops) the
+  affected buffers; `clearTopicLookback(pattern)` removes the rule and
+  drops buffers of topics that no longer match any rule.
+- **Live semantics on replay.** Buffered records walk the same
+  `admitReplayRecords` path as a durable-log resume: original sequence
+  numbers (no false gaps), TTL deadlines (expired records are dropped as
+  expired, never resurrected), content/header filters, compression
+  (replayed inflated), keyed/causal baselines, the retained-snapshot
+  dedup, and the subscriber's backpressure policy all apply unchanged.
+- **Orthogonal to durable resume.** The replay runs only when the
+  subscription carries no `resumeFromSeq`/`resumeFromTime` cursor — the
+  two backfill sources never double-deliver. Shadow subscribers (EB-63)
+  are live-traffic taps and never backfill.
+- **Observability.** `getStats().lookbackBuffers` reports
+  `{ rules, topics, messages }`.
+
+Memory note: each retained message holds its (wire) payload by
+reference, bounded per topic by the rule — but topic cardinality is
+unbounded, so a broad rule (e.g. `**`) retains up to `lookbackCount`
+messages for every distinct topic ever published. Size the rule for the
+topics you actually backfill.

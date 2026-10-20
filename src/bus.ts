@@ -2193,6 +2193,36 @@ export interface SubscribeOptions {
 }
 
 /**
+ * In-memory lookback retention for late-joining subscribers (EB-176):
+ * the per-topic ring-buffer bounds used by `setTopicLookback`. At least
+ * one of the two bounds is required.
+ */
+export interface LookbackOptions {
+  /**
+   * Maximum messages retained per concrete topic. Must be a positive
+   * integer. When the buffer is full the oldest message is evicted.
+   */
+  lookbackCount?: number;
+  /**
+   * Maximum age, in milliseconds on the bus clock, of a retained
+   * message. Must be a positive finite number. Older messages are
+   * evicted lazily (on the next publish to the topic, or filtered at
+   * replay time).
+   */
+  lookbackMs?: number;
+}
+
+/**
+ * One retained in-memory lookback entry (EB-176): the admitted
+ * `DurableLogRecord` plus its global admission order, so the
+ * cross-topic replay follows true publish order.
+ */
+interface LookbackEntry {
+  record: DurableLogRecord;
+  order: number;
+}
+
+/**
  * Options for `EventBus.pull` (EB-111): opt-in pull-mode consumption with
  * long-polling, the complement to push `subscribe`.
  */
@@ -5731,6 +5761,19 @@ export interface BusStats {
     segments: Record<string, { live: number; segments: number; archived: number }>;
   };
   /**
+   * In-memory lookback buffers (EB-176, see `setTopicLookback`): the
+   * late-joiner history retained without a durable log. Always present,
+   * so readers never need to probe for the feature.
+   */
+  lookbackBuffers: {
+    /** Registered lookback rules. */
+    rules: number;
+    /** Concrete topics currently holding a buffer. */
+    topics: number;
+    /** Total retained messages across all buffers. */
+    messages: number;
+  };
+  /**
    * Outbox records sitting in the attached outbox store, not yet relayed
    * (`seq > cursor`). 0 when no outbox relay is attached (see
    * `attachOutboxRelay`, EB-102). Always present, so readers never need
@@ -7079,6 +7122,34 @@ function validateTtlMs(ttlMs: number | undefined, caller: string): void {
   if (ttlMs === undefined) return;
   if (typeof ttlMs !== 'number' || !Number.isInteger(ttlMs) || ttlMs < 0) {
     throw new RangeError(`${caller}: ttlMs must be a non-negative integer number of milliseconds`);
+  }
+}
+
+/**
+ * Validates `LookbackOptions` (EB-176): at least one bound is required;
+ * `lookbackCount` must be a positive integer, `lookbackMs` a positive
+ * finite number of milliseconds. Anything else throws `RangeError`
+ * before any state is mutated, matching the other option validations.
+ */
+function validateLookbackOptions(opts: LookbackOptions | undefined, caller: string): void {
+  if (opts === undefined || opts === null || typeof opts !== 'object') {
+    throw new RangeError(`${caller}: lookback options are required`);
+  }
+  const { lookbackCount, lookbackMs } = opts;
+  if (lookbackCount === undefined && lookbackMs === undefined) {
+    throw new RangeError(`${caller}: at least one of lookbackCount/lookbackMs is required`);
+  }
+  if (
+    lookbackCount !== undefined &&
+    (typeof lookbackCount !== 'number' || !Number.isInteger(lookbackCount) || lookbackCount <= 0)
+  ) {
+    throw new RangeError(`${caller}: lookbackCount must be a positive integer`);
+  }
+  if (
+    lookbackMs !== undefined &&
+    (typeof lookbackMs !== 'number' || !Number.isFinite(lookbackMs) || lookbackMs <= 0)
+  ) {
+    throw new RangeError(`${caller}: lookbackMs must be a positive finite number of milliseconds`);
   }
 }
 
@@ -11653,6 +11724,40 @@ export class EventBus {
    */
   private ttlRules = new Map<string, number>();
   /**
+   * In-memory lookback rules (EB-176), keyed by the exact string passed
+   * to `setTopicLookback` — either a concrete topic name or a wildcard
+   * pattern. Match resolution mirrors `setTopicTtl`: an exact-topic rule
+   * wins over any pattern; between patterns the earliest-registered rule
+   * wins. A defensive copy of the options is stored; re-setting a rule
+   * replaces it.
+   */
+  private lookbackRules = new Map<string, LookbackOptions>();
+  /**
+   * Compiled matchers for the wildcard entries in `lookbackRules`, kept
+   * apart from the subscriber pattern cache so lookback configuration
+   * never inflates `patternCacheSize`.
+   */
+  private lookbackMatcherCache = new Map<string, RegExp>();
+  /**
+   * The live in-memory lookback buffers (EB-176): the most recent
+   * admitted messages per concrete topic, but only for topics matching a
+   * lookback rule — topics without a rule retain nothing. Each buffer is
+   * append-ordered (oldest first) and bounded by its rule; buffers are
+   * dropped when their topic no longer matches any rule. Records are the
+   * same `DurableLogRecord` shape the durable log persists, so replay
+   * reuses `admitReplayRecords` verbatim.
+   */
+  private lookbackBuffers = new Map<string, LookbackEntry[]>();
+  /**
+   * Global lookback admission order (EB-176): `at` timestamps only have
+   * millisecond granularity, so same-millisecond publishes to different
+   * topics need an explicit order for the cross-topic replay to follow
+   * true publish order (per-topic `seq` is not comparable across
+   * topics). Incremented only when a lookback rule matches — unconfigured
+   * topics never touch it.
+   */
+  private nextLookbackOrder = 0;
+  /**
    * Compiled matchers for the wildcard entries in `ttlRules`, kept apart
    * from the subscriber pattern cache so TTL configuration never inflates
    * `patternCacheSize`.
@@ -13627,6 +13732,169 @@ export class EventBus {
    */
   clearTopicTtl(topicPattern: string): boolean {
     return this.ttlRules.delete(topicPattern);
+  }
+
+  /**
+   * Retains the most recent admitted messages per matching topic in a
+   * bounded in-memory ring buffer (EB-176), so a late-joining subscriber
+   * immediately receives recent history without a durable log on disk.
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or an
+   * exact topic name). `opts` needs at least one bound: `lookbackCount`
+   * (max messages per concrete topic) and/or `lookbackMs` (max age in
+   * milliseconds on the bus clock).
+   *
+   * A new subscriber whose pattern matches a buffered topic replays the
+   * buffered messages at subscribe time — in publish-time order, with
+   * their original sequence numbers (no false gaps), TTL deadlines,
+   * compression, content filters and backpressure semantics intact, via
+   * the same `admitReplayRecords` path the durable-log resume uses. The
+   * replay only runs when the subscription carries no durable resume
+   * cursor (`resumeFromSeq`/`resumeFromTime`): the two backfill sources
+   * are orthogonal and never double-deliver.
+   *
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins.
+   * Re-setting a rule replaces it and immediately re-trims (or drops)
+   * the affected buffers. Buffer state is visible in
+   * `getStats().lookbackBuffers`. Throws `RangeError` on an empty pattern
+   * or an illegal options object.
+   */
+  setTopicLookback(topicPattern: string, opts: LookbackOptions): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    validateLookbackOptions(opts, 'setTopicLookback');
+    this.lookbackRules.set(topicPattern, { ...opts });
+    this.reconcileLookbackBuffers();
+  }
+
+  /**
+   * Removes the lookback rule previously registered for `topicPattern`,
+   * dropping the buffers of topics that no longer match any rule.
+   * Returns true when a rule existed and was removed.
+   */
+  clearTopicLookback(topicPattern: string): boolean {
+    const removed = this.lookbackRules.delete(topicPattern);
+    if (removed) this.reconcileLookbackBuffers();
+    return removed;
+  }
+
+  /**
+   * Re-applies the current lookback rules to the live buffers: topics
+   * that no longer match any rule lose their buffer, the rest are
+   * trimmed to their (possibly new) bounds. Runs on every rule change;
+   * the per-publish path only ever appends and trims its own topic.
+   */
+  private reconcileLookbackBuffers(): void {
+    const nowMs = this.now();
+    for (const [topic, buf] of this.lookbackBuffers) {
+      const rule = this.lookbackForTopic(topic);
+      if (rule === undefined) {
+        this.lookbackBuffers.delete(topic);
+        continue;
+      }
+      this.trimLookbackBuffer(buf, rule, nowMs);
+      if (buf.length === 0) this.lookbackBuffers.delete(topic);
+    }
+  }
+
+  /**
+   * Trims one topic's lookback buffer to its rule's bounds: first by age
+   * (`lookbackMs`), then by count (`lookbackCount`). Buffers stay in
+   * append order (oldest first), so trimming from the front is exact.
+   */
+  private trimLookbackBuffer(buf: LookbackEntry[], rule: LookbackOptions, nowMs: number): void {
+    const { lookbackCount, lookbackMs } = rule;
+    if (lookbackMs !== undefined) {
+      const cutoff = nowMs - lookbackMs;
+      while (buf.length > 0 && buf[0].record.at < cutoff) buf.shift();
+    }
+    if (lookbackCount !== undefined) {
+      while (buf.length > lookbackCount) buf.shift();
+    }
+  }
+
+  /**
+   * Returns the lookback rule that applies to `topic`, or `undefined`
+   * when no rule matches. An exact-topic rule wins over patterns;
+   * between patterns the earliest-registered matching rule wins.
+   */
+  private lookbackForTopic(topic: string): LookbackOptions | undefined {
+    const exact = this.lookbackRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, opts] of this.lookbackRules) {
+      let matcher = this.lookbackMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.lookbackMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return opts;
+    }
+    return undefined;
+  }
+
+  /**
+   * Retains one admitted message in its topic's lookback buffer (EB-176).
+   * No-op unless a lookback rule matches the topic — the fast path is a
+   * single map-size check, so publishes to unconfigured topics pay
+   * nothing. The stored record is the same object handed to the durable
+   * log; `admitReplayRecords` never mutates records, and replay passes
+   * defensive copies, so sharing is safe.
+   */
+  private noteLookbackPublish(topic: string, record: DurableLogRecord, nowMs: number): void {
+    if (this.lookbackRules.size === 0) return;
+    const rule = this.lookbackForTopic(topic);
+    if (rule === undefined) return;
+    let buf = this.lookbackBuffers.get(topic);
+    if (buf === undefined) {
+      buf = [];
+      this.lookbackBuffers.set(topic, buf);
+    }
+    buf.push({ record, order: this.nextLookbackOrder++ });
+    this.trimLookbackBuffer(buf, rule, nowMs);
+    if (buf.length === 0) this.lookbackBuffers.delete(topic);
+  }
+
+  /**
+   * Replays the in-memory lookback buffers to a newly subscribed
+   * subscriber (EB-176): every buffered topic matching the subscriber's
+   * pattern contributes its retained records, in global publish-time
+   * order (`at`, then `seq`). The records walk `admitReplayRecords`, so
+   * TTL expiry, content filters, keyed/causal baselines, the retained
+   * snapshot dedup and backpressure apply exactly as for a durable-log
+   * resume — a late joiner sees recent history with live semantics, and
+   * the per-topic sequence baselines advance so the replay never
+   * produces false gaps.
+   *
+   * Only runs when the subscription carries no durable resume cursor;
+   * shadow subscribers (EB-63) are live-traffic taps and never backfill.
+   */
+  private replayLookback(subscriber: Subscriber): void {
+    if (this.lookbackBuffers.size === 0) return;
+    if (subscriber.shadow !== undefined) return;
+    const matcher = subscriber.matcher;
+    const nowMs = this.now();
+    const entries: LookbackEntry[] = [];
+    for (const [topic, buf] of this.lookbackBuffers) {
+      if (!matcher.test(topic)) continue;
+      // Re-check the age bound: eviction is lazy (append-time), so a
+      // quiet topic's buffer can hold records older than `lookbackMs`.
+      const rule = this.lookbackForTopic(topic);
+      const cutoff = rule?.lookbackMs === undefined ? -Infinity : nowMs - rule.lookbackMs;
+      for (const entry of buf) {
+        if (entry.record.at < cutoff) continue;
+        entries.push(entry);
+      }
+    }
+    if (entries.length === 0) return;
+    // True publish order across topics: the global admission order, not
+    // the per-topic sequence numbers.
+    entries.sort((a, b) => a.order - b.order);
+    // Defensive copies: the buffer keeps the canonical records.
+    this.admitReplayRecords(
+      subscriber,
+      entries.map((entry) => ({ ...entry.record })),
+    );
   }
 
   /**
@@ -18041,6 +18309,16 @@ export class EventBus {
       this.replayLogSinceTime(subscriber, resumeFromTime);
     } else if (resumeFromSeq !== undefined) {
       this.replayLog(subscriber, resumeFromSeq);
+    }
+
+    // In-memory lookback (EB-176): a late joiner with no durable resume
+    // cursor replays the recent in-memory history of every matching
+    // topic — the zero-disk counterpart of the resume above. The two
+    // backfill sources are orthogonal by construction: when a resume
+    // cursor is present the durable log is the single source of truth,
+    // so history is never delivered twice.
+    if (resumeFromTime === undefined && resumeFromSeq === undefined) {
+      this.replayLookback(subscriber);
     }
 
     const subscription: Subscription = {
@@ -30913,7 +31191,9 @@ export class EventBus {
     // record together with its per-key sequence number, so restart
     // recovery and replay can preserve per-key publish order.
     // Namespaced topics (EB-52) append to their namespace's child log.
-    this.durableLogForTopic(topic)?.append({
+    // The record doubles as the in-memory lookback entry (EB-176): the
+    // same admitted message, same sequence number, same TTL deadline.
+    const logRecord: DurableLogRecord = {
       seq: msg.seq,
       topic,
       at: nowMs,
@@ -30979,7 +31259,12 @@ export class EventBus {
               sig: msg.publisherSignature.sig,
             },
           }),
-    });
+    };
+    this.durableLogForTopic(topic)?.append(logRecord);
+    // In-memory lookback (EB-176): retain the admitted message for
+    // late-joining subscribers when a lookback rule matches the topic —
+    // independent of whether a durable log is configured.
+    this.noteLookbackPublish(topic, logRecord, nowMs);
     // Pull-mode consumption (EB-111): the message cleared every admission
     // gate and was stamped and logged — feed the per-topic pull ring
     // buffer and wake long-poll waiters. The application payload (not the
@@ -32584,6 +32869,13 @@ export class EventBus {
               ...this.durableLog.stats(),
             },
           }),
+      // In-memory lookback buffers (EB-176): always present, even with
+      // no rules registered — readers never probe for the feature.
+      lookbackBuffers: {
+        rules: this.lookbackRules.size,
+        topics: this.lookbackBuffers.size,
+        messages: [...this.lookbackBuffers.values()].reduce((n, buf) => n + buf.length, 0),
+      },
       // Outbox relay lag (EB-102): probed only when a relay is attached;
       // a DB-backed store answers with one bounded scan.
       ...(this.outboxRelay === undefined
