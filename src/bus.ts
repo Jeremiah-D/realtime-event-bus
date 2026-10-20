@@ -214,6 +214,13 @@ import {
   type SequenceMatchEvent,
   type CepStats,
 } from './cep.ts';
+import {
+  StateStore,
+  validateStateStoreOptions,
+  type StateStoreOptions,
+  type StateEntry,
+  type StateStoreStats,
+} from './statestore.ts';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
@@ -5761,6 +5768,11 @@ export interface BusStats {
    * stats shape.
    */
   cep?: CepStats;
+  /**
+   * Materialized state-store counters (EB-171): present only when the
+   * store is enabled via `enableStateStore` — absent otherwise.
+   */
+  stateStore?: StateStoreStats;
 }
 
 /**
@@ -12866,6 +12878,15 @@ export class EventBus {
    */
   private cep?: CepEngine;
   /**
+   * Materialized state store (EB-171), created by `enableStateStore`.
+   * Observes every admitted keyed publish (see `observeAdmittedPublish`)
+   * and feeds `getStats().stateStore` plus the Prometheus exposition
+   * when present.
+   */
+  private stateStore?: StateStore;
+  /** Changelog topic for the state store (`StateStoreOptions.changelogTopic`), if any. */
+  private stateStoreChangelogTopic?: string;
+  /**
    * `durableLogMaxEntriesPerTopic` as configured — namespace child logs
    * (EB-52) open with the same per-topic budget as the root log.
    */
@@ -14956,15 +14977,125 @@ export class EventBus {
   }
 
   /**
-   * Single observation point for admitted publishes (EB-170), called from
-   * `fanOut` once per admitted publish — after the admission gates and
-   * sequence assignment, before compression rewrites the envelope — so
-   * the observer sees the raw application payload with a final sequence
-   * number.
+   * Enables the materialized state store (EB-171): every admitted keyed
+   * publish updates the per-(topic, key) latest value, readable via
+   * `getState` / `scanState` — the KTable-style query side of keyed
+   * publish (the EB-26 keyed-compaction dual: the log keeps the latest
+   * per key on disk, the store keeps it in memory for reads).
+   *
+   * When the bus has a durable log, the store is rebuilt from the log's
+   * latest per-(topic, key) records at enable time, so a restarted
+   * process keeps its table (TTL-expired records stay dead; namespace
+   * child logs are rebuilt too).
+   *
+   * `maxKeys` bounds the table (least-recently-updated key evicted first,
+   * counted in `getStats().stateStore.evictedKeys`); an opt-in
+   * `changelogTopic` receives one unkeyed record per update
+   * (`{ topic, key, value, oldValue, seq, at, version }` — unkeyed so it
+   * never feeds back into the store; otherwise an ordinary admitted
+   * publish).
+   *
+   * Throws `RangeError` before anything is enabled on invalid options or
+   * when the store is already enabled. `getStats().stateStore` exposes
+   * the live counters.
+   */
+  enableStateStore(opts?: StateStoreOptions): void {
+    validateStateStoreOptions(opts);
+    if (this.stateStore !== undefined) {
+      throw new RangeError('the state store is already enabled');
+    }
+    const store = new StateStore({ now: this.now }, opts);
+    // Durable restore runs before the store goes live: a failure (e.g. a
+    // compressed record whose preset dictionary is not registered on this
+    // bus) fails closed with zero partial state, exactly like replay.
+    this.rebuildStateStoreInto(store);
+    this.stateStore = store;
+    this.stateStoreChangelogTopic = opts?.changelogTopic;
+  }
+
+  /**
+   * Reads the latest materialized value for (topic, key) — `undefined`
+   * when the store is disabled or the key was never published. The topic
+   * is matched exactly (the alias-resolved concrete topic, as published).
+   */
+  getState(topic: string, key: string): StateEntry | undefined {
+    return this.stateStore?.get(topic, key);
+  }
+
+  /**
+   * Scans the materialized table in deterministic (topic, key) order.
+   * Both filters are optional: `topic` matches exactly, `keyPrefix`
+   * matches the key's start. Returns `[]` when the store is disabled.
+   */
+  scanState(topic?: string, keyPrefix?: string): StateEntry[] {
+    return this.stateStore?.scan(topic, keyPrefix) ?? [];
+  }
+
+  /**
+   * Single observation point for admitted publishes (EB-170/EB-171),
+   * called from `fanOut` once per admitted publish — after the admission
+   * gates and sequence assignment, before compression rewrites the
+   * envelope — so both observers see the raw application payload with a
+   * final sequence number.
    */
   private observeAdmittedPublish(msg: BusMessage, cepDerived: boolean): void {
     if (!cepDerived && this.cep !== undefined) {
       this.cep.observe(msg);
+    }
+    const store = this.stateStore;
+    if (store === undefined) return;
+    const changelogTopic = this.stateStoreChangelogTopic;
+    const oldValue =
+      changelogTopic === undefined ? undefined : store.get(msg.topic, msg.key ?? '')?.value;
+    const entry = store.apply(msg.topic, msg.key, msg.payload, msg.seq);
+    if (entry === undefined || changelogTopic === undefined) return;
+    // Changelog records are unkeyed so they can never feed back into the
+    // store (the key rides in the payload instead); they are ordinary
+    // admitted publishes otherwise — counted, logged and fanned out.
+    try {
+      this.publish(changelogTopic, {
+        topic: entry.topic,
+        key: entry.key,
+        value: entry.value,
+        oldValue,
+        seq: entry.seq,
+        at: entry.at,
+        version: entry.version,
+      });
+    } catch {
+      // Error-isolated, like every bus observer: a failing changelog
+      // publish (chaos fault, closed bus) must never break the publish
+      // path that triggered it.
+    }
+  }
+
+  /**
+   * Rebuilds the materialized table from the durable log (EB-171 restart
+   * recovery): every topic's records fold latest-per-(topic, key) into
+   * the store in ascending seq order. TTL-expired records never resurrect
+   * state; unkeyed and seq-0 schedule records are skipped; compressed
+   * envelopes inflate exactly like replay (a record whose preset
+   * dictionary is not registered fails closed — the caller decides
+   * whether that aborts the enable). Live segments only — archived
+   * segments predate them, so the latest record per key always lives in
+   * the live segment.
+   */
+  private rebuildStateStoreInto(store: StateStore): void {
+    const root = this.durableLog;
+    if (root === undefined) return;
+    const nowMs = this.now();
+    for (const log of [root, ...this.namespaceLogs.values()]) {
+      for (const topic of log.topics()) {
+        for (const rec of log.readSince(topic, 0)) {
+          if (rec.seq < 1 || rec.key === undefined) continue;
+          if (rec.expiresAt !== undefined && rec.expiresAt <= nowMs) continue;
+          const wire = this.wirePayloadOfRecord(rec);
+          const payload = isCompressedPayload(wire)
+            ? inflateEnvelopePayload(wire, this.dictionaryForRecord(rec))
+            : wire;
+          store.restore(rec.topic, rec.key, payload, rec.seq, rec.at);
+        }
+      }
     }
   }
 
@@ -30489,13 +30620,13 @@ export class EventBus {
     // this line. Opt-in per topic; unconfigured topics pay a single
     // map-size check (see `samplePayloadHistogram`).
     this.samplePayloadHistogram(topic, payload);
-    // CEP sequence detection (EB-170): observed once per admitted
-    // publish — after the admission gates and sequence assignment,
-    // before compression rewrites the envelope — so the engine sees the
-    // raw application payload with a final sequence number. Rejected and
-    // shed publishes never reach this line. CEP-derived match events
-    // never re-enter pattern detection (`cepDerived`), so a match can
-    // never trigger itself.
+    // CEP sequence detection (EB-170) + KTable materialized state
+    // (EB-171): observed once per admitted publish — after the admission
+    // gates and sequence assignment, before compression rewrites the
+    // envelope — so both see the raw application payload with a final
+    // sequence number. Rejected and shed publishes never reach this line.
+    // CEP-derived match events never re-enter pattern detection
+    // (`cepDerived`), so a match can never trigger itself.
     this.observeAdmittedPublish(msg, cepDerived);
     // Event-time watermark (EB-59): observed once per accepted publish —
     // after the admission gates (schema validation, rate-limit budget), so
@@ -32427,6 +32558,9 @@ export class EventBus {
       // defined — absent otherwise, so a CEP-free bus reports exactly
       // the stats shape it always did.
       ...(this.cep === undefined ? {} : { cep: this.cep.snapshot() }),
+      // Materialized state store (EB-171): present only when enabled via
+      // `enableStateStore` — absent otherwise.
+      ...(this.stateStore === undefined ? {} : { stateStore: this.stateStore.snapshot() }),
     };
   }
 

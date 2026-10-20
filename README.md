@@ -5730,3 +5730,48 @@ Semantics notes:
   lifetime, so clearing every pattern leaves zero counts).
 - Prometheus: `eventbus_cep_patterns`, `eventbus_cep_partial_matches`,
   `eventbus_cep_matches_total` — rendered only once a pattern was defined.
+
+## Materialized state store / KTable (EB-171)
+
+The query side of keyed publish — every admitted keyed publish updates the
+per-(topic, key) latest value, readable without touching subscriber queues
+(the EB-26 keyed-compaction dual: the log keeps the latest per key on
+disk, the store keeps it in memory for reads):
+
+```ts
+bus.enableStateStore({ maxKeys: 10_000, changelogTopic: 'state.changelog' });
+bus.publish('orders', { status: 'paid' }, { key: 'o1' });
+bus.getState('orders', 'o1');
+// → { topic: 'orders', key: 'o1', value: { status: 'paid' },
+//     seq: 2, at: <bus clock>, version: 2 }
+bus.scanState('orders', 'o'); // deterministic (topic, key) order
+```
+
+Semantics notes:
+
+- One update per admitted keyed publish, at the same admission point as
+  CEP (raw payload, final sequence number). Rejected or shed publishes
+  never touch the table; unkeyed publishes never create rows.
+- `version` is a per-(topic, key) update counter starting at 1 — the
+  changelog consumer's ordering key.
+- `maxKeys` (default 10000) bounds the table: the least-recently-updated
+  key is evicted first, counted in `getStats().stateStore.evictedKeys`.
+- `changelogTopic` (opt-in) receives one record per update:
+  `{ topic, key, value, oldValue, seq, at, version }`. Changelog records
+  are *unkeyed* — they can never feed back into the store (the key rides
+  in the payload instead) — but are otherwise ordinary admitted publishes
+  (counted, logged, fanned out).
+- Restart recovery: with `durableLogDir`, `enableStateStore` rebuilds the
+  table from the log's latest per-(topic, key) records (live segments
+  only — archived segments predate them; TTL-expired records stay dead;
+  compressed envelopes inflate exactly like replay; namespace child logs
+  are rebuilt too). Restore replays history, so a rebuilt row's `version`
+  counts the replayed updates. A record whose preset dictionary is not
+  registered on the restoring bus fails closed, exactly like replay — and
+  the enable itself aborts with zero partial state.
+- Enabling twice throws `RangeError` (fail-fast); invalid options throw
+  before anything is enabled.
+- `getStats().stateStore` → `{ keys, evictedKeys }` (present only when
+  enabled).
+- Prometheus: `eventbus_statestore_keys`,
+  `eventbus_statestore_evicted_keys_total` (rendered only when enabled).

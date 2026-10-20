@@ -136,6 +136,9 @@
  *   per-publisher counter).
  * - `eventbus_cep_matches_total`: sequence matches completed and emitted
  *   (EB-170; only emitted once a pattern was defined).
+ * - `eventbus_statestore_evicted_keys_total`: keys evicted by the
+ *   materialized state store's `maxKeys` bound (EB-171; only emitted when
+ *   the store is enabled).
  *
  * Gauges (point-in-time):
  * - `eventbus_subscribers`: currently active subscriptions.
@@ -248,6 +251,9 @@
  *   (EB-170; only emitted once a pattern was defined).
  * - `eventbus_cep_partial_matches`: partial sequence matches currently
  *   tracked (EB-170; only emitted once a pattern was defined).
+ * - `eventbus_statestore_keys`: keys currently tracked by the
+ *   materialized state store (EB-171; only emitted when the store is
+ *   enabled).
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
@@ -1072,6 +1078,22 @@ export function renderPrometheus(stats: BusStats): string {
       'eventbus_cep_matches_total',
       'Sequence matches completed and emitted (EB-170).',
       stats.cep.matches,
+    );
+  }
+
+  // Materialized state store (EB-171): key counts. Rendered only when the
+  // store is enabled — a store-free bus renders exactly what it always
+  // did.
+  if (stats.stateStore !== undefined) {
+    gauge(
+      'eventbus_statestore_keys',
+      'Keys currently tracked by the materialized state store (EB-171).',
+      stats.stateStore.keys,
+    );
+    counter(
+      'eventbus_statestore_evicted_keys_total',
+      'Keys evicted by the state-store maxKeys bound (EB-171).',
+      stats.stateStore.evictedKeys,
     );
   }
 
