@@ -41,6 +41,11 @@ export type {
   AdmissionWebhookDecision,
 } from './admission-webhook.ts';
 import { TokenBucket } from './throttle.ts';
+import {
+  GlobalPublishRateLimiter,
+  resolveGlobalPublishRateLimit,
+} from './global-rate-limit.ts';
+import type { GlobalPublishRateLimitOptions } from './global-rate-limit.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
   createSlowStartGate,
@@ -3774,6 +3779,30 @@ export interface EventBusOptions {
    */
   maxPendingMessages?: number;
   /**
+   * Bus-level global publish rate limit (EB-180, real-time systems /
+   * backend engineering): one token bucket shared by every publish on
+   * the bus — the backstop under the per-topic (EB-19) and per-publisher
+   * (EB-79) rate limits. A fleet of individually well-behaved topics
+   * whose *aggregate* publish rate would still overwhelm the subscriber
+   * fleet is shed here (hot-tenant flood protection).
+   *
+   * The gate runs in `fanOut`'s admission phase as the last pre-admission
+   * gate — after every per-topic check (ACL, schema, size caps, sampling,
+   * pressure budget, tenant quota), so only publishes that would otherwise
+   * be admitted consume global budget — and before sequence-number
+   * assignment and the per-topic rate-limit budget. An over-budget publish
+   * is shed: never fanned out, never written to the durable log, never
+   * queued, no sequence number consumed (subscribers see no gap), no
+   * per-topic rate-limit token burned. `publish` returns 0 for it. The
+   * shed is counted in `BusStats.globalRateLimitedMessages` and surfaced
+   * on `onAdmissionRejected` with reason `'global-rate-limit'`.
+   * `publishAtomic` checks the batch atomically against a shadow
+   * reservation and consumes the tokens at commit. Absent (the default)
+   * means unlimited — fully backward compatible. Invalid values throw
+   * `RangeError` at construction.
+   */
+  globalPublishRateLimit?: GlobalPublishRateLimitOptions;
+  /**
    * Opt-in time-based retention for the durable log (EB-85): records older
    * than `now - durableLogMaxAgeMs` (bus clock, `EventBusOptions.now`) are
    * evicted when their topic compacts, alongside the count bound above —
@@ -4635,6 +4664,13 @@ export interface BusStats {
    * admission-phase shed. Always 0 when no quota is configured.
    */
   tenantQuotaShedMessages: number;
+  /**
+   * Total publishes shed by the bus-level global publish rate limit
+   * (EB-180, see `EventBusOptions.globalPublishRateLimit`): each shed
+   * publish counted once, at the admission-phase shed. Always 0 when no
+   * global limit is configured.
+   */
+  globalRateLimitedMessages: number;
   /**
    * Per-rule usage vs. quota for every registered namespace tenant
    * quota (EB-162, see `setNamespaceQuota`), in registration order —
@@ -8750,7 +8786,8 @@ export type AtomicRejectReason =
   | 'topic-paused'
   | 'idempotency-conflict'
   | 'pressure'
-  | 'tenant-quota';
+  | 'tenant-quota'
+  | 'global-rate-limit';
 
 /**
  * Which publish-side admission gate decided a `previewPublish` call — the
@@ -8776,6 +8813,10 @@ export type AtomicRejectReason =
  *   `'payload-too-large'` — runs right after `'max-message-bytes'`
  * - `'topic-rate-limit'`: per-topic rate limiting (EB-19), reason
  *   `'rate-limit'`
+ * - `'global-rate-limit'`: bus-level global publish rate limiting
+ *   (EB-180), reason `'global-rate-limit'` — runs after every per-topic
+ *   gate and before the per-topic rate-limit budget (global first, then
+ *   topic)
  * - `'idempotency-dedup'`: idempotent-dedup suppression (EB-27), reason
  *   `'duplicate'` — only consulted when `PublishOptions.messageId` is a
  *   non-empty string, mirroring `publishIdempotent`
@@ -8792,6 +8833,7 @@ export type PreviewGateName =
   | 'max-payload-bytes'
   | 'topic-rate-limit'
   | 'tenant-quota'
+  | 'global-rate-limit'
   | 'idempotency-dedup';
 
 /**
@@ -9115,11 +9157,21 @@ interface PauseBufferEntry {
  *   a `'publisher-rate-limit'` shed it consumes no sequence number,
  *   writes nothing to the durable log, burns no rate-limit token, and is
  *   invisible to gap detection)
+ * - `'global-rate-limit'` → `BusStats.globalRateLimitedMessages` (the
+ *   bus-level global publish rate limit (EB-180,
+ *   `EventBusOptions.globalPublishRateLimit`) was exhausted — shed in
+ *   the admission phase, after every per-topic gate and before
+ *   sequence-number assignment and the per-topic rate-limit budget
+ *   (global first, then topic); like a `'publisher-rate-limit'` shed it
+ *   consumes no sequence number, writes nothing to the durable log,
+ *   burns no per-topic rate-limit token, and is invisible to gap
+ *   detection)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
  * `'payload-too-large'` | `'rate-limit'` | `'publisher-rate-limit'` |
- * `'alias-retired'` | `'topic-paused'` | `'pressure'`); the batch rejection
+ * `'alias-retired'` | `'topic-paused'` | `'pressure'` | `'tenant-quota'` |
+ * `'global-rate-limit'`); the batch rejection
  * is counted once against that entry's topic, so it stays reconcilable
  * too.
  */
@@ -9137,6 +9189,7 @@ export type AdmissionRejectReason =
   | 'sampled'
   | 'pressure'
   | 'tenant-quota'
+  | 'global-rate-limit'
   | 'webhook-deny'
   | 'maintenance';
 
@@ -13176,6 +13229,14 @@ export class EventBus {
    * in-flight backlog, it drains naturally.
    */
   private maxPendingMessages: number | undefined;
+  /**
+   * Bus-level global publish rate limiter (EB-180, see
+   * `EventBusOptions.globalPublishRateLimit`). `undefined` when
+   * unconfigured — the publish path then pays a single `undefined`
+   * check. The limiter's clock is the bus's injected `now`, so tests
+   * drive the bucket deterministically.
+   */
+  private readonly globalPublishRateLimiter: GlobalPublishRateLimiter | undefined;
   /** Chunked fan-out yield counter surfaced as `getStats().fanOutYields` (EB-150). */
   private fanOutYieldCount = 0;
   /**
@@ -13191,6 +13252,13 @@ export class EventBus {
    * `BusStats.tenantQuotaShedMessages`.
    */
   private totalTenantQuotaShed = 0;
+  /**
+   * Total publishes shed by the bus-level global publish rate limit
+   * (EB-180, see `EventBusOptions.globalPublishRateLimit`). Counts each
+   * shed publish once, at the admission-phase shed. Surfaced as
+   * `BusStats.globalRateLimitedMessages`.
+   */
+  private totalGlobalRateLimited = 0;
   /**
    * Namespace tenant quotas (EB-162), keyed by
    * `${namespace}\0${pattern}` in registration order: the per-tenant
@@ -13919,6 +13987,17 @@ export class EventBus {
       throw new RangeError('maxPendingMessages must be a non-negative integer');
     }
     this.maxPendingMessages = maxPendingMessages;
+    // Bus-level global publish rate limit (EB-180): absent means
+    // unlimited (backward compatible); a configured limit is enforced in
+    // the fan-out admission phase, after every per-topic gate.
+    const resolvedGlobalRateLimit = resolveGlobalPublishRateLimit(
+      options?.globalPublishRateLimit,
+      'EventBus',
+    );
+    this.globalPublishRateLimiter =
+      resolvedGlobalRateLimit === undefined
+        ? undefined
+        : new GlobalPublishRateLimiter(resolvedGlobalRateLimit, this.now);
   }
 
   /**
@@ -24987,6 +25066,7 @@ export class EventBus {
       new Map<string, number>(),
       opts?.schemaVersion,
       new Map<TenantQuotaRule, { messages: number; bytes: number }>(),
+      { reserved: 0 },
     );
     if (verdict !== undefined) {
       return { admitted: false, reason: verdict.reason, failedGate: verdict.failedGate };
@@ -25223,6 +25303,11 @@ export class EventBus {
     // plus the batch's own reservations, and the commit phase attributes
     // the verified usage.
     const quotaShadowBudget = new Map<TenantQuotaRule, { messages: number; bytes: number }>();
+    // Bus-level global publish rate-limit reservations for this batch
+    // (EB-180): the shadow admission checks each entry against the live
+    // bucket minus the batch's own reservations, and the commit phase
+    // consumes the reserved tokens.
+    const globalShadowBudget = { reserved: 0 };
     // Per-key sequence numbers are drawn in entry order (publish order)
     // against a shadow cursor: a rejected batch leaves the live cursors —
     // and every subscriber's key baseline — exactly untouched.
@@ -25290,6 +25375,7 @@ export class EventBus {
         publisherShadowBudget,
         entries[index].schemaVersion,
         quotaShadowBudget,
+        globalShadowBudget,
       );
       if (verdict !== undefined) {
         // The batch is rejected on the failing entry: count it once against
@@ -25461,6 +25547,14 @@ export class EventBus {
       // this is the only accounting point for atomic entries).
       if (commitOutcome.admitted) {
         this.recordTenantQuotaUsage(resolvedTopics[index], admittedPayloads[index]);
+        // Bus-level global publish rate limit (EB-180): the shadow
+        // admission verified the budget against the batch's reservations;
+        // the commit consumes the reserved tokens (pre-admitted `fanOut`
+        // skips the gate, so this is the only accounting point for atomic
+        // entries). The phase-1 loop and the commit loop run
+        // synchronously back to back, so the reserved tokens are still
+        // there — the take cannot fail.
+        this.globalPublishRateLimiter?.tryTake();
       }
     }
     this.scheduleFlush();
@@ -25511,6 +25605,7 @@ export class EventBus {
     publisherShadowBudget: Map<string, number>,
     schemaVersion: number | undefined,
     quotaShadow: Map<TenantQuotaRule, { messages: number; bytes: number }>,
+    globalShadow: { reserved: number },
   ): { reason: AtomicRejectReason; failedGate: PreviewGateName } | undefined {
     // Topic pause (EB-88) is the first shadow gate, mirroring `fanOut`:
     // any paused entry — shed or queue mode — rejects the whole batch. A
@@ -25575,6 +25670,19 @@ export class EventBus {
     // usage it verified here.
     if (this.checkTenantQuota(topic, payload, 'shadow', quotaShadow) !== undefined)
       return { reason: 'tenant-quota', failedGate: 'tenant-quota' };
+    // Bus-level global publish rate limit (EB-180): the last shadow
+    // gate, mirroring `fanOut` — after every per-topic gate, so only
+    // publishes that would otherwise be admitted consume global budget.
+    // The peek/reserve mirrors the live gate without mutating the
+    // bucket: a rejected batch or a preview creates no global budget
+    // state. The atomic commit phase consumes the reserved tokens (see
+    // `publishAtomic`).
+    const globalLimiter = this.globalPublishRateLimiter;
+    if (globalLimiter !== undefined) {
+      if (globalLimiter.availableTokens - globalShadow.reserved < 1)
+        return { reason: 'global-rate-limit', failedGate: 'global-rate-limit' };
+      globalShadow.reserved += 1;
+    }
     return undefined;
   }
 
@@ -27803,6 +27911,28 @@ export class EventBus {
     this.totalRejected += 1;
     this.totalPressureShed += 1;
     this.emitAdmissionRejected(topic, 'pressure', payload, publisherId, traceId);
+  }
+
+  /**
+   * Counts one publish shed by the bus-level global publish rate limit
+   * (EB-180) against the bus-wide total, then fires the
+   * admission-rejection hook with reason `'global-rate-limit'`. The shed
+   * happens in the admission phase — after every per-topic gate and
+   * before sequence-number assignment — so the payload never became a
+   * message: no sequence number is consumed (subscribers see no gap),
+   * the durable log never sees it, and no per-topic rate-limit token is
+   * burned. Unlike the per-topic `'rate-limit'` shed it lands in the
+   * dedicated `globalRateLimitedMessages` counter, not
+   * `rateLimitedMessages`, so the two limits stay separately observable.
+   */
+  private countGlobalRateLimited(
+    topic: string,
+    payload: unknown,
+    publisherId?: string,
+    traceId?: string,
+  ): void {
+    this.totalGlobalRateLimited += 1;
+    this.emitAdmissionRejected(topic, 'global-rate-limit', payload, publisherId, traceId);
   }
 
   /**
@@ -31584,6 +31714,22 @@ export class EventBus {
         auditPublish(false, undefined, 'tenant-quota');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'tenant-quota' };
       }
+      // Bus-level global publish rate limit (EB-180): the last
+      // pre-admission gate — after every per-topic check (so only
+      // publishes that would otherwise be admitted consume global
+      // budget) and before sequence-number assignment and the per-topic
+      // rate-limit budget below (global first, then topic). A shed
+      // consumes no sequence number (invisible to gap detection), writes
+      // nothing to the durable log, and burns no per-topic rate-limit
+      // token. Skipped for pre-admitted re-fan-outs and admission-DLQ
+      // records, like the gates above.
+      if (this.globalPublishRateLimiter !== undefined) {
+        if (!this.globalPublishRateLimiter.tryTake()) {
+          this.countGlobalRateLimited(topic, payload, publisherId, admissionTraceId);
+          auditPublish(false, undefined, 'global-rate-limit');
+          return { matched: 0, accepted: 0, admitted: false, rejectReason: 'global-rate-limit' };
+        }
+      }
     }
     // The message identity rides the envelope end to end (durable log,
     // replay, cluster forwarding, redeliveries) for subscriber-side
@@ -33289,6 +33435,7 @@ export class EventBus {
       fanOutYields: this.fanOutYieldCount,
       pendingPressure: this.totalPressureShed,
       tenantQuotaShedMessages: this.totalTenantQuotaShed,
+      globalRateLimitedMessages: this.totalGlobalRateLimited,
       namespaceQuotas: this.tenantQuotaUsageSnapshot(),
       droppedMessages: this.totalDropped,
       blockedMessages: this.totalBlocked,

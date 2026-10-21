@@ -844,6 +844,29 @@ library.
   `clearPublisherRateLimit` removes a rule (unknown id is a no-op returning
   `false`). Invalid publisher identities and invalid rate values throw
   `RangeError`.
+- **Bus-level global publish rate limiting** (in `src/global-rate-limit.ts`,
+  via `EventBusOptions.globalPublishRateLimit: { messagesPerSecond, burst? }`):
+  one token bucket shared by every publish on the bus — the backstop under the
+  per-topic (EB-19) and per-publisher rate limits. A fleet of individually
+  well-behaved topics whose *aggregate* publish rate would still overwhelm the
+  subscriber fleet is shed here (hot-tenant flood protection). The gate runs
+  as the last pre-admission gate — after every per-topic check (ACL, schema,
+  size caps, sampling, pressure budget, tenant quota), so only publishes that
+  would otherwise be admitted consume global budget — and before
+  sequence-number assignment and the per-topic rate-limit budget (global
+  first, then topic). An over-budget publish is shed: never fanned out, never
+  written to the durable log, never queued, no sequence number consumed
+  (subscribers see no gap), no per-topic rate-limit token burned; `publish`
+  returns 0 for it. The shed is counted in `BusStats.globalRateLimitedMessages`
+  (also rendered as `eventbus_global_rate_limited_messages_total`) and surfaces
+  on `onAdmissionRejected` with reason `'global-rate-limit'`. The first `burst`
+  messages (default: one second of budget) publish instantly; the bucket refills
+  from the bus clock, so tests stay deterministic. `publishBatch` sheds
+  over-budget entries one by one; `publishAtomic` checks the batch atomically
+  against a shadow reservation and consumes the tokens at commit;
+  `publishDelayed` draws global budget at due-time fan-out;
+  `previewPublish` reports the gate without consuming budget. Absent (the
+  default) means unlimited. Invalid values throw `RangeError` at construction.
 - **Per-topic subscriber caps** (in `src/bus.ts`, via
   `setTopicMaxSubscribers(pattern, maxSubscribers)`): a fail-fast guard
   against subscription storms — a runaway service subscribing in a loop, a

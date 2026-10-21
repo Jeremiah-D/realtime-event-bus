@@ -30,6 +30,9 @@
  *   event time older than their topic's event-time watermark (EB-59).
  * - `eventbus_rate_limited_messages_total`: messages shed by publish-side
  *   per-topic rate limiting.
+ * - `eventbus_global_rate_limited_messages_total`: messages shed by the
+ *   bus-level global publish rate limit (EB-180) — the backstop under
+ *   the per-topic and per-publisher limits.
  * - `eventbus_sampled_messages_total`: non-critical publishes shed by
  *   publish-side adaptive sampling (EB-38) — no sequence number
  *   consumed, no rate-limit token burned.
@@ -391,6 +394,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_publisher_rate_limited_messages_total',
     'Total messages shed by per-publisher publish-side rate limiting (EB-79).',
     stats.publisherRateLimited,
+  );
+  counter(
+    'eventbus_global_rate_limited_messages_total',
+    'Total messages shed by the bus-level global publish rate limit (EB-180): shed in the admission phase after every per-topic gate, so no sequence number is consumed and no per-topic rate-limit token is burned.',
+    stats.globalRateLimitedMessages ?? 0,
   );
   counter(
     'eventbus_sampled_messages_total',
