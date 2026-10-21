@@ -78,6 +78,12 @@ import {
   type SubscriberLagState,
 } from './lag.ts';
 import {
+  LagForecastTracker,
+  resolveLagForecastOptions,
+  type LagForecastOptions,
+  type SubscriberLagForecastState,
+} from './forecast.ts';
+import {
   resolveExpiringSoonOptions,
   type ExpiringSoonEvent,
   type ExpiringSoonOptions,
@@ -376,6 +382,11 @@ export type {
   ScheduleSkewSummaryStats,
 } from './scheduleskew.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
+export type {
+  LagForecastEvent,
+  LagForecastOptions,
+  LagForecastPrediction,
+} from './forecast.ts';
 export type {
   AdmissionGate,
   AdmissionLatencyOptions,
@@ -1572,6 +1583,33 @@ export interface SubscribeOptions {
    * throws, since the callback could never fire. Disabled by default.
    */
   lagMonitor?: boolean | LagMonitorOptions;
+  /**
+   * Opt-in predictive lag forecasting (see `src/forecast.ts`, EB-183):
+   * where `lagMonitor` reports the current watermark, the forecaster
+   * extrapolates its growth — least-squares linear trend over a bounded
+   * window of per-enqueue watermark samples — and predicts when the
+   * watermark will reach `thresholdMs`, firing `onLagForecast` early
+   * (once per predicted excursion, re-arming when the prediction
+   * clears) with `{ subscriberId, pattern, forecastMsAtThreshold,
+   * confidence }`.
+   *
+   * The forecast fires only while the watermark is still *below* the
+   * threshold and the predicted crossing is within `forecastHorizonMs`
+   * (defaults to `thresholdMs`): it is the early warning, never a second
+   * alarm for an excursion `onLag` already reported. A flat or shrinking
+   * trend predicts no crossing — a subscriber keeping up needs no
+   * warning. `getStats()` exposes the per-subscriber forecast state
+   * (`lagForecast`). Orthogonal to EB-35 (current waterlevel) and EB-48
+   * (group lag): this predicts, those observe.
+   *
+   * Pass `true` for watermark-trend reporting with no alerting (64-sample
+   * window, 4-sample minimum fit), or a `LagForecastOptions` object to
+   * tune the window and arm the forecast alert. Invalid values throw
+   * `RangeError` from `subscribe`; `onLagForecast` without
+   * `thresholdMs` also throws, since the callback could never fire.
+   * Disabled by default.
+   */
+  lagForecast?: boolean | LagForecastOptions;
   /**
    * Opt-in TTL expiring-soon warnings (see `src/expiring.ts`, EB-110):
    * warns when the oldest queued message's remaining TTL is at or below
@@ -5690,6 +5728,32 @@ export interface BusStats {
     { subscriberId: string; pattern: string; watermarkMs: number } & LagSummaryStats
   >;
   /**
+   * Per-subscriber lag forecast state (see
+   * `SubscribeOptions.lagForecast`): one entry per subscription with
+   * forecasting enabled, in subscription order. Each entry carries the
+   * current watermark, the sample count, the fitted trend slope (ms of
+   * lag growth per ms of wall time), the predicted milliseconds until
+   * the watermark reaches the threshold (absent when no crossing is
+   * predicted), the fit's R² confidence, and whether the forecast alert
+   * latch is set. Empty when no subscriber opts in.
+   */
+  lagForecast: Array<{
+    subscriberId: string;
+    pattern: string;
+    /** Current queue-head watermark, in milliseconds. */
+    watermarkMs: number;
+    /** Watermark samples currently in the window. */
+    samples: number;
+    /** Fitted trend slope, or undefined when no fit is available yet. */
+    slopeMsPerMs?: number;
+    /** Predicted ms until the watermark reaches the threshold; absent when no crossing is predicted. */
+    forecastMsAtThreshold?: number;
+    /** Least-squares R² of the trend fit, 0..1; 0 when no fit is available yet. */
+    confidence: number;
+    /** Whether the forecast alert latch is currently set. */
+    alerted: boolean;
+  }>;
+  /**
    * The slowest lag-monitored subscribers by p99 drain dwell (top 5,
    * descending) — the first place to look when the lag watermark keeps
    * growing. Only subscribers with at least one sample appear.
@@ -6666,6 +6730,11 @@ interface Subscriber {
    * Absent when monitoring is disabled for this subscriber.
    */
   lag?: SubscriberLagState;
+  /**
+   * Lag forecasting state (see `SubscribeOptions.lagForecast`).
+   * Absent when forecasting is disabled for this subscriber.
+   */
+  forecast?: SubscriberLagForecastState;
   /**
    * TTL expiring-soon monitoring state (see `SubscribeOptions.expiringSoon`).
    * Absent when monitoring is disabled for this subscriber.
@@ -18633,6 +18702,9 @@ export class EventBus {
     const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
+    const lagForecast = resolveLagForecastOptions(opts?.lagForecast);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
     const expiring = resolveExpiringSoonOptions(opts?.expiringSoon, 'subscribe');
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -18886,6 +18958,7 @@ export class EventBus {
       // enabled it and this subscriber tracks a processing-latency SLO.
       sloPhase,
       lag: lagMonitor,
+      forecast: lagForecast,
       expiring,
       keyHotspot,
       causal,
@@ -29841,6 +29914,17 @@ export class EventBus {
       lag.enqueuedAt.set(msg, nowMs);
       this.checkLag(subscriber, lag, nowMs);
     }
+    const forecast = subscriber.forecast;
+    if (forecast != null && result === 'accepted') {
+      // Stamp the enqueue time for lag forecasting (see
+      // `SubscribeOptions.lagForecast`): the forecast keeps its own
+      // per-subscriber stamp map — orthogonal to the lag monitor's — and
+      // records one watermark sample per accepted enqueue. Only
+      // forecast-enabled subscribers pay for the clock read.
+      const forecastNowMs = this.now();
+      forecast.enqueuedAt.set(msg, forecastNowMs);
+      this.checkLagForecast(subscriber, forecast, forecastNowMs);
+    }
     const expiring = subscriber.expiring;
     if (expiring != null && result === 'accepted') {
       // Evaluate the TTL warning on every accepted enqueue: a message
@@ -30045,6 +30129,66 @@ export class EventBus {
     } else {
       lag.alerted = false;
     }
+  }
+
+  /**
+   * Samples a forecast-enabled subscriber's watermark and evaluates the
+   * lag forecast (see `SubscribeOptions.lagForecast`, EB-183). One
+   * (nowMs, watermarkMs) sample per call; `onLagForecast` fires once per
+   * predicted excursion — when the least-squares trend predicts the
+   * watermark will reach `thresholdMs` within `forecastHorizonMs` while
+   * still below it — and re-arms when the prediction clears. The sample
+   * is recorded even without a threshold/callback: the trend is
+   * observable via `getStats().lagForecast` regardless.
+   */
+  private checkLagForecast(
+    subscriber: Subscriber,
+    forecast: SubscriberLagForecastState,
+    nowMs: number,
+  ): void {
+    const watermarkMs = this.forecastWatermarkMs(subscriber, forecast, nowMs);
+    forecast.tracker.record(nowMs, watermarkMs);
+    const thresholdMs = forecast.thresholdMs;
+    const onLagForecast = forecast.onLagForecast;
+    if (thresholdMs === undefined || onLagForecast === undefined) return;
+    const prediction = forecast.tracker.forecast(nowMs, thresholdMs);
+    if (
+      prediction !== undefined &&
+      prediction.forecastMsAtThreshold <= forecast.forecastHorizonMs
+    ) {
+      if (!forecast.alerted) {
+        forecast.alerted = true;
+        onLagForecast({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          forecastMsAtThreshold: prediction.forecastMsAtThreshold,
+          confidence: prediction.confidence,
+          watermarkMs,
+          thresholdMs,
+          at: nowMs,
+        });
+      }
+    } else {
+      forecast.alerted = false;
+    }
+  }
+
+  /**
+   * Reads a forecast-enabled subscriber's current watermark from its own
+   * stamp map: `nowMs - enqueuedAt(oldest queued message)`, 0 when the
+   * queue is empty. Mirrors `lagWatermarkMs` on the forecast's
+   * independent stamps.
+   */
+  private forecastWatermarkMs(
+    subscriber: Subscriber,
+    forecast: SubscriberLagForecastState,
+    nowMs: number,
+  ): number {
+    const head = subscriber.queue.peekOldest();
+    if (head === undefined) return 0;
+    const enqueuedAt = forecast.enqueuedAt.get(head);
+    if (enqueuedAt === undefined) return 0;
+    return Math.max(0, nowMs - enqueuedAt);
   }
 
   /**
@@ -30780,6 +30924,12 @@ export class EventBus {
       const nowMs = this.now();
       lag.enqueuedAt.set(msg, nowMs);
       this.checkLag(subscriber, lag, nowMs);
+    }
+    const forecast = subscriber.forecast;
+    if (forecast != null && result === 'accepted') {
+      const forecastNowMs = this.now();
+      forecast.enqueuedAt.set(msg, forecastNowMs);
+      this.checkLagForecast(subscriber, forecast, forecastNowMs);
     }
     const expiring = subscriber.expiring;
     if (expiring != null && result === 'accepted') {
@@ -33567,6 +33717,7 @@ export class EventBus {
     const subscriberLatencyP99: BusStats['subscriberLatencyP99'] = [];
     const sloMissesByPhase: BusStats['sloMissesByPhase'] = [];
     const lag: BusStats['lag'] = [];
+    const lagForecast: BusStats['lagForecast'] = [];
     const rateLimitedWaiting: BusStats['rateLimitedWaiting'] = [];
     const inFlightUsage: BusStats['inFlightUsage'] = [];
     const deliveryConcurrency: BusStats['deliveryConcurrency'] = [];
@@ -33767,6 +33918,30 @@ export class EventBus {
           pattern: subscriber.pattern,
           watermarkMs: this.lagWatermarkMs(subscriber, ratesNow),
           ...lagState.tracker.summary(),
+        });
+      }
+      // Lag forecasting (EB-183): one entry per forecast-enabled
+      // subscription, sharing the snapshot's clock reading above.
+      const forecastState = subscriber.forecast;
+      if (forecastState != null) {
+        const watermarkMs = this.forecastWatermarkMs(subscriber, forecastState, ratesNow);
+        const prediction =
+          forecastState.thresholdMs === undefined
+            ? undefined
+            : forecastState.tracker.forecast(ratesNow, forecastState.thresholdMs);
+        lagForecast.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          watermarkMs,
+          samples: forecastState.tracker.sampleCount,
+          ...(prediction === undefined
+            ? { confidence: 0 }
+            : {
+                slopeMsPerMs: prediction.slopeMsPerMs,
+                forecastMsAtThreshold: prediction.forecastMsAtThreshold,
+                confidence: prediction.confidence,
+              }),
+          alerted: forecastState.alerted,
         });
       }
       // Keyed hotspot sampling (see `SubscribeOptions.keyHotspot`): only
@@ -34096,6 +34271,7 @@ export class EventBus {
       slowAdmissionTopics,
       lag,
       laggingSubscribers,
+      lagForecast,
       keyedReorderedMessages: this.totalKeyedReordered,
       hotKeyMitigations: this.totalHotKeyMitigations,
       hotKeyShedMessages: this.totalHotKeyShed,
@@ -35844,6 +36020,16 @@ export class EventBus {
     // production path's tail.
     const lag = subscriber.lag;
     if (lag != null) this.checkLag(subscriber, lag, nowMs);
+    // Re-evaluate the lag forecast after the drain: the head moved (a new
+    // head flattens the trend, re-arming a fired alert) or the remaining
+    // backlog keeps growing toward the threshold. A drained queue ends
+    // the backlog episode: the sample window resets so stale watermark
+    // history cannot poison the next episode's trend fit.
+    const forecast = subscriber.forecast;
+    if (forecast != null) {
+      this.checkLagForecast(subscriber, forecast, nowMs);
+      if (subscriber.queue.size === 0) forecast.tracker.reset();
+    }
     // Re-evaluate the TTL warning after the drain: the head moved (a new
     // head may sit inside the warning window) or the queue drained
     // (re-arming a fired alert).
@@ -36401,6 +36587,15 @@ export class EventBus {
     // batched subscribers alike.
     const lag = subscriber.lag;
     if (lag != null) this.checkLag(subscriber, lag, nowMs);
+    // Re-evaluate the lag forecast after the drain, same coverage: a new
+    // head inside the trend window re-fits the prediction, a drained
+    // queue re-arms the latch and resets the sample window (the backlog
+    // episode is over — stale samples must not poison the next fit).
+    const forecast = subscriber.forecast;
+    if (forecast != null) {
+      this.checkLagForecast(subscriber, forecast, nowMs);
+      if (subscriber.queue.size === 0) forecast.tracker.reset();
+    }
     // Re-evaluate the TTL warning after the drain, same coverage: a new
     // head inside the warning window fires (latch clear), a drained queue
     // re-arms the latch.

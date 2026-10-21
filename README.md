@@ -6149,3 +6149,55 @@ Semantics:
   one branch per gate and zero clock reads. Latencies come from the bus
   clock (`EventBusOptions.now`), so tests drive deterministic values
   with a controllable clock; a backwards clock clamps samples at 0.
+
+## Subscriber lag forecasting (EB-183)
+
+Opt-in predictive lag monitoring (`src/forecast.ts`): where the lag
+monitor (EB-35) reports how far behind a consumer is *right now*, the
+forecaster predicts *when* the watermark will reach the threshold — the
+early warning before the lag alert fires:
+
+```ts
+bus.subscribe('orders', handler, {
+  lagForecast: {
+    thresholdMs: 5000,
+    forecastHorizonMs: 2000, // only warn when the crossing is ≤2s out
+    onLagForecast: (e) => {
+      // e = { subscriberId, pattern, forecastMsAtThreshold, confidence,
+      //         watermarkMs, thresholdMs, at }
+      pageOncall(`lag hits 5s in ~${e.forecastMsAtThreshold}ms (R²=${e.confidence})`);
+    },
+  },
+});
+```
+
+Semantics:
+
+- **Watermark samples.** Every accepted enqueue records one
+  `(atMs, watermarkMs)` sample — the queue-head dwell — into a bounded
+  window (default 64). The forecaster keeps its own per-subscriber
+  stamp map, independent of the lag monitor's: it works with or without
+  `lagMonitor`, and never disturbs it.
+- **Least-squares extrapolation.** The tracker fits
+  `lag = slope·t + intercept` over the window and solves for the
+  crossing time of `thresholdMs`. The event carries the predicted
+  remaining time (`forecastMsAtThreshold`) and the fit's R² as
+  `confidence` (0..1).
+- **Early, once per excursion.** The callback fires only while the
+  watermark is still *below* the threshold and the predicted crossing
+  is within `forecastHorizonMs` (defaults to `thresholdMs`) — never a
+  second alarm for an excursion `onLag` already reported. It re-arms
+  when the prediction clears. A flat or shrinking trend predicts no
+  crossing: a consumer keeping up gets no warning.
+- **Backlog episodes.** The forecast is evaluated on every accepted
+  enqueue and every drain. When the queue drains empty the sample
+  window resets — the backlog episode is over, and its watermark
+  history would poison the next episode's trend fit.
+- **Observability.** `getStats().lagForecast` exposes the per-subscriber
+  forecast state: current watermark, sample count, fitted slope,
+  predicted time-to-threshold, confidence, and the alert latch.
+- **Orthogonality.** EB-35 (current waterlevel) and EB-48 (group lag)
+  observe; this predicts. Sampling costs one clock read per accepted
+  enqueue for forecast-enabled subscribers only, and the clock is the
+  bus's injected `EventBusOptions.now` — tests drive deterministic
+  forecasts with a controllable clock.
