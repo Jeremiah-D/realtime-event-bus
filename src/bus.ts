@@ -102,7 +102,13 @@ import {
 import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
 import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
-import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
+import {
+  RotatingDekEncryptor,
+  isEncryptedPayload,
+  type DekKeyInput,
+  type EncryptedPayload,
+  type PayloadEncryptor,
+} from './encrypt.ts';
 import {
   RPC_REPLY_TOPIC,
   RPC_SETTLED_RING_SIZE,
@@ -383,6 +389,11 @@ export {
   randomCorrelationId,
   type RequestResponseOptions,
 } from './rpc.ts';
+export {
+  RotatingDekEncryptor,
+  assertValidKeyId,
+  type DekKeyInput,
+} from './encrypt.ts';
 export type {
   BusConfigSnapshot,
   ConfigApplyResult,
@@ -4518,6 +4529,22 @@ export interface TopicStats {
    */
   compressedMessages: number;
   /**
+   * Messages on this topic sealed with the topic's DEK (see
+   * `setTopicEncryptionKey`, EB-179): the durable log and the
+   * subscriber queues carry the sealed envelope (ciphertext at rest);
+   * delivery decrypts transparently so handlers see the original
+   * payload.
+   */
+  encryptedMessages: number;
+  /**
+   * Messages on this topic that failed to decrypt at delivery and were
+   * dropped fail-closed (see `setTopicEncryptionKey`, EB-179): unknown
+   * key id, retired past its grace window, or tampered envelope.
+   * Counted once per failed delivery; the loss also surfaces as a
+   * sequence gap — a genuine loss, not a deliberate skip.
+   */
+  decryptFailures: number;
+  /**
    * Sum of serialized payload bytes before compression, over this topic's
    * compressed messages.
    */
@@ -5233,6 +5260,16 @@ export interface BusStats {
    * the exact counting rules.
    */
   compressedMessages: number;
+  /**
+   * Total messages sealed with a per-topic DEK — the sum of every topic's
+   * `encryptedMessages` (EB-179).
+   */
+  encryptedMessages: number;
+  /**
+   * Total messages dropped fail-closed at delivery because they could not
+   * be decrypted — the sum of every topic's `decryptFailures` (EB-179).
+   */
+  decryptFailures: number;
   /**
    * Sum of serialized payload bytes before compression, across all
    * compressed messages.
@@ -6952,10 +6989,12 @@ function zeroedTopicStats(): {
   /** Subscriber-side delivery-sampling skips (EB-152). */
   sampleDropped: number;
   signatureFailures: number;
+  decryptFailures: number;
   dedupDropped: number;
   aliasRetiredMessages: number;
   redactedFields: number;
   compressedMessages: number;
+  encryptedMessages: number;
   compressedBytesBefore: number;
   compressedBytesAfter: number;
   compressionTimeMs: number;
@@ -6997,6 +7036,8 @@ function zeroedTopicStats(): {
     aliasRetiredMessages: 0,
     redactedFields: 0,
     compressedMessages: 0,
+    encryptedMessages: 0,
+    decryptFailures: 0,
     compressedBytesBefore: 0,
     compressedBytesAfter: 0,
     compressionTimeMs: 0,
@@ -12023,10 +12064,30 @@ export class EventBus {
    */
   private signingMatcherCache = new Map<string, RegExp>();
   /**
+   * Per-topic data-encryption-key (DEK) rings (EB-179), keyed by the exact
+   * string passed to `setTopicEncryptionKey` — either a concrete topic
+   * name or a wildcard pattern. An exact-topic rule wins over any
+   * pattern; between patterns the earliest-registered rule wins. Each
+   * ring's index-0 key is the live DEK; retired keys keep decrypting
+   * inside the rule's grace window. Orthogonal to `signingRules`:
+   * encryption seals the payload, signing authenticates the wire bytes.
+   */
+  private encryptionRules = new Map<string, { ring: RotatingDekEncryptor; graceMs: number }>();
+  /**
+   * Compiled matchers for the wildcard entries in `encryptionRules`, kept
+   * apart from the subscriber pattern cache and the other rule caches so
+   * encryption configuration never inflates `patternCacheSize`.
+   */
+  private encryptionMatcherCache = new Map<string, RegExp>();
+  /**
    * Messages discarded by `verifySignature` subscribers because the
    * envelope's HMAC signature was missing or invalid (global total).
    */
   private totalSignatureFailures = 0;
+  /**
+   * Messages sealed by `encryptPayload` (global total, EB-179).
+   */
+  private totalEncryptedMessages = 0;
   /**
    * Per-topic publish rate limits, keyed by the exact string passed to
    * `setTopicRateLimit` — either a concrete topic name or a wildcard
@@ -12810,6 +12871,24 @@ export class EventBus {
    * compressed one. Entries die with their message (WeakSet).
    */
   private compressedPayloads = new WeakSet<BusMessage>();
+  /**
+   * Messages whose payload is sealed with a per-topic DEK (EB-179):
+   * sealed by `encryptPayload` on the publish path; replayed messages
+   * are registered by `admitReplayRecords` when the log record carries
+   * an envelope. Decryption at delivery is gated on this set — NOT on
+   * the envelope marker alone — so a user payload that happens to share
+   * the envelope's shape is never mistaken for a sealed one. Entries
+   * die with their message (WeakSet).
+   */
+  private encryptedPayloads = new WeakSet<BusMessage>();
+  /**
+   * Messages sealed by `encryptPayload` that failed to decrypt at
+   * delivery, per topic — the key was unknown, retired past its grace
+   * window, or the envelope was tampered. Fail-closed: the message is
+   * dropped (never delivered as ciphertext, never as garbage), counted
+   * here and globally, and a `decrypt_failed` audit event is filed.
+   */
+  private totalDecryptFailures = 0;
   /**
    * Messages admitted by durable-log replay (`admitReplayRecords`,
    * EB-117). Replays walk an independent delivery budget: they never
@@ -14728,6 +14807,140 @@ export class EventBus {
    */
   clearTopicSigningKey(topicPattern: string): boolean {
     return this.signingRules.delete(topicPattern);
+  }
+
+  /**
+   * Enables publish-side per-topic payload encryption for topics matching
+   * `topicPattern` (EB-179, backend security): every admitted publish to
+   * a matching topic has its wire bytes sealed with AES-256-GCM under the
+   * topic's data-encryption key (DEK), after compression — the sealed
+   * envelope `{ alg, keyId, iv, data, tag }` is what travels the durable
+   * log and the subscriber queues, so payloads are ciphertext at rest.
+   * Delivery decrypts transparently: handlers always see the original
+   * payload. The per-topic signature (`setTopicSigningKey`), when also
+   * configured, is computed over the sealed bytes (encrypt-then-sign).
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or an
+   * exact topic name). `config.keys` lists the DEKs newest-first:
+   * `keys[0]` is the live DEK that seals new messages; every later key
+   * is a retired DEK that still decrypts inside `graceMs` (default 0)
+   * from the moment it stopped being newest. Each key is a 32-byte
+   * Buffer — generate with `randomAes256Key()` (re-exported). Re-setting
+   * a rule rotates, with the same rotation-stamping convention as
+   * `setTopicSigningKey`: dropped keys retire as of now, already-retired
+   * keys keep their original `retiredAtMs`, fully-elapsed keys are
+   * pruned. For the common case — mint one fresh DEK — prefer
+   * `rotateTopicKey`, which generates the key for you.
+   *
+   * A message that cannot be decrypted at delivery (unknown key id,
+   * retired past its grace window, tampered envelope) is dropped
+   * fail-closed — never delivered as ciphertext, never as garbage —
+   * counted in `TopicStats.decryptFailures` (plus the global total) with
+   * a `decrypt_failed` audit event. The loss surfaces as a sequence gap,
+   * like a failed signature verification: a genuine loss, not a
+   * deliberate skip.
+   *
+   * Encryption is per-bus, like signing: the bridge/mirror re-admits a
+   * message under the destination bus's rules, so a hop re-seals under
+   * the destination's DEK (or travels unsealed when it has no rule).
+   *
+   * Match resolution mirrors `setTopicSigningKey`: an exact-topic rule
+   * wins over patterns, the earliest-registered matching pattern wins.
+   * Throws `RangeError` when `topicPattern` is empty, when `keys` is
+   * empty, when a `keyId` is empty/duplicate/malformed, when a key is
+   * not a 32-byte Buffer, or when `graceMs` is negative — fail-fast at
+   * configuration time, never mid-publish.
+   */
+  setTopicEncryptionKey(
+    topicPattern: string,
+    config: { keys: DekKeyInput[]; graceMs?: number },
+  ): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('setTopicEncryptionKey: topicPattern must be a non-empty string');
+    }
+    const graceMs = config?.graceMs ?? 0;
+    if (!Number.isFinite(graceMs) || graceMs < 0) {
+      throw new RangeError('setTopicEncryptionKey: graceMs must be a non-negative finite number of milliseconds');
+    }
+    const nowMs = this.now();
+    const previous = this.encryptionRules.get(topicPattern);
+    if (previous === undefined) {
+      this.encryptionRules.set(topicPattern, {
+        ring: new RotatingDekEncryptor(config?.keys ?? [], { graceMs, nowMs }),
+        graceMs,
+      });
+    } else {
+      // Rotation-stamping mirrors `setTopicSigningKey`: the ring owns
+      // the merge — dropped keys retire as of now, already-retired keys
+      // keep their stamp, fully-elapsed keys are pruned. A changed
+      // graceMs applies to the rule going forward.
+      previous.ring.rekey(config?.keys ?? [], nowMs);
+      previous.graceMs = graceMs;
+    }
+  }
+
+  /**
+   * Rotates the DEK for the rule registered under exactly `topicPattern`
+   * (EB-179): generates a fresh random 32-byte DEK, makes it the live
+   * key, and retires the previous live key as of now — it keeps
+   * decrypting inside the rule's grace window, so in-flight messages
+   * sealed just before rotation still open. Returns the new key id
+   * (`k<N>` unless `newKeyId` names one explicitly).
+   *
+   * A `topic_key_rotated` audit event is filed with the pattern, the old
+   * and new key ids, and the rotation timestamp. Throws `RangeError`
+   * when no encryption rule is registered under exactly `topicPattern`
+   * (rotation targets the registered rule, not a topic it matches) or
+   * when `newKeyId` is malformed/already held.
+   */
+  rotateTopicKey(topicPattern: string, newKeyId?: string): string {
+    const rule = this.encryptionRules.get(topicPattern);
+    if (rule === undefined) {
+      throw new RangeError(
+        `rotateTopicKey: no encryption rule registered for "${topicPattern}"`,
+      );
+    }
+    const nowMs = this.now();
+    const oldKeyId = rule.ring.liveKeyId;
+    const keyId = rule.ring.rotate(newKeyId, nowMs);
+    this.auditSubscription({
+      action: 'topic_key_rotated',
+      actor: 'system',
+      topic: topicPattern,
+      detail: { oldKeyId, newKeyId: keyId, rotatedAtMs: nowMs },
+    });
+    return keyId;
+  }
+
+  /**
+   * Removes the DEK rule previously registered for `topicPattern`.
+   * Returns true when a rule existed and was removed. Messages sealed
+   * before removal — in subscriber queues or on the durable log — will
+   * fail to decrypt at delivery and are dropped fail-closed (see
+   * `setTopicEncryptionKey`); rotate first and let the grace window
+   * drain when that loss is unacceptable.
+   */
+  clearTopicEncryption(topicPattern: string): boolean {
+    return this.encryptionRules.delete(topicPattern);
+  }
+
+  /**
+   * Returns the encryption rule that applies to `topic`, or `undefined`
+   * when no rule matches. An exact-topic rule wins over patterns; between
+   * patterns the earliest-registered matching rule wins.
+   */
+  private encryptionForTopic(topic: string): { ring: RotatingDekEncryptor; graceMs: number } | undefined {
+    const exact = this.encryptionRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, rule] of this.encryptionRules) {
+      let matcher = this.encryptionMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.encryptionMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return rule;
+    }
+    return undefined;
   }
 
   /**
@@ -17419,6 +17632,30 @@ export class EventBus {
   }
 
   /**
+   * Opens a DEK-sealed replay record for filter judgment (EB-179):
+   * returns the sealed-then-plaintext wire form (still possibly a
+   * compression envelope — the caller inflates after), or `undefined`
+   * when the record cannot be decrypted (no rule, unknown key id,
+   * elapsed grace, tampered envelope). Binary records open to raw
+   * bytes; ordinary records are JSON-parsed, mirroring
+   * `decryptMessagePayload`. Unsealed records pass through untouched.
+   */
+  private openReplayRecordPayload(
+    wirePayload: unknown,
+    rec: { binary?: boolean; topic: string },
+  ): unknown {
+    if (!isEncryptedPayload(wirePayload)) return wirePayload;
+    const rule = this.encryptionForTopic(rec.topic);
+    if (rule === undefined) return undefined;
+    try {
+      const opened = rule.ring.decrypt(wirePayload, this.now());
+      return rec.binary === true ? opened : JSON.parse(opened.toString('utf8'));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Inflates a replayed compression envelope (EB-92): a binary record's
    * envelope inflates back to raw bytes — never `JSON.parse`d — so a
    * binary content filter sees the `Uint8Array` the publisher sent.
@@ -17493,6 +17730,81 @@ export class EventBus {
     } else {
       msg.payload = inflateEnvelopePayload(payload, dictionary);
     }
+  }
+
+  /**
+   * Opens a DEK-sealed message just before delivery (EB-179). Only acts
+   * on messages the publish path registered in `encryptedPayloads` — a
+   * plain payload, even one shaped like the envelope, passes through
+   * untouched. Idempotent: after the first decryption the payload is the
+   * original wire form, so redeliveries and multi-subscriber fan-out of
+   * the same message never decrypt twice.
+   *
+   * Runs BEFORE `inflateMessagePayload`: the publish path seals the
+   * post-compression bytes, so delivery opens them in reverse order.
+   * Returns true when the message is deliverable (decrypted, or never
+   * sealed). Returns false when decryption failed — the message is
+   * dropped fail-closed here: counted in per-topic + global
+   * `decryptFailures`, a `decrypt_failed` audit event is filed, and the
+   * caller must skip delivery (the loss surfaces as a sequence gap, a
+   * genuine loss like a failed signature verification). Never throws
+   * into the drain loop: a lost key is an operator action (cleared rule,
+   * pruned keys, elapsed grace), not a bus invariant violation — unlike
+   * `inflateMessagePayload`'s malformed-envelope throw, which can only
+   * mean a tampered durable log.
+   */
+  private decryptMessagePayload(msg: BusMessage): boolean {
+    if (!this.encryptedPayloads.has(msg)) return true;
+    this.encryptedPayloads.delete(msg);
+    const payload = msg.payload;
+    const rule = this.encryptionForTopic(msg.topic);
+    let keyId: string | undefined;
+    let failure: string | null = null;
+    if (!isEncryptedPayload(payload)) {
+      failure = 'malformed sealed envelope';
+    } else {
+      // The key id rides the envelope — report it even when there is no
+      // rule to decrypt with, so the audit event stays attributable.
+      keyId = typeof payload.keyId === 'string' ? payload.keyId : undefined;
+      if (rule === undefined) {
+        failure = 'no encryption rule for topic';
+      } else {
+        try {
+          const opened = rule.ring.decrypt(payload, this.now());
+          msg.payload = this.binaryMessages.has(msg)
+            ? opened
+            : JSON.parse(opened.toString('utf8'));
+        } catch (err) {
+          failure = err instanceof Error ? err.message : String(err);
+        }
+      }
+    }
+    if (failure !== null) {
+      this.countDecryptFailure(msg, keyId, failure);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Records one `decrypt_failed` audit event and counter bump (EB-179):
+   * a sealed message dropped fail-closed at delivery. Fully
+   * error-isolated like all audit emission: the drain path never throws
+   * for observability.
+   */
+  private countDecryptFailure(msg: BusMessage, keyId: string | undefined, reason: string): void {
+    this.statsFor(msg.topic).decryptFailures += 1;
+    this.totalDecryptFailures += 1;
+    this.auditSubscription({
+      action: 'decrypt_failed',
+      actor: 'system',
+      topic: msg.topic,
+      detail: {
+        seq: msg.seq,
+        ...(keyId === undefined ? {} : { keyId }),
+        reason,
+      },
+    });
   }
 
   // ------------------------------------------------------------------
@@ -22795,13 +23107,30 @@ export class EventBus {
             if (filter !== undefined || filterExpr !== undefined) {
               // The log holds the wire payload — resolve a binary record's
               // v2 bytes first (a binary+compressed record's bytes encode
-              // the envelope), then inflate a compressed envelope so the
-              // filter judges the raw application payload. A binary filter
+              // the envelope), then open a DEK-sealed envelope (EB-179) and
+              // inflate a compressed envelope so the filter judges the raw
+              // application payload — never ciphertext. A binary filter
               // sees the `Uint8Array`, never a misparsed value.
               const wirePayload = this.wirePayloadOfRecord(rec);
-              const rawPayload = isCompressedPayload(wirePayload)
-                ? this.inflateReplayEnvelope(wirePayload, rec)
-                : wirePayload;
+              // A sealed record that cannot be decrypted is skipped here:
+              // delivery would drop it fail-closed anyway, so judging it
+              // (or queuing it) would only churn the replay budget. The
+              // key/causal baselines advance past it like any other
+              // deliberate skip, so ordering gates never hang on it.
+              const openedPayload = this.openReplayRecordPayload(wirePayload, rec);
+              if (openedPayload === undefined) {
+                if (rec.key !== undefined && rec.keySeq !== undefined) {
+                  this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+                }
+                if (rec.causal !== undefined) {
+                  this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+                }
+                countReplaySkipped();
+                continue;
+              }
+              const rawPayload = isCompressedPayload(openedPayload)
+                ? this.inflateReplayEnvelope(openedPayload, rec)
+                : openedPayload;
               if (filter !== undefined && !filter(rawPayload, rec.topic)) {
                 this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
                 // A filtered replayed message is deliberately skipped: advance
@@ -22980,6 +23309,13 @@ export class EventBus {
               this.compressedPayloads.add(msg);
               const dictionary = this.dictionaryForRecord(rec);
               if (dictionary !== undefined) this.compressedDictionaries.set(msg, dictionary);
+            }
+            // The log stores the sealed envelope: re-register a DEK-sealed
+            // record for transparent decryption at delivery (EB-179) —
+            // exactly like a live sealed message. Gated on the set, never
+            // on the envelope shape alone.
+            if (isEncryptedPayload(wirePayload)) {
+              this.encryptedPayloads.add(msg);
             }
             // The publish-time HMAC signature rides the log record: restore it
             // onto the envelope so a `verifySignature` subscriber checks the
@@ -26782,6 +27118,10 @@ export class EventBus {
         this.countSignatureFailure(subscriber, msg, msg.publisherSignature?.kid, 'publisher');
         continue;
       }
+      // DEK-sealed payloads (EB-179) open here, before inflation: a
+      // message that cannot be decrypted is dropped fail-closed —
+      // counted, audited, never delivered as ciphertext.
+      if (!this.decryptMessagePayload(msg)) continue;
       this.inflateMessagePayload(msg);
       const filter = subscriber.filter;
       if (filter !== undefined && !filter(msg.payload, msg.topic)) {
@@ -31481,6 +31821,30 @@ export class EventBus {
       const autoTrainer = compressionRule.autoTrainState;
       if (autoTrainer !== undefined) autoTrainer.sample(payload, this.binaryMessages.has(msg));
     }
+    // Publish-side per-topic payload encryption (EB-179, opt-in via
+    // `setTopicEncryptionKey`): seals the wire bytes — the post-
+    // compression form, since ciphertext is incompressible — with
+    // AES-256-GCM under the topic's live DEK. The sealed envelope is
+    // what hits the durable log and the subscriber queues, so payloads
+    // are ciphertext at rest; delivery decrypts transparently. Runs
+    // AFTER compression and BEFORE signing: the topic signature
+    // (EB-84), when also configured, covers the sealed bytes
+    // (encrypt-then-sign), and a `verifySignature` subscriber checks
+    // those same sealed bytes before decryption. An unserializable
+    // non-binary payload has no wire bytes and travels unsealed, like
+    // compression's passthrough.
+    const encryptionRule = this.encryptionForTopic(topic);
+    if (encryptionRule !== undefined) {
+      const wireBytes = wireBytesOfPayload(msg.payload, this.binaryMessages.has(msg));
+      if (wireBytes !== undefined) {
+        const sealed = encryptionRule.ring.encrypt(wireBytes);
+        msg.payload = sealed;
+        this.encryptedPayloads.add(msg);
+        const topicStats = this.statsFor(topic);
+        topicStats.encryptedMessages += 1;
+        this.totalEncryptedMessages += 1;
+      }
+    }
     // Publish-side per-topic HMAC message signing (EB-84, opt-in via
     // `setTopicSigningKey`). The signature covers (topic, seq, wire
     // bytes): the wire bytes are the post-compression form, so a
@@ -33111,6 +33475,8 @@ export class EventBus {
       diagnosticEvents: this.totalDiagnosticEvents,
       admissionDlqEvents: this.totalAdmissionDlqEvents,
       compressedMessages: this.totalCompressed,
+      encryptedMessages: this.totalEncryptedMessages,
+      decryptFailures: this.totalDecryptFailures,
       compressedBytesBefore: this.totalCompressedBytesBefore,
       compressedBytesAfter: this.totalCompressedBytesAfter,
       compressionRatio:
@@ -33314,6 +33680,25 @@ export class EventBus {
         })(),
         dedupDropped: stats.dedupDropped,
         compressedMessages: stats.compressedMessages,
+        encryptedMessages: stats.encryptedMessages,
+        decryptFailures: stats.decryptFailures,
+        // Per-topic DEK configuration (EB-179): present only when an
+        // encryption rule currently matches the topic. Carries the key
+        // ids and the grace window — never the key material. Omitted
+        // otherwise, so stats snapshots without encryption are
+        // byte-identical to before.
+        ...(() => {
+          const rule = this.encryptionForTopic(topic);
+          return rule === undefined
+            ? {}
+            : {
+                encryption: {
+                  keyIds: rule.ring.keyIds(),
+                  liveKeyId: rule.ring.liveKeyId,
+                  graceMs: rule.graceMs,
+                },
+              };
+        })(),
         compressedBytesBefore: stats.compressedBytesBefore,
         compressedBytesAfter: stats.compressedBytesAfter,
         compressionRatio:
@@ -34857,6 +35242,9 @@ export class EventBus {
       // Compressed payloads inflate once per message before any handler
       // sees them — idempotent, so the production copy's earlier
       // inflation is harmless (see `inflateMessagePayload`).
+      // DEK-sealed payloads (EB-179) open before inflation; undecryptable
+      // messages are dropped fail-closed, never shadow-delivered.
+      if (!this.decryptMessagePayload(msg)) continue;
       this.inflateMessagePayload(msg);
       // Sampled before the handler runs: queue dwell, not processing
       // time — same rule as production.
@@ -35292,6 +35680,9 @@ export class EventBus {
           // any handler sees it — so every subscriber transparently receives
           // the original payload. See `inflateMessagePayload` for the
           // idempotency and envelope-collision notes.
+          // DEK-sealed payloads (EB-179) open before inflation; a message
+          // that cannot be decrypted is dropped fail-closed here.
+          if (!this.decryptMessagePayload(msg)) continue;
           this.inflateMessagePayload(msg);
           this.noteMessageDelivered(subscriber, msg);
           // Priority-lane accounting (EB-122): the drain hands the message
@@ -35373,6 +35764,9 @@ export class EventBus {
           // mid-drain health trip were never attempted and keep their
           // credit.
           this.consumeDeliveryCredit(subscriber, msg);
+          // DEK-sealed payloads (EB-179) open before inflation; a message
+          // that cannot be decrypted is dropped fail-closed here.
+          if (!this.decryptMessagePayload(msg)) continue;
           this.inflateMessagePayload(msg);
           // EB-159: the handler executes under one handler-concurrency
           // slot — the next queued message dispatches when this
@@ -35652,6 +36046,9 @@ export class EventBus {
       for (const msg of live) this.consumeDeliveryCredit(subscriber, msg);
     }
     for (const msg of live) {
+      // DEK-sealed payloads (EB-179) open before inflation; a message
+      // that cannot be decrypted is dropped fail-closed here.
+      if (!this.decryptMessagePayload(msg)) continue;
       this.inflateMessagePayload(msg);
       this.noteMessageDelivered(subscriber, msg);
       this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');

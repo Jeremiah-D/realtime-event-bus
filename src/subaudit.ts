@@ -80,7 +80,9 @@ export type SubscriptionAuditAction =
   | 'tenant_quota_warning'
   | 'bridge_unhealthy'
   | 'bridge_recovered'
-  | 'mirror_throttled';
+  | 'mirror_throttled'
+  | 'topic_key_rotated'
+  | 'decrypt_failed';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -101,6 +103,13 @@ export type SubscriptionAuditAction =
  *   `detail: { reason: 'wildcard_subscription_invalidated', purge }`
  * - `backpressure_dropped`: `{ policy: <backpressure tier>, dropped: <count>, queueSize: <number> }`
  * - `signature_verification_failed`: `{ seq: <per-topic seq>, kid?: <key id that signed, when present> }`
+ * - `topic_key_rotated`: `{ oldKeyId, newKeyId, rotatedAtMs }` — a
+ *   per-topic DEK rotation (EB-179); the `topic` field carries the rule's
+ *   topic pattern, `actor` is `'system'`
+ * - `decrypt_failed`: `{ seq: <per-topic seq>, keyId?: <key id on the
+ *   envelope, when present> }` — a sealed message dropped fail-closed at
+ *   delivery (EB-179): unknown key id, retired past its grace window, or
+ *   tampered envelope
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -241,6 +250,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'bridge_unhealthy',
   'bridge_recovered',
   'mirror_throttled',
+  'topic_key_rotated',
+  'decrypt_failed',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

@@ -5992,3 +5992,70 @@ A duplicate of an already-pending `correlationId` throws `RangeError`
 (the caller's bug — ids must be unique while pending); a non-positive
 `timeoutMs` throws `RangeError`.
 
+## Per-topic payload encryption with DEK rotation (EB-179)
+
+Opt-in publish-side confidentiality for sensitive topics
+(`src/encrypt.ts`, zero new dependencies — `node:crypto` only): every
+admitted publish to a matching topic has its wire bytes sealed with
+AES-256-GCM under the topic's data-encryption key (DEK), after
+compression. The sealed envelope `{ alg, keyId, iv, data, tag }` is
+what hits the durable log and the subscriber queues — payloads are
+ciphertext at rest — and delivery decrypts transparently, so handlers
+always see the original payload:
+
+```ts
+import { randomAes256Key } from 'realtime-event-bus';
+
+bus.setTopicEncryptionKey('payments.*', {
+  keys: [{ keyId: 'k1', key: randomAes256Key() }], // keys[0] is the live DEK
+  graceMs: 60_000,
+});
+bus.publish('payments.auth', { pan: '…', amount: 100 }); // sealed on disk
+
+// Rotate: mints a fresh random DEK, retires k1 as of now.
+const newKeyId = bus.rotateTopicKey('payments.*'); // -> 'k2'
+```
+
+Semantics:
+
+- **Versioned envelopes.** `RotatingDekEncryptor` seals with the live
+  key and stamps its `keyId`; decryption selects the key by `keyId`
+  and fails loudly on an unknown key id, a keyless envelope, or a
+  tampered envelope — never guessing, never returning garbage (the
+  WR-11 convention).
+- **Graceful rotation.** Retired keys keep decrypting inside `graceMs`
+  from their retirement, so in-flight messages sealed just before
+  rotation still open. `rotateTopicKey` files a `topic_key_rotated`
+  audit event `{ oldKeyId, newKeyId, rotatedAtMs }`; re-setting a rule
+  follows the `signing.ts` rotation-stamping convention (dropped keys
+  retire as of now, already-retired keys keep their stamp — rotation
+  never extends a grace window).
+- **Fail-closed delivery.** A message that cannot be decrypted (unknown
+  key id, retired past grace, no rule, tampered envelope) is dropped —
+  never delivered as ciphertext, never as garbage — counted in
+  `TopicStats.decryptFailures` (plus the global total) with a
+  `decrypt_failed` audit event `{ seq, keyId, reason }`. The loss
+  surfaces as a sequence gap: a genuine loss, not a deliberate skip.
+- **Pipeline order.** Sealing runs after compression (ciphertext is
+  incompressible) and before signing: a per-topic HMAC signature
+  (`setTopicSigningKey`), when also configured, covers the sealed
+  bytes (encrypt-then-sign), and a `verifySignature` subscriber checks
+  those same sealed bytes before decryption. Content filters still
+  judge the plaintext — on the live path they run pre-queue on the raw
+  payload, and replay opens sealed records before filter evaluation.
+- **Per-bus, like signing.** The bridge/mirror re-admits under the
+  destination bus's rules, so a hop re-seals under the destination's
+  DEK (or travels unsealed when it has none). Match resolution mirrors
+  signing: exact-topic rule wins, earliest-registered pattern wins.
+- **Observability.** `getStats()` exposes `encryptedMessages` /
+  `decryptFailures` globally and per topic; each topic row also
+  carries `encryption: { keyIds, liveKeyId, graceMs }` when a rule
+  matches — key ids only, never key material.
+
+`setTopicEncryptionKey` throws `RangeError` on an empty pattern, an
+empty key list, a malformed/duplicate `keyId`, a non-32-byte key, or a
+negative `graceMs`. `rotateTopicKey` targets the registered rule (not
+a topic it matches) and throws when none is registered under exactly
+that pattern. Clearing a rule (`clearTopicEncryption`) makes queued or
+logged sealed messages undecryptable — rotate first and let the grace
+window drain when that loss is unacceptable.
