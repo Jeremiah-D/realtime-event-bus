@@ -1590,6 +1590,20 @@ library.
   1024). Disabled by default, and the disabled path is allocation-free
   (one branch per instrumentation site — no WeakMap lookup, no clock read).
   Invalid options throw `RangeError` from the constructor.
+- **Tail-based delivery-pipeline trace sampling** (in `src/tail-sampling.ts`,
+  via `new EventBus({ tailSampling: true })`): the complement to head-based
+  sampling above. Every admitted publish opens a trace whose spans buffer
+  until the delivery terminal state — then the trace is decided: handler
+  errors, ack timeouts, and dead-letters are **always kept**; successful
+  traces are kept with probability `successSampleRate` (default 1, set to
+  0 to keep only the interesting ones). The keep reason is stamped on the
+  publish root as `attrs.tailKeepReason` (`'error'` | `'ack-timeout'` |
+  `'dead-letter'` | `'sampled'`). Kept spans go to the error-isolated
+  `onTraceSpan` callback (its own, or the head-based channel when unset)
+  and to a bounded ring buffer exported as `getStats().tailSampledSpans`.
+  Bounded by `maxOpenTraces` (default 4096, oldest force-decided first) and
+  `maxSpansPerTrace` (default 512). Disabled by default, allocation-free
+  when off. Invalid options throw `RangeError` from the constructor.
 - **Per-topic sliding-window publish rates** (in `src/rates.ts`, always
   on): each topic's publish rate in messages/sec over trailing 1s / 1m / 5m
   windows, load-average style (`r1s` / `r1m` / `r5m`) — the real-time signal

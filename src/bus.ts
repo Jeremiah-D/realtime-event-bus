@@ -46,6 +46,8 @@ import {
   resolveGlobalPublishRateLimit,
 } from './global-rate-limit.ts';
 import type { GlobalPublishRateLimitOptions } from './global-rate-limit.ts';
+import { TailSampler, resolveTailSamplingOptions } from './tail-sampling.ts';
+import type { TailSamplingOptions } from './tail-sampling.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
   createSlowStartGate,
@@ -4142,6 +4144,37 @@ export interface EventBusOptions {
    */
   trace?: boolean | TraceOptions;
   /**
+   * Opt-in tail-based delivery-pipeline trace sampling (see
+   * `src/tail-sampling.ts`, EB-181) — the complement to head-based
+   * sampling (`trace`, EB-45). Instead of deciding at admission time,
+   * every admitted publish's spans are buffered in memory until the
+   * publish's delivery reaches a terminal state — then the trace is
+   * decided: a trace that saw a handler error, an ack timeout, or a
+   * dead-letter is always kept; a trace whose deliveries all succeeded
+   * is kept with probability `successSampleRate` (default 1). Kept
+   * spans flow to the `onTraceSpan` callback channel (the tail option's
+   * own `onTraceSpan`, falling back to `trace.onTraceSpan` when absent)
+   * and to a bounded ring buffer exported as
+   * `getStats().tailSampledSpans` (oldest evicted first, `bufferSize`
+   * default 1024). The kept publish root span carries
+   * `attrs.tailKeepReason` (`'error'` | `'ack-timeout'` | `'dead-letter'`
+   * | `'sampled'`) so the keep decision stays visible.
+   *
+   * Two bounds keep memory honest: `maxSpansPerTrace` (default 512)
+   * caps the spans buffered per trace (past it, new spans are dropped
+   * and the trace is marked `tailTruncated`), and `maxOpenTraces`
+   * (default 4096) caps simultaneously open traces — when it is
+   * exceeded the oldest open trace is force-decided immediately (the
+   * decision horizon). Span timestamps come from the bus's injected
+   * clock (`EventBusOptions.now`).
+   *
+   * Disabled by default, and the disabled path is allocation-free like
+   * head-based tracing. Pass `true` for the defaults, or a
+   * `TailSamplingOptions` object to tune. Invalid values throw
+   * `RangeError` from the constructor.
+   */
+  tailSampling?: boolean | TailSamplingOptions;
+  /**
    * OTLP/HTTP span export (see `src/otlp.ts`, EB-105): ships the
    * delivery-pipeline trace spans (`EventBusOptions.trace`) to an
    * OpenTelemetry collector as OTLP/HTTP JSON, hand-encoded with zero
@@ -5695,6 +5728,19 @@ export interface BusStats {
    * receives. A snapshot — mutating it does not affect the bus.
    */
   traceSpans: TraceSpan[];
+  /**
+   * Tail-sampled delivery-trace spans (see `EventBusOptions.tailSampling`
+   * and `src/tail-sampling.ts`, EB-181), oldest first: every span of
+   * every kept trace since the bus was created, in completion order,
+   * bounded by `TailSamplingOptions.bufferSize` (oldest evicted first).
+   * Empty when tail sampling is disabled. Each span carries
+   * `{ traceId, spanId, parentId, name, at, durationMs, attrs }` — the
+   * same spans the `onTraceSpan` callback receives — and every kept
+   * trace's publish root span carries `attrs.tailKeepReason`
+   * (`'error'` | `'ack-timeout'` | `'dead-letter'` | `'sampled'`).
+   * A snapshot — mutating it does not affect the bus.
+   */
+  tailSampledSpans: TraceSpan[];
   /**
    * OTLP span export state (see `EventBusOptions.otlp` and `src/otlp.ts`,
    * EB-105). Present only when OTLP export is configured: `bufferedSpans`
@@ -12573,6 +12619,13 @@ export class EventBus {
    */
   private readonly trace: TraceRecorder | undefined;
   /**
+   * Tail-based trace sampler (EB-181, see
+   * `EventBusOptions.tailSampling`). `undefined` when disabled — every
+   * instrumentation site checks this field first, which is what makes
+   * the disabled path allocation-free.
+   */
+  private readonly tailSampler: TailSampler | undefined;
+  /**
    * Trace span archive journal (`EventBusOptions.trace.archive`,
    * EB-167), or `undefined` when the archive is disabled — every
    * sampled span lands here (via the trace pipeline's span fan-out)
@@ -13629,6 +13682,19 @@ export class EventBus {
     }
     this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.traceArchive = traceArchive;
+    // Tail-based trace sampling (EB-181): resolved after the head-based
+    // pipeline so the tail sampler reuses its composed `onTraceSpan`
+    // when the tail options carry no callback of their own — the shared
+    // callback channel (OTLP exporter and the trace archive journal ride
+    // along, like they do for head-based spans).
+    const resolvedTailSampling = resolveTailSamplingOptions(options?.tailSampling, 'EventBus');
+    if (resolvedTailSampling !== undefined && resolvedTailSampling.onTraceSpan === undefined) {
+      resolvedTailSampling.onTraceSpan = resolvedTrace?.onTraceSpan;
+    }
+    this.tailSampler =
+      resolvedTailSampling === undefined
+        ? undefined
+        : new TailSampler(resolvedTailSampling, this.now);
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
     // Bridge transport health monitor (EB-168): opt-in via
     // `EventBusOptions.bridge.health`. Watches every mirror outcome
@@ -19307,7 +19373,12 @@ export class EventBus {
     // each exactly once. Their open ack trace spans are abandoned — the
     // source will never close them.
     const takenTracker = reliable?.tracker.takePending() ?? [];
-    for (const msg of takenTracker) this.trace?.abandonAckSpan(msg);
+    for (const msg of takenTracker) {
+      this.trace?.abandonAckSpan(msg);
+      // Tail-based sampling (EB-181): the delivery moves to the
+      // migration target — the leg closes as invalidated there.
+      this.tailSampler?.abandonAckSpan(msg, 'invalidated');
+    }
     // A batched subscriber may hold dequeued-but-undelivered messages in
     // its batch accumulator — move them into the snapshot too, ahead of
     // the queued backlog (they were dequeued earliest).
@@ -19617,6 +19688,9 @@ export class EventBus {
       if (this.trace !== undefined && this.trace.hasTrace(msg)) {
         this.trace.closeAckSpan(subscriber, msg, this.now());
       }
+      // Tail-based sampling (EB-181): the delivery leg closes as
+      // delivered.
+      this.tailSampler?.closeAckSpan(subscriber, msg, this.now());
       // EB-40: single sample for the whole range — the last acked
       // message's accepted→ack latency at this moment.
       if (i === last && ackState != null) {
@@ -19720,6 +19794,9 @@ export class EventBus {
     for (const { msg } of settled) {
       if (requeue) {
         this.trace?.abandonAckSpan(msg);
+        // Tail-based sampling (EB-181): the nacked delivery's leg closes
+        // — the requeue opens a new one.
+        this.tailSampler?.abandonAckSpan(msg, 'nack');
         continue;
       }
       const live = reliable.liveDeliveries.get(msg);
@@ -19729,6 +19806,9 @@ export class EventBus {
           this.recordProcessingLatency(subscriber, sloState, stamps.get(msg) ?? this.now());
         }
         this.trace?.closeAckSpan(subscriber, msg, this.now());
+        // Tail-based sampling (EB-181): the delivery leg closes as
+        // delivered — same live-only guard as the head-based span.
+        this.tailSampler?.closeAckSpan(subscriber, msg, this.now());
       }
     }
     if (requeue) {
@@ -20313,6 +20393,25 @@ export class EventBus {
         // `bus.enqueue` span in the same trace, and the redelivery opens
         // a new ack span when it is handed to the handler.
         this.trace?.abandonAckSpan(msg);
+        // Tail-based sampling (EB-181): the terminal outcome must be
+        // known BEFORE the leg closes, because the keep decision runs on
+        // leg close. A redelivery that exhausts its budget dead-letters
+        // (immediately, or after the retry ladder drains) — that always
+        // keeps the trace. A requeue just closes this leg; the enqueue
+        // below opens a new one in the same trace.
+        const tail = this.tailSampler;
+        if (tail !== undefined && tail.hasTrace(msg)) {
+          const nextCount = (redeliveries.get(msg) ?? 0) + 1;
+          const exhaustsBudget = dlq != null && nextCount > dlq.maxRedeliveries;
+          tail.abandonAckSpan(
+            msg,
+            exhaustsBudget
+              ? 'dead-letter'
+              : reason === 'ack-timeout'
+                ? 'ack-timeout'
+                : 'nack',
+          );
+        }
         // EB-133: stamp the redelivery schedule for SLO phase attribution
         // (redelivery wait = re-hand-off − this stamp). Only
         // attribution-enabled subscribers pay for the clock read.
@@ -20424,6 +20523,12 @@ export class EventBus {
         tracer !== undefined && tracer.hasTrace(msg)
           ? tracer.openAckSpan(msg, redeliveries.get(msg) ?? 0, this.now())
           : false;
+      // Tail-based sampling (EB-181): record the open ack span on the
+      // message's tail trace; the leg closes when the delivery settles.
+      const tail = this.tailSampler;
+      if (tail !== undefined && tail.hasTrace(msg)) {
+        tail.openAckSpan(msg, redeliveries.get(msg) ?? 0, this.now());
+      }
       // EB-53: stamp the hand-off when SLO tracking is enabled, so the
       // sample taken on ack() completion measures delivery→ack
       // processing time, queue dwell excluded. A redelivery re-stamps
@@ -20471,6 +20576,9 @@ export class EventBus {
               this.recordProcessingLatency(subscriber, sloState, deliveredAtMs);
             }
             tracer?.closeAckSpan(subscriber, msg, this.now());
+            // Tail-based sampling (EB-181): the delivery leg closes as
+            // delivered — same live-only guard as the head-based span.
+            this.tailSampler?.closeAckSpan(subscriber, msg, this.now());
             // EB-155: the consumer confirmed this delivery — a rung
             // delivery that acks leaves the retry ladder.
             this.clearRetryLadder(subscriber, msg);
@@ -20481,6 +20589,10 @@ export class EventBus {
         },
         nack: () => {
           tracer?.abandonAckSpan(msg);
+          // Tail-based sampling (EB-181): the leg closes in `onRedeliver`
+          // below, which sees the redelivery outcome (requeue vs
+          // dead-letter) before deciding — abandoning here would decide
+          // the trace before the dead-letter is known.
           delivery.nack();
         },
       };
@@ -29247,6 +29359,9 @@ export class EventBus {
    * The expiry accounting (`recordExpired`) always runs, DLQ or not.
    */
   private noteDrainedExpired(msg: BusMessage, lane?: MessageLane): void {
+    // Tail-based sampling (EB-181): the expired delivery's leg closes —
+    // the message never reached a handler.
+    this.tailSampler?.noteExpired(msg);
     if (!this.admissionDlqMessages.has(msg)) {
       const rule = this.admissionDlqRuleFor(msg.topic);
       if (rule !== undefined) {
@@ -29635,6 +29750,13 @@ export class EventBus {
       // event in the same trace.
       tracer.enqueueSpan(subscriber, msg, this.now(), 0);
     }
+    // Tail-based sampling (EB-181): an accepted enqueue opens a delivery
+    // leg on the message's tail trace (buffered, decided at the terminal
+    // state). A message with no open trace — a DLQ replay after the
+    // original trace was decided — opens a fresh one.
+    if (result === 'accepted') {
+      this.tailSampler?.enqueueSpan(subscriber, msg, this.now(), 0);
+    }
     return result;
   }
 
@@ -29646,13 +29768,40 @@ export class EventBus {
    */
   private deliverTraced<T>(subscriber: Subscriber, msg: BusMessage, invoke: () => T): T {
     const tracer = this.trace;
-    if (tracer === undefined || !tracer.hasTrace(msg)) {
+    const tail = this.tailSampler;
+    const headTraced = tracer !== undefined && tracer.hasTrace(msg);
+    // Tail-based sampling (EB-181) closes the delivery leg here for
+    // plain subscribers without a health probe. Reliable subscribers
+    // settle through the ack/nack/timeout path instead, and
+    // health-probed subscribers settle in `deliverWithHealth` (which
+    // sees the true failure outcome the probe swallows here).
+    const tailTraced =
+      tail !== undefined && tail.hasTrace(msg) && subscriber.reliable == null && subscriber.health == null;
+    if (!headTraced && !tailTraced) {
       return invoke();
     }
     const at = this.now();
-    const result = invoke();
-    tracer.deliverSpan(subscriber, msg, at, this.now() - at);
-    return result;
+    if (!tailTraced) {
+      const result = invoke();
+      if (headTraced) tracer!.deliverSpan(subscriber, msg, at, this.now() - at);
+      return result;
+    }
+    // The tail leg needs the handler outcome: a throw marks the trace
+    // interesting (always kept). The head-based behavior is preserved —
+    // no deliver span when the handler threw.
+    let outcome: 'delivered' | 'error' = 'delivered';
+    try {
+      return invoke();
+    } catch (err) {
+      outcome = 'error';
+      throw err;
+    } finally {
+      const endAt = this.now();
+      if (headTraced && outcome === 'delivered') {
+        tracer!.deliverSpan(subscriber, msg, at, endAt - at);
+      }
+      tail!.deliverSpan(subscriber, msg, at, endAt - at, outcome);
+    }
   }
 
   /**
@@ -29667,26 +29816,45 @@ export class EventBus {
     invoke: () => void,
   ): void {
     const tracer = this.trace;
-    if (tracer === undefined) {
-      invoke();
-      return;
-    }
-    let anyTraced = false;
-    for (const msg of batch) {
-      if (tracer.hasTrace(msg)) {
-        anyTraced = true;
-        break;
+    const tail = this.tailSampler;
+    // Tail legs close here for plain batch subscribers without a health
+    // probe (see `deliverTraced`); health-probed batches settle in
+    // `deliverBatchWithHealth`.
+    const closeTailLeg = subscriber.reliable == null && subscriber.health == null;
+    let anyHeadTraced = false;
+    let anyTailTraced = false;
+    if (tracer !== undefined || (tail !== undefined && closeTailLeg)) {
+      for (const msg of batch) {
+        if (!anyHeadTraced && tracer !== undefined && tracer.hasTrace(msg)) anyHeadTraced = true;
+        if (!anyTailTraced && closeTailLeg && tail !== undefined && tail.hasTrace(msg)) {
+          anyTailTraced = true;
+        }
+        if (anyHeadTraced && anyTailTraced) break;
       }
     }
-    if (!anyTraced) {
+    if (!anyHeadTraced && !anyTailTraced) {
       invoke();
       return;
     }
     const at = this.now();
-    invoke();
-    const durationMs = this.now() - at;
-    for (const msg of batch) {
-      if (tracer.hasTrace(msg)) tracer.deliverSpan(subscriber, msg, at, durationMs);
+    let outcome: 'delivered' | 'error' = 'delivered';
+    try {
+      invoke();
+    } catch (err) {
+      outcome = 'error';
+      throw err;
+    } finally {
+      const durationMs = this.now() - at;
+      for (const msg of batch) {
+        // Head-based behavior preserved: no deliver span when the batch
+        // handler threw.
+        if (anyHeadTraced && outcome === 'delivered' && tracer!.hasTrace(msg)) {
+          tracer!.deliverSpan(subscriber, msg, at, durationMs);
+        }
+        if (anyTailTraced && closeTailLeg && tail!.hasTrace(msg)) {
+          tail!.deliverSpan(subscriber, msg, at, durationMs, outcome);
+        }
+      }
     }
   }
 
@@ -30493,6 +30661,10 @@ export class EventBus {
     const tracer = this.trace;
     if (tracer !== undefined && result === 'accepted' && tracer.hasTrace(msg)) {
       tracer.enqueueSpan(subscriber, msg, this.now(), 0);
+    }
+    // Tail-based sampling (EB-181): see the enqueue site above.
+    if (result === 'accepted') {
+      this.tailSampler?.enqueueSpan(subscriber, msg, this.now(), 0);
     }
     return result;
   }
@@ -31890,6 +32062,16 @@ export class EventBus {
         openTrace.endAdmission(this.now());
       }
     }
+    // Tail-based sampling (EB-181): every admitted publish opens a tail
+    // trace — no head decision. The spans buffer until the delivery
+    // terminal state, then the trace is decided (error/ack-timeout/
+    // dead-letter always kept, success at `successSampleRate`).
+    let openTailTrace: ReturnType<TailSampler['openTrace']> | undefined;
+    const tail = this.tailSampler;
+    if (tail !== undefined) {
+      openTailTrace = tail.openTrace(msg, topic, msg.seq, traceparent, fanOutStart);
+      openTailTrace?.endAdmission(this.now());
+    }
     // Per-key publish-order sequence (see `PublishOptions.key`). Delayed
     // messages reuse their schedule-time keySeq; `publishAtomic` reuses its
     // admission-time keySeq; direct publishes draw here — after the
@@ -32315,6 +32497,13 @@ export class EventBus {
       const traceEnd = this.now();
       openTrace.endFanout(traceEnd, matched, accepted);
       openTrace.endPublish(traceEnd);
+    }
+    if (openTailTrace !== undefined) {
+      // The tail trace's fan-out is done; the trace itself stays open
+      // until every delivery leg reaches a terminal state.
+      const tailEnd = this.now();
+      openTailTrace.endFanout(tailEnd, matched, accepted);
+      openTailTrace.endPublish(tailEnd);
     }
     // Topic routes (EB-50): a non-routed message admitted on a routed
     // topic is forwarded to the route's destination as a normal dst
@@ -33695,6 +33884,7 @@ export class EventBus {
       },
       hotKeys: hottestKeys,
       traceSpans: this.trace?.snapshot() ?? [],
+      tailSampledSpans: this.tailSampler?.snapshot() ?? [],
       // OTLP span export (EB-105): present only when configured — the
       // field stays absent otherwise so unconfigured buses keep
       // byte-identical stats.
@@ -34232,6 +34422,10 @@ export class EventBus {
   ): void {
     const dlq = subscriber.deadLetter;
     if (dlq == null) return;
+    // Tail-based sampling (EB-181): a dead-letter always keeps the
+    // trace. The delivery leg already closed at the redelivery that
+    // exhausted the budget — this only flips the keep decision.
+    this.tailSampler?.noteDeadLetter(msg);
     // EB-145: expired entries are shed before the bounded eviction runs
     // — expire-first, then oldest — so a full DLQ drops its dead entries
     // before shedding live ones.
@@ -34792,6 +34986,9 @@ export class EventBus {
         const live = reliable.liveDeliveries.get(msg);
         if (live !== undefined) live.live = false;
         this.trace?.abandonAckSpan(msg);
+        // Tail-based sampling (EB-181): the invalidated delivery's leg
+        // closes — the replay below opens a new one.
+        this.tailSampler?.abandonAckSpan(msg, 'invalidated');
         reliable.lastFailure.delete(msg);
       }
     }
@@ -36274,6 +36471,10 @@ export class EventBus {
     if (health == null) return;
     const budgetMs = health.processingTimeoutMs;
     const startedAtMs = budgetMs !== undefined ? this.now() : 0;
+    // Tail-based sampling (EB-181): the batch's delivery legs close at
+    // the end of this function with the batch outcome.
+    const tail = this.tailSampler;
+    const tailAt = tail !== undefined ? this.now() : 0;
     let failed = false;
     let reason: 'error' | 'timeout' = 'error';
     try {
@@ -36299,12 +36500,28 @@ export class EventBus {
       // EB-72: a clean batch-handler return is idle activity (reliable
       // batches record inside their at-least-once wrapper instead).
       if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
+      // Tail-based sampling (EB-181): every message in the batch closes
+      // its leg with the batch outcome.
+      if (tail !== undefined) {
+        const durationMs = this.now() - tailAt;
+        for (const msg of batch) {
+          if (tail.hasTrace(msg)) tail.deliverSpan(subscriber, msg, tailAt, durationMs, 'delivered');
+        }
+      }
       return;
     }
     health.consecutiveFailures += 1;
     if (!health.degraded && health.consecutiveFailures >= health.maxConsecutiveFailures) {
       this.pauseForHealth(subscriber, reason);
       this.reportDegraded(subscriber);
+    }
+    // Tail-based sampling (EB-181): a failed batch marks every message's
+    // trace interesting — always kept.
+    if (tail !== undefined) {
+      const durationMs = this.now() - tailAt;
+      for (const msg of batch) {
+        if (tail.hasTrace(msg)) tail.deliverSpan(subscriber, msg, tailAt, durationMs, 'error');
+      }
     }
   }
 
@@ -36793,6 +37010,13 @@ export class EventBus {
     const health = subscriber.health;
     if (health == null) return undefined;
     this.noteMessageDelivered(subscriber, msg);
+    // Tail-based sampling (EB-181): the delivery leg closes at the end
+    // of this function with the true outcome (`deliverTraced` left it
+    // open for health-probed subscribers). One WeakMap lookup; the
+    // disabled path pays nothing beyond it.
+    const tail = this.tailSampler;
+    const tailTraced = tail !== undefined && tail.hasTrace(msg);
+    const tailAt = tailTraced ? this.now() : 0;
     const budgetMs = health.processingTimeoutMs;
     // The health probe reads the clock only when it enforces a processing
     // budget; the SLO tracker needs the same reading on every invocation.
@@ -36848,12 +37072,20 @@ export class EventBus {
       // deliveries record inside their at-least-once wrapper instead —
       // see drainSubscriber).
       if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
+      // Tail-based sampling (EB-181): the delivery leg closes here with
+      // the true outcome — `deliverTraced` deliberately left it open for
+      // health-probed subscribers because the probe swallows the throw.
+      if (tailTraced) tail!.deliverSpan(subscriber, msg, tailAt, this.now() - tailAt, 'delivered');
       return result;
     }
     health.consecutiveFailures += 1;
     if (!health.degraded && health.consecutiveFailures >= health.maxConsecutiveFailures) {
       this.pauseForHealth(subscriber, reason);
     }
+    // Tail-based sampling (EB-181): a failed handler (throw or
+    // processing-budget overrun) marks the trace interesting — always
+    // kept.
+    if (tailTraced) tail!.deliverSpan(subscriber, msg, tailAt, this.now() - tailAt, 'error');
     return result;
   }
 
