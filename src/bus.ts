@@ -104,6 +104,17 @@ import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox
 import type { DurableStorageBackend } from './storage.ts';
 import type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 import {
+  RPC_REPLY_TOPIC,
+  RPC_SETTLED_RING_SIZE,
+  RPC_SETTLED_TTL_MS,
+  RequestTimeoutError,
+  assertCorrelationId,
+  cleanCorrelationId,
+  randomCorrelationId,
+  routeRpcResponse,
+  type RequestResponseOptions,
+} from './rpc.ts';
+import {
   BUS_CONFIG_SNAPSHOT_VERSION,
   ConfigApplyError,
   assertValidSnapshot,
@@ -365,6 +376,13 @@ export type {
 } from './trace.ts';
 export type { EncryptedPayload, PayloadEncryptor } from './encrypt.ts';
 export { AesGcmEncryptor, NoopEncryptor, isEncryptedPayload, randomAes256Key } from './encrypt.ts';
+export {
+  RPC_REPLY_TOPIC,
+  RequestTimeoutError,
+  cleanCorrelationId,
+  randomCorrelationId,
+  type RequestResponseOptions,
+} from './rpc.ts';
 export type {
   BusConfigSnapshot,
   ConfigApplyResult,
@@ -648,6 +666,25 @@ export interface BusMessage {
    * Absent for plain publishes without an identity.
    */
   messageId?: string;
+  /**
+   * RPC correlation id (see `EventBus.requestResponse`, EB-178): stamped
+   * when the publish carried one (`PublishOptions.correlationId`). It
+   * rides the live envelope — delivered to subscribers and redeliveries —
+   * so a responder can echo it back on the response and the requester's
+   * router can match the response to its pending request. Deliberately
+   * NOT persisted to the durable log: RPC is ephemeral — a restarted bus
+   * has no pending requests to settle, so replaying correlation ids
+   * would only address dead reply topics. Absent for non-RPC publishes.
+   */
+  correlationId?: string;
+  /**
+   * RPC reply topic (see `EventBus.requestResponse`, EB-178): the topic
+   * a responder publishes the response to (`EventBus.reply` reads it).
+   * Stamped exactly when `correlationId` is stamped; same
+   * non-persistence rule — it rides the live envelope only. Absent for
+   * non-RPC publishes.
+   */
+  replyTo?: string;
   /**
    * Publisher identity, set when the publish carried one
    * (`PublishOptions.publisherId`). A producer-side label — service name,
@@ -5240,6 +5277,18 @@ export interface BusStats {
    */
   throttledSubscribers: number;
   /**
+   * Request–reply RPC counters (see `EventBus.requestResponse`, EB-178):
+   * live waiters plus lifetime requests / settled responses / timeouts /
+   * responses discarded as late, duplicate, or unknown.
+   */
+  rpc: {
+    pending: number;
+    requests: number;
+    responses: number;
+    timeouts: number;
+    discardedResponses: number;
+  };
+  /**
    * Subscriptions currently auto-paused by subscriber health probing (see
    * `SubscribeOptions.healthProbe`): their handlers failed too many times
    * in a row and delivery is paused until they are resumed manually via
@@ -9820,6 +9869,24 @@ export interface PublishOptions {
    */
   messageId?: string;
   /**
+   * RPC correlation id for request–reply messaging (see
+   * `EventBus.requestResponse`, EB-178): stamps `BusMessage.correlationId`
+   * so the responder's reply can be matched to this request. A non-string,
+   * empty, or over-1024-char value is treated as absent (the lenient
+   * `messageId` rule — it is application data, not configuration).
+   * `requestResponse` stamps its own id; set this directly only when you
+   * drive the RPC handshake by hand.
+   */
+  correlationId?: string;
+  /**
+   * RPC reply topic for request–reply messaging (see
+   * `EventBus.requestResponse`, EB-178): stamps `BusMessage.replyTo` —
+   * the topic the responder publishes the response to. Same lenient
+   * absent-rule as `correlationId`. `requestResponse` always stamps the
+   * reserved `_bus.replies` topic; `EventBus.reply` reads this field.
+   */
+  replyTo?: string;
+  /**
    * Publisher identity for this publish (EB-65). A producer-side label —
    * service name, client id, tenant — aggregated into per-publisher
    * publish counters (`getStats().publishers` and the
@@ -11455,6 +11522,27 @@ export class EventBus {
   readonly busId: string;
   private subscribers = new Map<string, Subscriber>();
   private subscribersByPattern = new Map<string, number>();
+  /**
+   * Request–reply RPC state (EB-178): correlation ids with a live waiter,
+   * recently-settled ids (late/duplicate responses are discarded by id),
+   * and the lazily-created router subscription on the reserved
+   * `_bus.replies` topic. Settled ids are a bounded ring — the oldest
+   * entry is evicted past `RPC_SETTLED_RING_SIZE`, and entries older
+   * than `RPC_SETTLED_TTL_MS` are pruned on read.
+   */
+  private rpcPending = new Map<
+    string,
+    { resolve: (payload: unknown) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
+  >();
+  private rpcSettled = new Map<string, number>();
+  private rpcRouterSub: Subscription | undefined;
+  private rpcRouterReliable = false;
+  /** Clock for the RPC settled ring; injectable via `requestResponse` options (tests). */
+  private rpcNow: () => number = () => Date.now();
+  private rpcRequests = 0;
+  private rpcResponses = 0;
+  private rpcTimeouts = 0;
+  private rpcDiscardedResponses = 0;
   /**
    * Graceful shutdown (EB-154): set the moment `close()` starts and
    * never cleared. Every publish/subscribe-family entry point checks it
@@ -23111,6 +23199,200 @@ export class EventBus {
   }
 
   /**
+   * Request–reply RPC over the bus (EB-178, realtime): publishes a
+   * request to `topic` and resolves with the first response's payload.
+   *
+   * The request envelope carries a `correlationId` (explicit, or 32
+   * random hex chars) and a `replyTo` topic — the reserved `_bus.replies`
+   * inbox. A responder answers with `reply(requestMsg, payload)`; the
+   * bus's lazily-created router subscription on `_bus.replies` settles
+   * the first response with a matching correlation id and discards
+   * everything else for that id — duplicates (a second response to the
+   * same request) and late responses (arriving after this call settled)
+   * are dropped by correlation id, never delivered twice, counted in
+   * `getStats().rpc.discardedResponses`.
+   *
+   * Resolves with the response message's `payload`. Rejects with
+   * `RequestTimeoutError` (carrying `correlationId` and `timeoutMs`)
+   * when nothing arrives within `timeoutMs`, or fast — without waiting
+   * — when the request publish itself is not admitted (the rejection
+   * reason is in the error message). A duplicate of an already-pending
+   * `correlationId` throws `RangeError`; a non-positive `timeoutMs`
+   * throws `RangeError`.
+   *
+   * The router subscription is created on the first call and shared by
+   * every request; `reliable: true` (or `{ ackTimeoutMs }`) makes it a
+   * `subscribeReliable` subscription so a lost ack redelivers the
+   * response instead of losing it — composable with a responder that
+   * serves the request topic through `subscribeReliable`. The first
+   * call's reliability choice wins for the bus's lifetime (documented,
+   * not silently re-created: re-creating would drop in-flight replies).
+   *
+   * The timeout timer is `unref`'d — a pending RPC never holds the
+   * process open by itself. `close()` rejects every pending request
+   * with `BusClosedError` (see below).
+   */
+  requestResponse(
+    topic: string,
+    payload: unknown,
+    opts: RequestResponseOptions & { publishOptions?: PublishOptions },
+  ): Promise<unknown> {
+    // 'publish' is the honest action label: the call's fallible new work
+    // is publishing the request (the reply subscription is lazy).
+    this.assertNotClosed('publish', topic);
+    const timeoutMs = opts?.timeoutMs;
+    if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError('requestResponse: timeoutMs must be a finite number greater than 0');
+    }
+    const now = opts?.now ?? Date.now;
+    const correlationId =
+      opts?.correlationId === undefined ? randomCorrelationId() : opts.correlationId;
+    assertCorrelationId(correlationId, 'requestResponse');
+    if (this.rpcPending.has(correlationId)) {
+      throw new RangeError(
+        `requestResponse: correlationId "${correlationId}" already has a pending request`,
+      );
+    }
+    const reliable = opts?.reliable ?? false;
+    const publishOptions: PublishOptions = {
+      ...((opts?.publishOptions ?? {}) as PublishOptions),
+      correlationId,
+      replyTo: RPC_REPLY_TOPIC,
+    };
+    // The settled ring judges lateness on this clock; last call wins is
+    // fine — it is only ever Date.now in production.
+    this.rpcNow = now;
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.rpcPending.delete(correlationId);
+        this.rpcSettled.set(correlationId, this.rpcNow());
+        this.pruneRpcSettled(this.rpcNow());
+        this.rpcTimeouts += 1;
+        reject(new RequestTimeoutError(correlationId, timeoutMs));
+      }, timeoutMs);
+      // A pending RPC never holds the process open on its own.
+      (timer as unknown as { unref?: () => void }).unref?.();
+      this.rpcPending.set(correlationId, { resolve, reject, timer });
+      try {
+        this.ensureRpcRouter(reliable);
+      } catch (err) {
+        this.rpcPending.delete(correlationId);
+        clearTimeout(timer);
+        throw err;
+      }
+      // Registered before publishing: the request is admitted
+      // synchronously, but responses always arrive on a later flush, so
+      // registration-first cannot self-trigger — and it closes the race
+      // where a response lands between publish and registration.
+      const outcome = this.publishCore(topic, payload, publishOptions, 'requestResponse');
+      if (!outcome.admitted) {
+        this.rpcPending.delete(correlationId);
+        clearTimeout(timer);
+        reject(
+          new Error(
+            `requestResponse: request publish not admitted (reason: ${outcome.rejectReason ?? 'unknown'})`,
+          ),
+        );
+        return;
+      }
+      this.rpcRequests += 1;
+    });
+  }
+
+  /**
+   * Answers one RPC request (EB-178): publishes `responsePayload` to the
+   * request's `replyTo` topic carrying its `correlationId`, so the
+   * requester's router settles the matching `requestResponse` promise.
+   * Returns the accepted-subscriber count, like `publish`. Throws
+   * `RangeError` when `request` is not an RPC request (no `replyTo` or
+   * no `correlationId` on the envelope).
+   */
+  reply(request: BusMessage, responsePayload: unknown, opts?: PublishOptions): number {
+    const replyTo = request?.replyTo;
+    const correlationId = request?.correlationId;
+    if (typeof replyTo !== 'string' || replyTo.length === 0) {
+      throw new RangeError('reply: the request message has no replyTo topic');
+    }
+    if (typeof correlationId !== 'string' || correlationId.length === 0) {
+      throw new RangeError('reply: the request message has no correlationId');
+    }
+    return this.publish(replyTo, responsePayload, {
+      ...(opts ?? {}),
+      correlationId,
+      replyTo: undefined,
+    });
+  }
+
+  /**
+   * Lazily creates the shared router subscription on the reserved
+   * `_bus.replies` inbox (EB-178). First call wins on reliability: the
+   * subscription is never re-created, because re-creating it would drop
+   * in-flight replies. A closed bus refuses here too — `subscribe`
+   * already throws, this just keeps the error attributable.
+   */
+  private ensureRpcRouter(reliable: boolean | { ackTimeoutMs?: number }): void {
+    if (this.rpcRouterSub !== undefined) return;
+    const useReliable = reliable !== false;
+    this.rpcRouterReliable = useReliable;
+    // The router speaks both dialects: a plain subscription hands us the
+    // BusMessage; a reliable one hands us a Delivery wrapping it. Either
+    // way the first response settles the pending request and every later
+    // one for the same correlation id is discarded — acked first, so a
+    // reliable responder stops redelivering instead of retrying forever.
+    const onResponse = (m: BusMessage | Delivery<BusMessage>): void => {
+      const maybeDelivery = m as Partial<Delivery<BusMessage>>;
+      const hasAck = typeof maybeDelivery.ack === 'function';
+      const msg = hasAck && maybeDelivery.msg !== undefined ? maybeDelivery.msg : (m as BusMessage);
+      const ack = hasAck ? maybeDelivery.ack!.bind(maybeDelivery) : undefined;
+      const decision = routeRpcResponse(msg.correlationId, this.rpcPending, this.rpcSettled);
+      if (decision.kind === 'settle' && msg.correlationId !== undefined) {
+        const pending = this.rpcPending.get(msg.correlationId);
+        if (pending !== undefined) {
+          this.rpcPending.delete(msg.correlationId);
+          clearTimeout(pending.timer);
+          this.rpcSettled.set(msg.correlationId, this.rpcNow());
+          this.pruneRpcSettled(this.rpcNow());
+          this.rpcResponses += 1;
+          ack?.();
+          pending.resolve(msg.payload);
+          return;
+        }
+      }
+      // Late (settled id), duplicate, or unknown — never settled twice,
+      // never delivered twice.
+      ack?.();
+      this.rpcDiscardedResponses += 1;
+    };
+    this.rpcRouterSub = useReliable
+      ? this.subscribeReliable(
+          RPC_REPLY_TOPIC,
+          onResponse as ReliableMessageHandler,
+          typeof reliable === 'object' && reliable !== null
+            ? { ackTimeoutMs: reliable.ackTimeoutMs }
+            : undefined,
+        )
+      : this.subscribe(RPC_REPLY_TOPIC, onResponse as (msg: BusMessage) => void);
+  }
+
+  /**
+   * Bounds the settled-correlation ring (EB-178): drops entries older
+   * than `RPC_SETTLED_TTL_MS` and, past `RPC_SETTLED_RING_SIZE`, evicts
+   * oldest-inserted first. A forgotten id's late response is dropped as
+   * unknown instead of counted as a late duplicate — the counters stay
+   * honest about what the bus actually recognized.
+   */
+  private pruneRpcSettled(nowMs: number): void {
+    for (const [id, settledAt] of this.rpcSettled) {
+      if (nowMs - settledAt > RPC_SETTLED_TTL_MS) this.rpcSettled.delete(id);
+    }
+    while (this.rpcSettled.size > RPC_SETTLED_RING_SIZE) {
+      const oldest = this.rpcSettled.keys().next();
+      if (oldest.done) break;
+      this.rpcSettled.delete(oldest.value);
+    }
+  }
+
+  /**
    * The shared publish pipeline behind `publish` and
    * `publishWithConfirmation` (EB-125): chaos gate, option validation,
    * namespace resolution, the barrier slim path, the circuit-breaker
@@ -23312,6 +23594,12 @@ export class EventBus {
       // Per-message absolute delivery deadline (EB-177): validated above;
       // `deadlineAt` wins over `deadlineMs` when both are given.
       opts?.deadlineAt ?? opts?.deadlineMs,
+      // RPC correlation id + reply topic (EB-178): lenient cleaning
+      // happens in `fanOut`, exactly like `messageId` — a non-string or
+      // empty value is treated as absent. Every other `fanOut` caller
+      // leaves these undefined; only direct publishes carry RPC fields.
+      opts?.correlationId,
+      opts?.replyTo,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -30577,6 +30865,17 @@ export class EventBus {
     // the same instant. Last so existing positional call sites are
     // unaffected.
     messageDeadline?: number,
+    // RPC correlation id (see `PublishOptions.correlationId`, EB-178):
+    // leniently cleaned below, exactly like `messageId` — a non-string,
+    // empty, or over-1024-char value is treated as absent. Stamped onto
+    // the envelope (`BusMessage.correlationId`) but deliberately NOT
+    // persisted to the durable log: RPC is ephemeral. Only `publishCore`
+    // passes these; every other path leaves them undefined. Last so
+    // existing positional call sites are unaffected.
+    rpcCorrelationId?: string,
+    // RPC reply topic (see `PublishOptions.replyTo`, EB-178): same
+    // lenient cleaning and non-persistence rule as the correlation id.
+    rpcReplyTo?: string,
   ): {
     matched: number;
     accepted: number;
@@ -30951,6 +31250,10 @@ export class EventBus {
     // dedup. Only non-empty strings count — anything else is absent,
     // mirroring `publishIdempotent`'s lenient treatment.
     const cleanMessageId = typeof messageId === 'string' && messageId.length > 0 ? messageId : undefined;
+    // RPC correlation id + reply topic (EB-178): the shared lenient
+    // cleaner from `src/rpc.ts` — same absent-rule as `messageId`.
+    const cleanRpcCorrelationId = cleanCorrelationId(rpcCorrelationId);
+    const cleanRpcReplyTo = cleanCorrelationId(rpcReplyTo);
     const msg: BusMessage = {
       topic,
       payload,
@@ -30971,6 +31274,12 @@ export class EventBus {
       // publishes, which never participate in the arbitration.
       ...(key === undefined ? {} : { key }),
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+      // RPC correlation id + reply topic (EB-178): stamped on the live
+      // envelope only — never persisted to the durable log (see
+      // `BusMessage.correlationId`). Internal re-fan-out paths pass
+      // undefined, so only direct publishes carry them.
+      ...(cleanRpcCorrelationId === undefined ? {} : { correlationId: cleanRpcCorrelationId }),
+      ...(cleanRpcReplyTo === undefined ? {} : { replyTo: cleanRpcReplyTo }),
       // The producer label rides the envelope so attribution survives
       // durable-log replay, delayed schedules and cross-bus forwards.
       ...(publisherId === undefined ? {} : { publisherId }),
@@ -32121,6 +32430,14 @@ export class EventBus {
       );
     }
     this.closed = true;
+    // Request–reply RPC (EB-178): a closed bus settles nothing more —
+    // reject every pending request with BusClosedError instead of
+    // leaving it to time out against a bus that will never answer.
+    for (const pending of this.rpcPending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new BusClosedError('publish', RPC_REPLY_TOPIC));
+    }
+    this.rpcPending.clear();
     this.closePromise = this.runClose(drainTimeoutMs);
     return this.closePromise;
   }
@@ -32812,6 +33129,16 @@ export class EventBus {
       replayThrottled,
       creditExhaustedSubscribers,
       rampingSubscribers,
+      // Request–reply RPC (EB-178): lifetime counters plus the live
+      // waiter count — pending requests that would time out or be
+      // rejected by close().
+      rpc: {
+        pending: this.rpcPending.size,
+        requests: this.rpcRequests,
+        responses: this.rpcResponses,
+        timeouts: this.rpcTimeouts,
+        discardedResponses: this.rpcDiscardedResponses,
+      },
       rateLimitedWaiting,
       inFlightUsage,
       deliveryConcurrency,

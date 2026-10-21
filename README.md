@@ -5932,3 +5932,63 @@ Invalid values (non-number, `NaN`, infinite) throw `RangeError` from
 the publish entry point before anything is mutated — the same
 zero-side-effect convention as the schema rejection. `publishDelayed`
 validates `deadlineAt`/`deadlineMs` the same way at schedule time.
+
+## Request–reply RPC (EB-178)
+
+`EventBus.requestResponse(topic, payload, { timeoutMs })` turns the bus
+into an RPC transport: it publishes a request carrying a
+`correlationId` and a `replyTo` topic (the reserved `_bus.replies`
+inbox), and resolves with the first response's payload. A responder
+answers with `EventBus.reply(requestMsg, responsePayload)` — one line,
+no manual topic plumbing:
+
+```ts
+// Responder: serve RPC on a topic like any other subscription.
+bus.subscribe('billing.quote', (msg) => {
+  bus.reply(msg, { total: price(msg.payload.items) });
+});
+
+// Requester: resolves with { total }, or rejects with RequestTimeoutError.
+const quote = await bus.requestResponse('billing.quote', { items }, { timeoutMs: 2000 });
+```
+
+Semantics:
+
+- **First response wins.** The bus keeps one lazily-created router
+  subscription on `_bus.replies` (shared by every request) that settles
+  the pending request for a correlation id exactly once. Duplicate
+  responses and late responses (arriving after the request settled or
+  timed out) are discarded by correlation id — never delivered twice,
+  counted in `getStats().rpc.discardedResponses`.
+- **`RequestTimeoutError`.** Rejects when nothing arrives within
+  `timeoutMs`; the error carries `correlationId` and `timeoutMs` for
+  log correlation. A request whose publish is not admitted (schema
+  rejection, rate-limit shed, …) rejects fast with the admission reason
+  instead of waiting out the timeout.
+- **Manual handshake.** `publish` accepts `correlationId` / `replyTo`
+  directly (`PublishOptions`), stamped on `BusMessage.correlationId` /
+  `BusMessage.replyTo` for hand-rolled RPC. The lenient `messageId`
+  absent-rule applies: non-string/empty/over-1024-char values are
+  treated as absent. RPC fields ride the live envelope only — they are
+  deliberately not persisted to the durable log (a restarted bus has no
+  pending requests to settle).
+- **Composes with reliable delivery.** `requestResponse(…, { reliable:
+  true })` (or `{ reliable: { ackTimeoutMs } }`) makes the router an
+  at-least-once subscription: a response is acked on receipt, so a lost
+  ack redelivers instead of losing the reply. Pairs with a responder
+  serving the request topic through `subscribeReliable`. The first
+  request's reliability choice wins for the bus's lifetime — the router
+  is never re-created, which would drop in-flight replies.
+- **Settled ids are a bounded ring.** Recently settled correlation ids
+  (4096 max, 5-minute TTL) keep discarding late duplicates; older ids
+  are forgotten and their stragglers drop as unknown.
+- **Lifecycle.** The timeout timer is `unref`'d — a pending RPC never
+  holds the process open. `close()` rejects every pending request with
+  `BusClosedError` instead of leaving it to time out. Stats live under
+  `getStats().rpc`: `{ pending, requests, responses, timeouts,
+  discardedResponses }`.
+
+A duplicate of an already-pending `correlationId` throws `RangeError`
+(the caller's bug — ids must be unique while pending); a non-positive
+`timeoutMs` throws `RangeError`.
+
