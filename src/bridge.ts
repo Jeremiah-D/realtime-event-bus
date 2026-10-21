@@ -4,6 +4,7 @@ import {
   type BridgeHealthStats,
   type ResolvedBridgeHealthOptions,
 } from './bridgehealth.ts';
+import { isValidLineageShape, type MessageLineage } from './lineage.ts';
 
 /**
  * Cross-process fan-out bridge (EB-51).
@@ -99,6 +100,14 @@ export interface BridgeEnvelope {
   messageId?: string;
   /** End-to-end trace id, 32 lowercase hex chars. */
   traceId?: string;
+  /**
+   * Message lineage (EB-184): the source message's forwarding history.
+   * The receiving bus runs its cycle check against it and appends the
+   * ingress hop, so bridge topologies terminate loops instead of
+   * amplifying them. Validated on receipt — a malformed lineage rejects
+   * the envelope.
+   */
+  lineage?: MessageLineage;
   /**
    * The source's TTL deadline in bus-clock milliseconds, carried verbatim
    * (see EB-50's routed deadline). Absent when the source message had no
@@ -314,6 +323,13 @@ export function validateBridgeEnvelope(
       sig: s.sig as string,
       seq: s.seq as number,
     };
+  }
+  const lineage = env.lineage;
+  if (lineage !== undefined) {
+    // A malformed lineage rejects the envelope — the receiving bus only
+    // ever extends well-formed chains (see `EventBus.receiveFromBridge`).
+    if (!isValidLineageShape(lineage)) return { ok: false };
+    out.lineage = lineage as MessageLineage;
   }
   return { ok: true, envelope: out };
 }

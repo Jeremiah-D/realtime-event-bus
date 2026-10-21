@@ -34,6 +34,15 @@ import {
   type AdmissionWebhookOptions,
   type AdmissionWebhookRequest,
 } from './admission-webhook.ts';
+import {
+  LineageDepthSampler,
+  appendLineageHop,
+  assertValidLineage,
+  checkLineageCycle,
+  isValidLineageShape,
+  resolveMaxLineageHops,
+  type MessageLineage,
+} from './lineage.ts';
 
 export type {
   AdmissionWebhookOptions,
@@ -448,6 +457,16 @@ export type {
 export { assertValidSigningKeys, SIGNING_KID_PATTERN, SIGNATURE_HEX_LENGTH } from './signing.ts';
 export { compileFilterExpression } from './filterexpr.ts';
 export type { CompiledFilterExpression, FilterOperator, FilterPathSegment } from './filterexpr.ts';
+export {
+  DEFAULT_MAX_LINEAGE_HOPS,
+  LineageDepthSampler,
+  appendLineageHop,
+  assertValidLineage,
+  checkLineageCycle,
+  isValidLineageShape,
+  resolveMaxLineageHops,
+} from './lineage.ts';
+export type { LineageCheckVerdict, LineageHop, MessageLineage } from './lineage.ts';
 export { parseCronExpression, nextCronOccurrence } from './cronparse.ts';
 export type { CronSchedule, CronDomSpec, CronDowSpec } from './cronparse.ts';
 
@@ -727,6 +746,16 @@ export interface BusMessage {
    * non-RPC publishes.
    */
   replyTo?: string;
+  /**
+   * Message lineage (EB-184): the forwarding history of this message —
+   * `{ originTopic, parentMessageId?, hops: [{ topic, at }] }`, stamped at
+   * admission and extended at every processing boundary the message
+   * crosses (transform middleware, topic-route forwards, cross-bus
+   * forwards, bridge hops, mirror ingress). Lets an operator reconstruct
+   * the full chain a delivered message traveled. Absent for publishes
+   * that carried no `PublishOptions.lineage`.
+   */
+  lineage?: MessageLineage;
   /**
    * Publisher identity, set when the publish carried one
    * (`PublishOptions.publisherId`). A producer-side label — service name,
@@ -3712,6 +3741,14 @@ export interface EventBusOptions {
    */
   busId?: string;
   /**
+   * Cap on message-lineage hops per message (EB-184): a publish whose
+   * lineage already contains the target topic (a forwarding loop) or
+   * already reached this many hops is rejected at admission with zero
+   * side effects and counted in `BusStats.lineageCycleRejections`.
+   * Must be a positive integer; defaults to 32.
+   */
+  maxLineageHops?: number;
+  /**
    * Enables the durable topic log: every published message is appended to
    * an append-only per-topic JSONL log under this directory (created when
    * missing), so a restarted process — a new `EventBus` pointed at the same
@@ -4645,6 +4682,26 @@ export interface TopicStats {
    */
   aliasRetiredMessages: number;
   /**
+   * Publishes rejected by the message-lineage cycle check (EB-184): the
+   * target topic already appeared in the message's hops and was left (a
+   * forwarding loop), or the hop count already reached
+   * `EventBusOptions.maxLineageHops`. Rejected with zero side effects —
+   * no sequence number, no durable-log write, no rate-limit budget.
+   */
+  lineageCycleRejections: number;
+  /**
+   * p50 of the lineage hop-count distribution (EB-184): the median
+   * forwarding-chain length over lineage-carrying admissions, 0 when no
+   * lineage-carrying message was admitted yet.
+   */
+  lineageDepthP50: number;
+  /**
+   * p95 of the lineage hop-count distribution (EB-184): the
+   * near-maximum forwarding-chain length over lineage-carrying
+   * admissions, 0 when none were admitted yet.
+   */
+  lineageDepthP95: number;
+  /**
    * Sensitive fields replaced with the redaction sentinel on this topic
    * (see `setTopicRedaction`, EB-68): the number of field paths actually
    * masked across admitted publishes. Counted at admission — a field
@@ -5208,6 +5265,24 @@ export interface BusStats {
    * exact counting rules.
    */
   aliasRetiredMessages: number;
+  /**
+   * Total publishes rejected by the message-lineage cycle check (EB-184)
+   * — the sum of every topic's `lineageCycleRejections`. See
+   * `TopicStats.lineageCycleRejections` for the exact counting rules.
+   */
+  lineageCycleRejections: number;
+  /**
+   * p50 of the lineage hop-count distribution (EB-184): the median
+   * forwarding-chain length over lineage-carrying admissions, 0 when no
+   * lineage-carrying message was admitted yet.
+   */
+  lineageDepthP50: number;
+  /**
+   * p95 of the lineage hop-count distribution (EB-184): the
+   * near-maximum forwarding-chain length over lineage-carrying
+   * admissions, 0 when none were admitted yet.
+   */
+  lineageDepthP95: number;
   /**
    * Every registered topic alias (see `EventBus.setTopicAlias`), live and
    * retired — the zero-downtime migration table. A snapshot; each entry
@@ -7261,6 +7336,7 @@ function zeroedTopicStats(): {
     signatureFailures: 0,
     dedupDropped: 0,
     aliasRetiredMessages: 0,
+    lineageCycleRejections: 0,
     redactedFields: 0,
     compressedMessages: 0,
     encryptedMessages: 0,
@@ -8978,7 +9054,9 @@ export type AtomicRejectReason =
   | 'idempotency-conflict'
   | 'pressure'
   | 'tenant-quota'
-  | 'global-rate-limit';
+  | 'global-rate-limit'
+  | 'lineage-cycle'
+  | 'lineage-depth';
 
 /**
  * Which publish-side admission gate decided a `previewPublish` call — the
@@ -9357,6 +9435,12 @@ interface PauseBufferEntry {
  *   consumes no sequence number, writes nothing to the durable log,
  *   burns no per-topic rate-limit token, and is invisible to gap
  *   detection)
+ * - `'lineage-cycle'` / `'lineage-depth'` → `BusStats.lineageCycleRejections`
+ *   (message lineage, EB-184: the publish's lineage already contained the
+ *   target topic — a forwarding loop — or already reached
+ *   `EventBusOptions.maxLineageHops`; rejected in the admission phase
+ *   like a `'publisher-rate-limit'` shed — no sequence number, no
+ *   durable-log write, no rate-limit token, invisible to gap detection)
  *
  * A `publishAtomic` batch rejection surfaces as the failing entry's
  * underlying gate reason (`'acl'` | `'schema'` | `'message-too-big'` |
@@ -9382,7 +9466,9 @@ export type AdmissionRejectReason =
   | 'tenant-quota'
   | 'global-rate-limit'
   | 'webhook-deny'
-  | 'maintenance';
+  | 'maintenance'
+  | 'lineage-cycle'
+  | 'lineage-depth';
 
 /**
  * Snapshot delivered to `EventBusOptions.onAdmissionRejected` for every
@@ -9740,6 +9826,13 @@ export interface ForwardFrame {
   traceparent?: string;
   /** Application message identity, carried end to end. */
   messageId?: string;
+  /**
+   * Message lineage (EB-184): the source message's forwarding history.
+   * The destination bus runs its cycle check against it and appends the
+   * destination hop, so cross-bus forwarding chains stay visible and
+   * loops terminate instead of amplifying.
+   */
+  lineage?: MessageLineage;
   /**
    * Publisher identity (see `PublishOptions.publisherId`): the forwarded
    * message is the same logical publish, so it keeps its producer
@@ -10141,6 +10234,24 @@ export interface PublishOptions {
    */
   traceparent?: string;
   /**
+   * Message lineage (EB-184): the forwarding history of this message —
+   * `{ originTopic, parentMessageId?, hops: [{ topic, at }] }`. The bus
+   * appends a hop at every processing boundary it crosses (admission,
+   * each transform middleware invocation, topic-route forwards,
+   * cross-bus forwards, bridge hops, mirror ingress) and rejects the
+   * publish when the target topic already appears in `hops` *and was
+   * left* (a forwarding loop; the trailing run of the target topic is
+   * exempt — transform stages, or a legitimate same-topic re-admission)
+   * or when the hop count reached `EventBusOptions.maxLineageHops`.
+   * `originTopic` defaults to the publish topic when omitted;
+   * `parentMessageId` defaults to the publish's `messageId` when omitted
+   * and that is set. An invalid shape throws `RangeError`/`TypeError`
+   * fail-fast, before anything is mutated. Orthogonal to `traceparent`
+   * (request-scoped trace id) and `correlationId` (RPC-scoped): lineage
+   * answers "which topics did this message pass through".
+   */
+  lineage?: MessageLineage;
+  /**
    * Application-level message identity for this publish. It is stamped
    * onto the message envelope (`BusMessage.messageId`) and carried end
    * to end — durable log, replay, cluster forwarding, redeliveries — so
@@ -10493,6 +10604,13 @@ export type BatchMessage = Omit<BusMessage, 'seq'> & {
   key?: string;
   traceparent?: string;
   /**
+   * Message lineage (EB-184): validated per entry at the publish entry
+   * point (`publishBatch`, `publishAtomic`); the admitting fan-out runs
+   * the cycle check and stamps the origin hop, exactly like a direct
+   * publish.
+   */
+  lineage?: MessageLineage;
+  /**
    * Consistent-hash partition selector (see `PublishOptions.partitionKey`):
    * validated per entry at the publish entry point (`publishBatch`,
    * `publishAtomic`). The entry's `partition` field (inherited from
@@ -10562,6 +10680,14 @@ export interface PublishDelayedOptions {
    * A non-string throws `RangeError` at schedule time.
    */
   traceparent?: string;
+  /**
+   * Message lineage (EB-184), carried on the schedule and applied when
+   * the message fans out (see `PublishOptions.lineage`): the due-time
+   * fan-out runs the cycle check and stamps the origin hop. An invalid
+   * shape throws `RangeError`/`TypeError` at schedule time. In-memory
+   * only — like `traceparent`, a restart drops it.
+   */
+  lineage?: MessageLineage;
   /**
    * Application-level message identity, carried on the schedule and
    * stamped onto the envelope when the message fans out (see
@@ -12890,6 +13016,27 @@ export class EventBus {
   /** Per-topic mirror-conflict counts, feeding the Prometheus series. */
   private readonly mirrorConflictTopics = new Map<string, number>();
   /**
+   * Message lineage (EB-184): the per-message hop cap — a publish whose
+   * lineage already contains the target topic (and left it — a
+   * forwarding loop) or already reached this many hops is rejected at
+   * admission. Validated in the constructor
+   * (`EventBusOptions.maxLineageHops`, default 32).
+   */
+  private readonly maxLineageHops: number;
+  /**
+   * Publishes rejected by the lineage cycle check (EB-184): the target
+   * topic already appeared in the message's hops and was left (a
+   * forwarding loop), or the hop count already reached `maxLineageHops`.
+   * Feeds `BusStats.lineageCycleRejections`.
+   */
+  private totalLineageCycleRejections = 0;
+  /**
+   * Rolling sample of lineage hop counts (EB-184): one sample per
+   * lineage-carrying admission. Feeds `BusStats.lineageDepthP50` /
+   * `lineageDepthP95`.
+   */
+  private readonly lineageDepth = new LineageDepthSampler();
+  /**
    * Ops alert outlet (EB-132): undefined unless `EventBusOptions.opsAlert`
    * enabled it — the disabled path allocates nothing and changes no
    * behavior.
@@ -13667,6 +13814,9 @@ export class EventBus {
       throw new RangeError('busId must be a non-empty string');
     }
     this.busId = busId;
+    // Message lineage (EB-184): validated fail-fast — the hop cap is an
+    // admission invariant, so a bad value must never half-wire a bus.
+    this.maxLineageHops = resolveMaxLineageHops(options?.maxLineageHops);
     // EB-131: the HLC runs on the bus clock so tests inject time
     // deterministically via `EventBusOptions.now`.
     this.hlc = new HybridLogicalClock(busId, () => this.now());
@@ -16485,6 +16635,10 @@ export class EventBus {
           // of drawing a fresh tick, so downstream mirrors arbitrate
           // against the origin write.
           ...(msg.hlc === undefined ? {} : { hlc: msg.hlc }),
+          // Message lineage (EB-184): the mirror ingress is a forwarding
+          // hop — the destination runs its cycle check against the
+          // source's chain, then appends the destination hop.
+          ...(msg.lineage === undefined ? {} : { lineage: msg.lineage }),
           // Origin fields survive multi-hop mirrors verbatim; only the
           // trail grows — downstream gap detection always sees the first
           // bus's sequence space.
@@ -16655,6 +16809,20 @@ export class EventBus {
       // a malformed value falls back to a fresh local tick (never trust
       // a frame the mirror registration did not build).
       isHlcTimestamp(frame.hlc) ? frame.hlc : undefined,
+      undefined, // admissionDlq: a cross-bus frame is not a DLQ record
+      undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+      undefined, // messageTtlMs: cross-bus frames carry no per-message TTL
+      undefined, // messageHeaders: headers are admission-scoped
+      undefined, // cepDerived: a cross-bus frame never re-enters pattern detection
+      undefined, // messageDeadline: cross-bus frames carry no absolute deadline
+      undefined, // rpcCorrelationId: only direct publishes carry RPC fields
+      undefined, // rpcReplyTo: only direct publishes carry RPC fields
+      // Message lineage (EB-184): the ingress admission extends the
+      // source's chain — the cycle check runs against it, then the
+      // destination hop is appended. A malformed lineage is dropped, not
+      // trusted: the message still delivers, just without lineage (the
+      // frame builders are same-process, so this only fires on misuse).
+      frame.lineage !== undefined && isValidLineageShape(frame.lineage) ? frame.lineage : undefined,
     );
     this.scheduleFlush();
   }
@@ -16774,6 +16942,34 @@ export class EventBus {
     this.statsFor(topic).aliasRetiredMessages += 1;
     this.totalAliasRetired += 1;
     this.emitAdmissionRejected(topic, 'alias-retired', payload, publisherId);
+  }
+
+  /**
+   * Counts one publish rejected by the message-lineage cycle check
+   * (EB-184): either the target topic already appeared in the message's
+   * hops — a forwarding loop the registration-time checks cannot see —
+   * or the hop count already reached `maxLineageHops`. Like a schema
+   * rejection it is dropped before admission: no sequence number consumed
+   * (subscribers see no gap), the durable log never sees it, no
+   * rate-limit budget burned — and the admission-rejection hook fires
+   * with the precise reason (`'lineage-cycle'` vs `'lineage-depth'`).
+   */
+  private countLineageCycleRejection(
+    topic: string,
+    payload: unknown,
+    publisherId: string | undefined,
+    traceId: string | undefined,
+    verdict: 'cycle' | 'depth',
+  ): void {
+    this.statsFor(topic).lineageCycleRejections += 1;
+    this.totalLineageCycleRejections += 1;
+    this.emitAdmissionRejected(
+      topic,
+      verdict === 'cycle' ? 'lineage-cycle' : 'lineage-depth',
+      payload,
+      publisherId,
+      traceId,
+    );
   }
 
   /**
@@ -17513,9 +17709,13 @@ export class EventBus {
    * before sequence-number assignment, the durable log, and the
    * rate-limit budget, and none of them is touched.
    */
-  private applyTopicTransforms(topic: string, payload: unknown): unknown {
+  private applyTopicTransforms(
+    topic: string,
+    payload: unknown,
+    lineage?: MessageLineage,
+  ): { payload: unknown; lineage: MessageLineage | undefined } {
     const fns = this.transformsForTopic(topic);
-    if (fns === undefined) return payload;
+    if (fns === undefined) return { payload, lineage };
     const stats = this.statsFor(topic);
     for (const fn of fns) {
       stats.transformCalls += 1;
@@ -17527,8 +17727,19 @@ export class EventBus {
         this.totalTransformErrors += 1;
         throw err;
       }
+      // Message lineage (EB-184): each transform invocation is a
+      // processing stage of this admission, so it appends a hop. The
+      // append happens after the invocation — a throwing transform
+      // aborts the publish with zero side effects, leaving no hop — and
+      // the same-topic repeat never trips the cycle check, which ran
+      // once at admission before the chain. Shadow admission (the
+      // publishAtomic phase-1) and delayed schedules call this without a
+      // lineage: their transform stages do not append hops — the origin
+      // hop is stamped at the real admission (the commit fan-out / the
+      // due-time fan-out).
+      if (lineage !== undefined) lineage = appendLineageHop(lineage, topic, this.now());
     }
-    return payload;
+    return { payload, lineage };
   }
 
   /**
@@ -18411,6 +18622,7 @@ export class EventBus {
         duplicateMessages: 0,
         idempotentHits: 0,
         aliasRetiredMessages: 0,
+        lineageCycleRejections: 0,
         redactedFields: 0,
         filteredMessages: 0,
         sampledDeliveries: 0,
@@ -22886,6 +23098,33 @@ export class EventBus {
         false,
         env.expiresAt,
         true,
+        false, // diagnostic: bridge ingress is ordinary traffic
+        undefined, // eventTime: bridge envelopes carry no event-time stamp
+        undefined, // causal: bridge envelopes carry no causal clock
+        undefined, // publisherId: bridge ingress is anonymous
+        undefined, // schemaVersion: the ingress admission resolves the version
+        undefined, // retain: bridge envelopes never retain
+        undefined, // pausedExpiresAt
+        undefined, // partitionKey: bridge ingress lands on partition 0
+        undefined, // partition
+        false, // binary: bridge envelopes carry JSON payloads
+        undefined, // priority: bridge ingress lands in the normal lane
+        undefined, // confirm: only publishCore passes one
+        undefined, // mirrorProvenance: only receiveForward passes one
+        undefined, // critical: bridge ingress is never critical
+        undefined, // mirrorHlc: only receiveForward passes one
+        undefined, // admissionDlq: bridge ingress is not a DLQ record
+        undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+        undefined, // messageTtlMs: envelopes carry the stamped deadline
+        undefined, // messageHeaders: bridge envelopes carry no headers
+        undefined, // cepDerived: bridge ingress never re-enters pattern detection
+        undefined, // messageDeadline: envelopes carry the stamped deadline
+        undefined, // rpcCorrelationId: only direct publishes carry RPC fields
+        undefined, // rpcReplyTo: only direct publishes carry RPC fields
+        // Message lineage (EB-184): the envelope's chain was validated in
+        // `validateBridgeEnvelope` — the ingress admission extends it,
+        // running the cycle check, then appending the ingress hop.
+        env.lineage,
       );
       if (admitted) {
         this.bridgeInbound += 1;
@@ -24113,6 +24352,20 @@ export class EventBus {
     if (this.checkChaosAdmission()) return { accepted: 0, admitted: false, topic };
     validateMessageKey(opts?.key, caller);
     validateTraceparent(opts?.traceparent, caller);
+    // Message lineage (EB-184): fail-fast shape validation, before
+    // anything is mutated — the usual publish-option convention. An
+    // omitted `parentMessageId` defaults to the publish's `messageId`
+    // when one is set, so the origin identity rides the chain without
+    // the caller repeating itself.
+    let lineage = assertValidLineage(opts?.lineage, caller);
+    if (
+      lineage !== undefined &&
+      lineage.parentMessageId === undefined &&
+      typeof opts?.messageId === 'string' &&
+      opts.messageId.length > 0
+    ) {
+      lineage = { ...lineage, parentMessageId: opts.messageId };
+    }
     validateEventTime(opts?.eventTime, caller);
     validateCausal(opts?.causal, caller);
     validatePublisherId(opts?.publisherId, caller);
@@ -24292,6 +24545,9 @@ export class EventBus {
       // leaves these undefined; only direct publishes carry RPC fields.
       opts?.correlationId,
       opts?.replyTo,
+      // Message lineage (EB-184): validated above; `fanOut` runs the
+      // cycle check and stamps the origin hop.
+      lineage,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -25381,6 +25637,11 @@ export class EventBus {
     // Chaos (EB-103): see publish — evaluated once per batch call.
     if (this.checkChaosAdmission()) return 0;
     if (messages.length === 0) return 0;
+    // Message lineage (EB-184): validated per entry in the loop below,
+    // like the other per-entry options. Stored in a parallel array (never
+    // mutating the caller's entries); the entry's fan-out runs the cycle
+    // check and stamps the origin hop.
+    const batchLineages: Array<MessageLineage | undefined> = [];
     for (const msg of messages) {
       validateMessageKey(msg.key, 'publishBatch');
       validateTraceparent(msg.traceparent, 'publishBatch');
@@ -25398,9 +25659,11 @@ export class EventBus {
       // inherited `BusMessage.lane` field — validated per entry, like the
       // other per-entry options.
       if (msg.lane !== undefined) assertValidMessageLane(msg.lane, 'publishBatch');
+      batchLineages.push(assertValidLineage(msg.lineage, 'publishBatch'));
     }
     let accepted = 0;
-    for (const msg of messages) {
+    for (let entryIndex = 0; entryIndex < messages.length; entryIndex++) {
+      const msg = messages[entryIndex];
       // Explicit idempotency key (EB-151): enforced per entry like
       // `publish` — after alias resolution and the ACL, before the
       // remaining admission gates. A hit contributes the first publish's
@@ -25472,6 +25735,14 @@ export class EventBus {
         // Per-message TTL (EB-149): validated per entry above; `fanOut`
         // stamps `nowMs + ttlMs`, overriding the topic TTL rules.
         msg.ttlMs,
+        undefined, // messageHeaders: batch entries carry no headers
+        undefined, // cepDerived: batch entries never re-enter pattern detection
+        undefined, // messageDeadline: batch entries carry no absolute deadline
+        undefined, // rpcCorrelationId: only direct publishes carry RPC fields
+        undefined, // rpcReplyTo: only direct publishes carry RPC fields
+        // Message lineage (EB-184): validated per entry above; the
+        // entry's fan-out runs the cycle check and stamps the origin hop.
+        batchLineages[entryIndex],
       );
       accepted += outcome.accepted;
       // Explicit idempotency key (EB-151): only an admitted entry claims
@@ -25551,6 +25822,9 @@ export class EventBus {
     if (entries.length === 0) return { published: 0 };
     // Key validation first: a throw must leave zero state behind, and
     // validation mutates nothing.
+    // Message lineage (EB-184): validated per entry in the loop below;
+    // stored in a parallel array (never mutating the caller's entries).
+    const atomicLineages: Array<MessageLineage | undefined> = [];
     for (const entry of entries) {
       validateMessageKey(entry.key, 'publishAtomic');
       validateTraceparent(entry.traceparent, 'publishAtomic');
@@ -25569,6 +25843,11 @@ export class EventBus {
       // Priority lane (EB-122): validated per entry, like the other
       // per-entry options; the commit phase carries it into `fanOut`.
       if (entry.lane !== undefined) assertValidMessageLane(entry.lane, 'publishAtomic');
+      // Message lineage (EB-184): validated per entry, like the other
+      // per-entry options — the shadow admission runs the cycle check,
+      // the commit phase stamps the origin hop. Stored in a parallel
+      // array (never mutating the caller's entries).
+      atomicLineages.push(assertValidLineage(entry.lineage, 'publishAtomic'));
     }
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
@@ -25630,6 +25909,26 @@ export class EventBus {
         this.countAliasRetired(topic, payload);
         return { published: 0, rejected: { index, topic, reason: 'alias-retired' } };
       }
+      // Message lineage (EB-184): the cycle check runs in shadow
+      // admission so a looping entry aborts the whole batch — the commit
+      // phase must never partially admit. The origin hop is stamped at
+      // commit (the real admission); shadow appends nothing.
+      const shadowLineage = atomicLineages[index];
+      if (shadowLineage !== undefined) {
+        const shadowVerdict = checkLineageCycle(shadowLineage, resolvedTopic, this.maxLineageHops);
+        if (shadowVerdict !== 'ok') {
+          const reason: AtomicRejectReason =
+            shadowVerdict === 'cycle' ? 'lineage-cycle' : 'lineage-depth';
+          this.countLineageCycleRejection(
+            resolvedTopic,
+            payload,
+            entries[index].publisherId,
+            traceIdOfTraceparent(entries[index].traceparent),
+            shadowVerdict,
+          );
+          return { published: 0, rejected: { index, topic, reason } };
+        }
+      }
       resolvedTopics[index] = resolvedTopic;
       // Publish-side partition routing (EB-90): the range check runs here,
       // in admission — an out-of-range explicit partition aborts the batch
@@ -25647,7 +25946,7 @@ export class EventBus {
       // verdict, the size caps, and the commit phase all see the
       // transformed bytes. A throwing transform aborts the batch before
       // anything is mutated — zero side effects, the EB-20 convention.
-      payload = this.applyTopicTransforms(resolvedTopic, payload);
+      payload = this.applyTopicTransforms(resolvedTopic, payload).payload;
       admittedPayloads[index] = payload;
       // EB-182: one total-span sample per shadow-admitted entry — the
       // shadow verdict IS this entry's admission (the commit phase is
@@ -25816,6 +26115,15 @@ export class EventBus {
         // Per-message TTL (EB-149): validated per entry in the
         // key-validation loop above; the commit stamps it per entry.
         ttlMs,
+        undefined, // messageHeaders: atomic entries carry no headers
+        undefined, // cepDerived: atomic entries never re-enter pattern detection
+        undefined, // messageDeadline: atomic entries carry no absolute deadline
+        undefined, // rpcCorrelationId: only direct publishes carry RPC fields
+        undefined, // rpcReplyTo: only direct publishes carry RPC fields
+        // Message lineage (EB-184): the shadow admission already ran the
+        // cycle check; the commit fan-out stamps the origin hop (the real
+        // admission).
+        atomicLineages[index],
       );
       // Explicit idempotency key (EB-151): the admitted entries claim
       // their key slots at commit — the shadow phase claimed nothing, so
@@ -26113,6 +26421,10 @@ export class EventBus {
     validateDeadline(opts.deadlineMs, 'deadlineMs', 'publishDelayed');
     // Priority lane (EB-122): fail-fast, before anything is mutated.
     if (opts?.priority !== undefined) assertValidMessageLane(opts.priority, 'publishDelayed');
+    // Message lineage (EB-184): fail-fast shape validation at schedule
+    // time — the due-time fan-out runs the cycle check and stamps the
+    // origin hop.
+    const lineage = assertValidLineage(opts?.lineage, 'publishDelayed');
     const priority = opts?.priority;
     const publisherId = opts?.publisherId;
     // Topic aliases (EB-44) resolve before every other gate: the schedule
@@ -26142,7 +26454,7 @@ export class EventBus {
     // fan-out (pre-admitted) does not transform again. A throwing
     // transform fails the schedule fast — no id, nothing in the heap,
     // nothing on disk — the EB-20 validator convention.
-    payload = this.applyTopicTransforms(topic, payload);
+    payload = this.applyTopicTransforms(topic, payload).payload;
     // Topic pause (EB-88): the first schedule-time gate, before the
     // per-publisher rate limiter. In shed mode the schedule is refused
     // fail-fast — no id, nothing in the heap, nothing on disk — counted
@@ -26263,6 +26575,10 @@ export class EventBus {
       // The priority lane rides the schedule so the due-time fan-out
       // queues the message in its original lane (EB-122).
       priority,
+      // Message lineage (EB-184): rides the schedule in memory so the
+      // due-time fan-out runs the cycle check and stamps the origin hop.
+      // Like `traceparent`, a restart drops it.
+      ...(lineage === undefined ? {} : { lineage }),
     };
     // Persist the schedule before it is visible anywhere: a crash between
     // here and the due time must still deliver the message after restart.
@@ -26957,6 +27273,12 @@ export class EventBus {
         // fan-out enforces the earlier of it and the TTL-derived
         // deadline — the absolute instant, never re-stamped.
         top.deadline,
+        undefined, // rpcCorrelationId: only direct publishes carry RPC fields
+        undefined, // rpcReplyTo: only direct publishes carry RPC fields
+        // Message lineage (EB-184): the schedule-time validation passed;
+        // the due-time fan-out runs the cycle check and stamps the origin
+        // hop (the real admission).
+        top.lineage,
       );
       // EB-136: schedule-skew sampling — this is the only sampling point.
       // It sits on the true fan-out path: cancelled, expired,
@@ -31819,6 +32141,16 @@ export class EventBus {
     // RPC reply topic (see `PublishOptions.replyTo`, EB-178): same
     // lenient cleaning and non-persistence rule as the correlation id.
     rpcReplyTo?: string,
+    // Message lineage (see `PublishOptions.lineage`, EB-184): already
+    // validated by the publish entry points — `fanOut` never validates
+    // the shape, only runs the cycle check against the alias-resolved
+    // topic. Internal re-fan-out paths that continue an admitted
+    // message's chain (route forwards, cross-bus forwards, bridge
+    // ingress, delayed due-time fan-outs, the publishAtomic commit)
+    // pass the source message's lineage here, so the destination
+    // admission extends it; every other path leaves it undefined. Last
+    // so existing positional call sites are unaffected.
+    lineage?: MessageLineage,
   ): {
     matched: number;
     accepted: number;
@@ -31888,6 +32220,36 @@ export class EventBus {
       auditPublish(false, undefined, 'alias-retired');
       return { matched: 0, accepted: 0, admitted: false, rejectReason: 'alias-retired' };
     }
+    // Message lineage (EB-184): the admission-time cycle check. The
+    // alias-resolved topic is the hop this admission would append, so a
+    // lineage that already contains it *and left it* means the message
+    // looped back to a topic it visited before — bridge and mirror
+    // topologies whose cycles the registration-time checks cannot see
+    // terminate here instead of amplifying forever. The trailing run of
+    // the topic is exempt (transform stages of this admission, or a
+    // legitimate same-topic re-admission such as a bridge hop onto the
+    // same topic name on another bus). A hop count already at the cap
+    // means the chain ran away. Both reject with zero side effects (no
+    // sequence number, no durable-log write, no rate-limit budget),
+    // exactly like 'alias-retired' above. The surviving lineage gets its
+    // origin hop stamped here — the first hop always names the admitting
+    // topic, with `originTopic` defaulted when the caller omitted it.
+    if (lineage !== undefined) {
+      const verdict = checkLineageCycle(lineage, topic, this.maxLineageHops);
+      if (verdict !== 'ok') {
+        const reason: AdmissionRejectReason = verdict === 'cycle' ? 'lineage-cycle' : 'lineage-depth';
+        this.countLineageCycleRejection(
+          topic,
+          payload,
+          publisherId,
+          traceIdOfTraceparent(traceparent),
+          verdict,
+        );
+        auditPublish(false, undefined, reason);
+        return { matched: 0, accepted: 0, admitted: false, rejectReason: reason };
+      }
+      lineage = appendLineageHop(lineage, topic, this.now());
+    }
     // Publish-side partition routing (EB-90): resolves the message's
     // partition from the explicit `partition` (wins) or the consistent
     // hash of `partitionKey` over the topic's configured partition count
@@ -31927,7 +32289,9 @@ export class EventBus {
     // nothing structural to skip — a chain registered for a binary topic
     // is the operator's explicit choice.
     if (!preAdmitted && !admissionDlq) {
-      payload = this.applyTopicTransforms(topic, payload);
+      const transformed = this.applyTopicTransforms(topic, payload, lineage);
+      payload = transformed.payload;
+      lineage = transformed.lineage;
     }
     // Topic pause (EB-88): the FIRST admission gate — before the
     // per-publisher rate limiter (EB-79), the ACL, the schema validator
@@ -32283,6 +32647,11 @@ export class EventBus {
       // publishes, which never participate in the arbitration.
       ...(key === undefined ? {} : { key }),
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
+      // Message lineage (EB-184): the admission-stamped forwarding
+      // history — origin hop first, then one hop per transform stage —
+      // rides the envelope so downstream hops (routes, forwards, bridge,
+      // mirror) extend it. Absent for publishes that carried no lineage.
+      ...(lineage === undefined ? {} : { lineage }),
       // RPC correlation id + reply topic (EB-178): stamped on the live
       // envelope only — never persisted to the durable log (see
       // `BusMessage.correlationId`). Internal re-fan-out paths pass
@@ -32347,6 +32716,9 @@ export class EventBus {
     stats.lastSeq = Math.max(stats.lastSeq, msg.seq);
     this.totalPublished += 1;
     this.countPartitionPublish(topic, resolvedPartition, msg.seq);
+    // Message lineage (EB-184): sample the admitted hop count for the
+    // depth distribution (`BusStats.lineageDepthP50` / `lineageDepthP95`).
+    if (lineage !== undefined) this.lineageDepth.add(lineage.hops.length);
     // Per-publisher publish counting (EB-65): only admitted publishes
     // count — a schema rejection or rate-limit shed above never reaches
     // this line. Anonymous publishes move no per-publisher counter.
@@ -32672,6 +33044,10 @@ export class EventBus {
         ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
         ...(traceId === undefined ? {} : { traceId }),
         ...(expiresAt === undefined ? {} : { expiresAt }),
+        // Message lineage (EB-184): the admitted message's chain rides
+        // the envelope — the receiving bus extends it at ingress, so
+        // bridge topologies terminate loops instead of amplifying them.
+        ...(msg.lineage === undefined ? {} : { lineage: msg.lineage }),
         // Cross-bus signature (EB-84): when a signing rule matched, the
         // bridge envelope carries a signature over (topic, seq, canonical
         // RAW payload bytes) — the wire bytes the envelope signature
@@ -32915,6 +33291,23 @@ export class EventBus {
             undefined, // partitionKey
             undefined, // partition
             binary,
+            undefined, // priority: the route forward lands in the normal lane
+            undefined, // confirm: only publishCore passes one
+            undefined, // mirrorProvenance: only receiveForward passes one
+            undefined, // critical: the route forward is never critical
+            undefined, // mirrorHlc: only receiveForward passes one
+            undefined, // admissionDlq: the route forward is not a DLQ record
+            undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+            undefined, // messageTtlMs: the route forward carries no per-message TTL
+            undefined, // messageHeaders: headers are admission-scoped
+            undefined, // cepDerived: the route forward never re-enters pattern detection
+            undefined, // messageDeadline: the route forward carries no absolute deadline
+            undefined, // rpcCorrelationId: only direct publishes carry RPC fields
+            undefined, // rpcReplyTo: only direct publishes carry RPC fields
+            // Message lineage (EB-184): the forwarded admission extends
+            // the source message's chain — the destination's cycle check
+            // runs against it, then appends the destination hop.
+            msg.lineage,
           );
         }
       }
@@ -32957,6 +33350,10 @@ export class EventBus {
             // Binary payloads (EB-92) cross as bytes with the marker, so
             // the destination bus stays byte-oriented.
             ...(binary ? { binary: true } : {}),
+            // Message lineage (EB-184): the destination extends the
+            // chain — its admission runs the cycle check, then appends
+            // the destination hop.
+            ...(msg.lineage === undefined ? {} : { lineage: msg.lineage }),
           });
         }
       }
@@ -34153,6 +34550,9 @@ export class EventBus {
           return a.publisher < b.publisher ? -1 : 1;
         }),
       aliasRetiredMessages: this.totalAliasRetired,
+      lineageCycleRejections: this.totalLineageCycleRejections,
+      lineageDepthP50: this.lineageDepth.p50(),
+      lineageDepthP95: this.lineageDepth.p95(),
       bridge: {
         inbound: this.bridgeInbound,
         outbound: this.bridgeOutbound,
@@ -34401,6 +34801,7 @@ export class EventBus {
         duplicateMessages: stats.duplicateMessages,
         idempotentHits: stats.idempotentHits,
         aliasRetiredMessages: stats.aliasRetiredMessages,
+        lineageCycleRejections: stats.lineageCycleRejections,
         redactedFields: stats.redactedFields,
         transformCalls: stats.transformCalls,
         transformErrors: stats.transformErrors,

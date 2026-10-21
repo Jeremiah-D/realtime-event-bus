@@ -11,6 +11,7 @@
  */
 
 import type { MessageLane } from './lanes.ts';
+import type { MessageLineage } from './lineage.ts';
 
 /** One scheduled delayed delivery waiting in the timer heap. */
 export interface DelayedEntry {
@@ -70,6 +71,13 @@ export interface DelayedEntry {
    * the fan-out (see `PublishOptions.traceparent`).
    */
   traceparent?: string;
+  /**
+   * Message lineage carried from `PublishDelayedOptions` into the
+   * fan-out (see `PublishOptions.lineage`): the due-time fan-out runs
+   * the cycle check and stamps the origin hop. In-memory only — a
+   * restart drops it, like `traceparent`.
+   */
+  lineage?: MessageLineage;
   /**
    * Application-level message identity carried from
    * `PublishDelayedOptions` into the fan-out (see

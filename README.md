@@ -6201,3 +6201,59 @@ Semantics:
   enqueue for forecast-enabled subscribers only, and the clock is the
   bus's injected `EventBusOptions.now` — tests drive deterministic
   forecasts with a controllable clock.
+
+## Message lineage (EB-184)
+
+Opt-in end-to-end provenance (`src/lineage.ts`): a publish can carry its
+forwarding history — `{ originTopic, parentMessageId?, hops: [{ topic,
+at }] }` — and the bus extends it at every processing boundary the
+message crosses, so an operator can reconstruct the full chain any
+delivered message traveled:
+
+```ts
+bus.publish('orders', payload, { lineage: { originTopic: 'orders', hops: [] } });
+// downstream: msg.lineage.hops == [{ topic: 'orders', at: 1719... }]
+```
+
+Semantics:
+
+- **Hop append points.** Admission stamps the origin hop first (the
+  alias-resolved topic, on the bus clock), then each transform
+  middleware invocation (EB-147) appends one hop, then topic-route
+  forwards (EB-50), cross-bus forwards (EB-56), bridge hops (EB-51) and
+  mirror ingress (EB-37) each extend the chain at the destination
+  admission. `originTopic` defaults to the publish topic and
+  `parentMessageId` defaults to the publish's `messageId` when omitted.
+- **Cycle detection.** At admission, a lineage that already contains the
+  target topic *and left it* is rejected — the message looped back to a
+  topic it visited before, a forwarding loop the registration-time
+  checks cannot see (e.g. across independently configured bridge
+  peers). The trailing run of the target topic is exempt: those hops are
+  transform stages of the current admission, or a legitimate same-topic
+  re-admission (a bridge/mirror hop onto the same topic name on another
+  bus). A hop count already at `EventBusOptions.maxLineageHops`
+  (default 32, must be a positive integer) is rejected too — the
+  backstop for runaway chains, including same-topic republish loops the
+  cycle rule deliberately permits.
+- **Zero-side-effect rejection.** Both rejections consume no sequence
+  number (subscribers see no gap), write nothing to the durable log,
+  burn no rate-limit budget, and surface on `onAdmissionRejected` with
+  reason `'lineage-cycle'` / `'lineage-depth'`. An invalid lineage shape
+  throws `RangeError`/`TypeError` fail-fast at the publish entry point,
+  before anything is mutated.
+- **Observability.** `getStats()` exposes `lineageCycleRejections`
+  (bus total; per-topic on each `topics[]` entry) and the hop-depth
+  distribution `lineageDepthP50` / `lineageDepthP95` (nearest-rank over
+  the last 1024 lineage-carrying admissions, 0 when empty).
+- **Cross-bus.** Bridge envelopes (`BridgeEnvelope.lineage`) and forward
+  frames (`ForwardFrame.lineage`) carry the chain; the receiving side
+  validates the shape (a malformed lineage rejects the envelope) and
+  extends it. Delayed schedules carry lineage in memory to the due-time
+  fan-out (like `traceparent`, a restart drops it).
+- **Orthogonality.** Lineage answers "which topics did this message pass
+  through" — a per-message forwarding history. `traceparent` (EB-45)
+  carries the request-scoped trace id and `correlationId` (EB-178) is
+  RPC-scoped; the three compose without interfering. The hop clock is
+  the bus's injected `EventBusOptions.now`, so tests drive deterministic
+  hops with a controllable clock.
+
