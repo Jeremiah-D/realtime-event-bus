@@ -457,6 +457,11 @@ export function renderPrometheus(stats: BusStats): string {
     stats.signatureFailures ?? 0,
   );
   counter(
+    'eventbus_schema_migration_failures_total',
+    'Total messages discarded because no schema-version migration path reached a subscriber-declared expected version (EB-186).',
+    stats.migrationFailures ?? 0,
+  );
+  counter(
     'eventbus_dedup_dropped_messages_total',
     'Total messages suppressed by subscriber-side exactly-once dedup windows.',
     stats.dedupDropped,
@@ -804,6 +809,9 @@ export function renderPrometheus(stats: BusStats): string {
     // counter above — same metric, per-topic label set — so no second
     // HELP/TYPE block is emitted here.
     lines.push(`eventbus_signature_failures_total{${label}} ${t.signatureFailures ?? 0}`);
+    // Shares the `eventbus_schema_migration_failures_total` name with
+    // the global counter above — same convention, no second HELP/TYPE.
+    lines.push(`eventbus_schema_migration_failures_total{${label}} ${t.migrationFailures ?? 0}`);
     if (t.watermark !== undefined) {
       lines.push(`eventbus_topic_event_time_watermark{${label}} ${t.watermark}`);
     }

@@ -254,6 +254,11 @@ import {
   type CepStats,
 } from './cep.ts';
 import {
+  SchemaMigrationRegistry,
+  type SchemaMigrateFn,
+  type SchemaMigrationStep,
+} from './schemamigrate.ts';
+import {
   StateStore,
   validateStateStoreOptions,
   type StateStoreOptions,
@@ -457,6 +462,7 @@ export type {
 export { assertValidSigningKeys, SIGNING_KID_PATTERN, SIGNATURE_HEX_LENGTH } from './signing.ts';
 export { compileFilterExpression } from './filterexpr.ts';
 export type { CompiledFilterExpression, FilterOperator, FilterPathSegment } from './filterexpr.ts';
+export type { SchemaMigrateFn, SchemaMigrationStep } from './schemamigrate.ts';
 export {
   DEFAULT_MAX_LINEAGE_HOPS,
   LineageDepthSampler,
@@ -1991,6 +1997,37 @@ export interface SubscribeOptions {
    * pays a single boolean check per delivery.
    */
   verifySignature?: boolean;
+  /**
+   * Opt-in expected schema version (EB-186, backend engineering): the
+   * payload shape this subscriber speaks. A subscriber that declares it
+   * receives every message migrated from its write version
+   * (`PublishOptions.schemaVersion`) to this version — at delivery time,
+   * after decompression and signature verification, before the handler
+   * runs — along every registered migration hop (`setSchemaMigration`).
+   *
+   * Fail-closed: when the write version is known and no migration path
+   * reaches the declared version (or a hop throws), the message is
+   * dropped for this subscriber — never queued, never delivered — and
+   * counted in `TopicStats.migrationFailures` (plus the global total)
+   * with a `schema_migration_failed` subscription audit event. The loss
+   * surfaces as a sequence gap, exactly like a failed signature check.
+   * A message whose write version is unknown (internal re-fan-out paths
+   * that pass no version) or that already equals the declared version is
+   * delivered untouched — zero overhead when the option is absent.
+   *
+   * Applies to live fan-out, durable-log replay (`resumeFromSeq` /
+   * `resumeFromTime`), and retained snapshots: the durable log always
+   * stores the write-version payload, so every replay re-migrates from
+   * the original bytes. Signed topics (EB-84) verify first, migrate
+   * second: the signature authenticates the stored write-version wire
+   * bytes, and the migrated view is a local deterministic transform of
+   * that authenticated payload — it is not re-signed and never re-enters
+   * the wire or the log.
+   *
+   * Must be a non-negative integer when provided; anything else throws
+   * `RangeError` from `subscribe`. Absent by default.
+   */
+  schemaVersion?: number;
   /**
    * Opt-in publisher-identity verification (EB-97, backend security).
    * When true, every message fanned out to this subscriber is checked
@@ -4656,6 +4693,17 @@ export interface TopicStats {
    */
   signatureFailures: number;
   /**
+   * Messages on this topic discarded for schema-version migration
+   * failures (see `SubscribeOptions.schemaVersion`, EB-186): the
+   * subscriber declared an expected version the message's write version
+   * could not be migrated to (missing hop, or a hop that threw). The
+   * message never entered that subscriber's queue. Counts each discarded
+   * delivery once. The loss also surfaces as a sequence gap on the
+   * rejecting subscriber: an unmigratable message is a genuine loss for
+   * it, not a deliberate skip.
+   */
+  migrationFailures: number;
+  /**
    * Per-topic HMAC signing configuration (see `setTopicSigningKey`,
    * EB-84): present only when a signing rule currently matches the
    * topic. Carries the key ids and the grace window — never the secrets.
@@ -5390,6 +5438,13 @@ export interface BusStats {
    * the exact counting rules.
    */
   signatureFailures: number;
+  /**
+   * Total messages discarded because no schema-version migration path
+   * reached a subscriber's declared expected version — the sum of every
+   * topic's `migrationFailures`. See `TopicStats.migrationFailures` for
+   * the exact counting rules.
+   */
+  migrationFailures: number;
   /**
    * Total messages moved into subscriber dead-letter queues — every
    * reliable-subscription message that exhausted its redelivery budget
@@ -6259,6 +6314,12 @@ interface RetainedEntry {
    * fan-out saw.
    */
   headers?: Record<string, string>;
+  /**
+   * Write schema version (EB-186), when the publish carried one: the
+   * retained snapshot migrates to the subscriber's declared expected
+   * version exactly like live delivery.
+   */
+  schemaVersion?: number;
 }
 
 /**
@@ -6922,6 +6983,13 @@ interface Subscriber {
    */
   verifyPublisher: boolean;
   /**
+   * Declared expected schema version (see
+   * `SubscribeOptions.schemaVersion`, EB-186). Absent unless the
+   * subscriber opted in — delivery-time migration is a single
+   * undefined check per message for everyone else.
+   */
+  schemaVersion?: number;
+  /**
    * Opt-in durable-log replay progress observer (see
    * `SubscribeOptions.onReplayProgress`, EB-71). Absent unless the
    * subscriber opted in.
@@ -7334,6 +7402,7 @@ function zeroedTopicStats(): {
     sampledDeliveries: 0,
     sampleDropped: 0,
     signatureFailures: 0,
+    migrationFailures: 0,
     dedupDropped: 0,
     aliasRetiredMessages: 0,
     lineageCycleRejections: 0,
@@ -12454,6 +12523,8 @@ export class EventBus {
    * envelope's HMAC signature was missing or invalid (global total).
    */
   private totalSignatureFailures = 0;
+  /** Global counterpart of `TopicStats.migrationFailures` (EB-186). */
+  private totalMigrationFailures = 0;
   /**
    * Messages sealed by `encryptPayload` (global total, EB-179).
    */
@@ -12682,6 +12753,19 @@ export class EventBus {
    * kept apart from the other caches for the same reason.
    */
   private schemaVersionMatcherCache = new Map<string, RegExp>();
+  /**
+   * Schema-version migration graphs (EB-186), keyed by the exact string
+   * passed to `setSchemaMigration` — either a concrete topic name or a
+   * wildcard pattern. Match resolution mirrors the schema rules: an
+   * exact-topic registry wins over any pattern; between patterns the
+   * earliest-registered registry wins.
+   */
+  private schemaMigrationRules = new Map<string, SchemaMigrationRegistry>();
+  /**
+   * Compiled matchers for the wildcard entries in `schemaMigrationRules`,
+   * kept apart from the other caches for the same reason.
+   */
+  private schemaMigrationMatcherCache = new Map<string, RegExp>();
   /**
    * Per-topic maximum single-message size caps (UTF-8 JSON bytes), keyed by
    * the exact string passed to `setTopicMaxMessageBytes` — either a
@@ -17290,6 +17374,98 @@ export class EventBus {
   }
 
   /**
+   * Registers one schema-version migration hop for a topic (EB-186):
+   * `migrate` transforms a payload from `fromVersion` to `toVersion`
+   * (adjacent versions in the schema's evolution — upcast or downcast).
+   * Register every hop; the bus resolves multi-hop paths (shortest
+   * first, BFS) so a `1→2` plus `2→3` registration migrates `1→3`
+   * automatically, and a direct `1→3` registration short-circuits the
+   * chain.
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or
+   * an exact topic name); an exact-topic registry wins over patterns,
+   * the earliest-registered pattern wins between patterns — the same
+   * resolution as `setTopicSchemaVersion`.
+   *
+   * Delivery semantics (see `SubscribeOptions.schemaVersion`): a
+   * subscriber that declares an expected version gets every message
+   * migrated from its write version (`PublishOptions.schemaVersion`)
+   * to that version — at delivery time, after decompression and
+   * signature verification, before the handler. The migration is
+   * fail-closed: a missing hop (or a hop that throws) drops the message
+   * for that subscriber and counts it in `migrationFailures`. The
+   * durable log always stores the write-version payload, so replay
+   * re-migrates from the original bytes; signed topics verify first
+   * and migrate second (the migrated view is a local deterministic
+   * transform of the authenticated payload — never re-signed, never
+   * re-entering the wire).
+   *
+   * Throws `RangeError` when `topicPattern` is empty, a version is not
+   * a non-negative integer, `fromVersion === toVersion`, the hop is
+   * already registered, or `migrate` is not a function — fail-fast at
+   * configuration time, never mid-delivery.
+   */
+  setSchemaMigration(
+    topicPattern: string,
+    fromVersion: number,
+    toVersion: number,
+    migrate: SchemaMigrateFn,
+  ): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    let registry = this.schemaMigrationRules.get(topicPattern);
+    if (registry === undefined) {
+      registry = new SchemaMigrationRegistry();
+      this.schemaMigrationRules.set(topicPattern, registry);
+    }
+    // The registry validates versions, the hop direction, duplicates
+    // and the function — a throw leaves the (possibly fresh, still
+    // empty) registry in place, which resolves nothing: zero side
+    // effects on delivery.
+    registry.register(fromVersion, toVersion, migrate);
+  }
+
+  /**
+   * Removes schema-version migration registrations (EB-186): without
+   * `topicPattern`, clears every registry; with it, removes just that
+   * pattern's registry. Returns true when anything was removed.
+   * Messages already queued keep their write version; only the
+   * delivery-time path resolution changes — a removed hop fails closed
+   * from that moment on.
+   */
+  clearSchemaMigration(topicPattern?: string): boolean {
+    if (topicPattern === undefined) {
+      const had = this.schemaMigrationRules.size > 0;
+      this.schemaMigrationRules.clear();
+      this.schemaMigrationMatcherCache.clear();
+      return had;
+    }
+    const removed = this.schemaMigrationRules.delete(topicPattern);
+    if (removed) this.schemaMigrationMatcherCache.delete(topicPattern);
+    return removed;
+  }
+
+  /**
+   * Resolves the migration registry for a concrete topic: an
+   * exact-topic registry wins over patterns; between patterns the
+   * earliest-registered wins — mirrors `compressionForTopic`.
+   */
+  private schemaMigrationForTopic(topic: string): SchemaMigrationRegistry | undefined {
+    const exact = this.schemaMigrationRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, registry] of this.schemaMigrationRules) {
+      let matcher = this.schemaMigrationMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.schemaMigrationMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return registry;
+    }
+    return undefined;
+  }
+
+  /**
    * Caps the JSON byte size of a single publish to topics matching
    * `topicPattern` — an admission gate for oversized payloads. `topicPattern`
    * accepts the same wildcard syntax as `subscribe` (or an exact topic
@@ -18988,6 +19164,11 @@ export class EventBus {
     if (typeof verifyPublisher !== 'boolean') {
       throw new TypeError('verifyPublisher must be a boolean');
     }
+    // Declared expected schema version (EB-186): validated before
+    // anything registers, so a throw leaves no half-registered
+    // subscriber behind. Reuses the publish-side validator — the same
+    // non-negative-integer contract, the same `RangeError`.
+    validateSchemaVersion(opts?.schemaVersion, 'subscribe');
     // Durable-log replay progress (EB-71): the observer was validated
     // above; the interval falls back to the 100-entry default.
     const onReplayProgress = opts?.onReplayProgress;
@@ -19206,6 +19387,10 @@ export class EventBus {
       // envelope's publisherSignature verifies under the publisher's
       // registered keys — dropped, counted, and audited on failure.
       verifyPublisher,
+      // Declared expected schema version (EB-186): when set, every
+      // delivered message is migrated from its write version to this
+      // version at delivery time (see `SubscribeOptions.schemaVersion`).
+      schemaVersion: opts?.schemaVersion,
       // Durable-log replay progress observability (EB-71): the
       // per-subscriber progress state appears on the first resume
       // replay (see `admitReplayRecords`).
@@ -21036,10 +21221,17 @@ export class EventBus {
         // exactly like a real throwing handler would. Message projection
         // (EB-144): the consumer-held handle carries the projected view
         // while the tracked envelope stays original.
-        this.invokeChaosHandler(
-          null,
-          () => singleHandler(this.projectReliableDelivery(subscriber, delivery)),
-        );
+        this.invokeChaosHandler(null, () => {
+          // Schema-version migration (EB-186) runs inside the
+          // at-least-once envelope: an `undefined` delivery means the
+          // migration failed closed — the handler is skipped and the
+          // tracked delivery stays unacked, so it redelivers (and
+          // eventually dead-letters) instead of delivering an
+          // unmigratable payload.
+          const migrated = this.projectReliableDelivery(subscriber, delivery);
+          if (migrated === undefined) return;
+          singleHandler(migrated);
+        });
         // EB-72: the handler returned without throwing — idle activity
         // (see the batch path above for why this lives in the wrapper).
         this.recordIdleActivity(subscriber, 'deliver');
@@ -21058,10 +21250,17 @@ export class EventBus {
         // past the budget, the dead-letter queue (EB-28 reproduction). A
         // throwing projection is caught here too and nacks the delivery
         // exactly like a throwing handler.
-        this.invokeChaosHandler(
-          null,
-          () => singleHandler(this.projectReliableDelivery(subscriber, delivery)),
-        );
+        this.invokeChaosHandler(null, () => {
+          // Schema-version migration (EB-186) runs inside the
+          // at-least-once envelope: an `undefined` delivery means the
+          // migration failed closed — the handler is skipped and the
+          // tracked delivery stays unacked, so it redelivers (and
+          // eventually dead-letters) instead of delivering an
+          // unmigratable payload.
+          const migrated = this.projectReliableDelivery(subscriber, delivery);
+          if (migrated === undefined) return;
+          singleHandler(migrated);
+        });
         // A nacked delivery is a failed delivery, not activity — only
         // the clean return counts.
         this.recordIdleActivity(subscriber, 'deliver');
@@ -23879,6 +24078,12 @@ export class EventBus {
               ...(typeof rec.publisherId === 'string' && rec.publisherId.length > 0
                 ? { publisherId: rec.publisherId }
                 : {}),
+              // Restores the write schema version logged at publish time
+              // (EB-186), so a resumed subscriber's declared expected
+              // version migrates the replayed message exactly like the
+              // live delivery did. Records written before migration
+              // support replay unmigrated.
+              ...(rec.schemaVersion === undefined ? {} : { schemaVersion: rec.schemaVersion }),
               // Restores the application headers logged at publish time
               // (EB-153), so a resumed subscriber's header filter judges a
               // replayed message on the same headers the live fan-out saw
@@ -27681,6 +27886,10 @@ export class EventBus {
       // snapshot keeps the message's routing metadata for header-filter
       // evaluation.
       ...(msg.headers === undefined ? {} : { headers: { ...msg.headers } }),
+      // The write schema version rides the retained entry (EB-186):
+      // the snapshot migrates to the subscriber's declared expected
+      // version exactly like live delivery.
+      ...(msg.schemaVersion === undefined ? {} : { schemaVersion: msg.schemaVersion }),
     };
     this.retainedMessages.set(topic, entry);
     this.durableLogForTopic(topic)?.append({
@@ -27708,6 +27917,10 @@ export class EventBus {
       // so restart recovery rebuilds the table with the message's
       // routing metadata intact.
       ...(msg.headers === undefined ? {} : { headers: { ...msg.headers } }),
+      // The write schema version rides the seq-0 retained record
+      // (EB-186) so restart recovery rebuilds the table with the
+      // version intact.
+      ...(msg.schemaVersion === undefined ? {} : { schemaVersion: msg.schemaVersion }),
     });
   }
 
@@ -27818,6 +28031,10 @@ export class EventBus {
         // (EB-153) so a header-filtered subscriber judges the snapshot
         // copy on the same headers the live fan-out saw.
         ...(entry.headers === undefined ? {} : { headers: { ...entry.headers } }),
+        // Restores the write schema version (EB-186) so the snapshot
+        // migrates to the subscriber's declared expected version
+        // exactly like live delivery.
+        ...(entry.schemaVersion === undefined ? {} : { schemaVersion: entry.schemaVersion }),
         ...(entry.signature === undefined
           ? {}
           : { signature: { kid: entry.signature.kid, sig: entry.signature.sig } }),
@@ -27917,14 +28134,30 @@ export class EventBus {
       if (subscriber.reliable === undefined) this.recordIdleActivity(subscriber, 'deliver');
     };
     if (subscriber.batch !== undefined) {
+      // Schema-version migration (EB-186) applies to the retained
+      // snapshot exactly like live delivery: a message whose migration
+      // failed closed is dropped from the batch (already counted), the
+      // rest still delivers. Reliable subscribers migrate inside their
+      // at-least-once wrapper via `projectReliableDelivery`, so
+      // `projectBatchView` leaves them unmigrated here.
       if (
-        invokeQuietly(() => (subscriber.handler as unknown as (msgs: BusMessage[]) => void)(outgoing))
+        invokeQuietly(() =>
+          (subscriber.handler as unknown as (msgs: BusMessage[]) => void)(
+            this.projectBatchView(subscriber, outgoing),
+          ),
+        )
       ) {
         noteActivity();
       }
     } else {
       for (const msg of outgoing) {
-        if (invokeQuietly(() => subscriber.handler(msg))) noteActivity();
+        // Schema-version migration (EB-186): same fail-closed semantics
+        // as the live drain — a message whose migration failed is
+        // skipped (already counted). Reliable subscribers migrate
+        // inside their wrapper, so the view passes them through.
+        const view = this.projectMessageView(subscriber, msg);
+        if (view === undefined) continue;
+        if (invokeQuietly(() => subscriber.handler(view))) noteActivity();
       }
     }
   }
@@ -27976,6 +28209,9 @@ export class EventBus {
         // (EB-153) so the rebuilt table keeps the message's routing
         // metadata for snapshot header-filter evaluation.
         ...(latest.headers === undefined ? {} : { headers: { ...latest.headers } }),
+        // Restores the write schema version (EB-186) for the same
+        // reason: snapshot migration after a restart.
+        ...(latest.schemaVersion === undefined ? {} : { schemaVersion: latest.schemaVersion }),
       });
     }
   }
@@ -30832,6 +31068,14 @@ export class EventBus {
     // suppress its consumer-group offset record. Clearing first keeps the
     // marker a pure "this call skipped this message" signal.
     subscriber.sampleSkipMsg = undefined;
+    // Schema-version migration gate (EB-186): a subscriber that declared
+    // an expected schema version (`SubscribeOptions.schemaVersion`)
+    // only receives messages whose write version migrates to it — a
+    // missing hop drops the message fail-closed before the queue, the
+    // filter and the throttle, counted in `migrationFailures`. Runs
+    // first, before the barrier gate: barrier control messages carry no
+    // schema version, so the gate is a no-op for them.
+    if (!this.checkSchemaMigrationGate(subscriber, msg)) return false;
     // Barrier gate (EB-98) runs FIRST — before the causal gate (EB-62)
     // and the keyed gate. Design intent: the barrier cuts the
     // subscriber's whole delivery stream (cross-topic, which per-source
@@ -31854,6 +32098,112 @@ export class EventBus {
   }
 
   /**
+   * Resolves the migration hop path for a concrete topic (EB-186):
+   * `[]` when write and expected versions are equal (no migration
+   * needed), the registry's shortest path otherwise, `undefined` when
+   * no registry matches the topic or no path exists. Pure — never
+   * throws, never counts.
+   */
+  private resolveMigrationPath(
+    topic: string,
+    writeVersion: number,
+    expectedVersion: number,
+  ): SchemaMigrationStep[] | undefined {
+    if (writeVersion === expectedVersion) return [];
+    return this.schemaMigrationForTopic(topic)?.resolvePath(writeVersion, expectedVersion);
+  }
+
+  /**
+   * Counts one schema-migration failure on the topic and the global
+   * total, and files the error-isolated `schema_migration_failed`
+   * subscription audit event. Fail-closed, like the signature-failure
+   * counter above: the message never reaches the subscriber.
+   */
+  private countMigrationFailure(
+    subscriber: Subscriber,
+    topic: string,
+    seq: number,
+    writeVersion: number,
+    expectedVersion: number,
+    missingFrom?: number,
+    missingTo?: number,
+  ): void {
+    this.statsFor(topic).migrationFailures += 1;
+    this.totalMigrationFailures += 1;
+    this.auditSubscription({
+      action: 'schema_migration_failed',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      topic,
+      detail: {
+        seq,
+        writeVersion,
+        expectedVersion,
+        ...(missingFrom === undefined ? {} : { missingFrom }),
+        ...(missingTo === undefined ? {} : { missingTo }),
+      },
+    });
+  }
+
+  /**
+   * Schema-version migration gate (EB-186), evaluated per subscriber at
+   * fan-out — before the queue, next to the signature checks. A
+   * subscriber that declared no expected version, a message with no
+   * stamped write version, or equal versions pass with zero overhead.
+   * Otherwise the hop path must resolve: when it does not, the message
+   * is dropped fail-closed (counted, audited) — it never consumes
+   * backpressure budget. The loss is genuine for this subscriber, so
+   * the gap baseline does NOT advance — the same visibility a failed
+   * signature check gets.
+   */
+  private checkSchemaMigrationGate(subscriber: Subscriber, msg: BusMessage): boolean {
+    const expected = subscriber.schemaVersion;
+    const written = msg.schemaVersion;
+    if (expected === undefined || written === undefined || expected === written) return true;
+    const path = this.resolveMigrationPath(msg.topic, written, expected);
+    if (path !== undefined) return true;
+    this.countMigrationFailure(subscriber, msg.topic, msg.seq, written, expected);
+    return false;
+  }
+
+  /**
+   * Applies schema-version migration at delivery time (EB-186): after
+   * decryption and inflation, before the handler — on the inflated
+   * application payload. Returns the original envelope when no
+   * migration applies (no declared version, unknown write version, or
+   * equal versions — zero overhead), otherwise a shallow copy whose
+   * `payload` is the migrated value; the queued envelope, the durable
+   * log and every other subscriber are untouched.
+   *
+   * Fail-closed: a path that no longer resolves (registrations changed
+   * between fan-out and delivery) or a hop that throws drops the
+   * message — counted via `countMigrationFailure` — and returns
+   * `undefined` so the caller skips the handler.
+   */
+  private applySchemaMigration(
+    subscriber: Subscriber,
+    msg: BusMessage,
+  ): BusMessage | undefined {
+    const expected = subscriber.schemaVersion;
+    const written = msg.schemaVersion;
+    if (expected === undefined || written === undefined || expected === written) return msg;
+    const registry = this.schemaMigrationForTopic(msg.topic);
+    const result = registry?.migrate(msg.payload, written, expected);
+    if (result !== undefined && result.ok) return { ...msg, payload: result.payload };
+    this.countMigrationFailure(
+      subscriber,
+      msg.topic,
+      msg.seq,
+      written,
+      expected,
+      result === undefined || result.ok ? undefined : result.missingFrom,
+      result === undefined || result.ok ? undefined : result.missingTo,
+    );
+    return undefined;
+  }
+
+  /**
    * Pushes one message into every matching subscriber's queue and records
    * per-topic stats. Returns how many subscribers matched and how many
    * queues accepted the message (they differ when backpressure drops kick
@@ -32646,6 +32996,14 @@ export class EventBus {
       // last-writer-wins arbitration (EB-131). Absent for unkeyed
       // publishes, which never participate in the arbitration.
       ...(key === undefined ? {} : { key }),
+      // The write schema version rides the envelope (EB-186): stamped
+      // at admission from the already-validated
+      // `PublishOptions.schemaVersion` — delivery-time migration and the
+      // durable log read it from here. Absent when the publish carried
+      // no version (internal re-fan-out paths pass undefined and admit
+      // against the latest registered version): those messages deliver
+      // unmigrated.
+      ...(schemaVersion === undefined ? {} : { schemaVersion }),
       ...(cleanMessageId === undefined ? {} : { messageId: cleanMessageId }),
       // Message lineage (EB-184): the admission-stamped forwarding
       // history — origin hop first, then one hop per transform stage —
@@ -33148,6 +33506,13 @@ export class EventBus {
       // delayed-schedule rebuild) restores the message's producer
       // attribution instead of losing it across restarts.
       ...(publisherId === undefined ? {} : { publisherId }),
+      // The write schema version rides the log record (EB-186) so
+      // replay restores it onto the envelope — a resumed subscriber
+      // with a declared expected version re-migrates the replayed
+      // message from the original write-version bytes. The payload
+      // itself is always the write-version form: migration never
+      // rewrites the log.
+      ...(msg.schemaVersion === undefined ? {} : { schemaVersion: msg.schemaVersion }),
       // The application headers ride the log record (EB-153) so replay
       // restores them onto the envelope — a resumed subscriber's header
       // filter judges a replayed message on the same headers the live
@@ -34599,6 +34964,7 @@ export class EventBus {
       projectErrors: this.totalProjectErrors,
       projections,
       signatureFailures: this.totalSignatureFailures,
+      migrationFailures: this.totalMigrationFailures,
       deadLetteredMessages: this.totalDeadLettered,
       ladderPending: this.totalLadderPending,
       ladderAttempts: this.totalLadderAttempts,
@@ -34810,6 +35176,7 @@ export class EventBus {
         sampledDeliveries: stats.sampledDeliveries,
         sampleDropped: stats.sampleDropped,
         signatureFailures: stats.signatureFailures,
+        migrationFailures: stats.migrationFailures,
         // Per-topic HMAC signing state (EB-84): present only when a
         // signing rule currently matches the topic — secrets never leave
         // the rule, only the key ids and the grace window. Omitted
@@ -36592,16 +36959,33 @@ export class EventBus {
    * global); on throw, counts the error and lets it propagate so the
    * caller runs the same failure path a throwing handler would
    * (health-probe accounting, DLQ nack, mid-drain requeue semantics).
+   *
+   * Schema-version migration (EB-186) runs first, when the subscriber
+   * declared an expected version: the migrated payload — not the raw
+   * write-version bytes — is what the projection (and the handler)
+   * sees. Returns `undefined` when migration fails closed, so the
+   * caller skips the handler.
    */
-  private projectMessageView(subscriber: Subscriber, msg: BusMessage): BusMessage {
+  private projectMessageView(
+    subscriber: Subscriber,
+    msg: BusMessage,
+  ): BusMessage | undefined {
+    // Reliable subscribers migrate inside the at-least-once wrapper
+    // (`projectReliableDelivery`) for the same reason they project
+    // there: the ack tracker stays keyed on the original envelope, and
+    // a redelivery re-migrates from the original bytes instead of
+    // double-migrating a view.
+    const migrated =
+      subscriber.reliable != null ? msg : this.applySchemaMigration(subscriber, msg);
+    if (migrated === undefined) return undefined;
     const project = subscriber.project;
     // Reliable subscribers project inside the at-least-once wrapper
     // (`projectReliableDelivery`), where the ack tracker can stay keyed
     // on the original envelope — projecting here would re-key the
     // tracker, the redelivery counters and the DLQ on the projected
     // view, and requeues would double-project.
-    if (project === undefined || subscriber.reliable != null) return msg;
-    return this.applyProjection(project, msg);
+    if (project === undefined || subscriber.reliable != null) return migrated;
+    return this.applyProjection(project, migrated);
   }
 
   /**
@@ -36632,8 +37016,15 @@ export class EventBus {
    * array untouched when no projection is configured.
    */
   private projectBatchView(subscriber: Subscriber, batch: BusMessage[]): BusMessage[] {
-    if (subscriber.project === undefined) return batch;
-    return batch.map((msg) => this.projectMessageView(subscriber, msg));
+    if (subscriber.project === undefined && subscriber.schemaVersion === undefined) return batch;
+    const out: BusMessage[] = [];
+    for (const msg of batch) {
+      // A message whose migration failed closed is dropped from the
+      // batch (EB-186) — the rest still delivers.
+      const view = this.projectMessageView(subscriber, msg);
+      if (view !== undefined) out.push(view);
+    }
+    return out;
   }
 
   /**
@@ -36649,10 +37040,22 @@ export class EventBus {
   private projectReliableDelivery(
     subscriber: Subscriber,
     delivery: Delivery<BusMessage>,
-  ): Delivery<BusMessage> {
+  ): Delivery<BusMessage> | undefined {
+    // Schema-version migration (EB-186) runs inside the at-least-once
+    // envelope, on the tracked original: the consumer-held handle
+    // carries the migrated view while the tracked envelope stays
+    // original — a redelivery re-migrates from the original bytes,
+    // never double-migrating. Returns `undefined` when migration fails
+    // closed: the caller skips the handler and the tracked delivery
+    // stays unacked, so it redelivers (and eventually dead-letters)
+    // instead of delivering an unmigratable payload.
+    const migrated = this.applySchemaMigration(subscriber, delivery.msg);
+    if (migrated === undefined) return undefined;
     const project = subscriber.project;
-    if (project === undefined) return delivery;
-    const projected = this.applyProjection(project, delivery.msg);
+    // Fast path, byte-identical to before EB-186 when nothing is
+    // configured: the delivery passes through untouched.
+    if (project === undefined && migrated === delivery.msg) return delivery;
+    const projected = project === undefined ? migrated : this.applyProjection(project, migrated);
     const view: Delivery<BusMessage> = { ...delivery, msg: projected };
     const reliable = subscriber.reliable;
     if (reliable !== undefined) {
@@ -36874,23 +37277,27 @@ export class EventBus {
             this.invokeWithInflightSlot(subscriber, (): unknown => {
               let result: unknown;
               if (invocationSlo == null) {
-                result = this.deliverTraced(subscriber, msg, () =>
-                  this.invokeChaosHandler(
-                    subscriber,
-                    // Message projection (EB-144): the handler sees the
-                    // projected view; a throwing projection propagates
-                    // exactly like a throwing handler.
-                    () => subscriber.handler(this.projectMessageView(subscriber, msg)),
-                  ),
-                );
+                result = this.deliverTraced(subscriber, msg, () => {
+                  // Message projection (EB-144): the handler sees the
+                  // projected view; a throwing projection propagates
+                  // exactly like a throwing handler. Schema-version
+                  // migration (EB-186) already ran inside the view: an
+                  // `undefined` view means the migration failed closed —
+                  // skip the handler (already counted).
+                  const view = this.projectMessageView(subscriber, msg);
+                  if (view === undefined) return;
+                  return this.invokeChaosHandler(subscriber, () => subscriber.handler(view));
+                });
               } else {
                 const processingStartedAtMs = this.now();
                 try {
-                  result = this.deliverTraced(subscriber, msg, () =>
-                    this.invokeChaosHandler(subscriber, () =>
-                      subscriber.handler(this.projectMessageView(subscriber, msg)),
-                    ),
-                  );
+                  result = this.deliverTraced(subscriber, msg, () => {
+                    const view = this.projectMessageView(subscriber, msg);
+                    if (view === undefined) return;
+                    return this.invokeChaosHandler(subscriber, () =>
+                      subscriber.handler(view),
+                    );
+                  });
                 } finally {
                   this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
                 }
@@ -37876,10 +38283,12 @@ export class EventBus {
         // (EB-144) is evaluated inside this try for the same reason: a
         // throwing projection counts as a handler failure (consecutive
         // failures, degradation) without interrupting the drain.
-        result = this.invokeChaosHandler(
-          subscriber,
-          () => subscriber.handler(this.projectMessageView(subscriber, msg)),
-        );
+        // Schema-version migration (EB-186) ran inside the view first:
+        // an `undefined` view means the migration failed closed — the
+        // shadow handler is skipped (already counted).
+        const view = this.projectMessageView(subscriber, msg);
+        if (view === undefined) return;
+        result = this.invokeChaosHandler(subscriber, () => subscriber.handler(view));
       } catch {
         failed = true;
       }

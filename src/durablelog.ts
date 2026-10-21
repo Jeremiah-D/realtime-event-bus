@@ -4659,7 +4659,9 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
     }
   }
   if (o['schemaVersion'] !== undefined) {
-    if (!Number.isInteger(o['schemaVersion']) || (o['schemaVersion'] as number) < 1) return null;
+    // Version 0 is legal (EB-86 registers non-negative integers), so the
+    // floor is 0, not 1 — a version-0 record must survive a restart.
+    if (!Number.isInteger(o['schemaVersion']) || (o['schemaVersion'] as number) < 0) return null;
     record.schemaVersion = o['schemaVersion'] as number;
   }
   if (o['key'] !== undefined) {

@@ -2728,6 +2728,61 @@ Details:
   lifecycle audit log (below) as `topic_register` / `topic_deregister`,
   with the caller-supplied actor (default `'system'`).
 
+## Schema migration
+
+Opt-in payload transformation across schema versions (`src/schemamigrate.ts`,
+zero new dependencies). Versioned validators (`setTopicSchemaVersion`) let
+many payload shapes coexist on one topic, but they only *validate* — every
+consumer still sees the exact bytes the producer wrote. Schema migration is
+the transform layer for rolling upgrades: old consumers keep speaking the
+old shape while producers move on.
+
+```ts
+// Register one hop per adjacent version pair (upcasts and downcasts alike).
+bus.setSchemaMigration('orders.*', 1, 2, (payload) => ({ ...payload, v: 2 }));
+bus.setSchemaMigration('orders.*', 2, 3, (payload) => ({ ...payload, v: 3 }));
+
+// A subscriber declares the version it speaks; every message is migrated
+// from its write version (PublishOptions.schemaVersion) to that version.
+bus.subscribe('orders.*', handler, { schemaVersion: 3 });
+bus.publish('orders.created', { v: 1, item: 'book' }, { schemaVersion: 1 });
+// handler sees { v: 3, item: 'book' }
+```
+
+Semantics:
+
+- **Delivery-time, per subscriber** — migration runs after decompression
+  and signature verification, before the handler, on the inflated
+  application payload. A subscriber that declares no version (or whose
+  version equals the write version) gets the original payload untouched —
+  zero overhead when the feature is unused.
+- **Multi-hop paths** — hops are `(fromVersion → toVersion)` edges; the
+  bus resolves the shortest path (BFS), so stepwise `1→2, 2→3` chains and
+  direct `1→3` shortcuts compose freely. Each hop sees
+  `(payload, fromVersion, toVersion)`.
+- **Fail-closed** — a missing hop, or a hop that throws, drops the message
+  for that subscriber (never queued, never delivered — a sequence gap,
+  like a failed signature check) and counts it in
+  `getStats().migrationFailures` (per-topic and global, rendered as
+  `eventbus_schema_migration_failures_total`), with a
+  `schema_migration_failed` subscription audit event. A half-migrated
+  payload is never delivered.
+- **Write version is sticky** — the durable log stores the write-version
+  payload plus its version, so replay (`resumeFromSeq`/`resumeFromTime`)
+  and retained snapshots re-migrate from the original bytes. Messages with
+  no stamped write version (internal re-fan-out paths) deliver unmigrated.
+- **Signed topics verify first, migrate second** — the signature (EB-84)
+  authenticates the stored write-version wire bytes; the migrated view is
+  a local deterministic transform of that authenticated payload. It is
+  deliberately not re-signed: signatures bind `(topic, seq, wire bytes)`
+  on the shared envelope, and the migrated view never re-enters the wire
+  or the log.
+- **Validation** — empty patterns, non-integer/negative versions,
+  `fromVersion === toVersion`, duplicate hops, and non-function
+  transforms throw `RangeError` from `setSchemaMigration`;
+  `clearSchemaMigration(pattern?)` removes registrations (returns whether
+  anything was removed).
+
 ## Message signing (HMAC)
 
 Opt-in publish-side authenticity for tamper-evident topics
