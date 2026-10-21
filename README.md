@@ -5889,6 +5889,72 @@ Semantics notes:
   `eventbus_cep_absence_matches_total` — rendered only once a pattern was
   defined.
 
+## Stream joins (EB-187)
+
+Flink-interval-join-style correlation of two streams by key inside a
+sliding time window — the order/payment reconciliation primitive:
+
+```ts
+const joinId = bus.joinTopics(
+  { left: 'orders.*', right: 'payments.*' },
+  {
+    on: (msg) => msg.payload.orderId, // correlation key
+    windowMs: 60_000,
+    how: 'inner', // or 'left'
+    outputTopic: 'recon.joined',
+  },
+);
+bus.subscribe('recon.joined', (msg) => {
+  const { key, left, right, leftSeq, rightSeq, windowStart } = msg.payload;
+});
+bus.leaveJoin(joinId); // stops the sweep timer, drops buffered state
+```
+
+Semantics notes:
+
+- Every admitted publish is observed once: the arrival probes the
+  *opposite* side's buffer for same-key entries whose effective
+  timestamp (`msg.eventTime ??` observation time) falls in
+  `[arrivalTs - windowMs, arrivalTs]`. Each matching pair emits exactly
+  once — the arrival probes before buffering itself, so a pair is never
+  double-emitted.
+- `how: 'inner'` emits only on a hit; `how: 'left'` also emits left
+  arrivals with no in-window right peer (`right: null`,
+  `rightSeq: null`).
+- Window buffers are bounded per key per side by `maxBufferedPerKey`
+  (default 1000): the oldest entry is evicted first, counted in
+  `joinEvicted`. Entries older than `now - windowMs` are swept lazily
+  on every observation and by an unref'd periodic timer, so an idle bus
+  holds no stale state and never holds the process open.
+- An arrival whose effective time is older than `now - windowMs` can
+  never match — it is dropped and counted in `joinLate`, never
+  buffered.
+- Join outputs are first-class admitted publishes (sequence number,
+  durable log, subscriber fan-out) carrying lineage metadata
+  (`{ joinId, key, left, right, leftSeq, rightSeq, windowStart,
+  joinedAt }`). They never re-enter join observation (`joinDerived`) —
+  one hop, so a join can never trigger itself — while CEP sequence
+  patterns still observe them.
+- A throwing key function is error-isolated: the message is skipped and
+  counted in `keyErrors`.
+- Orthogonality: EB-73's subscriber-side tumbling aggregation composes
+  freely (it runs per subscriber at delivery time; a join output topic
+  can itself be window-aggregated), and EB-59's watermark is a
+  per-topic lateness *measure* while the join window is an
+  arrival-pairing *predicate* — both read `eventTime` when present,
+  neither changes the other's semantics.
+- Validation (`RangeError` before anything registers): empty
+  topics/outputTopic, non-function `on`, non-positive-finite
+  `windowMs`, `how` outside `'inner'|'left'`, non-positive-integer
+  `maxBufferedPerKey`, duplicate join ids.
+- `getStats().joins` → per-join `{ joined, joinLate, joinEvicted,
+  keyErrors, bufferedLeft, bufferedRight }` (present once a join was
+  defined); globals `totalStreamJoinMatches` / `totalStreamJoinLate` /
+  `totalStreamJoinEvicted` feed the Prometheus exposition as
+  `eventbus_stream_join_matches_total`,
+  `eventbus_stream_join_late_total`, and
+  `eventbus_stream_join_evicted_total`.
+
 ## Materialized state store / KTable (EB-171)
 
 The query side of keyed publish — every admitted keyed publish updates the

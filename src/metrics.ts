@@ -462,6 +462,21 @@ export function renderPrometheus(stats: BusStats): string {
     stats.migrationFailures ?? 0,
   );
   counter(
+    'eventbus_stream_join_matches_total',
+    'Total stream-join combined messages derived (EB-187).',
+    stats.totalStreamJoinMatches ?? 0,
+  );
+  counter(
+    'eventbus_stream_join_late_total',
+    'Total stream-join arrivals dropped as too late to ever match (EB-187).',
+    stats.totalStreamJoinLate ?? 0,
+  );
+  counter(
+    'eventbus_stream_join_evicted_total',
+    'Total stream-join buffered entries evicted by the per-key capacity bound (EB-187).',
+    stats.totalStreamJoinEvicted ?? 0,
+  );
+  counter(
     'eventbus_dedup_dropped_messages_total',
     'Total messages suppressed by subscriber-side exactly-once dedup windows.',
     stats.dedupDropped,

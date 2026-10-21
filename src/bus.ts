@@ -259,6 +259,14 @@ import {
   type SchemaMigrationStep,
 } from './schemamigrate.ts';
 import {
+  StreamJoinEngine,
+  type StreamJoinHow,
+  type StreamJoinKeyFn,
+  type StreamJoinOptions,
+  type StreamJoinOutput,
+  type StreamJoinStats,
+} from './streamjoin.ts';
+import {
   StateStore,
   validateStateStoreOptions,
   type StateStoreOptions,
@@ -463,6 +471,13 @@ export { assertValidSigningKeys, SIGNING_KID_PATTERN, SIGNATURE_HEX_LENGTH } fro
 export { compileFilterExpression } from './filterexpr.ts';
 export type { CompiledFilterExpression, FilterOperator, FilterPathSegment } from './filterexpr.ts';
 export type { SchemaMigrateFn, SchemaMigrationStep } from './schemamigrate.ts';
+export type {
+  StreamJoinHow,
+  StreamJoinKeyFn,
+  StreamJoinOptions,
+  StreamJoinOutput,
+  StreamJoinStats,
+} from './streamjoin.ts';
 export {
   DEFAULT_MAX_LINEAGE_HOPS,
   LineageDepthSampler,
@@ -5446,6 +5461,22 @@ export interface BusStats {
    */
   migrationFailures: number;
   /**
+   * Total stream-join combined messages derived (EB-187) — the sum of
+   * every join's `joined`. See `StreamJoinStats` for the per-join
+   * breakdown in `getStats().joins`.
+   */
+  totalStreamJoinMatches: number;
+  /**
+   * Total stream-join arrivals dropped as too late to ever match
+   * (EB-187) — the sum of every join's `joinLate`.
+   */
+  totalStreamJoinLate: number;
+  /**
+   * Total stream-join buffered entries evicted by the per-key capacity
+   * bound (EB-187) — the sum of every join's `joinEvicted`.
+   */
+  totalStreamJoinEvicted: number;
+  /**
    * Total messages moved into subscriber dead-letter queues — every
    * reliable-subscription message that exhausted its redelivery budget
    * (see `ReliableSubscribeOptions.deadLetter`).
@@ -6249,6 +6280,14 @@ export interface BusStats {
    * stats shape.
    */
   cep?: CepStats;
+  /**
+   * Stream-join counters (EB-187): one entry per defined join, present
+   * once at least one join has been defined (the engine persists for
+   * the bus's lifetime; removing every join leaves an empty array) —
+   * absent otherwise, so buses that never used joins render a
+   * byte-identical stats shape.
+   */
+  joins?: StreamJoinStats[];
   /**
    * Materialized state-store counters (EB-171): present only when the
    * store is enabled via `enableStateStore` — absent otherwise.
@@ -10427,6 +10466,17 @@ export interface PublishOptions {
    */
   cepDerived?: boolean;
   /**
+   * Join-derived marker (EB-187): the bus sets this on the combined
+   * messages its stream joins emit. A join-derived message never
+   * re-enters join observation — a join can never trigger itself — one
+   * hop, like topic routes and CEP matches. CEP sequence patterns
+   * (EB-170) still observe join-derived messages, so a join output can
+   * feed downstream pattern detection. Setting it on a direct publish
+   * opts that publish out of join observation (an escape hatch for
+   * producers that already handled derived traffic themselves).
+   */
+  joinDerived?: boolean;
+  /**
    * Multi-tenant namespace (EB-52, see `EventBus.createNamespace`): the
    * publish is scoped to the namespace — `topic` resolves to the
    * concrete topic `<namespace>/<topic>` and runs the full normal
@@ -13723,6 +13773,12 @@ export class EventBus {
    */
   private cep?: CepEngine;
   /**
+   * Stream-join engine (EB-187), created by `joinTopics`. Observes
+   * every admitted publish (see `observeAdmittedPublish`) and feeds
+   * `getStats().joins` plus the Prometheus exposition when present.
+   */
+  private streamJoins?: StreamJoinEngine;
+  /**
    * Materialized state store (EB-171), created by `enableStateStore`.
    * Observes every admitted keyed publish (see `observeAdmittedPublish`)
    * and feeds `getStats().stateStore` plus the Prometheus exposition
@@ -16147,6 +16203,69 @@ export class EventBus {
   }
 
   /**
+   * Defines a dual-stream window join (EB-187): correlates the `left`
+   * and `right` topic patterns by key inside a sliding time window and
+   * publishes the combined messages to `opts.outputTopic`. Returns the
+   * join id.
+   *
+   * Topics accept the same wildcard syntax as `subscribe`
+   * (`compilePattern` semantics); matching runs against the
+   * alias-resolved concrete topic. Every admitted publish is observed
+   * once: the arrival probes the *opposite* side's buffer for same-key
+   * entries whose effective timestamp (`msg.eventTime ??` observation
+   * time) falls in `[arrivalTs - windowMs, arrivalTs]`, and each hit
+   * derives one combined message — `{ joinId, key, left, right,
+   * leftSeq, rightSeq, windowStart, joinedAt }` — through the normal
+   * admission pipeline (ACL, schema, rate limit, TTL, durable log), so
+   * a join result is a first-class bus message. `how: 'left'` also
+   * emits left arrivals with no in-window right peer (`right: null`,
+   * `rightSeq: null`); `how: 'inner'` emits only on a hit.
+   *
+   * Window buffers are bounded per key per side by
+   * `maxBufferedPerKey` (default 1000): the oldest entry is evicted
+   * first, counted in `joinEvicted`. An arrival whose effective time is
+   * older than `now - windowMs` can never match — it is dropped and
+   * counted in `joinLate`. Join outputs never re-enter join
+   * observation (`joinDerived`) — one hop — while CEP sequence
+   * patterns still observe them.
+   *
+   * Throws `RangeError` before anything is registered on invalid
+   * options or a duplicate id. `getStats().joins` exposes the per-join
+   * counters (`joined` / `joinLate` / `joinEvicted` / `keyErrors` /
+   * buffered counts).
+   */
+  joinTopics(
+    topics: { left: string; right: string },
+    opts: StreamJoinOptions,
+  ): string {
+    if (this.streamJoins === undefined) {
+      this.streamJoins = new StreamJoinEngine({
+        now: this.now,
+        compile: compilePattern,
+        emitJoin: (joinId, outputTopic, output) => this.emitStreamJoin(joinId, outputTopic, output),
+      });
+    }
+    return this.streamJoins.define(topics, opts);
+  }
+
+  /**
+   * Removes a stream join: stops its unref'd sweep timer and drops all
+   * buffered state. Returns true when a join with that id existed.
+   */
+  leaveJoin(joinId: string): boolean {
+    return this.streamJoins?.remove(joinId) ?? false;
+  }
+
+  /**
+   * Emits one derived join output back onto the bus (EB-187): an
+   * `outputTopic` publish through the normal pipeline, marked
+   * join-derived so it never re-enters join observation.
+   */
+  private emitStreamJoin(joinId: string, outputTopic: string, output: StreamJoinOutput): void {
+    this.publish(outputTopic, output, { joinDerived: true });
+  }
+
+  /**
    * Emits one completed sequence match back onto the bus (EB-170): a
    * `cep.<patternId>` publish through the normal pipeline, marked
    * cep-derived so it never re-enters pattern detection.
@@ -16230,7 +16349,13 @@ export class EventBus {
    * envelope — so both observers see the raw application payload with a
    * final sequence number.
    */
-  private observeAdmittedPublish(msg: BusMessage, cepDerived: boolean): void {
+  private observeAdmittedPublish(msg: BusMessage, cepDerived: boolean, joinDerived: boolean): void {
+    // Stream joins (EB-187): derived traffic never re-enters join
+    // observation — one hop, like CEP matches — and CEP-derived matches
+    // never feed joins either, for the same reason.
+    if (!cepDerived && !joinDerived && this.streamJoins !== undefined) {
+      this.streamJoins.observe(msg);
+    }
     if (!cepDerived && this.cep !== undefined) {
       this.cep.observe(msg);
     }
@@ -24753,6 +24878,10 @@ export class EventBus {
       // Message lineage (EB-184): validated above; `fanOut` runs the
       // cycle check and stamps the origin hop.
       lineage,
+      // Join-derived marker (EB-187): the bus's own join publishes
+      // carry it (see `PublishOptions.joinDerived`); direct publishes
+      // never do unless they opt out explicitly.
+      opts?.joinDerived ?? false,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -32501,6 +32630,12 @@ export class EventBus {
     // admission extends it; every other path leaves it undefined. Last
     // so existing positional call sites are unaffected.
     lineage?: MessageLineage,
+    // Join-derived marker (EB-187): set only by `publishCore` for the
+    // bus's own join publishes (see `PublishOptions.joinDerived`).
+    // Every other path leaves it false, so a derived join output never
+    // re-enters join observation. Last so existing positional call
+    // sites are unaffected.
+    joinDerived = false,
   ): {
     matched: number;
     accepted: number;
@@ -33189,7 +33324,7 @@ export class EventBus {
     // sequence number. Rejected and shed publishes never reach this line.
     // CEP-derived match events never re-enter pattern detection
     // (`cepDerived`), so a match can never trigger itself.
-    this.observeAdmittedPublish(msg, cepDerived);
+    this.observeAdmittedPublish(msg, cepDerived, joinDerived);
     // Event-time watermark (EB-59): observed once per accepted publish —
     // after the admission gates (schema validation, rate-limit budget), so
     // a rejected or shed message never moves the watermark, exactly like
@@ -34965,6 +35100,9 @@ export class EventBus {
       projections,
       signatureFailures: this.totalSignatureFailures,
       migrationFailures: this.totalMigrationFailures,
+      totalStreamJoinMatches: this.streamJoins?.totals().joined ?? 0,
+      totalStreamJoinLate: this.streamJoins?.totals().late ?? 0,
+      totalStreamJoinEvicted: this.streamJoins?.totals().evicted ?? 0,
       deadLetteredMessages: this.totalDeadLettered,
       ladderPending: this.totalLadderPending,
       ladderAttempts: this.totalLadderAttempts,
@@ -35306,6 +35444,10 @@ export class EventBus {
       // defined — absent otherwise, so a CEP-free bus reports exactly
       // the stats shape it always did.
       ...(this.cep === undefined ? {} : { cep: this.cep.snapshot() }),
+      // Stream joins (EB-187): present only once a join is defined —
+      // absent otherwise, so a join-free bus reports exactly the stats
+      // shape it always did.
+      ...(this.streamJoins === undefined ? {} : { joins: this.streamJoins.snapshot() }),
       // Materialized state store (EB-171): present only when enabled via
       // `enableStateStore` — absent otherwise.
       ...(this.stateStore === undefined ? {} : { stateStore: this.stateStore.snapshot() }),
