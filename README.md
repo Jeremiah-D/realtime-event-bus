@@ -6257,3 +6257,49 @@ Semantics:
   the bus's injected `EventBusOptions.now`, so tests drive deterministic
   hops with a controllable clock.
 
+## GraphQL subscription gateway (EB-185)
+
+Opt-in graphql-ws protocol server (`src/graphql-gw.ts`) that exposes
+bus topics as GraphQL subscriptions — GraphQL clients (Apollo, urql,
+graphql-ws) subscribe with field selection, variables and filter
+expressions, zero new dependencies (`node:net` + `node:crypto` only):
+
+```graphql
+subscription ($t: String!) {
+  events(topic: $t, filter: "price > 100") { topic payload seq }
+}
+```
+
+Semantics:
+
+- **Wire protocol.** Raw-TCP server implementing the graphql-ws
+  message flow: `connection_init` → `connection_ack` (must arrive
+  within `connectionInitTimeoutMs` or the connection closes with 4429),
+  `subscribe` / `next` / `complete` per operation id, `ping` ↔ `pong`
+  keepalive. The RFC 6455 codec mirrors the one in `gateway-ws.ts`
+  (same opcodes, masking rules, incremental parsing). Standard close
+  codes: 4400 bad request, 4401 unauthorized, 4409 duplicate
+  subscription id, 4429 connection-init timeout.
+- **Query mapping.** Only `subscription` operations with a single root
+  field are accepted. The root field takes `topic: String!` (required
+  topic pattern) and `filter: String` (optional `filterexpr`
+  expression, compiled with `compileFilterExpression`). `$variables`
+  are substituted from the subscribe payload; `operationName` picks one
+  operation out of a multi-operation document. The selection set shapes
+  each `next` frame — one of `topic`, `payload`, `seq`, `messageId`,
+  `key`, `eventTime`. Unknown fields/arguments, a missing `topic`, a
+  non-subscription operation or an uncompilable filter all produce
+  `error` frames; the connection stays open.
+- **Delivery.** Subscriptions ride the normal bus subscriber path —
+  `bus.subscribe` with the compiled filter — so the subscriber's
+  backpressure policy applies unchanged. `complete` and connection
+  teardown unsubscribe.
+- **Auth.** Opt-in: with `authToken` set, `connection_init`'s payload
+  must carry `authorization: "Bearer <token>"` (constant-time compare);
+  otherwise the connection closes with 4401.
+- **Observability.** `GraphqlGateway.getStats()` reports
+  `{ connections, subscriptions, messagesSent, protocolErrors,
+  authFailures }`.
+- **Orthogonality.** `gateway-ws.ts` speaks the bus's own framing; this
+  speaks the graphql-ws wire protocol. A text-frame-only WebSocket
+  client is all a subscriber needs.
