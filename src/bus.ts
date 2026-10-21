@@ -358,6 +358,13 @@ export type {
   LatencySloMissEvent,
   ProcessingLatencySloOptions,
 } from './latency.ts';
+import {
+  AdmissionLatencyTracker,
+  resolveAdmissionLatencyOptions,
+  type AdmissionGate,
+  type AdmissionLatencyOptions,
+  type AdmissionLatencyStats,
+} from './publishlatency.ts';
 export type {
   AckLatencyOptions,
   AckLatencySummaryStats,
@@ -369,6 +376,12 @@ export type {
   ScheduleSkewSummaryStats,
 } from './scheduleskew.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
+export type {
+  AdmissionGate,
+  AdmissionLatencyOptions,
+  AdmissionLatencyStats,
+  SlowAdmissionTopic,
+} from './publishlatency.ts';
 export type {
   BusHealthReport,
   CheckStatus,
@@ -3995,6 +4008,42 @@ export interface EventBusOptions {
    */
   scheduleSkew?: ScheduleSkewOptions;
   /**
+   * Opt-in publish-side admission latency sampling (EB-182, see
+   * `src/publishlatency.ts`): samples the admission phase of every
+   * publish — the gate section every publish path funnels through
+   * (`publish`, `publishBatch` per entry, the admitted path of
+   * `publishIdempotent`, `publishDelayed`'s schedule-time fail-fast
+   * gates, and `publishAtomic` via the shadow admission verdict) — as one
+   * total-span sample per topic plus a per-(topic, gate) breakdown
+   * (`webhook`, `publisher-rate-limit`, `acl`, `schema`, `size`,
+   * `sampling`, `pressure`, `tenant-quota`, `global-rate-limit`,
+   * `topic-rate-limit`, `idempotency-dedup`).
+   *
+   * The span is a *gate* latency: it runs from the first admission gate
+   * to the admission decision (admitted or rejected) — sequence-number
+   * assignment, the durable log, compression and fan-out are past the
+   * decision point and never sampled, so this never double-samples the
+   * EB-31/EB-40/EB-53 delivery-side distributions. Latencies come from
+   * the bus clock (`EventBusOptions.now`), so tests drive deterministic
+   * values with a controllable clock.
+   *
+   * `getStats()` exposes the per-topic p50/p95/p99 distribution
+   * (`publishLatency`), the per-gate breakdown (`publishLatencyGates`)
+   * and the slow-admission hotspot ranking (`slowAdmissionTopics`, by
+   * total-span p99 — the list that surfaces topics with heavy schema
+   * validators or ACL rule sets), and `src/metrics.ts` renders them as
+   * `eventbus_publish_admission_latency_ms{quantile,topic}` plus the
+   * per-gate series. Disabled by default: the publish path then pays one
+   * branch per gate and zero clock reads.
+   *
+   * Pass `true` for the defaults (1024-sample windows per topic and per
+   * (topic, gate), slow threshold 100ms), or an
+   * `AdmissionLatencyOptions` object to tune the windows and the slow
+   * threshold. Invalid values throw `RangeError`/`TypeError` from the
+   * constructor.
+   */
+  publishLatency?: boolean | AdmissionLatencyOptions;
+  /**
    * Pluggable backing store for consumer-group committed offsets
    * (EB-114, see `src/offsetstore.ts`). Every group-level `commitOffset`
    * (no `partition`/`instanceId`) is mirrored into the store, so a
@@ -5532,6 +5581,33 @@ export interface BusStats {
   deliveryLatency: Array<
     { subscriberId: string; pattern: string } & DeliveryLatencySummaryStats
   >;
+  /**
+   * Per-topic publish-admission latency summaries (see
+   * `EventBusOptions.publishLatency`): one entry per topic with at least
+   * one total-span sample, in first-seen order. Each entry carries the
+   * admission-phase (first gate → admission decision) distribution
+   * (p50/p95/p99, min/max/mean, slow count over the topic's bounded
+   * rolling window). Empty when sampling is disabled or nothing has
+   * published yet.
+   */
+  publishLatency: Array<{ topic: string } & AdmissionLatencyStats>;
+  /**
+   * Per-(topic, gate) admission-gate latency summaries (see
+   * `EventBusOptions.publishLatency`): one entry per (topic, gate) with
+   * at least one sample. Lets operators attribute a slow admission to
+   * the hot gate — e.g. a topic whose schema validator is heavy. Empty
+   * when sampling is disabled.
+   */
+  publishLatencyGates: Array<
+    { topic: string; gate: AdmissionGate } & AdmissionLatencyStats
+  >;
+  /**
+   * Slow-admission hotspot ranking (see
+   * `EventBusOptions.publishLatency`): topics with samples, sorted by
+   * total-span p99 descending (top 5) — the admission-gate hotspot
+   * list. Empty when sampling is disabled.
+   */
+  slowAdmissionTopics: SlowAdmissionTopic[];
   /**
    * Per-subscriber end-to-end ack-latency summaries (see
    * `SubscribeOptions.ackLatency`): one entry per subscription with
@@ -12766,6 +12842,13 @@ export class EventBus {
     | { tracker: ScheduleSkewTracker; options: ResolvedScheduleSkewOptions }
     | undefined;
   /**
+   * Publish-side admission latency sampling (EB-182, see
+   * `EventBusOptions.publishLatency`). Absent when the option is not
+   * passed — no sampling, no tracker, zeroed stats, and the publish
+   * path pays one branch per gate with zero clock reads.
+   */
+  private readonly admissionLatency: AdmissionLatencyTracker | undefined;
+  /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
    * rejection it consumes no sequence number, never touches the durable
@@ -13544,6 +13627,15 @@ export class EventBus {
             tracker: new ScheduleSkewTracker(scheduleSkewOptions.windowSize),
             options: scheduleSkewOptions,
           };
+    // EB-182: opt-in publish-side admission latency sampling. A present
+    // (even empty) options object arms the tracker; an absent option
+    // disables everything — no sampling, zeroed stats, no Prometheus
+    // series, one branch per gate on the publish path.
+    const admissionLatencyOptions = resolveAdmissionLatencyOptions(options?.publishLatency);
+    this.admissionLatency =
+      admissionLatencyOptions === undefined
+        ? undefined
+        : new AdmissionLatencyTracker(admissionLatencyOptions);
     const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
     if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
       throw new RangeError(
@@ -24636,7 +24728,9 @@ export class EventBus {
     // Authorization precedes identity: a denied publish claims no dedup
     // slot and reports `{ duplicate: false, accepted: 0 }` — it was
     // denied, not deduplicated, and its retry stays a fresh publish.
+    const idempotentAclStart = this.admissionGateStart();
     if (!this.aclAllowsPublish(topic, publisherId)) {
+      this.admissionGateRecord(topic, 'acl', idempotentAclStart);
       this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       this.recordPublishAudit(topic, {
         admitted: false,
@@ -24648,10 +24742,13 @@ export class EventBus {
       });
       return { duplicate: false, accepted: 0 };
     }
+    this.admissionGateRecord(topic, 'acl', idempotentAclStart);
     const nowMs = this.now();
     const dedupKey = `${topic}\0${messageId}`;
+    const dedupStart = this.admissionGateStart();
     this.pruneDedup(nowMs);
     const firstAt = this.dedup.get(dedupKey);
+    this.admissionGateRecord(topic, 'idempotency-dedup', dedupStart);
     if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
       // Suppressed duplicate: dropped before admission — no sequence
       // number, no durable-log write, no rate-limit budget. Counted for
@@ -25479,6 +25576,11 @@ export class EventBus {
       // anything is mutated — zero side effects, the EB-20 convention.
       payload = this.applyTopicTransforms(resolvedTopic, payload);
       admittedPayloads[index] = payload;
+      // EB-182: one total-span sample per shadow-admitted entry — the
+      // shadow verdict IS this entry's admission (the commit phase is
+      // pre-admitted). Per-gate samples are recorded inside
+      // `admissionVerdict`.
+      const shadowSpanStart = this.admissionGateStart();
       const verdict = this.admissionVerdict(
         resolvedTopic,
         payload,
@@ -25489,6 +25591,12 @@ export class EventBus {
         quotaShadowBudget,
         globalShadowBudget,
       );
+      if (shadowSpanStart !== undefined) {
+        this.admissionLatency!.record(
+          resolvedTopic,
+          Math.max(0, this.now() - shadowSpanStart),
+        );
+      }
       if (verdict !== undefined) {
         // The batch is rejected on the failing entry: count it once against
         // that entry's admission-gate counters and surface it on the unified
@@ -25746,13 +25854,21 @@ export class EventBus {
     // The ACL is the next admission gate (after topic-alias resolution,
     // which rewrites the topic before the gates), including the atomic
     // batch's shadow admission: an unauthorized entry aborts the batch.
-    if (!this.aclAllowsPublish(topic, publisherId)) return { reason: 'acl', failedGate: 'acl' };
+    // EB-182: the shadow admission's gate executions are sampled like the
+    // live ones — the gates genuinely ran.
+    const shadowAclStart = this.admissionGateStart();
+    const shadowAclAllowed = this.aclAllowsPublish(topic, publisherId);
+    this.admissionGateRecord(topic, 'acl', shadowAclStart);
+    if (!shadowAclAllowed) return { reason: 'acl', failedGate: 'acl' };
     // Versioned schema validators (EB-86): the shadow admission runs the
     // pure verdict — no counting here. A rejection is counted once by the
     // caller; a deprecated admission is counted in the commit phase (see
     // `isDeprecatedSchemaAdmission`), so an aborted batch never moves the
     // counter for messages that were never published.
-    if (!this.schemaVerdict(topic, payload, schemaVersion).admitted)
+    const shadowSchemaStart = this.admissionGateStart();
+    const shadowSchemaAdmitted = this.schemaVerdict(topic, payload, schemaVersion).admitted;
+    this.admissionGateRecord(topic, 'schema', shadowSchemaStart);
+    if (!shadowSchemaAdmitted)
       return { reason: 'schema', failedGate: 'schema' };
     // Per-message size cap, same position as in `fanOut` (after schema, and
     // before any sequence number or rate-limit budget is touched): an
@@ -25976,26 +26092,37 @@ export class EventBus {
     // Design intent (EB-88): the topic-pause check above runs before this
     // gate — a schedule for a paused topic never takes a publisher token,
     // the same ordering as the live publish path.
+    // EB-182: the schedule-time fail-fast gates are genuine admission
+    // executions and are sampled like the live ones.
+    const delayedRateLimitStart = this.admissionGateStart();
     if (this.takePublisherToken(publisherId) !== undefined) {
+      this.admissionGateRecord(topic, 'publisher-rate-limit', delayedRateLimitStart);
       this.countPublisherRateLimited(topic, payload, publisherId);
       return undefined;
     }
+    this.admissionGateRecord(topic, 'publisher-rate-limit', delayedRateLimitStart);
     // Fail fast on ACL: an unauthorized publish never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
+    const delayedAclStart = this.admissionGateStart();
     if (!this.aclAllowsPublish(topic, publisherId)) {
+      this.admissionGateRecord(topic, 'acl', delayedAclStart);
       this.countAclDenied(topic, payload, publisherId, traceIdOfTraceparent(opts?.traceparent));
       return undefined;
     }
+    this.admissionGateRecord(topic, 'acl', delayedAclStart);
     // Fail fast on schema: a rejected payload never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Versioned
     // validators (EB-86) resolve the requested version here; a
     // deprecated-version admission is counted now (the due-time fan-out
     // is pre-admitted and never recounts). Counted the same way a
     // `publish` rejection is.
+    const delayedSchemaStart = this.admissionGateStart();
     if (!this.applySchemaVerdict(topic, payload, opts?.schemaVersion, publisherId, traceIdOfTraceparent(opts?.traceparent))) {
+      this.admissionGateRecord(topic, 'schema', delayedSchemaStart);
       return undefined;
     }
+    this.admissionGateRecord(topic, 'schema', delayedSchemaStart);
     // Fail fast on the per-topic message-size cap: an oversized payload
     // never becomes a scheduled delivery — same zero-side-effect semantics
     // as the schema fail-fast above.
@@ -31365,6 +31492,30 @@ export class EventBus {
     return { accepted, admitted: true, topic };
   }
 
+  /**
+   * Clock read for admission-gate timing (EB-182): returns `undefined`
+   * when admission-latency sampling is off, so the disabled publish
+   * path pays one branch and zero clock reads. Callers pass the result
+   * to `admissionGateRecord`.
+   */
+  private admissionGateStart(): number | undefined {
+    return this.admissionLatency === undefined ? undefined : this.now();
+  }
+
+  /**
+   * Records one admission-gate call-latency sample (EB-182): the bus-clock
+   * delta between `start` (from `admissionGateStart`) and now, clamped at
+   * 0 on clock regression. No-op when sampling is off.
+   */
+  private admissionGateRecord(
+    topic: string,
+    gate: AdmissionGate,
+    start: number | undefined,
+  ): void {
+    if (start === undefined) return;
+    this.admissionLatency!.recordGate(topic, gate, Math.max(0, this.now() - start));
+  }
+
   private fanOut(
     topic: string,
     payload: unknown,
@@ -31712,12 +31863,14 @@ export class EventBus {
     // (they were admitted at their own admission) and admission-DLQ
     // records (internal health traffic bypasses every gate).
     if (!preAdmitted && !admissionDlq && this.admissionWebhook !== undefined) {
+      const webhookStart = this.admissionGateStart();
       const webhookDecision = this.checkAdmissionWebhook(topic, payload, {
         publisherId,
         messageId,
         traceparent,
         binary,
       });
+      this.admissionGateRecord(topic, 'webhook', webhookStart);
       if (!webhookDecision.allowed) {
         this.countWebhookDenial(topic, payload, publisherId, webhookDecision.error);
         auditPublish(false, undefined, 'webhook-deny');
@@ -31740,6 +31893,16 @@ export class EventBus {
     // derived once from the publish's traceparent when it carried one.
     const admissionTraceId = traceIdOfTraceparent(traceparent);
     if (!preAdmitted && !admissionDlq) {
+      // EB-182: the total admission span starts at the first semantic
+      // gate and ends at the admission decision (any rejection below, or
+      // the fall-through past the last gate). Sequence-number
+      // assignment, the durable log and fan-out are past the decision and
+      // never sampled.
+      const admissionSpanStart = this.admissionGateStart();
+      const recordAdmissionSpan = (): void => {
+        if (admissionSpanStart === undefined) return;
+        this.admissionLatency!.record(topic, Math.max(0, this.now() - admissionSpanStart));
+      };
       // Per-publisher rate limiting (EB-79) is the first admission gate:
       // a cheap pre-filter that protects the bus from a single hot
       // publisher, so an over-budget publish is shed before the ACL, the
@@ -31757,11 +31920,15 @@ export class EventBus {
       // it burn a producer's budget would punish the producer for the
       // operator's window, and would make the shed's attribution
       // ambiguous (paused vs. over-budget).
+      const publisherRateLimitStart = this.admissionGateStart();
       if (this.takePublisherToken(publisherId) !== undefined) {
+        this.admissionGateRecord(topic, 'publisher-rate-limit', publisherRateLimitStart);
         this.countPublisherRateLimited(topic, payload, publisherId);
         auditPublish(false, undefined, 'publisher-rate-limit');
+        recordAdmissionSpan();
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'publisher-rate-limit' };
       }
+      this.admissionGateRecord(topic, 'publisher-rate-limit', publisherRateLimitStart);
       // Broker-level ACL runs before every other admission gate except
       // the per-publisher rate limiter above it (EB-79); topic aliases
       // were already resolved above. An
@@ -31769,11 +31936,15 @@ export class EventBus {
       // consumes no sequence number (subscribers see no gap), never touches
       // the durable log, and burns no rate-limit budget. Counted as a
       // rejection with reason 'acl' (see countAclDenied).
+      const aclStart = this.admissionGateStart();
       if (!this.aclAllowsPublish(topic, publisherId)) {
+        this.admissionGateRecord(topic, 'acl', aclStart);
         this.countAclDenied(topic, payload, publisherId, admissionTraceId);
         auditPublish(false, undefined, 'acl');
+        recordAdmissionSpan();
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'acl' };
       }
+      this.admissionGateRecord(topic, 'acl', aclStart);
       // Publish-side schema validation runs before admission: a rejected
       // payload never becomes a message — no sequence number is consumed
       // (subscribers see no gap), the durable log never sees it, and it
@@ -31781,10 +31952,14 @@ export class EventBus {
       // resolve the requested version here; admissions under a
       // superseded-but-graced version are counted in
       // `deprecatedSchemaVersions`.
+      const schemaStart = this.admissionGateStart();
       if (!this.applySchemaVerdict(topic, payload, schemaVersion, publisherId, admissionTraceId)) {
+        this.admissionGateRecord(topic, 'schema', schemaStart);
         auditPublish(false, undefined, 'schema');
+        recordAdmissionSpan();
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'schema' };
       }
+      this.admissionGateRecord(topic, 'schema', schemaStart);
       // Per-topic maximum message size runs after schema validation and
       // before sequence-number assignment: an oversized payload is rejected
       // before admission — no sequence number consumed (subscribers see no
@@ -31792,10 +31967,13 @@ export class EventBus {
       // budget — exactly the schema-rejection semantics. Counted in
       // `rejectedMessages`, surfaced on the admission-rejection hook with
       // reason 'message-too-big'.
+      const sizeStart = this.admissionGateStart();
       const maxBytes = this.maxMessageBytesForTopic(topic);
       if (maxBytes !== undefined && payloadByteSize(payload) > maxBytes) {
+        this.admissionGateRecord(topic, 'size', sizeStart);
         this.countMessageTooBig(topic, payload, publisherId, admissionTraceId);
         auditPublish(false, undefined, 'message-too-big');
+        recordAdmissionSpan();
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'message-too-big' };
       }
       // Per-topic payload-size cap (EB-120) runs right after the
@@ -31809,10 +31987,13 @@ export class EventBus {
       // 'payload-too-large'.
       const maxPayloadBytes = this.maxPayloadBytesForTopic(topic);
       if (maxPayloadBytes !== undefined && payloadByteSize(payload) > maxPayloadBytes) {
+        this.admissionGateRecord(topic, 'size', sizeStart);
         this.countPayloadTooLarge(topic, payload, publisherId);
         auditPublish(false, undefined, 'payload-too-large');
+        recordAdmissionSpan();
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'payload-too-large' };
       }
+      this.admissionGateRecord(topic, 'size', sizeStart);
       // Publish-side adaptive sampling (EB-38): the load-shedding gate
       // that complements the hard rate limit (EB-19). Position in the
       // admission order, and why:
@@ -31833,6 +32014,7 @@ export class EventBus {
       // comes from the injectable `EventBusOptions.samplingRandom`. A
       // rate of 0 short-circuits before drawing — the disabled path pays
       // one comparison and never consumes the random stream.
+      const samplingStart = this.admissionGateStart();
       if (critical !== true && this.sampleRules.size > 0) {
         const sampleRate = this.sampleRateForTopic(topic);
         if (
@@ -31840,11 +32022,14 @@ export class EventBus {
           sampleRate > 0 &&
           this.samplingRandom() < sampleRate
         ) {
+          this.admissionGateRecord(topic, 'sampling', samplingStart);
           this.countSampled(topic, payload, publisherId);
           auditPublish(false, undefined, 'sampled');
+          recordAdmissionSpan();
           return { matched: 0, accepted: 0, admitted: false, rejectReason: 'sampled' };
         }
       }
+      this.admissionGateRecord(topic, 'sampling', samplingStart);
       // Bus-wide fan-out pressure budget (EB-156): the last admission
       // gate, after every per-topic check and before sequence-number
       // assignment — the third layer of defense after the per-subscriber
@@ -31861,16 +32046,20 @@ export class EventBus {
       // admission-DLQ records (EB-139): internal health traffic must never
       // be shed by the load it reports on.
       if (this.maxPendingMessages !== undefined) {
+        const pressureStart = this.admissionGateStart();
         const width = this.estimateFanOutWidth(topic);
         if (width > 0) {
           const pending =
             this.laneQueued.urgent + this.laneQueued.normal + this.laneQueued.bulk;
           if (pending + width > this.maxPendingMessages) {
+            this.admissionGateRecord(topic, 'pressure', pressureStart);
             this.countPressureShed(topic, payload, publisherId, admissionTraceId);
             auditPublish(false, undefined, 'pressure');
+            recordAdmissionSpan();
             return { matched: 0, accepted: 0, admitted: false, rejectReason: 'pressure' };
           }
         }
+        this.admissionGateRecord(topic, 'pressure', pressureStart);
       }
       // Namespace tenant quota (EB-162): the last pre-admission gate —
       // after every semantic check (so only publishes that would
@@ -31880,12 +32069,16 @@ export class EventBus {
       // nothing to the durable log, and burns no rate-limit token.
       // Skipped for pre-admitted re-fan-outs and admission-DLQ records,
       // like the gates above.
+      const quotaStart = this.admissionGateStart();
       const quotaRule = this.checkTenantQuota(topic, payload, 'record');
       if (quotaRule !== undefined) {
+        this.admissionGateRecord(topic, 'tenant-quota', quotaStart);
         this.countTenantQuotaShed(topic, payload, publisherId, admissionTraceId, quotaRule);
         auditPublish(false, undefined, 'tenant-quota');
+        recordAdmissionSpan();
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'tenant-quota' };
       }
+      this.admissionGateRecord(topic, 'tenant-quota', quotaStart);
       // Bus-level global publish rate limit (EB-180): the last
       // pre-admission gate — after every per-topic check (so only
       // publishes that would otherwise be admitted consume global
@@ -31896,12 +32089,20 @@ export class EventBus {
       // token. Skipped for pre-admitted re-fan-outs and admission-DLQ
       // records, like the gates above.
       if (this.globalPublishRateLimiter !== undefined) {
+        const globalRateLimitStart = this.admissionGateStart();
         if (!this.globalPublishRateLimiter.tryTake()) {
+          this.admissionGateRecord(topic, 'global-rate-limit', globalRateLimitStart);
           this.countGlobalRateLimited(topic, payload, publisherId, admissionTraceId);
           auditPublish(false, undefined, 'global-rate-limit');
+          recordAdmissionSpan();
           return { matched: 0, accepted: 0, admitted: false, rejectReason: 'global-rate-limit' };
         }
+        this.admissionGateRecord(topic, 'global-rate-limit', globalRateLimitStart);
       }
+      // All gates passed: the admission decision is final here. The
+      // total-span sample stops before sequence-number assignment, the
+      // durable log and fan-out below.
+      recordAdmissionSpan();
     }
     // The message identity rides the envelope end to end (durable log,
     // replay, cluster forwarding, redeliveries) for subscriber-side
@@ -32035,7 +32236,9 @@ export class EventBus {
         bucket = new TokenBucket(limit.burst, limit.messagesPerSec, this.now);
         this.rateLimitBuckets.set(topic, bucket);
       }
+      const topicRateLimitStart = this.admissionGateStart();
       if (!bucket.take()) {
+        this.admissionGateRecord(topic, 'topic-rate-limit', topicRateLimitStart);
         this.countRateLimited(topic, payload, publisherId, admissionTraceId);
         // The keySeq was consumed at schedule time but the message never
         // fans out: release every subscriber's expectation past it, or a
@@ -32048,6 +32251,7 @@ export class EventBus {
         auditPublish(false, undefined, 'rate-limit');
         return { matched: 0, accepted: 0, admitted: false, rejectReason: 'rate-limit' };
       }
+      this.admissionGateRecord(topic, 'topic-rate-limit', topicRateLimitStart);
     }
     // Delivery-trace sampling decision (EB-45): head-based, taken once the
     // message is admitted — a schema rejection or rate-limit shed above
@@ -33596,6 +33800,28 @@ export class EventBus {
         p99Ms: s.p99Ms,
         samples: s.samples,
       }));
+    // Publish-side admission latency (EB-182): per-topic total-span
+    // summaries, the per-(topic, gate) breakdown, and the slow-admission
+    // hotspot ranking — all empty when sampling is disabled.
+    const admissionLatency = this.admissionLatency;
+    const publishLatency: BusStats['publishLatency'] =
+      admissionLatency === undefined
+        ? []
+        : admissionLatency.topics().map((topic) => ({
+            topic,
+            ...admissionLatency.summary(topic),
+          }));
+    const publishLatencyGates: BusStats['publishLatencyGates'] =
+      admissionLatency === undefined
+        ? []
+        : admissionLatency.topics().flatMap((topic) => {
+            const perGate = admissionLatency.gateSummary(topic);
+            return (Object.keys(perGate) as AdmissionGate[])
+              .filter((gate) => perGate[gate].samples > 0)
+              .map((gate) => ({ topic, gate, ...perGate[gate] }));
+          });
+    const slowAdmissionTopics: BusStats['slowAdmissionTopics'] =
+      admissionLatency === undefined ? [] : admissionLatency.topSlowTopics(5);
     const laggingSubscribers = lag
       .filter((s) => s.samples > 0)
       .sort((a, b) => b.p99Ms - a.p99Ms)
@@ -33865,6 +34091,9 @@ export class EventBus {
       sloMisses: this.totalSloMisses,
       sloMissesByPhase,
       slowestSubscribers,
+      publishLatency,
+      publishLatencyGates,
+      slowAdmissionTopics,
       lag,
       laggingSubscribers,
       keyedReorderedMessages: this.totalKeyedReordered,

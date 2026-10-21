@@ -6096,3 +6096,56 @@ a topic it matches) and throws when none is registered under exactly
 that pattern. Clearing a rule (`clearTopicEncryption`) makes queued or
 logged sealed messages undecryptable — rotate first and let the grace
 window drain when that loss is unacceptable.
+
+## Publish admission latency (EB-182)
+
+Opt-in publish-side admission observability (`src/publishlatency.ts`):
+how long the *admission phase* costs per publish, decomposed per
+admission gate. The span runs from the first admission gate to the
+admission decision (admitted or rejected) — sequence-number
+assignment, the durable log, compression and fan-out are past the
+decision point and never sampled, so this never double-samples the
+EB-31/EB-40/EB-53 delivery-side distributions:
+
+```ts
+const bus = new EventBus({
+  publishLatency: { windowSize: 1024, slowAdmissionThresholdMs: 50 },
+});
+
+bus.setTopicSchema('orders', heavyValidator); // 25ms of validator work
+bus.publish('orders', { id: 1 });
+
+const stats = bus.getStats();
+stats.publishLatency; // per-topic p50/p95/p99, min/max/mean, slowCount
+stats.publishLatencyGates; // per-(topic, gate) breakdown
+stats.slowAdmissionTopics; // hotspot ranking by total-span p99 (top 5)
+```
+
+Semantics:
+
+- **Total span + per-gate breakdown.** One total-span sample per
+  admission decision per topic, plus one sample per executed gate into
+  a per-(topic, gate) window. Gates: `webhook`,
+  `publisher-rate-limit`, `acl`, `schema`, `size`, `sampling`,
+  `pressure`, `tenant-quota`, `global-rate-limit`, `topic-rate-limit`,
+  `idempotency-dedup`.
+- **All five publish entry points.** `publish`, `publishBatch` (per
+  entry), `publishIdempotent` (the pre-`fanOut` ACL check and the
+  dedup-table probe, then the admitted path), `publishDelayed` (the
+  schedule-time fail-fast gates; the due-time fan-out is pre-admitted,
+  so only the topic-rate-limit gate re-runs), and `publishAtomic`
+  (one total-span sample per entry through the shadow admission
+  verdict).
+- **Hotspot identification.** A topic whose schema validator is heavy
+  shows a hot `schema` gate while its `acl` gate stays flat; the
+  `slowAdmissionTopics` ranking (by total-span p99) is the admission
+  equivalent of `slowestSubscribers`.
+- **Prometheus.** `eventbus_publish_admission_latency_ms{quantile,topic}`
+  (p50/p95/p99), `eventbus_publish_admission_latency_samples{topic}`,
+  `eventbus_publish_admission_slow_total{topic}` (samples at or above
+  the slow threshold), and
+  `eventbus_publish_admission_gate_latency_ms{quantile,topic,gate}`.
+- **Zero-cost when off.** Disabled by default: the publish path pays
+  one branch per gate and zero clock reads. Latencies come from the bus
+  clock (`EventBusOptions.now`), so tests drive deterministic values
+  with a controllable clock; a backwards clock clamps samples at 0.

@@ -186,6 +186,22 @@
  *   appear.
  * - `eventbus_delivery_latency_samples{subscriber,pattern}`: samples
  *   currently in each tracked subscriber's latency window.
+ * - `eventbus_publish_admission_latency_ms{quantile,topic}`: per-topic
+ *   publish-admission latency (EB-182) — first admission gate to the
+ *   admission decision, nearest-rank p50/p95/p99 over each topic's
+ *   bounded rolling window (`quantile` is "0.5", "0.95" or "0.99").
+ *   Rendered only when the bus was built with
+ *   `EventBusOptions.publishLatency` and the topic has samples.
+ * - `eventbus_publish_admission_latency_samples{topic}`: samples
+ *   currently in each topic's admission-latency window.
+ * - `eventbus_publish_admission_slow_total{topic}`: samples at or above
+ *   the configured slow-admission threshold in each topic's window.
+ * - `eventbus_publish_admission_gate_latency_ms{quantile,topic,gate}`:
+ *   per-(topic, gate) admission-gate call latency (EB-182) —
+ *   nearest-rank p50/p95/p99; the gate-attribution breakdown for slow
+ *   admissions (`gate` is one of `webhook`, `publisher-rate-limit`,
+ *   `acl`, `schema`, `size`, `sampling`, `pressure`, `tenant-quota`,
+ *   `global-rate-limit`, `topic-rate-limit`, `idempotency-dedup`).
  * - `eventbus_delayed_schedule_skew_ms{quantile}`: delayed-delivery
  *   schedule-skew distribution (EB-136) — each fanned-out schedule's
  *   actual fan-out time minus its due time (`deliverAt`), nearest-rank
@@ -590,6 +606,44 @@ export function renderPrometheus(stats: BusStats): string {
     lines.push(`eventbus_delivery_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
     lines.push(`eventbus_delivery_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
     lines.push(`eventbus_delivery_latency_samples{${labels}} ${s.samples}`);
+  }
+
+  // Publish-side admission latency (EB-182, opt-in via
+  // `EventBusOptions.publishLatency`): per-topic total-span distribution
+  // plus the per-(topic, gate) breakdown. HELP/TYPE always render like
+  // the other opt-in blocks; the series render only for topics with
+  // samples — a disabled bus, or one whose window is still empty,
+  // contributes no series. The `?? []` keeps the renderer tolerant of a
+  // stats object that predates the field (hand-built fixtures included).
+  lines.push(
+    '# HELP eventbus_publish_admission_latency_ms Per-topic publish-admission latency: first admission gate to the admission decision, in milliseconds — nearest-rank p50/p95/p99 over the rolling sample window. Never double-samples the delivery-side distributions.',
+  );
+  lines.push('# TYPE eventbus_publish_admission_latency_ms gauge');
+  lines.push(
+    '# HELP eventbus_publish_admission_latency_samples Samples currently in the topic admission-latency window.',
+  );
+  lines.push('# TYPE eventbus_publish_admission_latency_samples gauge');
+  lines.push(
+    '# HELP eventbus_publish_admission_slow_total Samples at or above the configured slow-admission threshold in the topic admission-latency window.',
+  );
+  lines.push('# TYPE eventbus_publish_admission_slow_total gauge');
+  for (const s of stats.publishLatency ?? []) {
+    const labels = `topic="${escapeLabelValue(s.topic)}"`;
+    lines.push(`eventbus_publish_admission_latency_ms{quantile="0.5",${labels}} ${s.p50Ms}`);
+    lines.push(`eventbus_publish_admission_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
+    lines.push(`eventbus_publish_admission_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
+    lines.push(`eventbus_publish_admission_latency_samples{${labels}} ${s.samples}`);
+    lines.push(`eventbus_publish_admission_slow_total{${labels}} ${s.slowCount}`);
+  }
+  lines.push(
+    '# HELP eventbus_publish_admission_gate_latency_ms Per-(topic, gate) admission-gate call latency in milliseconds — nearest-rank p50/p95/p99 over the rolling sample window; the gate-attribution breakdown for slow admissions.',
+  );
+  lines.push('# TYPE eventbus_publish_admission_gate_latency_ms gauge');
+  for (const s of stats.publishLatencyGates ?? []) {
+    const labels = `topic="${escapeLabelValue(s.topic)}",gate="${s.gate}"`;
+    lines.push(`eventbus_publish_admission_gate_latency_ms{quantile="0.5",${labels}} ${s.p50Ms}`);
+    lines.push(`eventbus_publish_admission_gate_latency_ms{quantile="0.95",${labels}} ${s.p95Ms}`);
+    lines.push(`eventbus_publish_admission_gate_latency_ms{quantile="0.99",${labels}} ${s.p99Ms}`);
   }
 
   // Delayed-delivery schedule-skew distribution (EB-136): bus-wide,
