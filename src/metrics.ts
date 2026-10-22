@@ -832,6 +832,24 @@ export function renderPrometheus(stats: BusStats): string {
     }
   }
 
+  // Watermark idle advancement (EB-189): per-topic idle-episode counts.
+  // Activity-gated — the HELP/TYPE block and the series render only when
+  // at least one topic advanced, so a bus without idle rules renders
+  // byte-identical exposition to before. `?.` keeps the renderer
+  // tolerant of a stats object that predates the field (hand-built
+  // fixtures included), mirroring the idempotency idiom below.
+  const watermarkIdleTopics = stats.topics.filter((t) => (t.watermarkIdle?.advances ?? 0) > 0);
+  if (watermarkIdleTopics.length > 0) {
+    lines.push(
+      '# HELP eventbus_watermark_idle_advances_total Watermark idle advancements (EB-189): how many times the topic event-time stream was declared idle after silence exceeded its idle timeout.',
+    );
+    lines.push('# TYPE eventbus_watermark_idle_advances_total counter');
+    for (const t of stats.topics) {
+      const label = `topic="${escapeLabelValue(t.topic)}"`;
+      lines.push(`eventbus_watermark_idle_advances_total{${label}} ${t.watermarkIdle?.advances ?? 0}`);
+    }
+  }
+
   // Explicit idempotency-key hits (EB-151): per-topic suppression counts.
   // Activity-gated — the HELP/TYPE block and the series render only when
   // at least one topic has a hit, so a bus without idempotency-key

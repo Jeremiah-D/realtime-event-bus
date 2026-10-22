@@ -1652,6 +1652,28 @@ library.
   `eventbus_topic_event_time_watermark{topic}`. Natural fit for
   fintech/settlement feeds: a retried settlement that arrives after the
   stream moved on is flagged late instead of silently double-applied.
+- **Watermark idle advancement** (in `src/bus.ts`, opt-in via
+  `setTopicWatermarkIdle(topicPattern, idleTimeoutMs)` /
+  `clearTopicWatermarkIdle(topicPattern)`, EB-189): the watermark only
+  moves when event-time publishes arrive, so a source that goes quiet
+  leaves the watermark — and every downstream event-time window or
+  lateness judgment waiting on stream progress — permanently stalled.
+  With an idle rule, silence longer than `idleTimeoutMs` (bus clock)
+  advances the watermark to the highest observed event time (allowed
+  lateness still deducted) and fires the bus-level
+  `EventBusOptions.onWatermarkIdle` hook once per idle episode
+  (error-isolated). The watermark value itself is unchanged — it is
+  already `maxEventTime − allowedLatenessMs` — but the idle episode is
+  now explicit, so downstream consumers can stop waiting and close
+  their windows. Only event-time publishes count as activity; a new
+  event-time publish re-arms the timer; late judgments after an idle
+  episode still use the unchanged watermark (never rolls back). Rule
+  resolution mirrors `setTopicAllowedLateness` (exact topic wins over
+  patterns). `getStats()` exposes per-topic `watermarkIdle`
+  (`{lastAdvanceAt, advances}`, present only when a rule matches) and
+  `src/metrics.ts` renders `eventbus_watermark_idle_advances_total`
+  (activity-gated). Invalid values throw `RangeError`. Disabled by
+  default.
 - **Subscriber batch delivery** (in `src/bus.ts`, opt-in via
   `subscribe(..., { batch: true })`): the drain collects up to `maxSize`
   queued messages (default 100) and invokes the handler once with the
@@ -2495,6 +2517,16 @@ npm test
   publishes never moving the watermark, `eventTime` on batch/atomic
   entries, durable-log persistence with replay restoring the envelope, and
   the late-message/watermark Prometheus series.
+- `test/watermark-idle.test.ts` — watermark idle advancement (EB-189):
+  `setTopicWatermarkIdle`/`clearTopicWatermarkIdle` semantics, idle
+  callback firing after event-time silence (edge-triggered, re-armed by
+  new activity), plain publishes never arming the timer, late judgments
+  after idle using the unchanged watermark (no rollback), allowed
+  lateness still deducted at advancement, `getStats().watermarkIdle`
+  shape, activity-gated `eventbus_watermark_idle_advances_total`
+  exposition, pattern rules with exact-wins-over-pattern resolution,
+  `onWatermarkIdle` error isolation, and invalid config throwing
+  `RangeError`/`TypeError`.
 - `test/shadow.test.ts` — shadow subscriber traffic mirroring (EB-63): a
   shadow subscription receiving a full copy of production traffic, the
   mirror excluded from the `publish` fan-out width and the topic's
@@ -3604,6 +3636,7 @@ Exported series:
 | `eventbus_topic_partition_published_total{topic,partition}` | counter | per-partition `publishedMessages` (EB-90); only emitted for topics with more than one configured partition |
 | `eventbus_topic_late_messages_total{topic}` | counter | per-topic `lateMessages` (EB-59) |
 | `eventbus_topic_event_time_watermark{topic}` | gauge | per-topic event-time watermark in epoch ms (EB-59); only emitted for topics with at least one event-time publish |
+| `eventbus_watermark_idle_advances_total{topic}` | counter | per-topic watermark idle advancements (EB-189); activity-gated — only emitted when at least one topic advanced |
 | `eventbus_payload_bytes_bucket{topic,le}` | histogram | per-topic cumulative payload-size histogram of admitted publishes in bytes (EB-143); `le` from the topic's configured buckets plus `+Inf`; only topics with a matching histogram rule |
 | `eventbus_payload_bytes_count{topic}` | counter | per-topic sampled publish count (EB-143) |
 | `eventbus_payload_bytes_sum{topic}` | counter | per-topic sampled payload bytes (EB-143) |

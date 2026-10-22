@@ -4448,6 +4448,19 @@ export interface EventBusOptions {
    */
   onLate?: LateMessageCallback;
   /**
+   * Watermark idle-advance hook (EB-189): called once when a topic with
+   * an idle rule (`EventBus.setTopicWatermarkIdle`) sees no event-time
+   * publish for its configured idle timeout. The event carries the
+   * topic, the watermark at advancement (`max(eventTime) -
+   * allowedLatenessMs`), and the observed silence in milliseconds.
+   * Edge-triggered — one call per idle episode; a new event-time
+   * publish re-arms the timer. The callback is error-isolated: a
+   * throwing hook is swallowed so a broken observer can never disturb
+   * the publish path. Default: unset (no hook — fully backward
+   * compatible).
+   */
+  onWatermarkIdle?: WatermarkIdleCallback;
+  /**
    * Deterministic fault-injection harness (see `src/chaos.ts`, EB-103):
    * scripted faults at the `admission`, `drain`, and `handler` targets so
    * tests and pre-production drills can deterministically reproduce
@@ -4666,6 +4679,16 @@ export interface TopicStats {
    * reading immediately.
    */
   watermark: number | undefined;
+  /**
+   * Watermark idle-advancement state (EB-189): present only when an idle
+   * rule currently matches the topic (`setTopicWatermarkIdle`).
+   * `advances` counts completed idle episodes (edge-triggered, one per
+   * quiet period); `lastAdvanceAt` is the bus-clock time of the most
+   * recent advancement (`undefined` before the first). Omitted
+   * otherwise, so stats snapshots without idle rules are byte-identical
+   * to before.
+   */
+  watermarkIdle?: WatermarkIdleStats;
   /**
    * Idempotent publishes to this topic suppressed as duplicates (see
    * `publishIdempotent`): the retry arrived with a `(topic, messageId)`
@@ -12260,6 +12283,60 @@ interface TenantQuotaRule {
 /** Hard cap on a quota rule's live second-buckets (clock-jump safety). */
 const TENANT_QUOTA_MAX_BUCKETS = 4096;
 
+/**
+ * Fired when a topic's event-time stream goes quiet for its configured
+ * idle timeout (see `EventBusOptions.onWatermarkIdle`, EB-189). The
+ * watermark is advanced to the highest observed event time (with the
+ * topic's allowed lateness still deducted) — the value is unchanged,
+ * but the idle episode is now explicit so downstream event-time
+ * windows and lateness judgments waiting on stream progress can
+ * proceed.
+ */
+export interface WatermarkIdleEvent {
+  /** The concrete topic whose event-time stream went idle. */
+  topic: string;
+  /**
+   * The topic's event-time watermark at advancement:
+   * `max(eventTime) - allowedLatenessMs` over the admitted publishes
+   * that carried an event time (EB-59).
+   */
+  watermark: number;
+  /** Milliseconds of event-time silence observed when the timer fired. */
+  idleMs: number;
+}
+
+/** Watermark idle-advance hook (see `EventBusOptions.onWatermarkIdle`). */
+export type WatermarkIdleCallback = (event: WatermarkIdleEvent) => void;
+
+/**
+ * Per-topic watermark idle-advancement state for `getStats()`
+ * (EB-189): present only when an idle rule currently matches the topic.
+ */
+export interface WatermarkIdleStats {
+  /**
+   * Bus-clock time of the most recent idle advancement; `undefined`
+   * before the first.
+   */
+  lastAdvanceAt: number | undefined;
+  /** Idle episodes completed (edge-triggered, one per quiet period). */
+  advances: number;
+}
+
+/**
+ * Per-topic watermark idle tracking state (EB-189): one entry per
+ * concrete topic with event-time traffic that matches an idle rule.
+ */
+interface WatermarkIdleState {
+  /** Bus-clock of the last admitted event-time publish on the topic. */
+  lastActivity: number;
+  /** Idle-expiry timer, armed while the topic has recent activity. Unref'd. */
+  timer?: ReturnType<typeof setTimeout>;
+  /** Idle episodes completed (edge-triggered). */
+  advances: number;
+  /** Bus-clock of the most recent idle advancement, if any. */
+  lastAdvanceAt: number | undefined;
+}
+
 export class EventBus {
   /**
    * Stable identity of this bus instance (see `EventBusOptions.busId`):
@@ -12950,6 +13027,12 @@ export class EventBus {
    */
   private readonly onLate?: LateMessageCallback;
   /**
+   * Bus-level watermark idle-advance hook (see
+   * `EventBusOptions.onWatermarkIdle`), fired error-isolated once per
+   * idle episode.
+   */
+  private readonly onWatermarkIdle?: WatermarkIdleCallback;
+  /**
    * Per-topic allowed-lateness overrides, keyed by the exact string passed
    * to `setTopicAllowedLateness` — either a concrete topic name or a
    * wildcard pattern. Match resolution mirrors the TTL and rate-limit
@@ -12972,6 +13055,28 @@ export class EventBus {
    * as `topicStats`.
    */
   private readonly eventWatermarks = new Map<string, EventTimeWatermark>();
+  /**
+   * Watermark idle-advancement rules (EB-189): topic pattern →
+   * idleTimeoutMs. Match resolution mirrors the allowed-lateness rules:
+   * an exact-topic rule wins over any pattern; between patterns the
+   * earliest-registered rule wins. Empty by default — idle advancement
+   * is opt-in per topic.
+   */
+  private watermarkIdleRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in
+   * `watermarkIdleRules`, kept apart from the subscriber pattern cache
+   * so idle configuration never inflates `patternCacheSize`.
+   */
+  private watermarkIdleMatcherCache = new Map<string, RegExp>();
+  /**
+   * Per-topic watermark idle tracking state (EB-189). An entry appears
+   * on the first admitted event-time publish to a topic that matches an
+   * idle rule and persists while the rule matches — topics without
+   * event-time publishes never appear here. Bounded by the distinct
+   * idle-configured topics with event-time traffic.
+   */
+  private readonly watermarkIdleStates = new Map<string, WatermarkIdleState>();
   /**
    * Messages admitted with a business event time older than their topic's
    * event-time watermark (global total). Late messages are still
@@ -14297,6 +14402,11 @@ export class EventBus {
       throw new TypeError('onLate must be a function');
     }
     this.onLate = onLate;
+    const onWatermarkIdle = options?.onWatermarkIdle;
+    if (onWatermarkIdle !== undefined && typeof onWatermarkIdle !== 'function') {
+      throw new TypeError('onWatermarkIdle must be a function');
+    }
+    this.onWatermarkIdle = onWatermarkIdle;
     // Deterministic fault-injection harness (EB-103): validated here,
     // fail-fast — an invalid scenario must never half-arm a bus. Absent
     // or empty means no injector at all (zero overhead, zero behavior
@@ -16370,6 +16480,76 @@ export class EventBus {
   }
 
   /**
+   * Opts a topic into event-time watermark idle advancement (EB-189):
+   * when the topic's event-time stream goes quiet for `idleTimeoutMs`
+   * milliseconds on the bus clock (`EventBusOptions.now`), the watermark
+   * is advanced to the highest observed event time (with the topic's
+   * allowed lateness still deducted) and `EventBusOptions.onWatermarkIdle`
+   * fires once for the idle episode.
+   *
+   * Why this exists: the watermark (`max(eventTime) -
+   * allowedLatenessMs`) only moves when event-time publishes arrive. A
+   * source that goes quiet leaves the watermark — and every downstream
+   * event-time window or lateness judgment waiting on stream progress —
+   * permanently stalled. Idle advancement marks the episode explicitly:
+   * the watermark value itself is unchanged (it is already
+   * `maxEventTime - allowedLatenessMs`), but the advancement is now
+   * observable — the callback, `getStats()`' per-topic `watermarkIdle`
+   * (`{lastAdvanceAt, advances}`), and the
+   * `eventbus_watermark_idle_advances_total` exposition series — so
+   * downstream consumers can stop waiting and close their windows.
+   *
+   * Semantics:
+   * - Only publishes carrying an event time (`PublishOptions.eventTime`)
+   *   count as stream activity: plain publishes neither arm the timer
+   *   nor reset it.
+   * - Edge-triggered: one callback per idle episode. A new event-time
+   *   publish re-arms the timer; while the stream stays quiet no
+   *   further callbacks fire.
+   * - Late judgments are unaffected: a message arriving after the idle
+   *   advancement is still judged against the (unchanged) watermark —
+   *   the watermark never rolls back — and a new event-time peak
+   *   advances it normally.
+   * - Rule resolution mirrors `setTopicAllowedLateness`: an exact-topic
+   *   rule wins over any pattern; between patterns the
+   *   earliest-registered wins. Disabled by default (no rule, no timer,
+   *   no overhead beyond one map lookup per event-time publish).
+   *
+   * Throws `RangeError` before anything is registered on an empty topic
+   * pattern or a non-positive/non-finite `idleTimeoutMs`.
+   */
+  setTopicWatermarkIdle(topicPattern: string, idleTimeoutMs: number): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+      throw new RangeError(
+        'setTopicWatermarkIdle: idleTimeoutMs must be a positive finite number of milliseconds',
+      );
+    }
+    this.watermarkIdleRules.set(topicPattern, idleTimeoutMs);
+  }
+
+  /**
+   * Removes the watermark-idle rule previously registered for
+   * `topicPattern`. Per-topic idle state that no longer matches any rule
+   * is dropped (armed timers are cancelled); the topic falls back to no
+   * idle advancement. Returns true when a rule existed and was removed.
+   */
+  clearTopicWatermarkIdle(topicPattern: string): boolean {
+    const removed = this.watermarkIdleRules.delete(topicPattern);
+    if (removed) {
+      for (const [topic, state] of [...this.watermarkIdleStates]) {
+        if (this.watermarkIdleForTopic(topic) === undefined) {
+          if (state.timer !== undefined) clearTimeout(state.timer);
+          this.watermarkIdleStates.delete(topic);
+        }
+      }
+    }
+    return removed;
+  }
+
+  /**
    * Defines a CEP sequence pattern (EB-170): declares that the `steps`
    * topics — in order, on the same correlation key — within `withinMs`
    * milliseconds constitute a match. Returns the pattern id.
@@ -16657,6 +16837,112 @@ export class EventBus {
   }
 
   /**
+   * Returns the watermark idle timeout in milliseconds that applies to
+   * `topic`: the exact-topic rule first, then the earliest-registered
+   * matching pattern, then `undefined` (idle advancement disabled).
+   * Mirrors `allowedLatenessForTopic`'s precedence.
+   */
+  private watermarkIdleForTopic(topic: string): number | undefined {
+    const exact = this.watermarkIdleRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, ms] of this.watermarkIdleRules) {
+      let matcher = this.watermarkIdleMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.watermarkIdleMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return ms;
+    }
+    return undefined;
+  }
+
+  /**
+   * Builds the `getStats()` watermark-idle snapshot for `topic`
+   * (EB-189): `undefined` when no idle rule currently matches the
+   * topic, so the `watermarkIdle` key stays absent and idle-free
+   * snapshots are byte-identical to before.
+   */
+  private watermarkIdleSnapshot(topic: string): WatermarkIdleStats | undefined {
+    if (this.watermarkIdleForTopic(topic) === undefined) return undefined;
+    const state = this.watermarkIdleStates.get(topic);
+    return {
+      lastAdvanceAt: state?.lastAdvanceAt,
+      advances: state?.advances ?? 0,
+    };
+  }
+
+  /**
+   * Records one admitted event-time publish as stream activity for
+   * watermark idle tracking (EB-189). Only event-time publishes count:
+   * a plain publish is not event-time stream traffic, so it neither
+   * arms the idle timer nor resets it. Topics without an idle rule pay a
+   * single map lookup here.
+   */
+  private noteWatermarkActivity(topic: string): void {
+    const idleMs = this.watermarkIdleForTopic(topic);
+    if (idleMs === undefined) return;
+    const nowMs = this.now();
+    let state = this.watermarkIdleStates.get(topic);
+    if (state === undefined) {
+      state = { lastActivity: nowMs, advances: 0, lastAdvanceAt: undefined, timer: undefined };
+      this.watermarkIdleStates.set(topic, state);
+    } else {
+      state.lastActivity = nowMs;
+    }
+    this.armWatermarkIdleTimer(topic, state, idleMs);
+  }
+
+  /**
+   * Arms the per-topic watermark idle timer. The timer is `unref()`'d,
+   * so an idle topic never keeps the process alive; on fire it advances
+   * the watermark when the topic's event-time stream has been quiet for
+   * the configured timeout, then disarms — edge-triggered, the next
+   * event-time publish re-arms. When the injected bus clock has not
+   * advanced since arming (a frozen test clock), the timer simply
+   * disarms instead of spinning against a dead clock.
+   */
+  private armWatermarkIdleTimer(topic: string, state: WatermarkIdleState, idleMs: number): void {
+    if (state.timer !== undefined) return;
+    const armedAt = this.now();
+    const delay = Math.max(0, state.lastActivity + idleMs - armedAt);
+    const timer = setTimeout(() => {
+      state.timer = undefined;
+      const current = this.watermarkIdleForTopic(topic);
+      if (current === undefined) {
+        // The rule was removed while armed: drop the per-topic state.
+        this.watermarkIdleStates.delete(topic);
+        return;
+      }
+      const nowMs = this.now();
+      if (nowMs <= armedAt) return;
+      if (nowMs - state.lastActivity >= current) {
+        const wm = this.eventWatermarks.get(topic);
+        if (wm !== undefined) {
+          const watermark = wm.watermarkFor(this.allowedLatenessForTopic(topic));
+          if (watermark !== undefined) {
+            state.advances += 1;
+            state.lastAdvanceAt = nowMs;
+            const onIdle = this.onWatermarkIdle;
+            if (onIdle !== undefined) {
+              try {
+                onIdle({ topic, watermark, idleMs: nowMs - state.lastActivity });
+              } catch {
+                // Swallowed: a failing observer must never break publishing.
+              }
+            }
+          }
+        }
+        // Edge-triggered: stay disarmed until new event-time activity.
+      } else {
+        this.armWatermarkIdleTimer(topic, state, current);
+      }
+    }, delay);
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    state.timer = timer;
+  }
+
+  /**
    * Folds one admitted publish's event time into the topic's event-time
    * watermark (EB-59). A message older than the watermark is late: it is
    * counted on the topic and the bus total, and the bus-level `onLate`
@@ -16672,6 +16958,9 @@ export class EventBus {
     }
     const allowedLatenessMs = this.allowedLatenessForTopic(topic);
     const observation = state.observe(eventTime, allowedLatenessMs);
+    // Watermark idle tracking (EB-189): every admitted event-time
+    // publish — late or not — is stream activity.
+    this.noteWatermarkActivity(topic);
     if (!observation.late) return;
     this.statsFor(topic).lateMessages += 1;
     this.totalLateMessages += 1;
@@ -35545,6 +35834,13 @@ export class EventBus {
         // immediately; `undefined` when no event-time publish has ever
         // been admitted on the topic.
         watermark: this.eventWatermarks.get(topic)?.watermarkFor(this.allowedLatenessForTopic(topic)),
+        // Watermark idle advancement (EB-189): present only when an idle
+        // rule currently matches the topic — the key is absent otherwise,
+        // so idle-free snapshots are byte-identical to before.
+        ...(() => {
+          const idle = this.watermarkIdleSnapshot(topic);
+          return idle === undefined ? {} : { watermarkIdle: idle };
+        })(),
         duplicateMessages: stats.duplicateMessages,
         idempotentHits: stats.idempotentHits,
         aliasRetiredMessages: stats.aliasRetiredMessages,
