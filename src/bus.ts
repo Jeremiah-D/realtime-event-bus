@@ -4939,6 +4939,13 @@ export interface BusStats {
   /** Total messages accepted via `publish`/`publishBatch`. */
   totalPublished: number;
   /**
+   * Total structured publish receipts issued via the `publishReceipt*`
+   * family (EB-190): `publishReceipt`, `publishReceiptBatch`,
+   * `publishReceiptAtomic` — one per call, regardless of how many
+   * entries the receipt accepted or rejected.
+   */
+  receiptsIssued: number;
+  /**
    * Total messages handed to subscriber handlers. Counts each handler
    * invocation, so at-least-once redeliveries count again; a handler
    * that throws still received the message, and still counts.
@@ -10522,6 +10529,78 @@ export interface AtomicPublishResult {
 }
 
 /**
+ * One accepted entry of a `PublishReceipt` (EB-190): the topic as the
+ * caller addressed it and the per-topic sequence number stamped at
+ * fan-out. An upstream holding the receipt can reconcile "accepted"
+ * against the subscriber-side gap detector (`TopicStats.lastSeq` /
+ * `sequenceGaps`) — every accepted entry must eventually surface with
+ * its seq, or show up as a gap.
+ */
+export interface PublishReceiptAcceptedEntry {
+  /** The topic as passed to the publish call (pre alias resolution for batch entries). */
+  topic: string;
+  /** The per-topic sequence number stamped at fan-out (starts at 1). */
+  seq: number;
+}
+
+/**
+ * One rejected entry of a `PublishReceipt` (EB-190): the topic as the
+ * caller addressed it and the admission gate that refused it, in the
+ * shared `AdmissionRejectReason` vocabulary — the same reasons
+ * `EventBusOptions.onAdmissionRejected` reports, so a rejected entry
+ * reconciles 1:1 with the bus's admission-rejection counters.
+ */
+export interface PublishReceiptRejectedEntry {
+  /** The topic as passed to the publish call. */
+  topic: string;
+  /** The admission gate that refused the entry. */
+  reason: AdmissionRejectReason;
+}
+
+/**
+ * Outcome of the `publishReceipt*` family (EB-190): a structured,
+ * per-entry publish receipt. `accepted` lists every entry that cleared
+ * admission (with its stamped seq); `rejected` lists every entry an
+ * admission gate refused (with the gate's reason). Exactly one of the
+ * two arrays holds a given entry — an entry is never in both, and for
+ * the single/batch forms every input entry appears in exactly one.
+ */
+export interface PublishReceipt {
+  accepted: Array<PublishReceiptAcceptedEntry>;
+  rejected: Array<PublishReceiptRejectedEntry>;
+}
+
+/**
+ * Maps an atomic-batch rejection reason onto the shared
+ * `AdmissionRejectReason` vocabulary (EB-190): every
+ * `AtomicRejectReason` already is an `AdmissionRejectReason` except
+ * `'idempotency-conflict'`, which surfaces on the unified
+ * admission-rejection hook as `'duplicate'` (see `publishAtomic`) — the
+ * receipt follows the hook, not the internal atomic enum.
+ */
+function atomicReasonToAdmissionReason(reason: AtomicRejectReason): AdmissionRejectReason {
+  return reason === 'idempotency-conflict' ? 'duplicate' : reason;
+}
+
+/**
+ * Outcome of `admitAtomicBatch` (EB-190 extraction): the phase-1 shadow
+ * admission of a `publishAtomic` batch. `verdicts` carries one entry per
+ * evaluated batch entry — `reason` set when the entry failed its own
+ * gate, in the shared `AdmissionRejectReason` vocabulary;
+ * `firstRejection` is the abort-mode rejection (the first failing
+ * entry), present exactly when some entry failed. The remaining fields
+ * are the shadow state the commit phase needs.
+ */
+interface AtomicAdmitOutcome {
+  resolvedTopics: string[];
+  admittedPayloads: unknown[];
+  keyCursors: Map<string, number>;
+  keySeqs: Array<number | undefined>;
+  verdicts: Array<{ index: number; topic: string; reason?: AdmissionRejectReason }>;
+  firstRejection?: AtomicPublishRejection;
+}
+
+/**
  * Options for `EventBus.publish`: per-message publish-time controls.
  */
 export interface PublishOptions {
@@ -12489,6 +12568,13 @@ export class EventBus {
     }
   >();
   private totalPublished = 0;
+  /**
+   * Structured publish receipts issued via the `publishReceipt*` family
+   * (EB-190, see `BusStats.receiptsIssued`): one per call, even when the
+   * receipt's entry lists are empty (chaos-shed or empty input).
+   */
+  private totalReceiptsIssued = 0;
+  /**
   /**
    * Per-publisher admitted-publish totals (see `PublishOptions.publisherId`).
    * Only publishes that clear admission count; a schema rejection or
@@ -24981,6 +25067,53 @@ export class EventBus {
   }
 
   /**
+   * Publishes one message and returns a structured publish receipt
+   * (EB-190): `{ accepted: [{ topic, seq }], rejected: [] }` when the
+   * message clears admission, `{ accepted: [], rejected: [{ topic,
+   * reason }] }` when an admission gate refuses it. The receipt is the
+   * synchronous, per-entry sibling of `publishWithConfirmation` —
+   * same pipeline (`publishCore`), same zero-side-effect contract on
+   * rejection, but the shape is built for batch reconciliation: an
+   * upstream holding the receipt can audit "accepted" entries against
+   * subscriber-side sequence numbers, and every rejection carries the
+   * shared `AdmissionRejectReason` vocabulary (the same reasons
+   * `EventBusOptions.onAdmissionRejected` reports).
+   *
+   * `publish`/`publishBatch`/`publishAtomic` keep their existing return
+   * shapes untouched; this family is purely additive. One receipt is
+   * counted in `getStats().receiptsIssued` per call, even when chaos
+   * admission sheds the publish before any gate runs (the receipt then
+   * carries no entries — a shed publish was decided by no gate).
+   */
+  publishReceipt(topic: string, payload: unknown, opts?: PublishOptions): PublishReceipt {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', topic);
+    this.totalReceiptsIssued += 1;
+    const confirm: ConfirmationCapture = {};
+    const outcome = this.publishCore(topic, payload, opts, 'publishReceipt', confirm);
+    if (!outcome.admitted) {
+      return {
+        accepted: [],
+        rejected: [
+          {
+            topic: confirm.topic ?? outcome.topic,
+            // Mirrors `publishWithConfirmation`: a chaos 'drop' sheds the
+            // publish before any admission gate runs, so no
+            // AdmissionRejectReason was captured and the generic shed
+            // reason stands in.
+            reason: outcome.rejectReason ?? 'rate-limit',
+          },
+        ],
+      };
+    }
+    return {
+      accepted: [{ topic: confirm.topic ?? outcome.topic, seq: outcome.seq ?? 0 }],
+      rejected: [],
+    };
+  }
+
+  /**
    * Request–reply RPC over the bus (EB-178, realtime): publishes a
    * request to `topic` and resolves with the first response's payload.
    *
@@ -26468,6 +26601,155 @@ export class EventBus {
   }
 
   /**
+   * Validates every entry of a batch publish call (EB-190 extraction):
+   * the exact per-entry validation loop `publishBatch` and
+   * `publishAtomic` used to run inline — fail-fast `RangeError` with
+   * zero side effects, exactly like `publish`. Returns the validated
+   * message lineages in entry order (never mutating the caller's
+   * entries). `caller` names the entry point for the error messages.
+   */
+  private validateBatchEntries(
+    messages: Array<BatchMessage>,
+    caller: string,
+  ): Array<MessageLineage | undefined> {
+    // Message lineage (EB-184): validated per entry in the loop below,
+    // like the other per-entry options. Stored in a parallel array (never
+    // mutating the caller's entries); the entry's fan-out runs the cycle
+    // check and stamps the origin hop.
+    const lineages: Array<MessageLineage | undefined> = [];
+    for (const msg of messages) {
+      validateMessageKey(msg.key, caller);
+      validateTraceparent(msg.traceparent, caller);
+      validateEventTime(msg.eventTime, caller);
+      validatePublisherId(msg.publisherId, caller);
+      validateSchemaVersion(msg.schemaVersion, caller);
+      validatePartitionOptions(msg.partitionKey, msg.partition, caller);
+      // Per-message TTL override (EB-149): validated per entry, like the
+      // other per-entry options — the commit phase stamps it into fanOut.
+      validateTtlMs(msg.ttlMs, caller);
+      // Explicit idempotency key (EB-151): validated per entry, like the
+      // other per-entry options — enforced per entry below.
+      validateIdempotencyKey(msg.idempotencyKey, caller);
+      // Priority lane (EB-122): a batch entry carries its lane on the
+      // inherited `BusMessage.lane` field — validated per entry, like the
+      // other per-entry options.
+      if (msg.lane !== undefined) assertValidMessageLane(msg.lane, caller);
+      lineages.push(assertValidLineage(msg.lineage, caller));
+    }
+    return lineages;
+  }
+
+  /**
+   * Publishes one `publishBatch` entry through `fanOut` (EB-190
+   * extraction): the exact per-entry body `publishBatch` used to run
+   * inline — explicit-idempotency-key suppression/claim plus the fan-out
+   * — so `publishBatch` and `publishReceiptBatch` share one code path
+   * and can never drift apart. Returns the fan-out outcome verbatim;
+   * the caller aggregates (`publishBatch`) or builds a per-entry receipt
+   * (`publishReceiptBatch`).
+   */
+  private publishBatchEntry(
+    msg: BatchMessage,
+    lineage: MessageLineage | undefined,
+  ): { accepted: number; admitted: boolean; seq?: number; rejectReason?: AdmissionRejectReason } {
+    // Explicit idempotency key (EB-151): enforced per entry like
+    // `publish` — after alias resolution and the ACL, before the
+    // remaining admission gates. A hit contributes the first publish's
+    // accepted count without fanning out; a payload conflict throws
+    // `IdempotencyKeyConflictError`, failing the whole batch call like
+    // any other per-entry throw. A denied or retired entry falls through
+    // to `fanOut`, which reports it normally.
+    let keyClaim: { topic: string; key: string; nowMs: number } | undefined;
+    if (msg.idempotencyKey !== undefined) {
+      const aliasResolution = this.resolvePublishTopic(msg.topic);
+      if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic, msg.publisherId)) {
+        const nowMs = this.now();
+        const firstAccepted = this.idempotencyKeyHit(
+          aliasResolution.topic,
+          msg.idempotencyKey,
+          confirmationPayloadHash(msg.payload, false),
+          nowMs,
+        );
+        if (firstAccepted !== undefined) {
+          this.countIdempotentHit(aliasResolution.topic, msg.payload, msg.publisherId);
+          this.recordPublishAudit(aliasResolution.topic, {
+            admitted: false,
+            reason: 'duplicate',
+            key: msg.key,
+            traceparent: msg.traceparent,
+            messageId: msg.messageId,
+            publisherId: msg.publisherId,
+          });
+          // A suppressed duplicate is not a new admission — it journals
+          // (and receipts) as a 'duplicate' rejection, exactly like the
+          // `publishCore` path, while still contributing the first
+          // publish's accepted count to the batch total.
+          return { accepted: firstAccepted, admitted: false, rejectReason: 'duplicate' };
+        }
+        keyClaim = { topic: aliasResolution.topic, key: msg.idempotencyKey, nowMs };
+      }
+    }
+    const outcome = this.fanOut(
+      msg.topic,
+      msg.payload,
+      false,
+      undefined,
+      msg.key,
+      undefined,
+      msg.traceparent,
+      msg.messageId,
+      false,
+      undefined,
+      false,
+      false,
+      msg.eventTime,
+      undefined, // causal: batch messages carry no causal clock
+      msg.publisherId,
+      msg.schemaVersion,
+      undefined, // retain: batch entries carry no retain flag
+      undefined, // pausedExpiresAt: only the pause-buffer drain passes this
+      // Publish-side partition routing (EB-90): the entry's `partition`
+      // (explicit) wins over `partitionKey` (consistent hash), exactly
+      // like `PublishOptions`.
+      msg.partitionKey,
+      msg.partition,
+      false, // binary: batch entries carry no binary flag
+      // Priority lane (EB-122): the entry's inherited `BusMessage.lane`,
+      // validated per entry above.
+      msg.lane,
+      undefined, // confirm: only `publishCore` passes one
+      undefined, // mirrorProvenance: only `receiveForward` passes one
+      undefined, // critical: batch entries carry no critical flag
+      undefined, // mirrorHlc: only `receiveForward` passes one
+      undefined, // admissionDlq: only the bus's own DLQ emitter passes this
+      undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
+      // Per-message TTL (EB-149): validated per entry above; `fanOut`
+      // stamps `nowMs + ttlMs`, overriding the topic TTL rules.
+      msg.ttlMs,
+      undefined, // messageHeaders: batch entries carry no headers
+      undefined, // cepDerived: batch entries never re-enter pattern detection
+      undefined, // messageDeadline: batch entries carry no absolute deadline
+      undefined, // rpcCorrelationId: only direct publishes carry RPC fields
+      undefined, // rpcReplyTo: only direct publishes carry RPC fields
+      // Message lineage (EB-184): validated per entry above; the
+      // entry's fan-out runs the cycle check and stamps the origin hop.
+      lineage,
+    );
+    // Explicit idempotency key (EB-151): only an admitted entry claims
+    // a key slot — a rejected or shed entry leaves its retry free.
+    if (keyClaim !== undefined && outcome.admitted) {
+      this.claimIdempotencyKey(
+        keyClaim.topic,
+        keyClaim.key,
+        confirmationPayloadHash(msg.payload, false),
+        outcome.accepted,
+        keyClaim.nowMs,
+      );
+    }
+    return outcome;
+  }
+
+  /**
    * Fans out every message in the batch to its matching subscribers' bounded
    * queues, then schedules a single flush for the whole batch — so N messages
    * cost one event-loop round instead of N, at the price of one larger drain.
@@ -26492,128 +26774,56 @@ export class EventBus {
     // Chaos (EB-103): see publish — evaluated once per batch call.
     if (this.checkChaosAdmission()) return 0;
     if (messages.length === 0) return 0;
-    // Message lineage (EB-184): validated per entry in the loop below,
-    // like the other per-entry options. Stored in a parallel array (never
-    // mutating the caller's entries); the entry's fan-out runs the cycle
-    // check and stamps the origin hop.
-    const batchLineages: Array<MessageLineage | undefined> = [];
-    for (const msg of messages) {
-      validateMessageKey(msg.key, 'publishBatch');
-      validateTraceparent(msg.traceparent, 'publishBatch');
-      validateEventTime(msg.eventTime, 'publishBatch');
-      validatePublisherId(msg.publisherId, 'publishBatch');
-      validateSchemaVersion(msg.schemaVersion, 'publishBatch');
-      validatePartitionOptions(msg.partitionKey, msg.partition, 'publishBatch');
-      // Per-message TTL override (EB-149): validated per entry, like the
-      // other per-entry options — the commit phase stamps it into fanOut.
-      validateTtlMs(msg.ttlMs, 'publishBatch');
-      // Explicit idempotency key (EB-151): validated per entry, like the
-      // other per-entry options — enforced per entry below.
-      validateIdempotencyKey(msg.idempotencyKey, 'publishBatch');
-      // Priority lane (EB-122): a batch entry carries its lane on the
-      // inherited `BusMessage.lane` field — validated per entry, like the
-      // other per-entry options.
-      if (msg.lane !== undefined) assertValidMessageLane(msg.lane, 'publishBatch');
-      batchLineages.push(assertValidLineage(msg.lineage, 'publishBatch'));
-    }
+    const lineages = this.validateBatchEntries(messages, 'publishBatch');
     let accepted = 0;
     for (let entryIndex = 0; entryIndex < messages.length; entryIndex++) {
-      const msg = messages[entryIndex];
-      // Explicit idempotency key (EB-151): enforced per entry like
-      // `publish` — after alias resolution and the ACL, before the
-      // remaining admission gates. A hit contributes the first publish's
-      // accepted count to the batch total without fanning out; a payload
-      // conflict throws `IdempotencyKeyConflictError`, failing the whole
-      // batch call like any other per-entry throw. A denied or retired
-      // entry falls through to `fanOut`, which reports it normally.
-      let keyClaim: { topic: string; key: string; nowMs: number } | undefined;
-      if (msg.idempotencyKey !== undefined) {
-        const aliasResolution = this.resolvePublishTopic(msg.topic);
-        if (!aliasResolution.retired && this.aclAllowsPublish(aliasResolution.topic, msg.publisherId)) {
-          const nowMs = this.now();
-          const firstAccepted = this.idempotencyKeyHit(
-            aliasResolution.topic,
-            msg.idempotencyKey,
-            confirmationPayloadHash(msg.payload, false),
-            nowMs,
-          );
-          if (firstAccepted !== undefined) {
-            this.countIdempotentHit(aliasResolution.topic, msg.payload, msg.publisherId);
-            this.recordPublishAudit(aliasResolution.topic, {
-              admitted: false,
-              reason: 'duplicate',
-              key: msg.key,
-              traceparent: msg.traceparent,
-              messageId: msg.messageId,
-              publisherId: msg.publisherId,
-            });
-            accepted += firstAccepted;
-            continue;
-          }
-          keyClaim = { topic: aliasResolution.topic, key: msg.idempotencyKey, nowMs };
-        }
-      }
-      const outcome = this.fanOut(
-        msg.topic,
-        msg.payload,
-        false,
-        undefined,
-        msg.key,
-        undefined,
-        msg.traceparent,
-        msg.messageId,
-        false,
-        undefined,
-        false,
-        false,
-        msg.eventTime,
-        undefined, // causal: batch messages carry no causal clock
-        msg.publisherId,
-        msg.schemaVersion,
-        undefined, // retain: batch entries carry no retain flag
-        undefined, // pausedExpiresAt: only the pause-buffer drain passes this
-        // Publish-side partition routing (EB-90): the entry's `partition`
-        // (explicit) wins over `partitionKey` (consistent hash), exactly
-        // like `PublishOptions`.
-        msg.partitionKey,
-        msg.partition,
-        false, // binary: batch entries carry no binary flag
-        // Priority lane (EB-122): the entry's inherited `BusMessage.lane`,
-        // validated per entry above.
-        msg.lane,
-        undefined, // confirm: only `publishCore` passes one
-        undefined, // mirrorProvenance: only `receiveForward` passes one
-        undefined, // critical: batch entries carry no critical flag
-        undefined, // mirrorHlc: only `receiveForward` passes one
-        undefined, // admissionDlq: only the bus's own DLQ emitter passes true
-        undefined, // admissionDlqExpiresAt: only the DLQ emitter passes one
-        // Per-message TTL (EB-149): validated per entry above; `fanOut`
-        // stamps `nowMs + ttlMs`, overriding the topic TTL rules.
-        msg.ttlMs,
-        undefined, // messageHeaders: batch entries carry no headers
-        undefined, // cepDerived: batch entries never re-enter pattern detection
-        undefined, // messageDeadline: batch entries carry no absolute deadline
-        undefined, // rpcCorrelationId: only direct publishes carry RPC fields
-        undefined, // rpcReplyTo: only direct publishes carry RPC fields
-        // Message lineage (EB-184): validated per entry above; the
-        // entry's fan-out runs the cycle check and stamps the origin hop.
-        batchLineages[entryIndex],
-      );
-      accepted += outcome.accepted;
-      // Explicit idempotency key (EB-151): only an admitted entry claims
-      // a key slot — a rejected or shed entry leaves its retry free.
-      if (keyClaim !== undefined && outcome.admitted) {
-        this.claimIdempotencyKey(
-          keyClaim.topic,
-          keyClaim.key,
-          confirmationPayloadHash(msg.payload, false),
-          outcome.accepted,
-          keyClaim.nowMs,
-        );
-      }
+      accepted += this.publishBatchEntry(messages[entryIndex], lineages[entryIndex]).accepted;
     }
     this.scheduleFlush();
     return accepted;
+  }
+
+  /**
+   * Publishes a batch and returns a structured per-entry publish receipt
+   * (EB-190): `accepted` holds one `{ topic, seq }` per entry that
+   * cleared admission (topics as the caller addressed them, seqs stamped
+   * at fan-out in batch order); `rejected` holds one `{ topic, reason }`
+   * per entry an admission gate refused, in the shared
+   * `AdmissionRejectReason` vocabulary. Unlike `publishAtomic`, entries
+   * are independent — one entry's rejection never blocks the rest.
+   *
+   * An explicit-idempotency-key hit receipts as a `'duplicate'`
+   * rejection (it journals the same way) while still contributing the
+   * first publish's accepted count — mirroring `publishBatch`'s total.
+   * One receipt is counted in `getStats().receiptsIssued` per call.
+   */
+  publishReceiptBatch(messages: Array<BatchMessage>): PublishReceipt {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', messages.length > 0 ? messages[0].topic : '<batch>');
+    this.totalReceiptsIssued += 1;
+    // Chaos (EB-103): see publishBatch — evaluated once per batch call.
+    // A shed batch issues an empty receipt: the chaos fault was decided
+    // by no gate, so no entry carries a reason.
+    if (this.checkChaosAdmission()) return { accepted: [], rejected: [] };
+    if (messages.length === 0) return { accepted: [], rejected: [] };
+    const lineages = this.validateBatchEntries(messages, 'publishReceiptBatch');
+    const accepted: Array<PublishReceiptAcceptedEntry> = [];
+    const rejected: Array<PublishReceiptRejectedEntry> = [];
+    for (let entryIndex = 0; entryIndex < messages.length; entryIndex++) {
+      const msg = messages[entryIndex];
+      const outcome = this.publishBatchEntry(msg, lineages[entryIndex]);
+      if (outcome.admitted) {
+        accepted.push({ topic: msg.topic, seq: outcome.seq ?? 0 });
+      } else {
+        // Mirrors `publishReceipt`: a gate always names itself, except
+        // the chaos shed (handled above), so the fallback only covers a
+        // hypothetical uncaptured path.
+        rejected.push({ topic: msg.topic, reason: outcome.rejectReason ?? 'rate-limit' });
+      }
+    }
+    this.scheduleFlush();
+    return { accepted, rejected };
   }
 
   /**
@@ -26668,42 +26878,21 @@ export class EventBus {
    * entry, and the commit phase skips re-validation. An empty batch is a
    * no-op returning `{ published: 0 }` without scheduling a flush.
    */
-  publishAtomic(entries: Array<BatchMessage>): AtomicPublishResult {
-    // EB-154: a closed bus refuses new work synchronously — never a
-    // silent queue.
-    this.assertNotClosed('publish', entries.length > 0 ? entries[0].topic : '<batch>');
-    // Chaos (EB-103): see publish — evaluated once per atomic batch.
-    if (this.checkChaosAdmission()) return { published: 0 };
-    if (entries.length === 0) return { published: 0 };
-    // Key validation first: a throw must leave zero state behind, and
-    // validation mutates nothing.
-    // Message lineage (EB-184): validated per entry in the loop below;
-    // stored in a parallel array (never mutating the caller's entries).
-    const atomicLineages: Array<MessageLineage | undefined> = [];
-    for (const entry of entries) {
-      validateMessageKey(entry.key, 'publishAtomic');
-      validateTraceparent(entry.traceparent, 'publishAtomic');
-      validateEventTime(entry.eventTime, 'publishAtomic');
-      validatePublisherId(entry.publisherId, 'publishAtomic');
-      validateSchemaVersion(entry.schemaVersion, 'publishAtomic');
-      validatePartitionOptions(entry.partitionKey, entry.partition, 'publishAtomic');
-      // Per-message TTL override (EB-149): an invalid value throws here —
-      // the whole batch is rejected with zero side effects, exactly like
-      // the other per-entry validations; the commit phase stamps the
-      // deadline into fanOut per entry.
-      validateTtlMs(entry.ttlMs, 'publishAtomic');
-      // Explicit idempotency key (EB-151): validated per entry, like the
-      // other per-entry options — enforced in shadow admission below.
-      validateIdempotencyKey(entry.idempotencyKey, 'publishAtomic');
-      // Priority lane (EB-122): validated per entry, like the other
-      // per-entry options; the commit phase carries it into `fanOut`.
-      if (entry.lane !== undefined) assertValidMessageLane(entry.lane, 'publishAtomic');
-      // Message lineage (EB-184): validated per entry, like the other
-      // per-entry options — the shadow admission runs the cycle check,
-      // the commit phase stamps the origin hop. Stored in a parallel
-      // array (never mutating the caller's entries).
-      atomicLineages.push(assertValidLineage(entry.lineage, 'publishAtomic'));
-    }
+  /**
+   * Phase 1 of `publishAtomic` (EB-190 extraction): admits the whole
+   * batch against shadow state — the exact shadow-admission loop
+   * `publishAtomic` used to run inline. In classic mode (`collectAll`
+   * false) it aborts on the first failing entry; in receipt collect-all
+   * mode it evaluates every entry so a rejected batch can list a reason
+   * per entry. Either way a rejected batch mutates nothing: no sequence
+   * numbers, no rate-limit tokens, no durable-log writes — only the
+   * failing entries' admission-gate counters move, exactly as before.
+   */
+  private admitAtomicBatch(
+    entries: Array<BatchMessage>,
+    lineages: Array<MessageLineage | undefined>,
+    collectAll: boolean,
+  ): AtomicAdmitOutcome {
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
     // Bus-wide pressure-budget width for this batch (EB-156): the sum of
@@ -26728,6 +26917,24 @@ export class EventBus {
     // against a shadow cursor: a rejected batch leaves the live cursors —
     // and every subscriber's key baseline — exactly untouched.
     const shadowKeyCursors = new Map<string, number>();
+    // Per-entry gate verdicts for the receipt path (EB-190): one per
+    // evaluated entry, in batch order.
+    const verdicts: Array<{ index: number; topic: string; reason?: AdmissionRejectReason }> = [];
+    let firstRejection: AtomicPublishRejection | undefined;
+    // Records one entry's gate verdict. Returns the abort outcome when
+    // the caller must stop evaluating further entries (classic atomic
+    // mode), or `undefined` to keep evaluating the rest of the batch
+    // (receipt collect-all mode).
+    const failEntry = (
+      index: number,
+      topic: string,
+      reason: AtomicRejectReason,
+    ): AtomicAdmitOutcome | undefined => {
+      verdicts.push({ index, topic, reason: atomicReasonToAdmissionReason(reason) });
+      if (firstRejection === undefined) firstRejection = { index, topic, reason };
+      if (collectAll) return undefined;
+      return { resolvedTopics, admittedPayloads, keyCursors: shadowKeyCursors, keySeqs, verdicts, firstRejection };
+    };
     const keySeqs: Array<number | undefined> = new Array(entries.length);
     // Alias-resolved topics, one per entry: the commit phase publishes the
     // resolved topics, never the raw entry topics.
@@ -26754,7 +26961,9 @@ export class EventBus {
       const aliasResolution = this.resolvePublishTopic(topic);
       if (aliasResolution.retired) {
         this.countAliasRetired(topic, payload);
-        return { published: 0, rejected: { index, topic, reason: 'alias-retired' } };
+        const abortOutcome = failEntry(index, topic, 'alias-retired');
+        if (abortOutcome !== undefined) return abortOutcome;
+        continue;
       }
       const resolvedTopic = aliasResolution.topic;
       // Topic lifecycle (EB-126): mirrors `fanOut` — an entry targeting a
@@ -26762,13 +26971,15 @@ export class EventBus {
       // reason, counted exactly like any other admission failure.
       if (this.topicLifecycle.isDeleted(resolvedTopic)) {
         this.countAliasRetired(topic, payload);
-        return { published: 0, rejected: { index, topic, reason: 'alias-retired' } };
+        const abortOutcome = failEntry(index, topic, 'alias-retired');
+        if (abortOutcome !== undefined) return abortOutcome;
+        continue;
       }
       // Message lineage (EB-184): the cycle check runs in shadow
       // admission so a looping entry aborts the whole batch — the commit
       // phase must never partially admit. The origin hop is stamped at
       // commit (the real admission); shadow appends nothing.
-      const shadowLineage = atomicLineages[index];
+      const shadowLineage = lineages[index];
       if (shadowLineage !== undefined) {
         const shadowVerdict = checkLineageCycle(shadowLineage, resolvedTopic, this.maxLineageHops);
         if (shadowVerdict !== 'ok') {
@@ -26781,7 +26992,9 @@ export class EventBus {
             traceIdOfTraceparent(entries[index].traceparent),
             shadowVerdict,
           );
-          return { published: 0, rejected: { index, topic, reason } };
+          const abortOutcome = failEntry(index, topic, reason);
+          if (abortOutcome !== undefined) return abortOutcome;
+          continue;
         }
       }
       resolvedTopics[index] = resolvedTopic;
@@ -26852,7 +27065,9 @@ export class EventBus {
             this.countTenantQuotaShed(topic, payload, publisherId, entryTraceId, quotaRule);
           }
         } else this.countRateLimited(topic, payload, publisherId, entryTraceId);
-        return { published: 0, rejected: { index, topic, reason } };
+        const abortOutcome = failEntry(index, topic, reason);
+        if (abortOutcome !== undefined) return abortOutcome;
+        continue;
       }
       // EB-156: accumulate the batch's conservative fan-out width for the
       // atomic pressure check after the loop. Only when a budget is
@@ -26897,10 +27112,15 @@ export class EventBus {
           this.statsFor(topic).rejectedMessages += 1;
           this.totalRejected += 1;
           this.emitAdmissionRejected(topic, 'duplicate', payload, entries[index].publisherId);
-          return { published: 0, rejected: { index, topic, reason: 'idempotency-conflict' } };
+          const abortOutcome = failEntry(index, topic, 'idempotency-conflict');
+          if (abortOutcome !== undefined) return abortOutcome;
+          continue;
         }
         shadowIdempotencyKeys.add(slot);
       }
+      // The entry cleared every gate: record its passing verdict (the
+      // receipt path lists a reason only for failed entries).
+      verdicts.push({ index, topic });
     }
     // EB-156: the batch-wide pressure check runs after every entry passed
     // shadow admission and before anything commits — atomicity demands the
@@ -26915,15 +27135,40 @@ export class EventBus {
       if (pending + batchWidth > this.maxPendingMessages) {
         const first = entries[0];
         this.countPressureShed(first.topic, first.payload, first.publisherId);
-        return { published: 0, rejected: { index: 0, topic: first.topic, reason: 'pressure' } };
+        // The batch-level pressure shed rejects the whole batch: entries
+        // that failed their own gates keep their own reason, the rest
+        // carry the batch cause.
+        for (const verdict of verdicts) {
+          if (verdict.reason === undefined) verdict.reason = 'pressure';
+        }
+        firstRejection = { index: 0, topic: first.topic, reason: 'pressure' };
+        return { resolvedTopics, admittedPayloads, keyCursors: shadowKeyCursors, keySeqs, verdicts, firstRejection };
       }
     }
+    return { resolvedTopics, admittedPayloads, keyCursors: shadowKeyCursors, keySeqs, verdicts, firstRejection };
+  }
+
+  /**
+   * Phase 2 of `publishAtomic` (EB-190 extraction): commits an admitted
+   * batch through the normal publish path in one synchronous turn, then
+   * schedules a single flush — the exact commit loop `publishAtomic`
+   * used to run inline. Returns one `{ topic, seq }` per committed entry
+   * in batch order, for the receipt path (`publishAtomic` discards it).
+   */
+  private commitAtomicBatch(
+    entries: Array<BatchMessage>,
+    lineages: Array<MessageLineage | undefined>,
+    admit: AtomicAdmitOutcome,
+  ): Array<{ topic: string; seq: number }> {
+    const { resolvedTopics, admittedPayloads, keyCursors, keySeqs } = admit;
+    const committed: Array<{ topic: string; seq: number }> = [];
     // Phase 2: everything was admitted — commit through the normal
     // publish path in one synchronous turn, then flush once.
-    for (const [key, next] of shadowKeyCursors) this.keyCursors.set(key, next);
+    for (const [key, next] of keyCursors) this.keyCursors.set(key, next);
     for (let index = 0; index < entries.length; index++) {
       const { key, traceparent, messageId, eventTime, publisherId, schemaVersion, partitionKey, partition, ttlMs } =
-        entries[index];      // Deprecated-schema accounting (EB-86): the shadow admission ran
+        entries[index];
+      // Deprecated-schema accounting (EB-86): the shadow admission ran
       // the validator, so the commit only re-resolves the version
       // bookkeeping — an aborted batch never reaches here, so every
       // committed deprecated admission is counted exactly once.
@@ -26978,7 +27223,7 @@ export class EventBus {
         // Message lineage (EB-184): the shadow admission already ran the
         // cycle check; the commit fan-out stamps the origin hop (the real
         // admission).
-        atomicLineages[index],
+        lineages[index],
       );
       // Explicit idempotency key (EB-151): the admitted entries claim
       // their key slots at commit — the shadow phase claimed nothing, so
@@ -27012,9 +27257,76 @@ export class EventBus {
         // there — the take cannot fail.
         this.globalPublishRateLimiter?.tryTake();
       }
+      committed.push({ topic: resolvedTopics[index], seq: commitOutcome.seq ?? 0 });
     }
     this.scheduleFlush();
+    return committed;
+  }
+
+  publishAtomic(entries: Array<BatchMessage>): AtomicPublishResult {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', entries.length > 0 ? entries[0].topic : '<batch>');
+    // Chaos (EB-103): see publish — evaluated once per atomic batch.
+    if (this.checkChaosAdmission()) return { published: 0 };
+    if (entries.length === 0) return { published: 0 };
+    // Key validation first: a throw must leave zero state behind, and
+    // validation mutates nothing. Shared with `publishBatch` (see
+    // `validateBatchEntries`) — the validators are identical.
+    const atomicLineages = this.validateBatchEntries(entries, 'publishAtomic');
+    // Phase 1: admit the whole batch against shadow state — abort on the
+    // first failing entry, the classic atomic contract.
+    const admit = this.admitAtomicBatch(entries, atomicLineages, false);
+    if (admit.firstRejection !== undefined) {
+      return { published: 0, rejected: admit.firstRejection };
+    }
+    // Phase 2: everything was admitted — commit through the normal
+    // publish path in one synchronous turn, then flush once.
+    this.commitAtomicBatch(entries, atomicLineages, admit);
     return { published: entries.length };
+  }
+
+  /**
+   * Publishes an atomic batch and returns a structured per-entry publish
+   * receipt (EB-190): on success `accepted` holds one `{ topic, seq }`
+   * per entry (topics as the caller addressed them, seqs stamped at
+   * fan-out in batch order); on failure nothing is committed and
+   * `rejected` holds one `{ topic, reason }` per batch entry — entries
+   * that failed their own admission gates carry their own reason, the
+   * rest carry the batch-level cause (the first failing entry's reason).
+   * Reasons use the shared `AdmissionRejectReason` vocabulary
+   * (`'idempotency-conflict'` surfaces as `'duplicate'`, matching the
+   * admission-rejection hook). One receipt is counted in
+   * `getStats().receiptsIssued` per call.
+   */
+  publishReceiptAtomic(entries: Array<BatchMessage>): PublishReceipt {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', entries.length > 0 ? entries[0].topic : '<batch>');
+    this.totalReceiptsIssued += 1;
+    // Chaos (EB-103): see publishAtomic — evaluated once per atomic
+    // batch. A shed batch issues an empty receipt: the chaos fault was
+    // decided by no gate, so no entry carries a reason.
+    if (this.checkChaosAdmission()) return { accepted: [], rejected: [] };
+    if (entries.length === 0) return { accepted: [], rejected: [] };
+    const atomicLineages = this.validateBatchEntries(entries, 'publishReceiptAtomic');
+    // Phase 1 in collect-all mode: every entry gets its own gate verdict
+    // so a rejected batch can list a reason per entry.
+    const admit = this.admitAtomicBatch(entries, atomicLineages, true);
+    if (admit.firstRejection !== undefined) {
+      // Nothing was committed: every entry is rejected. Entries that
+      // failed their own gates carry their own reason; the rest carry
+      // the batch-level cause. (`admitAtomicBatch` guarantees every
+      // verdict has a reason on this path — the `?? cause` is the
+      // defensive fallback.)
+      const cause = atomicReasonToAdmissionReason(admit.firstRejection.reason);
+      return {
+        accepted: [],
+        rejected: admit.verdicts.map((v) => ({ topic: v.topic, reason: v.reason ?? cause })),
+      };
+    }
+    const committed = this.commitAtomicBatch(entries, atomicLineages, admit);
+    return { accepted: committed, rejected: [] };
   }
 
   /**
@@ -35449,6 +35761,7 @@ export class EventBus {
       totalSubscribers: this.subscribers.size,
       subscribersByPattern: Object.fromEntries(this.subscribersByPattern),
       totalPublished: this.totalPublished,
+      receiptsIssued: this.totalReceiptsIssued,
       deliveredMessages: this.totalDelivered,
       fanOutYields: this.fanOutYieldCount,
       pendingPressure: this.totalPressureShed,

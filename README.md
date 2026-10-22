@@ -3345,6 +3345,57 @@ for resume, not rejected, and no second receipt fires at resume;
 barrier cut markers (`opts.barrier`) confirm with `seq: 0`
 (control-plane, never durably logged).
 
+## Publish receipts: publishReceipt / publishReceiptBatch / publishReceiptAtomic
+
+The `publishReceipt*` family (`src/bus.ts`, EB-190 — realtime systems /
+backend engineering) is the synchronous, per-entry sibling of
+`publishWithConfirmation`: same pipeline, same zero-side-effect contract
+on rejection, but the shape is built for batch reconciliation — an
+upstream holding the receipt can audit which entries were accepted (with
+their stamped sequence numbers) and which were refused (with the gate's
+reason), instead of just counting deliveries.
+
+```ts
+// Single publish:
+bus.publishReceipt('orders.eu', order);
+// -> { accepted: [{ topic: 'orders.eu', seq: 41 }], rejected: [] }
+
+bus.setTopicSchema('orders.eu', (p) => p.total > 0);
+bus.publishReceipt('orders.eu', { total: -1 });
+// -> { accepted: [], rejected: [{ topic: 'orders.eu', reason: 'schema' }] }
+
+// Batch: entries are independent — one entry's rejection never blocks
+// the rest:
+bus.publishReceiptBatch([
+  { topic: 'orders.eu', payload: ok },
+  { topic: 'orders.eu', payload: bad },
+]);
+// -> { accepted: [{ topic: 'orders.eu', seq: 42 }],
+//      rejected: [{ topic: 'orders.eu', reason: 'schema' }] }
+
+// Atomic batch: all-or-nothing. On failure nothing is committed and
+// every entry is listed — entries that failed their own gates carry
+// their own reason, the rest carry the batch-level cause:
+bus.publishReceiptAtomic([
+  { topic: 'orders.eu', payload: ok },
+  { topic: 'orders.eu', payload: bad },
+]);
+// -> { accepted: [],
+//      rejected: [{ topic: 'orders.eu', reason: 'schema' },
+//                 { topic: 'orders.eu', reason: 'schema' }] }
+```
+
+`reason` reuses the `AdmissionRejectReason` vocabulary verbatim — the
+same reasons `onAdmissionRejected` reports, so a rejected entry
+reconciles 1:1 with the bus's admission-rejection counters
+(`'idempotency-conflict'` surfaces as `'duplicate'`, matching the hook).
+`publish` / `publishBatch` / `publishAtomic` keep their existing return
+shapes untouched; the receipt family is purely additive (it shares the
+extracted `publishBatchEntry` / `admitAtomicBatch` / `commitAtomicBatch`
+code paths, so the receipt and the legacy call can never disagree on an
+admission decision). One receipt is counted in
+`getStats().receiptsIssued` per call.
+
 ## Declarative configuration snapshots
 
 `exportBusConfig()` / `applyConfig(snapshot, { dryRun? })` /
