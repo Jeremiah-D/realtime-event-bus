@@ -40,6 +40,21 @@ library.
   out a whole batch and schedules a single flush for it — N messages cost one
   event-loop round instead of N — with identical matching, drop, and
   backpressure semantics, returning the total accepted deliveries.
+  `tryPublish(topic, payload, opts?)` (EB-193) is the backpressure-aware
+  sibling of `publish`: before admission it checks the live queues of the
+  subscribers matching the topic, and when any of them sits at or above its
+  high-water mark the publish is shed immediately with
+  `{ admitted: false, reason: 'backpressure' }` — the publish-side
+  load-shedding signal, so a producer can back off and retry later instead
+  of piling backlog onto an already-hot subscriber. The shed is
+  pre-admission (no sequence number consumed, nothing written to the durable
+  log, no rate-limit budget burned), counts in
+  `TopicStats.backpressureRejected` / `BusStats.backpressureRejected` (plus
+  the shared `rejectedMessages`), and fires `onAdmissionRejected` with
+  reason `'backpressure'`. When no subscriber is over water the call runs the
+  exact `publish` pipeline, returning `{ admitted: true, accepted, seq }`.
+  `publish` itself is unchanged: it always admits, and subscriber-side
+  backpressure keeps handling overload downstream.
   `subscribe()` accepts an
   `onBackpressure` callback that fires — once per excursion, re-armed after the
   queue drains — when a subscriber's queue reaches its 80% high-water mark,
@@ -2292,6 +2307,13 @@ npm test
   behavior, drain ordering, runtime watermark adjustment (`setHighWaterMarkRatio`,
   validation, mid-excursion lowering/raising semantics) and the `onDrained`
   recovery callback.
+- `test/trypublish.test.ts` — backpressure-aware publish (EB-193):
+  admit-on-healthy-queue, shed at the high-water mark with reason
+  `'backpressure'`, zero side effects (no seq / no durable-log write / no
+  rate-limit budget), `publish` still admitting over water, non-matching
+  subscribers not blocking, consumer-group members, namespaces, closed-bus
+  parity, and regular admission gates reporting their own reason after the
+  pre-check.
 - `test/byte-budget.test.ts` — byte-budgeted backpressure queues: count+bytes
   dual-dimension shedding per drop policy, priority-aware byte eviction,
   oversized-item rejection, byte accounting across `drainLiveUpTo`,

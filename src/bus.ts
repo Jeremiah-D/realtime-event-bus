@@ -4718,6 +4718,16 @@ export interface TopicStats {
    */
   rejectedMessages: number;
   /**
+   * Publishes shed by `tryPublish` (EB-193) because a pattern-matching
+   * subscriber's live queue was at or above its high-water mark — the
+   * publish-side load-shedding signal. Shed before admission, so the
+   * payload never became a message: no sequence number consumed
+   * (invisible to gap detection), nothing written to the durable log,
+   * and no rate-limit budget burned. Subset of `rejectedMessages`
+   * (reason `'backpressure'`).
+   */
+  backpressureRejected: number;
+  /**
    * Sum of the JSON UTF-8 byte sizes of every publish to this topic
    * rejected by the per-topic payload-size cap (see
    * `setTopicMaxPayloadBytes`), surfaced on `onAdmissionRejected` with
@@ -5343,6 +5353,13 @@ export interface BusStats {
    * the exact counting rules.
    */
   rejectedMessages: number;
+  /**
+   * Total publishes shed by `tryPublish` (EB-193) because a matched
+   * subscriber's queue was at or above its high-water mark — the sum of
+   * every topic's `backpressureRejected`. Subset of `rejectedMessages`
+   * (reason `'backpressure'`).
+   */
+  backpressureRejected: number;
   /**
    * Sum of the JSON UTF-8 byte sizes of every publish rejected by the
    * per-topic payload-size cap (see `setTopicMaxPayloadBytes`) — the sum
@@ -7584,6 +7601,7 @@ function zeroedTopicStats(): {
   pausedMessages: number;
   circuitBrokenMessages: number;
   rejectedMessages: number;
+  backpressureRejected: number;
   deprecatedSchemaVersions: number;
   lateMessages: number;
   duplicateMessages: number;
@@ -7627,6 +7645,7 @@ function zeroedTopicStats(): {
     pausedMessages: 0,
     circuitBrokenMessages: 0,
     rejectedMessages: 0,
+    backpressureRejected: 0,
     payloadRejectedBytes: 0,
     deprecatedSchemaVersions: 0,
     lateMessages: 0,
@@ -9750,6 +9769,25 @@ interface PublishOutcome {
 }
 
 /**
+ * Result of `EventBus.tryPublish` (EB-193): whether the publish was
+ * admitted, and — when it was not — which admission gate refused it
+ * (`AdmissionRejectReason` vocabulary; `'backpressure'` when the
+ * pre-check shed it). `accepted` mirrors `publish`'s return (subscriber
+ * queues that accepted the message, 0 on any refusal); `seq` is the
+ * stamped sequence number when admitted.
+ */
+export interface TryPublishResult {
+  /** Whether the publish cleared the backpressure pre-check and every admission gate. */
+  admitted: boolean;
+  /** The refusing gate, when `admitted` is false. */
+  reason?: AdmissionRejectReason;
+  /** Subscriber queues that accepted the message (0 on any refusal). */
+  accepted: number;
+  /** The per-(topic, partition) sequence number stamped at fan-out, when admitted. */
+  seq?: number;
+}
+
+/**
  * Out-param for `publishWithConfirmation` (EB-125): `publishCore` passes
  * one into `fanOut`, and the admitted path records the receipt's content
  * fields here — computed once, right after admission-time redaction, so
@@ -9910,6 +9948,13 @@ interface PauseBufferEntry {
  *   `EventBusOptions.maxPendingMessages`; like a `'publisher-rate-limit'`
  *   shed it consumes no sequence number, writes nothing to the durable
  *   log, and burns no rate-limit token)
+ * - `'backpressure'` → `TopicStats.backpressureRejected` /
+ *   `BusStats.backpressureRejected` (EB-193 `tryPublish`: a subscriber
+ *   whose pattern matched the topic had its live queue at or above its
+ *   high-water mark, so the publish was shed before admission as the
+ *   publish-side load-shedding signal — no sequence number consumed,
+ *   nothing written to the durable log, no rate-limit budget burned;
+ *   also counted in the shared `rejectedMessages`, like `'pressure'`)
  * - `'tenant-quota'` → `BusStats.tenantQuotaShedMessages` (a namespace
  *   tenant quota's hard limit (EB-162, `setNamespaceQuota`) shed the
  *   publish in the admission phase — after every semantic gate, so only
@@ -9955,6 +10000,7 @@ export type AdmissionRejectReason =
   | 'circuit-breaker'
   | 'sampled'
   | 'pressure'
+  | 'backpressure'
   | 'tenant-quota'
   | 'global-rate-limit'
   | 'webhook-deny'
@@ -14292,6 +14338,8 @@ export class EventBus {
    * `BusStats.pendingPressure`.
    */
   private totalPressureShed = 0;
+  /** Total `tryPublish` sheds with reason `'backpressure'` (EB-193). */
+  private totalBackpressureRejected = 0;
   /**
    * Total publishes shed by namespace tenant quotas (EB-162). Counts
    * each shed publish once, at the admission-phase shed. Surfaced as
@@ -25260,6 +25308,50 @@ export class EventBus {
   }
 
   /**
+   * Backpressure-aware publish (EB-193): like `publish`, but before
+   * admission the bus checks the live queues of the subscribers matching
+   * `topic` — when any of them sits at or above its high-water mark the
+   * publish is shed immediately with `{ admitted: false, reason:
+   * 'backpressure' }` instead of being admitted. The shed is
+   * pre-admission: no sequence number is consumed (subscribers see no
+   * gap), nothing is written to the durable log, and no rate-limit
+   * budget is burned — the rejection is the publish-side load-shedding
+   * signal, so a producer can back off and retry later instead of piling
+   * backlog onto an already-hot subscriber.
+   *
+   * The shed counts in `TopicStats.backpressureRejected` /
+   * `BusStats.backpressureRejected` (plus the shared `rejectedMessages`)
+   * and fires `onAdmissionRejected` with reason `'backpressure'`. When
+   * no subscriber is over water the call runs the exact `publish`
+   * pipeline, returning `{ admitted: true, accepted, seq }` — or
+   * `{ admitted: false, reason }` when a regular admission gate rejects
+   * the publish (the backpressure pre-check is only the first gate; ACL,
+   * schema, rate limits, ... still apply afterwards).
+   *
+   * `publish` itself is unchanged: it always admits, and
+   * subscriber-side backpressure keeps handling overload downstream.
+   */
+  tryPublish(topic: string, payload: unknown, opts?: PublishOptions): TryPublishResult {
+    // EB-154: the same closed-bus refusal as `publish`.
+    this.assertNotClosed('publish', topic);
+    // Namespace resolution is side-effect free; the concrete topic is
+    // what the subscriber matchers see. `publishCore` re-resolves the
+    // same way below, so the pre-check and the publish agree.
+    const concrete = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    if (this.fanOutBackpressureExceeded(concrete)) {
+      this.countBackpressureRejected(concrete, payload, opts?.publisherId);
+      return { admitted: false, reason: 'backpressure', accepted: 0 };
+    }
+    const outcome = this.publishCore(topic, payload, opts, 'tryPublish');
+    return {
+      admitted: outcome.admitted,
+      ...(outcome.rejectReason === undefined ? {} : { reason: outcome.rejectReason }),
+      accepted: outcome.accepted,
+      ...(outcome.seq === undefined ? {} : { seq: outcome.seq }),
+    };
+  }
+
+  /**
    * Publishes with a Kafka-`acks`-style confirmation receipt (EB-125):
    * runs the EXACT `publish` pipeline (chaos gate, option validation,
    * namespace resolution, barrier slim path, circuit breaker, `fanOut`
@@ -29999,6 +30091,65 @@ export class EventBus {
     this.totalRejected += 1;
     this.totalPressureShed += 1;
     this.emitAdmissionRejected(topic, 'pressure', payload, publisherId, traceId);
+  }
+
+  /**
+   * Counts one publish shed by `tryPublish`'s backpressure pre-check
+   * (EB-193) against the topic and the global total, then fires the
+   * admission-rejection hook with reason `'backpressure'`. The shed
+   * happens before admission — before sequence-number assignment — so
+   * the payload never became a message: no sequence number is consumed
+   * (subscribers see no gap), the durable log never sees it, and no
+   * rate-limit token is burned. Counted in `rejectedMessages` (shared
+   * with the other pre-admission rejections) plus the dedicated
+   * `backpressureRejected` totals, so the shed stays reconcilable
+   * through the EB-39 channel like every other admission rejection.
+   */
+  private countBackpressureRejected(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalRejected += 1;
+    this.statsFor(topic).backpressureRejected += 1;
+    this.totalBackpressureRejected += 1;
+    this.emitAdmissionRejected(topic, 'backpressure', payload, publisherId);
+  }
+
+  /**
+   * Backpressure pre-check for `tryPublish` (EB-193): returns true when
+   * any subscriber whose pattern matches `topic` has its live queue at
+   * or above its high-water mark (`queue.size >= queue.highWaterMark`,
+   * EB-12 semantics). The scan mirrors `fanOut`'s candidate resolution
+   * (prefix-index pruning + alias-aware matching) so the pre-check sees
+   * exactly the subscribers a publish would fan out to — but it is pure
+   * read: unlike `fanOut` it never advances keyed/causal baselines for
+   * non-matching subscribers, consumes no sequence number, writes
+   * nothing to the durable log, and burns no rate-limit budget.
+   *
+   * Group members each carry their own queue, so every member of a
+   * matching consumer group is inspected (conservative: the pre-check
+   * does not predict which member the round-robin assignment would
+   * pick). Degraded, paused, and blocked subscribers are inspected too —
+   * their queues keep accumulating, so their waterline is real pressure.
+   */
+  private fanOutBackpressureExceeded(topic: string): boolean {
+    const effectiveTopic = this.resolveLiveTopic(topic);
+    const candidates = this.candidateIds(topic);
+    if (effectiveTopic !== topic) {
+      for (const id of this.candidateIds(effectiveTopic)) candidates.add(id);
+    }
+    for (const oldTopic of this.liveAliasSources(effectiveTopic)) {
+      if (oldTopic === topic || oldTopic === effectiveTopic) continue;
+      for (const id of this.candidateIds(oldTopic)) candidates.add(id);
+    }
+    const prune = candidates.size < this.subscribers.size;
+    for (const subscriber of this.subscribers.values()) {
+      if (prune && !candidates.has(subscriber.id)) continue;
+      if (!this.topicMatchesWithAliases(subscriber.matcher, topic, effectiveTopic)) continue;
+      // EB-12 waterline: the high-water mark is the queue's early-warning
+      // level (capacity * highWaterMarkRatio, default 0.8) — at or above
+      // it the subscriber is falling behind, so the producer sheds.
+      if (subscriber.queue.size >= subscriber.queue.highWaterMark) return true;
+    }
+    return false;
   }
 
   /**
@@ -36021,6 +36172,7 @@ export class EventBus {
       deliveredMessages: this.totalDelivered,
       fanOutYields: this.fanOutYieldCount,
       pendingPressure: this.totalPressureShed,
+      backpressureRejected: this.totalBackpressureRejected,
       tenantQuotaShedMessages: this.totalTenantQuotaShed,
       globalRateLimitedMessages: this.totalGlobalRateLimited,
       namespaceQuotas: this.tenantQuotaUsageSnapshot(),
@@ -36391,6 +36543,7 @@ export class EventBus {
         pausedMessages: stats.pausedMessages,
         circuitBrokenMessages: stats.circuitBrokenMessages,
         rejectedMessages: stats.rejectedMessages,
+        backpressureRejected: stats.backpressureRejected,
         payloadRejectedBytes: stats.payloadRejectedBytes,
         // Per-topic payload-size histogram (EB-143): present only when a
         // histogram rule currently matches the topic — the key is absent
