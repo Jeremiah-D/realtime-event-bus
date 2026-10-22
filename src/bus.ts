@@ -1762,6 +1762,47 @@ export interface SubscribeOptions {
    */
   slowHandler?: boolean | SlowHandlerOptions;
   /**
+   * Opt-in handler fault isolation (EB-197): per-subscriber consecutive
+   * error budget with automatic quarantine. A handler invocation fails
+   * when it throws synchronously or when its returned promise rejects —
+   * both count; today a throwing plain handler escapes the drain as an
+   * uncaught exception and a rejected promise vanishes into the
+   * slot-release machinery, so neither is observable. With the isolation
+   * on, every invocation outcome is counted: a success resets the
+   * consecutive-error counter to 0, a failure increments it, and reaching
+   * `maxConsecutiveErrors` quarantines the subscriber — delivery pauses
+   * (the backlog stays queued under the normal backpressure policy,
+   * preserved, not dropped), `onQuarantined` fires once, and the
+   * quarantine is recorded in the subscription audit log as
+   * `subscriber_quarantined`. Recovery is manual via
+   * `EventBus.resumeQuarantined(subId)` (audited as
+   * `subscriber_quarantine_resumed`).
+   *
+   * Orthogonal to the other failure machinery:
+   * - `slowHandler` (EB-191) observes slowness, this observes failures;
+   * - the poison-message DLQ is per-message while this is per-subscriber
+   *   (reliable subscriptions keep their at-least-once/nack/DLQ
+   *   semantics — the isolation only observes the wrapper's own
+   *   outcome there);
+   * - `pauseSubscriber`/`resumeSubscriber` (EB-113) is the operator's
+   *   manual hold: it never clears a quarantine and a quarantine never
+   *   clears it — a subscriber can hold both pauses at once, like the
+   *   health-probe degraded pause.
+   * - `healthProbe` (EB-18) keeps its own consecutive-failure accounting
+   *   for synchronous throws on the probed path; the isolation additionally
+   *   counts async rejections there, which the probe never observed.
+   *
+   * Pass `true` for the defaults, or a `HandlerFaultIsolationOptions`
+   * object to tune the budget and the quarantine callback. Invalid values
+   * throw `RangeError` from `subscribe`. Disabled by default — without
+   * it a throwing handler behaves exactly as before. Applies to
+   * single-message drains; the retained-snapshot catch-up path
+   * (EB-87) keeps its existing throw isolation and never feeds this
+   * budget — a replay of old messages must not quarantine a subscriber
+   * before live delivery even starts.
+   */
+  handlerFaultIsolation?: boolean | HandlerFaultIsolationOptions;
+  /**
    * Resume-from offset for durable-log replay. When the bus has a durable
    * log (`EventBusOptions.durableLogDir`), the subscriber's queue is
    * pre-filled at subscribe time with every logged message on topics
@@ -3002,6 +3043,44 @@ export interface DegradedEvent {
   /**
    * Messages preserved in the subscriber's queue at pause time — nothing
    * was dropped, and resuming redelivers them in order.
+   */
+  pendingMessages: number;
+}
+
+/**
+ * Tuning for subscriber handler fault isolation
+ * (`SubscribeOptions.handlerFaultIsolation`, EB-197).
+ */
+export interface HandlerFaultIsolationOptions {
+  /**
+   * Consecutive handler errors (a synchronous throw or a rejected
+   * returned promise) that trip quarantine. Defaults to 5. Must be a
+   * positive integer — anything else throws `RangeError` from
+   * `subscribe`.
+   */
+  maxConsecutiveErrors?: number;
+  /**
+   * Called once when the subscriber is quarantined (see
+   * `QuarantinedEvent`). Fires after the drain requeues the undelivered
+   * backlog, so `pendingMessages` is exact.
+   */
+  onQuarantined?: (event: QuarantinedEvent) => void;
+}
+
+/**
+ * Fired once when handler fault isolation quarantines a subscriber
+ * (see `SubscribeOptions.handlerFaultIsolation`, EB-197).
+ */
+export interface QuarantinedEvent {
+  /** The subscriber whose delivery was paused. */
+  subscriberId: string;
+  /** The topic pattern the quarantined subscriber registered. */
+  pattern: string;
+  /** Consecutive handler errors that tripped the quarantine. */
+  consecutiveErrors: number;
+  /**
+   * Messages preserved in the subscriber's queue at quarantine time —
+   * nothing was dropped, and resuming redelivers them in order.
    */
   pendingMessages: number;
 }
@@ -5851,6 +5930,15 @@ export interface BusStats {
    */
   degradedSubscribers: number;
   /**
+   * Subscriptions currently quarantined by handler fault isolation (see
+   * `SubscribeOptions.handlerFaultIsolation`, EB-197): their handlers
+   * failed too many times in a row and delivery is paused until they are
+   * resumed manually via `EventBus.resumeQuarantined`. Orthogonal to
+   * `degradedSubscribers` and `pausedSubscribers`: a subscriber can hold
+   * several pauses at once.
+   */
+  quarantinedSubscribers: number;
+  /**
    * Slow-handler offload observations (EB-191, see
    * `SubscribeOptions.slowHandler`): `count` is the total number of
    * handler invocations whose synchronous execution exceeded their
@@ -7169,6 +7257,12 @@ interface Subscriber {
   /** Fired once per degradation when health probing auto-pauses delivery. */
   onDegraded?: (event: DegradedEvent) => void;
   /**
+   * Per-subscriber handler fault isolation state (see
+   * `SubscribeOptions.handlerFaultIsolation`, EB-197). Absent when the
+   * isolation is disabled for this subscriber.
+   */
+  faultIsolation?: HandlerFaultIsolationState;
+  /**
    * Per-subscriber slow-handler offload state (see
    * `SubscribeOptions.slowHandler`, EB-191). Absent when the offload is
    * disabled for this subscriber.
@@ -7568,6 +7662,21 @@ interface HealthProbeState {
   autoResumeAfterMs?: number;
   /** Pending auto-resume timer, if the subscriber degraded with a cooldown. */
   autoResumeTimer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Per-subscriber handler fault isolation state (see
+ * `SubscribeOptions.handlerFaultIsolation`, EB-197). Only
+ * `consecutiveErrors` and `quarantined` change over the subscription's
+ * lifetime; the rest is the validated configuration.
+ */
+interface HandlerFaultIsolationState {
+  /** Consecutive handler errors; resets to 0 on every successful delivery and resume. */
+  consecutiveErrors: number;
+  /** True while delivery is quarantined after hitting the error budget. */
+  quarantined: boolean;
+  maxConsecutiveErrors: number;
+  onQuarantined?: (event: QuarantinedEvent) => void;
 }
 
 /**
@@ -9431,6 +9540,28 @@ function resolveHealthProbeOptions(
     processingTimeoutMs: checkPositiveMs('processingTimeoutMs', o.processingTimeoutMs),
     autoResumeAfterMs: checkPositiveMs('autoResumeAfterMs', o.autoResumeAfterMs),
   };
+}
+
+/**
+ * Validates `SubscribeOptions.handlerFaultIsolation` and builds the
+ * initial per-subscriber isolation config (EB-197). Returns `undefined`
+ * when the isolation is disabled. Throws `RangeError` for invalid
+ * values.
+ */
+function resolveHandlerFaultIsolationOptions(
+  opt: boolean | HandlerFaultIsolationOptions | undefined,
+): Omit<HandlerFaultIsolationState, 'consecutiveErrors' | 'quarantined'> | undefined {
+  if (opt == null || opt === false) return undefined;
+  const o: HandlerFaultIsolationOptions = opt === true ? {} : opt;
+  const maxConsecutiveErrors = o.maxConsecutiveErrors ?? 5;
+  if (!Number.isInteger(maxConsecutiveErrors) || maxConsecutiveErrors < 1) {
+    throw new RangeError('handlerFaultIsolation.maxConsecutiveErrors must be a positive integer');
+  }
+  const onQuarantined = o.onQuarantined;
+  if (onQuarantined !== undefined && typeof onQuarantined !== 'function') {
+    throw new RangeError('handlerFaultIsolation.onQuarantined must be a function');
+  }
+  return { maxConsecutiveErrors, onQuarantined };
 }
 
 /**
@@ -20161,6 +20292,9 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const slowHandler = resolveSlowHandlerOptions(opts?.slowHandler);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const faultIsolation = resolveHandlerFaultIsolationOptions(opts?.handlerFaultIsolation);
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind. The ramp targets the shaping
@@ -20505,6 +20639,11 @@ export class EventBus {
           ? undefined
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
+      // Handler fault isolation (EB-197): opt-in per subscriber.
+      faultIsolation:
+        faultIsolation == null
+          ? undefined
+          : { consecutiveErrors: 0, quarantined: false, ...faultIsolation },
       // Slow-handler offload (EB-191): opt-in per subscriber.
       slowHandler: slowHandler === undefined ? undefined : { ...slowHandler },
       filter,
@@ -36215,6 +36354,7 @@ export class EventBus {
     let unackedDeliveries = 0;
     let throttledSubscribers = 0;
     let degradedSubscribers = 0;
+    let quarantinedSubscribers = 0;
     let pausedSubscribers = 0;
     let shapedSubscribers = 0;
     let replayThrottled = 0;
@@ -36253,6 +36393,7 @@ export class EventBus {
       if (subscriber.draining !== undefined) drainingSubscribers += 1;
       if (subscriber.throttle?.throttled === true) throttledSubscribers += 1;
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
+      if (subscriber.faultIsolation?.quarantined === true) quarantinedSubscribers += 1;
       if (subscriber.manuallyPaused === true) pausedSubscribers += 1;
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
       // Durable-log replay throttle (EB-164): a resume replay currently
@@ -36747,6 +36888,7 @@ export class EventBus {
       transformErrors: this.totalTransformErrors,
       throttledSubscribers,
       degradedSubscribers,
+      quarantinedSubscribers,
       slowHandlers: {
         count: this.totalSlowHandlerInvocations,
         lastMs: this.lastSlowHandlerElapsedMs,
@@ -38890,6 +39032,13 @@ export class EventBus {
     // queued under the normal backpressure policy, untouched by the
     // drain, so resuming picks up exactly where delivery paused.
     if (subscriber.health?.degraded === true) return;
+    // Handler fault isolation (EB-197): a quarantined subscriber's
+    // deliveries are paused with the same skip semantics as the degraded
+    // gate above — the backlog stays queued under the normal
+    // backpressure policy until `resumeQuarantined`. Orthogonal to the
+    // health probe and the manual pause: a subscriber can hold several
+    // pauses at once and each clears independently.
+    if (subscriber.faultIsolation?.quarantined === true) return;
     // Manual operator pause (EB-113): the same skip semantics as the
     // degraded gate above — the backlog stays queued under the normal
     // backpressure policy until `resumeSubscriber`. Orthogonal to the
@@ -39053,45 +39202,87 @@ export class EventBus {
           // a macrotask (see the check after the invocation).
           const slowWatch = subscriber.slowHandler;
           const invokeStartedAtMs = slowWatch !== undefined ? this.now() : 0;
-          this.invokeWithDeliverySlot(subscriber, msg, (): unknown =>
-            this.invokeWithInflightSlot(subscriber, (): unknown => {
-              let result: unknown;
-              if (invocationSlo == null) {
-                result = this.deliverTraced(subscriber, msg, () => {
-                  // Message projection (EB-144): the handler sees the
-                  // projected view; a throwing projection propagates
-                  // exactly like a throwing handler. Schema-version
-                  // migration (EB-186) already ran inside the view: an
-                  // `undefined` view means the migration failed closed —
-                  // skip the handler (already counted).
-                  const view = this.projectMessageView(subscriber, msg);
-                  if (view === undefined) return;
-                  return this.invokeChaosHandler(subscriber, () => subscriber.handler(view));
-                });
-              } else {
-                const processingStartedAtMs = this.now();
-                try {
+          // Handler fault isolation (EB-197): the handler's return value
+          // is captured so a rejected promise can be counted; a
+          // synchronous throw is caught and counted below instead of
+          // escaping the drain.
+          let handlerResult: unknown;
+          const invokeOnce = (): void => {
+            this.invokeWithDeliverySlot(subscriber, msg, (): unknown =>
+              this.invokeWithInflightSlot(subscriber, (): unknown => {
+                let result: unknown;
+                if (invocationSlo == null) {
                   result = this.deliverTraced(subscriber, msg, () => {
+                    // Message projection (EB-144): the handler sees the
+                    // projected view; a throwing projection propagates
+                    // exactly like a throwing handler. Schema-version
+                    // migration (EB-186) already ran inside the view: an
+                    // `undefined` view means the migration failed closed —
+                    // skip the handler (already counted).
                     const view = this.projectMessageView(subscriber, msg);
                     if (view === undefined) return;
-                    return this.invokeChaosHandler(subscriber, () =>
-                      subscriber.handler(view),
-                    );
+                    return this.invokeChaosHandler(subscriber, () => subscriber.handler(view));
                   });
-                } finally {
-                  this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
+                } else {
+                  const processingStartedAtMs = this.now();
+                  try {
+                    result = this.deliverTraced(subscriber, msg, () => {
+                      const view = this.projectMessageView(subscriber, msg);
+                      if (view === undefined) return;
+                      return this.invokeChaosHandler(subscriber, () =>
+                        subscriber.handler(view),
+                      );
+                    });
+                  } finally {
+                    this.recordProcessingLatency(subscriber, invocationSlo, processingStartedAtMs);
+                  }
                 }
+                // EB-72: the handler returned without throwing — a successful
+                // delivery counts as idle activity. Not for reliable
+                // subscribers: their at-least-once wrapper can swallow a
+                // throwing handler (the DLQ nack path), so reliable deliveries
+                // record at the user handler's own success point inside the
+                // wrapper instead.
+                if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
+                handlerResult = result;
+                return result;
+              }),
+            );
+          };
+          const isolation = subscriber.faultIsolation;
+          if (isolation === undefined) {
+            invokeOnce();
+          } else {
+            // Handler fault isolation (EB-197): a synchronous throw is
+            // caught and counted — it never escapes the drain — and a
+            // clean synchronous return counts as a success. A returned
+            // promise defers the verdict to its settlement: the sync
+            // return itself proves nothing about an async handler.
+            let asyncPending = false;
+            let syncThrew = false;
+            try {
+              invokeOnce();
+              asyncPending = isThenable(handlerResult);
+            } catch {
+              syncThrew = true;
+              if (this.noteHandlerFaultOutcome(subscriber, false)) {
+                // The error budget tripped mid-drain: everything not yet
+                // attempted goes back to the queue, in FIFO order — the
+                // same requeue semantics as the health probe's mid-drain
+                // trip.
+                this.requeueUndelivered(subscriber, live.slice(i + 1));
+                this.reportQuarantined(subscriber);
+                break;
               }
-              // EB-72: the handler returned without throwing — a successful
-              // delivery counts as idle activity. Not for reliable
-              // subscribers: their at-least-once wrapper can swallow a
-              // throwing handler (the DLQ nack path), so reliable deliveries
-              // record at the user handler's own success point inside the
-              // wrapper instead.
-              if (subscriber.reliable == null) this.recordIdleActivity(subscriber, 'deliver');
-              return result;
-            }),
-          );
+            }
+            if (!syncThrew) {
+              if (asyncPending) {
+                this.trackAsyncHandlerOutcome(subscriber, handlerResult);
+              } else {
+                this.noteHandlerFaultOutcome(subscriber, true);
+              }
+            }
+          }
           if (this.slowHandlerTripped(subscriber, invokeStartedAtMs)) {
             // Slow-handler offload (EB-191): the handler already ran and
             // the observation is recorded — the rest of the drain moves
@@ -40404,6 +40595,18 @@ export class EventBus {
       // the true outcome — `deliverTraced` deliberately left it open for
       // health-probed subscribers because the probe swallows the throw.
       if (tailTraced) tail!.deliverSpan(subscriber, msg, tailAt, this.now() - tailAt, 'delivered');
+      // Handler fault isolation (EB-197): the probe owns the synchronous
+      // outcome above, but a rejected returned promise was never observed
+      // by anyone — the isolation counts the settlement. A synchronous
+      // success (no returned promise) resets the consecutive-error
+      // counter; a returned promise defers the verdict to its settlement.
+      // Synchronous throws stay with the probe's own consecutive-failure
+      // accounting.
+      if (isThenable(result)) {
+        this.trackAsyncHandlerOutcome(subscriber, result);
+      } else {
+        this.noteHandlerFaultOutcome(subscriber, true);
+      }
       return result;
     }
     health.consecutiveFailures += 1;
@@ -40620,6 +40823,117 @@ export class EventBus {
       reason: health.degradedReason ?? 'error',
       pendingMessages: subscriber.queue.size,
     });
+  }
+
+  /**
+   * Records one handler invocation outcome for fault isolation (EB-197).
+   * A success resets the consecutive-error counter to 0; a failure
+   * increments it, and reaching the budget quarantines the subscriber
+   * (audited as `subscriber_quarantined`). Returns true when this
+   * outcome newly quarantined the subscriber — the caller then requeues
+   * the undelivered backlog and reports the quarantine.
+   *
+   * No-op when the isolation is disabled or the subscriber is already
+   * quarantined (one quarantine per episode — no repeat audit, no
+   * repeat callback).
+   */
+  private noteHandlerFaultOutcome(subscriber: Subscriber, ok: boolean): boolean {
+    const isolation = subscriber.faultIsolation;
+    if (isolation == null || isolation.quarantined) return false;
+    if (ok) {
+      isolation.consecutiveErrors = 0;
+      return false;
+    }
+    isolation.consecutiveErrors += 1;
+    if (isolation.consecutiveErrors < isolation.maxConsecutiveErrors) return false;
+    isolation.quarantined = true;
+    this.auditSubscription({
+      action: 'subscriber_quarantined',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { consecutiveErrors: isolation.consecutiveErrors },
+    });
+    return true;
+  }
+
+  /**
+   * Fires the subscriber's `onQuarantined` callback once per quarantine
+   * with the error count and the preserved backlog size. Called after
+   * the drain requeues the undelivered messages, so `pendingMessages`
+   * is exact — mirroring `reportDegraded`.
+   */
+  private reportQuarantined(subscriber: Subscriber): void {
+    const isolation = subscriber.faultIsolation;
+    if (isolation == null) return;
+    isolation.onQuarantined?.({
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      consecutiveErrors: isolation.consecutiveErrors,
+      pendingMessages: subscriber.queue.size,
+    });
+  }
+
+  /**
+   * Observes the settlement of a handler's returned promise for fault
+   * isolation (EB-197): a rejection counts as a handler error exactly
+   * like a synchronous throw, a fulfillment resets the consecutive-error
+   * counter exactly like a synchronous return. The handlers are attached
+   * alongside the slot machinery's own settle handlers, so an async
+   * rejection is never an unhandled rejection — and never silently
+   * swallowed either.
+   *
+   * The subscriber may have unsubscribed (or been manually resumed)
+   * before the promise settles: only a still-registered subscriber
+   * counts the outcome.
+   */
+  private trackAsyncHandlerOutcome(subscriber: Subscriber, result: unknown): void {
+    if (!isThenable(result)) return;
+    result.then(
+      () => {
+        this.noteHandlerFaultOutcome(subscriber, true);
+      },
+      () => {
+        if (this.subscribers.get(subscriber.id) !== subscriber) return;
+        // A rejection that trips the budget quarantines here, after the
+        // drain round already finished: report it directly — there is no
+        // drain loop left to do it. The backlog stays queued; the
+        // quarantine gate pauses the next flush.
+        if (this.noteHandlerFaultOutcome(subscriber, false)) {
+          this.reportQuarantined(subscriber);
+        }
+      },
+    );
+  }
+
+  /**
+   * Resumes delivery to a quarantined subscriber (see
+   * `SubscribeOptions.handlerFaultIsolation`, EB-197): clears the
+   * quarantine, resets the consecutive-error counter to 0, and schedules
+   * a flush so the preserved backlog is delivered promptly, in order.
+   * Does not touch the health-probe degraded state or the manual pause —
+   * each pause clears independently.
+   *
+   * Returns true when the subscriber was quarantined and is now
+   * resumed, false when it was not quarantined (idempotent — no
+   * duplicate audit). Audited as `subscriber_quarantine_resumed`.
+   * Throws on an unknown subscriber id.
+   */
+  resumeQuarantined(subId: string): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const isolation = subscriber.faultIsolation;
+    if (isolation == null || !isolation.quarantined) return false;
+    isolation.quarantined = false;
+    isolation.consecutiveErrors = 0;
+    this.auditSubscription({
+      action: 'subscriber_quarantine_resumed',
+      actor: 'system',
+      subId,
+      pattern: subscriber.pattern,
+    });
+    this.scheduleFlush();
+    return true;
   }
 
   /**

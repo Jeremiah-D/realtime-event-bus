@@ -697,6 +697,35 @@ library.
   offload. Invalid options throw `RangeError` from `subscribe`. Applies
   to single-message drains (batched subscribers collect before they
   invoke); disabled by default.
+- **Handler fault isolation** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { handlerFaultIsolation: true })`, EB-197):
+  per-subscriber consecutive error budget with automatic quarantine. A
+  handler invocation fails when it throws synchronously or when its
+  returned promise rejects — without the isolation, a throwing plain
+  handler escapes the drain as an uncaught exception and a rejected
+  promise vanishes into the slot-release machinery, so neither is
+  observable. With the isolation on, every invocation outcome is counted:
+  a success resets the consecutive-error counter to 0 (a returned
+  promise defers the verdict to its settlement — the sync return itself
+  proves nothing about an async handler), a failure increments it, and
+  reaching `maxConsecutiveErrors` (default 5) quarantines the subscriber
+  — delivery pauses with the backlog preserved in queue under the normal
+  backpressure policy (a mid-drain trip requeues the unattempted
+  messages), `onQuarantined` fires once with the error count and the
+  preserved backlog size, and the quarantine is audited as
+  `subscriber_quarantined`. Recovery is manual via
+  `EventBus.resumeQuarantined(subId)` (audited as
+  `subscriber_quarantine_resumed`); `getStats().quarantinedSubscribers`
+  reports the count. Orthogonal to the health probe (which keeps its own
+  accounting for sync throws on the probed path — the isolation
+  additionally counts async rejections there), to the slow-handler
+  offload (slowness vs failure), to the poison-message DLQ
+  (per-message vs per-subscriber), and to the manual pause
+  (`pauseSubscriber`/`resumeSubscriber` never clears a quarantine and
+  vice versa). Invalid options throw `RangeError` from `subscribe`.
+  Applies to single-message drains; the retained-snapshot catch-up path
+  keeps its existing throw isolation and never feeds the budget.
+  Disabled by default.
 - **Nack-reason aggregation** (in `src/bus.ts` + `src/metrics.ts`, always
   on for reliable subscriptions): every redelivery is classified into
   exactly one of three mutually-exclusive triggers — `handler_throw` (the
@@ -3638,7 +3667,8 @@ Details:
   `retention_updated` carries `{ from, to }` (null when unset);
   `retained_rule_set` carries `{ enabled }`, `retained_cleared` carries
   `{ via: 'publish' }`; `partition_rule_set` carries `{ partitions }`;
-  `barrier_dropped` carries `{ epoch, lastEpoch }` (EB-98).
+  `barrier_dropped` carries `{ epoch, lastEpoch }` (EB-98);
+  `subscriber_quarantined` carries `{ consecutiveErrors }` (EB-197).
 
 ## Publish audit journal (EB-138)
 

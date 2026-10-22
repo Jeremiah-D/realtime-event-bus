@@ -13,7 +13,9 @@
  * `partition_rule_set` / `partition_rule_cleared`) / out-of-order barrier
  * discards (EB-98, `barrier_dropped`) / manual subscriber pause-resume
  * (EB-113, `subscriber_paused` / `subscriber_resumed`) / manual
- * consumer-offset seek (EB-130, `subscriber_seek`).
+ * consumer-offset seek (EB-130, `subscriber_seek`) / handler fault
+ * isolation quarantine (EB-197, `subscriber_quarantined` /
+ * `subscriber_quarantine_resumed`).
  *
  * This complements `EventBusOptions.onAuthzDenied`, which only fires for
  * *rejected* authorization decisions: the audit log records the normal,
@@ -73,6 +75,8 @@ export type SubscriptionAuditAction =
   | 'subscriber_paused'
   | 'subscriber_resumed'
   | 'subscriber_seek'
+  | 'subscriber_quarantined'
+  | 'subscriber_quarantine_resumed'
   | 'delivery_sample_rate_updated'
   | 'header_filter_updated'
   | 'client_pressure'
@@ -141,6 +145,12 @@ export type SubscriptionAuditAction =
  *   clampedByCommitted? }], invalidatedInflight }` — a manual
  *   consumer-offset seek (EB-130) repositioned the subscriber's
  *   consumption position; `subId`/`pattern` identify the subscription
+ * - `subscriber_quarantined`: `{ consecutiveErrors: <count> }` — handler
+ *   fault isolation (EB-197) auto-paused delivery after the consecutive
+ *   error budget tripped; `subId`/`pattern` identify the subscription
+ * - `subscriber_quarantine_resumed`: no detail — a
+ *   `resumeQuarantined` (EB-197) cleared the quarantine;
+ *   `subId`/`pattern` identify the subscription
  * - `delivery_sample_rate_updated`: `{ from: <old rate>, to: <new rate> }`
  *   — a `setDeliverySampleRate` (EB-152) hot-update changed the
  *   subscriber's delivery-sampling divisor; `subId`/`pattern` identify
@@ -242,6 +252,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'subscriber_paused',
   'subscriber_resumed',
   'subscriber_seek',
+  'subscriber_quarantined',
+  'subscriber_quarantine_resumed',
   'delivery_sample_rate_updated',
   'header_filter_updated',
   'client_pressure',
