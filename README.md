@@ -1249,6 +1249,32 @@ library.
   the earliest-registered matching pattern wins; `clearTopicCompression`
   removes a rule (already-queued messages keep the form they were published
   with). Invalid options throw `RangeError`. Disabled by default.
+  - **Pluggable codec** (`codec: 'deflate' | 'brotli'`, EB-194): the
+    compression codec is a registry — `deflate` is the default (EB-22
+    semantics unchanged), `brotli` is opt-in (`node:zlib`, zero new
+    dependencies). `brotliQuality` (0–11, default 4) tunes the
+    ratio/CPU trade-off; `level` keeps meaning the deflate level.
+    The codec id is stamped on the message envelope and persisted in the
+    durable log, so replay inflates with the codec the message was
+    compressed with — records written before codec support carry
+    `'deflate'` and replay unchanged. A record naming an unknown codec
+    fails loudly at replay instead of delivering garbage. Preset
+    dictionaries and `autoTrain` stay deflate-only (combining either with
+    `codec: 'brotli'` throws `RangeError`). Codec comparison on 2000
+    market ticks (mean 142 B serialized), Node v24.20.0 / 2-vCPU AMD EPYC
+    9D25 (`node bench/compress-codec.bench.ts`):
+
+    | codec | wire ratio | compress p50 | compress p99 |
+    |---|---|---|---|
+    | deflate level 6 (default) | 0.908 | 22.4 µs | ~475 µs |
+    | brotli quality 0 | 1.028 (expands — the never-adopt-larger guard rejects it on the bus) | 11.3 µs | ~157 µs |
+    | brotli quality 4 (bus default) | 0.834 | 24.6 µs | ~300 µs |
+    | brotli quality 11 | 0.849 (worse than q4 on small messages, and ~30× the CPU) | 760 µs | ~1854 µs |
+
+    Honest read: on small JSON, brotli q4 beats deflate on ratio at equal
+    CPU; quality 11 buys nothing on this shape and costs ~30× CPU, so the
+    bus defaults to 4. For larger payloads re-run the bench on your own
+    corpus — the trade-off moves with message size.
   - **Preset dictionary** (`dictionary` option): a `Uint8Array` /
     `ArrayBuffer` / `DataView` of up to 32 KiB (zlib's cap) passed as the
     deflate preset dictionary. Pre-seeding the compressor with the topic's
@@ -2419,6 +2445,14 @@ npm test
   resume inflates), ACK redelivery of compressed messages, TTL deadline
   preservation, envelope-shaped user payloads never mistaken for
   compressed, and option validation.
+- `test/compress-codec.test.ts` — pluggable compression codec (EB-194):
+  brotli round-trip with transparent inflation, deflate staying the
+  default, the codec id persisted in the durable log with replay inflating
+  by envelope id, pre-codec deflate records replaying unchanged, option
+  validation (`codec` / `brotliQuality` / `dictionary`+brotli /
+  `autoTrain`+brotli all `RangeError`), the never-adopt-larger guard for
+  brotli, unknown-codec records failing loudly at replay, binary payloads,
+  and brotli quality moving the wire bytes.
 - `test/dict-train.test.ts` — auto-trained per-topic deflate dictionaries:
   `autoTrain` option validation (`RangeError` fail-fast), disabled by
   default (no stats field, no timers), message-count trigger training with

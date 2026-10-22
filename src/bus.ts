@@ -280,7 +280,13 @@ import {
   type StateEntry,
   type StateStoreStats,
 } from './statestore.ts';
-import { deflateSync, inflateSync } from 'node:zlib';
+import {
+  brotliCompressSync,
+  brotliDecompressSync,
+  constants as zlibConstants,
+  deflateSync,
+  inflateSync,
+} from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import {
@@ -11492,14 +11498,42 @@ interface DelayedFanOut {
  * zero new dependencies — and only kicks in for payloads whose serialized
  * size exceeds `thresholdBytes`, so small messages never pay deflate CPU.
  */
+/**
+ * Payload compression codec (EB-194): `'deflate'` (the default, zlib
+ * deflate — EB-22 semantics unchanged) or `'brotli'` (opt-in, `node:zlib`
+ * brotli — zero new dependencies). The codec is stamped on the message
+ * envelope and persisted in the durable log, so replay inflates with the
+ * codec the message was compressed with; records written before codec
+ * support carry `'deflate'`.
+ */
+export type CompressionCodec = 'deflate' | 'brotli';
+
+/** Default brotli quality when `codec: 'brotli'` and no `brotliQuality` is given. */
+const DEFAULT_BROTLI_QUALITY = 4;
+
+/** Maximum brotli quality (`BROTLI_PARAM_QUALITY` range 0–11). */
+const MAX_BROTLI_QUALITY = 11;
+
 export interface TopicCompressionOptions {
   /**
    * Payloads whose serialized (UTF-8 JSON) size is strictly greater than
-   * this many bytes are deflate-compressed; anything at or below the
-   * threshold passes through untouched. Must be a positive finite number
-   * of bytes.
+   * this many bytes are compressed; anything at or below the threshold
+   * passes through untouched. Must be a positive finite number of bytes.
    */
   thresholdBytes: number;
+  /**
+   * Compression codec: `'deflate'` (default) or `'brotli'` (opt-in).
+   * Brotli typically wins on ratio for JSON text at the cost of more
+   * CPU — measure with `bench/compress-codec.bench.ts`. Unknown values
+   * throw `RangeError`.
+   */
+  codec?: CompressionCodec;
+  /**
+   * Brotli quality, 0–11. Default 4. Higher values trade CPU for smaller
+   * output. Only used when `codec: 'brotli'`; ignored for `'deflate'`
+   * (use `level` there). Must be an integer in 0–11.
+   */
+  brotliQuality?: number;
   /**
    * zlib deflate compression level, 0–9. Default 6. Higher levels trade
    * CPU for smaller output; level 0 stores without compressing, so its
@@ -11509,7 +11543,10 @@ export interface TopicCompressionOptions {
   level?: number;
   /**
    * Optional preset deflate dictionary (zlib `dictionary` option), zero
-   * new dependencies. Pre-seeding the compressor with the topic's
+   * new dependencies. Only meaningful with the default `'deflate'` codec —
+   * combining it with `codec: 'brotli'` throws `RangeError` (brotli's
+   * preset-dictionary plumbing differs; the bus keeps one honest code
+   * path per codec). Pre-seeding the compressor with the topic's
    * recurring byte patterns — field names, enum values, venue prefixes —
    * dramatically improves the compression ratio of SMALL JSON messages
    * that carry too little redundancy for deflate to find on its own.
@@ -11534,7 +11571,9 @@ export interface TopicCompressionOptions {
    * into a bounded sliding window and periodically derives a fresh preset
    * deflate dictionary from the recent corpus — no manual dictionary
    * building, zero new dependencies. Disabled by default; see
-   * `CompressionAutoTrainOptions`.
+   * `CompressionAutoTrainOptions`. Only meaningful with the default
+   * `'deflate'` codec — combining it with `codec: 'brotli'` throws
+   * `RangeError` (the trainer derives deflate preset dictionaries).
    */
   autoTrain?: CompressionAutoTrainOptions;
 }
@@ -11647,7 +11686,11 @@ export interface CompressionAutoTrainState {
  */
 interface ResolvedCompressionRule {
   thresholdBytes: number;
+  /** Compression codec (EB-194): 'deflate' by default, 'brotli' opt-in. */
+  codec: CompressionCodec;
   level: number;
+  /** Brotli quality 0–11 (EB-194); only used when `codec` is 'brotli'. */
+  brotliQuality: number;
   dictionary?: Buffer;
   dictionaryId?: string;
   /** Auto-trainer for the rule (EB-60), present when `autoTrain` was enabled. */
@@ -11984,9 +12027,9 @@ function coerceCompressionDictionary(
  * layout is internal and may change.
  */
 interface CompressedPayload {
-  /** Reserved marker: this envelope carries zlib-deflated payload bytes. */
-  __busCompressed: 'deflate';
-  /** Base64 of the raw deflate bytes of the payload's UTF-8 JSON encoding. */
+  /** Reserved marker: the codec id that produced the payload bytes. */
+  __busCompressed: CompressionCodec;
+  /** Base64 of the codec's raw output bytes of the payload's UTF-8 JSON encoding. */
   data: string;
 }
 
@@ -12002,8 +12045,7 @@ interface CompressedPayload {
  */
 function inflateEnvelopePayload(envelope: CompressedPayload, dictionary?: Buffer): unknown {
   const raw = Buffer.from(envelope.data, 'base64');
-  const inflated =
-    dictionary === undefined ? inflateSync(raw) : inflateSync(raw, { dictionary });
+  const inflated = decompressCodec(envelope.__busCompressed, raw, dictionary);
   return JSON.parse(inflated.toString('utf8'));
 }
 
@@ -12019,9 +12061,44 @@ function isCompressedPayload(value: unknown): value is CompressedPayload {
   const record = value as Record<string, unknown>;
   return (
     Object.keys(record).length === 2 &&
-    record.__busCompressed === 'deflate' &&
+    (record.__busCompressed === 'deflate' || record.__busCompressed === 'brotli') &&
     typeof record.data === 'string'
   );
+}
+
+/**
+ * True when the value has the compression-envelope shape but names a
+ * codec the bus does not know — e.g. a durable-log record written by a
+ * newer bus version, or a tampered log. The durable-log replay path
+ * fails loudly on these (see `admitReplayRecords`) instead of
+ * delivering the raw envelope as the subscriber's payload.
+ */
+function isUnknownCodecEnvelope(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    Object.keys(record).length === 2 &&
+    typeof record.__busCompressed === 'string' &&
+    record.__busCompressed !== 'deflate' &&
+    record.__busCompressed !== 'brotli' &&
+    typeof record.data === 'string'
+  );
+}
+
+/**
+ * Decompresses one codec's output bytes (EB-194). `dictionary` is the
+ * deflate preset dictionary (or `undefined`); brotli records never carry
+ * one (the registration rejects the combination). Throws on an unknown
+ * codec id — a tampered log must not silently deliver corrupt data.
+ */
+function decompressCodec(codec: CompressionCodec, raw: Buffer, dictionary?: Buffer): Buffer {
+  if (codec === 'deflate') {
+    return dictionary === undefined ? inflateSync(raw) : inflateSync(raw, { dictionary });
+  }
+  if (codec === 'brotli') {
+    return brotliDecompressSync(raw);
+  }
+  throw new Error(`unknown compression codec "${codec as string}": cannot inflate payload`);
 }
 
 /**
@@ -17094,6 +17171,7 @@ export class EventBus {
           if (rec.seq < 1 || rec.key === undefined) continue;
           if (rec.expiresAt !== undefined && rec.expiresAt <= nowMs) continue;
           const wire = this.wirePayloadOfRecord(rec);
+          this.assertKnownCompressionCodec(wire, rec);
           const payload = isCompressedPayload(wire)
             ? inflateEnvelopePayload(wire, this.dictionaryForRecord(rec))
             : wire;
@@ -19020,8 +19098,9 @@ export class EventBus {
    * compression. `topicPattern` accepts the same wildcard syntax as
    * `subscribe` (or an exact topic name). A publish whose payload
    * serializes to more than `opts.thresholdBytes` UTF-8 JSON bytes is
-   * deflate-compressed (`node:zlib`, zero new dependencies); smaller
-   * payloads pass through untouched and never pay deflate CPU.
+   * compressed with the rule's codec — `deflate` by default, opt-in
+   * `brotli` (both `node:zlib`, zero new dependencies); smaller payloads
+   * pass through untouched and never pay compression CPU.
    *
    * The compressed bytes — wrapped in a bus-internal envelope — are what
    * get written to the durable log and fanned out to subscriber queues;
@@ -19042,9 +19121,12 @@ export class EventBus {
    * Rule matching mirrors `setTopicTtl`: an exact-topic rule wins over
    * patterns, the earliest-registered matching pattern wins. Re-setting a
    * rule replaces it. Throws when `topicPattern` is empty, when
-   * `thresholdBytes` is not a positive finite number, when `level` is
-   * not an integer in 0–9, or when `dictionary` is not a non-empty byte
-   * buffer of at most 32 KiB.
+   * `thresholdBytes` is not a positive finite number, when `codec` is not
+   * `'deflate'`/`'brotli'`, when `brotliQuality` is not an integer in
+   * 0–11, when `level` is not an integer in 0–9, when `dictionary` is not
+   * a non-empty byte buffer of at most 32 KiB, when `dictionary` is
+   * combined with `codec: 'brotli'`, or when `autoTrain` is combined with
+   * `codec: 'brotli'`.
    */
   setTopicCompression(topicPattern: string, opts: TopicCompressionOptions): void {
     if (topicPattern.length === 0) {
@@ -19053,11 +19135,30 @@ export class EventBus {
     if (opts == null || !Number.isFinite(opts.thresholdBytes) || opts.thresholdBytes <= 0) {
       throw new RangeError('thresholdBytes must be a positive finite number of bytes');
     }
+    // EB-194: the codec registry — 'deflate' (default) or 'brotli' opt-in.
+    const codec = opts.codec ?? 'deflate';
+    if (codec !== 'deflate' && codec !== 'brotli') {
+      throw new RangeError(`codec must be 'deflate' or 'brotli', got ${JSON.stringify(opts.codec)}`);
+    }
+    const brotliQuality = opts.brotliQuality ?? DEFAULT_BROTLI_QUALITY;
+    if (!Number.isInteger(brotliQuality) || brotliQuality < 0 || brotliQuality > MAX_BROTLI_QUALITY) {
+      throw new RangeError(`brotliQuality must be an integer in 0-${MAX_BROTLI_QUALITY}`);
+    }
     const level = opts.level ?? 6;
     if (!Number.isInteger(level) || level < 0 || level > 9) {
       throw new RangeError('level must be an integer in 0-9');
     }
     const dictionary = coerceCompressionDictionary(opts.dictionary);
+    if (dictionary !== undefined && codec === 'brotli') {
+      throw new RangeError(
+        'dictionary is only supported with the deflate codec (brotli carries its own built-in dictionary)',
+      );
+    }
+    if (opts.autoTrain !== undefined && codec === 'brotli') {
+      throw new RangeError(
+        'autoTrain is only supported with the deflate codec (the trainer derives deflate preset dictionaries)',
+      );
+    }
     let dictionaryId: string | undefined;
     if (dictionary !== undefined) {
       dictionaryId = createHash('sha256').update(dictionary).digest('hex');
@@ -19086,7 +19187,7 @@ export class EventBus {
       );
       this.compressionAutoTrainers.set(topicPattern, autoTrainState);
     }
-    this.compressionRules.set(topicPattern, { thresholdBytes: opts.thresholdBytes, level, dictionary, dictionaryId, autoTrainState });
+    this.compressionRules.set(topicPattern, { thresholdBytes: opts.thresholdBytes, codec, level, brotliQuality, dictionary, dictionaryId, autoTrainState });
   }
 
   /**
@@ -19133,8 +19234,26 @@ export class EventBus {
    * instead. Re-registering the rule with the identical dictionary bytes
    * fixes it.
    */
-  private dictionaryForRecord(record: { topic: string; seq: number; dictId?: string }): Buffer | undefined {
-    const dictId = record.dictId;
+  /**
+   * Fails loudly on a durable-log record whose compression envelope names
+   * a codec this bus does not know (EB-194) — written by a newer bus, or
+   * a tampered log — instead of delivering the raw envelope as the
+   * subscriber's payload. Mirrors the missing-dictionary fail-closed
+   * behavior of `dictionaryForRecord`.
+   */
+  private assertKnownCompressionCodec(
+    wirePayload: unknown,
+    rec: { topic: string; seq: number },
+  ): void {
+    if (isUnknownCodecEnvelope(wirePayload)) {
+      throw new Error(
+        `cannot inflate compressed record for topic "${rec.topic}" (seq ${rec.seq}): ` +
+          `unknown compression codec "${(wirePayload as { __busCompressed: string }).__busCompressed}"`,
+      );
+    }
+  }
+
+  private dictionaryForRecord(record: { topic: string; seq: number; dictId?: string }): Buffer | undefined {    const dictId = record.dictId;
     if (dictId === undefined) return undefined;
     const dictionary = this.compressionDictionaryRegistry.get(dictId);
     if (dictionary !== undefined) {
@@ -19217,17 +19336,25 @@ export class EventBus {
     // not a tax on every publish.
     if (bytesBefore <= rule.thresholdBytes) return payload;
     const startedAtMs = this.now();
-    const deflated =
-      rule.dictionary === undefined
-        ? deflateSync(wireBytes, { level: rule.level })
-        : deflateSync(wireBytes, { level: rule.level, dictionary: rule.dictionary });
+    // EB-194: the codec registry — deflate (default) or opt-in brotli,
+    // both from `node:zlib`, zero new dependencies. A brotli rule never
+    // carries a preset dictionary (registration rejects the combination),
+    // so the brotli branch has no dictionary to thread.
+    const compressed =
+      rule.codec === 'brotli'
+        ? brotliCompressSync(wireBytes, {
+            params: { [zlibConstants.BROTLI_PARAM_QUALITY]: rule.brotliQuality },
+          })
+        : rule.dictionary === undefined
+          ? deflateSync(wireBytes, { level: rule.level })
+          : deflateSync(wireBytes, { level: rule.level, dictionary: rule.dictionary });
     const elapsedMs = Math.max(0, this.now() - startedAtMs);
     // Never adopt an encoding that does not shrink the payload —
     // incompressible data (or level 0) would only add envelope overhead.
-    if (deflated.length >= bytesBefore) return payload;
+    if (compressed.length >= bytesBefore) return payload;
     const envelope: CompressedPayload = {
-      __busCompressed: 'deflate',
-      data: deflated.toString('base64'),
+      __busCompressed: rule.codec,
+      data: compressed.toString('base64'),
     };
     this.compressedPayloads.add(msg);
     // The exact dictionary bytes travel with the message: inflating needs
@@ -19236,11 +19363,11 @@ export class EventBus {
     if (rule.dictionary !== undefined) this.compressedDictionaries.set(msg, rule.dictionary);
     stats.compressedMessages += 1;
     stats.compressedBytesBefore += bytesBefore;
-    stats.compressedBytesAfter += deflated.length;
+    stats.compressedBytesAfter += compressed.length;
     stats.compressionTimeMs += elapsedMs;
     this.totalCompressed += 1;
     this.totalCompressedBytesBefore += bytesBefore;
-    this.totalCompressedBytesAfter += deflated.length;
+    this.totalCompressedBytesAfter += compressed.length;
     this.totalCompressionTimeMs += elapsedMs;
     return envelope;
   }
@@ -19281,7 +19408,9 @@ export class EventBus {
     const dictionary = this.dictionaryForRecord(rec);
     if (rec.binary === true) {
       const raw = Buffer.from(envelope.data, 'base64');
-      return dictionary === undefined ? inflateSync(raw) : inflateSync(raw, { dictionary });
+      return dictionary === undefined
+        ? decompressCodec(envelope.__busCompressed, raw)
+        : decompressCodec(envelope.__busCompressed, raw, dictionary);
     }
     return inflateEnvelopePayload(envelope, dictionary);
   }
@@ -19340,7 +19469,7 @@ export class EventBus {
       // `JSON.parse`d. The subscriber receives a `Uint8Array`, the same
       // shape the publisher sent.
       const raw = Buffer.from(payload.data, 'base64');
-      msg.payload = dictionary === undefined ? inflateSync(raw) : inflateSync(raw, { dictionary });
+      msg.payload = decompressCodec(payload.__busCompressed, raw, dictionary);
     } else {
       msg.payload = inflateEnvelopePayload(payload, dictionary);
     }
@@ -24942,6 +25071,10 @@ export class EventBus {
               // application payload — never ciphertext. A binary filter
               // sees the `Uint8Array`, never a misparsed value.
               const wirePayload = this.wirePayloadOfRecord(rec);
+              // EB-194: fail loudly on an unknown-codec envelope here too —
+              // the filter must judge the application payload, and an
+              // envelope no codec can open has none.
+              this.assertKnownCompressionCodec(wirePayload, rec);
               // A sealed record that cannot be decrypted is skipped here:
               // delivery would drop it fail-closed anyway, so judging it
               // (or queuing it) would only churn the replay budget. The
@@ -25086,6 +25219,11 @@ export class EventBus {
               countReplaySkipped();
             }
             const wirePayload = this.wirePayloadOfRecord(rec);
+            // EB-194: a record whose envelope names a codec this bus does
+            // not know (written by a newer bus, or a tampered log) fails
+            // loudly here — like a missing preset dictionary below —
+            // instead of delivering the raw envelope as the payload.
+            this.assertKnownCompressionCodec(wirePayload, rec);
             const msg: BusMessage = {
               topic: rec.topic,
               payload: wirePayload,
@@ -26169,6 +26307,7 @@ export class EventBus {
    */
   private pulledMessageFromRecord(rec: DurableLogRecord): PulledMessage {
     const wire = this.wirePayloadOfRecord(rec);
+    this.assertKnownCompressionCodec(wire, rec);
     const payload = isCompressedPayload(wire)
       ? inflateEnvelopePayload(wire, this.dictionaryForRecord(rec))
       : wire;
@@ -29364,6 +29503,8 @@ export class EventBus {
       // envelope so delivery inflates to bytes and verifies signatures
       // against the raw bytes.
       if (entry.binary === true) this.binaryMessages.add(msg);
+      // EB-194: fail loudly on an unknown-codec envelope, like replay.
+      this.assertKnownCompressionCodec(entry.payload, { topic: entry.topic, seq: entry.seq });
       if (isCompressedPayload(entry.payload)) {
         this.compressedPayloads.add(msg);
         if (entry.dictId !== undefined) {
