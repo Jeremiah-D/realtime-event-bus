@@ -1989,7 +1989,14 @@ library.
   scripted sequence in tests for determinism; schedules without jitter
   never draw from it. Invalid timing options throw `RangeError`; with a durable
   log, a non-JSON-serializable payload throws instead of scheduling
-  something that could not survive a restart. Opt-in schedule-skew
+  something that could not survive a restart. Opt-in one-sided due-time jitter (EB-195, via
+  `publishDelayed(..., { jitterMs })`): spreads the due time by a random
+  offset in `[0, jitterMs)` — a staggered window that never fires early,
+  so wall-clock-scheduled work (cron ticks, embargoed releases) keeps its
+  "at-or-after" semantics while avoiding lockstep fan-out (thundering-herd
+  protection for scheduled-task staggering). Composes with `expiryJitterMs`
+  (the `jitterMs` draw comes first); accepted jittered schedules are counted
+  in `getStats().jitteredDelayed`. Opt-in schedule-skew
   observability (EB-136, in `src/scheduleskew.ts`, via `new EventBus({
   scheduleSkew: {} })`): samples every fanned-out schedule's skew — the
   actual fan-out time minus its due time (`deliverAt`, the expected

@@ -5939,6 +5939,15 @@ export interface BusStats {
    */
   pendingDelayed: number;
   /**
+   * Delayed schedules accepted with one-sided due-time jitter (EB-195,
+   * see `PublishDelayedOptions.jitterMs`): cumulative count of
+   * `publishDelayed` schedules that had a positive `jitterMs` applied,
+   * since the bus was created. Schedules rejected by a fail-fast gate
+   * or whose durable-log persist failed are never counted; the counter
+   * is in-memory, so a restart does not recount.
+   */
+  jitteredDelayed: number;
+  /**
    * Delayed-delivery schedule-skew summary (EB-136, see
    * `EventBusOptions.scheduleSkew`): the bounded rolling window over
    * every fanned-out schedule's skew (actual fan-out time minus its due
@@ -11439,6 +11448,35 @@ export interface PublishDelayedOptions {
    * `0`/absent means no jitter and draws nothing from the random source.
    */
   expiryJitterMs?: number;
+  /**
+   * One-sided due-time jitter for this delayed publish (EB-195, opt-in):
+   * a random offset in `[0, jitterMs)` applied to the due time once, at
+   * schedule time — so a burst of schedules sharing one nominal
+   * `deliverAt` fans out staggered over a window instead of in lockstep
+   * (thundering-herd protection for scheduled-task workloads), without
+   * ever firing EARLY. Unlike `expiryJitterMs` above — whose ± jitter
+   * can move the due time before the nominal instant — the scheduled
+   * instant stays a lower bound: wall-clock-scheduled work (cron ticks,
+   * embargoed releases, lease starts) never runs ahead of its window,
+   * only behind it. Combine with `expiryJitterMs` for a skewed window:
+   * the `jitterMs` draw comes first, then the `expiryJitterMs` draw, so
+   * an injected scripted random sequence stays deterministic. The
+   * jittered due time is what the timer heap, the durable-log schedule
+   * record, and the schedule-skew sampler observe: a restart rebuilds
+   * the same due time, `cancelDelayed` is unaffected, and keyed
+   * schedules keep their schedule-time key sequence numbers (the jitter
+   * changes *when* each schedule fans out, never the per-key order). A
+   * jittered due time in the past is already due and fans out on the
+   * next flush, exactly like `delayMs: 0`. The random draw comes from
+   * the injectable `EventBusOptions.delayJitterRandom` (default
+   * `Math.random`) — inject a scripted sequence in tests for
+   * determinism. Must be a non-negative finite number of milliseconds
+   * when provided; anything else throws `RangeError` at schedule time.
+   * `0`/absent means no jitter and draws nothing from the random source.
+   * Accepted jittered schedules are counted in
+   * `BusStats.jitteredDelayed`.
+   */
+  jitterMs?: number;
 }
 
 /**
@@ -14573,6 +14611,14 @@ export class EventBus {
   private delayedById = new Map<string, DelayedEntry>();
   /** Counter for `publishDelayed` ids (`delayed-1`, …). */
   private nextDelayedId = 0;
+  /**
+   * Cumulative count of accepted delayed schedules that had one-sided
+   * due-time jitter applied (EB-195, see
+   * `PublishDelayedOptions.jitterMs`): incremented when the schedule is
+   * accepted — rejected schedules and failed durable-log persists never
+   * count. Reported as `BusStats.jitteredDelayed`.
+   */
+  private totalJitteredDelayed = 0;
   /**
    * Wall-clock timer armed for the heap's next due time. Unref'd — a
    * pending delayed message never keeps the process alive on its own —
@@ -28036,6 +28082,34 @@ export class EventBus {
         throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
       }
     }
+    // One-sided due-time jitter (EB-195): spread the due time by a random
+    // offset in `[0, jitterMs)` so schedules sharing one nominal deliverAt
+    // do not fan out in lockstep — without ever firing early (see
+    // `PublishDelayedOptions.jitterMs`). Drawn before the `expiryJitterMs`
+    // draw below when both are set, so an injected scripted random
+    // sequence stays deterministic. Applied once, at schedule time — the
+    // jittered due time is what the heap, the durable-log schedule
+    // record, and the schedule-skew sampler all observe, so a restart
+    // rebuilds the same due time and cancel/key-ordering semantics are
+    // untouched. Validated fail-fast here, before anything is mutated; a
+    // zero/absent jitter draws nothing from the random source.
+    const jitterMs = opts.jitterMs;
+    let jitterApplied = false;
+    if (jitterMs !== undefined) {
+      if (
+        typeof jitterMs !== 'number' ||
+        !Number.isFinite(jitterMs) ||
+        jitterMs < 0
+      ) {
+        throw new RangeError(
+          'publishDelayed: jitterMs must be a non-negative finite number of milliseconds',
+        );
+      }
+      if (jitterMs > 0) {
+        deliverAt += this.delayJitterRandom() * jitterMs;
+        jitterApplied = true;
+      }
+    }
     // Due-time jitter (EB-160): spread the due time by a random
     // ±expiryJitterMs so schedules sharing one nominal deliverAt do not
     // fan out in lockstep. Applied once, at schedule time — the jittered
@@ -28287,6 +28361,10 @@ export class EventBus {
     }
     this.delayedById.set(id, entry);
     this.delayHeap.push(entry);
+    // One-sided due-time jitter (EB-195): the schedule was accepted with
+    // a positive `jitterMs` — count it once, here, so rejected schedules
+    // and failed persists never count.
+    if (jitterApplied) this.totalJitteredDelayed += 1;
     // A keyed schedule on a topic a subscriber's pattern does not match
     // advances that subscriber's per-key baseline NOW (schedule time), not
     // at fan-out: otherwise a subscriber buffering a later keySeq for the
@@ -36549,6 +36627,7 @@ export class EventBus {
       deliveryConcurrency,
       nackReasons,
       pendingDelayed: this.delayedById.size,
+      jitteredDelayed: this.totalJitteredDelayed,
       delayedScheduleSkew: this.scheduleSkew?.tracker.summary() ?? emptyScheduleSkewSummary(),
       recurringJobs: {
         active: [...this.recurringById.values()].filter((j) => !j.dormant).length,

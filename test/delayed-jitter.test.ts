@@ -192,3 +192,179 @@ test('a jittered schedule survives restart with its jittered due time', async ()
   assert.deepEqual(received, ['poke', 'poke2', 'survivor']);
   await bus2.close();
 });
+
+// ---------------------------------------------------------------------------
+// EB-195: one-sided due-time jitter (`jitterMs`) — staggered, never early.
+// ---------------------------------------------------------------------------
+
+test('EB-195: invalid jitterMs throws RangeError and schedules nothing', () => {
+  const clock = controllableClock();
+  const bus = new EventBus({ now: clock.now });
+  bus.subscribe('t', () => {});
+  for (const bad of [-1, -0.5, NaN, Infinity, '100' as unknown as number]) {
+    assert.throws(
+      () => bus.publishDelayed('t', 'x', { delayMs: 100, jitterMs: bad }),
+      RangeError,
+      `jitterMs=${String(bad)}`,
+    );
+  }
+  assert.equal(bus.getStats().pendingDelayed, 0);
+  assert.equal(bus.getStats().jitteredDelayed, 0);
+});
+
+test('EB-195: zero/absent jitterMs draws nothing from the random source', () => {
+  const clock = controllableClock();
+  const random = scriptedRandom([0]);
+  const bus = new EventBus({ now: clock.now, delayJitterRandom: random.fn });
+  bus.subscribe('t', () => {});
+  bus.publishDelayed('t', 'z', { delayMs: 1000, jitterMs: 0 });
+  bus.publishDelayed('t', 'plain', { delayMs: 1000 });
+  assert.equal(random.calls(), 0);
+  assert.equal(bus.getStats().jitteredDelayed, 0);
+});
+
+test('EB-195: jitterMs offsets the due time by [0, jitterMs) — never early', async () => {
+  const clock = controllableClock();
+  // draw 0 -> the most-negative jitterMs offset is still 0: nominal due
+  // t=2000 stays t=2000, never earlier (unlike expiryJitterMs).
+  const bus = new EventBus({ now: clock.now, delayJitterRandom: () => 0 });
+  const received: unknown[] = [];
+  bus.subscribe('t', (msg) => received.push(msg.payload));
+  bus.publishDelayed('t', 'on-time', { delayMs: 1000, jitterMs: 400 });
+  await flush();
+  clock.nowMs = 1_999;
+  bus.publish('t', 'poke');
+  await flush();
+  assert.deepEqual(received, ['poke']); // not early: still due at 2000
+  clock.nowMs = 2_000;
+  bus.publish('t', 'poke2');
+  await flush();
+  assert.deepEqual(received, ['poke', 'poke2', 'on-time']);
+  assert.equal(bus.getStats().jitteredDelayed, 1);
+});
+
+test('EB-195: a batch of same-due schedules spreads over [0, jitterMs)', async () => {
+  const clock = controllableClock();
+  // Three schedules, nominal due t=2000, jitterMs=400: draws give +0,
+  // +100, +300 — a staggered window, all at-or-after the nominal due.
+  const random = scriptedRandom([0, 0.25, 0.75]);
+  const bus = new EventBus({ now: clock.now, delayJitterRandom: random.fn });
+  const received: unknown[] = [];
+  bus.subscribe('t', (msg) => received.push(msg.payload));
+  bus.publishDelayed('t', 'a', { delayMs: 1000, jitterMs: 400 });
+  bus.publishDelayed('t', 'b', { delayMs: 1000, jitterMs: 400 });
+  bus.publishDelayed('t', 'c', { delayMs: 1000, jitterMs: 400 });
+  assert.equal(random.calls(), 3);
+  assert.equal(bus.getStats().jitteredDelayed, 3);
+  clock.nowMs = 2_000;
+  bus.publish('t', 'poke');
+  await flush();
+  assert.deepEqual(received, ['poke', 'a']); // only the +0 one is due
+  clock.nowMs = 2_100;
+  bus.publish('t', 'poke2');
+  await flush();
+  assert.deepEqual(received, ['poke', 'a', 'poke2', 'b']); // the +100 one joins
+  clock.nowMs = 2_300;
+  bus.publish('t', 'poke3');
+  await flush();
+  assert.deepEqual(received, ['poke', 'a', 'poke2', 'b', 'poke3', 'c']);
+  assert.equal(bus.getStats().pendingDelayed, 0);
+  // Cumulative: fanned-out schedules stay counted.
+  assert.equal(bus.getStats().jitteredDelayed, 3);
+});
+
+test('EB-195: jitterMs composes with expiryJitterMs — jitterMs draw first', async () => {
+  const clock = controllableClock();
+  // jitterMs draw 0.5 -> +50; expiryJitterMs draw 0 -> (0*2-1)*100 = -100.
+  // Total: nominal 2000 + 50 - 100 = 1950.
+  const random = scriptedRandom([0.5, 0]);
+  const bus = new EventBus({ now: clock.now, delayJitterRandom: random.fn });
+  const received: unknown[] = [];
+  bus.subscribe('t', (msg) => received.push(msg.payload));
+  bus.publishDelayed('t', 'skewed', { delayMs: 1000, jitterMs: 100, expiryJitterMs: 100 });
+  assert.equal(random.calls(), 2);
+  await flush();
+  clock.nowMs = 1_949;
+  bus.publish('t', 'poke');
+  await flush();
+  assert.deepEqual(received, ['poke']);
+  clock.nowMs = 1_950;
+  bus.publish('t', 'poke2');
+  await flush();
+  assert.deepEqual(received, ['poke', 'poke2', 'skewed']);
+  assert.equal(bus.getStats().jitteredDelayed, 1);
+});
+
+test('EB-195: cancelDelayed works on a one-sided jittered schedule', async () => {
+  const clock = controllableClock();
+  const bus = new EventBus({ now: clock.now, delayJitterRandom: () => 0.75 });
+  const received: unknown[] = [];
+  bus.subscribe('t', (msg) => received.push(msg.payload));
+  const id = bus.publishDelayed('t', 'gone', { delayMs: 1000, jitterMs: 400 });
+  assert.equal(bus.getStats().pendingDelayed, 1);
+  assert.equal(bus.cancelDelayed(id as string), true);
+  clock.nowMs = 5_000;
+  bus.publish('t', 'poke');
+  await flush();
+  assert.deepEqual(received, ['poke']);
+  assert.equal(bus.getStats().pendingDelayed, 0);
+  // The schedule was accepted (then cancelled) — still counted.
+  assert.equal(bus.getStats().jitteredDelayed, 1);
+});
+
+test('EB-195: a schedule rejected by a later fail-fast gate is not counted', () => {
+  const clock = controllableClock();
+  const bus = new EventBus({ now: clock.now, delayJitterRandom: () => 0.5 });
+  bus.subscribe('t', () => {});
+  // jitterMs is valid, but the per-message TTL gate runs after jitter and
+  // rejects: the never-created schedule must not count.
+  assert.throws(
+    () => bus.publishDelayed('t', 'x', { delayMs: 100, jitterMs: 50, ttlMs: -1 }),
+    RangeError,
+  );
+  assert.equal(bus.getStats().pendingDelayed, 0);
+  assert.equal(bus.getStats().jitteredDelayed, 0);
+});
+
+test('EB-195: a one-sided jittered schedule survives restart with its jittered due time', async () => {
+  const dir = freshDir();
+  const clock = controllableClock();
+  // random() -> 0.25: nominal due t=2000, jittered due t=2100 — never
+  // early, so the restart must rebuild 2100, not 2000.
+  const bus1 = new EventBus({ now: clock.now, delayJitterRandom: () => 0.25, durableLogDir: dir });
+  bus1.subscribe('t', () => {});
+  bus1.publishDelayed('t', 'survivor', { delayMs: 1000, jitterMs: 400 });
+  await flush();
+  const received: unknown[] = [];
+  const bus2 = new EventBus({ now: clock.now, durableLogDir: dir });
+  bus2.subscribe('t', (msg) => received.push(msg.payload));
+  await flush();
+  clock.nowMs = 2_000;
+  bus2.publish('t', 'poke');
+  await flush();
+  assert.deepEqual(received, ['poke']); // not yet: jittered due at 2100
+  clock.nowMs = 2_100;
+  bus2.publish('t', 'poke2');
+  await flush();
+  assert.deepEqual(received, ['poke', 'poke2', 'survivor']);
+  await bus2.close();
+});
+
+test('EB-195: one-sided jittered keyed schedules keep schedule-order per-key delivery', async () => {
+  const clock = controllableClock();
+  // First schedule draws ~+300 (due 2300), second draws +0 (due 2000):
+  // fan-out order inverts, but per-key delivery must stay schedule order
+  // (the key sequence numbers were assigned at schedule time).
+  const random = scriptedRandom([0.75, 0]);
+  const bus = new EventBus({ now: clock.now, delayJitterRandom: random.fn });
+  const received: unknown[] = [];
+  bus.subscribe('t', (msg) => received.push(msg.payload));
+  bus.publishDelayed('t', 'first', { delayMs: 1000, jitterMs: 400, key: 'k' });
+  bus.publishDelayed('t', 'second', { delayMs: 1000, jitterMs: 400, key: 'k' });
+  clock.nowMs = 2_300;
+  bus.publish('t', 'poke');
+  await flush();
+  // 'second' fanned out first (due 2000 < 2300) but keyed delivery holds
+  // schedule order: first, then second.
+  assert.deepEqual(received, ['poke', 'first', 'second']);
+});
