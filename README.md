@@ -219,7 +219,21 @@ library.
   resume point (its explicit window suppresses the automatic migration
   replay — no double delivery). The partition count is fixed by the group's
   first member: a later joiner that disagrees throws `RangeError` and its
-  subscription is rolled back. **Consumer-group lag monitoring**
+  subscription is rolled back. **Consumer-group member limit** (EB-196):
+  opt-in `maxMembers` on `subscribeToGroup` caps the roster at N members —
+  a join that would add a roster entry past the cap fails fast with
+  `RangeError` before anything registers (no half-joined member, no
+  rebalance triggered). Like the partition count, the limit is fixed by
+  the group's first member: a later joiner that names a different value
+  throws and is rolled back. Static rejoins (`instanceId`) reclaim their
+  existing slot and are never rejected. The limit can also be set or
+  raised at runtime via `setGroupMaxMembers(groupId, pattern, n)` (never
+  below the current member count); a stale limit from a dead generation
+  is dropped when the group is recreated. `getStats().consumerGroups`
+  rows report the active limit as `memberLimit`. This is consumer-group
+  scale governance: it bounds the roster the rebalance and routing tables
+  must handle, so a runaway autoscaler cannot drag a group into a
+  rebalance storm. **Consumer-group lag monitoring**
   (`src/grouplag.ts`): `getStats().groupLag` reports one row per
   (group, topic) — per (group, partition, topic) for partitioned groups —
   with `assignedSeq` (highest seq handed to the group), `committedSeq`

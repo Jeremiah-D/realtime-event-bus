@@ -3509,6 +3509,26 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    */
   handoffLingerMs?: number;
   /**
+   * Opt-in cap on the group's member count (EB-196): at most
+   * `maxMembers` members may hold roster slots in the (groupId, pattern)
+   * competing set. A `subscribeToGroup` that would add a roster entry
+   * past the limit fails fast with `RangeError` before anything
+   * registers — no half-joined member, no rebalance triggered. Static
+   * rejoins (`instanceId`) reclaim their existing slot and are never
+   * rejected. Guards the rebalance/routing tables against runaway member
+   * counts (consumer-group scale governance).
+   *
+   * Like the partition count, the limit is fixed by the FIRST
+   * `subscribeToGroup` for the (groupId, pattern): a later member that
+   * specifies a different value throws `RangeError` and its subscription
+   * is rolled back; members that omit it simply join. The limit can be
+   * raised (or set on a group created without one) at runtime via
+   * `setGroupMaxMembers`; it cannot be set below the current member
+   * count. The active limit is reported on `getStats().consumerGroups`
+   * rows as `memberLimit`. Must be a positive integer.
+   */
+  maxMembers?: number;
+  /**
    * Opt-in Kafka-style partition assignment for the competing set. When
    * set, the group's messages are divided into `partitions` logical
    * partitions and each partition is owned by exactly one member, which
@@ -6301,7 +6321,7 @@ export interface BusStats {
    * with at least one member, in first-registration order. Empty when no
    * group subscription is active.
    */
-  consumerGroups: Array<{ groupId: string; pattern: string; members: number; partitions?: number }>;
+  consumerGroups: Array<{ groupId: string; pattern: string; members: number; partitions?: number; memberLimit?: number }>;
   /**
    * Operator-paused consumer groups (EB-141): groupIds currently held by
    * `pauseGroup`, sorted. Empty when no group is paused.
@@ -14186,6 +14206,16 @@ export class EventBus {
    * groupId on two patterns is two independent competing sets.
    */
   private groupMembers = new Map<string, string[]>();
+  /**
+   * Consumer-group member limits (EB-196, see
+   * `GroupSubscribeOptions.maxMembers` / `setGroupMaxMembers`):
+   * `groupKey(groupId, pattern)` -> the group's member cap. Fixed by the
+   * group's first member (or set at runtime); a stale limit from a dead
+   * generation is dropped when the group is recreated, mirroring
+   * `groupPartitions`. Joins that would add a roster entry past the cap
+   * fail fast in `subscribeToGroup`.
+   */
+  private groupMemberLimits = new Map<string, number>();
   /**
    * Rebalance storm protection (EB-169, see `src/rebounce.ts`): the
    * per-group debounce windows. Configured per competing set via
@@ -22499,6 +22529,12 @@ export class EventBus {
     if (partitions !== undefined && (!Number.isInteger(partitions) || partitions < 1)) {
       throw new RangeError('partitions must be a positive integer');
     }
+    // Consumer-group member cap (EB-196): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const maxMembers = opts?.maxMembers;
+    if (maxMembers !== undefined && (!Number.isInteger(maxMembers) || maxMembers < 1)) {
+      throw new RangeError('maxMembers must be a positive integer');
+    }
     const assignment = opts?.assignment;
     if (assignment !== undefined && assignment !== 'rendezvous' && assignment !== 'sticky') {
       throw new RangeError("assignment must be 'rendezvous' or 'sticky'");
@@ -22546,7 +22582,7 @@ export class EventBus {
     // The durable-log replay is deferred until after the group assignment
     // is recorded below: `replayLog` skips seqs inside the group's live
     // handoff-linger windows, which needs `subscriber.groupId` to be set.
-    const { resumeFromSeq, resumeFromTime, partitions: _partitions, assignment: _assignment, assignor: _assignor, instanceId: _instanceId, sessionTimeoutMs: _sessionTimeoutMs, rebalanceDebounceMs: _rebalanceDebounceMs, onReplayProgress: replayObserver, progressInterval: replayInterval, replayThrottle: replayThrottleOpt, ...restOpts } = opts ?? {};
+    const { resumeFromSeq, resumeFromTime, partitions: _partitions, maxMembers: _maxMembers, assignment: _assignment, assignor: _assignor, instanceId: _instanceId, sessionTimeoutMs: _sessionTimeoutMs, rebalanceDebounceMs: _rebalanceDebounceMs, onReplayProgress: replayObserver, progressInterval: replayInterval, replayThrottle: replayThrottleOpt, ...restOpts } = opts ?? {};
     this.validateResumeFromSeq(resumeFromSeq);
     this.validateResumeFromTime(resumeFromTime, resumeFromSeq);
     // Durable-log replay progress (EB-71): validated before anything
@@ -22578,6 +22614,13 @@ export class EventBus {
       // roll back beyond the just-registered subscriber. Built-in
       // assignors are infallible and skip the trial.
       this.validateJoinAssignment(key, instanceId ?? sub.id);
+      // Consumer-group member limit (EB-196): the first member fixes the
+      // cap and a disagreeing joiner fails here, rolling back the
+      // just-registered subscriber; then the join itself is checked
+      // against the cap. Static rejoins reclaim their slot and are never
+      // rejected.
+      this.checkGroupMemberLimit(key, maxMembers);
+      this.checkGroupMemberLimitJoin(key, instanceId);
     } catch (err) {
       sub.unsubscribe();
       throw err;
@@ -23561,6 +23604,62 @@ export class EventBus {
   }
 
   /**
+   * Validates a joining member's `maxMembers` option against the group's
+   * fixed member limit (see `checkPartitionConfig`). The group's limit is
+   * fixed by its first member: a new group records the choice (or its
+   * absence); a later member that disagrees throws `RangeError`. Called
+   * before the member joins the competing set, so the caller can roll
+   * back the subscription.
+   */
+  private checkGroupMemberLimit(groupKey: string, maxMembers: number | undefined): void {
+    if (!this.groupMembers.has(groupKey)) {
+      // New (or fully drained and recreated) group: the first member
+      // fixes the limit; a stale limit from a dead generation is dropped.
+      if (maxMembers !== undefined) this.groupMemberLimits.set(groupKey, maxMembers);
+      else this.groupMemberLimits.delete(groupKey);
+      return;
+    }
+    const configured = this.groupMemberLimits.get(groupKey);
+    if (maxMembers !== undefined && maxMembers !== configured) {
+      throw new RangeError(
+        configured === undefined
+          ? `consumer group has no member limit: cannot join with maxMembers=${maxMembers}`
+          : `member limit mismatch: group allows ${configured} members, got ${maxMembers}`,
+      );
+    }
+  }
+
+  /**
+   * Enforces the consumer-group member cap (EB-196) at join time: a join
+   * that would add a roster entry past the group's limit throws
+   * `RangeError`. Static rejoins reclaim their existing roster slot (no
+   * roster change) and are never rejected; a static member already
+   * online is left for the precise already-online guard to report.
+   * Called before the roster is touched, so the caller can roll back the
+   * just-registered subscription.
+   */
+  private checkGroupMemberLimitJoin(groupKey: string, instanceId: string | undefined): void {
+    const limit = this.groupMemberLimits.get(groupKey);
+    if (limit === undefined) return;
+    const members = this.groupMembers.get(groupKey) ?? [];
+    if (instanceId !== undefined) {
+      // Already online: the already-online guard below reports it with
+      // the precise error — the limit must not shadow it.
+      if (this.groupStaticSubs.get(groupKey)?.has(instanceId)) return;
+      // Rejoin inside the session window reclaims the slot: no roster
+      // change, never rejected by the limit.
+      if (this.groupStaticSessions.get(groupKey)?.has(instanceId)) return;
+      // Defensive stale-entry reclaim (roster entry, no live session):
+      // reclaims the slot in place, no roster change.
+      if (members.includes(instanceId)) return;
+    }
+    if (members.length >= limit) {
+      throw new RangeError(
+        `consumer group member limit reached: group allows ${limit} members`,
+      );
+    }
+  }
+  /**
    * Validates a joining member's partition assignor against the group's
    * fixed configuration (see `checkPartitionConfig`). The group's
    * assignor is fixed by its first member — a custom
@@ -24257,6 +24356,51 @@ export class EventBus {
    */
   getGroupMembers(groupId: string, pattern: string): string[] {
     return [...(this.groupMembers.get(EventBus.groupKey(groupId, pattern)) ?? [])];
+  }
+
+  /**
+   * Sets (or updates) the member limit (EB-196) for one (groupId, pattern)
+   * competing set: at most `n` members may hold roster slots — a further
+   * `subscribeToGroup` that would add a roster entry past the limit fails
+   * fast with `RangeError` and registers nothing. Static rejoins reclaim
+   * their existing slot and are never rejected. Consumer-group scale
+   * governance: caps the roster the rebalance/routing tables must handle.
+   *
+   * The limit can also be fixed by the group's first member via
+   * `GroupSubscribeOptions.maxMembers`; a later member that disagrees
+   * with the group's limit fails to join. A stale limit from a dead
+   * generation is dropped when the group is recreated — set it again via
+   * this method or the next generation's first member.
+   *
+   * Throws `RangeError` when the group has no members (join the group
+   * first, or fix the limit via the first member's `maxMembers`), when
+   * `n` is not a positive integer, or when `n` is below the current
+   * member count — shrink the group first, then lower the limit. Raising
+   * the limit (or re-setting the same value) is always allowed and takes
+   * effect for the next join. The active limit is reported on
+   * `getStats().consumerGroups` rows as `memberLimit`.
+   */
+  setGroupMaxMembers(groupId: string, pattern: string, n: number): void {
+    if (groupId.length === 0) {
+      throw new RangeError('groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('pattern must be a non-empty string');
+    }
+    if (!Number.isInteger(n) || n < 1) {
+      throw new RangeError('maxMembers must be a positive integer');
+    }
+    const key = EventBus.groupKey(groupId, pattern);
+    const members = this.groupMembers.get(key);
+    if (members == null) {
+      throw new RangeError(`unknown consumer group "${groupId}" on pattern "${pattern}"`);
+    }
+    if (n < members.length) {
+      throw new RangeError(
+        `cannot set member limit ${n} below the current member count ${members.length}`,
+      );
+    }
+    this.groupMemberLimits.set(key, n);
   }
 
   /**
@@ -36700,11 +36844,15 @@ export class EventBus {
       consumerGroups: [...this.groupMembers.entries()].map(([key, members]) => {
         const sep = key.indexOf('\0');
         const partitions = this.groupPartitions.get(key);
+        const memberLimit = this.groupMemberLimits.get(key);
         return {
           groupId: key.slice(0, sep),
           pattern: key.slice(sep + 1),
           members: members.length,
           ...(partitions === undefined ? {} : { partitions }),
+          // Consumer-group member limit (EB-196): the cap fixed by the
+          // group's first member or `setGroupMaxMembers`.
+          ...(memberLimit === undefined ? {} : { memberLimit }),
         };
       }),
       pausedGroups: [...this.pausedGroups].sort(),
