@@ -26,6 +26,14 @@
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
+import {
+  AUDIT_CHAIN_GENESIS,
+  attachChainLink,
+  effectiveRecordHash,
+  isHashString,
+  verifyChainLinks,
+  type ChainVerification,
+} from './auditchain.ts';
 
 /** Live journal file name inside the log directory. */
 export const PUBLISH_AUDIT_LIVE_NAME = '__publish_audit.jsonl';
@@ -66,6 +74,15 @@ export interface PublishAuditEntry {
   key?: string;
   /** Bus-clock milliseconds of the admission decision. */
   admittedAtMs: number;
+  /**
+   * Tamper-evident hash chain (EB-198): `prevHash` is the previous
+   * record's `hash` (the fixed genesis for the first record), `hash`
+   * covers the whole record. Both are always present on records written
+   * by `record()`; records recovered from pre-chain journal files carry
+   * neither and verify as chain anchors.
+   */
+  prevHash?: string;
+  hash?: string;
 }
 
 /** Query filters for `PublishAuditLog.query`. */
@@ -171,6 +188,16 @@ export function parsePublishAuditLine(line: string): PublishAuditEntry | undefin
       entry[key] = value;
     }
   }
+  // Tamper-evident chain fields (EB-198): optional for backward
+  // compatibility with pre-chain journal files; when present they must
+  // be well-formed digests, otherwise the line is corrupt.
+  for (const key of ['prevHash', 'hash'] as const) {
+    const value = o[key];
+    if (value !== undefined) {
+      if (!isHashString(value)) return undefined;
+      entry[key] = value;
+    }
+  }
   return entry;
 }
 
@@ -186,6 +213,13 @@ export class PublishAuditLog {
   private liveDay: string | null = null;
   /** Byte size of the live file. */
   private liveBytes = 0;
+  /**
+   * Tamper-evident chain head (EB-198): the effective hash of the most
+   * recently recorded or recovered entry — the `prevHash` of the next
+   * record. Starts at the genesis; recovery advances it past the
+   * on-disk history so the chain continues across restarts.
+   */
+  private headHash: string = AUDIT_CHAIN_GENESIS;
 
   constructor(dir: string, options: PublishAuditOptions = {}) {
     if (typeof dir !== 'string' || dir.length === 0) {
@@ -211,9 +245,11 @@ export class PublishAuditLog {
   /**
    * Records one admission decision. The timestamp is stamped here on the
    * bus clock, so callers pass everything except `v`/`admittedAtMs`.
-   * Never throws: disk failures (append or rotation) are counted in
-   * `writeErrors()` and the in-memory entry always lands — the publish
-   * path is never blocked by the journal.
+   * The record is tamper-evident chained (EB-198): `prevHash`/`hash` are
+   * attached before the in-memory append and the disk write, so both
+   * layers carry the same links. Never throws: disk failures (append or
+   * rotation) are counted in `writeErrors()` and the in-memory entry
+   * always lands — the publish path is never blocked by the journal.
    */
   record(entry: Omit<PublishAuditEntry, 'v' | 'admittedAtMs'> & { admittedAtMs?: number }): void {
     const full: PublishAuditEntry = {
@@ -228,7 +264,9 @@ export class PublishAuditLog {
       ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
       ...(entry.key === undefined ? {} : { key: entry.key }),
     };
-    this.entries.push(full);
+    const linked = attachChainLink(this.headHash, full);
+    this.headHash = linked.hash;
+    this.entries.push(linked);
     if (this.entries.length > this.maxEntries) {
       this.entries.splice(0, this.entries.length - this.maxEntries);
     }
@@ -370,6 +408,20 @@ export class PublishAuditLog {
     this.entries.push(...recovered);
     if (recovered.length > 0) {
       this.liveDay = utcDay(recovered[recovered.length - 1].admittedAtMs);
+      // The chain continues across restarts: the next recorded entry
+      // links to the last recovered one (see `headHash`).
+      this.headHash = effectiveRecordHash(recovered[recovered.length - 1]);
     }
+  }
+
+  /**
+   * Verifies the tamper-evident hash chain (EB-198) over the in-memory
+   * read view: detects rewritten fields (`content-tampered`), deleted or
+   * spliced records (`link-broken`), and reports the first break. The
+   * oldest retained entry is the segment anchor — its link to evicted
+   * predecessors cannot be checked (see `src/auditchain.ts`).
+   */
+  verifyAuditChain(): ChainVerification {
+    return verifyChainLinks(this.entries);
   }
 }

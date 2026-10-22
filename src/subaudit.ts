@@ -40,6 +40,14 @@
  */
 import { appendFileSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  AUDIT_CHAIN_GENESIS,
+  attachChainLink,
+  effectiveRecordHash,
+  isHashString,
+  verifyChainLinks,
+  type ChainVerification,
+} from './auditchain.ts';
 
 /** Every lifecycle action the audit log records. */
 export type SubscriptionAuditAction =
@@ -197,6 +205,15 @@ export interface SubscriptionAuditEvent {
   /** Who made the change; defaults to `'system'` when the caller supplies none. */
   actor: string;
   detail?: Record<string, unknown>;
+  /**
+   * Tamper-evident hash chain (EB-198): `prevHash` is the previous
+   * event's `hash` (the fixed genesis for the first event), `hash`
+   * covers the whole event. Both are always present on events written
+   * by `append()`; events recovered from pre-chain journal files carry
+   * neither and verify as chain anchors.
+   */
+  prevHash?: string;
+  hash?: string;
 }
 
 /** Query filters for `SubscriptionAuditLog.query`. */
@@ -313,6 +330,13 @@ export class SubscriptionAuditLog {
   private readonly now: () => number;
   private readonly entries: SubscriptionAuditEvent[] = [];
   private diskWriteErrors = 0;
+  /**
+   * Tamper-evident chain head (EB-198): the effective hash of the most
+   * recently appended or recovered event — the `prevHash` of the next
+   * event. Starts at the genesis; recovery advances it past the on-disk
+   * history so the chain continues across restarts.
+   */
+  private headHash: string = AUDIT_CHAIN_GENESIS;
 
   constructor(options: SubscriptionAuditOptions = {}) {
     const { dir, maxEntries = SUBSCRIPTION_AUDIT_DEFAULT_MAX_ENTRIES, now = Date.now } = options;
@@ -335,8 +359,11 @@ export class SubscriptionAuditLog {
 
   /**
    * Appends one event. The timestamp is stamped here on the bus clock, so
-   * callers pass everything except `v`/`at`. Never throws: disk failures
-   * are counted in `writeErrors()` and the in-memory entry always lands.
+   * callers pass everything except `v`/`at`. The event is tamper-evident
+   * chained (EB-198): `prevHash`/`hash` are attached before the
+   * in-memory append and the disk write, so both layers carry the same
+   * links. Never throws: disk failures are counted in `writeErrors()`
+   * and the in-memory entry always lands.
    */
   append(event: Omit<SubscriptionAuditEvent, 'v' | 'at'> & { at?: number }): void {
     const full: SubscriptionAuditEvent = {
@@ -350,12 +377,14 @@ export class SubscriptionAuditLog {
       ...(event.topic === undefined ? {} : { topic: event.topic }),
       ...(event.detail === undefined ? {} : { detail: event.detail }),
     };
-    this.entries.push(full);
+    const linked = attachChainLink(this.headHash, full);
+    this.headHash = linked.hash;
+    this.entries.push(linked);
     if (this.entries.length > this.maxEntries) {
       this.entries.splice(0, this.entries.length - this.maxEntries);
     }
     if (this.dir !== undefined) {
-      this.appendToDisk(full);
+      this.appendToDisk(linked);
     }
   }
 
@@ -439,6 +468,22 @@ export class SubscriptionAuditLog {
       recovered.splice(0, recovered.length - this.maxEntries);
     }
     this.entries.push(...recovered);
+    if (recovered.length > 0) {
+      // The chain continues across restarts: the next appended event
+      // links to the last recovered one (see `headHash`).
+      this.headHash = effectiveRecordHash(recovered[recovered.length - 1]);
+    }
+  }
+
+  /**
+   * Verifies the tamper-evident hash chain (EB-198) over the in-memory
+   * index: detects rewritten fields (`content-tampered`), deleted or
+   * spliced events (`link-broken`), and reports the first break. The
+   * oldest retained event is the segment anchor — its link to evicted
+   * predecessors cannot be checked (see `src/auditchain.ts`).
+   */
+  verifyAuditChain(): ChainVerification {
+    return verifyChainLinks(this.entries);
   }
 }
 
@@ -475,6 +520,16 @@ export function parseAuditLine(line: string): SubscriptionAuditEvent | undefined
   if (o['detail'] !== undefined) {
     if (typeof o['detail'] !== 'object' || o['detail'] === null) return undefined;
     event.detail = o['detail'] as Record<string, unknown>;
+  }
+  // Tamper-evident chain fields (EB-198): optional for backward
+  // compatibility with pre-chain journal files; when present they must
+  // be well-formed digests, otherwise the line is corrupt.
+  for (const key of ['prevHash', 'hash'] as const) {
+    const value = o[key];
+    if (value !== undefined) {
+      if (!isHashString(value)) return undefined;
+      event[key] = value;
+    }
   }
   return event;
 }

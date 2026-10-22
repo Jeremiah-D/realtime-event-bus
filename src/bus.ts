@@ -306,6 +306,7 @@ import {
   type PublishAuditOptions,
   type PublishAuditQuery,
 } from './publishaudit.ts';
+import { type ChainVerification } from './auditchain.ts';
 import {
   TraceSpanJournal,
   type TraceArchiveEntry,
@@ -31032,6 +31033,29 @@ export class EventBus {
    */
   getPublishAudit(query?: PublishAuditQuery): PublishAuditEntry[] {
     return this.publishAudit?.query(query ?? {}) ?? [];
+  }
+
+  /**
+   * Verifies the publish audit journal's tamper-evident hash chain
+   * (EB-198) over the in-memory read view: every record's `hash` must
+   * match its recomputed content hash and every `prevHash` must link to
+   * the previous record's hash. Returns the first break found
+   * (`content-tampered` for a rewritten field, `link-broken` for a
+   * deleted or spliced record), or `{ ok: true, checked }` when the
+   * chain verifies. `{ ok: true, checked: 0 }` when the journal is
+   * disabled — there is nothing to verify.
+   */
+  verifyPublishAuditChain(): ChainVerification {
+    return this.publishAudit?.verifyAuditChain() ?? { ok: true, checked: 0 };
+  }
+
+  /**
+   * Verifies the subscription audit log's tamper-evident hash chain
+   * (EB-198) over the in-memory index — same semantics as
+   * `verifyPublishAuditChain`.
+   */
+  verifySubscriptionAuditChain(): ChainVerification {
+    return this.subAudit.verifyAuditChain();
   }
 
   /**

@@ -9,6 +9,7 @@ import {
   parsePublishAuditLine,
   PUBLISH_AUDIT_LIVE_NAME,
 } from '../src/publishaudit.ts';
+import { AUDIT_CHAIN_GENESIS } from '../src/auditchain.ts';
 
 /** Yields until the bus's scheduled microtask flush has run. */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -48,7 +49,10 @@ test('publish audit: admitted publishes are journaled with seq and identities, n
 
   const entries = bus.getPublishAudit();
   assert.equal(entries.length, 3);
-  assert.deepEqual(entries[0], {
+  // EB-198: every journaled record carries the tamper-evident chain
+  // link; strip the chain fields for the shape assertion below.
+  const { prevHash: _ph0, hash: _h0, ...shape0 } = entries[0];
+  assert.deepEqual(shape0, {
     v: 1,
     outcome: 'admitted',
     topic: 'orders.created',
@@ -59,6 +63,10 @@ test('publish audit: admitted publishes are journaled with seq and identities, n
     key: 'k-9',
     admittedAtMs: 5_000,
   });
+  assert.equal(entries[0].prevHash, AUDIT_CHAIN_GENESIS);
+  assert.ok(/^[0-9a-f]{64}$/.test(entries[0].hash));
+  assert.equal(entries[1].prevHash, entries[0].hash);
+  assert.equal(entries[2].prevHash, entries[1].hash);
   assert.equal(entries[1].seq, 2);
   assert.equal(entries[1].publisherId, undefined);
   assert.equal(entries[2].topic, 'orders.paid');

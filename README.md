@@ -3669,6 +3669,8 @@ Details:
   `{ via: 'publish' }`; `partition_rule_set` carries `{ partitions }`;
   `barrier_dropped` carries `{ epoch, lastEpoch }` (EB-98);
   `subscriber_quarantined` carries `{ consecutiveErrors }` (EB-197).
+- **Tamper-evident hash chain** — every event carries a `prevHash` /
+  `hash` link; see "Audit log hash chain (EB-198)" below.
 
 ## Publish audit journal (EB-138)
 
@@ -3713,6 +3715,58 @@ Details:
   delayed publishes (at due-time admission), route forwards,
   bridge/cluster ingress, and pause-buffer drains. Pre-admitted
   re-fan-outs and diagnostic publishes are not.
+- **Tamper-evident hash chain** — every record carries a `prevHash` /
+  `hash` link; see "Audit log hash chain (EB-198)" below.
+
+## Audit log hash chain (EB-198)
+
+Both audit journals — the subscription lifecycle audit log and the
+publish audit journal (EB-138) — chain every record with SHA-256
+(`src/auditchain.ts`, `node:crypto` only, zero new dependencies),
+mirroring the ledger's audit chain (ledger-api-go LG-11):
+
+```ts
+const bus = new EventBus({ durableLogDir: './data', publishAudit: true });
+bus.subscribe('orders.*', handler);
+bus.publish('orders.created', payload);
+await flush();
+
+bus.getPublishAudit();
+// [{ v:1, outcome:'admitted', topic:'orders.created', seq:1, …,
+//    prevHash:'000…0', hash:'9f2c…' }, …]
+
+bus.verifyPublishAuditChain();      // { ok:true, checked:1 }
+bus.verifySubscriptionAuditChain(); // { ok:true, checked:1 }
+```
+
+Each record's `prevHash` is the previous record's `hash` (the fixed
+`AUDIT_CHAIN_GENESIS` — 64 zero hex digits — for the first record) and
+`hash` covers the whole record, so rewriting any journaled field,
+deleting a record, or splicing records breaks the continuity and
+`verifyAuditChain()` reports the first break:
+
+- `{ ok:false, brokenAt, reason:'content-tampered', expected, actual }`
+  — a record's content no longer matches its stored hash;
+- `{ ok:false, brokenAt, reason:'link-broken', expected, actual }` — a
+  record's `prevHash` no longer matches its predecessor's hash (a
+  deletion or splice).
+
+Details:
+
+- **Both layers chained in sync** — the in-memory ring and the on-disk
+  JSONL lines carry the same `prevHash`/`hash` links, so a restarted bus
+  recovers a verifiable chain (files are read oldest-first, matching
+  append order; rotation preserves the links across files). New records
+  after a restart link to the recovered head.
+- **Bounded-ring caveat** — verification covers the retained window as a
+  contiguous segment; the oldest retained record is the segment anchor
+  (its link to evicted predecessors cannot be checked).
+- **Backward compatible** — journal files written before chaining
+  existed carry no chain fields; they parse as before and verify as
+  anchors, still anchoring the records chained after them. Malformed
+  chain fields are treated as corrupt lines and skipped on recovery.
+- **Best-effort, like the journals** — chaining never throws into the
+  publish/subscribe path.
 
 ## Admission dead-letter topics (EB-139)
 
