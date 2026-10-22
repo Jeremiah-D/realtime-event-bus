@@ -214,6 +214,15 @@ export class PublishRateTable {
   }
 
   /**
+   * Whether the topic has any publish samples (EB-192): a topic that
+   * never published has no rate history, which the autoscale signal
+   * treats as missing data rather than zero load.
+   */
+  has(topic: string): boolean {
+    return this.rings.has(topic);
+  }
+
+  /**
    * Drops a topic's rate ring (EB-126): the per-topic publish-rate state
    * is torn down with the topic instead of lingering as a stale ring.
    * A re-created topic starts from all-zero rates.

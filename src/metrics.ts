@@ -282,6 +282,12 @@
  * - `eventbus_statestore_keys`: keys currently tracked by the
  *   materialized state store (EB-171; only emitted when the store is
  *   enabled).
+ * - `eventbus_autoscale_signal{subscriber,topic}`: the advisory
+ *   consumer-lag autoscale signal (EB-192, see `src/autoscale.ts`):
+ *   `1` = `scale_up`, `0` = `hold`, `-1` = `scale_down`. Pure advice —
+ *   the bus never scales anything itself. Only emitted for rows passed
+ *   as the second `renderPrometheus` argument; the caller builds rows
+ *   from `EventBus.getScalingSignal()`.
  *
  * Cardinality note: the per-topic series grow with the number of distinct
  * topics ever published to — the same bound as `BusStats.topics` — so a
@@ -326,6 +332,7 @@
  * ```
  */
 import type { BusStats } from './bus.ts';
+import { SCALING_SIGNAL_VALUES, type ScalingSignalRow } from './autoscale.ts';
 
 /** Content-Type for a Prometheus exposition response body. */
 export const PROMETHEUS_CONTENT_TYPE = 'text/plain; version=0.0.4; charset=utf-8';
@@ -336,7 +343,7 @@ function escapeLabelValue(value: string): string {
 }
 
 /** Render a `BusStats` snapshot as Prometheus text exposition (0.0.4). */
-export function renderPrometheus(stats: BusStats): string {
+export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignalRow[]): string {
   const lines: string[] = [];
   const counter = (name: string, help: string, value: number): void => {
     lines.push(`# HELP ${name} ${help}`);
@@ -1240,6 +1247,30 @@ export function renderPrometheus(stats: BusStats): string {
       'Keys evicted by the state-store maxKeys bound (EB-171).',
       stats.stateStore.evictedKeys,
     );
+  }
+
+  // Consumer-lag autoscale signals (EB-192): one series per provided
+  // (subscriber, topic) row, encoded 1 = scale_up, 0 = hold, -1 =
+  // scale_down (see `SCALING_SIGNAL_VALUES`). The bus never scales
+  // itself — these are advisory inputs for an operator or HPA. Omitted
+  // entirely when no rows are passed, so a bus that never asks for
+  // scaling signals renders exactly what it always did.
+  const signalRows = scalingSignals ?? [];
+  if (signalRows.length > 0) {
+    lines.push(
+      '# HELP eventbus_autoscale_signal Advisory consumer-lag autoscale signal: 1 = scale_up, 0 = hold, -1 = scale_down. Pure signal — the bus never scales itself.',
+    );
+    lines.push('# TYPE eventbus_autoscale_signal gauge');
+    for (const row of signalRows) {
+      const labels: string[] = [];
+      if (row.subscriberId !== undefined) {
+        labels.push(`subscriber="${escapeLabelValue(row.subscriberId)}"`);
+      }
+      if (row.topic !== undefined) {
+        labels.push(`topic="${escapeLabelValue(row.topic)}"`);
+      }
+      lines.push(`eventbus_autoscale_signal{${labels.join(',')}} ${SCALING_SIGNAL_VALUES[row.signal]}`);
+    }
   }
 
   return lines.join('\n') + '\n';

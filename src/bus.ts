@@ -246,7 +246,14 @@ import {
   stickyPartitionAssignor,
   type PartitionAssignor,
 } from './assignor.ts';
-import { PublishRateTable, type HotTopic, type TopicRates } from './rates.ts';
+import { PublishRateTable, HOT_TOPICS_LIMIT, type HotTopic, type TopicRates } from './rates.ts';
+import {
+  computeScalingSignal,
+  resolveAutoscaleOptions,
+  type AutoscaleThresholds,
+  type ResolvedAutoscaleThresholds,
+  type ScalingSignal,
+} from './autoscale.ts';
 import {
   CepEngine,
   type SequencePatternOptions,
@@ -4169,6 +4176,19 @@ export interface EventBusOptions {
    * observable via `EventBus.getStats().lagSloBreaches`.
    */
   groupLag?: GroupLagMonitorOptions;
+  /**
+   * Consumer-lag autoscale signal thresholds (EB-192): tunes the
+   * advisory `EventBus.getScalingSignal()` recommendation computed from
+   * the lag monitor (EB-35), the publish rate table (EB-34), and the
+   * delivery-latency tracker (EB-31). Absent means defaults
+   * (`lagThresholdMs` 1000, `rateThreshold` 1, `idleLagMs` 10,
+   * `idleRate` 0.1). Invalid values throw `RangeError` at construction,
+   * and the thresholds stay adjustable at runtime via
+   * `EventBus.setAutoscaleThresholds`.
+   *
+   * The signal is pure advice — the bus never scales anything itself.
+   */
+  autoscale?: AutoscaleThresholds;
   /**
    * Ops alert webhook outlet (EB-132): opt-in delivery of operational
    * signals — consumer-lag SLO breaches (on top of the EB-112
@@ -14051,6 +14071,12 @@ export class EventBus {
    */
   private readonly groupLagMonitor: GroupLagMonitor;
   /**
+   * Effective autoscale signal thresholds (EB-192): resolved from
+   * `EventBusOptions.autoscale` at construction, adjustable at runtime
+   * via `setAutoscaleThresholds`.
+   */
+  private autoscaleThresholds: ResolvedAutoscaleThresholds;
+  /**
    * Consumer-checkpointed offsets: groupId -> concrete topic -> last
    * processed `seq` as reported by the consumer via `commitOffset`. Pure
    * bookkeeping for operators and resume-after-restart; the bus never acts
@@ -14737,6 +14763,10 @@ export class EventBus {
       };
     }
     this.groupLagMonitor = new GroupLagMonitor(resolvedGroupLag);
+    // EB-192: validated fail-fast — bad autoscale thresholds must never
+    // half-wire a bus. Absent means defaults; the thresholds stay
+    // adjustable at runtime via `setAutoscaleThresholds`.
+    this.autoscaleThresholds = resolveAutoscaleOptions(options?.autoscale);
     // EB-114: validated here, fail-fast — an invalid store must never
     // half-wire a bus. Absent means the default in-memory store: the bus
     // behaves exactly as before.
@@ -23740,6 +23770,103 @@ export class EventBus {
     }
     this.groupLagMonitor.clearThreshold(groupId);
     this.checkGroupLagForGroup(groupId);
+  }
+
+  /**
+   * Adjusts the autoscale signal thresholds at runtime (EB-192),
+   * following the `setGroupLagThreshold` convention: the partial is
+   * merged over the current thresholds and the merged result is
+   * validated, so an invalid value throws `RangeError` and leaves the
+   * current thresholds untouched. Takes effect on the next
+   * `getScalingSignal()` call — no re-evaluation is queued because the
+   * signal is computed on demand.
+   */
+  setAutoscaleThresholds(partial: AutoscaleThresholds): void {
+    this.autoscaleThresholds = resolveAutoscaleOptions({
+      ...this.autoscaleThresholds,
+      ...partial,
+    });
+  }
+
+  /**
+   * Computes the advisory consumer-lag autoscale signal (EB-192, see
+   * `src/autoscale.ts`) — a pure recommendation, never an action. The
+   * bus never scales anything itself; an operator or HPA consumes this
+   * signal and decides.
+   *
+   * Scoping:
+   * - `subscriberId` narrows to one subscription (throws `Error` for an
+   *   unknown id, like `droppedCount`); `topic` additionally fixes the
+   *   publish-rate input to that topic.
+   * - `topic` alone aggregates over every subscription whose pattern
+   *   matches the topic and uses that topic's trailing-1m rate.
+   * - Neither aggregates over all subscriptions and uses the hottest
+   *   topic's trailing-1m rate.
+   *
+   * The lag input is the worst (max) effective lag p99 across the
+   * scoped subscriptions — the lag-monitor drain-dwell p99, falling
+   * back to the delivery-latency p99. When no scoped subscription has
+   * lag or delivery-latency instrumentation (or nothing was delivered
+   * yet), the signal is `hold` with reason `no-data`: a missing signal
+   * is never reported as "all clear".
+   */
+  getScalingSignal(topic?: string, subscriberId?: string): ScalingSignal {
+    const nowMs = this.now();
+    let scoped: Subscriber[];
+    if (subscriberId !== undefined) {
+      const subscriber = this.subscribers.get(subscriberId);
+      if (subscriber == null) throw new Error(`unknown subscriber: ${subscriberId}`);
+      scoped = [subscriber];
+    } else if (topic !== undefined) {
+      scoped = [...this.subscribers.values()].filter((s) => s.matcher.test(topic));
+    } else {
+      scoped = [...this.subscribers.values()];
+    }
+    // Worst effective lag across the scoped subscriptions: the lag
+    // monitor's drain-dwell p99 first, the delivery-latency p99 as a
+    // fallback. The watermark is tracked separately (a live queue head
+    // is not a distribution).
+    let lagP99Ms: number | undefined;
+    let watermarkMs: number | undefined;
+    for (const s of scoped) {
+      const lag = s.lag;
+      if (lag !== undefined) {
+        const summary = lag.tracker.summary();
+        if (summary.samples > 0 && (lagP99Ms === undefined || summary.p99Ms > lagP99Ms)) {
+          lagP99Ms = summary.p99Ms;
+        }
+        const watermark = this.lagWatermarkMs(s, nowMs);
+        if (watermarkMs === undefined || watermark > watermarkMs) watermarkMs = watermark;
+      }
+      if (lagP99Ms === undefined) {
+        const latency = s.latency;
+        if (latency !== undefined) {
+          const summary = latency.tracker.summary();
+          if (summary.samples > 0 && (lagP99Ms === undefined || summary.p99Ms > lagP99Ms)) {
+            lagP99Ms = summary.p99Ms;
+          }
+        }
+      }
+    }
+    // Publish-rate input: undefined means "no rate history", which the
+    // evaluator treats as missing data (hold), not as zero load.
+    let rate1m: number | undefined;
+    if (topic !== undefined) {
+      if (this.publishRates.has(topic)) {
+        rate1m = this.publishRates.ratesFor(topic, nowMs).r1m;
+      }
+    } else if (subscriberId !== undefined) {
+      const matcher = scoped[0].matcher;
+      for (const hot of this.publishRates.hotTopics(nowMs, HOT_TOPICS_LIMIT)) {
+        if (matcher.test(hot.topic) && (rate1m === undefined || hot.r1m > rate1m)) {
+          rate1m = hot.r1m;
+        }
+      }
+    } else {
+      const hot = this.publishRates.hotTopics(nowMs, HOT_TOPICS_LIMIT);
+      if (hot.length > 0) rate1m = hot[0].r1m;
+    }
+    return computeScalingSignal({ lagP99Ms, watermarkMs, rate1m }, this.autoscaleThresholds, nowMs);
   }
 
   /**

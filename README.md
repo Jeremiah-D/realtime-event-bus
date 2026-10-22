@@ -3730,6 +3730,7 @@ Exported series:
 | `eventbus_lag_samples{subscriber,pattern}` | gauge | samples in the subscriber's lag dwell window |
 | `eventbus_lag_watermark_ms{subscriber,pattern}` | gauge | live consumer-lag watermark (oldest queued message dwell, 0 when empty); only `lagMonitor`-enabled subscriptions |
 | `eventbus_topic_rate_msg_per_sec{topic,window}` | gauge | per-topic publish rate in messages/sec over the trailing window (`window` = "1s"/"1m"/"5m"), load-average style; hot topics only (top 10 by 1m rate) |
+| `eventbus_autoscale_signal{subscriber,topic}` | gauge | advisory consumer-lag autoscale signal (EB-192): `1` = `scale_up`, `0` = `hold`, `-1` = `scale_down`; only emitted for rows passed to `renderPrometheus` — see below |
 | `eventbus_group_lag_messages{group,topic}` | gauge | consumer-group lag per (group, topic): assigned seq minus consumer checkpoint, excluding live handoff-linger holds |
 | `eventbus_group_partition_lag_messages{group,topic,partition}` | gauge | per-partition consumer-group lag for partitioned groups |
 | `eventbus_publisher_published_messages_total{publisher}` | counter | admitted publishes per publisher identity (`PublishOptions.publisherId`); only emitted when at least one publisher has admitted a publish |
@@ -3756,6 +3757,66 @@ deliberate exception to the per-topic rule: only the hot-topics set
 carries it (10 topics × 3 windows = 30 series max), because
 rate-limit/scaling decisions need the busiest topics, not the full topic
 space.
+
+## Consumer-lag autoscale signals (EB-192)
+
+`EventBus.getScalingSignal(topic?, subscriberId?)` computes an advisory
+scale recommendation from three existing observability signals — the
+lag-monitor dwell distribution (EB-35), the per-topic publish rate table
+(EB-34), and the delivery-latency distribution (EB-31):
+
+```ts
+const signal = bus.getScalingSignal('orders', sub.id);
+// { signal: 'scale_up', reason: 'lag-above-threshold',
+//   reasonDetail: 'lag p99 60000ms is above the 1000ms threshold with a
+//   sustained publish rate of 2/s: add consumer capacity',
+//   lagP99Ms: 60000, rate1m: 2, at: 1710000000000 }
+```
+
+The signal is **pure advice — the bus never scales anything itself**. An
+operator or HPA consumes it and decides.
+
+Decision table (defaults in parentheses):
+
+| Lag p99 | Publish rate (trailing 1m) | Signal |
+|---|---|---|
+| > `lagThresholdMs` (1000ms) | ≥ `rateThreshold` (1 msg/s) | `scale_up` |
+| > `lagThresholdMs` | < `rateThreshold` (spike already draining) | `hold` |
+| > `lagThresholdMs` | unknown (no rate history) | `hold` |
+| ≤ `idleLagMs` (10ms) | < `idleRate` (0.1 msg/s) | `scale_down` |
+| anything else | any | `hold` |
+
+Lag p99 is the lag-monitor drain-dwell p99 when the subscriber has
+samples, falling back to the delivery-latency p99; the live queue-head
+watermark additionally gates `scale_down` (a drained distribution with
+a still-growing queue head is not idle). When no scoped subscription has
+lag or delivery-latency instrumentation, the signal is `hold` with
+reason `no-data` — a missing signal is never reported as "all clear".
+
+Scoping: `subscriberId` narrows to one subscription (unknown ids throw,
+like `droppedCount`); `topic` alone aggregates over every subscription
+whose pattern matches the topic; neither aggregates over all
+subscriptions and uses the hottest topic's rate. In every scope the lag
+input is the worst (max) p99 across the scoped subscriptions.
+
+Thresholds are configured via `EventBusOptions.autoscale` (invalid
+values throw `RangeError` at construction) and adjustable at runtime
+with `bus.setAutoscaleThresholds(partial)`, which merges over the
+current thresholds and validates the result — following the
+`setGroupLagThreshold` convention.
+
+Prometheus exposition: pass rows to `renderPrometheus` to emit
+`eventbus_autoscale_signal{subscriber,topic}` — encoded `1` =
+`scale_up`, `0` = `hold`, `-1` = `scale_down`:
+
+```ts
+const rows = [bus.getScalingSignal('orders', sub.id)].map((s) => ({
+  signal: s.signal,
+  subscriberId: sub.id,
+  topic: 'orders',
+}));
+res.end(renderPrometheus(bus.getStats(), rows));
+```
 
 ## Barrier cut markers
 
