@@ -1556,6 +1556,24 @@ library.
   and `eventbus_delivery_latency_samples{subscriber,pattern}` gauges (four
   series per tracked subscriber; untracked subscribers add none). Invalid
   options throw `RangeError` from `subscribe`. Disabled by default.
+- **t-digest quantile sketch** (in `src/tdigest.ts`, `TDigest`, EB-199):
+  zero-dependency streaming quantile estimator for high-cardinality
+  latency measurement. Where `DeliveryLatencyTracker` keeps an exact
+  per-subscriber window and sorts it for every nearest-rank percentile,
+  `TDigest` keeps a small set of centroids (mean + count) whose size stays
+  bounded by the compression parameter `delta` (default 100) no matter how
+  many samples are added, and estimates quantiles by interpolation. The two
+  are orthogonal: `latency.ts` is the *window* (which samples are kept),
+  this module is the *estimator* (how quantiles are computed) — use it
+  anywhere a per-(topic, subscriber) p50/p95/p99 must not grow memory with
+  the sample count. Classic Dunning t-digest with the K_1 scale function
+  (greedy single-pass compression, `4*n*q*(1-q)/delta` centroid bound),
+  deterministic for a given insert sequence, clock-free (it only ever sees
+  already-computed deltas). Measured error vs exact sorting on 20k
+  right-skewed latency samples (`node --test test/tdigest.test.ts`):
+  p50 0.05%, p95 0.17%, p99 0.27% relative error at 485 centroids (pinned
+  <1% in tests); 200k samples stay under 800 centroids. Invalid `q`,
+  non-finite values, and non-positive weights throw `RangeError`.
 - **Per-subscriber end-to-end ack-latency SLO tracking** (in
   `src/acklatency.ts`, opt-in via
   `subscribeReliable(..., { ackLatency: true })`): measures each reliably
