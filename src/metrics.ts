@@ -154,6 +154,9 @@
  *   publish-side throttling.
  * - `eventbus_degraded_subscribers`: subscriptions auto-paused by health
  *   probing.
+ * - `eventbus_slow_handler_last_ms`: last observed slow handler synchronous
+ *   execution time in milliseconds (EB-191, see
+ *   `SubscribeOptions.slowHandler`); 0 when no slow invocation has fired.
  * - `eventbus_paused_subscribers`: subscriptions manually paused by the
  *   operator (see `EventBus.pauseSubscriber`, EB-113).
  * - `eventbus_shaped_subscribers`: subscriptions held back by
@@ -567,6 +570,11 @@ export function renderPrometheus(stats: BusStats): string {
     'eventbus_degraded_subscribers',
     'Subscriptions currently auto-paused by health probing.',
     stats.degradedSubscribers,
+  );
+  gauge(
+    'eventbus_slow_handler_last_ms',
+    'Last observed slow handler synchronous execution time in milliseconds (EB-191, see SubscribeOptions.slowHandler); 0 when no slow invocation has fired.',
+    stats.slowHandlers?.lastMs ?? 0,
   );
   gauge(
     'eventbus_paused_subscribers',

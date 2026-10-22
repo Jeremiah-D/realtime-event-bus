@@ -651,6 +651,23 @@ library.
   per-subscriber state. Invalid probe options throw `RangeError` from
   `subscribe`. Disabled by default — a throwing handler behaves exactly as
   before unless a subscriber opts in.
+- **Slow-handler offload** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { slowHandler: { thresholdMs } })`, EB-191): the bus times
+  every handler invocation with the bus clock — an invocation whose
+  synchronous execution exceeds `thresholdMs` (default 100 ms, `true` for
+  the default) records a slow-handler observation
+  (`getStats().slowHandlers` → `{ count, lastMs }`, plus the
+  `eventbus_slow_handler_last_ms` Prometheus gauge and the
+  `onSlowHandler` callback), then moves the rest of the drain to a
+  `setImmediate` macrotask — so a single slow callback cannot hold the
+  drain chain and starve the subscriber's own later messages. Untouched
+  messages go back to the queue front in order and are delivered on the
+  continuation; nothing is dropped, and the slow message itself was
+  already delivered. Composes with health probing: the probe still times
+  `processingTimeoutMs` on the handler itself, independently of the
+  offload. Invalid options throw `RangeError` from `subscribe`. Applies
+  to single-message drains (batched subscribers collect before they
+  invoke); disabled by default.
 - **Nack-reason aggregation** (in `src/bus.ts` + `src/metrics.ts`, always
   on for reliable subscriptions): every redelivery is classified into
   exactly one of three mutually-exclusive triggers — `handler_throw` (the

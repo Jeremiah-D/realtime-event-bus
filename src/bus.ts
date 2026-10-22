@@ -1727,6 +1727,28 @@ export interface SubscribeOptions {
    */
   onDegraded?: (event: DegradedEvent) => void;
   /**
+   * Opt-in slow-handler offload (EB-191). When enabled, the bus times
+   * every handler invocation with the bus clock (`EventBusOptions.now`):
+   * an invocation whose synchronous execution exceeds `thresholdMs`
+   * records a slow-handler observation (see `BusStats.slowHandlers`),
+   * fires `onSlowHandler`, and moves the rest of the drain to a
+   * macrotask (`setImmediate`) — so a single slow callback cannot hold
+   * the drain chain and starve the subscriber's own later messages (or
+   * other subscribers' drains in the same flush). The remaining messages
+   * keep their order and are delivered on the continuation; nothing is
+   * dropped, and the slow message itself was already delivered.
+   *
+   * Composes with `healthProbe`: the probe still times
+   * `processingTimeoutMs` on the handler itself, independently of the
+   * offload. Pass `true` for the default 100 ms threshold, or a
+   * `SlowHandlerOptions` object to tune it. Invalid values throw
+   * `RangeError` from `subscribe`. Disabled by default — without it the
+   * drain runs exactly as before. Applies to single-message drains;
+   * batched subscribers (`SubscribeOptions.batch`) collect before they
+   * invoke, so the offload does not apply there.
+   */
+  slowHandler?: boolean | SlowHandlerOptions;
+  /**
    * Resume-from offset for durable-log replay. When the bus has a durable
    * log (`EventBusOptions.durableLogDir`), the subscriber's queue is
    * pre-filled at subscribe time with every logged message on topics
@@ -2969,6 +2991,47 @@ export interface DegradedEvent {
    * was dropped, and resuming redelivers them in order.
    */
   pendingMessages: number;
+}
+
+/** Snapshot delivered to `SlowHandlerOptions.onSlowHandler` per slow invocation. */
+export interface SlowHandlerEvent {
+  /** The subscriber whose handler ran slow. */
+  subscriberId: string;
+  /** The topic pattern the subscriber registered. */
+  pattern: string;
+  /** The invocation's synchronous execution time in milliseconds (bus clock). */
+  elapsedMs: number;
+  /** The configured `thresholdMs` the invocation exceeded. */
+  thresholdMs: number;
+}
+
+/** Callback fired once per handler invocation that exceeds the slow threshold. */
+export type SlowHandlerCallback = (event: SlowHandlerEvent) => void;
+
+/**
+ * Tuning for slow-handler offload (`SubscribeOptions.slowHandler`,
+ * EB-191). Validation happens at `subscribe` time; violations throw
+ * `RangeError`.
+ */
+export interface SlowHandlerOptions {
+  /**
+   * Synchronous handler-execution budget in milliseconds, measured with
+   * the bus clock (`EventBusOptions.now`). A handler whose synchronous
+   * execution exceeds the budget is a "slow" invocation: the bus records
+   * it (see `BusStats.slowHandlers`), fires `onSlowHandler`, and moves
+   * the rest of the drain to a macrotask (`setImmediate`) so one slow
+   * callback cannot hold the drain chain — the remaining messages keep
+   * their order and are delivered on the continuation, never dropped.
+   * Must be a positive finite number. Default 100.
+   */
+  thresholdMs?: number;
+  /**
+   * Called once per slow invocation with the subscriber, the measured
+   * elapsed time, and the threshold. A throwing callback never breaks the
+   * drain — the error is swallowed, mirroring the `onBackpressure`
+   * convention.
+   */
+  onSlowHandler?: SlowHandlerCallback;
 }
 
 /** Point-in-time health snapshot for one subscriber (see `EventBus.subscriberHealth`). */
@@ -5725,6 +5788,15 @@ export interface BusStats {
    */
   degradedSubscribers: number;
   /**
+   * Slow-handler offload observations (EB-191, see
+   * `SubscribeOptions.slowHandler`): `count` is the total number of
+   * handler invocations whose synchronous execution exceeded their
+   * subscriber's threshold (each one moved the rest of its drain to a
+   * macrotask); `lastMs` is the most recent such invocation's elapsed
+   * time in milliseconds (bus clock), 0 when none has fired yet.
+   */
+  slowHandlers: { count: number; lastMs: number };
+  /**
    * Subscriptions currently paused by the operator (see
    * `EventBus.pauseSubscriber`): delivery is held — the backlog stays
    * queued under the normal backpressure policy — until
@@ -7025,6 +7097,12 @@ interface Subscriber {
   /** Fired once per degradation when health probing auto-pauses delivery. */
   onDegraded?: (event: DegradedEvent) => void;
   /**
+   * Per-subscriber slow-handler offload state (see
+   * `SubscribeOptions.slowHandler`, EB-191). Absent when the offload is
+   * disabled for this subscriber.
+   */
+  slowHandler?: SlowHandlerState;
+  /**
    * Present for consumer-group members: the group this subscription
    * belongs to. Members of the same (groupId, pattern) compete — each
    * message is delivered to exactly one of them (see `subscribeToGroup`).
@@ -7418,6 +7496,23 @@ interface HealthProbeState {
   autoResumeAfterMs?: number;
   /** Pending auto-resume timer, if the subscriber degraded with a cooldown. */
   autoResumeTimer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Per-subscriber slow-handler offload state (see
+ * `SubscribeOptions.slowHandler`, EB-191). Only `continueArmed` changes
+ * over the subscription's lifetime; the rest is the validated
+ * configuration.
+ */
+interface SlowHandlerState {
+  thresholdMs: number;
+  onSlowHandler?: SlowHandlerCallback;
+  /**
+   * True while a macrotask drain continuation is armed for this
+   * subscriber — at most one is ever pending, so a second slow trip
+   * before the first continuation fires does not stack continuations.
+   */
+  continueArmed?: boolean;
 }
 
 export function escapeRegExp(literal: string): string {
@@ -9262,6 +9357,27 @@ function resolveHealthProbeOptions(
     processingTimeoutMs: checkPositiveMs('processingTimeoutMs', o.processingTimeoutMs),
     autoResumeAfterMs: checkPositiveMs('autoResumeAfterMs', o.autoResumeAfterMs),
   };
+}
+
+/**
+ * Validates `SubscribeOptions.slowHandler` and builds the initial
+ * per-subscriber offload state (EB-191). Returns `undefined` when the
+ * offload is disabled. Throws `RangeError` for invalid values.
+ */
+function resolveSlowHandlerOptions(
+  opt: boolean | SlowHandlerOptions | undefined,
+): Omit<SlowHandlerState, 'continueArmed'> | undefined {
+  if (opt == null || opt === false) return undefined;
+  const o: SlowHandlerOptions = opt === true ? {} : opt;
+  const thresholdMs = o.thresholdMs ?? 100;
+  if (!Number.isFinite(thresholdMs) || thresholdMs <= 0) {
+    throw new RangeError('slowHandler.thresholdMs must be a positive finite number of milliseconds');
+  }
+  const onSlowHandler = o.onSlowHandler;
+  if (onSlowHandler !== undefined && typeof onSlowHandler !== 'function') {
+    throw new RangeError('slowHandler.onSlowHandler must be a function');
+  }
+  return { thresholdMs, onSlowHandler };
 }
 
 /**
@@ -12575,6 +12691,13 @@ export class EventBus {
    */
   private totalReceiptsIssued = 0;
   /**
+   * Slow-handler offload observations (EB-191, see
+   * `BusStats.slowHandlers`): total invocations whose synchronous
+   * execution exceeded their subscriber's threshold, and the most
+   * recent such invocation's elapsed milliseconds (bus clock).
+   */
+  private totalSlowHandlerInvocations = 0;
+  private lastSlowHandlerElapsedMs = 0;
   /**
    * Per-publisher admitted-publish totals (see `PublishOptions.publisherId`).
    * Only publishes that clear admission count; a schema rejection or
@@ -19687,6 +19810,7 @@ export class EventBus {
         ['slowStart', opts?.slowStart],
         ['rateLimit', opts?.rateLimit],
         ['healthProbe', opts?.healthProbe],
+        ['slowHandler', opts?.slowHandler],
         ['batch', opts?.batch],
         ['window', opts?.window],
         ['causal', opts?.causal],
@@ -19751,6 +19875,9 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
+    // Validated before anything registers, so a throw leaves no
+    // half-registered subscriber behind.
+    const slowHandler = resolveSlowHandlerOptions(opts?.slowHandler);
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind. The ramp targets the shaping
@@ -20095,6 +20222,8 @@ export class EventBus {
           ? undefined
           : { consecutiveFailures: 0, degraded: false, ...healthProbe },
       onDegraded,
+      // Slow-handler offload (EB-191): opt-in per subscriber.
+      slowHandler: slowHandler === undefined ? undefined : { ...slowHandler },
       filter,
       // Subscriber-side message projection (EB-144): the per-subscriber
       // invocation/error counters start at zero with the function.
@@ -35976,6 +36105,10 @@ export class EventBus {
       transformErrors: this.totalTransformErrors,
       throttledSubscribers,
       degradedSubscribers,
+      slowHandlers: {
+        count: this.totalSlowHandlerInvocations,
+        lastMs: this.lastSlowHandlerElapsedMs,
+      },
       pausedSubscribers,
       shapedSubscribers,
       replayThrottled,
@@ -38267,6 +38400,11 @@ export class EventBus {
           // EB-159: the handler executes under one handler-concurrency
           // slot — the next queued message dispatches when this
           // invocation settles (see invokeWithDeliverySlot).
+          // Slow-handler offload (EB-191): the invocation is timed with
+          // the bus clock; a slow handler moves the rest of the drain to
+          // a macrotask (see the check after the invocation).
+          const slowWatch = subscriber.slowHandler;
+          const invokeStartedAtMs = slowWatch !== undefined ? this.now() : 0;
           this.invokeWithDeliverySlot(subscriber, msg, (): unknown =>
             this.invokeWithInflightSlot(subscriber, (): unknown => {
               let result: unknown;
@@ -38306,6 +38444,16 @@ export class EventBus {
               return result;
             }),
           );
+          if (this.slowHandlerTripped(subscriber, invokeStartedAtMs)) {
+            // Slow-handler offload (EB-191): the handler already ran and
+            // the observation is recorded — the rest of the drain moves
+            // to a macrotask so one slow callback cannot hold the drain
+            // chain. Untouched messages go back to the queue front in
+            // order; the continuation delivers them.
+            this.requeueUndelivered(subscriber, live.slice(i + 1));
+            this.scheduleSlowHandlerContinue(subscriber);
+            break;
+          }
         }
       } else {
         for (let i = 0; i < live.length; i += 1) {
@@ -38332,12 +38480,28 @@ export class EventBus {
           // EB-159: the handler executes under one handler-concurrency
           // slot — the next queued message dispatches when this
           // invocation settles (see invokeWithDeliverySlot).
+          // Slow-handler offload (EB-191): the invocation is timed with
+          // the bus clock (see the check after the invocation). Composes
+          // with the health probe — `deliverWithHealth` still times
+          // `processingTimeoutMs` on the handler itself.
+          const slowWatch = subscriber.slowHandler;
+          const invokeStartedAtMs = slowWatch !== undefined ? this.now() : 0;
           this.invokeWithDeliverySlot(subscriber, msg, (): unknown =>
             this.invokeWithInflightSlot(subscriber, (): unknown =>
               this.deliverWithHealth(subscriber, msg, nowMs),
             ),
           );
-          if (!health.degraded) continue;
+          const slowTripped = this.slowHandlerTripped(subscriber, invokeStartedAtMs);
+          if (!health.degraded) {
+            if (slowTripped) {
+              // Slow-handler offload (EB-191): same requeue-and-continue
+              // semantics as the plain drain above.
+              this.requeueUndelivered(subscriber, live.slice(i + 1));
+              this.scheduleSlowHandlerContinue(subscriber);
+              break;
+            }
+            continue;
+          }
           // The threshold tripped mid-drain: everything not yet attempted
           // goes back to the queue, in FIFO order (see requeueUndelivered).
           // Only attempted messages were recorded in the window, so the
@@ -39216,6 +39380,72 @@ export class EventBus {
       this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
     for (const msg of rest)
       this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
+  }
+
+  /**
+   * Records one slow-handler observation (EB-191): bumps the bus-level
+   * counters (`BusStats.slowHandlers`) and fires the subscriber's
+   * `onSlowHandler`. A throwing observer is swallowed — observability
+   * must never break the drain.
+   */
+  private noteSlowHandler(subscriber: Subscriber, elapsedMs: number): void {
+    const watch = subscriber.slowHandler;
+    if (watch === undefined) return;
+    this.totalSlowHandlerInvocations += 1;
+    this.lastSlowHandlerElapsedMs = elapsedMs;
+    const onSlowHandler = watch.onSlowHandler;
+    if (onSlowHandler === undefined) return;
+    try {
+      onSlowHandler({
+        subscriberId: subscriber.id,
+        pattern: subscriber.pattern,
+        elapsedMs,
+        thresholdMs: watch.thresholdMs,
+      });
+    } catch {
+      // Swallowed: a throwing observability callback never breaks the drain.
+    }
+  }
+
+  /**
+   * Arms the macrotask drain continuation for a slow-handler offload
+   * (EB-191): the subscriber's remaining backlog drains on a
+   * `setImmediate` turn, so the event loop gets to run I/O and timers
+   * between the slow handler and the rest of its drain. At most one
+   * continuation is ever armed per subscriber; the timer is `unref`'d so
+   * an armed continuation never keeps the process alive on its own, and
+   * it no-ops if the subscriber unsubscribed meanwhile.
+   */
+  private scheduleSlowHandlerContinue(subscriber: Subscriber): void {
+    const watch = subscriber.slowHandler;
+    if (watch === undefined || watch.continueArmed === true) return;
+    watch.continueArmed = true;
+    const timer = setImmediate(() => {
+      watch.continueArmed = false;
+      // The subscriber may have unsubscribed while the continuation was
+      // armed — only a still-registered subscriber drains here.
+      if (this.subscribers.get(subscriber.id) !== subscriber) return;
+      this.drainSubscriber(subscriber, this.now());
+    });
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+  }
+
+  /**
+   * Times one handler invocation for the slow-handler offload (EB-191):
+   * when the synchronous execution (from `startedAtMs`, bus clock)
+   * exceeded the subscriber's threshold, records the observation and
+   * returns true. Never requeues or breaks — the caller owns the drain
+   * loop's control flow, so the health-probe degraded path keeps
+   * precedence when both trip on the same message.
+   */
+  private slowHandlerTripped(subscriber: Subscriber, startedAtMs: number): boolean {
+    const watch = subscriber.slowHandler;
+    if (watch === undefined) return false;
+    const elapsedMs = this.now() - startedAtMs;
+    if (elapsedMs <= watch.thresholdMs) return false;
+    this.noteSlowHandler(subscriber, elapsedMs);
+    return true;
   }
 
   /**
