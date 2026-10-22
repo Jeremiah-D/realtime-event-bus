@@ -1693,6 +1693,32 @@ library.
   discards the open window. `getStats().aggregatedWindows` counts
   completed windows. Invalid options throw `RangeError` from
   `subscribe`. Disabled by default.
+- **Subscriber session-window aggregation** (in `src/bus.ts`, opt-in via
+  `subscribe(..., { sessionWindow: { gapMs, aggregate, field?,
+  maxSessionsPerKey? } })`, EB-188): the Kafka/Flink session-window
+  semantic for user-behavior analytics — click bursts, session-duration
+  stats, per-user activity rollups. Sessions are keyed by the publish
+  key (`PublishOptions.key`, EB-36 key semantics; unkeyed messages share
+  the `''` session). Messages for one key fold into an open session with
+  O(1) accumulators; when a new message arrives `gapMs` or more after
+  that key's last activity, the old session closes and the subscriber
+  receives a single aggregate whose payload is `{ sessionStart,
+  sessionEnd, count, value }`. `aggregate` is the same seven folds as
+  tumbling windows (`'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' |
+  'concat'`) with the same field-extraction semantics. Unlike tumbling
+  windows, session windows cut on inactivity rather than clock
+  boundaries, and they use processing time — late event-time messages
+  never reopen a closed session (orthogonal to EB-59 watermark tracking).
+  A gap-expiry sweep timer (unref'd) closes idle sessions without new
+  traffic; `maxSessionsPerKey` (default 1024) bounds open sessions per
+  subscription — evicting the least-recently active session still
+  delivers its aggregate, so eviction is lossless. The aggregate travels
+  the normal delivery path (backpressure queue, reliable `Delivery`, one
+  ack per session); its `seq` is the session's last raw message `seq`.
+  The durable log stores raw messages only, so `resumeFromSeq` rebuilds
+  sessions by replay order. Session and tumbling windows cannot be
+  combined on one subscription (`RangeError`). `getStats().aggregatedSessionWindows` counts completed sessions. Invalid options
+  throw `RangeError` from `subscribe`. Disabled by default.
 - **Atomic cross-topic batch publish** (in `src/bus.ts`, via
   `publishAtomic(entries)`): all-or-nothing fan-out for multi-message
   batches — subscribers either see every message or none. Admission runs in

@@ -2309,6 +2309,43 @@ export interface SubscribeOptions {
    */
   window?: WindowAggregateOptions;
   /**
+   * Opt-in subscriber-side session-window aggregation (EB-188): the
+   * Kafka/Flink session-window semantic, keyed by the publish key
+   * (`PublishOptions.key`, EB-36 key semantics — unkeyed messages share
+   * the `''` session). Messages for one key fold into an open session;
+   * when a new message arrives `gapMs` or more after that key's last
+   * activity, the old session closes and the subscriber receives a
+   * single `SessionAggregateResult` (`{sessionStart, sessionEnd,
+   * count, value}`) instead of the raw messages.
+   *
+   * Session windows cut on inactivity while tumbling windows (EB-73)
+   * cut on fixed clock boundaries — orthogonal by construction, so the
+   * two cannot be combined on one subscription (fail-fast `RangeError`
+   * from `subscribe`). Event time is ignored: sessions use processing
+   * time (`EventBusOptions.now`), so late event-time messages never
+   * reopen a closed session (orthogonal to EB-59 watermark tracking).
+   *
+   * Composes with the other delivery features:
+   * - `filter`: applies to raw messages before aggregation (orthogonal).
+   * - `throttle`: publish-side shedding still protects the subscriber —
+   *   shed messages never enter a session and surface as sequence gaps.
+   * - reliable (`subscribeReliable`): the aggregate arrives as one
+   *   `Delivery` — ack it to confirm the whole session.
+   * - `batch`: aggregates are batched at drain like any queued message.
+   * - `deliveryShaping` / `rateLimit` / `maxInflight`: apply to the
+   *   aggregate delivery (one invocation per session).
+   *
+   * Unsubscribing clears the sweep timer and discards the open
+   * sessions' buffered state, exactly like discarding a queued backlog.
+   * The gap-expiry sweep timer is `unref()`'d, so an open session never
+   * keeps the process alive. `getStats().aggregatedSessionWindows`
+   * counts completed (non-empty) sessions. The durable log stores raw
+   * messages (never session state), so `resumeFromSeq` rebuilds sessions
+   * by replay order. Invalid values throw `RangeError` from `subscribe`.
+   * Disabled by default.
+   */
+  sessionWindow?: SessionWindowOptions;
+  /**
    * Multi-tenant namespace (EB-52, see `EventBus.createNamespace`): the
    * subscription is scoped to the namespace — `topicPattern` is matched
    * against the sub-topic after the `<namespace>/` prefix, so `**`
@@ -5035,6 +5072,14 @@ export interface BusStats {
    */
   aggregatedWindows: number;
   /**
+   * Completed (non-empty) session windows across all session-windowed
+   * subscribers (see `SubscribeOptions.sessionWindow`, EB-188). Counts
+   * each session once when it closes and produces its aggregate — 0
+   * when no subscriber ever opted into session aggregation. The field
+   * is always present, so readers never need a fallback.
+   */
+  aggregatedSessionWindows: number;
+  /**
    * Deliveries currently outstanding — handed to reliable subscribers but
    * not yet acked or nacked — across all subscriptions.
    */
@@ -7075,6 +7120,12 @@ interface Subscriber {
    */
   window?: SubscriberWindowState;
   /**
+   * Session-window aggregation state (see
+   * `SubscribeOptions.sessionWindow`, EB-188). Absent when the
+   * subscriber did not opt in.
+   */
+  sessionWindow?: SubscriberSessionWindowState;
+  /**
    * Subscriber-side exactly-once dedup window (see
    * `SubscribeOptions.deduplicateMessages`). Absent when dedup is
    * disabled for this subscriber.
@@ -8727,6 +8778,173 @@ function resolveWindowOptions(
     lastTopic: '',
     lastSeq: 0,
     lastEpoch: '',
+    timer: undefined,
+  };
+}
+
+/**
+ * Opt-in subscriber-side session-window aggregation (see
+ * `SubscribeOptions.sessionWindow`, EB-188): activity-gap-based
+ * sessions, the Kafka/Flink session-window semantic. Tumbling windows
+ * (EB-73) cut on fixed clock boundaries; session windows cut on
+ * inactivity — a new message for a key whose previous activity is
+ * `gapMs` or older closes the old session (delivering its aggregate)
+ * and opens a fresh one. The two are orthogonal by construction and
+ * cannot be combined on one subscription (fail-fast `RangeError` at
+ * `subscribe` time).
+ */
+export interface SessionWindowOptions {
+  /**
+   * Inactivity gap in milliseconds on the bus clock
+   * (`EventBusOptions.now`): when a message arrives for a key whose
+   * last activity is `gapMs` or older, the open session closes and
+   * the subscriber receives a single aggregate message
+   * (`SessionAggregateResult`) instead of the raw messages. Must be a
+   * positive finite number.
+   */
+  gapMs: number;
+  /**
+   * How the session's messages fold into
+   * `SessionAggregateResult.value`: the same seven folds as tumbling
+   * windows (`'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' |
+   * 'concat'`).
+   */
+  aggregate: WindowAggregateKind;
+  /**
+   * Dot-separated payload field the aggregation reads (e.g.
+   * `"metrics.price"`); when absent the whole payload is the value.
+   * Same extraction semantics as tumbling windows (EB-73): numeric
+   * folds ignore non-finite extractions, `concat` skips `undefined`,
+   * and `__proto__`/`constructor`/`prototype` segments throw
+   * `RangeError` at subscribe time.
+   */
+  field?: string;
+  /**
+   * Maximum number of concurrently open sessions (one per key) on this
+   * subscription. When a new key would exceed it, the least-recently
+   * active open session is evicted — its aggregate is still delivered,
+   * so eviction never loses data. Must be a positive integer; default
+   * 1024.
+   */
+  maxSessionsPerKey?: number;
+}
+
+/**
+ * The single message a session delivers when it closes (see
+ * `SubscribeOptions.sessionWindow`, EB-188). It travels the
+ * subscriber's normal delivery path — backpressure queue, reliable
+ * delivery, drain-time shaping — exactly like a published message.
+ */
+export interface SessionAggregateResult {
+  /** Bus-clock (`EventBusOptions.now`) of the session's first message. */
+  sessionStart: number;
+  /** Bus-clock of the session's last message (its close time). */
+  sessionEnd: number;
+  /** Messages that contributed to this aggregate. */
+  count: number;
+  /**
+   * The folded value: the count itself for `'count'`; the
+   * sum/mean/min/max of the extracted finite numbers for the numeric
+   * aggregates (`null` when no message carried a finite number); the
+   * last message's extracted value for `'last'`; the concatenated
+   * string forms for `'concat'`.
+   */
+  value: unknown;
+}
+
+/**
+ * One open per-key session inside a subscriber's session-window state
+ * (see `SubscribeOptions.sessionWindow`, EB-188). The key is the
+ * publish key (`msg.key ?? ''`, EB-36 key semantics): sessions are
+ * independent per key, so a hot key's inactivity never closes a quiet
+ * key's session and vice versa.
+ */
+interface SessionWindowEntry {
+  /** The publish key this session belongs to (`''` when unkeyed). */
+  key: string;
+  /** Bus-clock of the session's first message. */
+  sessionStart: number;
+  /** Bus-clock of the session's most recent message. */
+  lastActivity: number;
+  /** Messages that contributed to the open session. */
+  count: number;
+  /** Numeric fold accumulators (only for sum/avg/min/max). */
+  sum: number;
+  numericCount: number;
+  min: number;
+  max: number;
+  /** Last extracted value (only for `last`). */
+  last: unknown;
+  /** Stringified parts (only for `concat`). */
+  parts: string[];
+  /** Topic/seq/epoch of the last admitted message: the aggregate's envelope. */
+  lastTopic: string;
+  lastSeq: number;
+  lastEpoch: string;
+}
+
+/**
+ * Per-subscriber session-window aggregation state (see
+ * `SubscribeOptions.sessionWindow`, EB-188). Absent when the
+ * subscriber did not opt in — non-opt-in subscribers pay a single
+ * property check per delivery, no allocation and no timer.
+ *
+ * `sessions` is insertion-ordered by last activity (every arrival
+ * re-inserts its session at the tail), so the map head is always the
+ * least-recently active open session — O(1) eviction when
+ * `maxSessionsPerKey` is reached. The sweep timer is per subscriber
+ * (not per session): it closes every session whose activity gap has
+ * expired and re-arms only while sessions remain open, so an idle
+ * subscriber holds at most one unref'd timer.
+ */
+interface SubscriberSessionWindowState {
+  gapMs: number;
+  aggregate: WindowAggregateKind;
+  fieldPath: string[] | undefined;
+  maxSessionsPerKey: number;
+  sessions: Map<string, SessionWindowEntry>;
+  /** Gap-expiry sweep timer, armed while any session is open. Unref'd. */
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/** Default bound on concurrently open sessions per session-windowed subscription. */
+const DEFAULT_MAX_SESSIONS_PER_KEY = 1024;
+
+/**
+ * Validates `SubscribeOptions.sessionWindow` and builds the initial
+ * session state. Returns `undefined` when session aggregation is
+ * disabled. Throws `TypeError` for a non-object value and `RangeError`
+ * for an invalid `gapMs`, `aggregate`, `field`, or
+ * `maxSessionsPerKey`.
+ */
+function resolveSessionWindowOptions(
+  opt: SessionWindowOptions | undefined,
+): SubscriberSessionWindowState | undefined {
+  if (opt === undefined) return undefined;
+  if (typeof opt !== 'object' || opt === null) {
+    throw new TypeError('subscribe: sessionWindow must be a SessionWindowOptions object');
+  }
+  const gapMs = opt.gapMs;
+  if (!Number.isFinite(gapMs) || gapMs <= 0) {
+    throw new RangeError('subscribe: sessionWindow.gapMs must be a positive finite number of milliseconds');
+  }
+  const aggregate = opt.aggregate;
+  if (typeof aggregate !== 'string' || !WINDOW_AGGREGATES.has(aggregate)) {
+    throw new RangeError(
+      "subscribe: sessionWindow.aggregate must be one of 'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' | 'concat'",
+    );
+  }
+  const fieldPath = parseWindowFieldPath(opt.field);
+  const maxSessionsPerKey = opt.maxSessionsPerKey ?? DEFAULT_MAX_SESSIONS_PER_KEY;
+  if (!Number.isInteger(maxSessionsPerKey) || maxSessionsPerKey <= 0) {
+    throw new RangeError('subscribe: sessionWindow.maxSessionsPerKey must be a positive integer');
+  }
+  return {
+    gapMs,
+    aggregate: aggregate as WindowAggregateKind,
+    fieldPath,
+    maxSessionsPerKey,
+    sessions: new Map(),
     timer: undefined,
   };
 }
@@ -12228,6 +12446,8 @@ export class EventBus {
   private totalIdleExpired = 0;
   /** Completed non-empty tumbling windows (see `SubscribeOptions.window`, EB-73). */
   private totalAggregatedWindows = 0;
+  /** Completed (non-empty) session windows across all session-windowed subscribers (EB-188). */
+  private totalAggregatedSessionWindows = 0;
   /**
    * Active idle-reclamation timers (see `src/idle.ts`, EB-72), keyed by
    * subscription id. Armed at subscribe time, re-armed on qualifying
@@ -19234,6 +19454,16 @@ export class EventBus {
     // Tumbling-window aggregation (EB-73): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const window = resolveWindowOptions(opts?.window);
+    // Session-window aggregation (EB-188): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    // Session windows cut on inactivity while tumbling windows cut on
+    // clock boundaries — orthogonal semantics, so combining both on one
+    // subscription would double-aggregate the same messages: fail fast
+    // instead of pretending the composition is coherent.
+    const sessionWindow = resolveSessionWindowOptions(opts?.sessionWindow);
+    if (window !== undefined && sessionWindow !== undefined) {
+      throw new RangeError('subscribe: sessionWindow cannot be combined with window');
+    }
     // The in-flight cap counts single handler invocations; a batch hands
     // many messages to one call, so the two cannot share a coherent
     // accounting — fail fast instead of pretending the cap applies.
@@ -19484,6 +19714,7 @@ export class EventBus {
       barrier,
       batch,
       window,
+      sessionWindow,
       health:
         healthProbe == null
           ? undefined
@@ -19675,6 +19906,7 @@ export class EventBus {
           this.clearRateLimitTimer(subscriber);
           this.clearBatchTimer(subscriber);
           this.clearWindowTimer(subscriber);
+          this.clearSessionWindowTimer(subscriber);
           // Durable-log replay throttle (EB-164): a throttled replay
           // must not outlive its subscriber — the armed resume timer is
           // cancelled and the paused pass is dropped.
@@ -31522,6 +31754,16 @@ export class EventBus {
       // so windowing composes orthogonally with all three.
       return this.accumulateWindowed(subscriber, window, msg, expiresAt, rawPayload);
     }
+    const sessionWindow = subscriber.sessionWindow;
+    if (sessionWindow !== undefined) {
+      // Session-window aggregation (EB-188): the message folds into the
+      // subscriber's open per-key session instead of being queued — the
+      // aggregate is enqueued when the session's activity gap expires.
+      // Filter, composite matching and publish-side throttling above
+      // already ran on the raw message, so sessioning composes
+      // orthogonally with all three, exactly like tumbling windows.
+      return this.accumulateSessioned(subscriber, sessionWindow, msg, expiresAt, rawPayload);
+    }
     return this.enqueueMessage(subscriber, msg, expiresAt) === 'accepted';
   }
 
@@ -34957,6 +35199,7 @@ export class EventBus {
       expiredLeases: this.totalExpiredLeases,
       idleExpired: this.totalIdleExpired,
       aggregatedWindows: this.totalAggregatedWindows,
+      aggregatedSessionWindows: this.totalAggregatedSessionWindows,
       unackedDeliveries,
       patternCacheSize: this.patternCache.size,
       compositeSubscriptions: this.compositeSubscriptionCount,
@@ -38112,6 +38355,228 @@ export class EventBus {
     if (window?.timer !== undefined) {
       clearTimeout(window.timer);
       window.timer = undefined;
+    }
+  }
+
+  /**
+   * Folds one message into a session-windowed subscriber's per-key
+   * session (see `SubscribeOptions.sessionWindow`, EB-188). The session
+   * key is the publish key (`msg.key ?? ''`, EB-36 key semantics):
+   * sessions never cross keys, so a hot key's gap can never close a
+   * quiet key's session.
+   *
+   * A message arriving `gapMs` or more after its key's last activity
+   * closes the old session first (delivering its aggregate), then opens
+   * a fresh one — the boundary follows the injected bus clock even when
+   * the real-time sweep timer has not fired yet, exactly like the
+   * tumbling-window close on `windowEnd`. Returns `true`: the message
+   * was admitted to the subscriber's session, like a queue admission.
+   */
+  private accumulateSessioned(
+    subscriber: Subscriber,
+    state: SubscriberSessionWindowState,
+    msg: BusMessage,
+    expiresAt: number | undefined,
+    rawPayload: unknown,
+  ): boolean {
+    const nowMs = this.now();
+    // Admission-time expiry: a message already past its TTL never enters
+    // a session — counted as expired, like a queue drop at drain. A
+    // message that outlives its TTL inside a session still contributes
+    // (expiry is not re-evaluated at close), matching tumbling windows.
+    if (expiresAt !== undefined && nowMs >= expiresAt) {
+      this.recordExpired(msg.topic);
+      return true;
+    }
+    const key = msg.key ?? '';
+    let session = state.sessions.get(key);
+    if (session !== undefined && nowMs - session.lastActivity >= state.gapMs) {
+      // The key went quiet: close the old session (its aggregate is
+      // delivered, its entry removed) before opening the new one.
+      this.closeSession(subscriber, state, session);
+      session = undefined;
+    }
+    if (session === undefined) {
+      // Bounded memory: opening a session past `maxSessionsPerKey`
+      // evicts the least-recently active open session — and the evicted
+      // session's aggregate is still delivered, so eviction is lossless.
+      if (state.sessions.size >= state.maxSessionsPerKey) {
+        const oldestKey = state.sessions.keys().next().value;
+        if (oldestKey !== undefined && oldestKey !== key) {
+          const oldest = state.sessions.get(oldestKey);
+          if (oldest !== undefined) this.closeSession(subscriber, state, oldest);
+        }
+      }
+      session = {
+        key,
+        sessionStart: nowMs,
+        lastActivity: nowMs,
+        count: 0,
+        sum: 0,
+        numericCount: 0,
+        min: Infinity,
+        max: -Infinity,
+        last: undefined,
+        parts: [],
+        lastTopic: '',
+        lastSeq: 0,
+        lastEpoch: '',
+      };
+      state.sessions.set(key, session);
+      this.armSessionSweepTimer(subscriber, state);
+    } else {
+      // Refresh the session's LRU position: the map head stays the
+      // least-recently active open session.
+      state.sessions.delete(key);
+      state.sessions.set(key, session);
+    }
+    session.lastActivity = nowMs;
+    // Same fold semantics as tumbling windows (EB-73): only finite
+    // numbers fold into the numeric aggregates, `concat` skips
+    // `undefined`, `count`/`last` take every admitted message.
+    const value = extractWindowValue(rawPayload, state.fieldPath);
+    switch (state.aggregate) {
+      case 'count':
+        session.count += 1;
+        break;
+      case 'sum':
+      case 'avg':
+      case 'min':
+      case 'max':
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          session.count += 1;
+          session.numericCount += 1;
+          session.sum += value;
+          if (value < session.min) session.min = value;
+          if (value > session.max) session.max = value;
+        }
+        break;
+      case 'last':
+        session.count += 1;
+        session.last = value;
+        break;
+      case 'concat':
+        if (value !== undefined) {
+          session.count += 1;
+          session.parts.push(String(value));
+        }
+        break;
+    }
+    session.lastTopic = msg.topic;
+    session.lastSeq = msg.seq;
+    session.lastEpoch = msg.epoch ?? '';
+    return true;
+  }
+
+  /**
+   * Folds an open session's accumulators into the aggregate value for
+   * `SessionAggregateResult.value`. Same fold as tumbling windows.
+   */
+  private sessionWindowValue(state: SubscriberSessionWindowState, session: SessionWindowEntry): unknown {
+    switch (state.aggregate) {
+      case 'count':
+        return session.count;
+      case 'sum':
+        return session.numericCount === 0 ? null : session.sum;
+      case 'avg':
+        return session.numericCount === 0 ? null : session.sum / session.numericCount;
+      case 'min':
+        return session.numericCount === 0 ? null : session.min;
+      case 'max':
+        return session.numericCount === 0 ? null : session.max;
+      case 'last':
+        return session.last;
+      case 'concat':
+        return session.parts.join('');
+    }
+  }
+
+  /**
+   * Closes one open per-key session: builds the aggregate message and
+   * enqueues it through the subscriber's normal delivery path
+   * (backpressure queue, reliable delivery, drain-time shaping — the
+   * aggregate is one ordinary queued message). An empty session
+   * delivers nothing and counts nothing. Increments
+   * `getStats().aggregatedSessionWindows` for every completed
+   * non-empty session.
+   */
+  private closeSession(
+    subscriber: Subscriber,
+    state: SubscriberSessionWindowState,
+    session: SessionWindowEntry,
+  ): void {
+    state.sessions.delete(session.key);
+    const count = session.count;
+    const sessionStart = session.sessionStart;
+    const sessionEnd = session.lastActivity;
+    const value = this.sessionWindowValue(state, session);
+    const topic = session.lastTopic;
+    const seq = session.lastSeq;
+    const epoch = session.lastEpoch;
+    if (count === 0) return;
+    // The subscriber may have unsubscribed between the timer firing and
+    // this close (or re-entrantly during close): only a still-registered
+    // subscriber enqueues the aggregate.
+    if (this.subscribers.get(subscriber.id) !== subscriber) return;
+    const aggregate: BusMessage = {
+      topic,
+      payload: { sessionStart, sessionEnd, count, value } satisfies SessionAggregateResult,
+      seq,
+      ...(epoch === '' ? {} : { epoch }),
+    };
+    this.totalAggregatedSessionWindows += 1;
+    this.enqueueMessage(subscriber, aggregate, undefined);
+    // The aggregate was enqueued outside any publish fan-out — no flush
+    // is scheduled yet. Without this the aggregate would sit in the
+    // queue until unrelated traffic arrived.
+    this.scheduleFlush();
+  }
+
+  /**
+   * Arms the per-subscriber session sweep timer. The timer is
+   * `unref()`'d, so open sessions never keep the process alive; on fire
+   * it closes every session whose activity gap has expired and re-arms
+   * only while sessions remain open. When the injected bus clock has
+   * not advanced since arming (a frozen test clock), the timer simply
+   * disarms — the next message re-arms it — instead of spinning.
+   */
+  private armSessionSweepTimer(subscriber: Subscriber, state: SubscriberSessionWindowState): void {
+    if (state.timer !== undefined) return;
+    const armedAt = this.now();
+    const timer = setTimeout(() => {
+      state.timer = undefined;
+      // The subscriber may have unsubscribed while the timer was armed —
+      // closeSession re-checks registration before enqueuing.
+      if (this.subscribers.get(subscriber.id) !== subscriber) return;
+      const nowMs = this.now();
+      if (nowMs <= armedAt) {
+        // The bus clock never advanced (frozen test clock): no session
+        // can have expired. Disarm and let the next message re-arm —
+        // re-arming here would spin a real timer against a dead clock.
+        return;
+      }
+      for (const session of [...state.sessions.values()]) {
+        if (nowMs - session.lastActivity >= state.gapMs) {
+          this.closeSession(subscriber, state, session);
+        }
+      }
+      if (state.sessions.size > 0) this.armSessionSweepTimer(subscriber, state);
+    }, state.gapMs);
+    const handle = timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    state.timer = timer;
+  }
+
+  /**
+   * Cancels a session-windowed subscriber's pending sweep timer, if
+   * any. Open sessions are discarded with the subscriber, exactly like
+   * a queued backlog.
+   */
+  private clearSessionWindowTimer(subscriber: Subscriber): void {
+    const sessionWindow = subscriber.sessionWindow;
+    if (sessionWindow?.timer !== undefined) {
+      clearTimeout(sessionWindow.timer);
+      sessionWindow.timer = undefined;
     }
   }
 
