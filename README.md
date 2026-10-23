@@ -6560,6 +6560,52 @@ Semantics notes:
 - Prometheus: `eventbus_statestore_keys`,
   `eventbus_statestore_evicted_keys_total` (rendered only when enabled).
 
+## Conditional publish — compare-and-set (EB-212)
+
+`publishCompareAndSet(topic, key, expected, payload)` reads the
+materialized state store (EB-171) for `(topic, key)` and only runs the
+normal publish pipeline when the row matches `expected` — the
+lock-free primitive for distributed config rollout and keyed state
+synchronization (read value + version, compute next, publish only if
+the key did not move):
+
+```ts
+bus.enableStateStore();
+bus.publish('cfg.service', { replicas: 1 }, { key: 'deploy' }); // version 1
+bus.publishCompareAndSet('cfg.service', 'deploy', { version: 1 }, { replicas: 2 });
+// → { admitted: true, accepted: 1, seq: 2 } — row is now version 2
+bus.publishCompareAndSet('cfg.service', 'deploy', { version: 1 }, { replicas: 3 });
+// → { admitted: false, reason: 'cas-mismatch', accepted: 0,
+//     expectedVersion: 1, actualVersion: 2 }
+```
+
+`expected` takes two forms (or both — they AND): `{ version: n }`
+(the row's update counter; a missing row reads as version 0, so
+`{ version: 0 }` is the create-if-absent guard) and `{ value: v }`
+(structural equality against the row's latest value — object key
+order insignificant, typed arrays byte-wise, `NaN` equals `NaN`; a
+missing row reads as `undefined`).
+
+The compare and the publish run synchronously in one call stack — no
+await, no event-loop turn in between — so the check and the admission
+share a critical section (TOCTOU-safe on the event-loop model). On a
+match the publish is an ordinary keyed publish: it advances the row's
+version and composes with EB-26 keyed compaction and EB-36 keyed
+ordering, and every admission gate still applies (a matching compare
+followed by a schema rejection reports `reason: 'schema'`, not
+`'cas-mismatch'`).
+
+A mismatch is a publish-side admission rejection: no sequence number
+consumed, nothing written to the durable log, no rate-limit budget
+burned. It counts in `TopicStats.casMismatches` /
+`BusStats.casMismatches` and fires `onAdmissionRejected` with reason
+`'cas-mismatch'` (the EB-39 unified channel); a version-predicate
+mismatch also reports `expectedVersion` / `actualVersion` for retry.
+Prometheus: `eventbus_cas_mismatch_total`. Requires
+`enableStateStore` (`RangeError` fail-fast without it); `key` is
+required and non-empty. Namespace publishes address the
+namespace-scoped row.
+
 ## In-memory lookback for late joiners (EB-176)
 
 `setTopicLookback(topicPattern, { lookbackCount?, lookbackMs? })` retains

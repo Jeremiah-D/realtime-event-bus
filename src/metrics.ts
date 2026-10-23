@@ -45,6 +45,9 @@
  *   breaker opened (EB-116).
  * - `eventbus_duplicate_messages_total`: idempotent publishes suppressed
  *   as duplicates.
+ * - `eventbus_cas_mismatch_total`: `publishCompareAndSet` calls rejected
+ *   on compare mismatch (EB-212) — the expected version/value did not
+ *   match the state-store row, so the publish never ran.
  * - `eventbus_filtered_messages_total`: messages skipped by subscriber
  *   content filters.
  * - `eventbus_header_filtered_messages_total`: messages skipped by
@@ -455,6 +458,11 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     'eventbus_duplicate_messages_total',
     'Total idempotent publishes suppressed as duplicates.',
     stats.duplicateMessages,
+  );
+  counter(
+    'eventbus_cas_mismatch_total',
+    'Total publishCompareAndSet calls rejected on compare mismatch (EB-212).',
+    stats.casMismatches,
   );
   counter(
     'eventbus_filtered_messages_total',

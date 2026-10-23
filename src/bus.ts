@@ -72,6 +72,12 @@ import {
   type JsonPatchOp,
   type PatchEnvelope,
 } from './patchpublish.ts';
+import {
+  validateCompareAndSetExpected,
+  compareAndSetMatches,
+  type CompareAndSetExpected,
+} from './caspublish.ts';
+export type { CompareAndSetExpected } from './caspublish.ts';
 import type { GlobalPublishRateLimitOptions } from './global-rate-limit.ts';
 import { TailSampler, resolveTailSamplingOptions } from './tail-sampling.ts';
 import type { TailSamplingOptions } from './tail-sampling.ts';
@@ -5272,6 +5278,14 @@ export interface TopicStats {
    */
   duplicateMessages: number;
   /**
+   * `publishCompareAndSet` calls rejected because `expected` did not
+   * match the state-store row for (topic, key) (EB-212): the compare
+   * failed, so the publish never ran — no sequence number consumed,
+   * nothing written to the durable log, no rate-limit budget burned.
+   * Surfaces on `onAdmissionRejected` with reason `'cas-mismatch'`.
+   */
+  casMismatches: number;
+  /**
    * Publishes to this topic suppressed by an explicit idempotency key
    * (see `PublishOptions.idempotencyKey`, EB-151): the retry arrived with
    * a `(topic, idempotencyKey)` pair already claimed within the
@@ -5998,6 +6012,12 @@ export interface BusStats {
    * for the exact counting rules.
    */
   duplicateMessages: number;
+  /**
+   * Total `publishCompareAndSet` rejections on compare mismatch — the
+   * sum of every topic's `casMismatches`. See
+   * `TopicStats.casMismatches` for the exact counting rules.
+   */
+  casMismatches: number;
   /**
    * Total publishes suppressed by explicit idempotency keys — the sum of
    * every topic's `idempotentHits`. See `TopicStats.idempotentHits` for
@@ -8206,6 +8226,7 @@ function zeroedTopicStats(): {
   deprecatedSchemaVersions: number;
   lateMessages: number;
   duplicateMessages: number;
+  casMismatches: number;
   idempotentHits: number;
   filteredMessages: number;
   /** Subscriber-side delivery-sampling admissions (EB-152). */
@@ -8252,6 +8273,7 @@ function zeroedTopicStats(): {
     deprecatedSchemaVersions: 0,
     lateMessages: 0,
     duplicateMessages: 0,
+    casMismatches: 0,
     idempotentHits: 0,
     filteredMessages: 0,
     headerFilteredMessages: 0,
@@ -10547,6 +10569,11 @@ interface PauseBufferEntry {
  *   unlike a `'rate-limit'` shed it is invisible to gap detection)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
+ * - `'cas-mismatch'` → `TopicStats.casMismatches` /
+ *   `BusStats.casMismatches` (a `publishCompareAndSet` whose
+ *   `expected` did not match the state-store row, EB-212; rejected
+ *   before admission — no sequence number consumed, nothing written
+ *   to the durable log, no rate-limit budget burned, like `'schema'`)
  * - `'alias-retired'` → `TopicStats.aliasRetiredMessages` /
  *   `BusStats.aliasRetiredMessages` (publish to a topic whose migration
  *   alias expired — the old topic is read-only, EB-44)
@@ -10620,6 +10647,7 @@ export type AdmissionRejectReason =
   | 'rate-limit'
   | 'publisher-rate-limit'
   | 'duplicate'
+  | 'cas-mismatch'
   | 'alias-retired'
   | 'topic-paused'
   | 'circuit-breaker'
@@ -13022,6 +13050,48 @@ export interface IdempotentPublishResult {
 }
 
 /**
+ * The result of `EventBus.publishCompareAndSet` (EB-212).
+ */
+export interface CompareAndSetResult {
+  /**
+   * True when the compare matched and the publish ran the normal
+   * admission pipeline. False when the compare mismatched (the publish
+   * never ran) or when admission itself rejected the publish after a
+   * matching compare.
+   */
+  admitted: boolean;
+  /**
+   * Why the publish did not happen: `'cas-mismatch'` when `expected`
+   * did not match the state-store row (the compare failed), or the
+   * admission gate's reason when the compare matched but admission
+   * rejected. Absent when `admitted` is true.
+   */
+  reason?: AdmissionRejectReason;
+  /**
+   * Number of subscriber queues that accepted the message (the same
+   * value `publish` would return). 0 when the compare mismatched or
+   * admission rejected.
+   */
+  accepted: number;
+  /**
+   * The per-topic sequence number stamped at fan-out — present only
+   * when `admitted` is true.
+   */
+  seq?: number;
+  /**
+   * The `expected.version` the caller asked for — present on a
+   * version-predicate mismatch so the caller can re-read and retry.
+   */
+  expectedVersion?: number;
+  /**
+   * The state store's current version for (topic, key) at compare time
+   * (0 when the key has no row) — present on a version-predicate
+   * mismatch so the caller can retry against the fresh version.
+   */
+  actualVersion?: number;
+}
+
+/**
  * Options for `EventBus.publishDedupedByContent`: `PublishOptions` plus
  * the content-dedup window.
  *
@@ -13482,6 +13552,7 @@ export class EventBus {
       circuitBrokenMessages: number;
       rejectedMessages: number;
       duplicateMessages: number;
+      casMismatches: number;
       idempotentHits: number;
       filteredMessages: number;
       /** Subscriber-side delivery-sampling admissions (EB-152). */
@@ -14319,6 +14390,12 @@ export class EventBus {
    * topic's `duplicateMessages` stat only.
    */
   private totalDuplicates = 0;
+  /**
+   * `publishCompareAndSet` rejections on compare mismatch (global total,
+   * EB-212). A mismatch is dropped before admission — no sequence number,
+   * no durable-log write, no rate-limit budget.
+   */
+  private totalCasMismatches = 0;
   /**
    * Publishes suppressed by explicit idempotency keys (global total, EB-151).
    * A key hit is dropped before admission — no sequence number, no
@@ -21250,6 +21327,7 @@ export class EventBus {
         rejectedMessages: 0,
         lateMessages: 0,
         duplicateMessages: 0,
+        casMismatches: 0,
         idempotentHits: 0,
         aliasRetiredMessages: 0,
         lineageCycleRejections: 0,
@@ -28693,6 +28771,100 @@ export class EventBus {
   }
 
   /**
+   * Conditional publish — compare-and-set against the materialized
+   * state store (EB-212, real-time systems / backend engineering):
+   * reads the state-store row (EB-171 KTable) for `(topic, key)` and
+   * only runs the normal publish pipeline when it matches `expected`
+   * — the lock-free primitive for distributed config rollout and
+   * keyed state synchronization (read value + version, compute next,
+   * publish only if the key did not move).
+   *
+   * `expected` takes two forms (or both — they AND):
+   * `{ version: n }` (the row's per-(topic, key) update counter; a
+   * missing row reads as version 0, so `{ version: 0 }` is the
+   * create-if-absent guard) and `{ value: v }` (structural equality
+   * against the row's latest value; a missing row reads as
+   * `undefined`).
+   *
+   * The compare and the publish run synchronously in this call stack —
+   * no await, no event-loop turn in between — so the check and the
+   * admission share one critical section: a concurrent publish cannot
+   * slip between them (TOCTOU-safe on the event-loop model). On a match
+   * the publish is an ordinary keyed publish — it advances the row's
+   * version, composes with EB-26 keyed compaction and EB-36 keyed
+   * ordering, and goes through every admission gate.
+   *
+   * A mismatch is a publish-side admission rejection: it consumes no
+   * sequence number, writes nothing to the durable log, and burns no
+   * rate-limit budget. It counts in `TopicStats.casMismatches` /
+   * `BusStats.casMismatches` and fires `onAdmissionRejected` with
+   * reason `'cas-mismatch'` (the EB-39 unified channel); a
+   * version-predicate mismatch also reports `expectedVersion` /
+   * `actualVersion` so the caller can re-read and retry.
+   *
+   * Requires `enableStateStore` — without a materialized table there is
+   * nothing to compare against, so the call throws `RangeError`
+   * fail-fast. `key` is required and non-empty: it is the CAS identity.
+   */
+  publishCompareAndSet(
+    topic: string,
+    key: string,
+    expected: CompareAndSetExpected,
+    payload: unknown,
+    opts?: PublishOptions,
+  ): CompareAndSetResult {
+    // EB-154: a closed bus refuses new work synchronously — never a
+    // silent queue.
+    this.assertNotClosed('publish', topic);
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('publishCompareAndSet: topic must be a non-empty string');
+    }
+    validateMessageKey(key, 'publishCompareAndSet');
+    validateCompareAndSetExpected(expected, 'publishCompareAndSet');
+    const store = this.stateStore;
+    if (store === undefined) {
+      throw new RangeError(
+        'publishCompareAndSet: the state store is not enabled (call enableStateStore first)',
+      );
+    }
+    // The CAS identity is the concrete (namespace + alias-resolved)
+    // topic — the same topic the state store observes admitted publishes
+    // on, so the compare and the later store update address the same row.
+    const concrete = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    const resolved = this.resolvePublishTopic(concrete).topic;
+    const row = store.get(resolved, key);
+    if (!compareAndSetMatches(row, expected)) {
+      this.countCasMismatch(resolved, payload, opts?.publisherId);
+      const mismatch: CompareAndSetResult = {
+        admitted: false,
+        reason: 'cas-mismatch',
+        accepted: 0,
+      };
+      if ('version' in expected) {
+        mismatch.expectedVersion = expected.version;
+        mismatch.actualVersion = row?.version ?? 0;
+      }
+      return mismatch;
+    }
+    // Matched: run the exact `publish` pipeline as a keyed publish. The
+    // topic is already concrete, so namespace resolution inside is a
+    // no-op; the check above and this publish share one synchronous
+    // critical section.
+    const outcome = this.publishCore(
+      concrete,
+      payload,
+      { ...opts, key, namespace: undefined },
+      'publishCompareAndSet',
+    );
+    return {
+      admitted: outcome.admitted,
+      ...(outcome.rejectReason === undefined ? {} : { reason: outcome.rejectReason }),
+      accepted: outcome.accepted,
+      ...(outcome.seq === undefined ? {} : { seq: outcome.seq }),
+    };
+  }
+
+  /**
    * Content-hash idempotent publish (EB-146, backend engineering): within
    * the content window, `(topic, sha256(payload))` is published at most
    * once. A retry carrying the same payload on the same topic — the
@@ -32602,6 +32774,22 @@ export class EventBus {
     this.statsFor(topic).duplicateMessages += 1;
     this.totalDuplicates += 1;
     this.emitAdmissionRejected(topic, 'duplicate', payload, publisherId);
+  }
+
+  /**
+   * Counts one `publishCompareAndSet` rejected on compare mismatch
+   * against the topic and the global totals, then fires the
+   * admission-rejection hook with reason `'cas-mismatch'`. A mismatch
+   * is decided before admission — like a schema rejection it consumes
+   * no sequence number, never touches the durable log, and burns no
+   * rate-limit budget — so it lands in the dedicated `casMismatches`
+   * counters, keeping the hook's reason vocabulary 1:1 reconcilable
+   * with `getStats()`.
+   */
+  private countCasMismatch(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).casMismatches += 1;
+    this.totalCasMismatches += 1;
+    this.emitAdmissionRejected(topic, 'cas-mismatch', payload, publisherId);
   }
 
   /**
@@ -38725,6 +38913,7 @@ export class EventBus {
       },
       authzDenied: this.totalAuthzDenied,
       duplicateMessages: this.totalDuplicates,
+      casMismatches: this.totalCasMismatches,
       idempotentHits: this.totalIdempotentHits,
       dedupDropped: this.totalDedupDropped,
       // Per-publisher publish totals (EB-65), most-published first; ties
@@ -39010,6 +39199,7 @@ export class EventBus {
           return idle === undefined ? {} : { watermarkIdle: idle };
         })(),
         duplicateMessages: stats.duplicateMessages,
+        casMismatches: stats.casMismatches,
         idempotentHits: stats.idempotentHits,
         aliasRetiredMessages: stats.aliasRetiredMessages,
         lineageCycleRejections: stats.lineageCycleRejections,
