@@ -60,6 +60,17 @@ import {
   diffFieldPaths,
   type FingerprintDriftCallback,
 } from './fingerprint.ts';
+import {
+  validateJsonPatchOps,
+  applyJsonPatch,
+  isPatchEnvelope,
+  PatchVersionTracker,
+  JsonPatchApplyError,
+  PATCH_HEADER,
+  PATCH_VERSION_HEADER,
+  type JsonPatchOp,
+  type PatchEnvelope,
+} from './patchpublish.ts';
 import type { GlobalPublishRateLimitOptions } from './global-rate-limit.ts';
 import { TailSampler, resolveTailSamplingOptions } from './tail-sampling.ts';
 import type { TailSamplingOptions } from './tail-sampling.ts';
@@ -520,6 +531,63 @@ export type {
   FingerprintDriftCallback,
   TopicFingerprintOptions,
 } from './fingerprint.ts';
+export {
+  validateJsonPatchOps,
+  parseJsonPointer,
+  applyJsonPatch,
+  isPatchEnvelope,
+  PatchVersionTracker,
+  JsonPatchApplyError,
+  PATCH_HEADER,
+  PATCH_VERSION_HEADER,
+} from './patchpublish.ts';
+export type {
+  JsonPatchOp,
+  JsonPatchOpType,
+  JsonPatchFailureReason,
+  PatchEnvelope,
+  PatchKeyStats,
+} from './patchpublish.ts';
+
+/** A version gap observed by a JSON Patch subscriber (EB-202). */
+export interface PatchGapEvent {
+  /** Concrete topic the patch arrived on. */
+  topic: string;
+  /** The patch key. */
+  key: string;
+  /** The version the subscriber expected next. */
+  expectedVersion: number;
+  /** The version that actually arrived. */
+  receivedVersion: number;
+}
+
+/** A patch apply failure observed by a JSON Patch subscriber (EB-202). */
+export interface PatchApplyErrorEvent {
+  /** Concrete topic the patch arrived on. */
+  topic: string;
+  /** The patch key. */
+  key: string;
+  /** The patch's per-key version (`NaN` when the version header was invalid). */
+  version: number;
+  /** The failure: a `JsonPatchApplyError` or a version-header `RangeError`. */
+  error: Error;
+}
+
+/**
+ * Handler for `EventBus.subscribePatch` (EB-202): receives the
+ * subscriber's current snapshot for the key plus the triggering
+ * message. The snapshot is `undefined` until the first full publish
+ * with the key arrives.
+ */
+export type PatchSnapshotHandler = (snapshot: unknown, message: BusMessage) => void;
+
+/** Options for `EventBus.subscribePatch` (EB-202). */
+export interface SubscribePatchOptions extends SubscribeOptions {
+  /** Fired when a patch version gap is detected; the snapshot is left untouched. */
+  onPatchGap?: (event: PatchGapEvent) => void;
+  /** Fired when a patch cannot be applied (or carries an invalid version). */
+  onPatchApplyError?: (event: PatchApplyErrorEvent) => void;
+}
 
 /**
  * One cron-driven recurring publish job (see `EventBus.scheduleRecurring`).
@@ -13108,6 +13176,13 @@ export class EventBus {
     }
   >;
   /**
+   * JSON Patch incremental publish state (EB-202): per-key version +
+   * snapshot trackers, keyed by `EventBus.patchStateKey(concreteTopic,
+   * key)`. Only keys registered via `registerPatchKey` are tracked —
+   * ordinary keyed publishes never touch this map.
+   */
+  private readonly patchKeys = new Map<string, PatchVersionTracker>();
+  /**
    * Active subscription-lease timers (see `src/lease.ts`, EB-69), keyed
    * by subscription id. Armed at subscribe time, cleared from every
    * unsubscribe path, and renewed via `renewLease`.
@@ -18753,6 +18828,326 @@ export class EventBus {
    */
   clearTopicSchemaFingerprint(topicPattern: string): boolean {
     return this.schemaFingerprintRules.delete(topicPattern);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* JSON Patch incremental publish (EB-202)                             */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Storage key for a registered patch key: the concrete
+   * (namespace-resolved) topic and the key. A newline can appear in
+   * neither a topic nor a key, so the join is unambiguous.
+   */
+  private static patchStateKey(topic: string, key: string): string {
+    return `${topic}\n${key}`;
+  }
+
+  private patchTrackerFor(
+    topic: string,
+    key: string,
+    namespace: string | undefined,
+    caller: string,
+  ): PatchVersionTracker {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError(`${caller}: topic must be a non-empty string`);
+    }
+    validateMessageKey(key, caller);
+    const concrete = this.resolveNamespaceForPublish(namespace, topic);
+    const tracker = this.patchKeys.get(EventBus.patchStateKey(concrete, key));
+    if (tracker === undefined) {
+      throw new RangeError(
+        `${caller}: no patch key "${key}" registered on topic "${topic}" — call registerPatchKey first`,
+      );
+    }
+    return tracker;
+  }
+
+  /**
+   * Registers a key for JSON Patch incremental publish (EB-202):
+   * instead of republishing a whole state object on every change, the
+   * producer publishes RFC 6902 patches (`publishPatch`) and
+   * subscribers keep a local snapshot that applies them in order.
+   *
+   * `baseline` seeds the publisher-side snapshot — without it the first
+   * `publishPatch` fails fast until a full publish with the key arrives.
+   * Full publishes on a registered key (any publish path) establish a
+   * new baseline and advance the key's version; patches and full
+   * publishes share one per-key version counter, so subscribers order a
+   * mixed stream by it. Registering twice throws `RangeError`.
+   */
+  registerPatchKey(
+    topic: string,
+    key: string,
+    baseline?: unknown,
+    opts?: { namespace?: string },
+  ): void {
+    this.assertNotClosed('publish', topic);
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('registerPatchKey: topic must be a non-empty string');
+    }
+    validateMessageKey(key, 'registerPatchKey');
+    const concrete = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    const stateKey = EventBus.patchStateKey(concrete, key);
+    if (this.patchKeys.has(stateKey)) {
+      throw new RangeError(`registerPatchKey: key "${key}" is already registered on topic "${topic}"`);
+    }
+    this.patchKeys.set(stateKey, new PatchVersionTracker(baseline));
+  }
+
+  /**
+   * Publishes an RFC 6902 patch for a registered key (EB-202): only
+   * the operations travel the wire, not the whole payload. The patch
+   * is validated against the current baseline snapshot fail-fast — an
+   * invalid patch (missing path / type conflict) throws
+   * `JsonPatchApplyError` with zero side effects: no version is
+   * consumed and nothing is published. A structurally malformed patch
+   * throws `RangeError`. Returns the number of accepted deliveries,
+   * like `publish`.
+   *
+   * The patch rides a normal publish through the full admission
+   * pipeline (ACL, schema, rate limits) and is written to the durable
+   * log like any other message, so `rebuildPatchSnapshot` can restore
+   * the snapshot after a restart.
+   */
+  publishPatch(topic: string, key: string, ops: JsonPatchOp[], opts?: PublishOptions): number {
+    this.assertNotClosed('publish', topic);
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('publishPatch: topic must be a non-empty string');
+    }
+    validateMessageKey(key, 'publishPatch');
+    // Structural validation first: a malformed patch fails fast before
+    // the tracker is even consulted.
+    validateJsonPatchOps(ops);
+    const tracker = this.patchTrackerFor(topic, key, opts?.namespace, 'publishPatch');
+    // Fail-fast against the current baseline: staged on a clone, so an
+    // invalid patch consumes no version and publishes nothing.
+    const staged = tracker.stagePatch(ops);
+    const envelope: PatchEnvelope = { patch: true, key, version: staged.version, ops };
+    const outcome = this.publishCore(
+      topic,
+      envelope,
+      {
+        ...opts,
+        key,
+        headers: {
+          ...opts?.headers,
+          [PATCH_HEADER]: '1',
+          [PATCH_VERSION_HEADER]: String(staged.version),
+        },
+      },
+      'publishPatch',
+    );
+    // Commit only on admission: a rejected patch leaves no version
+    // hole, so subscribers never observe a phantom gap.
+    if (outcome.admitted) tracker.commitStaged(staged.version, staged.snapshot);
+    return outcome.accepted;
+  }
+
+  /**
+   * Returns the publisher-side baseline snapshot for a registered patch
+   * key (EB-202) — the state the next `publishPatch` validates
+   * against. `undefined` when no baseline exists yet.
+   */
+  getPatchSnapshot(topic: string, key: string, opts?: { namespace?: string }): unknown {
+    return this.patchTrackerFor(topic, key, opts?.namespace, 'getPatchSnapshot').snapshot;
+  }
+
+  /**
+   * Returns the per-key patch bookkeeping for a registered key
+   * (EB-202): version, baseline presence, applied/gap/error counters.
+   */
+  getPatchStats(topic: string, key: string, opts?: { namespace?: string }): PatchKeyStats {
+    return this.patchTrackerFor(topic, key, opts?.namespace, 'getPatchStats').toStats();
+  }
+
+  /**
+   * Resolves a durable-log record's wire payload to the application
+   * payload: compressed envelopes are inflated with the record's
+   * dictionary, exactly like the pull path (EB-111) does, so a replay
+   * sees what push subscribers saw.
+   */
+  private replayPayloadOfRecord(rec: DurableLogRecord): unknown {
+    const wire = this.wirePayloadOfRecord(rec);
+    this.assertKnownCompressionCodec(wire, rec);
+    return isCompressedPayload(wire) ? inflateEnvelopePayload(wire, this.dictionaryForRecord(rec)) : wire;
+  }
+
+  /**
+   * Rebuilds a key's snapshot from the durable log (EB-202): replays
+   * the topic's records in sequence order — full publishes set the
+   * baseline, patch envelopes apply in version order — and resets the
+   * publisher-side tracker to the rebuilt state. Returns the rebuilt
+   * snapshot, or the current tracker snapshot when the log holds no
+   * records for the key (or when no durable log is configured).
+   *
+   * Throws `JsonPatchApplyError` when the log's patch history is
+   * inconsistent (a patch before any baseline, or a version gap) —
+   * rebuilding from a corrupt history must fail loudly, never produce
+   * a silently wrong snapshot.
+   */
+  rebuildPatchSnapshot(
+    topic: string,
+    key: string,
+    opts?: { namespace?: string; includeArchived?: boolean },
+  ): unknown {
+    const tracker = this.patchTrackerFor(topic, key, opts?.namespace, 'rebuildPatchSnapshot');
+    const concrete = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    const log = this.durableLogForTopic(concrete);
+    if (log === undefined) return tracker.snapshot;
+    let snapshot: unknown;
+    let version = 0;
+    let sawRecord = false;
+    const records = log.readSince(
+      concrete,
+      0,
+      opts?.includeArchived === true ? { includeArchived: true } : undefined,
+    );
+    for (const rec of records) {
+      if (rec.seq < 1) continue;
+      const payload = this.replayPayloadOfRecord(rec);
+      if (isPatchEnvelope(payload) && payload.key === key) {
+        sawRecord = true;
+        if (snapshot === undefined) {
+          throw new JsonPatchApplyError(
+            `rebuildPatchSnapshot: patch for key "${key}" arrived before any baseline full publish`,
+            0,
+            'missing-path',
+          );
+        }
+        if (payload.version !== version + 1) {
+          throw new JsonPatchApplyError(
+            `rebuildPatchSnapshot: patch version gap for key "${key}" (expected ${version + 1}, got ${payload.version})`,
+            0,
+            'missing-path',
+          );
+        }
+        // Throws JsonPatchApplyError on an invalid patch — a corrupt
+        // history fails loudly instead of rebuilding a wrong snapshot.
+        snapshot = applyJsonPatch(snapshot, payload.ops);
+        version = payload.version;
+      } else if (rec.key === key) {
+        sawRecord = true;
+        // The publisher stamps the key version on full publishes; when
+        // present it is the authoritative version, otherwise the local
+        // counter advances by one.
+        const headerVersion =
+          rec.headers !== undefined ? Number(rec.headers[PATCH_VERSION_HEADER]) : NaN;
+        snapshot = payload;
+        version =
+          Number.isInteger(headerVersion) && headerVersion >= 1 ? headerVersion : version + 1;
+      }
+    }
+    if (!sawRecord) return tracker.snapshot;
+    tracker.snapshot = snapshot;
+    tracker.version = version;
+    return snapshot;
+  }
+
+  /**
+   * Subscribes to a topic with automatic JSON Patch snapshot tracking
+   * (EB-202): the subscriber keeps a local snapshot for `key` and the
+   * handler receives `(snapshot, message)` — patch envelopes apply to
+   * the snapshot in per-key version order, full publishes with the key
+   * reset the baseline, and unrelated messages pass through with the
+   * current snapshot.
+   *
+   * Version gaps (a missed full publish or patch) fire `onPatchGap`
+   * and leave the snapshot untouched — applying an out-of-order RFC
+   * 6902 patch would corrupt state, so the gap must be repaired (see
+   * `rebuildPatchSnapshot`). Stale redeliveries are ignored silently.
+   * Patch apply failures fire `onPatchApplyError`. Both callbacks are
+   * error-isolated: a throwing callback never breaks delivery.
+   *
+   * The subscription itself is a plain (non-reliable) subscription;
+   * batch handlers are not supported.
+   */
+  subscribePatch(
+    topicPattern: string,
+    key: string,
+    handler: PatchSnapshotHandler,
+    opts?: SubscribePatchOptions,
+  ): Subscription {
+    this.assertNotClosed('subscribe', topicPattern);
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('subscribePatch: topicPattern must be a non-empty string');
+    }
+    validateMessageKey(key, 'subscribePatch');
+    if (typeof handler !== 'function') {
+      throw new RangeError('subscribePatch: handler must be a function');
+    }
+    if (opts?.batch !== undefined) {
+      throw new RangeError('subscribePatch: batch handlers are not supported');
+    }
+    const tracker = new PatchVersionTracker();
+    const onPatchGap = opts?.onPatchGap;
+    const onPatchApplyError = opts?.onPatchApplyError;
+    const wrapped: MessageHandler = (msg) => {
+      const headers = msg.headers;
+      if (headers?.[PATCH_HEADER] === '1' && isPatchEnvelope(msg.payload) && msg.payload.key === key) {
+        const version = Number(headers[PATCH_VERSION_HEADER]);
+        if (!Number.isInteger(version) || version < 1) {
+          tracker.applyErrors += 1;
+          try {
+            onPatchApplyError?.({
+              topic: msg.topic,
+              key,
+              version: Number.NaN,
+              error: new RangeError(
+                `subscribePatch: patch envelope for key "${key}" carries an invalid version header`,
+              ),
+            });
+          } catch {
+            // Error-isolated: a throwing observer never breaks delivery.
+          }
+          return;
+        }
+        let verdict: 'applied' | 'stale' | 'gap';
+        try {
+          verdict = tracker.consumeRemote(version, msg.payload.ops);
+        } catch (error) {
+          try {
+            onPatchApplyError?.({ topic: msg.topic, key, version, error: error as Error });
+          } catch {
+            // Error-isolated.
+          }
+          return;
+        }
+        if (verdict === 'applied') {
+          handler(tracker.snapshot, msg);
+        } else if (verdict === 'gap') {
+          try {
+            onPatchGap?.({
+              topic: msg.topic,
+              key,
+              expectedVersion: tracker.version + 1,
+              receivedVersion: version,
+            });
+          } catch {
+            // Error-isolated.
+          }
+        }
+        // 'stale' is silently ignored: an already-seen version is a
+        // normal at-least-once redelivery, counted in the tracker.
+        return;
+      }
+      if (msg.key === key) {
+        // A full publish on the key establishes a new baseline. The
+        // publisher stamps the key version on the header; when present
+        // it wins over the local counter so a late joiner resyncs —
+        // otherwise the local counter advances by one.
+        const headerVersion = headers !== undefined ? Number(headers[PATCH_VERSION_HEADER]) : NaN;
+        tracker.snapshot = msg.payload;
+        tracker.version =
+          Number.isInteger(headerVersion) && headerVersion >= 1
+            ? Math.max(tracker.version, headerVersion)
+            : tracker.version + 1;
+        handler(tracker.snapshot, msg);
+        return;
+      }
+      handler(tracker.snapshot, msg);
+    };
+    return this.subscribe(topicPattern, wrapped, opts);
   }
 
   /**
@@ -26434,6 +26829,27 @@ export class EventBus {
     // (ACL, schema, rate limit, TTL, idempotency, durable log) then
     // operates on the concrete topic, exactly as for a global publish.
     topic = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    // JSON Patch incremental publish (EB-202): a full publish on a
+    // registered patch key peeks the key's next version and stamps it
+    // on the `x-eb-patch-version` header, so subscribers order mixed
+    // full/patch streams by one per-key version counter. The bump itself
+    // commits in the admitted block below — a rejected publish leaves
+    // no version hole. Patch publishes (marker header set by
+    // `publishPatch`) skip this: they bump after admission instead.
+    // Pre-validation is side-effect free, so a validation throw below
+    // leaves the version counter untouched.
+    let patchVersionPeek: { tracker: PatchVersionTracker; version: number } | undefined;
+    if (opts?.key !== undefined && opts?.headers?.[PATCH_HEADER] === undefined) {
+      const tracker = this.patchKeys.get(EventBus.patchStateKey(topic, opts.key));
+      if (tracker !== undefined) {
+        const version = tracker.version + 1;
+        patchVersionPeek = { tracker, version };
+        opts = {
+          ...opts,
+          headers: { ...opts.headers, [PATCH_VERSION_HEADER]: String(version) },
+        };
+      }
+    }
     // Topic registry (EB-77): advisory only — an unregistered topic is
     // counted and surfaced on the opt-in hook, never blocked.
     this.checkTopicRegistered(topic);
@@ -26609,6 +27025,13 @@ export class EventBus {
     // rejected/shed publishes never shape the baseline.
     if (admitted) {
       this.observePayloadFingerprint(topic, payload);
+      // JSON Patch incremental publish (EB-202): commit the peeked
+      // version bump for an admitted full publish on a registered patch
+      // key — rejected/shed publishes never reach here, so the per-key
+      // version stream has no holes.
+      if (patchVersionPeek !== undefined) {
+        patchVersionPeek.tracker.noteFullPublish(payload);
+      }
     }
     this.scheduleFlush();
     return { accepted, admitted, rejectReason, seq, topic };

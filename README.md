@@ -6821,3 +6821,38 @@ Semantics:
 - **Orthogonality.** `gateway-ws.ts` speaks the bus's own framing; this
   speaks the graphql-ws wire protocol. A text-frame-only WebSocket
   client is all a subscriber needs.
+
+## JSON Patch incremental publish (EB-202)
+
+For keyed state that changes in small steps (device shadows, config
+documents, presence maps), republishing the whole payload on every
+change wastes bandwidth and forces subscribers to diff. Register the
+key once, then publish RFC 6902 patches — only the operations travel
+the wire:
+
+```ts
+bus.registerPatchKey('state.devices', 'thermostat-1', { temp: 21, mode: 'auto' });
+bus.publishPatch('state.devices', 'thermostat-1', [
+  { op: 'replace', path: '/temp', value: 23 },
+]);
+
+bus.subscribePatch('state.devices', 'thermostat-1', (snapshot, msg) => {
+  console.log(snapshot); // { temp: 23, mode: 'auto' }
+});
+```
+
+- **One version counter per key.** Full publishes and patches share it:
+  a full publish with the key establishes a new baseline snapshot and
+  bumps the version; a patch validates against the baseline and bumps
+  only once admitted. Subscribers apply patches in version order and
+  detect gaps (a missed full publish or patch) via `onPatchGap` — an
+  out-of-order patch is never applied, so the snapshot cannot corrupt.
+- **Fail-fast.** A structurally malformed patch throws `RangeError`; a
+  patch that cannot apply (missing path, type conflict) throws
+  `JsonPatchApplyError` with zero side effects — no version consumed,
+  nothing published.
+- **Durable.** Patch envelopes are ordinary durable-log records, so
+  `rebuildPatchSnapshot(topic, key)` replays the log and restores the
+  snapshot after a restart. Only the RFC 6902 subset `add` / `remove` /
+  `replace` is supported (`move`, `copy`, `test` are rejected).
+
