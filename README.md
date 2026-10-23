@@ -2825,6 +2825,21 @@ B-before). Rerun the script to reproduce.
 node bench/index.bench.ts
 ```
 
+## Durable-log seq index (EB-205)
+
+`DurableTopicLog` maintains an in-memory `(topic, seq) → byte-offset`
+index for the live log file. `readSince(topic, fromSeqExclusive)` —
+the `resumeFromSeq` replay path — does a point lookup for
+`fromSeqExclusive + 1`, slices the file text at the indexed offset,
+and parses only the tail instead of scanning the whole file: O(records
+after cursor) instead of O(all records). The index is built during
+`recover()` by tracking byte offsets while parsing, maintained on
+`append()` (capturing the offset before the write), and rebuilt after
+`compact()` rewrites the file. For duplicate seqs (same seq on
+different partitions) it keeps the first offset, so no record is
+skipped. A missing index entry (gap from compaction or corruption)
+falls back to a full scan — never a silent miss.
+
 ## Batch delivery benchmark
 
 `bench/batch.bench.ts` measures end-to-end delivery throughput with and

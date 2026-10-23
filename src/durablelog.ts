@@ -1607,6 +1607,16 @@ export class DurableTopicLog {
   /** Lines currently in the dedup journal, used for compaction. */
   private dedupEntries = 0;
   /**
+   * EB-205: in-memory (topic, seq) → byte-offset index for the live
+   * log file. Lets `readSince` seek directly to the first record with
+   * `seq > fromSeqExclusive` instead of parsing the whole file — O(1)
+   * point lookup vs O(n) scan. Built during `recover()` by tracking
+   * byte offsets while parsing, maintained on `append()`. A seq missing
+   * from the index (gap from compaction or corruption) falls back to a
+   * full scan.
+   */
+  private readonly seqIndex = new Map<string, Map<number, number>>();
+  /**
    * Storage key of the publish-dedup journal (`__publish_dedup.jsonl`).
    * One append-only object for the whole bus — publish-side dedup
    * identities are scoped to concrete topics (which already include any
@@ -2009,7 +2019,8 @@ export class DurableTopicLog {
       // EB-119: byte accounting starts from the actual on-disk bytes —
       // the same measure `append` maintains per line.
       this.topicBytes.set(topic, text === undefined ? 0 : Buffer.byteLength(text));
-      const records = text === undefined ? [] : this.parseFileRecords(topic, text);
+      // EB-205: build the seq→offset index while parsing.
+      const records = text === undefined ? [] : this.parseFileRecordsWithIndex(topic, text);
       this.topicsSeen.add(topic);
       this.entryCounts.set(topic, records.length);
       let last = 0;
@@ -2358,6 +2369,53 @@ export class DurableTopicLog {
   }
 
   /**
+   * EB-205: parses records and builds the (seq → byte offset) index.
+   * Tracks the byte offset of each line's start so `readSince` can
+   * slice the file text directly instead of re-scanning from the
+   * beginning. Only indexes records with `seq >= 1` (the ones
+   * `readSince` can return). For duplicate seqs (e.g. same seq on
+   * different partitions), keeps the FIRST offset — `readSince` wants
+   * everything with `seq > fromSeqExclusive`, so starting at the
+   * first occurrence is correct.
+   */
+  private parseFileRecordsWithIndex(topic: string, text: string): DurableLogRecord[] {
+    const records: DurableLogRecord[] = [];
+    const index = new Map<number, number>();
+    let offset = 0;
+    // Split keeping the delimiter so offsets stay exact. JSON log
+    // lines are ASCII-safe, so byte offset == string index.
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const lineOffset = offset;
+      // +1 for the '\n' we split on (last line may not have it, but
+      // the offset math stays correct because we only use offsets
+      // of lines that exist).
+      offset += Buffer.byteLength(line) + 1;
+      if (line.length === 0) continue;
+      const inner = this.openLine(line);
+      if (inner == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      const rec = parseLogLine(inner, topic);
+      if (rec == null) {
+        this.corruptLines += 1;
+        continue;
+      }
+      records.push(rec);
+      if (rec.seq >= 1 && !index.has(rec.seq)) {
+        // Keep the first offset for each seq — duplicates (same seq
+        // on different partitions) must not overwrite it, or
+        // `readSince` would skip the earlier record.
+        index.set(rec.seq, lineOffset);
+      }
+    }
+    this.seqIndex.set(topic, index);
+    return records;
+  }
+
+  /**
    * Appends one message to its topic's log. Returns `true` when the record
    * was persisted, `false` when the payload could not be JSON-serialized
    * (the message is still delivered live — only its durability is lost).
@@ -2378,7 +2436,22 @@ export class DurableTopicLog {
       // The backend append is synchronous — the record is on stable
       // storage before this returns, the same durability the log always
       // relied on.
+      // EB-205: capture the byte offset before appending for the seq index.
+      const offsetBefore = this.topicBytes.get(record.topic) ?? 0;
       this.backend.append(this.fileFor(record.topic), line);
+      // EB-205: maintain the seq→offset index. Keep the first offset
+      // for each seq — duplicates (same seq on different partitions)
+      // must not overwrite it.
+      if (record.seq >= 1) {
+        let index = this.seqIndex.get(record.topic);
+        if (index == null) {
+          index = new Map();
+          this.seqIndex.set(record.topic, index);
+        }
+        if (!index.has(record.seq)) {
+          index.set(record.seq, offsetBefore);
+        }
+      }
     } catch {
       return false;
     }
@@ -3024,6 +3097,8 @@ export class DurableTopicLog {
     // EB-119: byte accounting restarts from the rewritten file's actual bytes.
     this.topicBytes.set(topic, Buffer.byteLength(text));
     if (this.keyCompaction) this.rebuildKeyIndex(topic, kept);
+    // EB-205: the file was rewritten — rebuild the seq→offset index.
+    this.parseFileRecordsWithIndex(topic, text);
   }
 
   /**
@@ -3136,7 +3211,12 @@ export class DurableTopicLog {
     fromSeqExclusive: number,
     opts?: { includeArchived?: boolean },
   ): DurableLogRecord[] {
-    const live = this.readFileRecords(topic).filter((rec) => rec.seq > fromSeqExclusive);
+    // EB-205: try the seq→offset index for a point lookup. If the
+    // target seq is indexed, slice the file text at its offset and
+    // parse only the tail — O(records after cursor) instead of O(all).
+    // A missing index entry (gap from compaction/corruption) falls
+    // back to the full scan below.
+    const live = this.readFileRecordsSince(topic, fromSeqExclusive);
     let records = live;
     if (opts?.includeArchived === true) {
       const archived = this.readArchivedRecords(topic, fromSeqExclusive);
@@ -3154,6 +3234,34 @@ export class DurableTopicLog {
     }
     if (latestByKey.size === 0) return records;
     return records.filter((rec) => rec.key === undefined || rec.seq < 1 || latestByKey.get(rec.key) === rec);
+  }
+
+  /**
+   * EB-205: reads live records with `seq > fromSeqExclusive`, using the
+   * seq→offset index when available. Falls back to a full scan when the
+   * index has no entry for the target seq (gap).
+   */
+  private readFileRecordsSince(topic: string, fromSeqExclusive: number): DurableLogRecord[] {
+    const targetSeq = fromSeqExclusive + 1;
+    const index = this.seqIndex.get(topic);
+    const offset = index?.get(targetSeq);
+    if (offset !== undefined) {
+      // Point lookup hit: slice at the indexed offset and parse the tail.
+      const text = this.readText(this.fileFor(topic));
+      if (text === undefined) return [];
+      // The offset is a byte offset; JSON log lines are ASCII-safe so
+      // it doubles as a string index. Clamp defensively — a stale
+      // index entry (e.g. after external file modification) falls back
+      // to the full scan instead of throwing or returning garbage.
+      if (offset < 0 || offset > text.length) {
+        return this.readFileRecords(topic).filter((rec) => rec.seq > fromSeqExclusive);
+      }
+      const tail = text.slice(offset);
+      // The tail starts exactly at the target record's line.
+      return this.parseFileRecords(topic, tail).filter((rec) => rec.seq > fromSeqExclusive);
+    }
+    // Index miss (gap): full scan.
+    return this.readFileRecords(topic).filter((rec) => rec.seq > fromSeqExclusive);
   }
 
   /**
