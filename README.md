@@ -6856,3 +6856,27 @@ bus.subscribePatch('state.devices', 'thermostat-1', (snapshot, msg) => {
   snapshot after a restart. Only the RFC 6902 subset `add` / `remove` /
   `replace` is supported (`move`, `copy`, `test` are rejected).
 
+## Durable-log time-travel accelerated replay (EB-203)
+
+Catch-up and backtest without re-publishing: `replayRange` reads a
+topic's history from the durable log (or the in-memory pull ring when
+no durable log is configured) and delivers it to subscribers at an
+accelerated pace:
+
+```ts
+const report = await bus.replayRange('market.ticks', { from: 1, to: 10_000, speed: 50 });
+// { requested: 10000, delivered: 10000, handlerErrors: 0, durationMs: 842, … }
+```
+
+- **Accelerated pacing.** The original inter-message gaps are compressed
+  by `speed` — a history spaced 1 second apart replays with 20ms
+  between messages at `speed: 50`.
+- **Catch-up mode.** Subscribers that opt in via
+  `subscribe('t', handler, { catchUpOnReplay: true })` pause their live
+  drain for the replay's duration; the live backlog stays queued and
+  drains when the replay finishes, so catch-up is lossless and seamless.
+- **Clean stats.** Replayed messages carry `replayed: true`: they never
+  move the sequence-gap baseline and never pollute `sequenceGaps`, are
+  never re-appended to the durable log, and skip reliable-delivery ack
+  tracking. A throwing replay handler is counted in the report, not
+  fatal. Two replays on one topic cannot run concurrently (fail-fast).

@@ -549,6 +549,13 @@ export type {
   PatchKeyStats,
 } from './patchpublish.ts';
 
+/** Minimal promise sleep, for time-travel replay pacing (EB-203). */
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 /** A version gap observed by a JSON Patch subscriber (EB-202). */
 export interface PatchGapEvent {
   /** Concrete topic the patch arrived on. */
@@ -587,6 +594,43 @@ export interface SubscribePatchOptions extends SubscribeOptions {
   onPatchGap?: (event: PatchGapEvent) => void;
   /** Fired when a patch cannot be applied (or carries an invalid version). */
   onPatchApplyError?: (event: PatchApplyErrorEvent) => void;
+}
+
+/** Sequence bounds and speed for `EventBus.replayRange` (EB-203). */
+export interface ReplayRangeOptions {
+  /** First sequence number to replay, inclusive (default 1). */
+  from?: number;
+  /** Last sequence number to replay, inclusive (default: latest). */
+  to?: number;
+  /** Acceleration multiplier over the original inter-message gaps (default 10). */
+  speed?: number;
+}
+
+/** Targeting options for `EventBus.replayRange` (EB-203). */
+export interface ReplayRangeCallOptions {
+  /** Namespace the topic lives in. */
+  namespace?: string;
+  /** Replay to these subscription ids only (default: every live subscription matching the topic). */
+  subscribers?: string[];
+}
+
+/** The outcome of one `EventBus.replayRange` pass (EB-203). */
+export interface ReplayRangeReport {
+  /** Concrete topic that was replayed. */
+  topic: string;
+  from: number;
+  to: number;
+  speed: number;
+  /** History records in the requested range. */
+  requested: number;
+  /** Subscribers the replay targeted. */
+  subscriberCount: number;
+  /** Handler invocations performed. */
+  delivered: number;
+  /** Handler invocations that threw (counted, not fatal). */
+  handlerErrors: number;
+  /** Wall time the replay pass took, in milliseconds. */
+  durationMs: number;
 }
 
 /**
@@ -865,6 +909,17 @@ export interface BusMessage {
    * non-RPC publishes.
    */
   replyTo?: string;
+  /**
+   * Time-travel replay marker (EB-203): set on messages delivered by
+   * `EventBus.replayRange`, never on live publishes. A replayed message
+   * carries the original topic, payload and `seq` from the durable log,
+   * but it is history, not a fresh publish: it does not move the
+   * subscriber's sequence-gap baseline (`detectGap` skips it), it is not
+   * written to the durable log again, and reliable-delivery ack tracking
+   * does not apply to it. Handlers can branch on it (e.g. skip
+   * side-effecting work during a backtest replay).
+   */
+  replayed?: boolean;
   /**
    * Message lineage (EB-184): the forwarding history of this message —
    * `{ originTopic, parentMessageId?, hops: [{ topic, at }] }`, stamped at
@@ -1990,6 +2045,16 @@ export interface SubscribeOptions {
    * instead of silently never engaging. Disabled by default.
    */
   replayThrottle?: boolean | ReplayThrottleOptions;
+  /**
+   * Opt-in time-travel replay catch-up mode (EB-203): while an
+   * `EventBus.replayRange` runs against this subscriber's topics, live
+   * deliveries pause — the backlog stays queued under the normal
+   * backpressure policy, untouched by the drain — and resume when the
+   * replay finishes, so catch-up is lossless and seamless. Without it a
+   * replay's history interleaves with the live stream at the handler.
+   * Disabled by default; must be a boolean when given.
+   */
+  catchUpOnReplay?: boolean;
   /**
    * Opt-in subscriber-side content filter. When set, every message fanned
    * out to this subscriber first passes the predicate at the publish side:
@@ -7543,6 +7608,21 @@ interface Subscriber {
   manuallyPaused?: boolean;
   /** Operator-supplied reason recorded at `pauseSubscriber` time. */
   manuallyPausedReason?: string;
+  /**
+   * Time-travel replay catch-up (EB-203): set while an
+   * `EventBus.replayRange` feeds this subscriber history directly.
+   * `drainSubscriber` skips the subscriber while set — live deliveries
+   * stay queued under the normal backpressure policy and drain when the
+   * replay finishes, so the catch-up is lossless. Only ever set for
+   * subscribers that opted in via `SubscribeOptions.catchUpOnReplay`.
+   */
+  replayPaused?: boolean;
+  /**
+   * Catch-up opt-in (EB-203): mirrors `SubscribeOptions.catchUpOnReplay`
+   * at registration time. `true` means `replayRange` pauses this
+   * subscriber's live drain while it replays history to the handler.
+   */
+  catchUpOnReplay: boolean;
   /**
    * Credit-based pull-style flow control (see `EventBus.grantCredits`,
    * EB-117). Opt-in: absent means the subscriber has unlimited delivery
@@ -13182,6 +13262,13 @@ export class EventBus {
    * ordinary keyed publishes never touch this map.
    */
   private readonly patchKeys = new Map<string, PatchVersionTracker>();
+  /**
+   * Topics with a `replayRange` currently in flight (EB-203), keyed by
+   * concrete topic. A second replay on the same topic fails fast —
+   * concurrent replays would interleave history at the handler and
+   * fight over the catch-up pause flags.
+   */
+  private readonly activeReplays = new Set<string>();
   /**
    * Active subscription-lease timers (see `src/lease.ts`, EB-69), keyed
    * by subscription id. Armed at subscribe time, cleared from every
@@ -18962,18 +19049,6 @@ export class EventBus {
   }
 
   /**
-   * Resolves a durable-log record's wire payload to the application
-   * payload: compressed envelopes are inflated with the record's
-   * dictionary, exactly like the pull path (EB-111) does, so a replay
-   * sees what push subscribers saw.
-   */
-  private replayPayloadOfRecord(rec: DurableLogRecord): unknown {
-    const wire = this.wirePayloadOfRecord(rec);
-    this.assertKnownCompressionCodec(wire, rec);
-    return isCompressedPayload(wire) ? inflateEnvelopePayload(wire, this.dictionaryForRecord(rec)) : wire;
-  }
-
-  /**
    * Rebuilds a key's snapshot from the durable log (EB-202): replays
    * the topic's records in sequence order — full publishes set the
    * baseline, patch envelopes apply in version order — and resets the
@@ -19148,6 +19223,218 @@ export class EventBus {
       handler(tracker.snapshot, msg);
     };
     return this.subscribe(topicPattern, wrapped, opts);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Durable-log time-travel accelerated replay (EB-203)                  */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Reads a topic's history for a time-travel replay (EB-203): durable-
+   * log records in ascending sequence order, falling back to the
+   * in-memory pull ring (EB-111) when no durable log is configured.
+   * Returns an empty list when no history is available — never an
+   * error, so a replay over a quiet topic is a clean no-op.
+   */
+  private readReplayHistory(
+    concrete: string,
+    from: number,
+    to: number,
+  ): Array<{ seq: number; at: number; message: BusMessage }> {
+    const log = this.durableLogForTopic(concrete);
+    if (log !== undefined) {
+      const out: Array<{ seq: number; at: number; message: BusMessage }> = [];
+      for (const rec of log.readSince(concrete, from - 1)) {
+        if (rec.seq < 1 || rec.seq < from) continue;
+        if (rec.seq > to) break;
+        out.push({ seq: rec.seq, at: rec.at, message: this.replayMessageFromRecord(rec) });
+      }
+      return out;
+    }
+    const ring = this.pullRing.get(concrete);
+    if (ring === undefined) return [];
+    const out: Array<{ seq: number; at: number; message: BusMessage }> = [];
+    for (const entry of ring) {
+      if (entry.seq < from || entry.seq > to) continue;
+      out.push({
+        seq: entry.seq,
+        at: entry.at,
+        message: {
+          topic: entry.topic,
+          payload: entry.payload,
+          seq: entry.seq,
+          replayed: true,
+          ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
+          ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
+        },
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Resolves a durable-log record's wire payload to the application
+   * payload (EB-203): compressed envelopes are inflated with the
+   * record's dictionary, exactly like the pull path (EB-111) does, so
+   * a replay sees what push subscribers saw.
+   */
+  private replayPayloadOfRecord(rec: DurableLogRecord): unknown {
+    const wire = this.wirePayloadOfRecord(rec);
+    this.assertKnownCompressionCodec(wire, rec);
+    return isCompressedPayload(wire) ? inflateEnvelopePayload(wire, this.dictionaryForRecord(rec)) : wire;
+  }
+
+  /**
+   * Builds the replay envelope for one history record (EB-203): the
+   * original topic, payload and sequence number, stamped
+   * `replayed: true`. Replayed messages are history, not fresh
+   * publishes — gap detection skips them, they are never re-appended
+   * to the durable log, and reliable-delivery ack tracking does not
+   * apply.
+   */
+  private replayMessageFromRecord(rec: DurableLogRecord): BusMessage {
+    return {
+      topic: rec.topic,
+      payload: this.replayPayloadOfRecord(rec),
+      seq: rec.seq,
+      replayed: true,
+      ...(rec.key === undefined ? {} : { key: rec.key }),
+      ...(rec.messageId === undefined ? {} : { messageId: rec.messageId }),
+      ...(rec.publisherId === undefined ? {} : { publisherId: rec.publisherId }),
+      ...(rec.headers === undefined ? {} : { headers: { ...rec.headers } }),
+      ...(rec.eventTime === undefined ? {} : { eventTime: rec.eventTime }),
+    };
+  }
+
+  /**
+   * Replays a topic's history at an accelerated speed (EB-203): reads
+   * `seq` in `[from, to]` from the durable log (or the in-memory pull
+   * ring when no durable log is configured) and delivers each record
+   * to the target subscribers' handlers in sequence order, pacing the
+   * original inter-message gaps compressed by `speed` — a speed of 10
+   * replays a history spaced 1 second apart with 100ms between
+   * messages. Resolves with a report when the replay finishes.
+   *
+   * Target subscribers default to every live subscription whose
+   * pattern matches the topic; pass `subscribers` to replay to a
+   * specific set of subscription ids. Subscribers that opted in via
+   * `SubscribeOptions.catchUpOnReplay` pause their live drain for the
+   * replay's duration — the live backlog stays queued and drains when
+   * the replay finishes, so catch-up is lossless and seamless.
+   *
+   * Replayed messages carry `replayed: true` and never pollute the
+   * topic's sequence-gap statistics. A throwing replay handler is
+   * counted in the report, not fatal: aborting a catch-up replay on
+   * one bad message would strand the subscriber mid-history. Two
+   * replays on the same topic cannot run concurrently (fail-fast).
+   */
+  async replayRange(
+    topic: string,
+    range?: ReplayRangeOptions,
+    opts?: ReplayRangeCallOptions,
+  ): Promise<ReplayRangeReport> {
+    this.assertNotClosed('publish', topic);
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('replayRange: topic must be a non-empty string');
+    }
+    const from = range?.from ?? 1;
+    const to = range?.to ?? Number.MAX_SAFE_INTEGER;
+    const speed = range?.speed ?? 10;
+    if (!Number.isInteger(from) || from < 1) {
+      throw new RangeError('replayRange: from must be a positive integer sequence number');
+    }
+    if ((!Number.isInteger(to) && to !== Number.MAX_SAFE_INTEGER) || to < from) {
+      throw new RangeError('replayRange: to must be an integer sequence number >= from');
+    }
+    if (typeof speed !== 'number' || !Number.isFinite(speed) || speed <= 0) {
+      throw new RangeError('replayRange: speed must be a positive finite multiplier');
+    }
+    let subscriberIds: string[] | undefined;
+    if (opts?.subscribers !== undefined) {
+      if (
+        !Array.isArray(opts.subscribers) ||
+        opts.subscribers.length === 0 ||
+        opts.subscribers.some((id) => typeof id !== 'string')
+      ) {
+        throw new RangeError('replayRange: subscribers must be a non-empty array of subscription ids');
+      }
+      subscriberIds = [...opts.subscribers];
+    }
+    const concrete = this.resolveNamespaceForPublish(opts?.namespace, topic);
+    if (this.activeReplays.has(concrete)) {
+      throw new RangeError(`replayRange: a replay is already in progress for topic "${topic}"`);
+    }
+    const history = this.readReplayHistory(concrete, from, to);
+    const targets: Subscriber[] = [];
+    if (subscriberIds !== undefined) {
+      for (const id of subscriberIds) {
+        const subscriber = this.subscribers.get(id);
+        if (subscriber === undefined) {
+          throw new RangeError(`replayRange: unknown subscription "${id}"`);
+        }
+        targets.push(subscriber);
+      }
+    } else {
+      for (const subscriber of this.subscribers.values()) {
+        if (subscriber.matcher.test(concrete)) targets.push(subscriber);
+      }
+    }
+    const report: ReplayRangeReport = {
+      topic: concrete,
+      from,
+      to,
+      speed,
+      requested: history.length,
+      subscriberCount: targets.length,
+      delivered: 0,
+      handlerErrors: 0,
+      durationMs: 0,
+    };
+    if (history.length === 0 || targets.length === 0) return report;
+    this.activeReplays.add(concrete);
+    const paused: Subscriber[] = [];
+    const startedAtMs = this.now();
+    try {
+      for (const subscriber of targets) {
+        if (subscriber.catchUpOnReplay) {
+          subscriber.replayPaused = true;
+          paused.push(subscriber);
+        }
+      }
+      let previousAt: number | undefined;
+      for (const entry of history) {
+        if (previousAt !== undefined) {
+          const delayMs = (entry.at - previousAt) / speed;
+          if (delayMs > 0) await sleep(delayMs);
+        }
+        previousAt = entry.at;
+        const msg = entry.message;
+        for (const subscriber of targets) {
+          // A subscriber that unsubscribed mid-replay stops receiving
+          // it — replaying to a dead subscription would resurrect it.
+          if (this.subscribers.get(subscriber.id) === undefined) continue;
+          this.noteMessageDelivered(subscriber, msg);
+          try {
+            if (subscriber.batch != null) {
+              (subscriber.handler as BatchMessageHandler)([msg]);
+            } else {
+              (subscriber.handler as MessageHandler)(msg);
+            }
+            report.delivered += 1;
+          } catch {
+            report.handlerErrors += 1;
+          }
+        }
+      }
+    } finally {
+      for (const subscriber of paused) subscriber.replayPaused = false;
+      this.activeReplays.delete(concrete);
+      // Wake the catch-up subscribers: their queued live backlog
+      // drains now that the replay finished.
+      this.scheduleFlush();
+    }
+    report.durationMs = this.now() - startedAtMs;
+    return report;
   }
 
   /**
@@ -20803,6 +21090,12 @@ export class EventBus {
     // subscriber behind.
     const deliverySampleRate = opts?.deliverySampleRate;
     validateDeliverySampleRate(deliverySampleRate, 'subscribe');
+    // Time-travel replay catch-up (EB-203): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const catchUpOnReplay = opts?.catchUpOnReplay;
+    if (catchUpOnReplay !== undefined && typeof catchUpOnReplay !== 'boolean') {
+      throw new RangeError('subscribe: catchUpOnReplay must be a boolean');
+    }
     // Idle subscriber auto-reclamation (EB-72): validated before
     // anything registers, so a throw leaves no half-registered
     // subscriber behind.
@@ -21134,6 +21427,10 @@ export class EventBus {
       // the default — a non-sampling subscriber pays one integer
       // comparison per delivery in `deliverUnkeyed`.
       deliverySampleRate: deliverySampleRate ?? 1,
+      // Time-travel replay catch-up (EB-203): mirrors the subscribe
+      // option — `replayRange` pauses this subscriber's live drain
+      // while it replays history, when true.
+      catchUpOnReplay: catchUpOnReplay === true,
       // Credit-based flow control (EB-117): the subscriber starts
       // unlimited — `grantCredits` creates the credit state on first
       // use, so a never-granted subscriber pays nothing for it.
@@ -39731,6 +40028,12 @@ export class EventBus {
     // backpressure policy until `resumeSubscriber`. Orthogonal to the
     // health probe: degraded recovery never clears a manual pause.
     if (subscriber.manuallyPaused === true) return;
+    // Time-travel replay catch-up (EB-203): while a `replayRange` feeds
+    // this subscriber history directly, live deliveries pause — the
+    // backlog stays queued under the normal backpressure policy and
+    // drains when the replay finishes, so catch-up is lossless and
+    // seamless. Only catch-up-opted-in subscribers are ever paused.
+    if (subscriber.replayPaused === true) return;
     // Consumer-group operator pause (EB-141): the same skip semantics —
     // every member of a paused group keeps its backlog queued under its
     // normal backpressure policy until `resumeGroup(groupId)`. Join/leave
@@ -41748,6 +42051,11 @@ export class EventBus {
    * as lost messages.
    */
   private detectGap(subscriber: Subscriber, msg: BusMessage): void {
+    // Time-travel replay (EB-203): replayed messages are history, not
+    // fresh publishes — they never move the gap baseline and never
+    // count as gaps, so a catch-up replay cannot pollute the topic's
+    // `sequenceGaps` statistics.
+    if (msg.replayed === true) return;
     const epoch = msg.epoch ?? '';
     const gapKey = EventBus.gapKey(msg.topic, msg.partition ?? 0);
     const lastEpoch = subscriber.lastEpoch.get(gapKey);
