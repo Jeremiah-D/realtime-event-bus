@@ -99,7 +99,14 @@ test('rebalance linger: leave event carries the handoff window; replay during th
   bus.publish('jobs.email', {});
   bus.publish('jobs.email', {});
   await flush();
-  assert.deepEqual([...liveB, ...liveC].sort((a, b) => a - b), [6, 7]);
+  // EB-207: 'g2' is a new group with no committed offsets, so each
+  // first-joining member replays the durable backlog under the default
+  // autoOffsetReset='earliest' ([1..5] each), then the two live publishes
+  // fan out normally (one copy per message, competing between B and C).
+  assert.deepEqual(
+    [...liveB, ...liveC].sort((a, b) => a - b),
+    [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7],
+  );
 });
 
 test('rebalance linger: after the window expires the backlog becomes replayable', async () => {

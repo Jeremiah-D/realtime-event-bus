@@ -3944,6 +3944,31 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * Must be a finite number `>= 0`; `0` (default) disables the window.
    */
   rebalanceDebounceMs?: number;
+  /**
+   * Kafka-style `auto.offset.reset` for the competing set (EB-207):
+   * where a joining member starts consuming when it has NO committed
+   * offset — neither in memory nor journaled (see `commitOffset` and the
+   * EB-32 offset journal). Two policies:
+   *
+   * - `'earliest'` (default): start from the smallest available seq for
+   *   the group's pattern — the durable log's earliest record; without a
+   *   durable log there is no history to replay, so the member starts at
+   *   the live stream.
+   * - `'latest'`: start at the current max assigned seq + 1 — the member
+   *   only sees messages published after it joined.
+   *
+   * resetOnlyOnce: the policy fires only while nothing is committed. Once
+   * any committed offset exists — committed by this member or anyone —
+   * the member takes the normal committed-offset recovery path instead
+   * (`resumeFromSeq` seeded from `getCommittedOffsets` for round-robin
+   * groups, the `(committed, watermark]` migration replay for partitioned
+   * groups) and the policy is never re-applied. An explicit
+   * `resumeFromSeq`/`resumeFromTime` always wins over the policy, and a
+   * static rejoin inside its session window never resets (it never left).
+   * Partitioned groups decide per partition. Any other value throws
+   * `RangeError`.
+   */
+  autoOffsetReset?: 'earliest' | 'latest';
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -23581,6 +23606,15 @@ export class EventBus {
     if (!Number.isFinite(rebalanceDebounceMs) || rebalanceDebounceMs < 0) {
       throw new RangeError('rebalanceDebounceMs must be a finite number of milliseconds >= 0');
     }
+    // Consumer-group auto.offset.reset (EB-207): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    // Like `assignment`, an explicit null is invalid — only an omitted
+    // option selects the 'earliest' default.
+    const autoOffsetReset = opts?.autoOffsetReset;
+    if (autoOffsetReset !== undefined && autoOffsetReset !== 'earliest' && autoOffsetReset !== 'latest') {
+      throw new RangeError("autoOffsetReset must be 'earliest' or 'latest'");
+    }
+    const resetPolicy = autoOffsetReset ?? 'earliest';
     const partitions = opts?.partitions;
     if (partitions !== undefined && (!Number.isInteger(partitions) || partitions < 1)) {
       throw new RangeError('partitions must be a positive integer');
@@ -23765,8 +23799,40 @@ export class EventBus {
         // not the fresh subscription id.
         if (resumeFromSeq === undefined && resumeFromTime === undefined) {
           for (const m of migrated) {
-            if (m.to === rosterKey) this.replayPartitionBacklog(subscriber, key, m.partition);
+            if (m.to !== rosterKey) continue;
+            // Consumer-group auto.offset.reset (EB-207): a partition the
+            // newcomer takes over that has NO committed offset is
+            // positioned by the member's policy — 'earliest' takes the
+            // backlog replay below (committed 0 replays from the log's
+            // start), 'latest' skips it and starts at the live stream
+            // (watermark + 1). A partition with a committed offset always
+            // takes the normal recovery path, so the reset fires at most
+            // once per partition.
+            if (
+              resetPolicy === 'latest' &&
+              !this.groupHasCommittedOffset(key, groupId, instanceId, m.partition)
+            ) {
+              continue;
+            }
+            this.replayPartitionBacklog(subscriber, key, m.partition);
           }
+        }
+      } else if (resumeFromSeq === undefined && resumeFromTime === undefined) {
+        // Consumer-group auto.offset.reset (EB-207): a round-robin member
+        // joining with no committed offset for the group and no explicit
+        // resume cursor is positioned by its policy — 'earliest' replays
+        // the pattern's durable history from the log's start; 'latest'
+        // starts at the live stream (no replay). Once any committed offset
+        // exists the reset never fires (resetOnlyOnce): the member resumes
+        // from `getCommittedOffsets` via `resumeFromSeq`, exactly as
+        // before. Without a durable log there is no history, so both
+        // policies behave as live-start. A static rejoin inside its
+        // session window never reaches here (it never left).
+        if (
+          resetPolicy === 'earliest' &&
+          !this.groupHasCommittedOffset(key, groupId, instanceId)
+        ) {
+          this.replayLog(subscriber, 0);
         }
       }
     }
@@ -25360,6 +25426,43 @@ export class EventBus {
   getCommittedOffsets(groupId: string): Record<string, number> {
     const committed = this.committedOffsets.get(groupId);
     return committed == null ? {} : Object.fromEntries(committed);
+  }
+
+  /**
+   * True when any committed offset exists covering a joining member's
+   * initial position (EB-207): the group-level checkpoint
+   * (`committedOffsets` — in-memory, journal-reseeded at construction and
+   * reseeded from the `OffsetStore` by `recoverFromOffsetStore`), the
+   * per-partition checkpoint for `partition` when given
+   * (`partitionCommittedOffsets`), or — for static members (EB-104) — the
+   * member's own instance checkpoints. Read-only: never creates map
+   * entries. The consumer-group `autoOffsetReset` policy only fires while
+   * this returns false (resetOnlyOnce): once anything is committed the
+   * member takes the normal committed-offset recovery path.
+   */
+  private groupHasCommittedOffset(
+    groupKey: string,
+    groupId: string,
+    instanceId: string | undefined,
+    partition?: number,
+  ): boolean {
+    if ((this.committedOffsets.get(groupId)?.size ?? 0) > 0) return true;
+    if (instanceId !== undefined) {
+      if ((this.instanceCommittedOffsets.get(groupId)?.get(instanceId)?.size ?? 0) > 0) return true;
+      if (
+        partition !== undefined &&
+        (this.instancePartitionCommittedOffsets.get(groupKey)?.get(instanceId)?.get(partition)?.size ?? 0) > 0
+      ) {
+        return true;
+      }
+    }
+    if (
+      partition !== undefined &&
+      (this.partitionCommittedOffsets.get(groupKey)?.get(partition)?.size ?? 0) > 0
+    ) {
+      return true;
+    }
+    return false;
   }
 
   /**

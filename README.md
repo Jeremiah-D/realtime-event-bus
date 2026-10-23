@@ -233,7 +233,25 @@ library.
   rows report the active limit as `memberLimit`. This is consumer-group
   scale governance: it bounds the roster the rebalance and routing tables
   must handle, so a runaway autoscaler cannot drag a group into a
-  rebalance storm. **Consumer-group lag monitoring**
+  rebalance storm. **Consumer-group auto.offset.reset** (EB-207):
+  opt-in `autoOffsetReset: 'earliest' | 'latest'` on `subscribeToGroup`
+  decides where a joining member starts when it has NO committed offset —
+  neither in memory nor journaled (`commitOffset` / the offset journal).
+  `'earliest'` (default) starts from the smallest available seq for the
+  group's pattern — the durable log's earliest record; without a durable
+  log there is no history, so the member starts at the live stream.
+  `'latest'` starts at the current max assigned seq + 1: the member only
+  sees messages published after it joined. resetOnlyOnce: the policy fires
+  only while nothing is committed — once any committed offset exists
+  (committed by this member or anyone), a joining member takes the normal
+  committed-offset recovery path instead (`resumeFromSeq` seeded from
+  `getCommittedOffsets` for round-robin groups, the
+  `(committed, watermark]` migration replay for partitioned groups) and
+  the policy is never re-applied. An explicit `resumeFromSeq` /
+  `resumeFromTime` always wins over the policy, and a static rejoin inside
+  its session window never resets. Partitioned groups decide per
+  partition. Any other value throws `RangeError` before anything
+  registers. **Consumer-group lag monitoring**
   (`src/grouplag.ts`): `getStats().groupLag` reports one row per
   (group, topic) — per (group, partition, topic) for partitioned groups —
   with `assignedSeq` (highest seq handed to the group), `committedSeq`
