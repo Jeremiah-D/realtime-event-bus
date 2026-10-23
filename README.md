@@ -6446,17 +6446,19 @@ topics you actually backfill.
 
 ## Per-message delivery deadline (EB-177)
 
-`PublishOptions.deadlineAt` / `deadlineMs` set an absolute delivery
-deadline for one message, in milliseconds on the bus clock
-(`EventBusOptions.now`) — the end-to-end counterpart of the relative
-`ttlMs` (EB-149). The deadline is absolute, so it rides every hop
-verbatim: fan-out, backpressure queues, redeliveries, delayed fan-out,
-the pre-DLQ retry ladder, durable-log replay, and the bridge/cluster
-forwards all enforce the same instant. A message past its deadline is
-dropped before delivery and counted in `expiredMessages` (per-topic and
-global), exactly like TTL expiry — drain-time, not an admission
-rejection, so `onAdmissionRejected` never fires for it, and the drop
-surfaces as a sequence gap on the next delivery.
+`PublishOptions.deadlineAt` sets an absolute delivery deadline for one
+message, in milliseconds on the bus clock (`EventBusOptions.now`) — the
+end-to-end counterpart of the relative `ttlMs` (EB-149). `deadlineMs`
+without `deadlineAt` is a different opt-in: EDF scheduling (EB-204, next
+section) — `deadlineAt` wins when both are given. The hard deadline is
+absolute, so it rides every hop verbatim: fan-out, backpressure queues,
+redeliveries, delayed fan-out, the pre-DLQ retry ladder, durable-log
+replay, and the bridge/cluster forwards all enforce the same instant. A
+message past its deadline is dropped before delivery and counted in
+`expiredMessages` (per-topic and global), exactly like TTL expiry —
+drain-time, not an admission rejection, so `onAdmissionRejected` never
+fires for it, and the drop surfaces as a sequence gap on the next
+delivery.
 
 ```ts
 // A market quote that is worthless after 500ms, wherever it travels:
@@ -6487,6 +6489,72 @@ Invalid values (non-number, `NaN`, infinite) throw `RangeError` from
 the publish entry point before anything is mutated — the same
 zero-side-effect convention as the schema rejection. `publishDelayed`
 validates `deadlineAt`/`deadlineMs` the same way at schedule time.
+
+## EDF deadline scheduling (EB-204)
+
+`PublishOptions.deadlineMs` **without** `deadlineAt` opts one message
+into earliest-deadline-first delivery — the scheduling counterpart of
+the hard deadline above. Where the hard deadline says "drop me if I am
+late", the EDF deadline says "deliver me as early as you can, and tell
+the subscriber when I am late". It is a queue-ordering policy, not an
+expiry: the deadline never drops the message — only the topic/message
+TTL chain can expire it.
+
+```ts
+// Three quotes published out of order; the subscriber sees them
+// earliest-deadline-first, not in publish order:
+bus.publish('market.btc', q3, { deadlineMs: now + 300 });
+bus.publish('market.btc', q1, { deadlineMs: now + 100 });
+bus.publish('market.btc', q2, { deadlineMs: now + 200 });
+// q1 -> q2 -> q3 at the subscriber, even though q3 was published first.
+```
+
+Semantics:
+
+- **Opt-in per message.** Only messages carrying `deadlineMs` (and no
+  `deadlineAt`) join EDF scheduling. Messages without a deadline keep
+  plain FIFO order — among themselves, and behind the deadline-carrying
+  messages (a real-time message always outranks best-effort traffic in
+  the drain). `deadlineAt` wins when both are given: the message is then
+  a hard-deadline message (EB-177), never EDF.
+- **Within-lane, orthogonal to priority lanes (EB-122).** Each
+  subscriber's queue drains deadline-carrying messages
+  earliest-deadline-first inside its lane; lanes still win across lanes
+  — an urgent message with no deadline still beats a normal message
+  with an earlier deadline. The drain budget (shaping, throttle,
+  credits) is unchanged: EDF reorders which messages the budget covers,
+  it never exceeds it.
+- **Missed-deadline marking, not dropping.** A message handed to a
+  handler at or past its EDF deadline is still delivered, stamped
+  `BusMessage.missedDeadline = true` so the subscriber can observe the
+  miss (skip a stale quote, flag an SLO breach), and counted in
+  `missedDeadlineMessages` (per-topic and global) and the
+  `eventbus_missed_deadline_messages_total` Prometheus counter. A
+  message delivered before its deadline carries no mark.
+- **TTL still wins.** A topic TTL rule or per-message `ttlMs` expiring
+  first drops the message as expired (`expiredMessages`) — the drop is
+  not a miss and moves no miss counter.
+- **Delayed schedules.** `publishDelayed` with `deadlineMs` (and no
+  `deadlineAt`) never drops the schedule for passing its deadline at
+  sweep time — only the TTL deadline can expire it — and the due-time
+  fan-out re-admits the message as EDF-class, so a late fan-out still
+  arrives marked `missedDeadline`.
+- **Scope.** EDF is a live-delivery-queue policy: it applies to the
+  plain and batched drain paths (reliable subscribers included — the
+  mark rides `delivery.msg`), but not to the topic-fair drain (EB-135,
+  which keeps its own scheduler), shadow drains, or bridge/cluster
+  ingress, which re-admit through their own admission. The EDF class
+  does not cross the durable log or the wire — replay and remote nodes
+  enforce TTL only.
+- **Zero-cost when unused.** Queues holding no deadline-carrying
+  message drain byte-identically to plain FIFO; the queue's physical
+  order never changes (EDF is a drain-time view), so `peekOldest` and
+  migration snapshots keep their FIFO meaning.
+- **Sequence numbers stay publish-order.** `seq` is assigned at
+  admission, so EDF reordering surfaces as out-of-order `seq` at the
+  subscriber — the gap detector sees it as redelivery-order, never a
+  phantom gap. Keep one deadline class per causal chain if strict
+  in-order processing matters.
 
 ## Request–reply RPC (EB-178)
 

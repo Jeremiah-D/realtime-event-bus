@@ -408,12 +408,15 @@ export class LaneQueue<T> {
    * first, per-lane FIFO. Entries past their TTL are discarded and
    * counted per lane instead of delivered. Used by the shadow drain and
    * the chaos drop-fault path, where the whole backlog goes at once.
+   *
+   * `deadlineOf` enables EDF scheduling (EB-204) within each lane — see
+   * `BoundedQueue.drainLive`.
    */
-  drainLive(nowMs: number): { live: T[]; expired: T[] } {
+  drainLive(nowMs: number, deadlineOf?: (item: T) => number | undefined): { live: T[]; expired: T[] } {
     const live: T[] = [];
     const expired: T[] = [];
     for (const lane of MESSAGE_LANES) {
-      const result = this.lanes[lane].drainLive(nowMs);
+      const result = this.lanes[lane].drainLive(nowMs, deadlineOf);
       live.push(...result.live);
       expired.push(...result.expired);
       for (let i = 0; i < result.expired.length; i += 1) this.recordExpired(lane);
@@ -450,11 +453,16 @@ export class LaneQueue<T> {
    * bulk message ahead of the rotation (consuming budget like any other
    * delivery) and resets the counter. The counter also resets whenever
    * bulk drains normally or the lane empties.
+   *
+   * `deadlineOf` enables EDF scheduling (EB-204) within each lane's
+   * share — lanes still win across lanes (urgent before bulk); the
+   * deadline only orders messages inside one lane's drain.
    */
   drainLiveUpTo(
     nowMs: number,
     maxLive: number,
     countAgainstBudget?: (item: T) => boolean,
+    deadlineOf?: (item: T) => number | undefined,
   ): { live: T[]; expired: T[] } {
     let occupied = 0;
     let only: MessageLane = 'normal';
@@ -465,7 +473,7 @@ export class LaneQueue<T> {
       }
     }
     if (occupied <= 1) {
-      const result = this.lanes[only].drainLiveUpTo(nowMs, maxLive, countAgainstBudget);
+      const result = this.lanes[only].drainLiveUpTo(nowMs, maxLive, countAgainstBudget, deadlineOf);
       for (let i = 0; i < result.expired.length; i += 1) this.recordExpired(only);
       this.subtractBytes(result.live);
       this.subtractBytes(result.expired);
@@ -478,7 +486,7 @@ export class LaneQueue<T> {
     // Sweep TTL expiry in every lane first — a message must not sit past
     // its deadline only because its lane was not scheduled this round.
     for (const lane of MESSAGE_LANES) {
-      const swept = this.lanes[lane].drainLiveUpTo(nowMs, 0);
+      const swept = this.lanes[lane].drainLiveUpTo(nowMs, 0, undefined, deadlineOf);
       expired.push(...swept.expired);
       for (let i = 0; i < swept.expired.length; i += 1) this.recordExpired(lane);
       this.subtractBytes(swept.expired);
@@ -491,7 +499,7 @@ export class LaneQueue<T> {
       // Starved long enough: force-interleave one bulk message ahead of
       // the rotation. It consumes budget like any other delivery — the
       // guard reorders within the budget, it never exceeds it.
-      const forced = bulkLane.drainLiveUpTo(nowMs, 1, countAgainstBudget);
+      const forced = bulkLane.drainLiveUpTo(nowMs, 1, countAgainstBudget, deadlineOf);
       live.push(...forced.live);
       expired.push(...forced.expired);
       for (let i = 0; i < forced.expired.length; i += 1) this.recordExpired('bulk');
@@ -516,7 +524,7 @@ export class LaneQueue<T> {
         // A zero share still runs the lane's drain so budget-exempt
         // messages (EB-117 replay bypass) keep flowing — the lane's own
         // drain only counts budget-consuming entries against the share.
-        const taken = this.lanes[lane].drainLiveUpTo(nowMs, share, countAgainstBudget);
+        const taken = this.lanes[lane].drainLiveUpTo(nowMs, share, countAgainstBudget, deadlineOf);
         if (taken.live.length > 0 || taken.expired.length > 0) progress = true;
         live.push(...taken.live);
         expired.push(...taken.expired);

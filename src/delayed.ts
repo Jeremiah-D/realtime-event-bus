@@ -52,6 +52,17 @@ export interface DelayedEntry {
    * the deadline intact.
    */
   deadline?: number;
+  /**
+   * EDF scheduling deadline (EB-204): set exactly when the schedule was
+   * created with `PublishDelayedOptions.deadlineMs` and no `deadlineAt`
+   * — the same absolute instant as `deadline`, but with scheduling
+   * semantics: the due-time sweep never drops the schedule for passing
+   * it (only the TTL deadline can expire it), and the due-time fan-out
+   * re-admits the message as EDF-class. In-memory only — a restart
+   * drops it, like `traceparent` and `lineage` (the rebuilt schedule
+   * keeps the hard-deadline `deadline` above).
+   */
+  edfDeadline?: number;
   /** Set by `cancelDelayed`; the heap skips marked entries lazily. */
   cancelled: boolean;
   /**

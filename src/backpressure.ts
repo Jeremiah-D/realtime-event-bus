@@ -322,9 +322,19 @@ export class BoundedQueue<T> {
    * Expiry boundary semantics: the deadline is inclusive — an entry is
    * expired exactly when `nowMs >= expiresAt`, i.e. a message that has been
    * alive for exactly its TTL is dropped, not delivered.
+   *
+   * EDF scheduling (EB-204): `deadlineOf`, when given, maps an item to its
+   * earliest-deadline-first scheduling deadline (or `undefined` when the
+   * item carries none). When at least one queued entry carries a deadline,
+   * the drain visits deadline-carrying entries earliest-deadline-first;
+   * entries without a deadline keep their relative FIFO order behind them
+   * (`deadline ?? +Infinity`, stable by insertion order). The queue's
+   * physical order is untouched — survivors are re-assembled in push order
+   * — so `peekOldest` and `snapshot` keep their FIFO meaning, and when no
+   * entry carries a deadline the drain is byte-identical to plain FIFO.
    */
-  drainLive(nowMs: number): { live: T[]; expired: T[] } {
-    return this.drainLiveUpTo(nowMs, Infinity);
+  drainLive(nowMs: number, deadlineOf?: (item: T) => number | undefined): { live: T[]; expired: T[] } {
+    return this.drainLiveUpTo(nowMs, Infinity, undefined, deadlineOf);
   }
 
   /**
@@ -342,33 +352,67 @@ export class BoundedQueue<T> {
    * independent budget, so it never consumes credit but still respects
    * FIFO order and the expiry sweep). Expiry is always evaluated for
    * every entry, budget or not.
+   *
+   * `deadlineOf` enables EDF scheduling (EB-204) — see `drainLive`.
    */
   drainLiveUpTo(
     nowMs: number,
     maxLive: number,
     countAgainstBudget?: (item: T) => boolean,
+    deadlineOf?: (item: T) => number | undefined,
   ): { live: T[]; expired: T[] } {
     const live: T[] = [];
     const expired: T[] = [];
-    const rest: QueueEntry<T>[] = [];
+    // EDF visit order (EB-204): computed only when the caller opts in via
+    // `deadlineOf` AND at least one queued entry actually carries a
+    // deadline — otherwise the drain walks `entries` in plain FIFO order,
+    // exactly as before. The order is a drain-time view: survivors are
+    // filtered back in push order below, so the physical queue never
+    // reorders.
+    let visitOrder: number[] | undefined;
+    if (deadlineOf !== undefined) {
+      let anyDeadline = false;
+      const keys = new Array<number | undefined>(this.entries.length);
+      for (let i = 0; i < this.entries.length; i += 1) {
+        const key = deadlineOf(this.entries[i].item);
+        keys[i] = key;
+        if (key !== undefined) anyDeadline = true;
+      }
+      if (anyDeadline) {
+        // Stable sort: `deadline ?? +Infinity` puts deadline-free entries
+        // behind deadline-carrying ones while preserving FIFO among
+        // themselves. `Array.prototype.sort` is stable, so equal deadlines
+        // (and equal +Infinity keys) keep insertion order.
+        visitOrder = this.entries
+          .map((_, i) => i)
+          .sort((a, b) => (keys[a] ?? Number.POSITIVE_INFINITY) - (keys[b] ?? Number.POSITIVE_INFINITY));
+      }
+    }
+    const removed = new Set<number>();
     let removedBytes = 0;
     let counted = 0;
-    for (const entry of this.entries) {
+    const visit = (index: number): void => {
+      const entry = this.entries[index];
       if (entry.expiresAt !== undefined && nowMs >= entry.expiresAt) {
         expired.push(entry.item);
         removedBytes += entry.bytes;
-        continue;
+        removed.add(index);
+        return;
       }
       const counts = countAgainstBudget === undefined || countAgainstBudget(entry.item);
       if (!counts || counted < maxLive) {
         live.push(entry.item);
         removedBytes += entry.bytes;
+        removed.add(index);
         if (counts) counted += 1;
-      } else {
-        rest.push(entry);
       }
+    };
+    if (visitOrder === undefined) {
+      for (let i = 0; i < this.entries.length; i += 1) visit(i);
+    } else {
+      for (const i of visitOrder) visit(i);
     }
-    this.entries = rest;
+    this.entries = this.entries.filter((_, i) => !removed.has(i));
     this.bytesTotal -= removedBytes;
     this.maybeFireDrained();
     this.expired += expired.length;

@@ -387,6 +387,11 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     stats.expiredMessages,
   );
   counter(
+    'eventbus_missed_deadline_messages_total',
+    'Total EDF hand-offs delivered at or past their scheduling deadline (see PublishOptions.deadlineMs).',
+    stats.missedDeadlineMessages,
+  );
+  counter(
     'eventbus_throttled_messages_total',
     'Total messages shed at the publish side by adaptive throttling.',
     stats.throttledMessages,

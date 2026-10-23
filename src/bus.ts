@@ -1006,6 +1006,19 @@ export interface BusMessage {
    */
   lane?: MessageLane;
   /**
+   * EDF missed-deadline marker (EB-204): `true` exactly when this message
+   * was published with an EDF scheduling deadline
+   * (`PublishOptions.deadlineMs` without `deadlineAt`) and handed to the
+   * handler at or past that deadline. Unlike the hard deadline
+   * (`deadlineAt`, EB-177) — which drops the message as expired — an EDF
+   * message is always delivered; the mark lets the subscriber observe
+   * that the delivery missed its scheduling target. Each such hand-off
+   * also counts into `missedDeadlineMessages` (per-topic and global).
+   * Absent (`undefined`) otherwise, so existing consumers see no shape
+   * change.
+   */
+  missedDeadline?: boolean;
+  /**
    * Barrier cut marker (see `PublishOptions.barrier`, EB-98): present
    * exactly on barrier control messages — `{ epoch }`, the cut's
    * sequence number. A barrier is a control-plane signal, not business
@@ -4889,6 +4902,14 @@ export interface TopicStats {
    */
   expiredMessages: number;
   /**
+   * Messages on this topic handed to a handler at or past their EDF
+   * scheduling deadline (see `PublishOptions.deadlineMs`, EB-204).
+   * Unlike `expiredMessages`, these were delivered — stamped
+   * `BusMessage.missedDeadline` — counting each hand-off once, so a
+   * message fanned out to N subscribers contributes N here.
+   */
+  missedDeadlineMessages: number;
+  /**
    * Highest sequence number published on this topic so far (0 when nothing
    * has been published yet). Compare with the last `seq` a subscriber
    * received to spot a lost tail the gap detector cannot see.
@@ -5425,6 +5446,14 @@ export interface BusStats {
    * discarded queue entry once — see `TopicStats.expiredMessages`).
    */
   expiredMessages: number;
+  /**
+   * Total EDF hand-offs that missed their scheduling deadline (sum of
+   * the per-topic `missedDeadlineMessages` counters — see
+   * `PublishOptions.deadlineMs`, EB-204). 0 when no EDF deadline was
+   * ever published — the field is always present, so readers never need
+   * a fallback.
+   */
+  missedDeadlineMessages: number;
   /**
    * Total subscription leases that expired and auto-unsubscribed their
    * subscriber (see `SubscribeOptions.leaseMs`, EB-69). Counts each
@@ -7918,6 +7947,7 @@ function zeroedTopicStats(): {
   subscriberCount: number;
   publishedMessages: number;
   expiredMessages: number;
+  missedDeadlineMessages: number;
   lastSeq: number;
   sequenceGaps: number;
   rateLimitedMessages: number;
@@ -7962,6 +7992,7 @@ function zeroedTopicStats(): {
     subscriberCount: 0,
     publishedMessages: 0,
     expiredMessages: 0,
+    missedDeadlineMessages: 0,
     lastSeq: 0,
     sequenceGaps: 0,
     rateLimitedMessages: 0,
@@ -11536,9 +11567,23 @@ export interface PublishOptions {
    */
   deadlineAt?: number;
   /**
-   * Alias spelling of `deadlineAt` (EB-177): the same absolute delivery
-   * deadline in milliseconds on the bus clock. `deadlineAt` takes
-   * precedence when both are given. Same validation.
+   * EDF scheduling deadline (EB-204): the same absolute delivery
+   * deadline in milliseconds on the bus clock as `deadlineAt` — but
+   * with scheduling semantics instead of expiry semantics. `deadlineAt`
+   * takes precedence when both are given (the message is then a
+   * hard-deadline message, see above).
+   *
+   * A message carrying `deadlineMs` WITHOUT `deadlineAt` opts into
+   * earliest-deadline-first delivery: each subscriber's queue drains
+   * deadline-carrying messages earliest-deadline-first (within its
+   * priority lane — lanes still win across lanes), while messages
+   * without a deadline keep FIFO order. The EDF deadline never expires
+   * the message — only the topic/message TTL chain can drop it — so a
+   * message handed to a handler at or past its deadline is still
+   * delivered, stamped `BusMessage.missedDeadline` and counted in
+   * `missedDeadlineMessages` (per-topic and global).
+   *
+   * Same validation as `deadlineAt`.
    */
   deadlineMs?: number;
   /**
@@ -11714,9 +11759,18 @@ export interface PublishDelayedOptions {
    */
   deadlineAt?: number;
   /**
-   * Alias spelling of `deadlineAt` (EB-177): the same absolute delivery
-   * deadline in milliseconds on the bus clock. `deadlineAt` takes
-   * precedence when both are given. Same validation.
+   * EDF scheduling deadline for this delayed publish (EB-204): the same
+   * absolute instant in milliseconds on the bus clock as `deadlineAt` —
+   * but with scheduling semantics instead of expiry semantics.
+   * `deadlineAt` takes precedence when both are given (the schedule is
+   * then a hard-deadline schedule, see above).
+   *
+   * A schedule carrying `deadlineMs` WITHOUT `deadlineAt` is never
+   * dropped for passing its deadline — only the TTL deadline can expire
+   * it at sweep time — and the due-time fan-out re-admits the message
+   * as EDF-class, so the subscriber queue still orders it
+   * earliest-deadline-first and marks a late hand-off
+   * `BusMessage.missedDeadline`. Same validation as `deadlineAt`.
    */
   deadlineMs?: number;
   /**
@@ -13220,6 +13274,13 @@ export class EventBus {
   private readonly publisherCounts = new Map<string, number>();
   private totalExpired = 0;
   /**
+   * EDF missed-deadline hand-offs (EB-204): messages carrying an EDF
+   * scheduling deadline (`PublishOptions.deadlineMs` without
+   * `deadlineAt`) that were handed to a handler at or past their
+   * deadline. Surfaced as `getStats().missedDeadlineMessages`.
+   */
+  private totalMissedDeadline = 0;
+  /**
    * Subscription leases that expired and auto-unsubscribed their
    * subscriber (see `src/lease.ts`, EB-69). Surfaced as
    * `getStats().expiredLeases`.
@@ -14550,6 +14611,17 @@ export class EventBus {
    * Entries die with their message (WeakMap).
    */
   private messageDeadlines = new WeakMap<BusMessage, number>();
+  /**
+   * EDF scheduling deadlines (EB-204): the raw per-message deadline for
+   * messages published with `PublishOptions.deadlineMs` and no
+   * `deadlineAt` — the EDF opt-in class. Unlike `messageDeadlines` (the
+   * TTL-chain expiry instant, which an EDF deadline never feeds), this
+   * drives earliest-deadline-first queue ordering and the
+   * `missedDeadline` hand-off mark; the message is never dropped for
+   * passing it. Set once at admission; entries die with their message
+   * (WeakMap), so redeliveries of the same envelope keep the class.
+   */
+  private edfDeadlines = new WeakMap<BusMessage, number>();
   /**
    * Consumer-group membership: `groupKey(groupId, pattern)` -> member
    * subscription ids in join order. A group is scoped to one pattern the
@@ -20878,6 +20950,7 @@ export class EventBus {
         // yet, so it must not count as published.
         publishedMessages: log.messageCount(topic),
         expiredMessages: 0,
+        missedDeadlineMessages: 0,
         lastSeq,
         sequenceGaps: 0,
         rateLimitedMessages: 0,
@@ -27297,6 +27370,11 @@ export class EventBus {
       // carry it (see `PublishOptions.joinDerived`); direct publishes
       // never do unless they opt out explicitly.
       opts?.joinDerived ?? false,
+      // EDF scheduling deadline (EB-204): `deadlineMs` without
+      // `deadlineAt` opts the message into earliest-deadline-first
+      // delivery — see `PublishOptions.deadlineMs`. `deadlineAt` wins
+      // when both are given (hard-deadline class, EB-177).
+      opts?.deadlineAt === undefined ? opts?.deadlineMs : undefined,
     );
     if (breakerTopic !== undefined) {
       // Trip/close evaluation: trips open after enough consecutive
@@ -29509,6 +29587,12 @@ export class EventBus {
     // at fan-out time, so the wait eats the message's life. `deadlineAt`
     // wins over `deadlineMs` when both are given.
     const deadline = opts.deadlineAt ?? opts.deadlineMs;
+    // EDF scheduling deadline (EB-204): `deadlineMs` without
+    // `deadlineAt` opts the schedule into earliest-deadline-first
+    // delivery — the sweep below never drops it for passing the
+    // deadline, and the due-time fan-out re-admits the message as
+    // EDF-class (see `DelayedEntry.edfDeadline`).
+    const edfDeadline = opts.deadlineAt === undefined ? opts.deadlineMs : undefined;
     validateMessageKey(opts.key, 'publishDelayed');
     validateTraceparent(opts.traceparent, 'publishDelayed');
     const key = opts.key;
@@ -29532,6 +29616,10 @@ export class EventBus {
       // the deadline passes first, and the fan-out enforces the earlier
       // of it and the TTL-derived deadline.
       ...(deadline === undefined ? {} : { deadline }),
+      // The EDF scheduling deadline rides the schedule in memory
+      // (EB-204): the sweep never drops the schedule for passing it,
+      // and the due-time fan-out re-admits the message as EDF-class.
+      ...(edfDeadline === undefined ? {} : { edfDeadline }),
       cancelled: false,
       key,
       keySeq,
@@ -30124,13 +30212,18 @@ export class EventBus {
       // The schedule's effective deadline is the earlier of the
       // schedule-time TTL deadline and the per-message absolute
       // deadline (EB-177) — a deadline that passed while delayed drops
-      // the schedule here, never delivered.
+      // the schedule here, never delivered. EDF-class schedules
+      // (EB-204, `edfDeadline`) are never dropped for passing their
+      // deadline — only the TTL deadline can expire them — so they fan
+      // out late instead, re-admitted as EDF-class below.
       const sweepDeadline =
-        top.deadline === undefined
+        top.edfDeadline !== undefined
           ? top.expiresAt
-          : top.expiresAt === undefined
-            ? top.deadline
-            : Math.min(top.expiresAt, top.deadline);
+          : top.deadline === undefined
+            ? top.expiresAt
+            : top.expiresAt === undefined
+              ? top.deadline
+              : Math.min(top.expiresAt, top.deadline);
       if (sweepDeadline !== undefined && nowMs >= sweepDeadline) {
         this.recordExpired(top.topic);
         this.appendDelayTombstone(top.id, top.topic);
@@ -30253,6 +30346,11 @@ export class EventBus {
         // the due-time fan-out runs the cycle check and stamps the origin
         // hop (the real admission).
         top.lineage,
+        undefined, // joinDerived: a delayed fan-out never re-enters join observation
+        // EDF scheduling deadline (EB-204): the due-time fan-out
+        // re-admits the schedule's EDF class — see
+        // `DelayedEntry.edfDeadline`.
+        top.edfDeadline,
       );
       // EB-136: schedule-skew sampling — this is the only sampling point.
       // It sits on the true fan-out path: cancelled, expired,
@@ -35370,6 +35468,16 @@ export class EventBus {
     // re-enters join observation. Last so existing positional call
     // sites are unaffected.
     joinDerived = false,
+    // EDF scheduling deadline (EB-204): the raw absolute deadline for
+    // messages published with `PublishOptions.deadlineMs` and no
+    // `deadlineAt` — the EDF opt-in class. Already validated by the
+    // publish entry points (`validateDeadline`); `fanOut` never
+    // validates. When set, the deadline drives earliest-deadline-first
+    // queue ordering and the `missedDeadline` hand-off mark, and is
+    // excluded from the TTL expiry chain below. Every other path leaves
+    // it undefined. Last so existing positional call sites are
+    // unaffected.
+    edfDeadline?: number,
   ): {
     matched: number;
     accepted: number;
@@ -36223,13 +36331,25 @@ export class EventBus {
     // deadline is absolute, so no re-stamping is ever needed; the single
     // `messageDeadlines` entry below carries it through every downstream
     // path (drain, redelivery, retry ladder, replay, bridge/cluster).
+    //
+    // EDF scheduling deadline (EB-204): an EDF-class deadline
+    // (`edfDeadline`, i.e. `deadlineMs` without `deadlineAt`) drives
+    // delivery ORDER, not expiry — the message is never dropped for
+    // missing it, so it stays out of the TTL expiry chain below. Only
+    // the topic/message TTL chain can expire an EDF message.
     const expiresAt =
-      messageDeadline === undefined
+      messageDeadline === undefined || edfDeadline !== undefined
         ? baseExpiresAt
         : baseExpiresAt === undefined
           ? messageDeadline
           : Math.min(baseExpiresAt, messageDeadline);
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
+    // EDF scheduling deadline (EB-204): the raw deadline for
+    // earliest-deadline-first queue ordering and the `missedDeadline`
+    // hand-off mark — tracked separately from the TTL-chain expiry
+    // above. Only set for the EDF opt-in class; every other path leaves
+    // it undefined.
+    if (edfDeadline !== undefined) this.edfDeadlines.set(msg, edfDeadline);
     // MQTT-style retained messages (EB-87): the message above cleared
     // every admission gate and is fully stamped (wire payload, signature,
     // TTL deadline) — a `retain: true` publish now becomes (or clears)
@@ -37692,6 +37812,7 @@ export class EventBus {
       },
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
+      missedDeadlineMessages: this.totalMissedDeadline,
       expiredLeases: this.totalExpiredLeases,
       idleExpired: this.totalIdleExpired,
       aggregatedWindows: this.totalAggregatedWindows,
@@ -38029,6 +38150,7 @@ export class EventBus {
         subscriberCount: stats.subscriberCount,
         publishedMessages: stats.publishedMessages,
         expiredMessages: stats.expiredMessages,
+        missedDeadlineMessages: stats.missedDeadlineMessages,
         lastSeq: stats.lastSeq,
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
@@ -40106,7 +40228,10 @@ export class EventBus {
         credits == null ? undefined : (msg: BusMessage) => !this.isReplayBypass(msg);
       const { live, expired } =
         fair === undefined
-          ? subscriber.queue.drainLiveUpTo(nowMs, drainBudget, countPredicate)
+          ? // EDF (EB-204): deadline-carrying messages drain
+            // earliest-deadline-first within their lane — lanes still win
+            // across lanes. The fair drain below keeps its own scheduler.
+            subscriber.queue.drainLiveUpTo(nowMs, drainBudget, countPredicate, this.edfDeadlineOf)
           : subscriber.queue.drainLiveUpToFair(
               nowMs,
               drainBudget,
@@ -40161,6 +40286,9 @@ export class EventBus {
           // that cannot be decrypted is dropped fail-closed here.
           if (!this.decryptMessagePayload(msg)) continue;
           this.inflateMessagePayload(msg);
+          // EDF (EB-204): stamp + count a hand-off that missed its
+          // scheduling deadline before the delivery bookkeeping below.
+          this.markMissedDeadline(msg, nowMs);
           this.noteMessageDelivered(subscriber, msg);
           // Priority-lane accounting (EB-122): the drain hands the message
           // toward the handler — it leaves its lane's backlog and counts
@@ -40474,6 +40602,9 @@ export class EventBus {
             nowMs,
             Math.min(room, budget),
             countPredicate,
+            // EDF (EB-204): collection order is deadline-first within the
+            // lane — the batch fills with the most urgent messages first.
+            this.edfDeadlineOf,
           ));
         } else {
           const winner = subscriber.queue.peekFairWinner(
@@ -40613,6 +40744,9 @@ export class EventBus {
       // that cannot be decrypted is dropped fail-closed here.
       if (!this.decryptMessagePayload(msg)) continue;
       this.inflateMessagePayload(msg);
+      // EDF (EB-204): stamp + count a hand-off that missed its scheduling
+      // deadline before the delivery bookkeeping below.
+      this.markMissedDeadline(msg, nowMs);
       this.noteMessageDelivered(subscriber, msg);
       this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');
       this.totalDelivered += 1;
@@ -41516,6 +41650,9 @@ export class EventBus {
   private deliverWithHealth(subscriber: Subscriber, msg: BusMessage, nowMs: number): unknown {
     const health = subscriber.health;
     if (health == null) return undefined;
+    // EDF (EB-204): stamp + count a hand-off that missed its scheduling
+    // deadline before the delivery bookkeeping below.
+    this.markMissedDeadline(msg, nowMs);
     this.noteMessageDelivered(subscriber, msg);
     // Tail-based sampling (EB-181): the delivery leg closes at the end
     // of this function with the true outcome (`deliverTraced` left it
@@ -41962,6 +42099,34 @@ export class EventBus {
     // before ever queueing, so they move no lane counter.
     if (lane !== undefined) this.countLaneUnqueued(topic, lane);
   }
+
+  /**
+   * EDF missed-deadline bookkeeping (EB-204): when a message carrying an
+   * EDF scheduling deadline (`PublishOptions.deadlineMs` without
+   * `deadlineAt`) is handed toward a handler at or past its deadline,
+   * stamp `BusMessage.missedDeadline` and count the hand-off (per-topic
+   * and global). A no-op for every other message — one WeakMap lookup on
+   * the hot path. Unlike the hard deadline (EB-177), an EDF message is
+   * always delivered; the mark is the subscriber-observable signal that
+   * the delivery missed its scheduling target.
+   */
+  private markMissedDeadline(msg: BusMessage, nowMs: number): void {
+    const deadline = this.edfDeadlines.get(msg);
+    if (deadline === undefined || nowMs < deadline) return;
+    msg.missedDeadline = true;
+    this.totalMissedDeadline += 1;
+    const stats = this.topicStats.get(msg.topic);
+    if (stats !== undefined) stats.missedDeadlineMessages += 1;
+  }
+
+  /**
+   * EDF deadline lookup for queue drains (EB-204): the drain-time key
+   * function passed to the lane queue — `undefined` for every message
+   * outside the EDF opt-in class, so those drains stay plain FIFO. An
+   * arrow field so drain call sites can pass it without rebinding.
+   */
+  private readonly edfDeadlineOf = (msg: BusMessage): number | undefined =>
+    this.edfDeadlines.get(msg);
 
   /**
    * Priority-lane backlog accounting (EB-122). Every production queue
