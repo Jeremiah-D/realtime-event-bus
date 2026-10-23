@@ -219,7 +219,21 @@ library.
   resume point (its explicit window suppresses the automatic migration
   replay — no double delivery). The partition count is fixed by the group's
   first member: a later joiner that disagrees throws `RangeError` and its
-  subscription is rolled back. **Consumer-group member limit** (EB-196):
+  subscription is rolled back. **Partition-count expansion** (EB-210):
+  `setGroupPartitionCount(groupId, n)` grows a partitioned group's logical
+  partition count at runtime (growth only — a shrink or no-op throws
+  `RangeError`). The group's fixed assignor recomputes deterministically
+  with the pre-expansion assignment as `previous`: the built-ins never move
+  an old partition (rendezvous scores per partition, sticky targets only
+  grow), so old partitions keep their owners, watermarks, and committed
+  offsets, and only the new partitions migrate (`migrated[]` entries with
+  `from: null`). New partitions start from the latest offset — no backlog
+  replay. An operator rebalance fires (`trigger: 'expand'`, `memberId: ''`;
+  the rebalance debounce is bypassed) so members observe the migration
+  through `onRebalance`/`rebalanceListener`, and the change is audited
+  with `partitionsBefore`/`partitionsAfter`. A custom assignor that moves
+  an old partition gets the normal cooperative handoff, selected with the
+  pre-expansion routing so it stays exact. **Consumer-group member limit** (EB-196):
   opt-in `maxMembers` on `subscribeToGroup` caps the roster at N members —
   a join that would add a roster entry past the cap fails fast with
   `RangeError` before anything registers (no half-joined member, no

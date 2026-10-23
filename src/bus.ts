@@ -3749,6 +3749,31 @@ export interface PartitionRebalanceInfo {
   strategy: string;
 }
 
+/**
+ * The result of `EventBus.setGroupPartitionCount` (EB-210): a
+ * partition-count expansion of one partitioned consumer group.
+ */
+export interface GroupPartitionExpansion {
+  /** The expanded group. */
+  groupId: string;
+  /** The competing set's topic pattern. */
+  pattern: string;
+  /** Logical partition count before the expansion. */
+  partitionsBefore: number;
+  /** Logical partition count after the expansion. */
+  partitionsAfter: number;
+  /**
+   * Partitions whose owner changed, in ascending partition order.
+   * Entries with `from: null` are brand-new partitions — they start
+   * consuming from the latest offset with no backlog replay. Entries
+   * with a non-null `from` are old partitions a custom assignor moved;
+   * their uncommitted backlog was handed to the new owner.
+   */
+  migrated: PartitionMigration[];
+  /** Post-expansion partition -> member roster key. */
+  assignment: Record<number, string>;
+}
+
 export interface GroupRebalanceEvent {
   /** The group whose membership changed. */
   groupId: string;
@@ -3760,9 +3785,17 @@ export interface GroupRebalanceEvent {
    * otherwise. A snapshot — mutating it does not affect the bus.
    */
   members: string[];
-  /** What triggered the rebalance. */
-  trigger: 'join' | 'leave';
-  /** The roster key of the member that joined or left. */
+  /**
+   * What triggered the rebalance: a member joining, a member leaving, or
+   * an operator-initiated partition-count expansion
+   * (`EventBus.setGroupPartitionCount`, EB-210).
+   */
+  trigger: 'join' | 'leave' | 'expand';
+  /**
+   * The roster key of the member that joined or left. Empty for
+   * `trigger: 'expand'` — an expansion is operator-initiated and names
+   * no single member.
+   */
   memberId: string;
   /**
    * Present on `leave` events when the leaving member configured
@@ -24346,7 +24379,7 @@ export class EventBus {
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave',
+    trigger: 'join' | 'leave' | 'expand',
     memberId: string,
     linger?: { until: number; windows: LingerWindow[] },
     partitionRebalance?: PartitionRebalanceInfo,
@@ -24378,7 +24411,7 @@ export class EventBus {
    */
   private fireRebalanceListener(
     groupId: string,
-    trigger: 'join' | 'leave',
+    trigger: 'join' | 'leave' | 'expand',
     memberId: string,
     rosterKey: string,
     subscriber: Subscriber,
@@ -24441,22 +24474,34 @@ export class EventBus {
    * (non-debounced) emission. The `suppressedRebalances` event field is
    * only present for debounced groups; without the opt-in the event and
    * the audit entry are byte-identical to before EB-169.
+   *
+   * `bypassDebounce` is for operator-initiated rebalances (EB-210
+   * expansion, EB-211 remediation): they apply immediately instead of
+   * merging into a membership-change window, and the debounce baseline
+   * is refreshed from the post-change assignment so a later window
+   * never diffs across the operator's change. `expansion` carries the
+   * partition counts into the audit entry for `trigger: 'expand'`.
    */
   private emitRebalance(
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave',
+    trigger: 'join' | 'leave' | 'expand',
     memberId: string,
     linger: { until: number; windows: LingerWindow[] } | undefined,
     partitionRebalance: PartitionRebalanceInfo | undefined,
     suppressed: number,
+    bypassDebounce = false,
+    expansion?: { partitionsBefore: number; partitionsAfter: number },
   ): void {
     const members = this.groupMembers.get(key);
     if (members == null) return;
     // The group opted into rebalance debounce (EB-169): the event
     // carries how many membership changes were absorbed into the window.
-    const debounced = this.rebalancer.getWindowMs(key) !== undefined;
+    // Operator-initiated rebalances (EB-210 expansion, EB-211 remediation)
+    // bypass the debouncer — they apply immediately and are audited on
+    // their own — so they never report a membership-change count.
+    const debounced = !bypassDebounce && this.rebalancer.getWindowMs(key) !== undefined;
     // Offset auto-commit (EB-127): every rebalance — join or leave —
     // checkpoints the group's pending offsets first, before ownership
     // moves: the Kafka revoke-hook analogue. Idempotent with the
@@ -24513,6 +24558,15 @@ export class EventBus {
               assignor: partitionRebalance.strategy,
               assignment: partitionRebalance.assignment,
             }),
+        // Partition-count expansion (EB-210): the operator action that
+        // caused this rebalance, so the audit reads without the caller's
+        // context.
+        ...(expansion == null
+          ? {}
+          : {
+              partitionsBefore: expansion.partitionsBefore,
+              partitionsAfter: expansion.partitionsAfter,
+            }),
       },
     });
     // Membership changed: the assignment-to-commitment balance for the
@@ -24524,8 +24578,10 @@ export class EventBus {
     this.checkGroupLagForGroup(groupId);
     // Rebalance debounce baseline (EB-169): the next window's merged
     // event diffs its net partition migration from this assignment.
-    // Tracked only for debounced partitioned groups.
-    if (debounced && this.groupPartitions.get(key) !== undefined) {
+    // Tracked for debounced partitioned groups; an operator-initiated
+    // rebalance that bypassed the debouncer still refreshes it so a
+    // later window never diffs across the operator's change.
+    if (this.groupPartitions.get(key) !== undefined && (debounced || bypassDebounce)) {
       this.rebounceBaselines.set(key, new Map(this.partitionAssignment(key)));
     }
   }
@@ -25767,6 +25823,133 @@ export class EventBus {
   }
 
   /**
+   * Expands a partitioned consumer group's logical partition count at
+   * runtime (EB-210, real-time systems): the Kafka `kafka-topics --alter
+   * --partitions` analogue. Growth only — shrinking would renumber live
+   * partitions and strand per-partition watermarks and committed
+   * offsets, so a shrink (or a no-op) throws `RangeError`.
+   *
+   * The expansion is deterministic: the group's fixed assignor (see
+   * `GroupSubscribeOptions.assignor`, EB-106) recomputes the assignment
+   * over the new count with the pre-expansion assignment as its
+   * `previous` input. The built-ins never move an old partition —
+   * rendezvous scores each partition independently of the count, sticky
+   * targets only grow — so with them the migration list contains
+   * exactly the new partitions, and every old partition keeps its
+   * owner, its watermarks, and its committed offsets. A custom assignor
+   * may move old partitions; those get the normal cooperative handoff
+   * (the new owner replays `(committed, watermark]`, selected with the
+   * pre-expansion routing so the handoff is exact).
+   *
+   * New partitions start from the latest offset: no backlog replay, no
+   * committed offsets — the first message routed to them under the new
+   * count seeds their watermarks. Delivery during the expansion neither
+   * loses nor duplicates: the count flips atomically between
+   * event-loop turns, and each in-flight message is routed exactly
+   * once, to exactly one owner, under whichever count is current at
+   * its delivery.
+   *
+   * An operator-initiated rebalance fires (`trigger: 'expand'`,
+   * `memberId: ''`): members observe it through `onRebalance` and their
+   * `rebalanceListener` (revoke/assign for the migrated partitions),
+   * and the change is audited with `partitionsBefore`/`partitionsAfter`.
+   * The rebalance debounce (EB-169) is bypassed — an explicit operator
+   * action applies immediately. Expanding an empty (fully drained)
+   * group only updates the retained count for the next generation; no
+   * rebalance fires and the change is audited as `partition_expansion`.
+   *
+   * Throws `RangeError` when `groupId` is empty, `n` is not a positive
+   * integer, `n` does not exceed the current count, or `groupId` does
+   * not resolve to exactly one partitioned group (see
+   * `partitionGroupKey` — a groupId with several partitioned competing
+   * sets is ambiguous). A throwing or invalid custom assignor aborts
+   * before any state is touched.
+   */
+  setGroupPartitionCount(groupId: string, n: number): GroupPartitionExpansion {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('groupId must be a non-empty string');
+    }
+    if (!Number.isInteger(n) || n < 1) {
+      throw new RangeError('partition count must be a positive integer');
+    }
+    const key = this.partitionGroupKey(groupId);
+    const before = this.groupPartitions.get(key);
+    if (before === undefined) {
+      // Unreachable: partitionGroupKey only resolves keys present in
+      // groupPartitions. Defensive — the map owns the invariant.
+      throw new RangeError(`no partitioned consumer group found for groupId "${groupId}"`);
+    }
+    if (n <= before) {
+      throw new RangeError(
+        `partition count can only grow: group "${groupId}" has ${before} partitions, got ${n}`,
+      );
+    }
+    const members = this.groupMembers.get(key) ?? [];
+    // Pluggable assignor fail-fast (EB-106): trial the expansion
+    // against the current roster before touching any state, mirroring
+    // validateJoinAssignment — a throwing or invalid custom assignor
+    // aborts here with nothing to roll back. Built-ins are infallible.
+    const resolved = this.groupAssignors.get(key);
+    const impl = resolved?.assignor ?? rendezvousPartitionAssignor;
+    if (impl !== rendezvousPartitionAssignor && impl !== stickyPartitionAssignor) {
+      const trial = impl.assign(n, members, this.previousPartitionAssignment.get(key));
+      assertValidPartitionAssignment(trial, n, members, resolved?.name ?? impl.name);
+    }
+    const sep = key.indexOf('\0');
+    const pattern = key.slice(sep + 1);
+    const beforeAssignment = new Map(this.partitionAssignment(key));
+    this.groupPartitions.set(key, n);
+    this.invalidatePartitionAssignment(key);
+    const after = this.partitionAssignment(key);
+    const migrated = this.diffPartitionAssignment(key, beforeAssignment, after);
+    // Cooperative handoff for old partitions a custom assignor moved:
+    // the new owner replays the partition's uncommitted backlog with
+    // the PRE-expansion count — the routing that actually assigned
+    // those records. New partitions (from: null) start from the live
+    // stream: nothing to replay, nothing committed.
+    const staticSubs = this.groupStaticSubs.get(key);
+    for (const m of migrated) {
+      if (m.from === null) continue;
+      const owner = this.subscribers.get(staticSubs?.get(m.to) ?? m.to);
+      if (owner !== undefined) this.replayPartitionBacklog(owner, key, m.partition, before);
+    }
+    const partitionRebalance: PartitionRebalanceInfo = {
+      assignment: Object.fromEntries(after),
+      migrated,
+      strategy: this.groupAssignorName(key),
+    };
+    if (this.groupMembers.get(key) == null) {
+      // Fully drained group: only the retained count changes — the
+      // next generation rejoins with the new count. No rebalance to
+      // fire; audit the config change on its own.
+      this.auditSubscription({
+        action: 'partition_expansion',
+        groupId,
+        pattern,
+        actor: 'system',
+        detail: { partitionsBefore: before, partitionsAfter: n, members: 0 },
+      });
+    } else {
+      // Operator-initiated: bypass the membership-change debounce, audit
+      // on its own. emitRebalance flushes pending auto-commits, notifies
+      // members (onRebalance + rebalance listeners for the migrated
+      // partitions), audits the rebalance, and re-checks group lag.
+      this.emitRebalance(groupId, pattern, key, 'expand', '', undefined, partitionRebalance, 0, true, {
+        partitionsBefore: before,
+        partitionsAfter: n,
+      });
+    }
+    return {
+      groupId,
+      pattern,
+      partitionsBefore: before,
+      partitionsAfter: n,
+      migrated,
+      assignment: Object.fromEntries(after),
+    };
+  }
+
+  /**
    * Per-partition assignment watermarks for a competing set: partition ->
    * concrete topic -> highest per-topic `seq` assigned to that partition.
    * Empty when the group is not partitioned or nothing was assigned yet.
@@ -26536,10 +26719,20 @@ export class EventBus {
    * nothing. The handoff-linger skip does not apply: a migration is a
    * deliberate partition takeover, not a resume.
    */
-  private replayPartitionBacklog(subscriber: Subscriber, groupKey: string, partition: number): void {
+  private replayPartitionBacklog(
+    subscriber: Subscriber,
+    groupKey: string,
+    partition: number,
+    partitionCountOverride?: number,
+  ): void {
     const log = this.durableLog;
     if (log == null) return;
-    const n = this.groupPartitions.get(groupKey);
+    // The group's logical partition count, or an explicit override: a
+    // partition-count expansion (EB-210) replays a migrated old
+    // partition's backlog with the PRE-expansion count, so records are
+    // selected by the routing that actually assigned them — re-hashing
+    // them with the new count would strand or misroute the handoff.
+    const n = partitionCountOverride ?? this.groupPartitions.get(groupKey);
     if (n === undefined) return;
     const sep = groupKey.indexOf('\0');
     const groupId = groupKey.slice(0, sep);
