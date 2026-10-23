@@ -268,7 +268,26 @@ library.
   and rebalance, so a lag spike during a rebalance alerts promptly. Lag rows
   are exposed as `eventbus_group_lag_messages{group,topic}` and
   `eventbus_group_partition_lag_messages{group,topic,partition}` gauges in
-  `src/metrics.ts`. `subscribe()` also accepts an opt-in content `filter`
+  `src/metrics.ts`. **Consumer rebalance listener** (EB-209): opt-in
+  `rebalanceListener` on `subscribeToGroup` adds Kafka-style
+  `ConsumerRebalanceListener` semantics for partitioned groups —
+  `onPartitionsRevoked(member, partitions, ctx)` fires for partitions the
+  member loses (revoke first), `onPartitionsAssigned(member, partitions)`
+  for partitions it gains. The `member` argument is the roster key (the
+  `instanceId` for static members, the subscription id otherwise). The
+  revoke context carries `commitOffsetsSync(offsets)` — the Kafka
+  commitSync analogue — which checkpoints through the same `commitOffset`
+  path (durable-log journal included), so it is idempotent with offset
+  auto-commit (EB-127): highest seq wins, never regresses. The listener
+  fires before the group-level `onRebalance` notification, so a member
+  checkpoints before anyone acts on the new roster; callback errors are
+  isolated (a throwing listener never blocks the rebalance) and counted
+  in `getStats().rebalanceListenerErrors`. Only meaningful with
+  `partitions`: round-robin groups have no partitions, so the listener
+  never fires there — use `onRebalance` (EB-16) for roster join/leave
+  notification. Must be an object with function callbacks; anything else
+  throws `RangeError` at registration.
+  `subscribe()` also accepts an opt-in content `filter`
   predicate: a message the filter rejects never enters that subscriber's
   queue — no backpressure budget consumed, no adaptive-throttle token
   burned — and the subscriber's per-topic baseline advances over it, so a

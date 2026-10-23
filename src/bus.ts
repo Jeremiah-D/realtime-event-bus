@@ -3642,6 +3642,73 @@ export interface DeadLetterEvent {
 
 /** Snapshot delivered to `onRebalance` when a consumer group's membership changes. */
 /**
+ * One offset checkpoint for the rebalance revoke hook's
+ * `commitOffsetsSync` (EB-209) — the Kafka commitSync analogue for the
+ * revoke phase.
+ */
+export interface RebalanceCommitOffset {
+  /** Concrete topic (not the group's pattern). */
+  topic: string;
+  /** Sequence number to commit (`>= 1`). */
+  seq: number;
+  /** Partitioned groups: the partition this checkpoint covers. */
+  partition?: number;
+}
+
+/**
+ * Context passed to `ConsumerRebalanceListener.onPartitionsRevoked`
+ * (EB-209).
+ */
+export interface RebalanceRevokeContext {
+  /**
+   * Synchronously checkpoint offsets for this member before the
+   * revoked partitions move — the Kafka commitSync analogue for the
+   * rebalance revoke hook. Goes through the same `commitOffset` path
+   * (durable-log offset journal included), so it is idempotent with
+   * offset auto-commit (EB-127) and manual `commitOffset` calls:
+   * highest seq wins, a checkpoint never regresses. Throws
+   * `RangeError` on invalid input exactly like `commitOffset`.
+   */
+  commitOffsetsSync: (offsets: RebalanceCommitOffset[]) => void;
+}
+
+/**
+ * Kafka-style consumer rebalance listener (EB-209): member-level
+ * partition assignment callbacks for partitioned consumer groups (see
+ * `GroupSubscribeOptions.partitions`). `onPartitionsRevoked` fires for
+ * partitions this member loses, `onPartitionsAssigned` for partitions
+ * it gains — revoke before assign when a member does both, mirroring
+ * the Kafka `ConsumerRebalanceListener` protocol.
+ *
+ * The `member` argument is the roster key: the `instanceId` for static
+ * members (EB-104), the subscription id otherwise. Callback errors are
+ * isolated — a throwing listener never blocks the rebalance — and
+ * counted in `getStats().rebalanceListenerErrors`.
+ *
+ * Orthogonal to `onRebalance` (EB-16): that is the group-level roster
+ * join/leave notification fired on every member; this is the
+ * member-level partition assignment.
+ */
+export interface ConsumerRebalanceListener {
+  /**
+   * Called on the member with the partitions it just gained. Fires
+   * only when the member actually gained partitions (empty
+   * assignments are not reported).
+   */
+  onPartitionsAssigned?: (member: string, partitions: number[]) => void;
+  /**
+   * Called on the member with the partitions it just lost. The third
+   * argument carries `commitOffsetsSync` to synchronously checkpoint
+   * offsets before ownership moves. Fires only when the member
+   * actually lost partitions.
+   */
+  onPartitionsRevoked?: (
+    member: string,
+    partitions: number[],
+    ctx: RebalanceRevokeContext,
+  ) => void;
+}
+/**
  * Partition ownership change from one consumer-group rebalance, for
  * partitioned groups (see `GroupSubscribeOptions.partitions`).
  */
@@ -3996,6 +4063,27 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * `RangeError`.
    */
   autoOffsetReset?: 'earliest' | 'latest';
+  /**
+   * Kafka-style consumer rebalance listener (EB-209): member-level
+   * partition assignment callbacks, fired during the rebalance for
+   * partitioned groups (see `partitions`) — `onPartitionsRevoked` for
+   * partitions this member loses (revoke first), `onPartitionsAssigned`
+   * for partitions it gains. The revoke callback receives a
+   * `commitOffsetsSync` hook to synchronously checkpoint offsets before
+   * ownership moves (the Kafka commitSync analogue; goes through the
+   * same `commitOffset` path, so it is idempotent with auto-commit
+   * EB-127). Callback errors are isolated — a throwing listener never
+   * blocks the rebalance — and counted in
+   * `getStats().rebalanceListenerErrors`.
+   *
+   * Only meaningful with `partitions`: round-robin groups have no
+   * partitions, so the listener never fires there. Orthogonal to
+   * `onRebalance` (EB-16): that is the group-level roster join/leave
+   * notification; this is the member-level partition assignment. Must
+   * be an object with function callbacks when present; anything else
+   * throws `RangeError` at registration.
+   */
+  rebalanceListener?: ConsumerRebalanceListener;
 }
 
 /** Snapshot of a subscriber's backpressure state when `onBackpressure` fires. */
@@ -5689,6 +5777,13 @@ export interface BusStats {
    * `eventbus_autocommitted_offsets_total` in `src/metrics.ts`.
    */
   autoCommittedOffsets: number;
+  /**
+   * Consumer rebalance listener callback errors (see
+   * `GroupSubscribeOptions.rebalanceListener`, EB-209): a throwing
+   * listener never blocks the rebalance; each isolated throw is
+   * counted here. Monotonic.
+   */
+  rebalanceListenerErrors: number;
   /**
    * Currently active topic-pause rules (see `EventBus.pauseTopic`,
    * EB-88), in registration order: the rule key, its mode, and how many
@@ -7561,6 +7656,12 @@ interface Subscriber {
   instanceId?: string;
   /** Fired on group membership changes (see `GroupSubscribeOptions`). */
   onRebalance?: (event: GroupRebalanceEvent) => void;
+  /**
+   * Kafka-style consumer rebalance listener (see
+   * `GroupSubscribeOptions.rebalanceListener`, EB-209): member-level
+   * partition assignment callbacks for partitioned groups.
+   */
+  rebalanceListener?: ConsumerRebalanceListener;
   /**
    * Graceful-handoff linger in ms for consumer-group members (see
    * `GroupSubscribeOptions.handoffLingerMs`). Absent (or 0) for plain
@@ -14826,6 +14927,11 @@ export class EventBus {
   private autoCommitPending = new Map<string, Map<string, number>>();
   /** Checkpoints written by offset auto-commit (EB-127). Monotonic. */
   private totalAutoCommittedOffsets = 0;
+  /**
+   * Consumer rebalance listener (EB-209) callback errors, isolated per
+   * callback: a throwing listener never blocks the rebalance. Monotonic.
+   */
+  private totalRebalanceListenerErrors = 0;
   /**
    * Active handoff-linger windows: groupId -> windows (see
    * `GroupSubscribeOptions.handoffLingerMs`). While a window is live,
@@ -23697,6 +23803,20 @@ export class EventBus {
       throw new RangeError("autoOffsetReset must be 'earliest' or 'latest'");
     }
     const resetPolicy = autoOffsetReset ?? 'earliest';
+    // Consumer rebalance listener (EB-209): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const rebalanceListener = opts?.rebalanceListener;
+    if (rebalanceListener !== undefined) {
+      if (typeof rebalanceListener !== 'object' || rebalanceListener === null) {
+        throw new RangeError('rebalanceListener must be an object with onPartitionsAssigned/onPartitionsRevoked callbacks');
+      }
+      for (const key of ['onPartitionsAssigned', 'onPartitionsRevoked'] as const) {
+        const cb = rebalanceListener[key];
+        if (cb !== undefined && typeof cb !== 'function') {
+          throw new RangeError(`rebalanceListener.${key} must be a function`);
+        }
+      }
+    }
     const partitions = opts?.partitions;
     if (partitions !== undefined && (!Number.isInteger(partitions) || partitions < 1)) {
       throw new RangeError('partitions must be a positive integer');
@@ -23802,6 +23922,7 @@ export class EventBus {
     subscriber.groupId = groupId;
     subscriber.instanceId = instanceId;
     subscriber.onRebalance = opts?.onRebalance;
+    subscriber.rebalanceListener = opts?.rebalanceListener;
     subscriber.handoffLingerMs = handoffLingerMs;
     // Durable-log replay progress observer (EB-71): stripped from
     // `restOpts` above so the inner `subscribe` does not replay early —
@@ -24235,6 +24356,85 @@ export class EventBus {
   }
 
   /**
+   * Fires one member's `ConsumerRebalanceListener` (EB-209): derives
+   * the member's revoked/assigned partitions from the rebalance's net
+   * partition migration and invokes the callbacks — revoke before
+   * assign for a member that does both, mirroring the Kafka
+   * `ConsumerRebalanceListener` protocol. The revoke callback gets a
+   * `commitOffsetsSync` hook (the Kafka commitSync analogue) that
+   * checkpoints through the same `commitOffset` path, so it is
+   * idempotent with auto-commit (EB-127).
+   *
+   * The joining member owned nothing before the rebalance, so every
+   * post-change partition it owns is newly assigned — including the
+   * first join, whose from-null assignment the bus's before-snapshot
+   * cannot see (the snapshot is taken after the roster push, so the
+   * net migration is empty). Members with no changed partitions are
+   * not called — an empty assignment is not an event.
+   *
+   * Callback errors are isolated: a throwing listener increments
+   * `getStats().rebalanceListenerErrors` and never blocks the
+   * rebalance.
+   */
+  private fireRebalanceListener(
+    groupId: string,
+    trigger: 'join' | 'leave',
+    memberId: string,
+    rosterKey: string,
+    subscriber: Subscriber,
+    partitionRebalance: PartitionRebalanceInfo,
+  ): void {
+    const listener = subscriber.rebalanceListener;
+    if (listener == null) return;
+    const migratedPartitions = new Set<number>();
+    const revoked: number[] = [];
+    const assigned: number[] = [];
+    for (const m of partitionRebalance.migrated) {
+      migratedPartitions.add(m.partition);
+      if (m.from === rosterKey) revoked.push(m.partition);
+      if (m.to === rosterKey) assigned.push(m.partition);
+    }
+    if (trigger === 'join' && rosterKey === memberId) {
+      // The joiner owned nothing before: every post-change partition
+      // it owns that did not arrive via a recorded migration is newly
+      // assigned (the first join's from-null assignment).
+      for (const [pStr, owner] of Object.entries(partitionRebalance.assignment)) {
+        const p = Number(pStr);
+        if (owner === rosterKey && !migratedPartitions.has(p) && !assigned.includes(p)) {
+          assigned.push(p);
+        }
+      }
+      assigned.sort((a, b) => a - b);
+    }
+    if (revoked.length > 0 && listener.onPartitionsRevoked != null) {
+      const ctx: RebalanceRevokeContext = {
+        commitOffsetsSync: (offsets) => {
+          for (const o of offsets) {
+            this.commitOffset(
+              groupId,
+              o.topic,
+              o.seq,
+              o.partition === undefined ? undefined : { partition: o.partition },
+            );
+          }
+        },
+      };
+      try {
+        listener.onPartitionsRevoked(rosterKey, revoked, ctx);
+      } catch {
+        this.totalRebalanceListenerErrors += 1;
+      }
+    }
+    if (assigned.length > 0 && listener.onPartitionsAssigned != null) {
+      try {
+        listener.onPartitionsAssigned(rosterKey, assigned);
+      } catch {
+        this.totalRebalanceListenerErrors += 1;
+      }
+    }
+  }
+
+  /**
    * Emits one rebalance event for a group: the offset pre-flush, the
    * per-member notification, the audit entry and the lag re-check.
    * `suppressed` is the EB-169 debounce count — `0` for an immediate
@@ -24269,6 +24469,13 @@ export class EventBus {
     const staticSubs = this.groupStaticSubs.get(key);
     for (const rosterKey of members) {
       const subscriber = this.subscribers.get(staticSubs?.get(rosterKey) ?? rosterKey);
+      // Consumer rebalance listener (EB-209): the member-level
+      // partition-assignment hook fires before the group-level
+      // onRebalance notification, so a member checkpoints (revoke)
+      // before anyone acts on the new roster.
+      if (subscriber?.rebalanceListener != null && partitionRebalance != null) {
+        this.fireRebalanceListener(groupId, trigger, memberId, rosterKey, subscriber, partitionRebalance);
+      }
       subscriber?.onRebalance?.({
         groupId,
         pattern,
@@ -38205,6 +38412,7 @@ export class EventBus {
       })),
       offsetStoreWriteErrors: this.totalOffsetStoreWriteErrors,
       autoCommittedOffsets: this.totalAutoCommittedOffsets,
+      rebalanceListenerErrors: this.totalRebalanceListenerErrors,
       // Active topic-pause rules (EB-88), in registration order.
       pausedTopics: [...this.pauseRules.entries()].map(([topicPattern, rule]) => ({
         topicPattern,
