@@ -5568,6 +5568,13 @@ export interface BusStats {
    */
   schemaDrifts: number;
   /**
+   * Total messages restored to subscriber queues via explicit gap repair
+   * (`EventBus.requestMissingReplay`, EB-201). Counts each message
+   * actually re-enqueued (after dedup, TTL/filter/backpressure); skipped
+   * records do not count. Always present, 0 when never used.
+   */
+  gapRepaired: number;
+  /**
    * Pull-mode consumption counters (EB-111): `pulls` counts `pull()` calls,
    * `pulledMessages` the messages those calls returned, and
    * `longPollTimeouts` the long polls that waited the full `waitMs`
@@ -13080,6 +13087,11 @@ export class EventBus {
    * `src/fingerprint.ts`). Surfaced as `getStats().schemaDrifts`.
    */
   private totalSchemaDrifts = 0;
+  /**
+   * Messages restored via explicit gap repair (EB-201, see
+   * `requestMissingReplay`). Surfaced as `getStats().gapRepaired`.
+   */
+  private totalGapRepaired = 0;
   /**
    * Per-topic payload fingerprint watchers (EB-200), keyed by the exact
    * `topicPattern` string passed to `setTopicSchemaFingerprint`. Each
@@ -25122,6 +25134,87 @@ export class EventBus {
   }
 
   /**
+   * Repairs a sequence gap for a live subscriber (EB-201): re-reads
+   * messages with per-topic `seq` in `[fromSeq, toSeq]` from the durable
+   * log and re-enqueues them into the subscriber's queue. This is the
+   * remediation action after EB-13 gap detection — e.g. a subscriber that
+   * saw seq 5 then 8 calls `requestMissingReplay(subId, 6, 7)`.
+   *
+   * The replay walks every durable-log topic matching the subscriber's
+   * pattern (alias-aware, like `replayLog`), reads the seq range, and
+   * admits the records through the normal replay path: TTL deadlines are
+   * re-evaluated against the bus clock (expired messages count as
+   * expired, never resurrected), the subscriber's filter applies, and
+   * backpressure policy is honored. Records already present in the
+   * subscriber's queue (same topic+seq) are skipped — the repair never
+   * double-enqueues.
+   *
+   * Returns `{ replayed, unavailable }`: `replayed` counts messages
+   * actually re-enqueued (also added to `getStats().gapRepaired`);
+   * `unavailable` is `true` when there is no durable log or the range
+   * holds no records — an explicit "nothing to repair", never a faked
+   * success. Throws `RangeError` on bad arguments or an unknown
+   * subscriber id.
+   */
+  requestMissingReplay(
+    subId: string,
+    fromSeq: number,
+    toSeq: number,
+  ): { replayed: number; unavailable: boolean } {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('requestMissingReplay: subId must be a non-empty string');
+    }
+    if (!Number.isInteger(fromSeq) || fromSeq < 1) {
+      throw new RangeError('requestMissingReplay: fromSeq must be a positive integer');
+    }
+    if (!Number.isInteger(toSeq) || toSeq < 1) {
+      throw new RangeError('requestMissingReplay: toSeq must be a positive integer');
+    }
+    if (fromSeq > toSeq) {
+      throw new RangeError('requestMissingReplay: fromSeq must be <= toSeq');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber === undefined) {
+      throw new RangeError(`requestMissingReplay: unknown subscriber "${subId}"`);
+    }
+    // The subscriber's namespace log wins; otherwise the bus root log.
+    const log = subscriber.durableLog ?? this.durableLog;
+    if (log === undefined) {
+      return { replayed: 0, unavailable: true };
+    }
+    const matcher = subscriber.matcher;
+    const records: ReplayRecord[] = [];
+    for (const topic of log.topics()) {
+      if (!this.topicMatchesWithAliases(matcher, topic, this.resolveLiveTopic(topic))) continue;
+      for (const rec of log.readSince(topic, fromSeq - 1)) {
+        if (rec.seq >= fromSeq && rec.seq <= toSeq) records.push(rec);
+      }
+    }
+    if (records.length === 0) {
+      return { replayed: 0, unavailable: true };
+    }
+    // Deduplicate against messages already queued: the repair must not
+    // double-enqueue what the subscriber already holds.
+    const queued = new Set<string>();
+    for (const msg of subscriber.queue.snapshot()) {
+      queued.add(`${msg.topic}:${msg.seq}`);
+    }
+    const fresh = records.filter((rec) => !queued.has(`${rec.topic}:${rec.seq}`));
+    if (fresh.length === 0) {
+      return { replayed: 0, unavailable: false };
+    }
+    // Deterministic cross-topic order, like replayLog.
+    fresh.sort(
+      (a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0),
+    );
+    this.admitReplayRecords(subscriber, fresh, { trackProgress: true });
+    const replayed = subscriber.replayProgress?.replayed ?? 0;
+    this.totalGapRepaired += replayed;
+    this.scheduleFlush();
+    return { replayed, unavailable: false };
+  }
+
+  /**
    * Replays durable-log records into a resubscribing subscriber's queue:
    * every logged message on a topic matching the subscriber's pattern with
    * `seq` greater than `fromSeq` is re-enqueued with its original `seq` and
@@ -36954,6 +37047,7 @@ export class EventBus {
       lateMessages: this.totalLateMessages,
       expiringSoonAlerts: this.totalExpiringSoonAlerts,
       schemaDrifts: this.totalSchemaDrifts,
+      gapRepaired: this.totalGapRepaired,
       pullStats: {
         pulls: this.totalPulls,
         pulledMessages: this.totalPulledMessages,

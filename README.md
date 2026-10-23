@@ -371,7 +371,23 @@ library.
   `resumeFromSeq` are mutually exclusive (one replay cursor), and honest
   about history: only what the log still retains replays — messages already
   compacted away cannot be recovered by time. `resumeFromSeq` without
-  `durableLogDir` throws instead of silently replaying nothing. Opt-in replay
+  `durableLogDir` throws instead of silently replaying nothing.
+  **Explicit gap repair** (`requestMissingReplay(subId, fromSeq, toSeq)`,
+  EB-201): the remediation action after EB-13 sequence-gap detection. A
+  live subscriber that observes a seq jump (e.g. saw 5 then 8) calls this
+  to re-read the missing per-topic seq range from the durable log and
+  re-enqueue it. Every matching log topic is scanned (alias-aware, like
+  resume), the `[fromSeq, toSeq]` records are admitted through the normal
+  replay path — TTL deadlines re-evaluated (expired counts as expired,
+  never resurrected), subscriber filter and backpressure honored — and
+  records already in the subscriber's queue (same topic+seq) are skipped
+  so the repair never double-enqueues. Returns `{ replayed,
+  unavailable }`: `replayed` is the count actually re-enqueued (also
+  added to `getStats().gapRepaired` and
+  `eventbus_gap_repaired_messages_total`); `unavailable: true` means no
+  durable log or no records in the range — explicit, never faked.
+  Bad arguments or an unknown subscriber id throw `RangeError`.
+  Opt-in replay
   rate limiting (`replayThrottle: { messagesPerSec, burst? }`, EB-164) caps
   a resume replay's admission rate so a large cold-start replay cannot flood
   a slow handler or downstream: only records actually admitted into the queue

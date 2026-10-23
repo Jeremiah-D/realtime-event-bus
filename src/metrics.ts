@@ -522,6 +522,11 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     stats.schemaDrifts ?? 0,
   );
   counter(
+    'eventbus_gap_repaired_messages_total',
+    'Total messages restored to subscriber queues via explicit gap repair (EB-201).',
+    stats.gapRepaired ?? 0,
+  );
+  counter(
     'eventbus_consumer_lag_slo_breach_total',
     'Total consumer-group lag SLO breach episodes fired (EB-112, see EventBusOptions.groupLag.slo).',
     stats.lagSloBreaches ?? 0,
