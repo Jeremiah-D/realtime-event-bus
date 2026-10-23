@@ -517,6 +517,11 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     stats.expiringSoonAlerts ?? 0,
   );
   counter(
+    'eventbus_schema_drifts_total',
+    'Total payload structural drift events detected by per-topic fingerprint watchers (EB-200).',
+    stats.schemaDrifts ?? 0,
+  );
+  counter(
     'eventbus_consumer_lag_slo_breach_total',
     'Total consumer-group lag SLO breach episodes fired (EB-112, see EventBusOptions.groupLag.slo).',
     stats.lagSloBreaches ?? 0,

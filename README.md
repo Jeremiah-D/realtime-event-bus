@@ -1003,6 +1003,20 @@ library.
   `getStats().topicSchemas` as `compatGate` (`'passed' | 'not-tested'`)
   with `compatCorpusSize`; omitting the corpus skips the gate
   (`'not-tested'`).
+  **Payload structural fingerprint drift** (observe-only, EB-200):
+  `setTopicSchemaFingerprint(pattern, { onDrift })` watches a
+  topic/pattern for silent producer shape changes — no validator, no
+  admission gating. The watcher starts in sampling mode (learns the
+  payload's field-path set from admitted publishes, fires nothing);
+  `promoteTopicSchemaFingerprint(pattern)` promotes the sampled shape to
+  the baseline and arms detection. Afterwards, every admitted publish
+  whose field-path set differs (fields added/removed) fires `onDrift`
+  with `{ topic, fingerprint, added, removed }` (error-isolated) and
+  bumps `getStats().schemaDrifts`. Array length is not structural
+  (`{items:[1,2]}` and `{items:[1,2,3]}` share a fingerprint); only the
+  field set matters. Re-registering resets to sampling;
+  `clearTopicSchemaFingerprint(pattern)` removes the watcher. Orthogonal
+  to EB-86/EB-95 (those admit/reject; this only observes).
 - **Per-topic max message size** (in `src/bus.ts`, via
   `setTopicMaxMessageBytes(pattern, maxBytes)`): an admission gate for
   oversized payloads (backend/real-time systems). A publish whose payload

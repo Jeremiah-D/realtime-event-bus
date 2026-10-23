@@ -54,6 +54,12 @@ import {
   GlobalPublishRateLimiter,
   resolveGlobalPublishRateLimit,
 } from './global-rate-limit.ts';
+import {
+  computePayloadFingerprint,
+  extractFieldPaths,
+  diffFieldPaths,
+  type FingerprintDriftCallback,
+} from './fingerprint.ts';
 import type { GlobalPublishRateLimitOptions } from './global-rate-limit.ts';
 import { TailSampler, resolveTailSamplingOptions } from './tail-sampling.ts';
 import type { TailSamplingOptions } from './tail-sampling.ts';
@@ -504,6 +510,16 @@ export {
 export type { LineageCheckVerdict, LineageHop, MessageLineage } from './lineage.ts';
 export { parseCronExpression, nextCronOccurrence } from './cronparse.ts';
 export type { CronSchedule, CronDomSpec, CronDowSpec } from './cronparse.ts';
+export {
+  computePayloadFingerprint,
+  extractFieldPaths,
+  diffFieldPaths,
+} from './fingerprint.ts';
+export type {
+  FingerprintDrift,
+  FingerprintDriftCallback,
+  TopicFingerprintOptions,
+} from './fingerprint.ts';
 
 /**
  * One cron-driven recurring publish job (see `EventBus.scheduleRecurring`).
@@ -5542,6 +5558,15 @@ export interface BusStats {
    * readers never need a fallback.
    */
   expiringSoonAlerts: number;
+  /**
+   * Total payload structural drift events detected by per-topic
+   * fingerprint watchers (EB-200, see `setTopicSchemaFingerprint`).
+   * Counts each drift once, at detection time; the drift itself never
+   * blocks the publish — this is the observe-only early-warning signal
+   * for producers silently changing shape in production. Always present,
+   * 0 when no watcher ever fired.
+   */
+  schemaDrifts: number;
   /**
    * Pull-mode consumption counters (EB-111): `pulls` counts `pull()` calls,
    * `pulledMessages` the messages those calls returned, and
@@ -13051,6 +13076,26 @@ export class EventBus {
    */
   private totalExpiringSoonAlerts = 0;
   /**
+   * Payload structural drift events detected (EB-200, see
+   * `src/fingerprint.ts`). Surfaced as `getStats().schemaDrifts`.
+   */
+  private totalSchemaDrifts = 0;
+  /**
+   * Per-topic payload fingerprint watchers (EB-200), keyed by the exact
+   * `topicPattern` string passed to `setTopicSchemaFingerprint`. Each
+   * entry holds the compiled matcher, the drift callback, the promoted
+   * baseline (when armed), and the latest sampled shape (for promotion).
+   */
+  private readonly schemaFingerprintRules = new Map<
+    string,
+    {
+      matcher: RegExp;
+      onDrift: FingerprintDriftCallback;
+      baseline?: { fingerprint: string; paths: string[] };
+      sampled?: { fingerprint: string; paths: string[] };
+    }
+  >;
+  /**
    * Active subscription-lease timers (see `src/lease.ts`, EB-69), keyed
    * by subscription id. Armed at subscribe time, cleared from every
    * unsubscribe path, and renewed via `renewLease`.
@@ -18631,6 +18676,100 @@ export class EventBus {
     // empty) registry in place, which resolves nothing: zero side
     // effects on delivery.
     registry.register(fromVersion, toVersion, migrate);
+  }
+
+  /**
+   * Registers a payload structural fingerprint watcher for
+   * `topicPattern` (EB-200): a concrete topic name or a wildcard
+   * pattern (`*` / `**`, same syntax as subscriptions). The watcher
+   * starts in *sampling* mode — it learns the payload shape from
+   * admitted publishes but fires no alerts. Call
+   * `promoteTopicSchemaFingerprint` with the same pattern to promote
+   * the sampled shape to the baseline and arm drift detection.
+   *
+   * After promotion, every admitted publish whose field-path set
+   * differs from the baseline (fields added or removed) fires
+   * `opts.onDrift` (error-isolated, so a throwing callback never
+   * breaks publishing) and increments `getStats().schemaDrifts`.
+   * The drift never blocks admission — this is observe-only, orthogonal
+   * to the schema validators (EB-20/EB-86) and the compatibility gate
+   * (EB-95).
+   *
+   * Re-registering the same pattern replaces the callback and resets
+   * the watcher to sampling mode (the old baseline is discarded).
+   * Throws `RangeError` when `topicPattern` is empty or `opts.onDrift`
+   * is not a function.
+   */
+  setTopicSchemaFingerprint(topicPattern: string, opts: TopicFingerprintOptions): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('setTopicSchemaFingerprint: topicPattern must be a non-empty string');
+    }
+    if (typeof opts !== 'object' || opts === null || typeof opts.onDrift !== 'function') {
+      throw new RangeError('setTopicSchemaFingerprint: opts.onDrift must be a function');
+    }
+    this.schemaFingerprintRules.set(topicPattern, {
+      matcher: compilePattern(topicPattern),
+      onDrift: opts.onDrift,
+      baseline: undefined,
+      sampled: undefined,
+    });
+  }
+
+  /**
+   * Promotes the sampled payload shape to the drift-detection baseline
+   * for `topicPattern` (EB-200): after this call, structural changes
+   * fire the watcher callback. Returns `true` when a sample existed and
+   * was promoted, `false` when no payload has been observed yet (call
+   * again after traffic flows). Throws `RangeError` when no watcher is
+   * registered for the pattern.
+   */
+  promoteTopicSchemaFingerprint(topicPattern: string): boolean {
+    const rule = this.schemaFingerprintRules.get(topicPattern);
+    if (rule === undefined) {
+      throw new RangeError(
+        `promoteTopicSchemaFingerprint: no fingerprint watcher registered for "${topicPattern}"`,
+      );
+    }
+    if (rule.sampled === undefined) return false;
+    rule.baseline = rule.sampled;
+    return true;
+  }
+
+  /**
+   * Removes the fingerprint watcher for `topicPattern` (EB-200).
+   * Returns `true` when a watcher was removed.
+   */
+  clearTopicSchemaFingerprint(topicPattern: string): boolean {
+    return this.schemaFingerprintRules.delete(topicPattern);
+  }
+
+  /**
+   * Observes one admitted publish's payload against every registered
+   * fingerprint watcher (EB-200). Sampling mode records the shape;
+   * armed mode diffs against the baseline and fires `onDrift` on change.
+   * Never throws — callback errors are isolated.
+   */
+  private observePayloadFingerprint(topic: string, payload: unknown): void {
+    if (this.schemaFingerprintRules.size === 0) return;
+    for (const rule of this.schemaFingerprintRules.values()) {
+      if (!rule.matcher.test(topic)) continue;
+      const paths = extractFieldPaths(payload);
+      const fingerprint = computePayloadFingerprint(payload);
+      if (rule.baseline === undefined) {
+        // Sampling: learn the current shape. Keep the latest sample —
+        // promotion arms whatever the traffic looks like now.
+        rule.sampled = { fingerprint, paths };
+        continue;
+      }
+      if (fingerprint === rule.baseline.fingerprint) continue;
+      const { added, removed } = diffFieldPaths(rule.baseline.paths, paths);
+      this.totalSchemaDrifts += 1;
+      try {
+        rule.onDrift({ topic, fingerprint, added, removed });
+      } catch {
+        // Error-isolated: a throwing drift callback never breaks publishing.
+      }
+    }
   }
 
   /**
@@ -26371,6 +26510,12 @@ export class EventBus {
         accepted,
         keyClaim.nowMs,
       );
+    }
+    // Payload structural fingerprint observation (EB-200): observe-only,
+    // never blocks admission. Only admitted publishes are observed —
+    // rejected/shed publishes never shape the baseline.
+    if (admitted) {
+      this.observePayloadFingerprint(topic, payload);
     }
     this.scheduleFlush();
     return { accepted, admitted, rejectReason, seq, topic };
@@ -36808,6 +36953,7 @@ export class EventBus {
       unregisteredTopicPublishes: this.unregisteredTopicPublishes,
       lateMessages: this.totalLateMessages,
       expiringSoonAlerts: this.totalExpiringSoonAlerts,
+      schemaDrifts: this.totalSchemaDrifts,
       pullStats: {
         pulls: this.totalPulls,
         pulledMessages: this.totalPulledMessages,
