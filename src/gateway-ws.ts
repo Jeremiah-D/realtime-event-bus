@@ -3,7 +3,7 @@
  * so remote processes (other languages, browsers, edge workers) can
  * publish and subscribe without embedding the bus.
  *
- * Zero new dependencies: `node:net` + `node:crypto` only. The server-side
+ * Zero new dependencies: `node:net` + `node:crypto` + `node:zlib` only. The server-side
  * frame codec is adapted from the client-side codec in webhook-relay-ts
  * (`src/websocket.ts`, WR-45): same opcodes, same masking rules (clients
  * mask, servers never do), same incremental parsing.
@@ -77,6 +77,21 @@
  * carry `Authorization: Bearer <token>` (constant-time compare), otherwise
  * the server answers 401 and drops the connection.
  *
+ * permessage-deflate (RFC 7692, EB-206, opt-in via `permessageDeflate`):
+ * when the client offers the extension, the server selects it and answers
+ * `permessage-deflate; client_no_context_takeover` (plus agreed
+ * `server_max_window_bits` / `client_max_window_bits`, default 15,
+ * range 8-15). Client context takeover is never used, and the server
+ * never reuses its own deflate context either — every message
+ * compresses/decompresses independently. Server -> client text and
+ * binary message frames at/above `compressThresholdBytes` (default
+ * 1024) whose compressed form is strictly smaller go out with RSV1
+ * set (trailing `00 00 ff ff` stripped per RFC 7692 §7.2.1); anything
+ * else goes out plaintext, and a failed or non-shrinking deflate
+ * always falls back to plaintext. Inbound RSV1 frames are inflated
+ * symmetrically (trailer re-appended). Invalid offers fail the
+ * handshake; clients that offer nothing connect normally in plaintext.
+ *
  * Backpressure (server -> client): frames are written while the socket
  * buffer stays under `sendHighWaterMarkBytes`; past it the connection
  * pauses and frames accumulate in a bounded per-connection queue. When
@@ -84,7 +99,9 @@
  * counted in `droppedFrames` — the gateway sheds load instead of growing
  * memory without bound. `GatewayServer.getStats()` reports
  * `{connections, framesReceived, framesSent, droppedFrames,
- * authFailures, protocolErrors, pausedConnections, connectionQueues}`.
+ * authFailures, protocolErrors, pausedConnections, connectionQueues,
+ * compressedFrames, deflatedBytes, savedBytes}` (the deflate counters
+ * are zero-initialized when the extension is disabled).
  *
  * Client pressure (EB-161, opt-in): with
  * `clientPressureWatermarkBytes` set, a connection whose queued bytes
@@ -114,6 +131,15 @@ import {
   type SubscribeOptions,
   type Subscription,
 } from './bus.ts';
+import {
+  decompressMessage,
+  maybeCompressMessage,
+  negotiateServerDeflate,
+  resolvePerMessageDeflate,
+  WsInflateBombError,
+  type PerMessageDeflateOptions,
+  type ResolvedPerMessageDeflate,
+} from './gateway-deflate.ts';
 
 // --- RFC 6455 codec (server side) ------------------------------------------
 
@@ -129,10 +155,14 @@ function wsAcceptKey(key: string): string {
   return createHash('sha1').update(key + WS_GUID).digest('base64');
 }
 
-/** Encode one server-to-client frame: servers never mask (RFC 6455 §5.3). */
-function encodeFrame(opcode: number, payload: Buffer): Buffer {
+/**
+ * Encode one server-to-client frame: servers never mask (RFC 6455 §5.3).
+ * `rsv1` sets the RSV1 bit (RFC 7692 §7.2.1) for permessage-deflate
+ * frames — only ever set on data frames when the extension negotiated.
+ */
+function encodeFrame(opcode: number, payload: Buffer, rsv1 = false): Buffer {
   const len = payload.length;
-  const b0 = 0x80 | opcode;
+  const b0 = (rsv1 ? 0x40 : 0) | 0x80 | opcode;
   let header: Buffer;
   if (len < 126) {
     header = Buffer.from([b0, len]);
@@ -153,6 +183,8 @@ function encodeFrame(opcode: number, payload: Buffer): Buffer {
 interface WsMessage {
   opcode: number;
   payload: Buffer;
+  /** RSV1 was set on the first frame of this message (permessage-deflate). */
+  rsv1: boolean;
 }
 
 /**
@@ -202,12 +234,21 @@ function encodeBinaryMessageBody(payload: unknown): { bytes: Buffer; encoding: '
  * chunks, pull out complete messages. Masked inbound frames are unmasked
  * (clients must mask; unmasked frames are tolerated). Throws on frames
  * whose declared length exceeds `maxFrameBytes`.
+ *
+ * permessage-deflate (EB-206): set `permessageDeflate` once the
+ * extension negotiated; RSV1 is then legal on data frames (first
+ * fragment only — continuations and control frames must keep RSV1
+ * clear) and is reported on the assembled message. Without the
+ * extension, any set RSV bit throws, as before.
  */
 class FrameParser {
   private buf = Buffer.alloc(0);
   private fragments: Buffer[] = [];
   private fragmentOpcode = -1;
+  private fragmentRsv1 = false;
   private readonly maxFrameBytes: number;
+  /** Set when permessage-deflate negotiated on this connection. */
+  permessageDeflate = false;
 
   constructor(maxFrameBytes: number) {
     this.maxFrameBytes = maxFrameBytes;
@@ -219,32 +260,46 @@ class FrameParser {
     for (;;) {
       const frame = this.nextFrame();
       if (frame === undefined) return out;
-      const { fin, opcode, payload } = frame;
+      const { fin, opcode, payload, rsv1 } = frame;
+      const isControl = opcode >= OP_CLOSE;
+      if (isControl && rsv1) {
+        throw new Error('websocket: RSV1 set on control frame');
+      }
       if (opcode === OP_CONT) {
         if (this.fragmentOpcode === -1) throw new Error('websocket: unexpected continuation');
+        if (rsv1) throw new Error('websocket: RSV1 set on continuation frame');
         this.fragments.push(payload);
         if (fin) {
-          out.push({ opcode: this.fragmentOpcode, payload: Buffer.concat(this.fragments) });
+          out.push({
+            opcode: this.fragmentOpcode,
+            payload: Buffer.concat(this.fragments),
+            rsv1: this.fragmentRsv1,
+          });
           this.fragments = [];
           this.fragmentOpcode = -1;
+          this.fragmentRsv1 = false;
         }
         continue;
       }
       if (!fin && (opcode === OP_TEXT || opcode === OP_BINARY)) {
         this.fragments = [payload];
         this.fragmentOpcode = opcode;
+        this.fragmentRsv1 = rsv1;
         continue;
       }
-      out.push({ opcode, payload });
+      out.push({ opcode, payload, rsv1 });
     }
   }
 
-  private nextFrame(): { fin: boolean; opcode: number; payload: Buffer } | undefined {
+  private nextFrame(): { fin: boolean; opcode: number; payload: Buffer; rsv1: boolean } | undefined {
     const b = this.buf;
     if (b.length < 2) return undefined;
     const fin = (b[0] & 0x80) !== 0;
     const rsv = b[0] & 0x70;
-    if (rsv !== 0) throw new Error('websocket: RSV bits set without negotiated extension');
+    const rsv1 = (b[0] & 0x40) !== 0;
+    if (rsv !== 0 && !(rsv === 0x40 && this.permessageDeflate)) {
+      throw new Error('websocket: RSV bits set without negotiated extension');
+    }
     const opcode = b[0] & 0x0f;
     const masked = (b[1] & 0x80) !== 0;
     let len = b[1] & 0x7f;
@@ -272,7 +327,7 @@ class FrameParser {
       payload = unmasked;
     }
     this.buf = b.subarray(off + maskOff + len);
-    return { fin, opcode, payload };
+    return { fin, opcode, payload, rsv1 };
   }
 }
 
@@ -375,6 +430,26 @@ export interface GatewayOptions {
    * swallowed: teardown must not fail.
    */
   onDisconnect?: (event: GatewayDisconnectEvent) => void;
+  /**
+   * Opt-in permessage-deflate (RFC 7692, EB-206): `true` enables with
+   * defaults, or pass `PerMessageDeflateOptions` to tune it.
+   * `false`/`undefined` (default) disables — the extension is never
+   * selected and every frame goes out plaintext.
+   *
+   * When enabled and the client offers `permessage-deflate`, the
+   * server selects it and answers
+   * `permessage-deflate; client_no_context_takeover` (plus agreed
+   * window-bits params). Client context takeover is never used, and
+   * the server never reuses its own deflate context either: every
+   * message compresses and decompresses independently.
+   * `compressThresholdBytes` (default 1024) gates compression by
+   * payload size; payloads whose compressed form is not smaller than
+   * the original go out plaintext. `serverMaxWindowBits` /
+   * `clientMaxWindowBits` (default 15, range 8–15) tune the LZ77
+   * windows in each direction. Invalid values throw `RangeError` at
+   * construction, like every other option.
+   */
+  permessageDeflate?: boolean | PerMessageDeflateOptions;
 }
 
 /** One established gateway connection's teardown, as delivered to `onDisconnect`. */
@@ -411,6 +486,12 @@ export interface GatewayStats {
     /** Live bus subscriptions on this connection (EB-173). */
     subscriptions: number;
   }>;
+  /** Server→client frames sent with RSV1 (permessage-deflate, EB-206). */
+  compressedFrames: number;
+  /** Sum of compressed payload bytes sent on the wire (post-deflate). */
+  deflatedBytes: number;
+  /** Sum of `original − compressed` bytes saved by compression. */
+  savedBytes: number;
 }
 
 interface ConnectionSubscription {
@@ -429,6 +510,25 @@ interface Connection {
   pending: Buffer[];
   pendingBytes: number;
   subscriptions: Map<string, ConnectionSubscription>;
+  /**
+   * permessage-deflate negotiation for this connection (EB-206):
+   * set when the handshake selected the extension — the window bits
+   * the server must use when compressing to this client. Undefined
+   * means plaintext both ways.
+   */
+  deflate: { serverWindowBits: number } | undefined;
+  /**
+   * Outbound serialization chain: compression is async, so every
+   * outbound frame is appended here to keep wire order across slow
+   * compresses. Settling the chain never throws.
+   */
+  sendChain: Promise<void>;
+  /**
+   * Inbound serialization chain: decompression is async, so every
+   * inbound message is appended here to keep processing order.
+   * Settling the chain never throws.
+   */
+  recvChain: Promise<void>;
   /**
    * Client-pressure state (EB-161): true while the connection's queued
    * bytes are at or above the pressure watermark and its subscriptions
@@ -484,6 +584,8 @@ export class GatewayServer {
   private readonly maxSubscriptionsPerConnection: number | undefined;
   private readonly clientPressureRecoveryWatermarkBytes: number;
   private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
+  /** Resolved permessage-deflate config (EB-206); undefined = disabled. */
+  private readonly deflateOpts: ResolvedPerMessageDeflate | undefined;
   private server: TcpServer | null = null;
   private readonly connections = new Set<Connection>();
   private readonly stats: GatewayStats = {
@@ -493,6 +595,9 @@ export class GatewayServer {
     droppedFrames: 0,
     authFailures: 0,
     protocolErrors: 0,
+    compressedFrames: 0,
+    deflatedBytes: 0,
+    savedBytes: 0,
   };
 
   constructor(bus: EventBus, options: GatewayOptions = {}) {
@@ -558,6 +663,15 @@ export class GatewayServer {
       fail('onDisconnect must be a function');
     }
     this.onDisconnect = onDisconnect;
+    // EB-206: validate permessage-deflate once, at construction.
+    // RangeError here, like every other option, is fail-fast.
+    let deflateOpts: ResolvedPerMessageDeflate | undefined;
+    try {
+      deflateOpts = resolvePerMessageDeflate(options.permessageDeflate);
+    } catch (err) {
+      fail((err as Error).message);
+    }
+    this.deflateOpts = deflateOpts;
   }
 
   /** Starts listening; resolves with the bound port. */
@@ -618,6 +732,9 @@ export class GatewayServer {
       pressured: false,
       pressurePausedSubs: new Set(),
       drainPoll: undefined,
+      deflate: undefined,
+      sendChain: Promise.resolve(),
+      recvChain: Promise.resolve(),
     };
     this.connections.add(conn);
     this.stats.connections += 1;
@@ -653,7 +770,13 @@ export class GatewayServer {
         this.closeWithCode(conn, 1009, 'frame too large');
         return;
       }
-      for (const msg of messages) this.handleWsMessage(conn, msg);
+      // Inbound order is connection-scoped: decompression is async, so
+      // each message joins the connection's receive chain. The chain
+      // settles without throwing (processWsMessage is infallible).
+      for (const msg of messages) {
+        const task = (): Promise<void> => this.processWsMessage(conn, msg);
+        conn.recvChain = conn.recvChain.then(task, task);
+      }
     });
     socket.on('drain', () => {
       if (conn.closed || conn.handshook === false) return;
@@ -703,11 +826,34 @@ export class GatewayServer {
         return reject('401 Unauthorized');
       }
     }
+    // EB-206: permessage-deflate negotiation. An enabled server that
+    // cannot honor the client's offer fails the handshake outright;
+    // a client that offers nothing (or a server with the extension
+    // disabled) connects normally in plaintext.
+    let extensionsResponse: string | undefined;
+    if (this.deflateOpts !== undefined) {
+      const offered = headers.get('sec-websocket-extensions');
+      if (offered !== undefined && offered.trim() !== '') {
+        try {
+          const negotiated = negotiateServerDeflate(offered, this.deflateOpts);
+          if (negotiated !== null) {
+            extensionsResponse = negotiated.response;
+            conn.deflate = { serverWindowBits: negotiated.serverWindowBits };
+            conn.parser.permessageDeflate = true;
+          }
+        } catch {
+          return reject('400 Bad Request');
+        }
+      }
+    }
     conn.socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
         'Upgrade: websocket\r\n' +
         'Connection: Upgrade\r\n' +
         `Sec-WebSocket-Accept: ${wsAcceptKey(key)}\r\n` +
+        (extensionsResponse === undefined
+          ? ''
+          : `Sec-WebSocket-Extensions: ${extensionsResponse}\r\n`) +
         '\r\n',
     );
     conn.handshook = true;
@@ -767,7 +913,53 @@ export class GatewayServer {
   // --- outbound -------------------------------------------------------------
 
   private sendJson(conn: Connection, value: object): void {
-    this.sendRaw(conn, encodeFrame(OP_TEXT, Buffer.from(JSON.stringify(value), 'utf8')));
+    this.sendFrame(conn, OP_TEXT, Buffer.from(JSON.stringify(value), 'utf8'), true);
+  }
+
+  /**
+   * Queues one outbound data frame on the connection's send chain.
+   * Compression is async, so the frame joins the chain to keep wire
+   * order across slow compresses; settling the chain never throws.
+   * Control frames (ping/pong/close) bypass this and are written
+   * directly, never compressed.
+   */
+  private sendFrame(conn: Connection, opcode: number, payload: Buffer, compressible: boolean): void {
+    if (conn.closed) return;
+    const task = async (): Promise<void> => {
+      const frame = await this.buildFrame(conn, opcode, payload, compressible);
+      this.sendRaw(conn, frame);
+    };
+    conn.sendChain = conn.sendChain.then(task, task);
+  }
+
+  /**
+   * Builds one outbound data frame, applying permessage-deflate (EB-206)
+   * when negotiated: payloads at/above `compressThresholdBytes` whose
+   * compressed form is strictly smaller go out with RSV1 set. A failed
+   * deflate or a non-shrinking result falls back to plaintext — never
+   * breaking frame semantics.
+   */
+  private async buildFrame(
+    conn: Connection,
+    opcode: number,
+    payload: Buffer,
+    compressible: boolean,
+  ): Promise<Buffer> {
+    const negotiated = conn.deflate;
+    if (compressible && negotiated !== undefined && this.deflateOpts !== undefined) {
+      const { bytes, compressed } = await maybeCompressMessage(
+        payload,
+        this.deflateOpts.compressThresholdBytes,
+        negotiated.serverWindowBits,
+      );
+      if (compressed) {
+        this.stats.compressedFrames += 1;
+        this.stats.deflatedBytes += bytes.length;
+        this.stats.savedBytes += payload.length - bytes.length;
+        return encodeFrame(opcode, bytes, true);
+      }
+    }
+    return encodeFrame(opcode, payload);
   }
 
   private sendError(conn: Connection, code: ErrorCode, message: string, id?: unknown): void {
@@ -926,6 +1118,39 @@ export class GatewayServer {
 
   // --- inbound ---------------------------------------------------------------
 
+  /**
+   * One inbound message off the connection's receive chain: RSV1 data
+   * frames (permessage-deflate, EB-206) are decompressed with a fresh
+   * inflate context before the frame enters the normal dispatch below.
+   * A decompression bomb (past `maxInflatedBytes`) or corrupt input
+   * fails the connection — a tampered compressed frame must not
+   * produce garbage bytes. Infallible: settling never throws.
+   */
+  private async processWsMessage(conn: Connection, msg: WsMessage): Promise<void> {
+    if (conn.closed) return;
+    if (msg.rsv1) {
+      if (conn.deflate === undefined || this.deflateOpts === undefined) {
+        this.stats.protocolErrors += 1;
+        this.closeWithCode(conn, 1002, 'unexpected compressed frame');
+        return;
+      }
+      let payload: Buffer;
+      try {
+        payload = await decompressMessage(msg.payload, this.deflateOpts.maxInflatedBytes);
+      } catch (err) {
+        this.stats.protocolErrors += 1;
+        if (err instanceof WsInflateBombError) {
+          this.closeWithCode(conn, 1009, 'compressed frame too large');
+        } else {
+          this.closeWithCode(conn, 1007, 'invalid compressed frame');
+        }
+        return;
+      }
+      msg = { opcode: msg.opcode, payload, rsv1: false };
+    }
+    this.handleWsMessage(conn, msg);
+  }
+
   private handleWsMessage(conn: Connection, msg: WsMessage): void {
     if (conn.closed) return;
     switch (msg.opcode) {
@@ -1053,24 +1278,23 @@ export class GatewayServer {
     const emitLive = (item: OutboxItem, subId: string): void => {
       if (binaryDelivery) {
         const { bytes, encoding } = encodeBinaryMessageBody(item.payload);
-        this.sendRaw(
+        this.sendFrame(
           conn,
-          encodeFrame(
-            OP_BINARY,
-            encodeBinaryFrame(
-              {
-                type: 'message',
-                subId,
-                topic: item.topic,
-                seq: item.seq,
-                encoding,
-                ...(item.delivery !== undefined
-                  ? { deliveryId: item.delivery.seq, redeliveries: item.redeliveries }
-                  : {}),
-              },
-              bytes,
-            ),
+          OP_BINARY,
+          encodeBinaryFrame(
+            {
+              type: 'message',
+              subId,
+              topic: item.topic,
+              seq: item.seq,
+              encoding,
+              ...(item.delivery !== undefined
+                ? { deliveryId: item.delivery.seq, redeliveries: item.redeliveries }
+                : {}),
+            },
+            bytes,
           ),
+          true,
         );
         return;
       }

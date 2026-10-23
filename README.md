@@ -4126,7 +4126,7 @@ is mutated.
 `src/gateway-ws.ts` exposes an `EventBus` over RFC 6455 WebSocket so remote
 processes — other languages, browsers, edge workers — can publish and
 subscribe without embedding the bus. Zero new dependencies (`node:net` +
-`node:crypto` only); the server-side frame codec is adapted from the
+`node:crypto` + `node:zlib` only); the server-side frame codec is adapted from the
 client-side codec in webhook-relay-ts (`src/websocket.ts`, WR-45).
 
 ```ts
@@ -4190,6 +4190,31 @@ Semantics:
   `resumeFromSeq` / `resumeFromTime` (EB-17/EB-42) and namespaces (EB-52)
   work for reconnecting clients. Function-valued options (filters, hooks)
   cannot cross the wire.
+- **permessage-deflate (RFC 7692, EB-206, opt-in).** Pass
+  `permessageDeflate: true` (or an options object) to `GatewayServer`:
+  when the client offers `permessage-deflate` in `Sec-WebSocket-Extensions`,
+  the server selects it and answers
+  `permessage-deflate; client_no_context_takeover` plus any agreed
+  window-bits parameters. Client context takeover is never used, and the
+  server never reuses its own deflate context either — every message
+  compresses and decompresses independently, so a client that reuses
+  context across messages fails with a 1007 close instead of silently
+  mis-decoding. Server → client text and binary message frames at/above
+  `compressThresholdBytes` (default 1024) whose compressed form is
+  strictly smaller go out with RSV1 set (the `00 00 ff ff` sync-flush
+  trailer is stripped per RFC 7692 §7.2.1); anything else — and any
+  failed or non-shrinking deflate — goes out plaintext, never breaking
+  frame semantics. Inbound RSV1 frames are inflated symmetrically
+  (trailer re-appended, fresh context, 8 MiB decompression-bomb cap).
+  Invalid offers (unknown parameters, window bits outside 8–15) fail the
+  handshake; clients that offer nothing connect normally in plaintext.
+  `serverMaxWindowBits` / `clientMaxWindowBits` (default 15, validated
+  8–15) tune the LZ77 windows in each direction. `gw.getStats()` exposes
+  `compressedFrames` (RSV1 frames sent), `deflatedBytes` (compressed
+  payload bytes on the wire), and `savedBytes` (`original − compressed`,
+  so `deflatedBytes + savedBytes` equals the original bytes) — all
+  zero-initialized when the extension is disabled. Zero new dependencies
+  (`node:zlib` only).
 - **Retained snapshots keep wire order.** A synchronous retained snapshot
   (EB-87) is buffered until the subscription registers, so the client
   sees snapshot messages before the `subscribed` ack, then live messages.
@@ -4203,7 +4228,8 @@ Semantics:
   `droppedFrames` — the gateway sheds load instead of growing memory.
   `gw.getStats()` reports
   `{connections, framesReceived, framesSent, droppedFrames, authFailures,
-  protocolErrors, pausedConnections, connectionQueues}`.
+  protocolErrors, pausedConnections, connectionQueues, compressedFrames,
+  deflatedBytes, savedBytes}`.
 - **Client pressure (EB-161, opt-in).** With
   `clientPressureWatermarkBytes` set, a connection whose queued bytes
   reach the watermark pauses its bus subscriptions (delivery-side hold —
