@@ -33,10 +33,41 @@ export interface FingerprintDrift {
 /** Callback fired when a watched topic's payload structure drifts. */
 export type FingerprintDriftCallback = (drift: FingerprintDrift) => void;
 
+/** A per-subscriber oversize skip observed on a watched topic (EB-208). */
+export interface FingerprintOversize {
+  /** The concrete topic the oversized message was published to. */
+  topic: string;
+  /** The subscriber id that skipped the message. */
+  subscriberId: string;
+  /** The message payload's size in UTF-8 JSON bytes (the EB-120 yardstick). */
+  payloadBytes: number;
+  /** The cap that was exceeded, in bytes. */
+  capBytes: number;
+  /**
+   * Where the cap came from: `'subscriber'` = the subscriber's explicit
+   * `subscriberMaxPayloadBytes`, `'topic'` = the inherited topic-level
+   * payload cap (`setTopicMaxPayloadBytes`, EB-120).
+   */
+  capSource: 'subscriber' | 'topic';
+}
+
+/** Callback fired when a watched topic sees a subscriber oversize skip. */
+export type FingerprintOversizeCallback = (oversize: FingerprintOversize) => void;
+
 /** Options for `EventBus.setTopicSchemaFingerprint`. */
 export interface TopicFingerprintOptions {
   /** Fired (error-isolated) on every structural drift after promotion. */
   onDrift: FingerprintDriftCallback;
+  /**
+   * Fired (error-isolated) whenever a subscriber skips an oversize
+   * message on a matching topic (EB-208 linkage): the message exceeded
+   * the subscriber's payload cap — its explicit
+   * `subscriberMaxPayloadBytes`, or the inherited EB-120 topic cap.
+   * Optional: a watcher that only cares about structural drift omits it.
+   * Never fires for publish-side admission rejections (those never reach
+   * a subscriber).
+   */
+  onOversize?: FingerprintOversizeCallback;
 }
 
 /**

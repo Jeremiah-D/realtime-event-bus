@@ -467,6 +467,11 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     stats.headerFilteredMessages ?? 0,
   );
   counter(
+    'eventbus_subscriber_oversize_dropped_total',
+    "Total messages skipped by per-subscriber payload-size caps (EB-208): the payload exceeded the subscriber's explicit subscriberMaxPayloadBytes or the inherited EB-120 topic cap — never queued, no backpressure/throttle/shaping/credit budget burned, no ack obligation, never a sequence gap.",
+    stats.subscriberOversizeDropped ?? 0,
+  );
+  counter(
     'eventbus_signature_failures_total',
     'Total messages discarded by verifySignature subscribers because the envelope HMAC signature was missing or invalid (EB-84).',
     stats.signatureFailures ?? 0,
@@ -944,6 +949,25 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
       const label = `topic="${escapeLabelValue(t.topic)}"`;
       lines.push(
         `eventbus_header_filtered_messages_total{${label}} ${t.headerFilteredMessages ?? 0}`,
+      );
+    }
+  }
+
+  // Per-subscriber payload-size caps (EB-208): per-topic skip counts.
+  // Activity-gated — the series render only when at least one topic has
+  // an oversize skip, so a bus without capped subscribers renders
+  // byte-identical exposition to before. Shares the
+  // `eventbus_subscriber_oversize_dropped_total` name with the global
+  // counter above — same metric, per-topic label set — so no second
+  // HELP/TYPE block is emitted here. `?? 0` keeps the renderer tolerant
+  // of a stats object that predates the field (hand-built fixtures
+  // included), mirroring the per-topic idiom above.
+  const oversizeDroppedTopics = stats.topics.filter((t) => (t.subscriberOversizeDropped ?? 0) > 0);
+  if (oversizeDroppedTopics.length > 0) {
+    for (const t of stats.topics) {
+      const label = `topic="${escapeLabelValue(t.topic)}"`;
+      lines.push(
+        `eventbus_subscriber_oversize_dropped_total{${label}} ${t.subscriberOversizeDropped ?? 0}`,
       );
     }
   }

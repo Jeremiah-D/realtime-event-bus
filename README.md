@@ -1050,7 +1050,12 @@ library.
   (`{items:[1,2]}` and `{items:[1,2,3]}` share a fingerprint); only the
   field set matters. Re-registering resets to sampling;
   `clearTopicSchemaFingerprint(pattern)` removes the watcher. Orthogonal
-  to EB-86/EB-95 (those admit/reject; this only observes).
+  to EB-86/EB-95 (those admit/reject; this only observes). The options
+  object also accepts an optional `onOversize` callback (EB-208 linkage):
+  fired (error-isolated) whenever a subscriber skips an oversize message
+  on a matching topic, with `{ topic, subscriberId, payloadBytes,
+  capBytes, capSource }` — the same per-topic watchers double as the
+  alert channel for per-subscriber payload-cap drops.
 - **Per-topic max message size** (in `src/bus.ts`, via
   `setTopicMaxMessageBytes(pattern, maxBytes)`): an admission gate for
   oversized payloads (backend/real-time systems). A publish whose payload
@@ -1101,6 +1106,29 @@ library.
   `setTopicMaxMessageBytes` are configured for a topic, the message-size
   cap is evaluated first. Empty patterns and non-positive-integer sizes
   throw `RangeError`. Unset by default (fully backward compatible).
+- **Per-subscriber payload-size cap** (in `src/bus.ts`, via
+  `SubscribeOptions.subscriberMaxPayloadBytes`, EB-208): the consume-side
+  complement of the EB-64/EB-120 publish-side caps — protecting slow or
+  small-memory subscribers from large payloads. A message whose payload
+  exceeds the subscriber's cap is skipped for that subscriber only: never
+  queued (no backpressure budget consumed), no throttle / shaping / credit
+  budget burned, no ack obligation on reliable subscriptions, never the
+  DLQ. The skip is deliberate subscriber-side narrowing (like a content
+  filter): the per-topic sequence baseline advances over it, so it never
+  counts as a sequence gap, and consumer-group offsets keep the filter-skip
+  semantics. The byte measure is the EB-120 yardstick (`payloadByteSize`).
+  Default: inherits the topic's EB-120 payload cap resolved for the
+  message's topic at delivery time — an explicit value wins; with neither,
+  the subscriber has no cap (fully backward compatible). The skip counts
+  into `TopicStats.subscriberOversizeDropped` / `BusStats.subscriberOversizeDropped`
+  (also rendered as `eventbus_subscriber_oversize_dropped_total` in the
+  Prometheus exposition) and fires the topic's EB-200 fingerprint watchers'
+  optional `onOversize` callback (error-isolated) with `{ topic,
+  subscriberId, payloadBytes, capBytes, capSource }`, linking oversize
+  drops into the same per-topic alert channel as structural drift. Applies
+  uniformly: live fan-out, durable-log replay (`resumeFromSeq` /
+  `resumeFromTime`), and the retained-message snapshot. Non-positive-integer
+  values throw `RangeError` at subscribe time.
 - **Per-topic sensitive-field redaction** (in `src/bus.ts`, via
   `setTopicRedaction(pattern, fields)`): admission-time masking of
   sensitive payload fields for PII/secret hygiene (backend/real-time
@@ -3927,6 +3955,8 @@ Exported series:
 | `eventbus_duplicate_messages_total` | counter | `duplicateMessages` — idempotent-publish suppressions |
 | `eventbus_unregistered_topic_publishes_total` | counter | `unregisteredTopicPublishes` — publishes to topics with no live catalog registration (advisory; delivered normally) |
 | `eventbus_filtered_messages_total` | counter | `filteredMessages` — subscriber content-filter skips |
+| `eventbus_subscriber_oversize_dropped_total` | counter | `subscriberOversizeDropped` — per-subscriber payload-cap skips (EB-208) |
+| `eventbus_subscriber_oversize_dropped_total{topic}` | counter | per-topic `subscriberOversizeDropped` (EB-208); only topics with ≥1 skip carry a series |
 | `eventbus_signature_failures_total` | counter | `signatureFailures` — messages discarded by `verifySignature` subscribers (missing/invalid HMAC signature, EB-84) |
 | `eventbus_signature_failures_total{topic}` | counter | per-topic `signatureFailures` (EB-84) |
 | `eventbus_mirror_conflicts_total{topic}` | counter | per-topic mirror write conflicts — stale writes dropped by per-key last-writer-wins arbitration on the mirror receive side (EB-131); only topics with ≥1 conflict carry a series |

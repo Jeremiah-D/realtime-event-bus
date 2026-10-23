@@ -59,6 +59,7 @@ import {
   extractFieldPaths,
   diffFieldPaths,
   type FingerprintDriftCallback,
+  type FingerprintOversizeCallback,
 } from './fingerprint.ts';
 import {
   validateJsonPatchOps,
@@ -529,6 +530,8 @@ export {
 export type {
   FingerprintDrift,
   FingerprintDriftCallback,
+  FingerprintOversize,
+  FingerprintOversizeCallback,
   TopicFingerprintOptions,
 } from './fingerprint.ts';
 export {
@@ -1380,6 +1383,30 @@ export interface SubscribeOptions {
    * number when given.
    */
   queueMaxBytes?: number;
+  /**
+   * Opt-in per-subscriber payload-size cap, in bytes (EB-208): messages
+   * whose payload exceeds the cap are skipped for this subscriber only —
+   * never queued, no backpressure budget consumed, no throttle / shaping
+   * / credit budget burned, no ack obligation on reliable subscriptions —
+   * protecting slow or small-memory subscribers from large payloads.
+   * The skip counts into `subscriberOversizeDropped` (per-topic + global)
+   * and fires the topic's EB-200 fingerprint watchers' `onOversize`
+   * linkage; the subscriber's per-topic sequence baseline advances over
+   * the skip, so it never counts as a sequence gap (deliberate
+   * subscriber-side narrowing, like a content-filter rejection).
+   *
+   * Payload size uses the EB-120 yardstick: JSON UTF-8 bytes
+   * (unserializable payloads measure 0 and always pass), binary
+   * `Uint8Array` payloads measure as their wire bytes.
+   *
+   * Default: inherits the topic's EB-120 payload cap
+   * (`setTopicMaxPayloadBytes`) resolved for the message's topic at
+   * delivery time — an explicit value here wins over the inherited one.
+   * With neither, the subscriber has no cap (fully backward compatible).
+   * Must be a positive integer when given — anything else throws
+   * `RangeError` at subscribe time.
+   */
+  subscriberMaxPayloadBytes?: number;
   /**
    * Opt-in subscription lease, in milliseconds (see `src/lease.ts`,
    * EB-69): the subscription automatically unsubscribes when the lease
@@ -5126,6 +5153,20 @@ export interface TopicStats {
    */
   headerFilteredMessages: number;
   /**
+   * Messages fanned out on this topic that a subscriber skipped because
+   * they exceeded its payload-size cap (see
+   * `SubscribeOptions.subscriberMaxPayloadBytes`, EB-208): the message
+   * never entered that subscriber's queue — no backpressure budget
+   * consumed, no throttle / shaping / credit budget burned, no ack
+   * obligation — and the subscriber's per-topic baseline advanced over
+   * it, so it is invisible to sequence-gap detection. Counts each
+   * skipped delivery once, so a message fanned out to N capped
+   * subscribers that all skip it contributes N here. Kept separate from
+   * `filteredMessages`: size narrowing and content filtering are
+   * independent decisions and stay observable independently.
+   */
+  subscriberOversizeDropped: number;
+  /**
    * Messages on this topic admitted by subscriber-side delivery-sampling
    * gates (see `SubscribeOptions.deliverySampleRate`, EB-152): the
    * message's `seq` satisfied the subscriber's `seq % N === 0` decision
@@ -5914,6 +5955,14 @@ export interface BusStats {
    * header-routing rejections stay independently observable.
    */
   headerFilteredMessages: number;
+  /**
+   * Total messages skipped by per-subscriber payload-size caps — the sum
+   * of every topic's `subscriberOversizeDropped`. See
+   * `TopicStats.subscriberOversizeDropped` for the exact counting rules.
+   * Kept separate from `filteredMessages` so size narrowing and content
+   * filtering stay independently observable.
+   */
+  subscriberOversizeDropped: number;
   /**
    * Total messages admitted by subscriber-side delivery-sampling gates —
    * the sum of every topic's `sampledDeliveries`. See
@@ -7323,6 +7372,14 @@ interface Subscriber {
    */
   deliverySampleRate: number;
   /**
+   * Explicit per-subscriber payload-size cap in bytes (see
+   * `SubscribeOptions.subscriberMaxPayloadBytes`, EB-208). Undefined
+   * means no explicit cap — the delivery gate then falls back to the
+   * topic's EB-120 payload cap (`maxPayloadBytesForTopic`); with neither,
+   * the gate is inert.
+   */
+  subscriberMaxPayloadBytes?: number;
+  /**
    * The most recent message this subscriber's delivery-sampling gate
    * skipped (EB-152), by identity. The group fan-out checks it right
    * after `deliverToSubscriber` to suppress offset records for exactly
@@ -8034,6 +8091,7 @@ function zeroedTopicStats(): {
     idempotentHits: 0,
     filteredMessages: 0,
     headerFilteredMessages: 0,
+    subscriberOversizeDropped: 0,
     sampledDeliveries: 0,
     sampleDropped: 0,
     signatureFailures: 0,
@@ -13337,6 +13395,7 @@ export class EventBus {
     {
       matcher: RegExp;
       onDrift: FingerprintDriftCallback;
+      onOversize?: FingerprintOversizeCallback;
       baseline?: { fingerprint: string; paths: string[] };
       sampled?: { fingerprint: string; paths: string[] };
     }
@@ -14399,6 +14458,12 @@ export class EventBus {
    * keeps its exact meaning.
    */
   private totalHeaderFiltered = 0;
+  /**
+   * Global per-subscriber oversize-skip counter (EB-208): the sum of
+   * every topic's `subscriberOversizeDropped`. Only moves when a
+   * subscriber's payload-size cap (explicit or inherited) is exceeded.
+   */
+  private totalSubscriberOversizeDropped = 0;
   /**
    * Global delivery-sampling counters (EB-152): the sums of every
    * topic's `sampledDeliveries` / `sampleDropped`. Only move for
@@ -18978,9 +19043,13 @@ export class EventBus {
     if (typeof opts !== 'object' || opts === null || typeof opts.onDrift !== 'function') {
       throw new RangeError('setTopicSchemaFingerprint: opts.onDrift must be a function');
     }
+    if (opts.onOversize !== undefined && typeof opts.onOversize !== 'function') {
+      throw new RangeError('setTopicSchemaFingerprint: opts.onOversize must be a function when given');
+    }
     this.schemaFingerprintRules.set(topicPattern, {
       matcher: compilePattern(topicPattern),
       onDrift: opts.onDrift,
+      onOversize: opts.onOversize,
       baseline: undefined,
       sampled: undefined,
     });
@@ -21177,6 +21246,15 @@ export class EventBus {
     if (queueMaxBytes !== undefined && (!Number.isFinite(queueMaxBytes) || queueMaxBytes <= 0)) {
       throw new RangeError('subscribe: queueMaxBytes must be a positive finite number of bytes');
     }
+    // Per-subscriber payload-size cap (EB-208): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const subscriberMaxPayloadBytes = opts?.subscriberMaxPayloadBytes;
+    if (
+      subscriberMaxPayloadBytes !== undefined &&
+      (!Number.isInteger(subscriberMaxPayloadBytes) || subscriberMaxPayloadBytes <= 0)
+    ) {
+      throw new RangeError('subscribe: subscriberMaxPayloadBytes must be a positive integer number of bytes');
+    }
     // Subscription lease (EB-69): validated before anything registers, so
     // a throw leaves no half-registered subscriber behind.
     const leaseMs = opts?.leaseMs;
@@ -21525,6 +21603,10 @@ export class EventBus {
       // the default — a non-sampling subscriber pays one integer
       // comparison per delivery in `deliverUnkeyed`.
       deliverySampleRate: deliverySampleRate ?? 1,
+      // Per-subscriber payload-size cap (EB-208): the explicit opt-in
+      // cap; when absent the delivery gate inherits the topic's EB-120
+      // payload cap at delivery time.
+      subscriberMaxPayloadBytes,
       // Time-travel replay catch-up (EB-203): mirrors the subscribe
       // option — `replayRange` pauses this subscriber's live drain
       // while it replays history, when true.
@@ -26493,7 +26575,15 @@ export class EventBus {
             // filter judges the raw application payload. A dictionary-compressed
             // record resolves its bytes from the registry here; an unregistered
             // dictionary fails loudly rather than judging garbage.
-            if (filter !== undefined || filterExpr !== undefined) {
+            //
+            // The per-subscriber payload-size cap (EB-208) needs the same raw
+            // payload, so the wire→raw resolution below runs when any
+            // payload-judging gate needs it (content filter, filter
+            // expression, or size cap) and the resolved payload is reused by
+            // the size gate after the composite check.
+            const replayCap = this.subscriberPayloadCapFor(subscriber, rec.topic);
+            let replayRawPayload: unknown;
+            if (filter !== undefined || filterExpr !== undefined || replayCap !== undefined) {
               // The log holds the wire payload — resolve a binary record's
               // v2 bytes first (a binary+compressed record's bytes encode
               // the envelope), then open a DEK-sealed envelope (EB-179) and
@@ -26524,6 +26614,7 @@ export class EventBus {
               const rawPayload = isCompressedPayload(openedPayload)
                 ? this.inflateReplayEnvelope(openedPayload, rec)
                 : openedPayload;
+              replayRawPayload = rawPayload;
               if (filter !== undefined && !filter(rawPayload, rec.topic)) {
                 this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
                 // A filtered replayed message is deliberately skipped: advance
@@ -26596,6 +26687,41 @@ export class EventBus {
               }
               countReplaySkipped();
               continue;
+            }
+            // Per-subscriber payload-size cap (EB-208) applies to replay
+            // exactly as to live fan-out: an oversize record is
+            // deliberately skipped — never queued (no backpressure budget
+            // churned on reconnect), the per-topic baseline advances over
+            // it (never a sequence gap), the key/causal baselines advance
+            // past it like a filter skip, and it counts as
+            // oversize-dropped with the EB-200 onOversize linkage.
+            // `replayCap` was resolved above; `replayRawPayload` holds the
+            // inflated application payload when any payload-judging gate
+            // needed it (a sealed-undecryptable record already continued
+            // above, so a missing payload here only means no gate needed
+            // it — but the cap is set, so the payload was resolved).
+            if (replayCap !== undefined && replayRawPayload !== undefined) {
+              const replaySize = payloadByteSize(replayRawPayload);
+              if (replaySize > replayCap.cap) {
+                this.countSubscriberOversizeDropped(
+                  subscriber,
+                  rec.topic,
+                  rec.seq,
+                  '',
+                  rec.partition ?? 0,
+                  replaySize,
+                  replayCap.cap,
+                  replayCap.source,
+                );
+                if (rec.key !== undefined && rec.keySeq !== undefined) {
+                  this.skipKeySeq(subscriber, rec.key, rec.keySeq);
+                }
+                if (rec.causal !== undefined) {
+                  this.skipCausalClock(subscriber, rec.causal.source, rec.causal.clock);
+                }
+                countReplaySkipped();
+                continue;
+              }
             }
             // Handoff linger: a group member that left within its linger window
             // is presumed still processing these seqs — skip them so the
@@ -31081,6 +31207,29 @@ export class EventBus {
         this.countHeaderFiltered(subscriber, msg.topic, msg.seq, '', msg.partition ?? 0);
         continue;
       }
+      // Per-subscriber payload-size cap (EB-208) applies to the retained
+      // snapshot exactly as to live fan-out and replay: seen and
+      // deliberately skipped — never queued, never a sequence gap —
+      // counted as oversize-dropped with the EB-200 onOversize linkage.
+      // The payload was inflated above, so it is measured as the
+      // subscriber would receive it.
+      const snapshotCap = this.subscriberPayloadCapFor(subscriber, msg.topic);
+      if (snapshotCap !== undefined) {
+        const snapshotSize = payloadByteSize(msg.payload);
+        if (snapshotSize > snapshotCap.cap) {
+          this.countSubscriberOversizeDropped(
+            subscriber,
+            msg.topic,
+            msg.seq,
+            '',
+            msg.partition ?? 0,
+            snapshotSize,
+            snapshotCap.cap,
+            snapshotCap.source,
+          );
+          continue;
+        }
+      }
       this.noteMessageDelivered(subscriber, msg);
       this.totalDelivered += 1;
       delivered.set(entry.topic, entry.seq);
@@ -34429,6 +34578,24 @@ export class EventBus {
       this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
       return false;
     }
+    // Per-subscriber payload-size cap (EB-208): subscriber-side
+    // narrowing protecting slow / small-memory subscribers. The
+    // effective cap is the subscriber's explicit
+    // `subscriberMaxPayloadBytes`, falling back to the topic's EB-120
+    // payload cap resolved for the concrete topic at delivery time; with
+    // neither, the gate is inert (fully backward compatible). Runs after
+    // the content filters — a filtered message never pays the
+    // serialization cost — and before the throttle gate, so throttled
+    // accounting stays exact. An oversize message is a deliberate skip
+    // with filter-like semantics: never queued (no backpressure budget),
+    // no throttle / shaping / credit budget burned, never the DLQ, never
+    // in the ack tracker (no ack obligation on reliable subscriptions),
+    // the per-topic baseline advances over it (never a sequence gap),
+    // and the group fan-out keeps the filter-skip offset semantics
+    // (recorded — the skip is a narrowing decision, not a loss).
+    if (this.subscriberPayloadCapExceeded(subscriber, msg, rawPayload)) {
+      return false;
+    }
     const throttle = subscriber.throttle;
     if (throttle != null && throttle.throttled && !throttle.bucket.take()) {
       // Publish-side shed: the message never reaches the queue, so the
@@ -35018,6 +35185,98 @@ export class EventBus {
     this.advanceBaseline(subscriber, topic, seq, epoch, partition);
     this.statsFor(topic).headerFilteredMessages += 1;
     this.totalHeaderFiltered += 1;
+  }
+
+  /**
+   * Resolves the effective per-subscriber payload-size cap (EB-208) for
+   * a topic: the subscriber's explicit `subscriberMaxPayloadBytes` wins;
+   * otherwise the topic's EB-120 payload cap
+   * (`setTopicMaxPayloadBytes`), resolved for the concrete topic at
+   * delivery time. Undefined when neither is set — the gate is inert.
+   */
+  private subscriberPayloadCapFor(
+    subscriber: Subscriber,
+    topic: string,
+  ): { cap: number; source: 'subscriber' | 'topic' } | undefined {
+    if (subscriber.subscriberMaxPayloadBytes !== undefined) {
+      return { cap: subscriber.subscriberMaxPayloadBytes, source: 'subscriber' };
+    }
+    const topicCap = this.maxPayloadBytesForTopic(topic);
+    if (topicCap !== undefined) return { cap: topicCap, source: 'topic' };
+    return undefined;
+  }
+
+  /**
+   * Per-subscriber payload-size gate (EB-208): returns true when the
+   * message's payload exceeds the subscriber's effective payload cap —
+   * counting the skip (per-topic + global `subscriberOversizeDropped`),
+   * advancing the subscriber's per-topic baseline over it (never a
+   * sequence gap), and firing the topic's EB-200 fingerprint watchers'
+   * `onOversize` linkage — and returns false otherwise.
+   *
+   * Size uses the EB-120 yardstick (`payloadByteSize`): JSON UTF-8
+   * bytes, binary `Uint8Array` payloads as wire bytes, unserializable
+   * payloads as 0 (always pass — the same passthrough semantics as the
+   * EB-120 admission gate).
+   */
+  private subscriberPayloadCapExceeded(
+    subscriber: Subscriber,
+    msg: BusMessage,
+    rawPayload: unknown,
+  ): boolean {
+    const resolved = this.subscriberPayloadCapFor(subscriber, msg.topic);
+    if (resolved === undefined) return false;
+    const size = payloadByteSize(rawPayload);
+    if (size <= resolved.cap) return false;
+    this.countSubscriberOversizeDropped(
+      subscriber,
+      msg.topic,
+      msg.seq,
+      msg.epoch ?? '',
+      msg.partition ?? 0,
+      size,
+      resolved.cap,
+      resolved.source,
+    );
+    return true;
+  }
+
+  /**
+   * Counts one message skipped by a subscriber's payload-size cap (see
+   * `SubscribeOptions.subscriberMaxPayloadBytes`, EB-208) against the
+   * topic and the global total, advances the subscriber's per-topic
+   * sequence baseline over it so the deliberately skipped message never
+   * counts as a gap, and fires the EB-200 fingerprint watchers'
+   * `onOversize` linkage for the topic (error-isolated, so a throwing
+   * watcher never breaks delivery). The baseline advance is shared with
+   * `countFiltered` — both are subscriber-side narrowing, invisible to
+   * gap detection — but the counters are separate from
+   * `filteredMessages`: size narrowing and content filtering stay
+   * independently observable.
+   */
+  private countSubscriberOversizeDropped(
+    subscriber: Subscriber,
+    topic: string,
+    seq: number,
+    epoch: string,
+    partition: number,
+    payloadBytes: number,
+    capBytes: number,
+    capSource: 'subscriber' | 'topic',
+  ): void {
+    this.advanceBaseline(subscriber, topic, seq, epoch, partition);
+    this.statsFor(topic).subscriberOversizeDropped += 1;
+    this.totalSubscriberOversizeDropped += 1;
+    if (this.schemaFingerprintRules.size === 0) return;
+    for (const rule of this.schemaFingerprintRules.values()) {
+      if (rule.onOversize === undefined) continue;
+      if (!rule.matcher.test(topic)) continue;
+      try {
+        rule.onOversize({ topic, subscriberId: subscriber.id, payloadBytes, capBytes, capSource });
+      } catch {
+        // Error-isolated: a throwing watcher never breaks delivery.
+      }
+    }
   }
 
   /**
@@ -38058,6 +38317,7 @@ export class EventBus {
       opsAlert: this.opsAlerter?.getStats() ?? { sent: 0, failed: 0, suppressed: 0 },
       filteredMessages: this.totalFiltered,
       headerFilteredMessages: this.totalHeaderFiltered,
+      subscriberOversizeDropped: this.totalSubscriberOversizeDropped,
       sampledDeliveries: this.totalSampledDeliveries,
       sampleDropped: this.totalSampleDropped,
       projectedMessages: this.totalProjectedMessages,
@@ -38295,6 +38555,7 @@ export class EventBus {
         transformErrors: stats.transformErrors,
         filteredMessages: stats.filteredMessages,
         headerFilteredMessages: stats.headerFilteredMessages,
+        subscriberOversizeDropped: stats.subscriberOversizeDropped,
         sampledDeliveries: stats.sampledDeliveries,
         sampleDropped: stats.sampleDropped,
         signatureFailures: stats.signatureFailures,
