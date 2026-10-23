@@ -4436,6 +4436,47 @@ Tuning: `bus.exportBusHealth({ slowSubscriberP99Ms, lagWatermarkDefaultMs })`
 overrides the two doctor-owned defaults; every other threshold is
 reused from the module that owns it.
 
+### Auto-remediation (EB-211)
+
+`bus.autoRemediate()` layers an opt-in repair pass on top of the same
+diagnosis: it runs `diagnoseBusHealth` first, then applies a bounded set
+of safe, reversible repairs derived from the findings — each one audited:
+
+- `resume-subscriber` — a health-probe-degraded subscriber (EB-18) with
+  no auto-resume cooldown armed is stuck degraded forever; resuming it
+  is the only recovery path, and it is safe by construction (the probe
+  re-degrades it if the fault persists). Subscribers whose
+  `autoResumeAfterMs` timer is already armed are skipped — the bus
+  recovers those on its own.
+- `prune-linger-windows` — drop expired handoff-linger windows (EB-32)
+  so replay stops consulting dead windows.
+- `rebalance-group` — force a rebalance (`trigger: 'remediate'`) for a
+  partitioned group running fewer live members than partitions (the
+  `partition-coverage` finding), re-running the cooperative protocol so
+  member state re-syncs.
+
+Findings with no safe automatic fix (slow subscribers, DLQ backlog,
+corrupt durable-log segments, …) produce no actions — they stay in the
+report for the operator. `dryRun: true` previews the plan with zero
+state changes (the run summary is still audited); `maxActions`
+(default 10) caps the applied actions per run as a circuit breaker.
+Every applied action is audited (`auto_remediate_resume` /
+`auto_remediate_linger_pruned` / `auto_remediate_rebalance`) plus a
+per-run `auto_remediate_run` summary.
+
+```ts
+const result = bus.autoRemediate({ dryRun: true, maxActions: 5 });
+// { at, dryRun, maxActions, healthBefore, healthReport,
+//   planned: [{ kind, target, pattern?, reason }],
+//   results: [{ ..., applied, skippedReason? }], capped }
+```
+
+For hands-off operation, `EventBusOptions.autoRemediate` arms the same
+run on an unref'd periodic timer: `new EventBus({ autoRemediate:
+{ intervalMs: 60_000, maxActions: 10 } })`. Absent the opt-in nothing is
+scheduled and the bus behaves exactly as before EB-211; the timer is
+cleared on `close()`.
+
 ## Transactional outbox relay (EB-102)
 
 The transactional outbox closes the dual-write gap between a business

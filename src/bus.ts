@@ -139,6 +139,16 @@ import {
   type DoctorInput,
   type DoctorOptions,
 } from './doctor.ts';
+import {
+  assertValidRemediateSchedule,
+  DEFAULT_REMEDIATE_MAX_ACTIONS,
+  planRemediation,
+  type AutoRemediateOptions,
+  type AutoRemediateScheduleOptions,
+  type RemediationAction,
+  type RemediationActionResult,
+  type RemediationReport,
+} from './remediate.ts';
 import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
 import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
@@ -455,6 +465,14 @@ export type {
   HealthCheck,
   HealthStatus,
 } from './doctor.ts';
+export type {
+  AutoRemediateOptions,
+  AutoRemediateScheduleOptions,
+  RemediationAction,
+  RemediationActionKind,
+  RemediationActionResult,
+  RemediationReport,
+} from './remediate.ts';
 export type { SlowStartOptions, SlowStartStrategy } from './slowstart.ts';
 export type { LeaseExpiredCallback, LeaseExpiredEvent } from './lease.ts';
 export type { IdleActivityMode, IdleExpiredCallback, IdleExpiredEvent } from './idle.ts';
@@ -3790,11 +3808,11 @@ export interface GroupRebalanceEvent {
    * an operator-initiated partition-count expansion
    * (`EventBus.setGroupPartitionCount`, EB-210).
    */
-  trigger: 'join' | 'leave' | 'expand';
+  trigger: 'join' | 'leave' | 'expand' | 'remediate';
   /**
    * The roster key of the member that joined or left. Empty for
-   * `trigger: 'expand'` — an expansion is operator-initiated and names
-   * no single member.
+   * `trigger: 'expand'` / `'remediate'` — those are operator-initiated
+   * and name no single member.
    */
   memberId: string;
   /**
@@ -5026,6 +5044,18 @@ export interface EventBusOptions {
    * constructor.
    */
   delayJitterRandom?: () => number;
+  /**
+   * Opt-in doctor auto-remediation schedule (EB-211): when present, the
+   * bus runs `autoRemediate()` on an unref'd timer every `intervalMs`
+   * (`{ intervalMs, maxActions?, dryRun?, doctor? }`), applying the
+   * bounded safe repairs (stuck degraded-subscriber resumes, expired
+   * linger-window pruning, skewed-group rebalances) automatically.
+   * Absent — the default — nothing is scheduled and the bus behaves
+   * exactly as before EB-211. The timer is cleared on `close()`.
+   * `intervalMs` must be a positive finite number, otherwise the
+   * constructor throws `RangeError`.
+   */
+  autoRemediate?: AutoRemediateScheduleOptions;
 }
 
 /** Per-topic stats kept live by the bus. */
@@ -15347,6 +15377,12 @@ export class EventBus {
    * mirroring and records every mirror outcome.
    */
   private readonly bridgeHealth: BridgeHealthMonitor | undefined;
+  /**
+   * Doctor auto-remediation schedule timer (EB-211): the unref'd
+   * interval armed by the `EventBusOptions.autoRemediate` opt-in.
+   * Absent unless the opt-in is configured; cleared on close().
+   */
+  private remediateTimer: ReturnType<typeof setInterval> | undefined;
   /** Envelopes mirrored to the bridge transport (see `BridgeStats`). */
   private bridgeOutbound = 0;
   /** Bridge envelopes admitted and fanned out locally. */
@@ -15585,6 +15621,27 @@ export class EventBus {
       this.bridgeHealth.start();
     } else {
       this.bridgeHealth = undefined;
+    }
+    // Doctor auto-remediation schedule (EB-211): opt-in via
+    // `EventBusOptions.autoRemediate`. The timer is unref'd (it never
+    // holds the process open) and cleared on close(). Absent the opt-in
+    // nothing is scheduled — zero behavior change.
+    const remediateOpt = options?.autoRemediate;
+    if (remediateOpt !== undefined) {
+      assertValidRemediateSchedule(remediateOpt, 'EventBus');
+      const schedule = remediateOpt;
+      const timer = setInterval(() => {
+        try {
+          this.autoRemediate(schedule);
+        } catch {
+          // Best-effort: a failing remediation run must not kill the
+          // timer — the next run retries. The failure itself is not
+          // audited here; per-run failures surface in the run's own
+          // audit entries when they get that far.
+        }
+      }, schedule.intervalMs);
+      timer.unref();
+      this.remediateTimer = timer;
     }
     const resolvedGroupLag = resolveGroupLagOptions(options?.groupLag, 'EventBus');
     // EB-132: the ops alert outlet sits on top of the EB-112 lag-SLO
@@ -24379,7 +24436,7 @@ export class EventBus {
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave' | 'expand',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate',
     memberId: string,
     linger?: { until: number; windows: LingerWindow[] },
     partitionRebalance?: PartitionRebalanceInfo,
@@ -24411,7 +24468,7 @@ export class EventBus {
    */
   private fireRebalanceListener(
     groupId: string,
-    trigger: 'join' | 'leave' | 'expand',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate',
     memberId: string,
     rosterKey: string,
     subscriber: Subscriber,
@@ -24486,7 +24543,7 @@ export class EventBus {
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave' | 'expand',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate',
     memberId: string,
     linger: { until: number; windows: LingerWindow[] } | undefined,
     partitionRebalance: PartitionRebalanceInfo | undefined,
@@ -38170,6 +38227,11 @@ export class EventBus {
     // Bridge health monitor (EB-168): stop probing — a closed bus
     // mirrors nothing, so there is nothing left to probe.
     this.bridgeHealth?.stop();
+    // Doctor auto-remediation schedule (EB-211): stop the periodic runs.
+    if (this.remediateTimer !== undefined) {
+      clearInterval(this.remediateTimer);
+      this.remediateTimer = undefined;
+    }
     for (const groupId of [...this.autoCommitGroups.keys()]) {
       try {
         this.flushAutoCommits(groupId);
@@ -39113,7 +39175,14 @@ export class EventBus {
    * It never publishes, never writes the durable log, never mutates
    * state, and never fires callbacks.
    */
-  exportBusHealth(options?: DoctorOptions): BusHealthReport {
+  /**
+   * Assembles the read-only `DoctorInput` snapshot for `diagnoseBusHealth`
+   * (EB-101): `getStats()` plus a few read-only internal views (DLQ
+   * occupancy, per-subscriber lag thresholds). Shared by
+   * `exportBusHealth()` and `autoRemediate()` so both diagnose from the
+   * same snapshot logic.
+   */
+  private assembleDoctorInput(): DoctorInput {
     const stats = this.getStats();
     const dlqBacklog: DoctorInput['dlqBacklog'] = [];
     const lagThresholdMs = new Map<string, number>();
@@ -39130,7 +39199,7 @@ export class EventBus {
         lagThresholdMs.set(sub.id, sub.lag.thresholdMs);
       }
     }
-    const input: DoctorInput = {
+    return {
       at: this.now(),
       aliases: stats.aliases,
       slowestSubscribers: stats.slowestSubscribers,
@@ -39155,7 +39224,211 @@ export class EventBus {
       namespaces: stats.namespaces,
       durableLog: stats.durableLog,
     };
-    return diagnoseBusHealth(input, options);
+  }
+
+  exportBusHealth(options?: DoctorOptions): BusHealthReport {
+    return diagnoseBusHealth(this.assembleDoctorInput(), options);
+  }
+
+  /**
+   * Doctor auto-remediation (EB-211, real-time systems / backend
+   * engineering): runs the read-only diagnosis first
+   * (`diagnoseBusHealth` over the same snapshot `exportBusHealth()`
+   * uses), then applies a bounded set of safe, reversible repairs
+   * derived from the findings:
+   *
+   * - `resume-subscriber`: a health-probe-degraded subscriber with no
+   *   auto-resume cooldown armed is stuck degraded forever — resume it
+   *   (the probe re-degrades it if the fault persists).
+   * - `prune-linger-windows`: drop expired handoff-linger windows.
+   * - `rebalance-group`: force a rebalance (`trigger: 'remediate'`) for
+   *   a partitioned group running fewer live members than partitions
+   *   (the doctor's `partition-coverage` finding).
+   *
+   * Findings with no safe automatic fix (slow subscribers, DLQ
+   * backlog, corrupt durable-log segments, …) produce no actions —
+   * they stay in the report for the operator. Every applied action is
+   * audited (`auto_remediate_resume` / `auto_remediate_linger_pruned` /
+   * `auto_remediate_rebalance`), plus a per-run `auto_remediate_run`
+   * summary. `dryRun` previews the plan with zero state changes (the
+   * summary is still audited). `maxActions` caps the applied actions
+   * per run (default 10); the rest are reported as capped.
+   *
+   * Throws `RangeError` on a negative or non-integer `maxActions`.
+   */
+  autoRemediate(options?: AutoRemediateOptions): RemediationReport {
+    const maxActions = options?.maxActions ?? DEFAULT_REMEDIATE_MAX_ACTIONS;
+    if (!Number.isInteger(maxActions) || maxActions < 0) {
+      throw new RangeError('autoRemediate: maxActions must be a non-negative integer');
+    }
+    const dryRun = options?.dryRun === true;
+    const at = this.now();
+    // Collect the linger view BEFORE the diagnosis: assembleDoctorInput()
+    // -> getStats() prunes expired linger windows as a side effect
+    // (group-lag accounting), so a post-diagnosis read would never see
+    // them. The explicit prune in applyRemediationAction then reaps
+    // exactly what was observed here.
+    const groupsWithExpiredLinger: Array<{ groupId: string; expiredWindows: number }> = [];
+    for (const [groupId, windows] of this.lingerWindows) {
+      const expiredWindows = windows.filter((w) => w.until <= at).length;
+      if (expiredWindows > 0) groupsWithExpiredLinger.push({ groupId, expiredWindows });
+    }
+    // Live views behind the findings the planner acts on.
+    const degradedSubscribers: Array<{
+      subscriberId: string;
+      pattern: string;
+      consecutiveFailures: number;
+      autoResumeArmed: boolean;
+    }> = [];
+    for (const sub of this.subscribers.values()) {
+      const health = sub.health;
+      if (health?.degraded === true) {
+        degradedSubscribers.push({
+          subscriberId: sub.id,
+          pattern: sub.pattern,
+          consecutiveFailures: health.consecutiveFailures,
+          autoResumeArmed: health.autoResumeTimer !== undefined,
+        });
+      }
+    }
+    // Reuse the diagnosis snapshot's consumer-group rows: no second
+    // getStats() pass.
+    const doctorInput = this.assembleDoctorInput();
+    const skewedGroups: Array<{ groupId: string; pattern: string; partitions: number; members: number }> = [];
+    for (const g of doctorInput.consumerGroups) {
+      // A fully drained group has no live state to re-sync — the
+      // doctor still flags it, the remediator skips it.
+      if (g.partitions !== undefined && g.members > 0 && g.members < g.partitions) {
+        skewedGroups.push({ groupId: g.groupId, pattern: g.pattern, partitions: g.partitions, members: g.members });
+      }
+    }
+    const healthReport = diagnoseBusHealth(doctorInput, options?.doctor);
+    const planned = planRemediation({
+      report: healthReport,
+      degradedSubscribers,
+      groupsWithExpiredLinger,
+      skewedGroups,
+    });
+    const capped = planned.length > maxActions;
+    const results: RemediationActionResult[] = [];
+    let applied = 0;
+    for (const action of planned) {
+      if (applied >= maxActions) {
+        results.push({ ...action, applied: false, skippedReason: `capped by maxActions=${maxActions}` });
+        continue;
+      }
+      if (dryRun) {
+        results.push({ ...action, applied: false, skippedReason: 'dry-run' });
+        continue;
+      }
+      const outcome = this.applyRemediationAction(action);
+      results.push(outcome);
+      if (outcome.applied) applied += 1;
+    }
+    this.auditSubscription({
+      action: 'auto_remediate_run',
+      actor: 'system',
+      detail: {
+        dryRun,
+        healthBefore: healthReport.status,
+        planned: planned.length,
+        applied,
+        capped,
+        maxActions,
+      },
+    });
+    return {
+      at,
+      dryRun,
+      maxActions,
+      healthBefore: healthReport.status,
+      healthReport,
+      planned,
+      results,
+      capped,
+    };
+  }
+
+  /**
+   * Applies one planned remediation action. Returns the outcome; a
+   * target that vanished between planning and application is reported
+   * as skipped, never thrown.
+   */
+  private applyRemediationAction(action: RemediationAction): RemediationActionResult {
+    switch (action.kind) {
+      case 'resume-subscriber': {
+        const subscriber = this.subscribers.get(action.target);
+        if (subscriber == null || subscriber.health == null || !subscriber.health.degraded) {
+          return { ...action, applied: false, skippedReason: 'target no longer degraded' };
+        }
+        this.resumeDelivery(subscriber);
+        this.auditSubscription({
+          action: 'auto_remediate_resume',
+          subId: subscriber.id,
+          pattern: subscriber.pattern,
+          actor: 'system',
+          detail: { reason: action.reason },
+        });
+        return { ...action, applied: true };
+      }
+      case 'prune-linger-windows': {
+        // Idempotent: the diagnosis's getStats() pass already prunes
+        // expired windows lazily (group-lag accounting), so this usually
+        // confirms rather than reaps — the audit reports what the plan
+        // observed, and the post-condition (no expired windows left for
+        // the group) holds either way.
+        this.pruneLingerWindows(action.target);
+        const pruned = action.expiredWindows ?? 0;
+        this.auditSubscription({
+          action: 'auto_remediate_linger_pruned',
+          groupId: action.target,
+          actor: 'system',
+          detail: { pruned, reason: action.reason },
+        });
+        return { ...action, applied: true };
+      }
+      case 'rebalance-group': {
+        if (action.pattern === undefined) {
+          return { ...action, applied: false, skippedReason: 'missing pattern for group' };
+        }
+        const key = EventBus.groupKey(action.target, action.pattern);
+        if (this.groupMembers.get(key) == null) {
+          return { ...action, applied: false, skippedReason: 'group has no live members' };
+        }
+        const beforeAssignment = new Map(this.partitionAssignment(key));
+        this.invalidatePartitionAssignment(key);
+        const after = this.partitionAssignment(key);
+        const migrated = this.diffPartitionAssignment(key, beforeAssignment, after);
+        // Operator-initiated: bypass the membership-change debounce.
+        // The assignment is deterministic from the roster, so this
+        // re-syncs member state (pending auto-commit checkpoints flush,
+        // members re-observe the assignment) rather than moving
+        // partitions.
+        this.emitRebalance(
+          action.target,
+          action.pattern,
+          key,
+          'remediate',
+          '',
+          undefined,
+          {
+            assignment: Object.fromEntries(after),
+            migrated,
+            strategy: this.groupAssignorName(key),
+          },
+          0,
+          true,
+        );
+        this.auditSubscription({
+          action: 'auto_remediate_rebalance',
+          groupId: action.target,
+          pattern: action.pattern,
+          actor: 'system',
+          detail: { reason: action.reason },
+        });
+        return { ...action, applied: true };
+      }
+    }
   }
 
   /** Number of active subscriptions. */

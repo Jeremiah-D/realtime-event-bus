@@ -94,7 +94,11 @@ export type SubscriptionAuditAction =
   | 'bridge_recovered'
   | 'mirror_throttled'
   | 'topic_key_rotated'
-  | 'decrypt_failed';
+  | 'decrypt_failed'
+  | 'auto_remediate_resume'
+  | 'auto_remediate_linger_pruned'
+  | 'auto_remediate_rebalance'
+  | 'auto_remediate_run';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -122,6 +126,18 @@ export type SubscriptionAuditAction =
  *   envelope, when present> }` — a sealed message dropped fail-closed at
  *   delivery (EB-179): unknown key id, retired past its grace window, or
  *   tampered envelope
+ * - `auto_remediate_resume`: `{ reason }` — the doctor auto-remediator
+ *   (EB-211) resumed a stuck health-probe-degraded subscriber; `subId`
+ *   carries the subscriber
+ * - `auto_remediate_linger_pruned`: `{ pruned: <count>, reason }` — the
+ *   remediator dropped expired handoff-linger windows; `groupId` carries
+ *   the group
+ * - `auto_remediate_rebalance`: `{ reason }` — the remediator forced a
+ *   rebalance (`trigger: 'remediate'`) for a skewed partitioned group;
+ *   `groupId` carries the group
+ * - `auto_remediate_run`: `{ dryRun, healthBefore, planned, applied,
+ *   capped, maxActions }` — one `autoRemediate()` run's summary,
+ *   including dry-run previews
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -281,6 +297,10 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'mirror_throttled',
   'topic_key_rotated',
   'decrypt_failed',
+  'auto_remediate_resume',
+  'auto_remediate_linger_pruned',
+  'auto_remediate_rebalance',
+  'auto_remediate_run',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {
