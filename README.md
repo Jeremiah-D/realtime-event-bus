@@ -6075,6 +6075,69 @@ synchronous call, publishes to either name fail fast with
 callback cannot land on a half-moved topic). After the rename the old
 name is free again — publishing to it starts a fresh topic.
 
+## Topic fork (EB-224)
+
+`forkTopic(sourceTopic, targetTopic, { fromSeq, fromTime, keyedLatest })`
+(`src/bus.ts`, `DurableTopicLog.forkTopic` in `src/durablelog.ts`)
+copies a topic's live history into a brand-new topic, once, and then
+the two topics evolve independently — no alias, no ongoing sync, no
+shared sequence space. The blue-green / topic-evolution primitive:
+fork the live topic, point new consumers at the fork, and retire the
+source when ready.
+
+```ts
+bus.publish('market.btc', tick); // seq 1..3
+const r = bus.forkTopic('market.btc', 'market.btc.v2');
+// r.copied === 3, r.targetLastSeq === 3, r.sourceLastSeq === 3
+bus.publish('market.btc.v2', tick); // seq 4 on the fork, in its own space
+bus.publish('market.btc', tick); // seq 4 on the source, unaffected
+```
+
+What the fork copies, and what it does not:
+
+- **Live message records only** (`seq >= 1`), re-seqed from 1 per
+  partition in source seq order, so the fork reads as a topic that
+  was always the fork. The source topic is untouched — its seq
+  counters, files and indexes do not move.
+- **Filters compose**: `fromSeq` is an exclusive lower bound on the
+  source seq, `fromTime` an exclusive lower bound on the publish
+  timestamp, `keyedLatest` keeps only the latest record per key
+  (keyless records always copy). All three are explicit — the
+  fork's contents never depend on the log's key-compaction setting.
+- **Message metadata travels** (payload, headers, messageId,
+  publisherId, eventTime, partition, lane, key and keySeq, causal
+  clock, expiry deadline). `keySeq` is preserved, not renumbered:
+  it is global per key across topics, and the bus cursor already
+  covers the source's range.
+- **Signatures do not travel**: `signature` / `publisherSignature`
+  bind (topic, seq, wire bytes), and a re-seqed copy under a new
+  topic is a different signed statement. Forked records are
+  unsigned, and a verifier on the fork sees exactly that.
+- **Not copied**: seq-0 runtime state (delayed-delivery schedules,
+  retained messages, pause buffers, recurring jobs, key-TTL
+  tombstones — a fork that resurrected another topic's pending
+  timers would double-fire them), archived (rotated) segments
+  (cold history stays replayable on the source), subscribers,
+  rules, or retained state. The target starts with no subscribers
+  and no rules: its TTL, schema, rate-limit and compression rules
+  are whatever the caller configures afterwards, so the fork's
+  future is governed by its own rules, never the source's.
+
+Fail-closed: an unknown source, a source with no durable log, an
+already-used target, a same-name fork, a namespaced name, or an
+invalid option all throw `RangeError` before any copy; a failed
+append mid-copy purges the partial target, so a fork is all copied
+records or no fork. The call provisions the target's lifecycle
+record, seeds its sequence counters from the forked log (so the
+next publish continues the fork's numbering), and is audited as
+`topic_forked` with the fork source in the detail — the fork's
+provenance record (queryable via
+`getSubscriptionAudit({ action: 'topic_forked' })`). Orthogonal to
+the EB-44 migration alias (continuous routing/dual-write, not a
+copy), to seek (EB-130, a subscriber position, not a topic copy),
+and to mirror (cross-bus replication, not a local fork). (Real-time
+systems: blue-green migration / topic evolution.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into

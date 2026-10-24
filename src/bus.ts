@@ -156,7 +156,7 @@ import {
   type RemediationActionResult,
   type RemediationReport,
 } from './remediate.ts';
-import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type SegmentRotationOptions } from './durablelog.ts';
+import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type SegmentRotationOptions } from './durablelog.ts';
 import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
 import {
@@ -34852,6 +34852,144 @@ export class EventBus {
       this.renameFrozen.delete(oldTopic);
       this.renameFrozen.delete(newTopic);
     }
+  }
+
+  /**
+   * Forks a topic's live history into a new topic (EB-224):
+   * `forkTopic('market.btc', 'market.btc.v2', { fromSeq: 100 })`
+   * copies the source's live messages into the target with a fresh
+   * per-partition sequence space, then the two topics evolve
+   * independently — no alias, no ongoing sync (unlike the EB-44
+   * migration alias, which keeps routing, and unlike mirror, which
+   * replicates across buses). The blue-green / topic-evolution
+   * primitive: fork, point new consumers at the fork, and retire
+   * the source when ready.
+   *
+   * The fork itself copies history only. The target starts with no
+   * subscribers, no rules and no retained state: its TTL, schema,
+   * rate-limit and compression rules are whatever the caller
+   * configures afterwards through the usual per-topic APIs, so the
+   * fork's future is governed by its own rules, never the source's.
+   * Subscribers are never copied — a fork that silently moved
+   * consumers would change delivery without anyone subscribing.
+   *
+   * Ordering mirrors `renameTopic`: the durable log forks first
+   * (it re-validates and throws before mutating on any failure, so
+   * a failed fork leaves the bus untouched), then the bus seeds
+   * the target's sequence counters and stats from the forked log
+   * (the `recoverLogState` pattern, scoped to one topic), provisions
+   * the target's lifecycle record, and audits `topic_forked` with
+   * the fork source in the detail — the fork's provenance record.
+   * Fail-closed before any copy: an unknown source, a source with
+   * no durable log, an already-used target, or an invalid option
+   * all throw `RangeError`. See `DurableTopicLog.forkTopic` for the
+   * copy semantics (live messages only, re-seqed per partition,
+   * signatures dropped, seq-0 families and archived segments
+   * excluded).
+   */
+  forkTopic(
+    sourceTopic: string,
+    targetTopic: string,
+    opts?: ForkTopicOptions & { actor?: string },
+  ): ForkTopicResult & { lifecycleProvisioned: boolean } {
+    assertValidLifecycleTopicName(sourceTopic, 'forkTopic');
+    assertValidLifecycleTopicName(targetTopic, 'forkTopic');
+    if (sourceTopic.includes('/')) {
+      throw new RangeError('forkTopic: sourceTopic must be a concrete global topic name, not a namespaced topic');
+    }
+    if (targetTopic.includes('/')) {
+      throw new RangeError('forkTopic: targetTopic must be a concrete global topic name, not a namespaced topic');
+    }
+    if (sourceTopic === targetTopic) {
+      throw new RangeError('forkTopic: sourceTopic and targetTopic must differ');
+    }
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'forkTopic');
+    if (!this.topicHasState(sourceTopic)) {
+      throw new RangeError(`forkTopic: unknown source topic "${sourceTopic}"`);
+    }
+    if (this.topicHasState(targetTopic)) {
+      throw new RangeError(`forkTopic: target topic "${targetTopic}" is already in use`);
+    }
+    const log = this.durableLogForTopic(sourceTopic);
+    if (log === undefined) {
+      throw new RangeError('forkTopic: fork requires a durable log (no durableLogDir configured)');
+    }
+    if (!log.topics().includes(sourceTopic)) {
+      throw new RangeError(`forkTopic: source topic "${sourceTopic}" has no durable log`);
+    }
+    // Durable log first: it throws before mutating on any failure.
+    const result = log.forkTopic(sourceTopic, targetTopic, {
+      fromSeq: opts?.fromSeq,
+      fromTime: opts?.fromTime,
+      keyedLatest: opts?.keyedLatest,
+    });
+    // Seed the target's sequence counters from the forked log (the
+    // recoverLogState pattern, scoped to one topic): per-partition
+    // highs, falling back to the topic max for pre-partitioning
+    // logs, so the next publish continues the fork's numbering
+    // instead of restarting at 1 and colliding with forked seqs.
+    const partitionSeqs = log.recoveredPartitionSeqs(targetTopic);
+    if (partitionSeqs.size === 0) {
+      if (result.targetLastSeq > 0) {
+        this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, 0), result.targetLastSeq);
+        this.seedPartitionPublished(targetTopic, 0, result.targetLastSeq);
+      }
+    } else {
+      for (const [partition, seq] of partitionSeqs) {
+        this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, partition), seq);
+        this.seedPartitionPublished(targetTopic, partition, seq);
+      }
+    }
+    this.topicStats.set(targetTopic, {
+      subscriberCount: 0,
+      publishedMessages: log.messageCount(targetTopic),
+      expiredMessages: 0,
+      missedDeadlineMessages: 0,
+      lastSeq: result.targetLastSeq,
+      sequenceGaps: 0,
+      rateLimitedMessages: 0,
+      publisherRateLimited: 0,
+      pausedMessages: 0,
+      circuitBrokenMessages: 0,
+      rejectedMessages: 0,
+      lateMessages: 0,
+      duplicateMessages: 0,
+      casMismatches: 0,
+      idempotentHits: 0,
+      aliasRetiredMessages: 0,
+      lineageCycleRejections: 0,
+      redactedFields: 0,
+      filteredMessages: 0,
+      sampledDeliveries: 0,
+      sampleDropped: 0,
+      dedupDropped: 0,
+      compressedMessages: 0,
+      compressedBytesBefore: 0,
+      compressedBytesAfter: 0,
+      compressionTimeMs: 0,
+      lanes: {
+        queued: zeroedLaneCounts(),
+        delivered: zeroedLaneCounts(),
+        dropped: zeroedLaneCounts(),
+      },
+    });
+    const { created } = this.topicLifecycle.provision(targetTopic, undefined, this.now());
+    this.auditSubscription({
+      action: 'topic_forked',
+      actor,
+      topic: targetTopic,
+      detail: {
+        forkSource: sourceTopic,
+        copied: result.copied,
+        sourceLastSeq: result.sourceLastSeq,
+        targetLastSeq: result.targetLastSeq,
+        ...(result.fromSeq === undefined ? {} : { fromSeq: result.fromSeq }),
+        ...(result.fromTime === undefined ? {} : { fromTime: result.fromTime }),
+        keyedLatest: result.keyedLatest,
+      },
+    });
+    return { ...result, lifecycleProvisioned: created };
   }
 
   /**

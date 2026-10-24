@@ -1576,6 +1576,48 @@ function parseDedupLine(line: string): DedupEntry | null {
  * structures) are delivered live but skipped by the log — `append` returns
  * `false` for them instead of throwing into the publish path.
  */
+
+/** Options for [`DurableTopicLog.forkTopic`] (EB-224). */
+export interface ForkTopicOptions {
+  /**
+   * Exclusive lower bound on the source seq: only records with
+   * `seq > fromSeq` copy. Defaults to 0 (the whole live history).
+   * Must be a non-negative integer.
+   */
+  fromSeq?: number;
+  /**
+   * Exclusive lower bound on the publish timestamp: only records
+   * with `at > fromTime` copy. Composes with `fromSeq` (a record
+   * copies only when it passes both).
+   */
+  fromTime?: number;
+  /**
+   * When true, keep only the latest record per key (by source seq);
+   * keyless records always copy. Defaults to false (full history).
+   */
+  keyedLatest?: boolean;
+}
+
+/** Result of [`DurableTopicLog.forkTopic`] (EB-224). */
+export interface ForkTopicResult {
+  /** The topic the history was copied from (unchanged by the fork). */
+  sourceTopic: string;
+  /** The new topic holding the copied history. */
+  targetTopic: string;
+  /** Number of records copied into the target. */
+  copied: number;
+  /** The source topic's last seq at fork time (its history is untouched). */
+  sourceLastSeq: number;
+  /** The target topic's last seq after the fork (0 when nothing copied). */
+  targetLastSeq: number;
+  /** The `fromSeq` option as passed, if any. */
+  fromSeq?: number;
+  /** The `fromTime` option as passed, if any. */
+  fromTime?: number;
+  /** Whether `keyedLatest` filtering applied. */
+  keyedLatest: boolean;
+}
+
 export class DurableTopicLog {
   private readonly logDir: string;
   private readonly maxEntriesPerTopic: number;
@@ -4090,6 +4132,161 @@ export class DurableTopicLog {
       offsetCommitsMoved,
       dedupEntriesMoved,
       publishDedupEntriesMoved,
+    };
+  }
+
+  /**
+   * Forks one topic's live history into a brand-new topic (EB-224):
+   * a one-time copy of the source topic's message records into the
+   * target topic, after which the two topics evolve independently —
+   * no ongoing sync, no shared sequence space, no alias (unlike the
+   * EB-44 migration alias, which keeps routing, and unlike mirror,
+   * which replicates across buses). The blue-green / topic-evolution
+   * primitive: fork the live topic, point new consumers at the fork,
+   * and let the fork's own TTL / schema / rate-limit / compression
+   * rules (applied later through the bus's per-topic APIs) govern
+   * everything published after the fork.
+   *
+   * Copy semantics, each deliberate:
+   * - Only live message records (`seq >= 1`) copy. The seq-0
+   *   families — delayed-delivery schedules, retained state, pause
+   *   buffers, recurring jobs, key-TTL tombstones — are per-topic
+   *   runtime state, not history: a fork that resurrected another
+   *   topic's pending timers would double-fire them. Archived
+   *   (rotated) segments do not copy either: the fork is the live
+   *   log's snapshot, and cold segments stay replayable on the
+   *   source via `readSince` with `{ includeArchived: true }`.
+   * - The target gets its own sequence space: records are re-seqed
+   *   from 1 per partition (the bus's per-(topic, partition)
+   *   numbering, EB-90), in source seq order, so the fork reads as
+   *   a topic that was always the fork. The source topic is
+   *   untouched — its seq counters, files and indexes do not move.
+   * - `fromSeq` is an exclusive lower bound on the *source* seq
+   *   (records with `seq > fromSeq` copy), mirroring `readSince`'s
+   *   `fromSeqExclusive`; `fromTime` keeps records with `at >
+   *   fromTime`, mirroring `readSinceTime`'s exclusive bound. Both
+   *   filters compose: a record copies only when it passes both.
+   * - `keyedLatest` keeps, per key, only the latest record (by
+   *   source seq) and drops superseded keyed records; keyless
+   *   records always copy. This is the fork-time equivalent of the
+   *   keyed-compaction read view, applied explicitly instead of
+   *   depending on the log's `keyCompaction` setting — the fork's
+   *   contents are the same whether or not the log compacts.
+   * - Everything else about a record travels with it: payload,
+   *   headers, messageId, publisherId, eventTime, partition, lane,
+   *   key and keySeq, causal clock and expiry deadline. `keySeq`
+   *   is preserved, not renumbered: it is global per key across
+   *   topics (the cross-topic publish order), and the bus cursor
+   *   already covers the source's range, so a preserved keySeq can
+   *   never collide with a future publish.
+   * - `signature` / `publisherSignature` do NOT travel: both bind
+   *   (topic, seq, wire bytes) (EB-84 / EB-97), and a re-seqed copy
+   *   under a new topic is a different signed statement. A forked
+   *   record that carried the source's signature would fail
+   *   verification on the target — worse, it would look verified
+   *   until checked. Forked records are unsigned; a verifier on the
+   *   fork sees exactly that.
+   *
+   * Fail-closed, before any copy: an unknown source (no live log),
+   * an already-known target, a target with stray log files on disk,
+   * or an invalid option all throw `RangeError` with the target
+   * untouched. A failed append mid-copy purges the partial target
+   * (best effort) and throws, so a fork never leaves a half-copied
+   * topic behind: the result is all copied records or no fork.
+   */
+  forkTopic(
+    sourceTopic: string,
+    targetTopic: string,
+    opts?: ForkTopicOptions,
+  ): ForkTopicResult {
+    const o = opts ?? {};
+    if (!this.topicsSeen.has(sourceTopic)) {
+      throw new RangeError(`forkTopic: unknown source topic "${sourceTopic}"`);
+    }
+    if (this.topicsSeen.has(targetTopic)) {
+      throw new RangeError(`forkTopic: target topic "${targetTopic}" is already in use`);
+    }
+    if (
+      o.fromSeq !== undefined &&
+      (!Number.isInteger(o.fromSeq) || o.fromSeq < 0)
+    ) {
+      throw new RangeError('forkTopic: fromSeq must be a non-negative integer');
+    }
+    if (
+      o.fromTime !== undefined &&
+      (typeof o.fromTime !== 'number' || !Number.isFinite(o.fromTime) || o.fromTime < 0)
+    ) {
+      throw new RangeError('forkTopic: fromTime must be a non-negative finite number');
+    }
+    const targetEnc = encodeURIComponent(targetTopic);
+    const targetLiveKey = `${targetEnc}.log`;
+    const targetSegmentPrefix = `${targetEnc}.seg-`;
+    const keys = this.backend.list();
+    if (keys.includes(targetLiveKey) || keys.some((k) => k.startsWith(targetSegmentPrefix))) {
+      throw new RangeError(`forkTopic: target topic "${targetTopic}" already has log files`);
+    }
+    const fromSeq = o.fromSeq ?? 0;
+    const sourceLastSeq = this.lastSeq(sourceTopic);
+    // Raw live records in source seq order (not the `readSince`
+    // view: that view applies the log's key-compaction dedup, which
+    // would silently change the fork's contents with the log's
+    // compaction setting — the fork's filters below are explicit).
+    const sourceRecords = this.readFileRecordsSince(sourceTopic, fromSeq).filter(
+      (rec) => rec.seq >= 1,
+    );
+    let selected = sourceRecords;
+    if (o.fromTime !== undefined) {
+      const fromTime = o.fromTime;
+      selected = selected.filter((rec) => rec.at > fromTime);
+    }
+    if (o.keyedLatest === true) {
+      const latestByKey = new Map<string, DurableLogRecord>();
+      for (const rec of selected) {
+        if (rec.key !== undefined) latestByKey.set(rec.key, rec);
+      }
+      if (latestByKey.size > 0) {
+        selected = selected.filter(
+          (rec) => rec.key === undefined || latestByKey.get(rec.key) === rec,
+        );
+      }
+    }
+    // Re-seq per partition from 1, in source seq order.
+    const nextSeqByPartition = new Map<number, number>();
+    let copied = 0;
+    try {
+      for (const rec of selected) {
+        const partition = rec.partition ?? 0;
+        const seq = (nextSeqByPartition.get(partition) ?? 0) + 1;
+        nextSeqByPartition.set(partition, seq);
+        const { signature, publisherSignature, ...rest } = rec;
+        void signature;
+        void publisherSignature;
+        const ok = this.append({ ...rest, topic: targetTopic, seq });
+        if (!ok) {
+          throw new Error(`forkTopic: failed to append record seq ${rec.seq} to "${targetTopic}"`);
+        }
+        copied += 1;
+      }
+    } catch (err) {
+      // All-or-nothing: a partial fork is worse than no fork — a
+      // consumer that found half a history would trust it. Purge
+      // best effort; the throw below is the signal regardless.
+      try {
+        this.purgeTopic(targetTopic);
+      } catch {
+        // The purge itself failed; the original error still reports.
+      }
+      throw err;
+    }
+    return {
+      sourceTopic,
+      targetTopic,
+      copied,
+      sourceLastSeq,
+      targetLastSeq: this.lastSeq(targetTopic),
+      fromSeq: o.fromSeq,
+      fromTime: o.fromTime,
+      keyedLatest: o.keyedLatest ?? false,
     };
   }
 
