@@ -201,6 +201,13 @@ import {
   type SubscriptionAuditQuery,
 } from './subaudit.ts';
 import {
+  DropJournal,
+  type DropJournalEntry,
+  type DropJournalFilter,
+  type DropJournalStats,
+  type DropReason,
+} from './dropjournal.ts';
+import {
   resolveTopicFairnessOptions,
   type ResolvedTopicFairnessOptions,
   type TopicFairnessOptions,
@@ -4549,6 +4556,16 @@ export interface EventBusOptions {
    */
   subscriptionAuditMaxEntries?: number;
   /**
+   * Bounded in-memory size for the subscriber-queue drop journal
+   * (EB-225, default 1000): per-message drop rows (topic, subscriber
+   * id, seq, reason, timestamp — never the payload) for non-reliable
+   * subscriber queues, queried with `getDropJournal` and summarized in
+   * `getStats().dropJournal`. The oldest rows are evicted past this
+   * size; lifetime totals survive in the stats. Must be a positive
+   * integer.
+   */
+  dropJournalMaxEntries?: number;
+  /**
    * Opt-in publish audit journal (EB-138): every publish admission — each
    * admitted publish and every admission rejection (the EB-39
    * `AdmissionRejectReason` vocabulary) — is appended to
@@ -5748,6 +5765,13 @@ export interface BusStats {
    * sum of the per-subscriber `droppedCount` values for live subscribers.
    */
   droppedMessages: number;
+  /**
+   * Subscriber-queue drop journal totals (EB-225): lifetime per-message
+   * drop rows for non-reliable subscriber queues, bounded by
+   * `EventBusOptions.dropJournalMaxEntries`. Query the rows themselves
+   * with `getDropJournal`.
+   */
+  dropJournal: DropJournalStats;
   /**
    * Total messages refused by saturated subscribers under the `'block'`
    * backpressure tier (see `SubscribeOptions.backpressure`, EB-83) — the
@@ -15743,6 +15767,21 @@ export class EventBus {
    */
   private readonly publishAudit: PublishAuditLog | undefined;
   /**
+   * Subscriber-queue drop journal (EB-225): always on, bounded by
+   * `EventBusOptions.dropJournalMaxEntries`. Records per-message drops
+   * for non-reliable subscriber queues only (see `noteSubscriberDrop`).
+   */
+  private readonly dropJournal: DropJournal;
+  /**
+   * Messages whose effective queue expiry is driven by a hard delivery
+   * deadline rather than a TTL (EB-225): TTL and deadline collapse into
+   * one `expiresAt` at fan-out, so the cause is stamped here while fan-out
+   * still knows which one won. A `WeakSet` — membership dies with the
+   * message object, so replayed or bridged messages (new objects) simply
+   * report as TTL expiries.
+   */
+  private readonly deadlineDrivenExpiry = new WeakSet<BusMessage>();
+  /**
    * Topic metadata registry (EB-77): the operator-side catalog of known
    * topics. Advisory only — publishing to an unregistered topic is
    * counted and surfaced on `onUnregisteredTopic`, never blocked.
@@ -16470,6 +16509,16 @@ export class EventBus {
       maxEntries: subscriptionAuditMaxEntries,
       now: this.now,
     });
+    // Subscriber-queue drop journal (EB-225): validated fail-fast like
+    // the other bounded options above; the journal itself validates too.
+    const dropJournalMaxEntries = options?.dropJournalMaxEntries;
+    if (
+      dropJournalMaxEntries !== undefined &&
+      (!Number.isInteger(dropJournalMaxEntries) || dropJournalMaxEntries < 1)
+    ) {
+      throw new RangeError('dropJournalMaxEntries must be a positive integer');
+    }
+    this.dropJournal = new DropJournal(dropJournalMaxEntries);
     // Pull-mode ring buffer size (EB-111): validated fail-fast like the
     // other bounded options above.
     const pullBufferSize = options?.pullBufferSize;
@@ -22453,6 +22502,11 @@ export class EventBus {
           }),
       weights: this.laneWeights,
       bulkStarvationRounds: this.bulkStarvationRounds,
+      // Subscriber-queue drop journal (EB-225): every shed victim is
+      // recorded by identity — the queue itself only counts sheds.
+      // (The closure runs long after `subscriber` below is initialized,
+      // exactly like the `onHighWaterMark` wrapper that follows.)
+      onEvicted: (msg: BusMessage) => this.noteSubscriberDrop(subscriber, msg, 'evicted'),
       // The internal wrappers are registered whenever throttling is enabled,
       // even without user callbacks: the bus needs the excursion signals to
       // engage/disengage the throttle.
@@ -34050,6 +34104,18 @@ export class EventBus {
   }
 
   /**
+   * Subscriber-queue drop journal (EB-225): per-message drop rows for
+   * non-reliable subscriber queues — topic, subscriber id, seq, reason,
+   * bus-clock timestamp — never the payload. Filter by subscriber,
+   * topic, reason, and/or time range; `limit` caps the oldest-first
+   * result. Empty when nothing was dropped (or when the caller only
+   * runs reliable/shadow subscriptions, which are out of scope).
+   */
+  getDropJournal(filter?: DropJournalFilter): DropJournalEntry[] {
+    return this.dropJournal.query(filter ?? {});
+  }
+
+  /**
    * Verifies the publish audit journal's tamper-evident hash chain
    * (EB-198) over the in-memory read view: every record's `hash` must
    * match its recomputed content hash and every `prevHash` must link to
@@ -35163,7 +35229,35 @@ export class EventBus {
    *
    * The expiry accounting (`recordExpired`) always runs, DLQ or not.
    */
-  private noteDrainedExpired(msg: BusMessage, lane?: MessageLane): void {
+  /**
+   * Records one non-reliable subscriber-queue drop in the drop journal
+   * (EB-225): identity only, never the payload. Reliable subscribers
+   * are out of scope — their loss path is the dead-letter / ack
+   * machinery, not the plain queue — and shadow mirrors keep their own
+   * counters, so neither is journaled here.
+   */
+  private noteSubscriberDrop(subscriber: Subscriber, msg: BusMessage, reason: DropReason): void {
+    if (subscriber.reliable != null || subscriber.shadow !== undefined) return;
+    this.dropJournal.record({
+      topic: msg.topic,
+      subscriberId: subscriber.id,
+      seq: msg.seq,
+      reason,
+      at: this.now(),
+    });
+  }
+
+  private noteDrainedExpired(msg: BusMessage, lane?: MessageLane, subscriber?: Subscriber): void {
+    // Subscriber-queue drop journal (EB-225): a drain expiry is a queue
+    // drop like any other — deadline-driven when fan-out marked the
+    // message so, TTL-driven otherwise (see `deadlineDrivenExpiry`).
+    if (subscriber !== undefined) {
+      this.noteSubscriberDrop(
+        subscriber,
+        msg,
+        this.deadlineDrivenExpiry.has(msg) ? 'deadline-expired' : 'ttl-expired',
+      );
+    }
     // Tail-based sampling (EB-181): the expired delivery's leg closes —
     // the message never reached a handler.
     this.tailSampler?.noteExpired(msg);
@@ -35495,6 +35589,7 @@ export class EventBus {
       // change, like any other refused newcomer.
       this.countLaneRefused(msg.topic, msg.lane ?? 'normal');
       this.auditBackpressureDrop(subscriber, msg, 'block', 1);
+      this.noteSubscriberDrop(subscriber, msg, 'refused');
       return 'dropped';
     }
     // Count-saturation check BEFORE the push: the 'block' tier arms only
@@ -35538,6 +35633,9 @@ export class EventBus {
       // Every queue-level drop is audited (EB-83): shed evictions and
       // refused newcomers alike, with the tier that was in force.
       this.auditBackpressureDrop(subscriber, msg, subscriber.backpressure, shed > 0 ? shed : 1);
+      // Shed victims are already journaled one by one via the queue's
+      // `onEvicted` hook; only the refused newcomer needs a row here.
+      if (result === 'dropped') this.noteSubscriberDrop(subscriber, msg, 'refused');
     }
     if (subscriber.backpressure === 'block' && wasFull) {
       // First count-saturation under the 'block' tier: the admit-with-shed
@@ -38598,6 +38696,18 @@ export class EventBus {
           ? messageDeadline
           : Math.min(baseExpiresAt, messageDeadline);
     if (expiresAt !== undefined) this.messageDeadlines.set(msg, expiresAt);
+    // Subscriber-queue drop journal (EB-225): when the hard deadline
+    // (not an EDF scheduling deadline, which never expires a message)
+    // is the earlier instant — or the only one — the queue expiry that
+    // follows is deadline-driven, not TTL-driven. Ties go to the
+    // deadline: an explicitly set deadlineAt is the stricter contract.
+    if (
+      messageDeadline !== undefined &&
+      edfDeadline === undefined &&
+      (baseExpiresAt === undefined || messageDeadline <= baseExpiresAt)
+    ) {
+      this.deadlineDrivenExpiry.add(msg);
+    }
     // EDF scheduling deadline (EB-204): the raw deadline for
     // earliest-deadline-first queue ordering and the `missedDeadline`
     // hand-off mark — tracked separately from the TTL-chain expiry
@@ -40082,6 +40192,7 @@ export class EventBus {
       globalRateLimitedMessages: this.totalGlobalRateLimited,
       namespaceQuotas: this.tenantQuotaUsageSnapshot(),
       droppedMessages: this.totalDropped,
+      dropJournal: this.dropJournal.stats(),
       blockedMessages: this.totalBlocked,
       blockedSubscribers: [...this.subscribers.values()].filter((s) => s.blocked).length,
       shadowedMessages: this.totalShadowed,
@@ -41108,7 +41219,7 @@ export class EventBus {
       pending.timer.cancel();
       dlq.pendingLadders.delete(msg);
       this.totalLadderPending = Math.max(0, this.totalLadderPending - 1);
-      this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+      this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
       this.checkDrainComplete(subscriber);
       return;
     }
@@ -41155,7 +41266,7 @@ export class EventBus {
     // dropped as expired, never resurrected by the backoff.
     const deadline = this.messageDeadlines.get(msg);
     if (deadline !== undefined && this.now() >= deadline) {
-      this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+      this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
       this.checkDrainComplete(subscriber);
       return;
     }
@@ -42535,7 +42646,7 @@ export class EventBus {
       // deliberately discarded — the loss stays visible as a sequence
       // gap, exactly like a backpressure shed.
       const { live: chaosLive, expired } = subscriber.queue.drainLive(nowMs);
-      for (const msg of expired) this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+      for (const msg of expired) this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
       // The discarded live backlog leaves its lanes' backlogs and counts
       // as lane sheds — the same visibility a backpressure shed gets.
       for (const msg of chaosLive) this.countLaneShed(msg.topic, msg.lane ?? 'normal', 1);
@@ -42855,7 +42966,7 @@ export class EventBus {
         }
       }
       for (const msg of expired) {
-        this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+        this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
       }
       const health = subscriber.health;
       if (health == null) {
@@ -43279,7 +43390,7 @@ export class EventBus {
           }
         }
         for (const msg of expired) {
-          this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+          this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
         }
         batch.pending.push(...live);
       }
@@ -43353,7 +43464,7 @@ export class EventBus {
     for (const msg of pending) {
       const deadline = this.messageDeadlines.get(msg);
       if (deadline !== undefined && nowMs >= deadline) {
-        this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+        this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
       } else {
         live.push(msg);
       }

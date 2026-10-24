@@ -153,6 +153,13 @@ export interface LaneQueueOptions<T> {
   onHighWaterMark?: (size: number) => void;
   /** Fired once when the aggregate size recedes below the high-water mark after an excursion. */
   onDrained?: (size: number) => void;
+  /**
+   * Fired with each message shed under `drop-oldest` (EB-225): the
+   * evicted item and the lane it was shed from. Refused newcomers never
+   * fire this — they never entered a lane. The bus wires this to the
+   * subscriber-queue drop journal; the queue itself only counts sheds.
+   */
+  onEvicted?: (item: T, lane: MessageLane) => void;
 }
 
 /**
@@ -195,6 +202,7 @@ export class LaneQueue<T> {
   private bytesTotal = 0;
   private readonly onHighWaterMark?: (size: number) => void;
   private readonly onDrained?: (size: number) => void;
+  private readonly onEvicted?: (item: T, lane: MessageLane) => void;
   private highWaterMarkFraction: number;
   private highWaterMarkReached = false;
   private readonly droppedByLaneCount: LaneCounts = zeroedLaneCounts();
@@ -210,6 +218,7 @@ export class LaneQueue<T> {
     this.bulkStarvationRounds = options.bulkStarvationRounds ?? DEFAULT_BULK_STARVATION_ROUNDS;
     this.onHighWaterMark = options.onHighWaterMark;
     this.onDrained = options.onDrained;
+    this.onEvicted = options.onEvicted;
     this.highWaterMarkFraction = options.highWaterMarkRatio ?? 0.8;
     if (
       !Number.isFinite(this.highWaterMarkFraction) ||
@@ -755,6 +764,10 @@ export class LaneQueue<T> {
     if (evicted === undefined) return;
     this.bytesTotal -= this.measure(evicted);
     this.recordDrop(lane);
+    // The journal hook fires after the counts, so the drop is counted
+    // even if an observer misbehaves; the bus's observer only appends
+    // to a bounded ring and never throws.
+    this.onEvicted?.(evicted, lane);
     // No maybeFireDrained(): like the original single-queue shed, the
     // transient dip during evict-then-push must not clear the high-water
     // excursion — the queue ends the push back at/above the mark.

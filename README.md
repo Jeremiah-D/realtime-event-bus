@@ -4032,6 +4032,51 @@ Details:
 - **Tamper-evident hash chain** — every record carries a `prevHash` /
   `hash` link; see "Audit log hash chain (EB-198)" below.
 
+## Subscriber-queue drop journal (EB-225)
+
+Aggregate counters (`getStats().droppedMessages`) say how many
+messages a subscriber queue shed; they cannot say which ones. The drop
+journal answers that: every backpressure shed, every backpressure
+refusal, and every drain-time expiry of a non-reliable subscriber's
+queue leaves one metadata-only row — topic, subscriber id, per-topic
+sequence number, reason, bus-clock timestamp — never the payload:
+
+```ts
+const bus = new EventBus({ dropJournalMaxEntries: 1000 }); // default 1000
+bus.getDropJournal({ subscriberId: 'sub-1', topic: 'orders.created' });
+// [{ topic:'orders.created', subscriberId:'sub-1', seq:7,
+//    reason:'evicted', at:… }]
+bus.getDropJournal({ reason: 'ttl-expired', since, until, limit });
+bus.getStats().dropJournal;
+// { total, size, capacity, byReason: { evicted, refused,
+//   'ttl-expired', 'deadline-expired' } }
+```
+
+Details:
+
+- **Reasons** — `'evicted'` (shed under `drop-oldest`, count or
+  byte-budget pressure), `'refused'` (refused newcomer: `drop-newest`,
+  the `'block'` tier, or a lower-precedence newcomer refused to
+  protect higher-precedence backlog), `'ttl-expired'` (the TTL deadline
+  passed before the drain could hand the message to a handler),
+  `'deadline-expired'` (the hard delivery deadline, `deadlineAt`,
+  passed first). TTL and hard deadline collapse into one `expiresAt`
+  at fan-out, so the split is exact for messages the bus itself fanned
+  out; replayed, bridged, or cluster-forwarded messages whose origin
+  cause is not visible locally report as `'ttl-expired'`.
+- **Scope** — non-reliable subscriber queues only. Reliable
+  subscribers are not journaled (their loss path is the dead-letter /
+  ack machinery), nor are shadow mirrors (their own counters), nor
+  graceful-drain skips, filter skips, or dedup duplicates (not drops).
+- **Bounded** — the ring evicts the oldest rows past
+  `dropJournalMaxEntries`; lifetime totals survive in
+  `getStats().dropJournal`, so a full ring never hides that drops
+  happened — only which ones, oldest first.
+- **Orthogonal** — the reliable DLQ (EB-28) keeps payloads and
+  replays; the publish audit (EB-138) records admissions, not drops.
+  The drop journal is the per-message record of what the queue itself
+  discarded.
+
 ## Audit log hash chain (EB-198)
 
 Both audit journals — the subscription lifecycle audit log and the
