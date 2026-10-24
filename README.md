@@ -2639,6 +2639,15 @@ npm test
   degraded-subscriber ladder pause until resume, per-message ladder walks
   for batch subscriptions, unchanged immediate dead-lettering without the
   option, and `ladderPending`/`ladderAttempts` stats.
+- `test/redelivery-backoff.test.ts` — per-subscriber redelivery backoff
+  (EB-220): `validateRedeliveryBackoff`/`RedeliveryBackoff` unit tests
+  (illegal values throw `RangeError`, injectable timers/clock/random,
+  cancel-before-fire, exponential growth with cap, full jitter),
+  nack and ack-timeout redeliveries waiting out the backoff, unchanged
+  immediate redelivery without the option, unsubscribe cancelling an
+  armed delay, no backoff before a budget-exhaustion dead-lettering,
+  TTL-expired messages dropped at the hand-off (never resurrected),
+  and a graceful drain staying open across a pending backoff until ack.
 - `test/health.test.ts` — subscriber health probing: consecutive-error and
   processing-timeout thresholds auto-pause delivery, success resets the
   counter, a mid-drain degradation requeues unattempted messages in order,
@@ -6951,6 +6960,59 @@ Semantics:
   subscriber — the gap detector sees it as redelivery-order, never a
   phantom gap. Keep one deadline class per causal chain if strict
   in-order processing matters.
+
+## Per-subscriber redelivery backoff (EB-220)
+
+`ReliableSubscribeOptions.redeliveryBackoff` spaces a reliable
+subscriber's in-budget redeliveries: instead of requeueing a nacked /
+ack-timed-out message immediately, the bus waits an exponentially
+growing delay — first redelivery `baseMs`, then `baseMs * 2`,
+`baseMs * 4`, … capped at `capMs` — before the message is requeued.
+A downstream that flaps (up just long enough to accept a delivery,
+down again before it can process it) gets breathing room between
+attempts instead of being hammered by its own redeliveries at full
+speed.
+
+```ts
+const sub = bus.subscribeReliable('orders', (d) => {
+  try {
+    process(d.message);
+    d.ack();
+  } catch {
+    d.nack(); // redelivery 1 waits 100ms, then 200ms, then 400ms, …
+  }
+}, { redeliveryBackoff: { baseMs: 100, capMs: 5000 } });
+```
+
+Semantics:
+
+- **Opt-in per reliable subscription, disabled by default.** Without
+  the option, `nack()` / ack timeout requeues immediately, exactly as
+  before. The option is validated at subscribe time (`RangeError` for
+  a missing/illegal `baseMs`, a `capMs` below `baseMs`, or a
+  non-boolean `jitter`).
+- **Budget-internal only, orthogonal to the retry ladder (EB-155).**
+  The backoff spaces redeliveries *inside* the instant redelivery
+  budget (`deadLetter.maxRedeliveries`); once the budget is exhausted
+  the message walks the ladder's rungs (or dead-letters immediately
+  without a ladder) with no extra backoff delay — the backoff never
+  delays a dead-lettering.
+- **Full jitter, opt-in.** With `jitter: true` each delay is a uniform
+  draw from `[0, computed delay)`, so a fleet of subscribers hammering
+  the same downstream does not re-synchronize.
+- **Same guarantees as an immediate redelivery.** The delayed requeue
+  carries the identical message object through the normal pipeline:
+  original per-topic `seq` and TTL deadline preserved, dedup bypassed,
+  fresh ACK envelope per attempt. A message whose TTL expires while
+  waiting is dropped as expired at the hand-off — never resurrected,
+  never dead-lettered.
+- **In-memory, unref'd timers, cancelled on unsubscribe.** A pending
+  backoff never keeps the process alive and never fires for a gone
+  subscriber. A graceful drain (`unsubscribe({ drain: true })`) stays
+  open while a backoff is pending, so the redelivery still settles
+  before teardown. Unlike the ladder, a degraded subscriber (EB-18)
+  does not re-arm the delay: the message is already queued by the
+  requeue and simply waits out the pause in the backlog.
 
 ## Request–reply RPC (EB-178)
 

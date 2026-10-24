@@ -28,6 +28,7 @@ import {
 } from './idle.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { validateRetryLadder, RetryLadder, type RetryLadderTimer, type RetryLadderTimerFactory } from './retry-ladder.ts';
+import { validateRedeliveryBackoff, RedeliveryBackoff, type RedeliveryBackoffConfig, type RedeliveryBackoffTimer } from './redelivery-backoff.ts';
 import {
   validateAdmissionWebhookOptions,
   decideAdmission,
@@ -3447,6 +3448,28 @@ export interface ReliableSubscribeOptions extends SubscribeOptions {
    * number.
    */
   ackTimeoutMs?: number;
+  /**
+   * Opt-in per-subscriber redelivery backoff (EB-220): within the
+   * instant redelivery budget, each `nack()` / ack-timeout redelivery
+   * waits an exponentially growing delay before it is requeued —
+   * first redelivery `baseMs`, then `baseMs * 2`, `baseMs * 4`, …
+   * capped at `capMs` — instead of requeueing immediately, so a
+   * flapping downstream is not hammered by its own redeliveries at full
+   * speed. `jitter: true` draws each delay uniformly from
+   * [0, computed delay) (full jitter) so a fleet of subscribers does
+   * not re-synchronize. Orthogonal to `deadLetter.retryLadder`
+   * (EB-155): the backoff spaces redeliveries *inside* the budget,
+   * the ladder only runs *after* the budget is exhausted, and the
+   * backoff never delays a dead-lettering. Disabled by default
+   * (absent): immediate requeue, the pre-EB-220 behavior. The delay
+   * computation is validated at subscribe time (`RangeError` for an
+   * illegal config) and runs on the bus clock / unref'd timers, so a
+   * pending backoff never keeps the process alive and is cancelled on
+   * unsubscribe. A graceful drain (`unsubscribe({ drain: true })`)
+   * stays open while a backoff is pending — the redelivery still
+   * settles before teardown.
+   */
+  redeliveryBackoff?: RedeliveryBackoffConfig;
   /**
    * Opt-in per-subscriber dead-letter queue for poison messages. Without
    * it, a reliable subscription retries forever (at-least-once): every
@@ -7755,6 +7778,22 @@ interface Subscriber {
      * calls.
      */
     liveDeliveries: WeakMap<BusMessage, { live: boolean }>;
+    /**
+     * EB-220: per-subscriber redelivery-backoff scheduler. Present
+     * only for reliable subscriptions that opted into
+     * `redeliveryBackoff` — plain subscriptions and reliable ones
+     * without the option requeue immediately, as before.
+     */
+    redeliveryBackoff?: RedeliveryBackoff;
+    /**
+     * EB-220: redelivery delays currently armed, by message. A message
+     * sits here between its settle (`nack()` / ack timeout) and its
+     * delayed requeue — neither queued nor unacked in that window, so
+     * the graceful-drain check treats a non-empty map as outstanding
+     * work, and unsubscribe cancels every armed delay. Deleted when
+     * the delay fires (the message is requeued, not kept).
+     */
+    pendingRedeliveryBackoffs: Map<BusMessage, RedeliveryBackoffTimer>;
   };
   /**
    * Present for reliable subscriptions with `deadLetter` enabled: the
@@ -22637,6 +22676,18 @@ export class EventBus {
           // must not outlive its subscriber — the armed resume timer is
           // cancelled and the paused pass is dropped.
           this.clearReplayThrottleRun(subscriber);
+          // EB-220: pending redelivery backoffs must not outlive the
+          // subscriber — a delayed requeue for a gone subscriber is
+          // dropped. Runs in the shared teardown, so it covers
+          // immediate unsubscribes, post-drain teardowns, and forced
+          // teardowns alike.
+          const reliable = subscriber.reliable;
+          if (reliable !== undefined) {
+            for (const timer of reliable.pendingRedeliveryBackoffs.values()) {
+              timer.cancel();
+            }
+            reliable.pendingRedeliveryBackoffs.clear();
+          }
           // EB-134: pending dead-letter auto-replays must not outlive
           // the subscriber — a replay for a gone subscriber is dropped.
           const dlq = subscriber.deadLetter;
@@ -22840,6 +22891,11 @@ export class EventBus {
     if ((subscriber.batch?.pending.length ?? 0) !== 0) return false;
     const tracker = subscriber.reliable?.tracker;
     if (tracker !== undefined && tracker.unackedCount !== 0) return false;
+    // EB-220: a pending redelivery backoff is outstanding work — the
+    // message is neither queued nor unacked while its delay runs, so
+    // without this a drain would complete and the teardown would cancel
+    // the delay, losing the at-least-once redelivery.
+    if ((subscriber.reliable?.pendingRedeliveryBackoffs.size ?? 0) !== 0) return false;
     return true;
   }
 
@@ -24026,6 +24082,9 @@ export class EventBus {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
     const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable');
+    // EB-220: validate the redelivery backoff before subscribing — a
+    // rejected option must not leave a half-registered subscription.
+    const redeliveryBackoff = validateRedeliveryBackoff(opts?.redeliveryBackoff, 'subscribeReliable');
     let deliver!: (msg: BusMessage | BusMessage[]) => void;
     // The retained snapshot (EB-87) is deferred until the at-least-once
     // wrapper below is installed: delivering through the not-yet-assigned
@@ -24172,8 +24231,26 @@ export class EventBus {
         // `deduplicateMessages` subscriber would be suppressed as a
         // duplicate and never redelivered, silently breaking
         // at-least-once (EB-134).
-        this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
-        this.scheduleFlush();
+        //
+        // EB-220: with a redelivery backoff configured the requeue is
+        // delayed instead of immediate — the message waits out its
+        // exponential delay (armed on an unref'd timer) and is requeued
+        // by `fireRedeliveryBackoff`, which re-applies the same
+        // already-admitted guarantees. The drain check below stays a
+        // no-op while the delay is armed: `isDrainComplete` treats a
+        // pending backoff as outstanding work, so a graceful drain
+        // cannot complete (and cancel the delay) mid-backoff.
+        const reliable = subscriber.reliable;
+        const backoff = reliable?.redeliveryBackoff;
+        if (backoff !== undefined && reliable !== undefined) {
+          reliable.pendingRedeliveryBackoffs.set(
+            msg,
+            backoff.schedule(count, () => this.fireRedeliveryBackoff(subscriber, msg)),
+          );
+        } else {
+          this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
+          this.scheduleFlush();
+        }
         // The requeue re-armed the backlog: re-evaluate the drain — a
         // drain whose queue just refilled stays open, and one whose last
         // redelivery landed in an otherwise empty queue stays open until
@@ -24181,7 +24258,20 @@ export class EventBus {
         this.checkDrainComplete(subscriber);
       },
     });
-    subscriber.reliable = { tracker, redeliveries, lastFailure, batchHandles, liveDeliveries };
+    subscriber.reliable = {
+      tracker,
+      redeliveries,
+      lastFailure,
+      batchHandles,
+      liveDeliveries,
+      // EB-220: build the per-subscriber backoff scheduler when the
+      // option is enabled — unref'd timers on the bus clock.
+      redeliveryBackoff:
+        redeliveryBackoff === undefined
+          ? undefined
+          : new RedeliveryBackoff(redeliveryBackoff, { now: this.now, timers: retryLadderTimers }),
+      pendingRedeliveryBackoffs: new Map(),
+    };
     // EB-129: allocate the per-subscriber nack-reason counters — only
     // reliable subscriptions carry them; plain subscriptions never do.
     subscriber.nackReasons = { handler_throw: 0, explicit_nack: 0, ack_timeout: 0 };
@@ -40746,6 +40836,45 @@ export class EventBus {
     // redelivery — refusing it here would break at-least-once and wedge
     // the drain. `skipDedup`: same already-admitted reasoning as the
     // redelivery path — a rung must never be suppressed as a duplicate.
+    this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
+    this.scheduleFlush();
+    this.checkDrainComplete(subscriber);
+  }
+
+  /**
+   * Fires one armed redelivery-backoff delay (EB-220): requeues the
+   * message for a single delayed redelivery. Stale firings (unsubscribed
+   * subscriber, superseded delay) are dropped. A message whose TTL
+   * expired while waiting is judged expired at the hand-off and
+   * dropped — never resurrected, never dead-lettered — mirroring the
+   * retry-ladder rung hand-off. Unlike the ladder, a degraded
+   * subscriber (EB-18 health probe) does NOT re-arm the delay: the
+   * message is already queued by the requeue below and simply waits
+   * out the pause in the backlog, delivered on resume — re-arming
+   * would double-count the backoff against a downstream that is
+   * already paused.
+   *
+   * The requeue is already-admitted at-least-once work — the same
+   * shape as an immediate redelivery (`skipDedup`, `fromRedelivery`) —
+   * so the drain hands it to the handler through the normal pipeline:
+   * a fresh ACK envelope (EB-11) per attempt and FIFO order.
+   */
+  private fireRedeliveryBackoff(subscriber: Subscriber, msg: BusMessage): void {
+    const reliable = subscriber.reliable;
+    // Unsubscribed while armed (or the reliable record is gone): the
+    // teardown already cancelled the timer, so a firing here is stale.
+    if (reliable === undefined || !this.subscribers.has(subscriber.id)) return;
+    const pending = reliable.pendingRedeliveryBackoffs.get(msg);
+    if (pending === undefined) return;
+    reliable.pendingRedeliveryBackoffs.delete(msg);
+    // EB-220: judge TTL expiry at the hand-off — an expired message is
+    // dropped as expired, never resurrected by the backoff.
+    const deadline = this.messageDeadlines.get(msg);
+    if (deadline !== undefined && this.now() >= deadline) {
+      this.noteDrainedExpired(msg, msg.lane ?? 'normal');
+      this.checkDrainComplete(subscriber);
+      return;
+    }
     this.enqueueMessage(subscriber, msg, this.messageDeadlines.get(msg), true, true);
     this.scheduleFlush();
     this.checkDrainComplete(subscriber);
