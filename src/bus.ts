@@ -3864,6 +3864,24 @@ export interface GroupPartitionExpansion {
   assignment: Record<number, string>;
 }
 
+/**
+ * Result of `EventBus.scalePartitions` (EB-216): the topic-scale
+ * operation's publish-side counts plus one per-group expansion for
+ * every partitioned competing set whose pattern is exactly the scaled
+ * topic (each in the `GroupPartitionExpansion` shape, so callers see
+ * the same migration detail as a direct `setGroupPartitionCount`).
+ */
+export interface TopicPartitionScale {
+  /** The scaled topic (exact topic name). */
+  topic: string;
+  /** Publish-side partition count before the scale. */
+  partitionsBefore: number;
+  /** Publish-side partition count after the scale. */
+  partitionsAfter: number;
+  /** Per-group expansions performed, in `groupPartitions` key order. */
+  groups: GroupPartitionExpansion[];
+}
+
 export interface GroupRebalanceEvent {
   /** The group whose membership changed. */
   groupId: string;
@@ -5959,6 +5977,15 @@ export interface BusStats {
    * messages its durable-side buffer currently holds (queue mode).
    */
   pausedTopics: PausedTopicRule[];
+  /**
+   * Publish-side partition rules (see `EventBus.setTopicPartitions` /
+   * `EventBus.scalePartitions`, EB-90/EB-216), in registration order: the
+   * rule key and its partition count. A concrete topic publishes with
+   * the resolved count — an exact-topic rule wins over patterns, the
+   * earliest-registered matching pattern wins, no rule means 1. Rendered
+   * as `eventbus_topic_partitions` in `src/metrics.ts`.
+   */
+  topicPartitions: Array<{ topicPattern: string; partitions: number }>;
   /**
    * Total publishes rejected by admission gates before admission — schema
    * validation, the broker-level ACL, the per-topic message-size cap, the
@@ -26402,17 +26429,32 @@ export class EventBus {
       throw new RangeError('partition count must be a positive integer');
     }
     const key = this.partitionGroupKey(groupId);
+    return this.expandGroupPartitions(key, n);
+  }
+
+  /**
+   * Key-addressed core of `setGroupPartitionCount` (EB-216): expands the
+   * partitioned competing set at `key` (`groupKey(groupId, pattern)`) to
+   * `n` partitions. Split out so `scalePartitions` can expand exactly
+   * the competing sets whose pattern is the scaled topic — a groupId may
+   * own several partitioned competing sets, which `partitionGroupKey`
+   * would reject as ambiguous.
+   */
+  private expandGroupPartitions(key: string, n: number): GroupPartitionExpansion {
     const before = this.groupPartitions.get(key);
     if (before === undefined) {
-      // Unreachable: partitionGroupKey only resolves keys present in
-      // groupPartitions. Defensive — the map owns the invariant.
-      throw new RangeError(`no partitioned consumer group found for groupId "${groupId}"`);
+      // Unreachable: callers resolve the key from `groupPartitions`.
+      // Defensive — the map owns the invariant.
+      throw new RangeError(`no partitioned consumer group found for key "${key}"`);
     }
     if (n <= before) {
       throw new RangeError(
-        `partition count can only grow: group "${groupId}" has ${before} partitions, got ${n}`,
+        `partition count can only grow: group has ${before} partitions, got ${n}`,
       );
     }
+    const sep = key.indexOf('\0');
+    const groupId = key.slice(0, sep);
+    const pattern = key.slice(sep + 1);
     const members = this.groupMembers.get(key) ?? [];
     // Pluggable assignor fail-fast (EB-106): trial the expansion
     // against the current roster before touching any state, mirroring
@@ -26424,8 +26466,6 @@ export class EventBus {
       const trial = impl.assign(n, members, this.previousPartitionAssignment.get(key));
       assertValidPartitionAssignment(trial, n, members, resolved?.name ?? impl.name);
     }
-    const sep = key.indexOf('\0');
-    const pattern = key.slice(sep + 1);
     const beforeAssignment = new Map(this.partitionAssignment(key));
     this.groupPartitions.set(key, n);
     this.invalidatePartitionAssignment(key);
@@ -26476,6 +26516,77 @@ export class EventBus {
       migrated,
       assignment: Object.fromEntries(after),
     };
+  }
+
+  /**
+   * Scales a topic's partition count up at runtime (EB-216, real-time
+   * systems): the Kafka `kafka-topics --alter --partitions` analogue,
+   * applied end to end on one topic. Growth only — `newCount` must be a
+   * positive integer strictly above the topic's current count, or the
+   * call throws `RangeError` before anything is touched.
+   *
+   * Publish side first: the topic's exact-topic rule grows through the
+   * `setTopicPartitions` path, so new publishes route by the new count
+   * immediately (`sha256(partitionKey) mod newCount`); the operation is
+   * audited as `partition_rule_set` like any other rule change.
+   *
+   * Consumer side: every partitioned competing set whose pattern is
+   * exactly this topic grows to `newCount` through the same sticky
+   * minimal-migration path as `setGroupPartitionCount` — the pre-scale
+   * assignment is the assignor's `previous` input, so old partitions
+   * keep their owners and only the new partitions are distributed; each
+   * group fires its operator rebalance with the existing shape
+   * (`trigger: 'expand'`). Sets already at or above `newCount` are left
+   * alone. A competing set whose pattern merely matches the topic (a
+   * wildcard like `orders.*`) is not expanded: one topic's scale must
+   * not renumber another topic's routing.
+   *
+   * Kafka-style no-migration guarantee: already-stored partition data —
+   * durable-log records, per-partition sequence counters, assignment
+   * watermarks, committed offsets — is never moved or renumbered. New
+   * partitions start empty from the latest offset.
+   *
+   * The scale itself is audited as `topic_partition_scaled`
+   * (`partitionsBefore`/`partitionsAfter`, the scaled `topic`, and the
+   * expanded `groups`).
+   */
+  scalePartitions(topic: string, newCount: number): TopicPartitionScale {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    if (!Number.isInteger(newCount) || newCount < 1) {
+      throw new RangeError('partition count must be a positive integer');
+    }
+    const before = this.partitionsForTopic(topic);
+    if (newCount <= before) {
+      throw new RangeError(
+        `partition count can only grow: topic '${topic}' has ${before} partition(s), got ${newCount}`,
+      );
+    }
+    this.setTopicPartitions(topic, newCount);
+    // Consumer side, key-addressed: a snapshot of the keys, because
+    // expanding one set notifies members whose handlers may mutate the
+    // map (unsubscribe during the rebalance).
+    const groups: GroupPartitionExpansion[] = [];
+    for (const [key, current] of [...this.groupPartitions.entries()]) {
+      const sep = key.indexOf('\0');
+      if (key.slice(sep + 1) !== topic) continue;
+      if (current < newCount) {
+        groups.push(this.expandGroupPartitions(key, newCount));
+      }
+    }
+    this.auditSubscription({
+      action: 'topic_partition_scaled',
+      actor: 'system',
+      pattern: topic,
+      topic,
+      detail: {
+        partitionsBefore: before,
+        partitionsAfter: newCount,
+        groups: groups.map((g) => g.groupId),
+      },
+    });
+    return { topic, partitionsBefore: before, partitionsAfter: newCount, groups };
   }
 
   /**
@@ -39359,6 +39470,13 @@ export class EventBus {
         topicPattern,
         mode: rule.mode,
         bufferedMessages: rule.buffer.length,
+      })),
+      // Publish-side partition rules (EB-90/EB-216), in registration
+      // order — the raw rules; a concrete topic's effective count is the
+      // resolved rule (exact wins, earliest pattern wins, default 1).
+      topicPartitions: [...this.partitionRules.entries()].map(([topicPattern, partitions]) => ({
+        topicPattern,
+        partitions,
       })),
       rejectedMessages: this.totalRejected,
       payloadRejectedBytes: this.totalPayloadRejectedBytes,

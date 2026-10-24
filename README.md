@@ -233,7 +233,25 @@ library.
   through `onRebalance`/`rebalanceListener`, and the change is audited
   with `partitionsBefore`/`partitionsAfter`. A custom assignor that moves
   an old partition gets the normal cooperative handoff, selected with the
-  pre-expansion routing so it stays exact. **Consumer-group member limit** (EB-196):
+  pre-expansion routing so it stays exact. **Topic partition scaling**
+  (EB-216): `scalePartitions(topic, newCount)` is the Kafka
+  `kafka-topics --alter --partitions` analogue applied end to end on one
+  topic — real-time systems' elastic scale-out. Growth only (a
+  shrink/no-op throws `RangeError`): the topic's publish-side rule grows
+  first through the `setTopicPartitions` path, so new publishes immediately
+  route by the new count (`sha256(partitionKey) mod newCount`), then every
+  partitioned consumer group whose pattern is exactly that topic expands
+  to the new count through the same sticky minimal-migration path —
+  each group fires its operator rebalance with the existing `trigger:
+  'expand'` shape, and groups whose pattern is a wildcard (or that are
+  already at/above the new count) are left alone. The no-migration
+  guarantee is Kafka-style: stored partition data — durable-log records,
+  per-partition sequence counters, assignment watermarks, committed
+  offsets — is never moved or renumbered; new partitions start empty from
+  the latest offset. The scale is audited as `topic_partition_scaled`
+  (topic, `partitionsBefore`/`partitionsAfter`, the expanded groups), and
+  `getStats().topicPartitions` / the `eventbus_topic_partitions` gauge
+  report the configured per-pattern counts. **Consumer-group member limit** (EB-196):
   opt-in `maxMembers` on `subscribeToGroup` caps the roster at N members —
   a join that would add a roster entry past the cap fails fast with
   `RangeError` before anything registers (no half-joined member, no

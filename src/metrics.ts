@@ -1090,6 +1090,25 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     }
   }
 
+  // Configured publish-side partition counts per topic pattern (EB-216),
+  // in registration order (same as BusStats.topicPartitions). Emitted
+  // only when a partition rule exists — a bus with no partition rules
+  // renders byte-identical exposition to before. The `?? []` keeps the
+  // renderer tolerant of a stats object that predates the field
+  // (hand-built fixtures included).
+  const topicPartitions = stats.topicPartitions ?? [];
+  if (topicPartitions.length > 0) {
+    lines.push(
+      '# HELP eventbus_topic_partitions Configured publish-side partition count per topic pattern (EB-216).',
+    );
+    lines.push('# TYPE eventbus_topic_partitions gauge');
+    for (const t of topicPartitions) {
+      lines.push(
+        `eventbus_topic_partitions{topic_pattern="${escapeLabelValue(t.topicPattern)}"} ${t.partitions}`,
+      );
+    }
+  }
+
   // Per-namespace aggregates (EB-52), in registration order (same as
   // BusStats.namespaces). Emitted only when the bus has namespaces
   // registered — a namespace-free bus renders byte-identical exposition

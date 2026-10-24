@@ -76,6 +76,8 @@ export type SubscriptionAuditAction =
   | 'delayed_cancelled'
   | 'partition_rule_set'
   | 'partition_rule_cleared'
+  | 'partition_expansion'
+  | 'topic_partition_scaled'
   | 'config_applied'
   | 'config_rolled_back'
   | 'segment_checksum_failed'
@@ -145,6 +147,10 @@ export type SubscriptionAuditAction =
  * - `retained_cleared`: `{ via: 'publish' }` (the `topic` field carries the concrete topic)
  * - `partition_rule_set`: `{ partitions: <count> }` (the `pattern` field carries the rule key)
  * - `partition_rule_cleared`: no detail (the `pattern` field carries the rule key)
+ * - `partition_expansion`: `{ partitionsBefore, partitionsAfter, members }`
+ *   (drained-group expansion; the live path audits `rebalance` instead)
+ * - `topic_partition_scaled`: `{ partitionsBefore, partitionsAfter, groups: <groupId[]> }`
+ *   (the `pattern` and `topic` fields carry the scaled topic)
  * - `topic_paused`: `{ mode: 'shed'|'queue' }` (the `pattern` field carries the rule key)
  * - `topic_resumed`: `{ mode: 'shed'|'queue', drainedMessages: <count> }` (the `pattern` field carries the rule key)
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
@@ -286,6 +292,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_cancelled',
   'partition_rule_set',
   'partition_rule_cleared',
+  'partition_expansion',
+  'topic_partition_scaled',
   'barrier_dropped',
   'subscriber_paused',
   'subscriber_resumed',
