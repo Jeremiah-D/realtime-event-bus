@@ -7196,6 +7196,11 @@ export interface BusStats {
      * EB-85), across compactions. 0 when no age bound is configured.
      */
     retentionEvicted: number;
+    /**
+     * Keys evicted by per-key TTL (`setTopicKeyTtl`, EB-221), across
+     * compactions. 0 when no key TTL is configured.
+     */
+    keyTtlEvicted: number;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
     /**
@@ -14282,6 +14287,22 @@ export class EventBus {
    */
   private partitionMatcherCache = new Map<string, RegExp>();
   /**
+   * Per-key TTL rules (EB-221), keyed by the exact string passed to
+   * `setTopicKeyTtl` — either a concrete topic name or a wildcard
+   * pattern. Match resolution mirrors `partitionRules`: an exact-topic
+   * rule wins over any pattern; between patterns the
+   * earliest-registered rule wins. Runtime-only, like the partition
+   * rules: a restart forgets them (the operator re-sets them), while
+   * evicted keys keep their seq baseline via log tombstones.
+   */
+  private keyTtlRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in `keyTtlRules`, kept
+   * apart from the other rule caches for the same reason as
+   * `partitionMatcherCache`.
+   */
+  private keyTtlMatcherCache = new Map<string, RegExp>();
+  /**
    * Per-(topic, partition) publish counters (EB-90): admitted publishes
    * and the highest per-partition sequence number assigned. Keyed by
    * concrete topic, then partition. Grows with the distinct (topic,
@@ -17130,6 +17151,119 @@ export class EventBus {
       });
     }
     return removed;
+  }
+
+  /**
+   * Registers a per-key TTL for topics matching `topicPattern`
+   * (EB-221): in a keyed-compacted durable log, a key whose latest
+   * message record is older than `ttlMs` is evicted at compact time
+   * (leaving a tombstone that preserves its keySeq baseline, so a later
+   * publish for the same key never renumbers) and skipped by
+   * `readSince` replay even before compaction — cold state keys are
+   * reclaimed instead of living forever under EB-26. The rule applies
+   * to already-known topics immediately and to later topics on their
+   * first log access; it is runtime-only (a restart forgets it — the
+   * operator re-sets it, like the partition rules).
+   *
+   * Requires a durable log (`durableLogDir`) with keyed compaction
+   * (`durableLogKeyCompaction`): without latest-per-key semantics a
+   * per-key TTL has nothing to evict. Throws `RangeError` when either
+   * is missing, when `topicPattern` is empty, or when `ttlMs` is not a
+   * positive finite number of milliseconds.
+   */
+  setTopicKeyTtl(topicPattern: string, ttlMs: number): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('setTopicKeyTtl: topicPattern must be a non-empty string');
+    }
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+      throw new RangeError('setTopicKeyTtl: ttlMs must be a positive finite number of milliseconds');
+    }
+    if (this.durableLog === undefined) {
+      throw new RangeError('setTopicKeyTtl requires EventBusOptions.durableLogDir to be set');
+    }
+    if (!this.durableLogKeyCompaction) {
+      throw new RangeError('setTopicKeyTtl requires durableLogKeyCompaction to be enabled');
+    }
+    this.keyTtlRules.set(topicPattern, ttlMs);
+    this.applyKeyTtlRulesToExistingTopics();
+    this.auditSubscription({
+      action: 'key_ttl_rule_set',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { ttlMs },
+    });
+  }
+
+  /**
+   * Removes the per-key TTL rule previously registered for
+   * `topicPattern` (EB-221). Returns true when a rule existed and was
+   * removed. Already-evicted keys stay evicted — removal only stops
+   * future evictions: every known topic's log TTL is recomputed from
+   * the remaining rules, so a topic that only matched the removed rule
+   * stops expiring keys on its next compact. Audited as
+   * `key_ttl_rule_cleared` when a rule existed.
+   */
+  clearTopicKeyTtl(topicPattern: string): boolean {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError('clearTopicKeyTtl: topicPattern must be a non-empty string');
+    }
+    const removed = this.keyTtlRules.delete(topicPattern);
+    if (removed) {
+      this.applyKeyTtlRulesToExistingTopics();
+      this.auditSubscription({
+        action: 'key_ttl_rule_cleared',
+        actor: 'system',
+        pattern: topicPattern,
+      });
+    }
+    return removed;
+  }
+
+  /**
+   * Returns the per-key TTL that applies to `topic`, or undefined when
+   * no rule matches. An exact-topic rule wins over patterns; between
+   * patterns the earliest-registered matching rule wins — the same
+   * resolution as `partitionsForTopic`.
+   */
+  private keyTtlForTopic(topic: string): number | undefined {
+    const exact = this.keyTtlRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, ttlMs] of this.keyTtlRules) {
+      let matcher = this.keyTtlMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.keyTtlMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return ttlMs;
+    }
+    return undefined;
+  }
+
+  /**
+   * Pushes the resolved per-key TTL for one topic into its log, but
+   * only when it differs — the common no-rule case costs one map-size
+   * check. Runs from `durableLogForTopic` (every log access) and from
+   * the rule setters (every known topic), so a topic's log TTL can
+   * never go stale.
+   */
+  private syncKeyTtl(topic: string, log: DurableTopicLog): void {
+    if (this.keyTtlRules.size === 0) return;
+    const ttl = this.keyTtlForTopic(topic);
+    if (log.keyTtl(topic) !== ttl) log.setKeyTtl(topic, ttl);
+  }
+
+  /**
+   * Recomputes the log TTL for every topic the bus already knows —
+   * root log topics plus every namespace child log's topics — from the
+   * current rules. No-op without a durable log.
+   */
+  private applyKeyTtlRulesToExistingTopics(): void {
+    const root = this.durableLog;
+    if (root === undefined) return;
+    for (const topic of root.topics()) this.syncKeyTtl(topic, root);
+    for (const child of this.namespaceLogs.values()) {
+      for (const topic of child.topics()) this.syncKeyTtl(topic, child);
+    }
   }
 
   /**
@@ -21771,16 +21905,25 @@ export class EventBus {
    */
   private durableLogForTopic(topic: string): DurableTopicLog | undefined {
     const root = this.durableLog;
-    if (root === undefined || this.namespaces.size === 0) return root;
-    for (const prefix of this.namespaces.keys()) {
-      // The trailing `/` is structural: prefix `t1` never matches topic
-      // `t10/x` — the same anchor property the wildcard engine relies on
-      // to keep namespaces from crossing.
-      if (topic.startsWith(`${prefix}/`)) {
-        return this.namespaceLogs.get(prefix) ?? root;
+    if (root === undefined) return undefined;
+    let log = root;
+    if (this.namespaces.size !== 0) {
+      for (const prefix of this.namespaces.keys()) {
+        // The trailing `/` is structural: prefix `t1` never matches topic
+        // `t10/x` — the same anchor property the wildcard engine relies on
+        // to keep namespaces from crossing.
+        if (topic.startsWith(`${prefix}/`)) {
+          log = this.namespaceLogs.get(prefix) ?? root;
+          break;
+        }
       }
     }
-    return root;
+    // EB-221: a topic created after its key-TTL rule was registered gets
+    // its TTL on first log access — every append, read, and purge flows
+    // through here, so no topic can compact under a stale (missing) TTL.
+    // A no-op when no rules exist, the common case.
+    this.syncKeyTtl(topic, log);
+    return log;
   }
 
   /**

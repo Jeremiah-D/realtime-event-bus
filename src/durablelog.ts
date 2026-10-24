@@ -247,6 +247,17 @@ export interface DurableLogRecord {
    */
   keySeq?: number;
   /**
+   * Key-TTL tombstone marker (EB-221): present exactly on seq-0 records
+   * compaction leaves behind for a key it evicted — the key's seq
+   * baseline (`keySeq` of its latest evicted record) so restart
+   * recovery never renumbers the key. A tombstone carries no payload
+   * and no timer intent: it is invisible to `readSince` replay (seq 0)
+   * and to every seq-0 family recovery (it carries no `delayId`,
+   * `retained`, `paused`, or `recurring` marker), and it survives
+   * future compactions like every other seq-0 record.
+   */
+  keyTtlEvicted?: boolean;
+  /**
    * SHA-256 id of the preset dictionary that compressed this record's
    * payload (see `setTopicCompression`'s `dictionary` option). Present
    * only on dictionary-compressed records. The bytes themselves live in
@@ -723,6 +734,8 @@ interface LogLine {
   key?: string;
   /** Per-key publish-order sequence number, present exactly when `key` is. */
   keySeq?: number;
+  /** Key-TTL tombstone marker (see `DurableLogRecord.keyTtlEvicted`). */
+  keyTtlEvicted?: boolean;
   /**
    * Publish-side partition the message was assigned to (see
    * `DurableLogRecord.partition`). Absent on records written before
@@ -1768,6 +1781,20 @@ export class DurableTopicLog {
   /** Records evicted by time-based retention, across compactions. */
   private retentionEvicted = 0;
   /**
+   * EB-221: per-topic key TTL in milliseconds, exact topics only — the
+   * bus resolves its pattern rules to concrete topics and pushes them
+   * here (see `setKeyTtl`). A key whose latest message record is older
+   * than `now - ttlMs` is evicted at compact time and skipped by
+   * `readSince` even before compaction. Absent per topic by default
+   * (no TTL). Runtime-only, like the bus's partition rules: restart
+   * recovery does not restore it — the bus re-applies its rules on
+   * first access, and evicted keys keep their seq baseline via
+   * tombstones, not via this map.
+   */
+  private readonly keyTtls = new Map<string, number>();
+  /** EB-221: keys evicted by per-key TTL across compactions. */
+  private keyTtlEvicted = 0;
+  /**
    * EB-163: resolved remote-offload configuration, `undefined` when
    * offload is disabled (the default — the log never touches the
    * network and keeps every archived segment locally).
@@ -1947,6 +1974,30 @@ export class DurableTopicLog {
     const previous = this.maxAgeMs;
     this.maxAgeMs = maxAgeMs;
     return previous;
+  }
+
+  /**
+   * EB-221: sets (or, with `undefined`, clears) the per-key TTL for one
+   * exact topic, returning the previous value. The bus exposes this as
+   * `setTopicKeyTtl` with pattern resolution and a subscription-audit
+   * trail. Throws `RangeError` for a non-positive-finite `ttlMs`.
+   * Takes effect on the next compact for the topic and immediately for
+   * `readSince` filtering — a key that expired since the last compact
+   * is skipped in replay even before the file is rewritten.
+   */
+  setKeyTtl(topic: string, ttlMs: number | undefined): number | undefined {
+    if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs <= 0)) {
+      throw new RangeError('keyTtlMs must be a positive finite number of milliseconds');
+    }
+    const previous = this.keyTtls.get(topic);
+    if (ttlMs === undefined) this.keyTtls.delete(topic);
+    else this.keyTtls.set(topic, ttlMs);
+    return previous;
+  }
+
+  /** EB-221: the per-key TTL configured for one exact topic, if any. */
+  keyTtl(topic: string): number | undefined {
+    return this.keyTtls.get(topic);
   }
 
   /** The log directory, as configured. */
@@ -3178,7 +3229,13 @@ export class DurableTopicLog {
    */
   private compact(topic: string): void {
     const records = this.readFileRecords(topic);
-    const retained = this.applyRetention(records);
+    // EB-221: key-TTL eviction runs before age retention — a key older
+    // than its TTL leaves a tombstone (seq baseline preserved), while a
+    // key older than `maxAgeMs` but younger than its TTL is
+    // retention-dropped without one (the pre-EB-221 `maxAgeMs` behavior;
+    // set the key TTL <= `maxAgeMs` to keep the baseline guarantee for
+    // every key).
+    const retained = this.applyRetention(this.applyKeyTtl(topic, records));
     const kept = this.applyBytesBound(
       this.keyCompaction
         ? compactKeyed(retained, this.maxEntriesPerTopic)
@@ -3199,6 +3256,63 @@ export class DurableTopicLog {
     if (this.keyCompaction) this.rebuildKeyIndex(topic, kept);
     // EB-205: the file was rewritten — rebuild the seq→offset index.
     this.parseFileRecordsWithIndex(topic, text);
+  }
+
+  /**
+   * EB-221: evicts cold keys for a topic — every key whose latest
+   * message record is older than `now - keyTtl(topic)` loses all of
+   * its records (latest plus superseded dead weight) and leaves one
+   * seq-0 tombstone carrying the evicted key's `keySeq` baseline, so
+   * restart recovery never renumbers the key (EB-36 per-key order
+   * depends on strictly increasing keySeqs). Stale tombstones for the
+   * same keys are replaced by the fresh ones, so churned keys leave at
+   * most one tombstone each. Seq-0 records that are NOT tombstones
+   * (delayed-delivery schedules, retained/pause/recurring state) are
+   * never touched even when they carry an evicted key — they are timer
+   * intents and state, not the key's value. A key exactly on the cutoff
+   * (`at === now - ttlMs`) is kept; only strictly older keys go.
+   * No-op when keyed compaction is off or the topic has no TTL.
+   */
+  private applyKeyTtl(topic: string, records: DurableLogRecord[]): DurableLogRecord[] {
+    if (!this.keyCompaction) return records;
+    const ttlMs = this.keyTtls.get(topic);
+    if (ttlMs === undefined) return records;
+    const cutoff = this.now() - ttlMs;
+    // Latest message record per key — file order, so the last write wins.
+    const latest = new Map<string, DurableLogRecord>();
+    for (const rec of records) {
+      if (rec.key !== undefined && rec.seq >= 1) latest.set(rec.key, rec);
+    }
+    const evicted = new Set<string>();
+    for (const [key, rec] of latest) {
+      if (rec.at < cutoff) evicted.add(key);
+    }
+    if (evicted.size === 0) return records;
+    const nowMs = this.now();
+    const kept: DurableLogRecord[] = [];
+    for (const rec of records) {
+      if (rec.key !== undefined && evicted.has(rec.key)) {
+        // Drop the key's messages and its stale tombstones; keep any
+        // other seq-0 record carrying the key (a pending schedule's
+        // timer intent must survive its key's value eviction).
+        if (rec.seq >= 1 || rec.keyTtlEvicted === true) continue;
+      }
+      kept.push(rec);
+    }
+    for (const key of evicted) {
+      const rec = latest.get(key) as DurableLogRecord;
+      kept.push({
+        seq: 0,
+        topic,
+        at: nowMs,
+        payload: null,
+        key,
+        ...(rec.keySeq !== undefined ? { keySeq: rec.keySeq } : {}),
+        keyTtlEvicted: true,
+      });
+      this.keyTtlEvicted += 1;
+    }
+    return kept;
   }
 
   /**
@@ -3333,7 +3447,18 @@ export class DurableTopicLog {
       if (rec.key !== undefined && rec.seq >= 1) latestByKey.set(rec.key, rec);
     }
     if (latestByKey.size === 0) return records;
-    return records.filter((rec) => rec.key === undefined || rec.seq < 1 || latestByKey.get(rec.key) === rec);
+    let deduped = records.filter((rec) => rec.key === undefined || rec.seq < 1 || latestByKey.get(rec.key) === rec);
+    // EB-221: a key whose latest value expired is skipped here, before
+    // any compact rewrites the file — replay never resurrects a cold
+    // key, including an archived value whose live successor was already
+    // TTL-evicted (the merged latest is still older than the cutoff).
+    // A record exactly on the cutoff is kept, mirroring compact.
+    const ttlMs = this.keyTtls.get(topic);
+    if (ttlMs !== undefined) {
+      const cutoff = this.now() - ttlMs;
+      deduped = deduped.filter((rec) => rec.key === undefined || rec.seq < 1 || rec.at >= cutoff);
+    }
+    return deduped;
   }
 
   /**
@@ -3559,6 +3684,11 @@ export class DurableTopicLog {
     this.lastSeqs.delete(topic);
     this.maxPartitionSeqs.delete(topic);
     this.keyIndex.delete(topic);
+    // EB-221: the topic's key TTL goes with it — the bus re-applies its
+    // rules on next access if one still matches, exactly like a fresh
+    // topic. (maxKeySeqs is untouched: purging one topic must not
+    // renumber keys, same as below.)
+    this.keyTtls.delete(topic);
     // maxKeySeqs is keyed by message key, not topic — key sequence numbers
     // are a cross-topic publish-order space (mirrors the bus's keyCursors),
     // so purging one topic must not touch it.
@@ -4361,6 +4491,13 @@ export class DurableTopicLog {
      * compactions (EB-85). 0 when no age bound is configured.
      */
     retentionEvicted: number;
+    /**
+     * EB-221: keys evicted by per-key TTL (`setKeyTtl`) across
+     * compactions. 0 when no key TTL is configured. Counts keys, not
+     * records — one evicted key drops its latest record plus its
+     * superseded dead weight and leaves one tombstone.
+     */
+    keyTtlEvicted: number;
     /** Archive files that failed to decompress during archived reads. */
     corruptArchives: number;
     /**
@@ -4445,6 +4582,7 @@ export class DurableTopicLog {
       publishDedupEntries: this.publishDedupEntries,
       encrypted: this.encryptor !== undefined,
       retentionEvicted: this.retentionEvicted,
+      keyTtlEvicted: this.keyTtlEvicted,
       corruptArchives: this.corruptArchives,
       corruptSegments: this.corruptSegments,
       archived,
@@ -4665,6 +4803,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
   if (record.schemaVersion !== undefined) line.schemaVersion = record.schemaVersion;
   if (record.key !== undefined) line.key = record.key;
   if (record.keySeq !== undefined) line.keySeq = record.keySeq;
+  if (record.keyTtlEvicted !== undefined) line.keyTtlEvicted = record.keyTtlEvicted;
   if (record.partition !== undefined) line.partition = record.partition;
   if (record.dictId !== undefined) line.dictId = record.dictId;
   if (record.messageId !== undefined) line.messageId = record.messageId;
@@ -4753,6 +4892,7 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   const isRetainedRecord = o['retained'] === true;
   const isPauseRecord = o['paused'] === true;
   const isRecurringRecord = o['recurring'] === true;
+  const isKeyTtlTombstone = o['keyTtlEvicted'] === true;
   if (isRetainedRecord && !isScheduleRecord) return null;
   if (isPauseRecord && !isScheduleRecord) return null;
   if (isRetainedRecord && isPauseRecord) return null;
@@ -4790,6 +4930,23 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       if (!isTombstone) {
         if (typeof o['cronExpr'] !== 'string' || (o['cronExpr'] as string).length === 0) return null;
       } else if (o['cronExpr'] !== undefined || o['recurringTrigger'] !== undefined) {
+        return null;
+      }
+    } else if (isKeyTtlTombstone) {
+      // Key-TTL tombstone (EB-221): a seq-0 marker compaction leaves for
+      // an evicted key, carrying the key's seq baseline so restart
+      // recovery never renumbers the key. It carries no timer intent —
+      // no delayId, no deliverAt, no cancellation — and it never mixes
+      // with the retained/pause/recurring families (those branches ran
+      // first). A tombstone without its key retains nothing, so the key
+      // is required here (the later key validation re-checks it).
+      if (
+        typeof o['key'] !== 'string' ||
+        (o['key'] as string).length === 0 ||
+        o['delayId'] !== undefined ||
+        o['deliverAt'] !== undefined ||
+        o['cancelled'] !== undefined
+      ) {
         return null;
       }
     } else if (typeof o['delayId'] !== 'string' || (o['delayId'] as string).length === 0) {
@@ -4913,6 +5070,22 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       return null;
     }
     record.keySeq = o['keySeq'] as number;
+  }
+  if (o['keyTtlEvicted'] !== undefined) {
+    // The bus only ever writes `keyTtlEvicted: true` on seq-0 tombstone
+    // records (EB-221); any other value — or the flag on a real message
+    // or on a retained/pause/recurring record — means the line was
+    // tampered with or miswritten.
+    if (
+      o['keyTtlEvicted'] !== true ||
+      !isScheduleRecord ||
+      isRetainedRecord ||
+      isPauseRecord ||
+      isRecurringRecord
+    ) {
+      return null;
+    }
+    record.keyTtlEvicted = true;
   }
   if (o['partition'] !== undefined) {
     // The partition is routing metadata, not ordering metadata on its
@@ -5044,11 +5217,14 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
   // due. Retained-message records (EB-87), pause-buffer records (EB-88),
   // and recurring-job records (EB-124) are the other seq-0 families and
   // carry no due time — only their own identity fields, validated above.
+  // Key-TTL tombstones (EB-221) are a further due-less family: they carry
+  // a key and its seq baseline, never a delivery time.
   if (
     isScheduleRecord &&
     !isRetainedRecord &&
     !isPauseRecord &&
     !isRecurringRecord &&
+    !isKeyTtlTombstone &&
     record.cancelled !== true &&
     record.deliverAt === undefined
   ) {

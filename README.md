@@ -2785,6 +2785,17 @@ npm test
   batch/atomic publishes, `RangeError` on invalid keys with zero state
   change, delayed messages carrying their key through restart, and keys
   working without a durable log.
+- `test/key-ttl.test.ts` — per-key TTL for the keyed-compacted durable
+  log (EB-221): `setKeyTtl` validation, compact-time eviction of cold
+  keys with tombstones and the `keyTtlEvicted` counter, `readSince`
+  skipping expired keys before any rewrite (boundary-inclusive),
+  inertness without keyed compaction, pending schedule records for an
+  evicted key surviving compaction, re-eviction replacing (never
+  stacking) the stale tombstone, corrupt key-TTL lines rejected,
+  `setTopicKeyTtl` preconditions and pattern resolution (exact wins,
+  earliest pattern wins, clear falls back), and bus end-to-end
+  `resumeFromSeq` never resurrecting an evicted key with keySeq
+  continuing across eviction and restart (never renumbered).
 - `test/causal.test.ts` — causal (happens-before) delivery: out-of-order
   arrivals delivered in clock order, independent per-source streams (one
   stalled source never blocks another), source defaulting to the topic
@@ -7013,6 +7024,59 @@ Semantics:
   before teardown. Unlike the ladder, a degraded subscriber (EB-18)
   does not re-arm the delay: the message is already queued by the
   requeue and simply waits out the pause in the backlog.
+
+## Per-key TTL for the keyed-compacted durable log (EB-221)
+
+`setTopicKeyTtl(topicPattern, ttlMs)` reclaims cold state keys from a
+keyed-compacted durable log (EB-26): without it, every `(topic, key)`
+lives forever, so a state-snapshot log grows with its key space even
+when most keys are long dead. With a TTL, a key whose latest message
+record is older than `ttlMs` is evicted — its records leave the file
+at the next compact, and `readSince` replay skips it even before that
+compact runs, so a resubscribing consumer (`resumeFromSeq`) never
+resurrects a cold value.
+
+```ts
+// State snapshots per device; a device silent for 24h loses its slot.
+bus.setTopicKeyTtl('device.state', 24 * 60 * 60 * 1000);
+```
+
+Semantics:
+
+- **Opt-in per topic pattern, disabled by default.** Pattern
+  resolution mirrors the partition rules: an exact-topic rule wins
+  over patterns, and between patterns the earliest-registered rule
+  wins. `clearTopicKeyTtl(pattern)` removes a rule; topics that only
+  matched it stop expiring keys on their next compact. Rules are
+  runtime-only (a restart forgets them — re-set them, like the
+  partition rules).
+- **Requires a keyed-compacted durable log.** `setTopicKeyTtl`
+  throws `RangeError` without `durableLogDir` or without
+  `durableLogKeyCompaction`: without latest-per-key semantics there
+  is no cold key to evict. Without keyed compaction the TTL is fully
+  inert — no eviction, no replay filtering, no counter movement.
+- **Eviction at compact time, filtering at read time.** The compact
+  drops every record of an evicted key (latest plus superseded dead
+  weight) and counts the key in `getStats().durableLog.keyTtlEvicted`.
+  `readSince` applies the same cutoff to its merged latest-per-key
+  set, so an archived value whose live successor was already evicted
+  stays skipped too. A key exactly on the cutoff is kept.
+- **Seq baselines survive eviction (EB-36).** Each evicted key leaves
+  one seq-0 tombstone carrying the evicted record's `keySeq`, so
+  restart recovery reseeds the bus's per-key cursors and a later
+  publish for the same key continues its numbering instead of
+  renumbering from 1 — per-key publish order never breaks across an
+  eviction. Re-eviction replaces the stale tombstone; churned keys
+  leave at most one each. Pending delayed-delivery schedules for an
+  evicted key are timer intents, not values, and survive compaction
+  untouched.
+- **Composes with age retention (`maxAgeMs`).** Key-TTL eviction runs
+  before age retention in a compact, so a key older than its TTL leaves
+  a tombstone even when it would also age out. A key older than
+  `maxAgeMs` but younger than its key TTL is retention-dropped
+  without a tombstone (the pre-existing `maxAgeMs` behavior) — set the
+  key TTL at or below `maxAgeMs` to keep the baseline guarantee for
+  every key.
 
 ## Request–reply RPC (EB-178)
 
