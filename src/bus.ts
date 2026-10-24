@@ -220,6 +220,11 @@ import {
   type ScheduleSkewSummaryStats,
 } from './scheduleskew.ts';
 import {
+  PartitionHealthTracker,
+  resolvePartitionHealthOptions,
+  type PartitionHealthRow,
+} from './partitionhealth.ts';
+import {
   resolveMirrorRules,
   type MirrorHandle,
   type MirrorProvenance,
@@ -457,6 +462,7 @@ export type {
   ScheduleSkewOptions,
   ScheduleSkewSummaryStats,
 } from './scheduleskew.ts';
+export type { PartitionHealthOptions, PartitionHealthRow } from './partitionhealth.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
 export type {
   LagForecastEvent,
@@ -4467,6 +4473,22 @@ export interface EventBusOptions {
    */
   durableLogDir?: string;
   /**
+   * EB-217: opt-in publish-side partition health-aware routing. A
+   * present (even empty) options object arms per-(topic, partition)
+   * health tracking (`src/partitionhealth.ts`): reported failures and
+   * timeouts feed a sliding-window bad-outcome rate, and the publish
+   * path skips unhealthy partitions — a `partitionKey` keeps its hashed
+   * partition unless that partition is unhealthy, in which case the
+   * publish is rerouted to the nearest healthy partition (counted in
+   * `eventbus_partition_skipped_unhealthy_total`); an explicit
+   * `partition` always wins, even when unhealthy. Unhealthy partitions
+   * re-enter routing after a cool-down of consecutive successes.
+   * Absent means tracking is off entirely: no health state, no
+   * rerouting, no new stats fields, no new Prometheus series — and the
+   * `reportPartition*` APIs throw `RangeError`.
+   */
+  partitionHealth?: PartitionHealthOptions;
+  /**
    * EB-96: pluggable persistence for the durable topic log. When set,
    * every object the log keeps — the per-topic live log, archived
    * segments, the group-offset journal, the subscriber-dedup journal,
@@ -5986,6 +6008,25 @@ export interface BusStats {
    * as `eventbus_topic_partitions` in `src/metrics.ts`.
    */
   topicPartitions: Array<{ topicPattern: string; partitions: number }>;
+  /**
+   * Publish-side partition health (see `EventBusOptions.partitionHealth`,
+   * EB-217): one row per (topic, partition) pair with at least one
+   * recorded outcome, in first-report order. Present only when health
+   * tracking is enabled — otherwise omitted so snapshots stay
+   * byte-identical to before. Never audited; the effect is visible in
+   * `partitionSkippedUnhealthy` and the
+   * `eventbus_partition_skipped_unhealthy_total` metric.
+   */
+  partitionHealth?: PartitionHealthRow[];
+  /**
+   * Publishes rerouted away from unhealthy partitions (EB-217), in topic
+   * first-skip order: each row counts publishes whose key-hashed or
+   * default partition was unhealthy and was replaced by the nearest
+   * healthy partition. Present only when at least one skip has been
+   * counted. Rendered as `eventbus_partition_skipped_unhealthy_total`
+   * in `src/metrics.ts`.
+   */
+  partitionSkippedUnhealthy?: Array<{ topic: string; partition: number; skipped: number }>;
   /**
    * Total publishes rejected by admission gates before admission — schema
    * validation, the broker-level ACL, the per-topic message-size cap, the
@@ -14195,6 +14236,21 @@ export class EventBus {
    */
   private partitionPublished = new Map<string, Map<number, { publishedMessages: number; lastSeq: number }>>();
   /**
+   * Publish-side partition health (EB-217, see
+   * `EventBusOptions.partitionHealth`). Present only when the option is
+   * passed — an absent option means no health state at all: the publish
+   * path skips the health branch and `resolvePartition` behaves exactly
+   * as EB-90 defined it.
+   */
+  private readonly partitionHealthTracker: PartitionHealthTracker | undefined;
+  /**
+   * Unhealthy-skip counters (EB-217): publishes rerouted away from an
+   * unhealthy (topic, partition) pair, keyed by concrete topic then by
+   * the *skipped* partition. Feeds `eventbus_partition_skipped_unhealthy_total`
+   * and `getStats().partitionSkippedUnhealthy`.
+   */
+  private partitionSkippedUnhealthy = new Map<string, Map<number, number>>();
+  /**
    * The live retained-message table (EB-87): the latest retained message
    * per concrete (alias-resolved) topic. Rebuilt from the durable log on
    * restart (seq-0 retained records + tombstones).
@@ -15775,6 +15831,14 @@ export class EventBus {
             tracker: new ScheduleSkewTracker(scheduleSkewOptions.windowSize),
             options: scheduleSkewOptions,
           };
+    // EB-217: opt-in publish-side partition health tracking. A present
+    // (even empty) options object arms the tracker; an absent option
+    // disables everything — no health state, no rerouting, no new stats
+    // or Prometheus series. Validated fail-fast by the resolver, so a
+    // bad config never half-wires a bus.
+    const partitionHealthOptions = resolvePartitionHealthOptions(options?.partitionHealth);
+    this.partitionHealthTracker =
+      partitionHealthOptions === undefined ? undefined : new PartitionHealthTracker(partitionHealthOptions);
     // EB-182: opt-in publish-side admission latency sampling. A present
     // (even empty) options object arms the tracker; an absent option
     // disables everything — no sampling, zeroed stats, no Prometheus
@@ -17025,6 +17089,19 @@ export class EventBus {
    * check needs the alias-resolved topic, so it runs here — still before
    * anything is mutated — and throws `RangeError` when the explicit
    * partition is negative or `>=` the topic's partition count.
+   *
+   * EB-217 health-aware routing: with `EventBusOptions.partitionHealth`
+   * armed, the key-hashed and default candidates are checked against
+   * the health tracker — an unhealthy candidate is skipped for the
+   * nearest healthy partition in wrap-around order (`candidate + 1`,
+   * `candidate + 2`, ...), counted in
+   * `eventbus_partition_skipped_unhealthy_total` against the *skipped*
+   * partition. Key affinity is preserved as much as possible: the same
+   * key keeps its hashed partition unless that partition is unhealthy.
+   * An explicit `partition` always wins, even when unhealthy — the
+   * caller pinned it deliberately. When every partition is unhealthy the
+   * publish still goes to the original candidate (best-effort, never a
+   * skip) rather than being dropped.
    */
   private resolvePartition(
     topic: string,
@@ -17040,10 +17117,37 @@ export class EventBus {
       }
       return partition;
     }
-    if (partitionKey !== undefined) {
-      return Number(EventBus.hash64(partitionKey) % BigInt(count));
+    const candidate =
+      partitionKey !== undefined ? Number(EventBus.hash64(partitionKey) % BigInt(count)) : 0;
+    const health = this.partitionHealthTracker;
+    if (health === undefined || count <= 1 || health.isHealthy(topic, candidate)) {
+      return candidate;
     }
-    return 0;
+    for (let step = 1; step < count; step++) {
+      const alt = (candidate + step) % count;
+      if (health.isHealthy(topic, alt)) {
+        this.countUnhealthySkip(topic, candidate);
+        return alt;
+      }
+    }
+    // Every partition is unhealthy: best-effort — publish to the
+    // original candidate rather than dropping (not counted as a skip).
+    return candidate;
+  }
+
+  /**
+   * Counts one publish rerouted away from an unhealthy partition
+   * (EB-217), against the *skipped* (topic, partition) pair. Feeds
+   * `eventbus_partition_skipped_unhealthy_total` and
+   * `getStats().partitionSkippedUnhealthy`.
+   */
+  private countUnhealthySkip(topic: string, skippedPartition: number): void {
+    let perTopic = this.partitionSkippedUnhealthy.get(topic);
+    if (perTopic === undefined) {
+      perTopic = new Map();
+      this.partitionSkippedUnhealthy.set(topic, perTopic);
+    }
+    perTopic.set(skippedPartition, (perTopic.get(skippedPartition) ?? 0) + 1);
   }
 
   /**
@@ -26587,6 +26691,72 @@ export class EventBus {
       },
     });
     return { topic, partitionsBefore: before, partitionsAfter: newCount, groups };
+  }
+
+  /**
+   * Reports a partition health signal (EB-217, real-time systems): one
+   * observed outcome for a (topic, partition) pair. The signals feed the
+   * sliding-window bad-outcome rate that decides whether the publish
+   * path skips the partition — see `src/partitionhealth.ts`.
+   *
+   * - `reportPartitionFailure(topic, partition)`: a hard failure for the
+   *   partition (e.g. the downstream consumer reported a poisoned
+   *   offset, the segment write failed).
+   * - `reportPartitionTimeout(topic, partition)`: the partition did not
+   *   serve the outcome in time (e.g. a slow consumer pushed the
+   *   partition past its lag SLO).
+   * - `reportPartitionSuccess(topic, partition)`: the partition served
+   *   fine — the recovery signal that ticks the cool-down down.
+   *
+   * The signals are *reported in* because an in-memory publish-side bus
+   * cannot observe downstream partition health itself: the operator, a
+   * monitoring sidecar, or a bridge to an external log is the honest
+   * source. They are not audited (they are observations, not bus
+   * operations) — the effect is observable in
+   * `getStats().partitionHealth` and the
+   * `eventbus_partition_skipped_unhealthy_total` metric.
+   *
+   * `topic` is resolved through live alias links, exactly like the
+   * publish path. Throws `RangeError` when health tracking is not
+   * enabled (`EventBusOptions.partitionHealth`), when `topic` is empty,
+   * or when `partition` is not an integer in `[0, partitionCount)`.
+   */
+  reportPartitionFailure(topic: string, partition: number): void {
+    this.reportPartitionOutcome(topic, partition, 'failure');
+  }
+
+  /** See {@link EventBus.reportPartitionFailure}. */
+  reportPartitionTimeout(topic: string, partition: number): void {
+    this.reportPartitionOutcome(topic, partition, 'timeout');
+  }
+
+  /** See {@link EventBus.reportPartitionFailure}. */
+  reportPartitionSuccess(topic: string, partition: number): void {
+    this.reportPartitionOutcome(topic, partition, 'success');
+  }
+
+  private reportPartitionOutcome(
+    topic: string,
+    partition: number,
+    outcome: 'success' | 'failure' | 'timeout',
+  ): void {
+    const tracker = this.partitionHealthTracker;
+    if (tracker === undefined) {
+      throw new RangeError('reportPartition* requires EventBusOptions.partitionHealth to be set');
+    }
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    // Alias-resolved, exactly like the publish path — the health map is
+    // keyed by the concrete topic `resolvePartition` sees.
+    const resolved = this.resolveLiveTopic(topic);
+    const count = this.partitionsForTopic(resolved);
+    if (!Number.isInteger(partition) || partition < 0 || partition >= count) {
+      throw new RangeError(
+        `reportPartition*: partition ${partition} out of range for topic '${resolved}' (${count} partition(s))`,
+      );
+    }
+    tracker.record(resolved, partition, outcome);
   }
 
   /**
@@ -39478,6 +39648,27 @@ export class EventBus {
         topicPattern,
         partitions,
       })),
+      // Publish-side partition health (EB-217): present only when
+      // health tracking is enabled (`EventBusOptions.partitionHealth`) —
+      // otherwise omitted so snapshots stay byte-identical to before.
+      // One row per (topic, partition) pair with at least one recorded
+      // outcome, in first-report order.
+      ...(this.partitionHealthTracker === undefined
+        ? {}
+        : { partitionHealth: this.partitionHealthTracker.snapshot() }),
+      // Publishes rerouted away from unhealthy partitions (EB-217), in
+      // topic first-skip order. Present only when at least one skip has
+      // been counted — a bus that never skipped renders byte-identical
+      // exposition to before.
+      ...(() => {
+        const rows: Array<{ topic: string; partition: number; skipped: number }> = [];
+        for (const [topic, perTopic] of this.partitionSkippedUnhealthy) {
+          for (const [partition, skipped] of perTopic) {
+            rows.push({ topic, partition, skipped });
+          }
+        }
+        return rows.length === 0 ? {} : { partitionSkippedUnhealthy: rows };
+      })(),
       rejectedMessages: this.totalRejected,
       payloadRejectedBytes: this.totalPayloadRejectedBytes,
       // External admission webhook (EB-157): denial counters. Present

@@ -3578,6 +3578,28 @@ How it works:
   Prometheus renders
   `eventbus_topic_partition_published_total{topic,partition}`, and rule
   changes are audited as `partition_rule_set` / `partition_rule_cleared`.
+- **Health-aware routing** (EB-217, opt-in via
+  `EventBusOptions.partitionHealth`) — per-(topic, partition) health
+  tracked from *reported* outcomes (`reportPartitionFailure` /
+  `reportPartitionTimeout` / `reportPartitionSuccess`; the bus cannot
+  observe downstream partition health itself, so the operator, a
+  monitoring sidecar, or a bridge is the honest signal source). A
+  sliding window of recent outcomes yields a bad-outcome rate
+  (`(failures + timeouts) / window`); a partition reaching
+  `unhealthyThreshold` (default 0.5, `minSamples` default 10) is cut out
+  of routing, and the publish path skips it for the nearest healthy
+  partition in wrap-around order. Key affinity is preserved as much as
+  possible: the same key keeps its hashed partition unless that
+  partition is unhealthy. An explicit `partition` always wins, even when
+  unhealthy; when every partition is unhealthy the publish still goes to
+  the original candidate (best-effort, never dropped). Recovery needs a
+  cool-down of `cooldownSuccesses` (default 5) *consecutive* successes —
+  a bad outcome during the cool-down restarts it — and cuts the
+  partition back in with a cleared window. `getStats().partitionHealth`
+  shows per-partition health, and each reroute is counted in
+  `eventbus_partition_skipped_unhealthy_total{topic,partition}` (only
+  emitted after the first skip). Without the option everything is
+  disabled: no health state, no rerouting, no new stats or series.
 - **Scope note** — partition routing is a publish-side admission
   decision: delayed schedules, pause-buffered messages, and bridge/cluster
   ingress fan out as ordinary (partition-0) publishes.
@@ -4086,6 +4108,7 @@ Exported series:
 | `eventbus_topic_published_messages_total{topic}` | counter | per-topic `publishedMessages` |
 | `eventbus_topic_circuit_broken_messages_total{topic}` | counter | per-topic `circuitBrokenMessages` (EB-116) |
 | `eventbus_topic_partition_published_total{topic,partition}` | counter | per-partition `publishedMessages` (EB-90); only emitted for topics with more than one configured partition |
+| `eventbus_partition_skipped_unhealthy_total{topic,partition}` | counter | publishes rerouted away from an unhealthy publish-side partition to the nearest healthy one (EB-217); only emitted after the first skip |
 | `eventbus_topic_late_messages_total{topic}` | counter | per-topic `lateMessages` (EB-59) |
 | `eventbus_topic_event_time_watermark{topic}` | gauge | per-topic event-time watermark in epoch ms (EB-59); only emitted for topics with at least one event-time publish |
 | `eventbus_watermark_idle_advances_total{topic}` | counter | per-topic watermark idle advancements (EB-189); activity-gated — only emitted when at least one topic advanced |

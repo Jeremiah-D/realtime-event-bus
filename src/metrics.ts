@@ -112,6 +112,11 @@
  *   publishes per topic partition (EB-90; only emitted for topics with
  *   more than one configured partition — single-partition topics render
  *   byte-identical exposition to before).
+ * - `eventbus_partition_skipped_unhealthy_total{topic,partition}`:
+ *   publishes rerouted away from an unhealthy publish-side partition to
+ *   the nearest healthy one (EB-217; only emitted after the first skip —
+ *   a bus that never skipped renders byte-identical exposition to
+ *   before).
  * - `eventbus_topic_paused_messages_total{topic}`: publishes per topic
  *   shed by topic pauses in shed mode (EB-88).
  * - `eventbus_topic_circuit_broken_messages_total{topic}`: publishes per
@@ -1106,6 +1111,24 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
       lines.push(
         `eventbus_topic_partitions{topic_pattern="${escapeLabelValue(t.topicPattern)}"} ${t.partitions}`,
       );
+    }
+  }
+
+  // Publishes rerouted away from unhealthy partitions (EB-217), in topic
+  // first-skip order (same as BusStats.partitionSkippedUnhealthy).
+  // Emitted only when at least one skip has been counted — a bus that
+  // never skipped renders byte-identical exposition to before. The `??`
+  // keeps the renderer tolerant of a stats object that predates the
+  // field (hand-built fixtures included).
+  const skippedUnhealthy = stats.partitionSkippedUnhealthy ?? [];
+  if (skippedUnhealthy.length > 0) {
+    lines.push(
+      '# HELP eventbus_partition_skipped_unhealthy_total Publishes rerouted away from an unhealthy publish-side partition to the nearest healthy one (EB-217).',
+    );
+    lines.push('# TYPE eventbus_partition_skipped_unhealthy_total counter');
+    for (const r of skippedUnhealthy) {
+      const labels = `topic="${escapeLabelValue(r.topic)}",partition="${r.partition}"`;
+      lines.push(`eventbus_partition_skipped_unhealthy_total{${labels}} ${r.skipped}`);
     }
   }
 
