@@ -2231,7 +2231,20 @@ library.
   pause-shed/pause-buffered schedules never fan out and stay out of the
   distribution. Schedules rebuilt from the durable log sample exactly like
   live ones, and invalid options throw `RangeError`/`TypeError` from the
-  constructor.
+  constructor. Opt-in same-tick fan-out priority (EB-219, via
+  `setDelayedTopicPriority(topicPattern, priority)`): when one sweep pass
+  finds several schedules due at once, entries for higher-priority topics
+  fan out first, so a burst of low-priority delayed traffic cannot starve
+  a high-priority topic that became due in the same pass
+  (`clearDelayedTopicPriority` removes a rule). Priority affects only
+  ordering inside one sweep pass: it never changes when a schedule
+  becomes due, never resets or extends any TTL/deadline, never reorders
+  entries across different passes, and never reorders entries for the
+  same topic (same-topic FIFO holds). Pattern matching follows the
+  `setTopicTtl` convention (exact topic wins over patterns, earliest
+  matching pattern wins); unmatched topics resolve to 0. With no
+  priorities configured the sweep keeps its exact heap order — the
+  feature is default-off with zero behavior change.
 - **Shadow subscriber traffic mirroring** (in `src/bus.ts`, via
   `subscribe(pattern, handler, { shadow: true | { queueSize?,
   dropPolicy? } })`): the subscription becomes a shadow subscriber — it
@@ -2727,6 +2740,13 @@ npm test
   double delivery, no recount), unserializable payloads throwing with a
   durable log and scheduling in memory without one, timing-option
   validation, and `getStats().pendingDelayed`.
+- `test/delayed-priority.test.ts` — delayed-delivery same-tick topic
+  priority (EB-219): higher-priority topic fans out first within one
+  sweep pass, FIFO preserved within a topic, earlier-tick messages keep
+  precedence across ticks, priority never delivers early or rescues a
+  TTL-expired schedule, unset topics fall back to default ordering,
+  default-off zero behavior change, pattern/exact/earliest-pattern
+  resolution, argument validation, and clearing restores heap order.
 - `test/schedule-skew.test.ts` — delayed-delivery schedule-skew observability
   (EB-136): skew sampling (`now - deliverAt`) on the real fan-out path only,
   nearest-rank p50/p99 over the window, oldest-first eviction past

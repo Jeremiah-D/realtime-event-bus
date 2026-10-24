@@ -15752,6 +15752,22 @@ export class EventBus {
    */
   private delayTimer?: ReturnType<typeof setTimeout>;
   /**
+   * Delayed-delivery topic priorities (EB-219), keyed by the exact
+   * string passed to `setDelayedTopicPriority` — either a concrete
+   * topic name or a wildcard pattern. Higher numbers fan out first
+   * within a single sweep pass; topics without a matching rule resolve
+   * to 0. Empty means the feature is off entirely: the sweep keeps its
+   * heap order untouched, so unconfigured buses pay nothing for it.
+   */
+  private delayedTopicPriorities = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in
+   * `delayedTopicPriorities`, kept apart from the subscriber pattern
+   * cache so priority configuration never inflates
+   * `patternCacheSize`.
+   */
+  private delayedTopicPriorityMatcherCache = new Map<string, RegExp>();
+  /**
    * Live recurring jobs by their `scheduleRecurring` id, in schedule
    * order. Dormant post-restart jobs (see `recoverRecurring`) also live
    * here — they carry no timer and never fire — until the application
@@ -31354,6 +31370,76 @@ export class EventBus {
   }
 
   /**
+   * Sets the same-tick fan-out priority for delayed deliveries on one
+   * topic or topic pattern (EB-219): when a single sweep pass finds
+   * several schedules due at once, entries for higher-priority topics
+   * fan out first, so a burst of low-priority delayed traffic cannot
+   * starve a high-priority topic that became due in the same pass.
+   * `topicPattern` accepts the same wildcard syntax as `subscribe`
+   * (or an exact topic name); `priority` is any finite number, higher
+   * meaning earlier within the pass, and topics without a matching
+   * rule resolve to 0.
+   *
+   * Priority affects only the ordering inside one sweep pass. It never
+   * changes when a schedule becomes due (`deliverAt` still gates
+   * eligibility), never resets or extends any TTL/deadline, never
+   * reorders entries across different sweep passes (an entry already
+   * fanned out stays ahead), and never reorders entries for the same
+   * topic (the sort is stable over heap order, so same-topic FIFO
+   * holds). With no priorities configured the sweep keeps its exact
+   * heap order — the feature is opt-in and default-off.
+   *
+   * When several rules match a topic, an exact-topic rule wins over
+   * any pattern; between patterns the earliest-registered rule wins.
+   * Re-setting a rule replaces it. Throws `TypeError` when
+   * `topicPattern` is not a string, `RangeError` when it is empty or
+   * `priority` is not finite.
+   */
+  setDelayedTopicPriority(topicPattern: string, priority: number): void {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('setDelayedTopicPriority: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('setDelayedTopicPriority: topicPattern must be a non-empty string');
+    }
+    if (!Number.isFinite(priority)) {
+      throw new RangeError('setDelayedTopicPriority: priority must be a finite number');
+    }
+    this.delayedTopicPriorities.set(topicPattern, priority);
+  }
+
+  /**
+   * Removes the delayed-delivery topic priority previously registered
+   * for `topicPattern`. Returns true when a rule existed and was
+   * removed.
+   */
+  clearDelayedTopicPriority(topicPattern: string): boolean {
+    const removed = this.delayedTopicPriorities.delete(topicPattern);
+    if (removed) this.delayedTopicPriorityMatcherCache.delete(topicPattern);
+    return removed;
+  }
+
+  /**
+   * Returns the delayed-delivery fan-out priority that applies to
+   * `topic`, or 0 when no rule matches. An exact-topic rule wins over
+   * patterns; between patterns the earliest-registered matching rule
+   * wins — the same resolution as `ttlForTopic`.
+   */
+  private delayedTopicPriorityForTopic(topic: string): number {
+    const exact = this.delayedTopicPriorities.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, priority] of this.delayedTopicPriorities) {
+      let matcher = this.delayedTopicPriorityMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.delayedTopicPriorityMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return priority;
+    }
+    return 0;
+  }
+
+  /**
    * Schedules a cron-driven recurring publish: on every trigger of
    * `cronExpr` the bus calls `payloadFactory()` and publishes its return
    * value to `topic` through the normal publish pipeline — admission,
@@ -31756,6 +31842,16 @@ export class EventBus {
    */
   private sweepDelayed(nowMs: number = this.now(), trailingFlush = true): void {
     let fannedOut = false;
+    // EB-219: collect the whole due batch first, instead of popping and
+    // handling one heap entry at a time. A "tick" is one sweep pass, so
+    // every entry due at `nowMs` belongs to the same tick even when
+    // their `deliverAt` values differ — the batch is the unit priority
+    // reorders. Collecting up front also keeps the pass stable: fan-out
+    // never schedules new delayed entries, so nothing due can join or
+    // leave the batch mid-pass. Cancelled heads are still discarded
+    // lazily here, and the first not-yet-due entry stops the drain
+    // exactly as the old peek loop did.
+    const due: DelayedEntry[] = [];
     for (;;) {
       const top = this.delayHeap.peek();
       if (top == null) break;
@@ -31768,6 +31864,28 @@ export class EventBus {
       if (top.deliverAt > nowMs) break;
       this.delayHeap.pop();
       this.delayedById.delete(top.id);
+      due.push(top);
+    }
+    // Same-tick ordering by topic priority, highest first. The sort is
+    // stable over heap order (deliverAt, then schedule order), so
+    // entries for one topic — which always resolve to one priority —
+    // keep their FIFO order, and with no priorities configured the
+    // batch keeps its exact heap order (the loop below is skipped when
+    // the map is empty, so the default-off path is byte-identical in
+    // behavior). Priority never gates eligibility: every entry here
+    // was already due, and the per-entry expiry/pause/fan-out handling
+    // below runs unchanged, in the new order.
+    if (this.delayedTopicPriorities.size > 0 && due.length > 1) {
+      const ranked = due.map((entry, index) => ({
+        entry,
+        index,
+        priority: this.delayedTopicPriorityForTopic(entry.topic),
+      }));
+      ranked.sort((a, b) => b.priority - a.priority || a.index - b.index);
+      due.length = 0;
+      for (const { entry } of ranked) due.push(entry);
+    }
+    for (const top of due) {
       // The schedule's effective deadline is the earlier of the
       // schedule-time TTL deadline and the per-message absolute
       // deadline (EB-177) — a deadline that passed while delayed drops
