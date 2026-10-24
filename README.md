@@ -5354,6 +5354,60 @@ Semantics:
   `eventbus_circuit_breakers_open`, and per-topic
   `eventbus_topic_circuit_broken_messages_total{topic}`.
 
+## Subscriber auto circuit breaker (EB-215)
+
+`bus.setSubscriberBreaker(opts?)` arms an opt-in consumer-side circuit
+breaker for the whole bus — consumer self-protection against a poisoned
+handler. Disabled by default: without a rule every subscriber keeps
+exactly its old delivery behavior (backward compatible).
+
+```ts
+bus.setSubscriberBreaker({
+  maxConsecutiveFailures: 5, // default
+  onTripped: (e) => alert(`${e.subscriberId}: ${e.consecutiveFailures} handler failures, paused`),
+});
+```
+
+Semantics:
+
+- **Trip condition.** While armed, every handler invocation outcome is
+  counted per subscriber: a success resets the consecutive-failure
+  streak to 0, a failure (a synchronous throw — caught and counted, it
+  no longer escapes the drain while the breaker is armed — or a
+  rejected returned promise) increments it. Reaching
+  `maxConsecutiveFailures` auto-pauses the subscriber through
+  `pauseSubscriber` (EB-113 semantics): the backlog stays queued under
+  the normal backpressure policy, preserved, and a mid-drain trip
+  requeues the unattempted messages in FIFO order.
+- **Alert, never silent.** The trip is audited as `subscriber_paused`
+  with reason `subscriber-breaker: N consecutive handler failures
+  (EB-215)`, fires the `onTripped` callback once with the failure count
+  and the preserved backlog size, and raises an ops alert of kind
+  `'subscriber-breaker-tripped'` (subscriberId / pattern /
+  consecutiveFailures / pendingMessages) when the ops outlet (EB-132)
+  is enabled.
+- **Manual recovery only.** The breaker never resumes on its own — a
+  still-broken handler cannot flap the subscription.
+  `bus.resumeSubscriber(subId)` clears the pause and resets the streak.
+  An operator's manual pause is never fought: the breaker does not trip
+  a subscriber that is already manually paused.
+- **Observability.** `getStats().subscriberBreaker` reports
+  `{ enabled, maxConsecutiveFailures, tripped: [{ subscriberId,
+  pattern, consecutiveFailures, pendingMessages }] }`;
+  `bus.clearSubscriberBreaker()` disarms the rule (already-tripped
+  pauses stay paused — recovery is still a manual `resumeSubscriber`).
+  Invalid options throw `RangeError` from `setSubscriberBreaker`;
+  re-setting replaces the rule and resets every streak.
+
+Orthogonal to `pauseSubscriber`/`resumeSubscriber` (EB-113, the manual
+hold this drives automatically), to the publish circuit breaker
+(EB-116, publish-side per topic — this is consume-side per
+subscriber), to handler fault isolation (EB-197, per-subscriber opt-in
+quarantine recovered via `resumeQuarantined` — the breaker is bus-level
+and recovers via `resumeSubscriber`), and to bridge health (bridge
+links vs subscriber handlers). (Real-time systems: consumer
+self-protection.)
+
 ## Credit-based delivery flow control (EB-117)
 
 `bus.grantCredits(subId, n)` gives one subscriber an explicit delivery

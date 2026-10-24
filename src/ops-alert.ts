@@ -43,7 +43,8 @@ export type OpsAlertKind =
   | 'lag-slo-breach'
   | 'dead-letter-growth'
   | 'gateway-disconnect-storm'
-  | 'processing-latency-slo-breach';
+  | 'processing-latency-slo-breach'
+  | 'subscriber-breaker-tripped';
 
 /** One operational alert, as built by the bus. */
 export interface OpsAlert {
@@ -60,7 +61,9 @@ export interface OpsAlert {
    * subscriberId/pattern/topic/redeliveries/lastError;
    * `gateway-disconnect-storm` carries disconnects/windowMs/threshold;
    * `processing-latency-slo-breach` carries
-   * subscriberId/pattern/p99Ms/thresholdMs/samples/phaseAttribution.
+   * subscriberId/pattern/p99Ms/thresholdMs/samples/phaseAttribution;
+   * `subscriber-breaker-tripped` carries
+   * subscriberId/pattern/consecutiveFailures/pendingMessages.
    */
   detail: Record<string, unknown>;
 }

@@ -3324,6 +3324,47 @@ export interface QuarantinedEvent {
   pendingMessages: number;
 }
 
+/**
+ * Tuning for the subscriber-side auto circuit breaker
+ * (`EventBus.setSubscriberBreaker`, EB-215). Validation happens at
+ * `setSubscriberBreaker` time; violations throw `RangeError`.
+ */
+export interface SubscriberBreakerOptions {
+  /**
+   * Consecutive handler failures that trip the breaker (positive
+   * integer, default 5). A handler invocation fails when it throws
+   * synchronously or when its returned promise rejects — both count;
+   * a success resets the streak to 0.
+   */
+  maxConsecutiveFailures?: number;
+  /**
+   * Called once when the breaker trips a subscriber (see
+   * `SubscriberBreakerTrippedEvent`). Fires after the drain requeues
+   * the undelivered backlog (or directly on an async rejection that
+   * trips outside any drain), so `pendingMessages` is exact.
+   */
+  onTripped?: (event: SubscriberBreakerTrippedEvent) => void;
+}
+
+/**
+ * Fired once when the subscriber-side auto circuit breaker trips a
+ * subscriber (`EventBus.setSubscriberBreaker`, EB-215).
+ */
+export interface SubscriberBreakerTrippedEvent {
+  /** The subscriber whose delivery was auto-paused. */
+  subscriberId: string;
+  /** The topic pattern the tripped subscriber registered. */
+  pattern: string;
+  /** Consecutive handler failures that tripped the breaker. */
+  consecutiveFailures: number;
+  /**
+   * Messages preserved in the subscriber's queue at trip time —
+   * nothing was dropped, and a manual `resumeSubscriber` redelivers
+   * them in order.
+   */
+  pendingMessages: number;
+}
+
 /** Snapshot delivered to `SlowHandlerOptions.onSlowHandler` per slow invocation. */
 export interface SlowHandlerEvent {
   /** The subscriber whose handler ran slow. */
@@ -6437,6 +6478,24 @@ export interface BusStats {
    */
   quarantinedSubscribers: number;
   /**
+   * Subscriber-side auto circuit breaker state (EB-215, see
+   * `EventBus.setSubscriberBreaker`): `enabled` mirrors whether a rule
+   * is armed; `maxConsecutiveFailures` is the configured threshold
+   * (`null` when disarmed); `tripped` lists the subscribers currently
+   * holding a breaker-tripped pause (recoverable only by a manual
+   * `resumeSubscriber`).
+   */
+  subscriberBreaker: {
+    enabled: boolean;
+    maxConsecutiveFailures: number | null;
+    tripped: Array<{
+      subscriberId: string;
+      pattern: string;
+      consecutiveFailures: number;
+      pendingMessages: number;
+    }>;
+  };
+  /**
    * Slow-handler offload observations (EB-191, see
    * `SubscribeOptions.slowHandler`): `count` is the total number of
    * handler invocations whose synchronous execution exceeded their
@@ -7823,6 +7882,22 @@ interface Subscriber {
    * isolation is disabled for this subscriber.
    */
   faultIsolation?: HandlerFaultIsolationState;
+  /**
+   * Subscriber-side auto circuit breaker state (see
+   * `EventBus.setSubscriberBreaker`, EB-215). Only
+   * `breakerConsecutiveFailures` and `breakerTripped` change over the
+   * subscription's lifetime; the configuration itself is bus-level.
+   * Absent (treated as 0) until the first observed handler outcome
+   * while the breaker is armed.
+   */
+  breakerConsecutiveFailures?: number;
+  /**
+   * True while the subscriber holds a breaker-tripped pause — set when
+   * the breaker auto-pauses via `pauseSubscriber` (EB-113 semantics),
+   * cleared by `resumeSubscriber`. Lets `getStats` tell a breaker trip
+   * apart from an operator's manual pause.
+   */
+  breakerTripped?: boolean;
   /**
    * Per-subscriber slow-handler offload state (see
    * `SubscribeOptions.slowHandler`, EB-191). Absent when the offload is
@@ -14171,6 +14246,15 @@ export class EventBus {
    */
   private publishCircuitBreakers = new Map<string, PublishCircuitBreaker>();
   /**
+   * Subscriber-side auto circuit breaker configuration (see
+   * `setSubscriberBreaker`, EB-215). `undefined` by default — the
+   * breaker is opt-in, so a bus without a rule keeps exactly its old
+   * delivery behavior.
+   */
+  private subscriberBreaker:
+    | { maxConsecutiveFailures: number; onTripped?: (event: SubscriberBreakerTrippedEvent) => void }
+    | undefined;
+  /**
    * Per-topic subscriber caps (EB-81), keyed by the exact string passed
    * to `setTopicMaxSubscribers` — either a concrete topic name or a
    * wildcard pattern. Match resolution mirrors `setTopicTtl`: an
@@ -17692,6 +17776,76 @@ export class EventBus {
    */
   circuitBreakerState(topic: string): PublishCircuitBreakerState | undefined {
     return this.publishCircuitBreakers.get(topic)?.state;
+  }
+
+  /**
+   * Arms the subscriber-side auto circuit breaker (EB-215) — an opt-in
+   * consumer self-protection policy for the whole bus. Disabled by
+   * default: without a rule every subscriber keeps exactly its old
+   * delivery behavior.
+   *
+   * While armed, every handler invocation outcome is counted per
+   * subscriber: a success resets the consecutive-failure streak to 0,
+   * a failure (a synchronous throw or a rejected returned promise)
+   * increments it, and reaching `maxConsecutiveFailures` (default 5)
+   * auto-pauses the subscriber through `pauseSubscriber` (EB-113
+   * semantics — the backlog stays queued under the normal backpressure
+   * policy, preserved, audited as `subscriber_paused`) and raises an
+   * ops alert (`'subscriber-breaker-tripped'`, EB-132) when the ops
+   * outlet is enabled. Recovery is manual: `resumeSubscriber` clears
+   * the pause and resets the streak — the breaker never resumes on its
+   * own, so a still-broken handler cannot flap the subscription.
+   *
+   * While armed, a synchronous handler throw is caught and counted — it
+   * no longer escapes the drain — mirroring the fault-isolation path
+   * (EB-197). Without the breaker a throwing plain handler still
+   * escapes as an uncaught exception; the breaker only changes that
+   * behavior while armed.
+   *
+   * Orthogonal to the other failure machinery:
+   * - `pauseSubscriber`/`resumeSubscriber` (EB-113) is the operator's
+   *   manual hold: the breaker *drives* that same flag automatically,
+   *   and a manual pause/resume never disturbs the breaker's streak
+   *   accounting beyond the resume reset;
+   * - `setPublishCircuitBreaker` (EB-116) guards the publish side per
+   *   topic — this guards the consume side per subscriber;
+   * - `SubscribeOptions.handlerFaultIsolation` (EB-197) is the
+   *   per-subscriber opt-in quarantine with its own budget and
+   *   `resumeQuarantined` recovery — the breaker is bus-level, trips
+   *   into the EB-113 pause, and recovers through `resumeSubscriber`;
+   * - bridge health (EB-40) watches bridge links, this watches
+   *   subscriber handlers.
+   *
+   * Re-setting replaces the rule and resets every subscriber's streak.
+   * Throws `RangeError` when `maxConsecutiveFailures` is not a positive
+   * integer or when `onTripped` is not a function.
+   */
+  setSubscriberBreaker(opts?: SubscriberBreakerOptions): void {
+    const maxConsecutiveFailures = opts?.maxConsecutiveFailures ?? 5;
+    if (!Number.isInteger(maxConsecutiveFailures) || maxConsecutiveFailures < 1) {
+      throw new RangeError('maxConsecutiveFailures must be a positive integer');
+    }
+    const onTripped = opts?.onTripped;
+    if (onTripped !== undefined && typeof onTripped !== 'function') {
+      throw new RangeError('onTripped must be a function');
+    }
+    this.subscriberBreaker = { maxConsecutiveFailures, onTripped };
+    for (const subscriber of this.subscribers.values()) {
+      subscriber.breakerConsecutiveFailures = 0;
+      subscriber.breakerTripped = false;
+    }
+  }
+
+  /**
+   * Disarms the subscriber-side auto circuit breaker (see
+   * `setSubscriberBreaker`, EB-215). Returns true when a rule existed
+   * and was removed. Already-tripped pauses stay paused — recovery is
+   * still a manual `resumeSubscriber`.
+   */
+  clearSubscriberBreaker(): boolean {
+    if (this.subscriberBreaker === undefined) return false;
+    this.subscriberBreaker = undefined;
+    return true;
   }
 
   /**
@@ -38774,6 +38928,7 @@ export class EventBus {
     let degradedSubscribers = 0;
     let quarantinedSubscribers = 0;
     let pausedSubscribers = 0;
+    const breakerTripped: BusStats['subscriberBreaker']['tripped'] = [];
     let shapedSubscribers = 0;
     let replayThrottled = 0;
     let creditExhaustedSubscribers = 0;
@@ -38822,6 +38977,17 @@ export class EventBus {
       if (subscriber.health?.degraded === true) degradedSubscribers += 1;
       if (subscriber.faultIsolation?.quarantined === true) quarantinedSubscribers += 1;
       if (subscriber.manuallyPaused === true) pausedSubscribers += 1;
+      // Subscriber-side auto circuit breaker (EB-215): currently
+      // breaker-tripped subscribers, recoverable only by a manual
+      // `resumeSubscriber`.
+      if (subscriber.breakerTripped === true) {
+        breakerTripped.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          consecutiveFailures: subscriber.breakerConsecutiveFailures ?? 0,
+          pendingMessages: subscriber.queue.size,
+        });
+      }
       if (subscriber.deliveryShaping?.shaping === true) shapedSubscribers += 1;
       // Durable-log replay throttle (EB-164): a resume replay currently
       // paused waiting for admission budget.
@@ -39341,6 +39507,11 @@ export class EventBus {
       throttledSubscribers,
       degradedSubscribers,
       quarantinedSubscribers,
+      subscriberBreaker: {
+        enabled: this.subscriberBreaker !== undefined,
+        maxConsecutiveFailures: this.subscriberBreaker?.maxConsecutiveFailures ?? null,
+        tripped: breakerTripped,
+      },
       slowHandlers: {
         count: this.totalSlowHandlerInvocations,
         lastMs: this.lastSlowHandlerElapsedMs,
@@ -40571,6 +40742,11 @@ export class EventBus {
     if (subscriber.manuallyPaused !== true) return false;
     subscriber.manuallyPaused = false;
     subscriber.manuallyPausedReason = undefined;
+    // Subscriber-side auto circuit breaker (EB-215): a manual resume is
+    // a fresh start — clear the trip flag and reset the streak so the
+    // first post-resume failure does not instantly re-trip.
+    subscriber.breakerTripped = false;
+    subscriber.breakerConsecutiveFailures = 0;
     this.auditSubscription({
       action: 'subscriber_resumed',
       actor: 'system',
@@ -41945,14 +42121,18 @@ export class EventBus {
             );
           };
           const isolation = subscriber.faultIsolation;
-          if (isolation === undefined) {
+          const breakerArmed = this.subscriberBreaker !== undefined;
+          if (isolation === undefined && !breakerArmed) {
             invokeOnce();
-          } else {
-            // Handler fault isolation (EB-197): a synchronous throw is
-            // caught and counted — it never escapes the drain — and a
-            // clean synchronous return counts as a success. A returned
-            // promise defers the verdict to its settlement: the sync
-            // return itself proves nothing about an async handler.
+          } else if (isolation === undefined) {
+            // Subscriber-side auto circuit breaker (EB-215): a synchronous
+            // throw is caught and counted — it never escapes the drain
+            // while the breaker is armed — and a clean synchronous return
+            // counts as a success. A returned promise defers the verdict
+            // to its settlement: the sync return itself proves nothing
+            // about an async handler. (Without the breaker, a throwing
+            // plain handler still escapes the drain as an uncaught
+            // exception — the breaker only changes behavior while armed.)
             let asyncPending = false;
             let syncThrew = false;
             try {
@@ -41960,21 +42140,58 @@ export class EventBus {
               asyncPending = isThenable(handlerResult);
             } catch {
               syncThrew = true;
-              if (this.noteHandlerFaultOutcome(subscriber, false)) {
-                // The error budget tripped mid-drain: everything not yet
+              if (this.noteBreakerOutcome(subscriber, false)) {
+                // The breaker tripped mid-drain: everything not yet
                 // attempted goes back to the queue, in FIFO order — the
                 // same requeue semantics as the health probe's mid-drain
                 // trip.
                 this.requeueUndelivered(subscriber, live.slice(i + 1));
-                this.reportQuarantined(subscriber);
+                this.reportBreakerTripped(subscriber);
+                break;
+              }
+            }
+            if (!syncThrew) {
+              if (asyncPending) {
+                this.trackBreakerAsyncOutcome(subscriber, handlerResult);
+              } else {
+                this.noteBreakerOutcome(subscriber, true);
+              }
+            }
+          } else {
+            // Handler fault isolation (EB-197): a synchronous throw is
+            // caught and counted — it never escapes the drain — and a
+            // clean synchronous return counts as a success. A returned
+            // promise defers the verdict to its settlement: the sync
+            // return itself proves nothing about an async handler.
+            // The breaker (EB-215), when armed, observes the same
+            // outcomes independently.
+            let asyncPending = false;
+            let syncThrew = false;
+            try {
+              invokeOnce();
+              asyncPending = isThenable(handlerResult);
+            } catch {
+              syncThrew = true;
+              const quarantined = this.noteHandlerFaultOutcome(subscriber, false);
+              const tripped = this.noteBreakerOutcome(subscriber, false);
+              if (quarantined || tripped) {
+                // The error budget / breaker tripped mid-drain:
+                // everything not yet attempted goes back to the queue,
+                // in FIFO order — the same requeue semantics as the
+                // health probe's mid-drain trip.
+                this.requeueUndelivered(subscriber, live.slice(i + 1));
+                if (quarantined) this.reportQuarantined(subscriber);
+                if (tripped) this.reportBreakerTripped(subscriber);
                 break;
               }
             }
             if (!syncThrew) {
               if (asyncPending) {
                 this.trackAsyncHandlerOutcome(subscriber, handlerResult);
+                this.trackBreakerAsyncOutcome(subscriber, handlerResult);
               } else {
                 this.noteHandlerFaultOutcome(subscriber, true);
+                this.noteBreakerOutcome(subscriber, true);
               }
             }
           }
@@ -43531,6 +43748,92 @@ export class EventBus {
       reason: health.degradedReason ?? 'error',
       pendingMessages: subscriber.queue.size,
     });
+  }
+
+  /**
+   * Records one handler invocation outcome for the subscriber-side auto
+   * circuit breaker (EB-215). A success resets the consecutive-failure
+   * streak to 0; a failure increments it, and reaching the configured
+   * threshold auto-pauses the subscriber through `pauseSubscriber`
+   * (EB-113 semantics — audited as `subscriber_paused`) and raises an
+   * ops alert (`'subscriber-breaker-tripped'`) when the ops outlet is
+   * enabled. Returns true when this outcome newly tripped the breaker —
+   * the caller then requeues the undelivered backlog and reports the
+   * trip.
+   *
+   * No-op when the breaker is disarmed, when the subscriber already
+   * holds a breaker-tripped pause (one trip per episode — no repeat
+   * audit, no repeat alert), or when the subscriber is already manually
+   * paused (an operator hold the breaker must not fight).
+   */
+  private noteBreakerOutcome(subscriber: Subscriber, ok: boolean): boolean {
+    const breaker = this.subscriberBreaker;
+    if (breaker === undefined || subscriber.breakerTripped === true) return false;
+    if (ok) {
+      subscriber.breakerConsecutiveFailures = 0;
+      return false;
+    }
+    if (subscriber.manuallyPaused === true) return false;
+    const failures = (subscriber.breakerConsecutiveFailures ?? 0) + 1;
+    subscriber.breakerConsecutiveFailures = failures;
+    if (failures < breaker.maxConsecutiveFailures) return false;
+    subscriber.breakerTripped = true;
+    this.pauseSubscriber(subscriber.id, {
+      reason: `subscriber-breaker: ${failures} consecutive handler failures (EB-215)`,
+    });
+    this.opsAlerter?.note('subscriber-breaker-tripped', subscriber.id, {
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      consecutiveFailures: failures,
+      pendingMessages: subscriber.queue.size,
+    });
+    return true;
+  }
+
+  /**
+   * Fires the bus-level `onTripped` callback once per breaker trip with
+   * the failure count and the preserved backlog size. Called after the
+   * drain requeues the undelivered messages, so `pendingMessages` is
+   * exact — mirroring `reportQuarantined`.
+   */
+  private reportBreakerTripped(subscriber: Subscriber): void {
+    this.subscriberBreaker?.onTripped?.({
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      consecutiveFailures: subscriber.breakerConsecutiveFailures ?? 0,
+      pendingMessages: subscriber.queue.size,
+    });
+  }
+
+  /**
+   * Observes the settlement of a handler's returned promise for the
+   * subscriber-side auto circuit breaker (EB-215): a rejection counts
+   * as a handler failure exactly like a synchronous throw, a
+   * fulfillment resets the consecutive-failure streak exactly like a
+   * synchronous return. The handlers are attached alongside the slot
+   * machinery's own settle handlers, so an async rejection is never an
+   * unhandled rejection — and never silently swallowed either.
+   *
+   * The subscriber may have unsubscribed (or been manually paused)
+   * before the promise settles: only a still-registered subscriber
+   * counts the outcome. A rejection that trips the breaker pauses
+   * here, after the drain round already finished: the backlog stays
+   * queued and the pause gate stops the next flush.
+   */
+  private trackBreakerAsyncOutcome(subscriber: Subscriber, result: unknown): void {
+    if (this.subscriberBreaker === undefined || !isThenable(result)) return;
+    result.then(
+      () => {
+        if (this.subscribers.get(subscriber.id) !== subscriber) return;
+        this.noteBreakerOutcome(subscriber, true);
+      },
+      () => {
+        if (this.subscribers.get(subscriber.id) !== subscriber) return;
+        if (this.noteBreakerOutcome(subscriber, false)) {
+          this.reportBreakerTripped(subscriber);
+        }
+      },
+    );
   }
 
   /**
