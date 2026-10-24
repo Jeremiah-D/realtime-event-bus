@@ -87,6 +87,7 @@ export type SubscriptionAuditAction =
   | 'subscriber_quarantine_resumed'
   | 'delivery_sample_rate_updated'
   | 'header_filter_updated'
+  | 'subscriber_labels_updated'
   | 'client_pressure'
   | 'client_pressure_recovered'
   | 'tenant_quota_warning'
@@ -183,6 +184,10 @@ export type SubscriptionAuditAction =
  *   — a `setHeaderFilter` (EB-153) hot-update replaced the subscriber's
  *   header-filter rules (`0` when the filter was cleared);
  *   `subId`/`pattern` identify the subscription
+ * - `subscriber_labels_updated`: `{ previous: <labels before>, labels: <labels after> }`
+ *   — a `setSubscriberLabels` (EB-213) hot-update replaced the
+ *   subscriber's labels (`{}` when cleared); `subId`/`pattern` identify
+ *   the subscription
  * - `client_pressure`: `{ remoteAddress?, queuedBytes, watermarkBytes,
  *   pausedSubscriptions }` — a gateway (EB-99) connection's outbound
  *   queue crossed its client-pressure watermark (EB-161): the
@@ -289,6 +294,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'subscriber_quarantine_resumed',
   'delivery_sample_rate_updated',
   'header_filter_updated',
+  'subscriber_labels_updated',
   'client_pressure',
   'client_pressure_recovered',
   'tenant_quota_warning',

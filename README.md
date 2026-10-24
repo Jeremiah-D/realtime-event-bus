@@ -2998,6 +2998,47 @@ What it buys:
   exception: a receiving node treats remote traffic as anonymous inbound —
   the origin node already counted the publish under its publisher.
 
+## Subscriber labels
+
+Operator-defined `key=value` tags on subscriptions (EB-213) — the
+consumer-side counterpart of publisher identity, for multi-tenant
+dashboards and team attribution:
+
+```ts
+const sub = bus.subscribe('orders.*', handler, {
+  labels: { team: 'search', tier: 'gold' },
+});
+bus.getSubscriberLabels(sub.id); // { team: 'search', tier: 'gold' }
+bus.setSubscriberLabels(sub.id, { team: 'search', tier: 'silver' }); // hot update
+bus.setSubscriberLabels(sub.id, undefined); // clear
+```
+
+Labels are pure metadata: they never affect matching, admission, ordering
+or delivery, so they compose with every other subscribe option and are safe
+to hot-update on a live subscription with a non-empty backlog. Keys use the
+publisher-identity alphabet (1–64 ASCII alphanumeric, `_` or `-`); values
+are 1–128 characters — anything else throws `RangeError` at subscribe /
+update time, before anything registers or mutates. A namespace scoped handle
+passes labels straight through (`ns.subscribe(pattern, handler, { labels })`
+— the namespace only scopes the topic space).
+
+What it buys:
+
+- **Per-label aggregation** — `getStats().subscriberLabels` lists one row
+  per distinct `(key, value)` pair across live subscriptions, in `(key,
+  value)` order: `{ key, value, subscribers, deliveredMessages }`. A
+  subscription with N labels contributes to N rows. `deliveredMessages`
+  sums handler hand-offs (each invocation counts, redeliveries count again
+  — the bus-wide `deliveredMessages` semantics).
+- **Prometheus dimension** — `eventbus_subscriber_label_info{label_key,
+  label_value}` (live subscriptions, gauge) and
+  `eventbus_subscriber_label_delivered_total{label_key, label_value}`
+  (handler hand-offs, counter), emitted only when at least one live
+  subscription carries labels.
+- **Audit trail** — the `subscribe` event records the initial labels in
+  its detail, and every `setSubscriberLabels` call emits a
+  `subscriber_labels_updated` event with `{ previous, labels }`.
+
 The identity also renders as
 `eventbus_publisher_published_messages_total{publisher}` in the
 Prometheus exposition (see above) — emitted only when at least one
@@ -4040,6 +4081,8 @@ Exported series:
 | `eventbus_group_partition_lag_messages{group,topic,partition}` | gauge | per-partition consumer-group lag for partitioned groups |
 | `eventbus_publisher_published_messages_total{publisher}` | counter | admitted publishes per publisher identity (`PublishOptions.publisherId`); only emitted when at least one publisher has admitted a publish |
 | `eventbus_nack_reasons_total{subscriber,reason}` | counter | per-subscriber redelivery counts by trigger (`reason` = `handler_throw` / `explicit_nack` / `ack_timeout`); one series per non-zero class, so `getStats().nackReasons` rows with zero counts emit nothing (EB-129) |
+| `eventbus_subscriber_label_info{label_key,label_value}` | gauge | live subscriptions per subscriber-label pair (`SubscribeOptions.labels`); only emitted when at least one live subscription carries labels (EB-213) |
+| `eventbus_subscriber_label_delivered_total{label_key,label_value}` | counter | handler hand-offs per subscriber-label pair; each invocation counts, redeliveries count again (EB-213) |
 
 The per-publisher series grow with the distinct publisher identities ever
 admitted — the same bound as `BusStats.publishers` — so a bus admitting

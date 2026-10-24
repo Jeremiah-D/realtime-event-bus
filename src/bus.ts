@@ -2704,6 +2704,25 @@ export interface SubscribeOptions {
    * non-empty string when provided.
    */
   actor?: string;
+  /**
+   * Subscriber labels (EB-213): operator-defined `key=value` tags attached
+   * to the subscription — e.g. `{ team: 'search', tier: 'gold' }`. Labels
+   * are pure metadata: they never affect matching, admission, ordering or
+   * delivery, so they compose with every other subscribe option.
+   *
+   * `getStats().subscriberLabels` aggregates live subscriptions and their
+   * delivered-message counts per `(key, value)` pair, and the Prometheus
+   * exposition carries the same dimension. Hot-updatable via
+   * `setSubscriberLabels`; every change is recorded in the subscription
+   * audit log (`subscriber_labels_updated`). A namespace scoped handle
+   * passes labels straight through — they live on the subscription, and
+   * the namespace only scopes the topic space.
+   *
+   * Keys use the publisher-identity alphabet (1–64 ASCII alphanumeric,
+   * `'_'` or `'-'`); values are 1–128 characters. Anything else throws
+   * `RangeError` at subscribe time, before anything registers.
+   */
+  labels?: Record<string, string>;
 }
 
 /**
@@ -6596,6 +6615,27 @@ export interface BusStats {
     breaching: boolean;
   }>;
   /**
+   * Subscriber-label aggregation (EB-213, see `SubscribeOptions.labels`):
+   * one row per distinct `(key, value)` label pair across live
+   * subscriptions, in `(key, value)` order — the pivot dimension for
+   * multi-tenant / team dashboards. A subscription with N labels
+   * contributes to N rows. `deliveredMessages` sums the subscriptions'
+   * handler hand-offs (each invocation counts, redeliveries count again —
+   * the `deliveredMessages` semantics). Empty when no live subscription
+   * carries labels. Optional so hand-built stats fixtures keep
+   * compiling; the renderer treats a missing field as empty.
+   */
+  subscriberLabels?: Array<{
+    /** Label key. */
+    key: string;
+    /** Label value. */
+    value: string;
+    /** Live subscriptions carrying this exact `(key, value)` pair. */
+    subscribers: number;
+    /** Handler hand-offs across those subscriptions. */
+    deliveredMessages: number;
+  }>;
+  /**
    * Total SLO-miss excursions fired across all latency-SLO subscribers
    * (EB-133). Counts only when `EventBusOptions.processingLatencySloAlert`
    * armed attribution; 0 otherwise.
@@ -7457,6 +7497,21 @@ interface Subscriber {
   blockedCount: number;
   /** The queue's count capacity, for saturation checks at enqueue time. */
   queueCapacity: number;
+  /**
+   * Operator-defined `key=value` labels (see `SubscribeOptions.labels`,
+   * EB-213): pure metadata, never consulted by matching, admission,
+   * ordering or delivery. Hot-updatable via `setSubscriberLabels`;
+   * always a fresh object — the subscriber owns its copy.
+   */
+  labels: Record<string, string>;
+  /**
+   * Messages handed to this subscriber's handler (EB-213): incremented
+   * next to every `totalDelivered` increment, so it mirrors the bus-wide
+   * counter's semantics exactly — each handler invocation counts,
+   * redeliveries count again. Feeds the per-label delivery aggregation in
+   * `getStats().subscriberLabels`.
+   */
+  deliveredCount: number;
   /**
    * Per-subscriber nack-reason diagnostic counters (EB-129). Present only
    * for reliable subscriptions — plain subscriptions never carry them.
@@ -8432,6 +8487,38 @@ function validatePublisherId(publisherId: string | undefined, caller: string): v
     throw new RangeError(
       `${caller}: publisherId must be 1-64 ASCII alphanumeric, '_' or '-' characters`,
     );
+  }
+}
+
+/**
+ * Validates `SubscribeOptions.labels` / `setSubscriberLabels` input
+ * (EB-213): a plain object mapping label keys to string values. Keys use
+ * the publisher-identity alphabet (1–64 ASCII alphanumeric, `'_'` or
+ * `'-'`); values are 1–128 characters — both ranges keep the Prometheus
+ * exposition's label cardinality and label-value length sane. Labels are
+ * metadata only, so validation is strict up front: a non-object is a
+ * `TypeError`, any malformed entry a `RangeError`, before anything
+ * registers or mutates.
+ */
+function validateSubscriberLabels(
+  labels: Record<string, string> | undefined,
+  caller: string,
+): void {
+  if (labels === undefined) return;
+  if (labels === null || typeof labels !== 'object' || Array.isArray(labels)) {
+    throw new TypeError(`${caller}: labels must be an object mapping string keys to string values`);
+  }
+  for (const [key, value] of Object.entries(labels)) {
+    if (!PUBLISHER_ID_PATTERN.test(key)) {
+      throw new RangeError(
+        `${caller}: label key ${JSON.stringify(key)} must be 1-64 ASCII alphanumeric, '_' or '-' characters`,
+      );
+    }
+    if (typeof value !== 'string' || value.length === 0 || value.length > 128) {
+      throw new RangeError(
+        `${caller}: label value for key ${JSON.stringify(key)} must be a 1-128 character string`,
+      );
+    }
   }
 }
 
@@ -21570,6 +21657,11 @@ export class EventBus {
     // registers, so a throw leaves no half-registered subscriber behind.
     const actor = opts?.actor ?? 'system';
     assertValidActor(actor, 'subscribe');
+    // Subscriber labels (EB-213): validated before anything registers,
+    // so a throw leaves no half-registered subscriber behind. Labels are
+    // metadata only — validation is the only subscribe-time gate.
+    const labels = opts?.labels;
+    validateSubscriberLabels(labels, 'subscribe');
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
     const onThrottled = opts?.onThrottled;
@@ -21869,6 +21961,13 @@ export class EventBus {
       blocked: false,
       blockedCount: 0,
       queueCapacity: capacity,
+      // Subscriber labels (EB-213): the subscriber owns a fresh copy —
+      // the caller's object is never aliased, so later mutations of
+      // `opts.labels` cannot change the subscription's metadata.
+      labels: labels === undefined ? {} : { ...labels },
+      // Per-subscriber delivery counter (EB-213): incremented next to
+      // every `totalDelivered` increment below.
+      deliveredCount: 0,
       lastDeliveredSeq: new Map(),
       lastEpoch: new Map(),
       throttle,
@@ -22211,12 +22310,24 @@ export class EventBus {
     // uses, so a namespaced subscription audits under its concrete form.
     // A multi-pattern aggregate (EB-137) names its first pattern in
     // `pattern` and lists every registered pattern in `detail.patterns`.
+    // Subscriber labels (EB-213) are recorded on the subscribe event when
+    // the subscription carries any, so the audit trail answers "which
+    // labels did this subscription start with" without a second query.
+    const subscribeDetail: Record<string, unknown> | undefined =
+      multi || (labels !== undefined && Object.keys(labels).length > 0)
+        ? {
+            ...(multi ? { patterns: resolved.map((r) => r.internalPattern) } : {}),
+            ...(labels !== undefined && Object.keys(labels).length > 0
+              ? { labels: { ...labels } }
+              : {}),
+          }
+        : undefined;
     this.auditSubscription({
       action: 'subscribe',
       subId: id,
       pattern: topicPattern,
       actor,
-      ...(multi ? { detail: { patterns: resolved.map((r) => r.internalPattern) } } : {}),
+      ...(subscribeDetail === undefined ? {} : { detail: subscribeDetail }),
     });
     return subscription;
   }
@@ -22448,6 +22559,49 @@ export class EventBus {
       detail: { rules: rules === undefined ? 0 : rules.length },
     });
     return true;
+  }
+
+  /**
+   * Replaces a subscription's labels (EB-213): `undefined` clears every
+   * label. Labels are pure metadata — replacing them never touches
+   * matching, admission, ordering or delivery, so the update is safe to
+   * apply to a live subscription with a non-empty backlog. Every change
+   * is recorded in the subscription audit log
+   * (`subscriber_labels_updated`) with the previous and new label sets.
+   *
+   * Returns `false` when `subId` names no live subscription (the
+   * `renewLease` / `setHeaderFilter` convention: an unknown id is not an
+   * error, there is simply nothing to update). Malformed labels throw
+   * `RangeError`/`TypeError` before the subscription is touched.
+   */
+  setSubscriberLabels(subId: string, labels: Record<string, string> | undefined): boolean {
+    validateSubscriberLabels(labels, 'setSubscriberLabels');
+    const subscriber = this.subscribers.get(subId);
+    // Parallels `renewLease`: an unknown id is not an error — there is
+    // simply nothing to update.
+    if (subscriber === undefined) return false;
+    const previous = { ...subscriber.labels };
+    subscriber.labels = labels === undefined ? {} : { ...labels };
+    this.auditSubscription({
+      action: 'subscriber_labels_updated',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { previous, labels: { ...subscriber.labels } },
+    });
+    return true;
+  }
+
+  /**
+   * Returns a copy of a subscription's labels (EB-213), or `undefined`
+   * when `subId` names no live subscription. The copy is detached —
+   * mutating it never affects the subscription; use
+   * `setSubscriberLabels` to change labels.
+   */
+  getSubscriberLabels(subId: string): Record<string, string> | undefined {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber === undefined) return undefined;
+    return { ...subscriber.labels };
   }
 
   /**
@@ -31860,6 +32014,8 @@ export class EventBus {
         }
       }
       this.noteMessageDelivered(subscriber, msg);
+      // Per-subscriber delivery counter (EB-213): mirrors totalDelivered.
+      subscriber.deliveredCount += 1;
       this.totalDelivered += 1;
       delivered.set(entry.topic, entry.seq);
       outgoing.push(msg);
@@ -38495,6 +38651,15 @@ export class EventBus {
     const projections: BusStats['projections'] = [];
     const replayProgress: BusStats['replayProgress'] = [];
     const hotKeys: HotKeyStat[] = [];
+    // Subscriber labels (EB-213): per-(key, value) aggregation of live
+    // subscriptions and their delivered-message counts, built in the
+    // loop below. The map key is `${key}\0${value}` — both sides are
+    // validated at subscribe time, so the separator can never appear in
+    // either.
+    const labelAgg = new Map<
+      string,
+      { key: string; value: string; subscribers: number; deliveredMessages: number }
+    >();
     let causalBufferDepth = 0;
     let barrierHeldMessages = 0;
     for (const subscriber of this.subscribers.values()) {
@@ -38516,6 +38681,25 @@ export class EventBus {
       if (subscriber.credits?.exhaustedLatch === true) creditExhaustedSubscribers += 1;
       const slowStart = subscriber.slowStart;
       if (slowStart !== undefined && !slowStart.isComplete(ratesNow)) rampingSubscribers += 1;
+      // Subscriber labels (EB-213): fold this subscription's labels into
+      // the per-(key, value) aggregation — a subscriber with N labels
+      // contributes to N rows, which is what makes the dimension a proper
+      // pivot for multi-tenant dashboards.
+      for (const [labelKey, labelValue] of Object.entries(subscriber.labels)) {
+        const aggKey = `${labelKey}\0${labelValue}`;
+        const row = labelAgg.get(aggKey);
+        if (row === undefined) {
+          labelAgg.set(aggKey, {
+            key: labelKey,
+            value: labelValue,
+            subscribers: 1,
+            deliveredMessages: subscriber.deliveredCount,
+          });
+        } else {
+          row.subscribers += 1;
+          row.deliveredMessages += subscriber.deliveredCount;
+        }
+      }
       // Shadow mirror counters (see `SubscribeOptions.shadow`): the
       // independent stats surface for shadow traffic, in subscription
       // order — one row per live shadow subscription.
@@ -39075,6 +39259,12 @@ export class EventBus {
         overflowedHolds: this.totalBarrierOverflows,
       },
       hotKeys: hottestKeys,
+      // Subscriber labels (EB-213): per-(key, value) live-subscription and
+      // delivered-message counts, sorted by (key, value) for deterministic
+      // snapshots. Empty when no live subscription carries labels.
+      subscriberLabels: [...labelAgg.values()].sort((a, b) =>
+        a.key < b.key ? -1 : a.key > b.key ? 1 : a.value < b.value ? -1 : a.value > b.value ? 1 : 0,
+      ),
       traceSpans: this.trace?.snapshot() ?? [],
       tailSampledSpans: this.tailSampler?.snapshot() ?? [],
       // OTLP span export (EB-105): present only when configured — the
@@ -41522,6 +41712,8 @@ export class EventBus {
           // toward the handler — it leaves its lane's backlog and counts
           // as a lane delivery.
           this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');
+          // Per-subscriber delivery counter (EB-213): mirrors totalDelivered.
+          subscriber.deliveredCount += 1;
           this.totalDelivered += 1;
           // Sampled before the handler runs: queue dwell, not processing time.
           this.recordDeliveryLatency(subscriber, msg, nowMs);
@@ -41977,6 +42169,8 @@ export class EventBus {
       this.markMissedDeadline(msg, nowMs);
       this.noteMessageDelivered(subscriber, msg);
       this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');
+      // Per-subscriber delivery counter (EB-213): mirrors totalDelivered.
+      subscriber.deliveredCount += 1;
       this.totalDelivered += 1;
       // Sampled before the handler runs: queue dwell, not processing time.
       this.recordDeliveryLatency(subscriber, msg, nowMs);
@@ -42903,6 +43097,8 @@ export class EventBus {
     // Priority-lane accounting (EB-122): same as the plain drain path —
     // the message leaves its lane's backlog here, at hand-off.
     this.countLaneDelivered(msg.topic, msg.lane ?? 'normal');
+    // Per-subscriber delivery counter (EB-213): mirrors totalDelivered.
+    subscriber.deliveredCount += 1;
     this.totalDelivered += 1;
     // Sampled before the handler runs: queue dwell, not processing time.
     this.recordDeliveryLatency(subscriber, msg, nowMs);

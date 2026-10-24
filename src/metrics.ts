@@ -140,6 +140,14 @@
  *   publishes per publisher identity (EB-65; only emitted when at least
  *   one publisher has admitted a publish — anonymous publishes move no
  *   per-publisher counter).
+ * - `eventbus_subscriber_label_info{label_key,label_value}`: live
+ *   subscriptions per subscriber-label pair (EB-213; only emitted when
+ *   at least one live subscription carries labels).
+ * - `eventbus_subscriber_label_delivered_total{label_key,label_value}`:
+ *   handler hand-offs per subscriber-label pair (EB-213; each invocation
+ *   counts, redeliveries count again — the `deliveredMessages`
+ *   semantics; only emitted when at least one live subscription carries
+ *   labels).
  * - `eventbus_cep_matches_total`: sequence matches completed and emitted
  * - `eventbus_cep_absence_matches_total`: absence steps satisfied (EB-174)
  *   (EB-170; only emitted once a pattern was defined).
@@ -1119,6 +1127,29 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     for (const p of publishers) {
       const label = `publisher="${escapeLabelValue(p.publisher)}"`;
       lines.push(`eventbus_publisher_published_messages_total{${label}} ${p.publishedMessages}`);
+    }
+  }
+
+  // Subscriber labels (EB-213): per-(key, value) live-subscription counts
+  // and handler hand-offs. Only the labeled set carries these series —
+  // emitting them for every subscription would tie series cardinality to
+  // the subscription count; the labeled set is bounded by the operator's
+  // label taxonomy instead. The `?? []` keeps the renderer tolerant of a
+  // stats object that predates the field (hand-built fixtures included).
+  const subscriberLabels = stats.subscriberLabels ?? [];
+  if (subscriberLabels.length > 0) {
+    lines.push(
+      '# HELP eventbus_subscriber_label_info Live subscriptions per subscriber-label (key, value) pair (see SubscribeOptions.labels).',
+    );
+    lines.push('# TYPE eventbus_subscriber_label_info gauge');
+    lines.push(
+      '# HELP eventbus_subscriber_label_delivered_total Handler hand-offs per subscriber-label (key, value) pair; each invocation counts, redeliveries count again.',
+    );
+    lines.push('# TYPE eventbus_subscriber_label_delivered_total counter');
+    for (const row of subscriberLabels) {
+      const label = `label_key="${escapeLabelValue(row.key)}",label_value="${escapeLabelValue(row.value)}"`;
+      lines.push(`eventbus_subscriber_label_info{${label}} ${row.subscribers}`);
+      lines.push(`eventbus_subscriber_label_delivered_total{${label}} ${row.deliveredMessages}`);
     }
   }
 
