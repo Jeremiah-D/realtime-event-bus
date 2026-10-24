@@ -1929,6 +1929,28 @@ library.
   `src/metrics.ts` renders `eventbus_watermark_idle_advances_total`
   (activity-gated). Invalid values throw `RangeError`. Disabled by
   default.
+- **Event-time ordered emit** (in `src/eventtime-order.ts`,
+  opt-in per topic via `EventTimeOrderedBuffer`, EB-222): the
+  watermark only judges lateness — it never blocks delivery — so a
+  subscriber that cares about business-time order still sees
+  out-of-order arrivals. This buffer holds on-time messages until
+  the watermark passes them (`eventTime <= maxEventTime −
+  allowedLatenessMs`) and then releases them sorted by event time,
+  ties by arrival order. Messages without an event time pass straight
+  through and never move the watermark; a message late beyond the
+  grace is reported on `onLate` and returned immediately, never
+  buffered and never silently dropped. A `maxHoldMs` escape hatch
+  (default 60000 ms, measured from arrival on the caller's clock)
+  releases a stalled message on the next `push` or `drainDue` even
+  when the watermark never advances, so a quiet source cannot hold
+  messages forever; `flushAll` drains everything in event-time
+  order for shutdown. Invalid options, event times, and clocks
+  throw `RangeError` before anything is buffered. With no buffer in
+  use, delivery order is unchanged. It is orthogonal to the
+  watermark (which decides what counts as late, not what order
+  on-time messages release in) and to per-key sequence reordering
+  (which orders by publish sequence within one key, not by business
+  event time across a topic).
 - **Subscriber batch delivery** (in `src/bus.ts`, opt-in via
   `subscribe(..., { batch: true })`): the drain collects up to `maxSize`
   queued messages (default 100) and invokes the handler once with the
