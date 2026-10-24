@@ -7200,6 +7200,22 @@ export interface BusStats {
      * closed archived segment count, and archived entries.
      */
     segments: Record<string, { live: number; segments: number; archived: number }>;
+    /**
+     * Durable-log S3 offload readbacks (EB-218): remote segment pulls
+     * that reached S3 (cache misses). 0 when offload is disabled.
+     */
+    s3Readbacks?: number;
+    /**
+     * Durable-log S3 offload readbacks (EB-218): total bytes downloaded
+     * by remote segment pulls. 0 when offload is disabled.
+     */
+    s3ReadbackBytes?: number;
+    /**
+     * Durable-log S3 offload readbacks (EB-218): readback reads served
+     * from the local readback cache, no S3 request. 0 when offload is
+     * disabled.
+     */
+    s3ReadbackCacheHits?: number;
   };
   /**
    * In-memory lookback buffers (EB-176, see `setTopicLookback`): the

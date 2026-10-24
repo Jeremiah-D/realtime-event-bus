@@ -654,7 +654,16 @@ library.
   with `{ includeArchived: true }`) pulls the bytes back down and
   verifies them against the manifest hash; a segment missing locally
   and remotely — or failing the hash check — throws explicitly instead
-  of silently truncating the replay. Offload runs on the same
+  of silently truncating the replay. Readback cache (EB-218): a pulled segment is cached
+  in memory (LRU, keyed by topic + segment id), so repeated replays over the same range
+  — e.g. several subscribers resuming from old offsets — do not re-download; bounds via
+  `readbackCacheMaxSegments` (default 16) and `readbackCacheMaxBytes` (default 64 MiB,
+  accounted against downloaded bytes), either 0 to disable. A failed pull is never
+  cached, and `purgeTopic` evicts the topic from the cache. Readback volume is observable
+  in `getStats().durableLog` (`s3Readbacks` pulls, `s3ReadbackBytes` downloaded bytes,
+  `s3ReadbackCacheHits` cache hits) and renders as the `durablelog_s3_readbacks_total`,
+  `durablelog_s3_readback_bytes_total`, and `durablelog_s3_readback_cache_hits_total`
+  Prometheus counters. Offload runs on the same
   background pass as archiving (and via `DurableTopicLog.offloadNow()`
   for manual/dry-run triggers); failures are counted in
   `getStats().durableLog.offloadFailed` and retried on the next pass.

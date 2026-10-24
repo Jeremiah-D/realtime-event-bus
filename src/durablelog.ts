@@ -475,6 +475,30 @@ export interface SegmentOffloadOptions {
    * prefix.
    */
   retainLocalSegments?: number;
+  /**
+   * EB-218: bounds for the local readback cache. A replay that needs a
+   * locally-trimmed segment (`readSince`/`readSinceTime` with
+   * `{ includeArchived: true }`) pulls the segment from the remote —
+   * sealed segments are immutable and hash-verified against the
+   * manifest, so a fetched copy is always current and is cached here,
+   * keyed by (topic, segmentId), least-recently-used first. Repeated
+   * replays over the same range (multiple subscribers resuming from old
+   * offsets) then hit memory instead of re-downloading synchronously.
+   *
+   * `readbackCacheMaxSegments` caps how many segments the cache holds
+   * (default 16), `readbackCacheMaxBytes` caps the total downloaded
+   * byte size it holds (default 64 MiB — accounted against the
+   * downloaded bytes of each segment, a proxy for the cache's memory
+   * cost). Either bound may be 0 to disable the cache entirely:
+   * every readback then downloads from the remote. Must be
+   * non-negative integers.
+   */
+  readbackCacheMaxSegments?: number;
+  /**
+   * EB-218: total downloaded-byte budget for the local readback cache.
+   * See `readbackCacheMaxSegments`.
+   */
+  readbackCacheMaxBytes?: number;
 }
 
 /**
@@ -542,6 +566,10 @@ interface ResolvedSegmentOffload {
   keyPrefix: string;
   namespace: string;
   retainLocalSegments: number;
+  /** EB-218: max cached segments for the local readback cache. */
+  readbackCacheMaxSegments: number;
+  /** EB-218: downloaded-byte budget for the local readback cache. */
+  readbackCacheMaxBytes: number;
 }
 
 /**
@@ -587,7 +615,22 @@ function resolveSegmentOffloadOptions(
   if (!(retain === Infinity || (Number.isInteger(retain) && retain >= 0))) {
     throw new RangeError('segmentOffload.retainLocalSegments must be a non-negative integer or Infinity');
   }
-  return { s3, keyPrefix: resolvedPrefix, namespace: resolvedNamespace, retainLocalSegments: retain };
+  const readbackCacheMaxSegments = options.readbackCacheMaxSegments ?? 16;
+  if (!Number.isInteger(readbackCacheMaxSegments) || readbackCacheMaxSegments < 0) {
+    throw new RangeError('segmentOffload.readbackCacheMaxSegments must be a non-negative integer');
+  }
+  const readbackCacheMaxBytes = options.readbackCacheMaxBytes ?? 64 * 1024 * 1024;
+  if (!Number.isInteger(readbackCacheMaxBytes) || readbackCacheMaxBytes < 0) {
+    throw new RangeError('segmentOffload.readbackCacheMaxBytes must be a non-negative integer');
+  }
+  return {
+    s3,
+    keyPrefix: resolvedPrefix,
+    namespace: resolvedNamespace,
+    retainLocalSegments: retain,
+    readbackCacheMaxSegments,
+    readbackCacheMaxBytes,
+  };
 }
 
 /**
@@ -1734,6 +1777,22 @@ export class DurableTopicLog {
   private offloadUploaded = 0;
   /** EB-163: offload attempts that failed (upload or manifest write). */
   private offloadFailed = 0;
+  /**
+   * EB-218: local readback cache — remotely-fetched (locally-trimmed)
+   * segments, keyed `<topic>\0<segmentId>`, in LRU order (the tail is
+   * the most recently used). Sealed segments are immutable and
+   * hash-verified against the manifest, so a cached copy is always
+   * current; the cache is only populated on a verified remote pull.
+   */
+  private readonly readbackCache = new Map<string, { records: DurableLogRecord[]; bytes: number }>();
+  /** EB-218: downloaded bytes currently held by the readback cache. */
+  private readbackCacheBytes = 0;
+  /** EB-218: remote segment pulls that reached S3 (cache misses). */
+  private s3Readbacks = 0;
+  /** EB-218: total bytes downloaded by remote segment pulls. */
+  private s3ReadbackBytes = 0;
+  /** EB-218: readback reads served from the local cache (no S3 call). */
+  private s3ReadbackCacheHits = 0;
 
   private constructor(
     dir: string,
@@ -2881,6 +2940,17 @@ export class DurableTopicLog {
   ): DurableLogRecord[] {
     const offload = this.offload as ResolvedSegmentOffload;
     const id = `${segment.topic}\0${segment.segmentId}`;
+    // EB-218: serve from the local readback cache when this segment was
+    // pulled before — sealed segments are immutable and hash-verified,
+    // so a cached copy is always current.
+    const cached = this.readbackCache.get(id);
+    if (cached !== undefined) {
+      this.s3ReadbackCacheHits += 1;
+      // LRU touch: re-insert at the tail.
+      this.readbackCache.delete(id);
+      this.readbackCache.set(id, cached);
+      return cached.records.filter((rec) => rec.seq > fromSeqExclusive);
+    }
     const key = this.remoteSegmentKey(segment);
     const refuse = (detail: string): Error =>
       new Error(
@@ -2910,9 +2980,39 @@ export class DurableTopicLog {
       // genuine corruption worth failing on, not a skippable archive.
       throw refuse(`downloaded bytes failed to decompress: ${(err as Error).message}`);
     }
-    const out: DurableLogRecord[] = [];
-    this.parseArchivedSegmentText(text, segment.topic, fromSeqExclusive, out);
-    return out;
+    // EB-218: parse the whole segment, cache the verified records,
+    // then filter by cursor — identical to parsing with the cursor
+    // directly (`rec.seq > fromSeqExclusive`).
+    const records: DurableLogRecord[] = [];
+    this.parseArchivedSegmentText(text, segment.topic, -1, records);
+    this.s3Readbacks += 1;
+    this.s3ReadbackBytes += bytes.length;
+    this.cacheReadbackSegment(id, records, bytes.length);
+    return records.filter((rec) => rec.seq > fromSeqExclusive);
+  }
+
+  /**
+   * EB-218: inserts one hash-verified remote segment into the local
+   * readback cache, evicting least-recently-used entries first until
+   * both the segment-count and downloaded-byte budgets hold. A cache
+   * bound of 0 disables caching; a segment larger than the whole byte
+   * budget is never cached.
+   */
+  private cacheReadbackSegment(id: string, records: DurableLogRecord[], bytes: number): void {
+    const offload = this.offload as ResolvedSegmentOffload;
+    const maxSegments = offload.readbackCacheMaxSegments;
+    const maxBytes = offload.readbackCacheMaxBytes;
+    if (maxSegments === 0 || maxBytes === 0) return;
+    if (bytes > maxBytes) return;
+    while (this.readbackCache.size >= maxSegments || this.readbackCacheBytes + bytes > maxBytes) {
+      const oldest = this.readbackCache.keys().next();
+      if (oldest.done) break;
+      const evicted = this.readbackCache.get(oldest.value);
+      this.readbackCache.delete(oldest.value);
+      if (evicted !== undefined) this.readbackCacheBytes -= evicted.bytes;
+    }
+    this.readbackCache.set(id, { records, bytes });
+    this.readbackCacheBytes += bytes;
   }
 
   /**
@@ -3477,6 +3577,15 @@ export class DurableTopicLog {
     }
     for (let i = this.chainEntries.length - 1; i >= 0; i--) {
       if (this.chainEntries[i].topic === topic) this.chainEntries.splice(i, 1);
+    }
+    // EB-218: drop the purged topic's readback-cached segments — the
+    // topic must read as never-seen afterwards, from the cache too.
+    for (const id of [...this.readbackCache.keys()]) {
+      if (id.startsWith(`${topic}\0`)) {
+        const evicted = this.readbackCache.get(id);
+        this.readbackCache.delete(id);
+        if (evicted !== undefined) this.readbackCacheBytes -= evicted.bytes;
+      }
     }
     return { filesDeleted, indexLinesRemoved, chainLinesRemoved };
   }
@@ -4289,6 +4398,23 @@ export class DurableTopicLog {
      * write). 0 when offload is disabled.
      */
     offloadFailed: number;
+    /**
+     * EB-218: remote segment pulls (readbacks) that reached S3 — a
+     * locally-trimmed segment pulled down during replay. Counts cache
+     * misses only; cache hits are counted separately. 0 when offload
+     * is disabled.
+     */
+    s3Readbacks: number;
+    /**
+     * EB-218: total bytes downloaded by remote segment pulls. 0 when
+     * offload is disabled.
+     */
+    s3ReadbackBytes: number;
+    /**
+     * EB-218: readback reads served from the local readback cache —
+     * no S3 request. 0 when offload is disabled.
+     */
+    s3ReadbackCacheHits: number;
   } {
     let entries = 0;
     for (const count of this.entryCounts.values()) entries += count;
@@ -4326,6 +4452,9 @@ export class DurableTopicLog {
       bytes,
       offloadUploaded: this.offloadUploaded,
       offloadFailed: this.offloadFailed,
+      s3Readbacks: this.s3Readbacks,
+      s3ReadbackBytes: this.s3ReadbackBytes,
+      s3ReadbackCacheHits: this.s3ReadbackCacheHits,
       ...(this.maxBytesPerTopic === undefined ? {} : { bytesLimit: this.maxBytesPerTopic }),
     };
   }

@@ -159,6 +159,13 @@
  * - `eventbus_statestore_evicted_keys_total`: keys evicted by the
  *   materialized state store's `maxKeys` bound (EB-171; only emitted when
  *   the store is enabled).
+ * - `durablelog_s3_readbacks_total`: locally-trimmed durable-log
+ *   segments pulled back from S3 during replay — cache misses only
+ *   (EB-218; only emitted once a readback has happened).
+ * - `durablelog_s3_readback_bytes_total`: bytes downloaded by those
+ *   readbacks (EB-218).
+ * - `durablelog_s3_readback_cache_hits_total`: readbacks served from
+ *   the local readback cache without an S3 request (EB-218).
  *
  * Gauges (point-in-time):
  * - `eventbus_subscribers`: currently active subscriptions.
@@ -1129,6 +1136,37 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     for (const r of skippedUnhealthy) {
       const labels = `topic="${escapeLabelValue(r.topic)}",partition="${r.partition}"`;
       lines.push(`eventbus_partition_skipped_unhealthy_total{${labels}} ${r.skipped}`);
+    }
+  }
+
+  // Durable-log S3 offload readbacks (EB-218): remote segment pulls and
+  // their downloaded bytes, plus readback-cache hits — read from
+  // `stats.durableLog`. Emitted only once at least one readback or
+  // cache hit has been counted, so a bus that never read back renders
+  // byte-identical exposition to before. The `??` keeps the renderer
+  // tolerant of a stats object that predates the fields (hand-built
+  // fixtures included).
+  const durableLog = stats.durableLog;
+  if (durableLog !== undefined) {
+    const s3Readbacks = durableLog.s3Readbacks ?? 0;
+    const s3ReadbackBytes = durableLog.s3ReadbackBytes ?? 0;
+    const s3ReadbackCacheHits = durableLog.s3ReadbackCacheHits ?? 0;
+    if (s3Readbacks > 0 || s3ReadbackBytes > 0 || s3ReadbackCacheHits > 0) {
+      lines.push(
+        '# HELP durablelog_s3_readbacks_total Locally-trimmed durable-log segments pulled back from S3 during replay (cache misses) (EB-218).',
+      );
+      lines.push('# TYPE durablelog_s3_readbacks_total counter');
+      lines.push(`durablelog_s3_readbacks_total ${s3Readbacks}`);
+      lines.push(
+        '# HELP durablelog_s3_readback_bytes_total Bytes downloaded by durable-log S3 segment readbacks (EB-218).',
+      );
+      lines.push('# TYPE durablelog_s3_readback_bytes_total counter');
+      lines.push(`durablelog_s3_readback_bytes_total ${s3ReadbackBytes}`);
+      lines.push(
+        '# HELP durablelog_s3_readback_cache_hits_total Durable-log S3 readbacks served from the local readback cache without an S3 request (EB-218).',
+      );
+      lines.push('# TYPE durablelog_s3_readback_cache_hits_total counter');
+      lines.push(`durablelog_s3_readback_cache_hits_total ${s3ReadbackCacheHits}`);
     }
   }
 
