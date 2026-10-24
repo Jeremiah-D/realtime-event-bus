@@ -2009,6 +2009,26 @@ library.
   itself to the most recently claimed `idempotencyMaxEntries` identities
   when it grows past twice that many lines. `getStats().durableLog`
   exposes the journal line count as `publishDedupEntries`.
+- **Bloom pre-filter for the publish-side idempotent dedup window**
+  (EB-214, opt-in via `EventBusOptions.dedupBloom`, `src/bloom.ts`): a
+  space-efficient probabilistic membership test in front of the exact
+  `(topic, messageId)` map above. A negative answer is definitive — the
+  key was never claimed — so the map lookup is skipped; a positive answer
+  falls through to the exact map, which stays authoritative (a false
+  positive costs one extra map lookup, never a wrong suppression). This is
+  a memory optimization for high-cardinality `messageId` workloads, not a
+  latency optimization: `true` enables it sized for `idempotencyMaxEntries`
+  at p = 0.01, or pass `{ expectedInsertions, falsePositiveRate }` to tune
+  it (invalid sizing throws `RangeError` in the constructor). The filter
+  cannot delete, so a saturation guard rebuilds it from the live table
+  once insertions pass 2x the sized capacity and exceed the live table
+  size; a restart rebuilds it from the `__publish_dedup.jsonl` journal
+  (EB-66). `getStats().bloomStats` reports `{ enabled, insertions,
+  estimatedFalsePositiveRate, bitSize, hashFunctions }`. Measured
+  (`bench/bloom-dedup.bench.ts`, Node v24, `--expose-gc`): 100k 64-char
+  messageIds retain 3.50 MiB as a `Map` vs ~19 KiB as a filter (~186x
+  smaller); absent-key probes run at roughly map-only speed or slower —
+  the filter trades a small JS hash cost per probe for the memory win.
 - **Subscriber-side exactly-once dedup window** (in `src/bus.ts`, opt-in via
   `subscribe(pattern, handler, { deduplicateMessages })`): the complement of
   `publishIdempotent`'s publish-side dedup. Every publish may carry an

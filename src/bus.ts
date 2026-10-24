@@ -367,6 +367,12 @@ import {
   type ResolvedBridgeOptions,
 } from './bridge.ts';
 import {
+  BloomFilter,
+  resolveDedupBloomOptions,
+  type DedupBloomOptions,
+  type ResolvedDedupBloomOptions,
+} from './bloom.ts';
+import {
   BridgeHealthMonitor,
   type BridgeHealthOptions,
   type BridgeHealthStats,
@@ -4618,6 +4624,32 @@ export interface EventBusOptions {
    */
   idempotencyMaxEntries?: number;
   /**
+   * Bloom pre-filter for the publish-side idempotency dedup window
+   * (EB-214, opt-in): a space-efficient probabilistic membership test in
+   * front of the exact `(topic, messageId)` map. A negative answer is
+   * definitive — the key was never claimed — so the map lookup is
+   * skipped; a positive answer falls through to the exact map, which
+   * stays authoritative (a false positive costs one extra map lookup,
+   * never a wrong suppression — zero false kills).
+   *
+   * This is a memory optimization for high-cardinality `messageId`
+   * workloads, not a latency optimization: the filter holds ~9.6 bits
+   * per entry at the default false-positive rate (vs hundreds of bytes
+   * per `Map` entry for long messageIds), while each probe pays a small
+   * JS hash cost. Measured: 100k 64-char messageIds retain 3.50 MiB as a
+   * `Map` vs ~31 KiB as a filter (~116x smaller); absent-key probes run
+   * at roughly map-only speed or slower (see
+   * `bench/bloom-dedup.bench.ts`).
+   *
+   * `true` enables it with defaults (sized for `idempotencyMaxEntries`
+   * at p = 0.01); an object tunes `{ expectedInsertions,
+   * falsePositiveRate }`; `false` / omitted disables it (the default —
+   * the bus then behaves exactly as before). Invalid sizing throws
+   * `RangeError` in the constructor. `getStats().bloomStats` exposes the
+   * live insertion count and estimated false-positive rate.
+   */
+  dedupBloom?: boolean | DedupBloomOptions;
+  /**
    * Per-topic priority-lane tuning (EB-122, opt-in): every subscriber's
    * queue holds three priority lanes (`urgent` / `normal` / `bulk`) drained
    * in weighted round-robin order. `weights` sets the per-lane drain
@@ -6635,6 +6667,25 @@ export interface BusStats {
     /** Handler hand-offs across those subscriptions. */
     deliveredMessages: number;
   }>;
+  /**
+   * Bloom pre-filter state for the publish-side idempotency dedup window
+   * (EB-214, see `EventBusOptions.dedupBloom`). `enabled` is false when
+   * the pre-filter is disabled (the default) — the remaining fields are
+   * then zero. Optional so hand-built stats fixtures keep compiling; the
+   * renderer treats a missing field as disabled.
+   */
+  bloomStats?: {
+    /** Whether the pre-filter is enabled. */
+    enabled: boolean;
+    /** Claims recorded since construction / the last rebuild. */
+    insertions: number;
+    /** Estimated false-positive rate at the current insertion count. */
+    estimatedFalsePositiveRate: number;
+    /** Bit array length. */
+    bitSize: number;
+    /** Hash functions (probe positions per key). */
+    hashFunctions: number;
+  };
   /**
    * Total SLO-miss excursions fired across all latency-SLO subscribers
    * (EB-133). Counts only when `EventBusOptions.processingLatencySloAlert`
@@ -14543,6 +14594,20 @@ export class EventBus {
    */
   private readonly idempotencyMaxEntries: number;
   /**
+   * Bloom pre-filter for the EB-27 dedup table (EB-214, opt-in via
+   * `EventBusOptions.dedupBloom`): every admitted claim is added, and
+   * every lookup probes it first — a negative answer skips the map. The
+   * map stays authoritative, so the filter can never suppress wrongly.
+   * `undefined` when disabled (the default): the bus then behaves exactly
+   * as before, with zero per-publish overhead.
+   */
+  private readonly dedupBloom: BloomFilter | undefined;
+  /**
+   * The `expectedInsertions` the bloom filter was sized for (EB-214):
+   * drives the saturation guard in `refreshDedupBloom`.
+   */
+  private readonly dedupBloomExpectedInsertions: number;
+  /**
    * Per-lane drain weights for the priority-lane rotation (EB-122), from
    * `EventBusOptions.priorityLanes` (default 8:2:1). Shared by every
    * subscriber's `LaneQueue` — lanes are a bus-wide mechanism, not a
@@ -15620,6 +15685,23 @@ export class EventBus {
       throw new RangeError('idempotencyMaxEntries must be a positive integer');
     }
     this.idempotencyMaxEntries = idempotencyMaxEntries;
+    // Bloom pre-filter for the EB-27 dedup table (EB-214, opt-in):
+    // validated fail-fast — a bad sizing must never silently degrade
+    // into an unbounded filter. `true` sizes for `idempotencyMaxEntries`
+    // at p = 0.01; an object tunes the sizing.
+    const dedupBloomOptions = resolveDedupBloomOptions(
+      options?.dedupBloom,
+      idempotencyMaxEntries,
+      'EventBus',
+    );
+    this.dedupBloom =
+      dedupBloomOptions === undefined
+        ? undefined
+        : new BloomFilter(
+            dedupBloomOptions.expectedInsertions,
+            dedupBloomOptions.falsePositiveRate,
+          );
+    this.dedupBloomExpectedInsertions = dedupBloomOptions?.expectedInsertions ?? 0;
     // Per-topic priority lanes (EB-122): validated fail-fast — a bad
     // weight or starvation threshold must never silently degrade the
     // drain rotation.
@@ -15972,6 +16054,10 @@ export class EventBus {
         for (const { key, at } of live.slice(-this.idempotencyMaxEntries)) {
           this.dedup.set(key, at);
         }
+        // Bloom pre-filter (EB-214): rebuilt from the recovered table
+        // (EB-66) — a restarted bus keeps the pre-filter without
+        // replaying the claim stream one by one.
+        this.dedupBloom?.rebuild(this.dedup.keys());
         for (const { key, at, hash, accepted } of liveTable.slice(-this.idempotencyMaxEntries)) {
           this.contentDedup.set(key, { at, windowMs: this.idempotencyWindowMs, hash, accepted });
         }
@@ -28835,7 +28921,10 @@ export class EventBus {
     const dedupKey = `${topic}\0${messageId}`;
     const dedupStart = this.admissionGateStart();
     this.pruneDedup(nowMs);
-    const firstAt = this.dedup.get(dedupKey);
+    // Bloom pre-filter (EB-214): a negative answer proves the key was
+    // never claimed, so the exact map lookup is skipped; a positive
+    // answer falls through to the authoritative map below.
+    const firstAt = this.dedupBloomMightContain(dedupKey) ? this.dedup.get(dedupKey) : undefined;
     this.admissionGateRecord(topic, 'idempotency-dedup', dedupStart);
     if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
       // Suppressed duplicate: dropped before admission — no sequence
@@ -28908,6 +28997,9 @@ export class EventBus {
       // position so the bounded eviction tracks last-publish order.
       this.dedup.delete(dedupKey);
       this.dedup.set(dedupKey, nowMs);
+      // Bloom pre-filter (EB-214): the filter's claim stream mirrors
+      // the map's — every admitted claim is added.
+      this.addDedupBloomClaim(dedupKey);
       while (this.dedup.size > this.idempotencyMaxEntries) {
         const oldest = this.dedup.keys().next();
         if (oldest.done) break;
@@ -29438,7 +29530,11 @@ export class EventBus {
         return { admitted: false, reason: 'acl', failedGate: 'acl' };
       }
       const nowMs = this.now();
-      const firstAt = this.dedup.get(`${topic}\0${messageId}`);
+      // Bloom pre-filter (EB-214): read-only probe — a preview must not
+      // mutate the table OR the filter, so only `has` is consulted here,
+      // never `add`. A negative answer is definitive.
+      const previewKey = `${topic}\0${messageId}`;
+      const firstAt = this.dedupBloomMightContain(previewKey) ? this.dedup.get(previewKey) : undefined;
       if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
         return { admitted: false, reason: 'duplicate', failedGate: 'idempotency-dedup' };
       }
@@ -31643,7 +31739,9 @@ export class EventBus {
       if (entry.messageId !== undefined) {
         const dedupKey = `${entry.topic}\0${entry.messageId}`;
         this.pruneDedup(nowMs);
-        const firstAt = this.dedup.get(dedupKey);
+        // Bloom pre-filter (EB-214): a negative answer proves the key
+        // was never claimed, so the exact map lookup is skipped.
+        const firstAt = this.dedupBloomMightContain(dedupKey) ? this.dedup.get(dedupKey) : undefined;
         if (firstAt !== undefined && nowMs - firstAt < this.idempotencyWindowMs) {
           this.countDuplicate(entry.topic, entry.payload, entry.publisherId);
           suppressed = true;
@@ -31685,6 +31783,8 @@ export class EventBus {
           const dedupKey = `${entry.topic}\0${entry.messageId}`;
           this.dedup.delete(dedupKey);
           this.dedup.set(dedupKey, nowMs);
+          // Bloom pre-filter (EB-214): mirror the claim.
+          this.addDedupBloomClaim(dedupKey);
           while (this.dedup.size > this.idempotencyMaxEntries) {
             const oldest = this.dedup.keys().next();
             if (oldest.done) break;
@@ -34154,6 +34254,54 @@ export class EventBus {
     for (const [key, firstAt] of this.dedup) {
       if (nowMs - firstAt < this.idempotencyWindowMs) break;
       this.dedup.delete(key);
+    }
+    this.refreshDedupBloom();
+  }
+
+  /**
+   * Bloom pre-filter probe (EB-214): `true` means "maybe claimed — consult
+   * the exact map", `false` is definitive ("never claimed — skip the
+   * map"). Disabled → always `true`, so every call site keeps a single
+   * code path and the disabled bus pays one property check per lookup.
+   */
+  private dedupBloomMightContain(key: string): boolean {
+    const bloom = this.dedupBloom;
+    return bloom === undefined || bloom.has(key);
+  }
+
+  /**
+   * Records an admitted claim in the bloom pre-filter (EB-214): called
+   * next to every `this.dedup.set` for the EB-27 table, so the filter's
+   * claim stream exactly mirrors the map's. No-op when disabled.
+   */
+  private addDedupBloomClaim(key: string): void {
+    this.dedupBloom?.add(key);
+  }
+
+  /**
+   * Bloom saturation guard (EB-214): the filter cannot delete, so
+   * evicted/expired map entries leave stale bits behind and the estimated
+   * false-positive rate degrades as churn accumulates. Once insertions
+   * pass 2x the sized capacity AND exceed the live table size (i.e. stale
+   * bits dominate — if the live table itself is bigger than the sized
+   * capacity the filter is undersized by configuration and rebuilding
+   * cannot help), the filter is rebuilt from the live table — restoring
+   * the configured rate with an amortized O(table) cost (the table is
+   * bounded by `idempotencyMaxEntries`). Runs inside `pruneDedup`, i.e.
+   * ahead of every `publishIdempotent` lookup, so the estimate
+   * `getStats().bloomStats` reports never drifts far. Correctness never
+   * depends on the guard: the map stays authoritative, so an undersized
+   * or stale filter only costs extra map lookups, never a wrong
+   * suppression.
+   */
+  private refreshDedupBloom(): void {
+    const bloom = this.dedupBloom;
+    if (bloom === undefined) return;
+    if (
+      bloom.insertions >= 2 * this.dedupBloomExpectedInsertions &&
+      bloom.insertions > this.dedup.size
+    ) {
+      bloom.rebuild(this.dedup.keys());
     }
   }
 
@@ -39265,6 +39413,15 @@ export class EventBus {
       subscriberLabels: [...labelAgg.values()].sort((a, b) =>
         a.key < b.key ? -1 : a.key > b.key ? 1 : a.value < b.value ? -1 : a.value > b.value ? 1 : 0,
       ),
+      // Bloom pre-filter state (EB-214): disabled buses report
+      // `enabled: false` with zeroed fields, so the shape is stable.
+      bloomStats: {
+        enabled: this.dedupBloom !== undefined,
+        insertions: this.dedupBloom?.insertions ?? 0,
+        estimatedFalsePositiveRate: this.dedupBloom?.estimatedFalsePositiveRate() ?? 0,
+        bitSize: this.dedupBloom?.size ?? 0,
+        hashFunctions: this.dedupBloom?.hashes ?? 0,
+      },
       traceSpans: this.trace?.snapshot() ?? [],
       tailSampledSpans: this.tailSampler?.snapshot() ?? [],
       // OTLP span export (EB-105): present only when configured — the
