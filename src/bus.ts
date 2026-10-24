@@ -4118,7 +4118,10 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * partition, unknown owner) fails the join with `RangeError` before
    * the roster is touched; a throwing assignor propagates. Every
    * assignment is recorded in the subscription audit log
-   * (`getSubscriptionAudit`, action `'rebalance'`).
+   * (`getSubscriptionAudit`, action `'rebalance'`). The third built-in,
+   * `'zone-aware'` (EB-223, `createZoneAwarePartitionAssignor({ memberZones })` in
+   * `src/assignor.ts`), is used through this field: it cannot be selected by the
+   * `assignment` string alone because zone declarations are operator data, not a bare name.
    */
   assignor?: PartitionAssignor;
   /**

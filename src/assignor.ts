@@ -22,6 +22,14 @@
  *   assignment (`src/sticky.ts`) — every member owns `floor(P/N)` or
  *   `ceil(P/N)` partitions, maximally sticky across rebalances.
  *
+ * A third built-in, the zone-aware assignor (EB-223), is constructed
+ * with operator-supplied zone declarations —
+ * `createZoneAwarePartitionAssignor({ memberZones })` — because zone
+ * topology is operator data, not a bare string option: it cannot be
+ * selected by the `assignment` string alone. It is otherwise a
+ * first-class built-in with the same pure, deterministic contract, and
+ * it is resolvable by name with its options via
+ * `resolveBuiltinPartitionAssignor('zone-aware', options)`.
  * An assignor should be pure and deterministic: same
  * `{ partitions, members, previous }` must yield the same assignment, so
  * every computation agrees without coordination. `previous` carries the
@@ -134,11 +142,205 @@ export const stickyPartitionAssignor: PartitionAssignor = {
   },
 };
 
-/** Resolves one of the two built-in strategy names to its assignor. */
+/**
+ * Zone declarations for the zone-aware assignor (EB-223).
+ */
+export interface ZoneAwareAssignorOptions {
+  /**
+   * Member id -> zone name. A member absent from the map declares no
+   * zone and falls into the implicit unzoned pool (see
+   * `zoneAwareAssignment`). Zone names must be non-empty and must not
+   * contain NUL. Entries for members that never join are ignored, so
+   * the map may cover the full deployment roster up front.
+   */
+  readonly memberZones: Readonly<Record<string, string>>;
+  /**
+   * Full deployment zone list. Defaults to the distinct zones in
+   * `memberZones`. An explicitly listed zone with no live member is a
+   * fallback candidate that is simply skipped — a zone whose members
+   * all left (or never joined) never strands a partition. A live
+   * member's declared zone is always ranked even when the list omits
+   * it, so the list can only add zones, never remove a live member's.
+   */
+  readonly zones?: readonly string[];
+}
+
+/**
+ * Sentinel zone for members that declare no zone. Zone names are
+ * validated NUL-free, so a real zone can never collide with it.
+ */
+const UNZONED_ZONE = '\0unzoned';
+
+/** Validates one zone name. Throws `RangeError` on a bad shape. */
+function assertValidZoneName(zone: unknown, where: string): asserts zone is string {
+  if (typeof zone !== 'string' || zone.length === 0 || zone.includes('\0')) {
+    throw new RangeError(`${where}: zone names must be non-empty strings without NUL`);
+  }
+}
+
+/**
+ * Validates zone-aware options and returns the normalized form: the
+ * declared map as a `Map` (own entries only, so a member id like
+ * `'toString'` can never pick up an inherited property) and the
+ * explicitly listed zones deduplicated in order.
+ */
+function normalizeZoneAwareOptions(
+  options: ZoneAwareAssignorOptions,
+): { declared: Map<string, string>; listedZones: string[] } {
+  if (typeof options !== 'object' || options === null) {
+    throw new RangeError('zone-aware assignor: options must be an object with { memberZones }');
+  }
+  const { memberZones, zones } = options;
+  if (typeof memberZones !== 'object' || memberZones === null || Array.isArray(memberZones)) {
+    throw new RangeError('zone-aware assignor: `memberZones` must be an object mapping member id -> zone');
+  }
+  const declared = new Map<string, string>();
+  for (const [member, zone] of Object.entries(memberZones)) {
+    assertValidZoneName(zone, `zone-aware assignor: zone of member '${member}'`);
+    declared.set(member, zone);
+  }
+  const listedZones: string[] = [];
+  if (zones !== undefined) {
+    if (!Array.isArray(zones)) {
+      throw new RangeError('zone-aware assignor: `zones` must be an array of zone names when set');
+    }
+    const seen = new Set<string>();
+    for (const zone of zones) {
+      assertValidZoneName(zone, 'zone-aware assignor: `zones` entry');
+      if (!seen.has(zone)) {
+        seen.add(zone);
+        listedZones.push(zone);
+      }
+    }
+  }
+  return { declared, listedZones };
+}
+
+/** Zone-aware score of a zone for a partition (rendezvous over zones). */
+function zoneScore(partition: number, zone: string): bigint {
+  const digest = createHash('sha256').update(`${partition}\0zone\0${zone}`, 'utf8').digest();
+  return digest.readBigUInt64BE(0);
+}
+
+/**
+ * Zone-aware assignment (EB-223), as a pure function.
+ *
+ * Cross-zone traffic localization, without a coordinator: for each
+ * partition, rank the zones by rendezvous score
+ * (`sha256(partition + NUL + 'zone' + NUL + zone)`, ties broken by
+ * zone name so the ranking is total and deterministic), then take the
+ * highest-ranked zone that still has a live roster member and pick its
+ * winner by the same rendezvous hashing used for members. A zone with
+ * no live member is skipped — the cross-zone fallback — so a zone
+ * emptying out (all members left, none joined yet) migrates its
+ * partitions to the next-ranked zone instead of stranding them.
+ *
+ * Members with no zone declaration form one implicit unzoned pool that
+ * ranks like any other zone. Consequences, both deliberate:
+ *
+ * - when every member is unzoned, the pool is the only zone and the
+ *   result is byte-identical to the plain `'rendezvous'` assignment;
+ * - in a mixed roster the unzoned pool competes for partitions on its
+ *   hash ranking, so unzoned members still receive work instead of
+ *   starving behind zoned ones.
+ *
+ * Like rendezvous, this assignor is stateless with respect to
+ * `previous`: it is a pure function of the roster and the zone
+ * topology, so every computation agrees without coordination. It is
+ * orthogonal to both other built-ins — rendezvous has no zone
+ * preference at all, and sticky's minimal-migration guarantee is a
+ * different axis (a future sticky+zone combination would be a fourth
+ * strategy, not a change to this one).
+ */
+export function zoneAwareAssignment(
+  partitions: number,
+  members: string[],
+  options: ZoneAwareAssignorOptions,
+): Map<number, string> {
+  const assignment = new Map<number, string>();
+  if (partitions <= 0 || members.length === 0) return assignment;
+  const { declared, listedZones } = normalizeZoneAwareOptions(options);
+  // Group the live roster by zone; undeclared members share the pool.
+  const byZone = new Map<string, string[]>();
+  for (const m of members) {
+    const key = declared.get(m) ?? UNZONED_ZONE;
+    const list = byZone.get(key);
+    if (list === undefined) byZone.set(key, [m]);
+    else list.push(m);
+  }
+  // Ranking universe: listed zones, every live member's zone, and the
+  // unzoned pool when it has members. Zones with no live member are
+  // ranked but skipped at pick time (the fallback).
+  const universe = new Set<string>(listedZones);
+  for (const zone of declared.values()) universe.add(zone);
+  if (byZone.has(UNZONED_ZONE)) universe.add(UNZONED_ZONE);
+  for (let p = 0; p < partitions; p++) {
+    const ranked = [...universe].sort((a, b) => {
+      const sa = zoneScore(p, a);
+      const sb = zoneScore(p, b);
+      if (sa !== sb) return sa > sb ? -1 : 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    for (const zone of ranked) {
+      const candidates = byZone.get(zone);
+      if (candidates === undefined || candidates.length === 0) continue;
+      let best: string | undefined;
+      let bestScore = -1n;
+      for (const m of candidates) {
+        const score = rendezvousScore(p, m);
+        if (score > bestScore) {
+          bestScore = score;
+          best = m;
+        }
+      }
+      if (best !== undefined) assignment.set(p, best);
+      break;
+    }
+  }
+  return assignment;
+}
+
+/**
+ * The zone-aware built-in as a `PartitionAssignor` (EB-223), named
+ * `'zone-aware'`. Options are validated eagerly, so a bad zone map
+ * fails at construction — not at the first rebalance. Pass the result
+ * as `GroupSubscribeOptions.assignor`; the group's first member fixes
+ * it like any other assignor.
+ */
+export function createZoneAwarePartitionAssignor(
+  options: ZoneAwareAssignorOptions,
+): PartitionAssignor {
+  normalizeZoneAwareOptions(options);
+  return {
+    name: 'zone-aware',
+    assign(partitions: number, members: string[]): Map<number, string> {
+      return zoneAwareAssignment(partitions, members, options);
+    },
+  };
+}
+
+/** Resolves one of the built-in strategy names to its assignor. */
 export function resolveBuiltinPartitionAssignor(
   name: 'rendezvous' | 'sticky',
+): PartitionAssignor;
+export function resolveBuiltinPartitionAssignor(
+  name: 'zone-aware',
+  options: ZoneAwareAssignorOptions,
+): PartitionAssignor;
+export function resolveBuiltinPartitionAssignor(
+  name: 'rendezvous' | 'sticky' | 'zone-aware',
+  options?: ZoneAwareAssignorOptions,
 ): PartitionAssignor {
-  return name === 'sticky' ? stickyPartitionAssignor : rendezvousPartitionAssignor;
+  if (name === 'sticky') return stickyPartitionAssignor;
+  if (name === 'zone-aware') {
+    if (options === undefined) {
+      throw new RangeError(
+        `resolveBuiltinPartitionAssignor: 'zone-aware' requires zone declarations — pass { memberZones } as the second argument (or use createZoneAwarePartitionAssignor)`,
+      );
+    }
+    return createZoneAwarePartitionAssignor(options);
+  }
+  return rendezvousPartitionAssignor;
 }
 
 /**

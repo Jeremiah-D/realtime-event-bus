@@ -4944,6 +4944,37 @@ semantics, so the existing string options are unchanged:
 assignor's own `name` — a contradictory pair throws `RangeError` at
 registration.
 
+A third built-in keeps traffic inside its availability zone (EB-223,
+`createZoneAwarePartitionAssignor` in `src/assignor.ts`):
+
+```ts
+import { createZoneAwarePartitionAssignor } from './src/assignor.ts';
+
+bus.subscribeToGroup('g', 'orders.*', handler, {
+  partitions: 12,
+  // Members declare their zone up front; the map may cover members
+  // that have not joined yet.
+  assignor: createZoneAwarePartitionAssignor({
+    memberZones: { 'm-a': 'zone-a', 'm-b': 'zone-b', 'm-c': 'zone-a' },
+    zones: ['zone-a', 'zone-b'], // optional full zone list
+  }),
+});
+```
+
+Per partition it ranks zones by rendezvous hashing, then takes the
+highest-ranked zone that still has a live member and picks that zone's
+rendezvous winner — so a zone that empties out falls back to the next
+zone instead of stranding partitions, and partitions stay in-zone
+whenever their zone has members. Members with no zone declaration form
+one implicit pool that ranks like any other zone; when every member is
+unzoned the result is byte-identical to `'rendezvous'`. It is
+orthogonal to both other built-ins (rendezvous has no zone preference,
+sticky's minimal-migration guarantee is a different axis). Unlike the
+other two it cannot be selected by the `assignment` string alone: zone
+declarations are operator data, so the factory's assignor is passed
+through the `assignor` field (or resolved by name with its options via
+`resolveBuiltinPartitionAssignor('zone-aware', options)`).
+
 Semantics notes:
 
 - `assign(partitions, members, previous)` must be pure and deterministic;
