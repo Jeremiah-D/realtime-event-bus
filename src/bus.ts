@@ -3735,6 +3735,27 @@ export interface DeadLetterOptions {
    * the poisoning. Only fires when `autoReplay` is enabled.
    */
   onPoisoned?: (event: PoisonedMessageEvent) => void;
+  /**
+   * Opt-in dead-letter replay approval (EB-233): when true, an operator's
+   * `replayDeadLetter` does not requeue the message directly — the entry
+   * moves to a bounded pending-approval queue instead, and only
+   * `approveDeadLetterReplay(subId, seq)` requeues it. `rejectDeadLetterReplay`
+   * returns the entry to the DLQ, still dead-lettered, and audits
+   * `dead_letter_replay_rejected`. The automatic EB-134 auto-replay is
+   * system-initiated, not an operator replay, so it bypasses approval.
+   * Disabled by default (backward compatible): replays go straight to
+   * the queue exactly as before.
+   */
+  requireApproval?: boolean;
+  /**
+   * Maximum entries in the pending-approval queue (EB-233). When the
+   * queue is full, a new replay request is refused: the entry stays in
+   * the DLQ, `replayDeadLetter` returns false, and
+   * `dead_letter_replay_rejected` is audited with reason
+   * `'approval_queue_full'`. Defaults to 100. Must be a positive
+   * integer. Only meaningful with `requireApproval`.
+   */
+  maxPending?: number;
 }
 
 /**
@@ -3843,6 +3864,21 @@ export interface DeadLetterEntry {
    * replays. Always false when auto-replay is disabled.
    */
   poisoned: boolean;
+}
+
+/**
+ * Per-subscriber dead-letter snapshot (EB-233): how many entries sit in
+ * the DLQ and how many replay requests await operator approval.
+ */
+export interface DeadLetterStats {
+  /** Entries currently in the subscriber's DLQ. */
+  entries: number;
+  /** Replay requests parked in the pending-approval queue. */
+  pendingApprovals: number;
+  /** Whether this subscriber's replays need approval. */
+  requireApproval: boolean;
+  /** Bound for the pending-approval queue. */
+  maxPending: number;
 }
 
 /** Snapshot delivered to `DeadLetterOptions.onDeadLetter`. */
@@ -8590,6 +8626,20 @@ interface SubscriberDeadLetter {
    * over to the new DLQ entry instead of resetting.
    */
   autoReplayAttemptsInFlight: Map<BusMessage, number>;
+  /**
+   * Whether operator replays need approval (EB-233), resolved from
+   * `DeadLetterOptions.requireApproval`. False by default.
+   */
+  requireApproval: boolean;
+  /** Bound for the pending-approval queue (EB-233). Defaults to 100. */
+  maxPending: number;
+  /**
+   * Entries awaiting operator approval (EB-233), by DLQ seq, in
+   * request order. An entry here is neither in the DLQ nor queued for
+   * delivery: only `approveDeadLetterReplay` requeues it, and only
+   * `rejectDeadLetterReplay` returns it to the DLQ.
+   */
+  pendingApprovals: Map<number, DeadLetterEntry & { msg: BusMessage }>;
 }
 
 /**
@@ -9127,7 +9177,7 @@ function thrownErrorMessage(err: unknown): string {
 function normalizeDeadLetterOptions(
   opt: boolean | DeadLetterOptions | undefined,
   caller: string,
-): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned'> & { retryLadder?: number[] }) | null {
+): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError(`${caller}: deadLetter must be true or a DeadLetterOptions object`);
@@ -9183,6 +9233,16 @@ function normalizeDeadLetterOptions(
   if (o.onPoisoned !== undefined && typeof o.onPoisoned !== 'function') {
     throw new TypeError(`${caller}: deadLetter.onPoisoned must be a function`);
   }
+  // EB-233: replay-approval gate. Invalid values throw before anything
+  // is mutated, matching the other validations above.
+  const requireApproval = o.requireApproval ?? false;
+  if (typeof requireApproval !== 'boolean') {
+    throw new TypeError(`${caller}: deadLetter.requireApproval must be a boolean`);
+  }
+  const maxPending = o.maxPending ?? 100;
+  if (!Number.isInteger(maxPending) || maxPending <= 0) {
+    throw new RangeError(`${caller}: deadLetter.maxPending must be a positive integer`);
+  }
   return {
     maxRedeliveries,
     maxEntries,
@@ -9191,6 +9251,8 @@ function normalizeDeadLetterOptions(
     diagnosticTopic,
     autoReplay,
     onPoisoned: o.onPoisoned,
+    requireApproval,
+    maxPending,
     // EB-155: validate the pre-DLQ retry ladder. Invalid rungs throw here,
     // before anything is mutated or subscribed — a rejected option never
     // leaves a half-registered subscription behind.
@@ -23096,6 +23158,9 @@ export class EventBus {
             }
             dlq.pendingAutoReplays.clear();
             dlq.autoReplayAttemptsInFlight.clear();
+            // EB-233: pending replay approvals must not outlive the
+            // subscriber — an approval for a gone subscriber is dropped.
+            dlq.pendingApprovals.clear();
             // EB-155: pending retry-ladder rungs must not outlive the
             // subscriber either — a retry for a gone subscriber has no
             // one to deliver to.
@@ -24693,6 +24758,8 @@ export class EventBus {
         // EB-134: auto-replay bookkeeping starts empty per subscriber.
         pendingAutoReplays: new Map(),
         autoReplayAttemptsInFlight: new Map(),
+        // EB-233: replay-approval queue starts empty per subscriber.
+        pendingApprovals: new Map(),
       };
     }
     // Tracks one delivery, wrapping the handle so the ack-latency tracker
@@ -42315,6 +42382,14 @@ export class EventBus {
       dlq.autoReplayAttemptsInFlight.delete(record.msg);
       expired += 1;
     }
+    // EB-233: pending approvals age out on the same clock — an entry
+    // that expired while awaiting approval is dropped, never approved
+    // into a resurrection.
+    for (const [seq, record] of [...dlq.pendingApprovals.entries()]) {
+      if (record.deadLetteredAt + maxAgeMs > nowMs) continue;
+      dlq.pendingApprovals.delete(seq);
+      expired += 1;
+    }
     if (expired > 0) this.totalDlqExpired += expired;
     return expired;
   }
@@ -42376,6 +42451,15 @@ export class EventBus {
    * EB-145: with `maxAgeMs` configured, an expired entry is not
    * resurrected — the lazy sweep drops it first (counted in
    * `BusStats.dlqExpiredMessages`) and the call returns false.
+   *
+   * EB-233: with `requireApproval` configured, a replay does NOT
+   * requeue directly — the entry moves to the pending-approval queue
+   * and this call returns true to mean "request accepted for approval"
+   * (not "delivered"); only `approveDeadLetterReplay` requeues it.
+   * When the approval queue is full the entry stays in the DLQ, the
+   * call returns false, and `dead_letter_replay_rejected` is audited
+   * with reason `'approval_queue_full'`. An already-pending entry is
+   * not in the DLQ anymore, so a second request for it returns false.
    */
   replayDeadLetter(subId: string, seq: number): boolean {
     const subscriber = this.subscribers.get(subId);
@@ -42388,11 +42472,41 @@ export class EventBus {
     const [record] = dlq.entries.splice(idx, 1);
     // EB-134: a manual replay supersedes any pending auto-replay for
     // the same entry — cancel the timer so the message is not replayed
-    // twice.
+    // twice. Under EB-233 approval the timer stays cancelled while the
+    // request waits: approval requeues explicitly, rejection leaves the
+    // entry dead-lettered, and neither path resurrects it automatically.
     const pendingTimer = dlq.pendingAutoReplays.get(seq);
     if (pendingTimer !== undefined) {
       clearTimeout(pendingTimer);
       dlq.pendingAutoReplays.delete(seq);
+    }
+    if (dlq.requireApproval) {
+      if (dlq.pendingApprovals.size >= dlq.maxPending) {
+        // Queue full: refuse the request, entry back in the DLQ in
+        // arrival order (seq order), audited as a rejection.
+        const at = dlq.entries.findIndex((e) => e.seq > record.seq);
+        if (at === -1) dlq.entries.push(record);
+        else dlq.entries.splice(at, 0, record);
+        this.auditSubscription({
+          action: 'dead_letter_replay_rejected',
+          actor: 'operator',
+          subId: subscriber.id,
+          pattern: subscriber.pattern,
+          topic: record.topic,
+          detail: { seq, reason: 'approval_queue_full' },
+        });
+        return false;
+      }
+      dlq.pendingApprovals.set(seq, record);
+      this.auditSubscription({
+        action: 'dead_letter_replay_requested',
+        actor: 'operator',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        topic: record.topic,
+        detail: { seq },
+      });
+      return true;
     }
     dlq.autoReplayAttemptsInFlight.delete(record.msg);
     // Fresh retry budget: the operator's replay is a new chance, not a
@@ -42404,6 +42518,118 @@ export class EventBus {
     this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg), true);
     this.scheduleFlush();
     return true;
+  }
+
+  /**
+   * Approves a pending dead-letter replay request (EB-233): requeues
+   * the entry exactly as a direct `replayDeadLetter` would — same
+   * per-message semantics (original per-topic `seq`, original TTL
+   * deadline, fresh redelivery budget, dedup bypassed). Audited as
+   * `dead_letter_replay_approved`.
+   *
+   * Returns true when a pending request with that `seq` was approved
+   * and requeued, false when the subscriber has no DLQ, no pending
+   * request with that `seq`, or the request aged out of its `maxAgeMs`
+   * TTL (the lazy sweep drops it first). Throws on an unknown
+   * subscriber id. On a subscriber without `requireApproval` there is
+   * never a pending request, so this always returns false — approval
+   * is not a second replay path for direct replays.
+   */
+  approveDeadLetterReplay(subId: string, seq: number): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) return false;
+    this.sweepExpiredDlqEntries(dlq);
+    const record = dlq.pendingApprovals.get(seq);
+    if (record === undefined) return false;
+    dlq.pendingApprovals.delete(seq);
+    dlq.autoReplayAttemptsInFlight.delete(record.msg);
+    subscriber.reliable?.redeliveries.delete(record.msg);
+    subscriber.reliable?.lastFailure.delete(record.msg);
+    this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg), true);
+    this.scheduleFlush();
+    this.auditSubscription({
+      action: 'dead_letter_replay_approved',
+      actor: 'operator',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      topic: record.topic,
+      detail: { seq },
+    });
+    return true;
+  }
+
+  /**
+   * Rejects a pending dead-letter replay request (EB-233): the entry
+   * returns to the DLQ in arrival (seq) order, still dead-lettered —
+   * rejection never drops the message and never requeues it — and
+   * `dead_letter_replay_rejected` is audited with reason
+   * `'operator_rejected'`. A later `replayDeadLetter` may request
+   * approval for it again.
+   *
+   * Returns true when a pending request with that `seq` was rejected,
+   * false otherwise. Throws on an unknown subscriber id.
+   */
+  rejectDeadLetterReplay(subId: string, seq: number): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) return false;
+    this.sweepExpiredDlqEntries(dlq);
+    const record = dlq.pendingApprovals.get(seq);
+    if (record === undefined) return false;
+    dlq.pendingApprovals.delete(seq);
+    const at = dlq.entries.findIndex((e) => e.seq > record.seq);
+    if (at === -1) dlq.entries.push(record);
+    else dlq.entries.splice(at, 0, record);
+    this.auditSubscription({
+      action: 'dead_letter_replay_rejected',
+      actor: 'operator',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      topic: record.topic,
+      detail: { seq, reason: 'operator_rejected' },
+    });
+    return true;
+  }
+
+  /**
+   * The replay requests currently awaiting operator approval for a
+   * subscriber (EB-233), in request order, as snapshots — mutating
+   * them does not affect the bus. Empty when the subscriber has no DLQ
+   * or nothing is pending. Throws on an unknown subscriber id. Entries
+   * past their `maxAgeMs` TTL are lazily dropped first (see
+   * `getDeadLetterMessages`).
+   */
+  getPendingDeadLetterReplays(subId: string): DeadLetterEntry[] {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) return [];
+    this.sweepExpiredDlqEntries(dlq);
+    return [...dlq.pendingApprovals.values()].map(({ msg: _msg, ...entry }) => ({ ...entry }));
+  }
+
+  /**
+   * Per-subscriber dead-letter counts (EB-233): DLQ entries plus
+   * pending replay approvals. Throws on an unknown subscriber id. A
+   * subscriber without a DLQ reports all zeros.
+   */
+  getDeadLetterStats(subId: string): DeadLetterStats {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) {
+      return { entries: 0, pendingApprovals: 0, requireApproval: false, maxPending: 100 };
+    }
+    this.sweepExpiredDlqEntries(dlq);
+    return {
+      entries: dlq.entries.length,
+      pendingApprovals: dlq.pendingApprovals.size,
+      requireApproval: dlq.requireApproval,
+      maxPending: dlq.maxPending,
+    };
   }
 
   /**

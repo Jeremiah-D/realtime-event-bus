@@ -91,6 +91,9 @@ export type SubscriptionAuditAction =
   | 'subscriber_seek'
   | 'subscriber_quarantined'
   | 'subscriber_quarantine_resumed'
+  | 'dead_letter_replay_requested'
+  | 'dead_letter_replay_approved'
+  | 'dead_letter_replay_rejected'
   | 'delivery_sample_rate_updated'
   | 'header_filter_updated'
   | 'subscriber_labels_updated'
@@ -323,6 +326,9 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'auto_remediate_linger_pruned',
   'auto_remediate_rebalance',
   'auto_remediate_run',
+  'dead_letter_replay_requested',
+  'dead_letter_replay_approved',
+  'dead_letter_replay_rejected',
 ]);
 
 function isAuditAction(value: unknown): value is SubscriptionAuditAction {

@@ -6520,6 +6520,37 @@ combined with a shadow subscription. `getStats().keyRangeSubscribers`
 counts live key-range subscriptions. (Real-time systems: key-range
 subscription.)
 
+## Dead-letter replay approval (EB-233)
+
+`replayDeadLetter` used to redeliver immediately: any operator
+(or any code path) that could call it could push a poison
+message straight back into the live stream, with no second
+pair of eyes. `DeadLetterOptions.requireApproval` closes it:
+with the opt-in on, a replay first parks the entry in a
+bounded pending-approval queue (`maxPending`, default 100)
+and returns `true` meaning "request accepted", not
+"delivered" — the message stays dead-lettered until an
+operator calls `approveDeadLetterReplay(subId, seq)`, which
+requeues it with a fresh redelivery budget and the usual
+dedup bypass. `rejectDeadLetterReplay` sends the entry
+back to the DLQ, still dead-lettered, never dropped and
+never requeued; a later replay may request approval again.
+`getPendingDeadLetterReplays` lists the queue in request
+order, and `getDeadLetterStats` gains `pendingApprovals`.
+All three transitions audit (`dead_letter_replay_requested`
+/ `_approved` / `_rejected`, the last with `reason`:
+`operator_rejected` or `approval_queue_full`).
+
+- Default off, so every existing replay behaves exactly as
+  before; a full approval queue refuses the new request
+  (entry stays in the DLQ) rather than evicting an older
+  one. Pending requests age out with the DLQ entry's
+  `maxAgeMs` expiry and can no longer be approved, and
+  unsubscribe drops them with the subscriber. System
+  auto-replay (EB-134) bypasses approval — it is not an
+  operator replay. (Backend engineering: dead-letter
+  governance.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into
