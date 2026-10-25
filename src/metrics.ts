@@ -450,6 +450,11 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
     stats.publisherRateLimited,
   );
   counter(
+    'eventbus_key_rate_limited_messages_total',
+    'Total messages shed by per-key publish-side rate limiting (EB-234): shed in the admission phase, so no sequence number is consumed and no per-topic rate-limit token is burned.',
+    stats.keyRateLimited ?? 0,
+  );
+  counter(
     'eventbus_global_rate_limited_messages_total',
     'Total messages shed by the bus-level global publish rate limit (EB-180): shed in the admission phase after every per-topic gate, so no sequence number is consumed and no per-topic rate-limit token is burned.',
     stats.globalRateLimitedMessages ?? 0,

@@ -58,6 +58,7 @@
 export type AdmissionGate =
   | 'webhook'
   | 'publisher-rate-limit'
+  | 'key-rate-limit'
   | 'acl'
   | 'schema'
   | 'size'
@@ -262,6 +263,7 @@ export class AdmissionLatencyTracker {
     const gates: AdmissionGate[] = [
       'webhook',
       'publisher-rate-limit',
+      'key-rate-limit',
       'acl',
       'schema',
       'size',

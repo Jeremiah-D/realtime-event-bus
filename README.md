@@ -1013,6 +1013,31 @@ library.
   `clearPublisherRateLimit` removes a rule (unknown id is a no-op returning
   `false`). Invalid publisher identities and invalid rate values throw
   `RangeError`.
+- **Per-key publish rate limiting** (in `src/bus.ts`, via
+  `setKeyRateLimit(pattern, { messagesPerSec, burst })`): a token bucket
+  per (topic, key) (refilled from the bus clock, so tests stay
+  deterministic) caps how many messages per second one key may publish —
+  so one hot key (one hot user, device, or order book) cannot starve the
+  other keys on the same topic. Only keyed publishes (`PublishOptions.key`)
+  are subject to the gate; unkeyed messages pass through untouched. The
+  first `burst` messages (default: one second of budget) publish instantly.
+  A publish that finds its key's bucket empty is shed in the admission
+  phase, as the last pre-admission gate (after the global rate limit, so
+  only publishes that would otherwise be admitted consume key budget):
+  it consumes no sequence number (subscribers see no gap), is never fanned
+  out, never written to the durable log, never queued, and burns no
+  per-topic rate-limit token, so a key shed and a topic shed can never
+  double-count one publish; `publish` returns 0 for it. The shed is counted
+  in `TopicStats.keyRateLimited` (and the global total, also rendered as
+  `eventbus_key_rate_limited_messages_total`) and surfaces on
+  `onAdmissionRejected` with reason `'key-rate-limit'`. `publishBatch`
+  sheds over-budget entries one by one; `publishAtomic` checks the batch
+  in shadow admission and consumes the reserved tokens at commit;
+  `publishDelayed` fails fast at schedule time. Rule matching mirrors
+  `setTopicTtl`: an exact-topic rule wins over patterns, the
+  earliest-registered matching pattern wins, and re-setting a rule resets
+  every key budget. `clearKeyRateLimit` removes a rule. Invalid
+  configurations throw `RangeError`.
 - **Bus-level global publish rate limiting** (in `src/global-rate-limit.ts`,
   via `EventBusOptions.globalPublishRateLimit: { messagesPerSecond, burst? }`):
   one token bucket shared by every publish on the bus — the backstop under the

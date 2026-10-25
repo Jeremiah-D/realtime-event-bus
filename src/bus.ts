@@ -5459,6 +5459,17 @@ export interface TopicStats {
    */
   publisherRateLimited: number;
   /**
+   * Messages on this topic shed by per-key publish-side rate limiting
+   * (see `setKeyRateLimit`, EB-234): the per-(topic, key) token bucket
+   * was empty when the keyed message was published, so it was never
+   * fanned out to any subscriber. The shed happens in the admission
+   * phase — before sequence-number assignment — so like a
+   * per-publisher shed it consumes no sequence number and subscribers
+   * see no gap, and it burns no per-topic rate-limit token. Unkeyed
+   * messages are never subject to this gate.
+   */
+  keyRateLimited: number;
+  /**
    * Messages on this topic shed by publish-side adaptive sampling (see
    * `EventBus.setTopicSampleRate`, EB-38): the topic's sampling rule won
    * the random draw and the publish was not marked critical, so it was
@@ -6115,6 +6126,12 @@ export interface BusStats {
    * `TopicStats.publisherRateLimited` for the exact counting rules.
    */
   publisherRateLimited: number;
+  /**
+   * Total messages shed by per-key publish-side rate limiting — the sum
+   * of every topic's `keyRateLimited`. See `TopicStats.keyRateLimited`
+   * for the exact counting rules.
+   */
+  keyRateLimited: number;
   /**
    * Total messages shed by publish-side adaptive sampling — the sum of
    * every topic's `sampledMessages`. See `TopicStats.sampledMessages` for
@@ -8753,6 +8770,7 @@ function zeroedTopicStats(): {
   sequenceGaps: number;
   rateLimitedMessages: number;
   publisherRateLimited: number;
+  keyRateLimited: number;
   sampledMessages: number;
   pausedMessages: number;
   circuitBrokenMessages: number;
@@ -8799,6 +8817,7 @@ function zeroedTopicStats(): {
     sequenceGaps: 0,
     rateLimitedMessages: 0,
     publisherRateLimited: 0,
+    keyRateLimited: 0,
     sampledMessages: 0,
     pausedMessages: 0,
     circuitBrokenMessages: 0,
@@ -10776,7 +10795,9 @@ interface SchemaVersionRegistration {
  * per-message size cap (`'message-too-big'`), its payload exceeded the
  * topic's payload-size cap (`'payload-too-large'`), or the topic's
  * rate-limit
- * bucket had no token left for it (`'rate-limit'`). TTL expiry is
+ * bucket had no token left for it (`'rate-limit'`), or the
+ * (topic, key) bucket had no token left for it (`'key-rate-limit'`,
+ * EB-234). TTL expiry is
  * drain-time and never rejects a publish, so it cannot appear here.
  */
 export type AtomicRejectReason =
@@ -10786,6 +10807,7 @@ export type AtomicRejectReason =
   | 'payload-too-large'
   | 'rate-limit'
   | 'publisher-rate-limit'
+  | 'key-rate-limit'
   | 'alias-retired'
   | 'topic-paused'
   | 'idempotency-conflict'
@@ -10811,6 +10833,10 @@ export type AtomicRejectReason =
  *   name never appears as a `failedGate` in practice
  * - `'topic-pause'`: topic pause (EB-88), reason `'topic-paused'`
  * - `'publisher-rate-limit'`: per-publisher rate limiting (EB-79)
+ * - `'key-rate-limit'`: per-key publish rate limiting (EB-234),
+ *   reason `'key-rate-limit'` — runs after the global rate-limit gate
+ *   in the live path and after the topic rate-limit gate in the shadow
+ *   walk, so a key shed never burns a topic rate-limit token
  * - `'acl'`: broker-level ACL (EB-41)
  * - `'schema'`: schema validation incl. versioned schemas (EB-20/EB-86)
  * - `'max-message-bytes'`: per-message size cap (EB-64), reason
@@ -10833,6 +10859,7 @@ export type PreviewGateName =
   | 'partition-routing'
   | 'topic-pause'
   | 'publisher-rate-limit'
+  | 'key-rate-limit'
   | 'acl'
   | 'schema'
   | 'max-message-bytes'
@@ -11146,6 +11173,11 @@ interface PauseBufferEntry {
  *   `BusStats.publisherRateLimited` (per-publisher token bucket empty,
  *   EB-79; shed in the admission phase — no sequence number consumed, so
  *   unlike a `'rate-limit'` shed it is invisible to gap detection)
+ * - `'key-rate-limit'` → `TopicStats.keyRateLimited` /
+ *   `BusStats.keyRateLimited` (per-(topic, key) token bucket empty,
+ *   EB-234; shed in the admission phase — no sequence number consumed,
+ *   so like a `'publisher-rate-limit'` shed it is invisible to gap
+ *   detection, and it burns no per-topic rate-limit token)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
  * - `'cas-mismatch'` → `TopicStats.casMismatches` /
@@ -11225,6 +11257,7 @@ export type AdmissionRejectReason =
   | 'payload-too-large'
   | 'rate-limit'
   | 'publisher-rate-limit'
+  | 'key-rate-limit'
   | 'duplicate'
   | 'cas-mismatch'
   | 'alias-retired'
@@ -14127,6 +14160,7 @@ export class EventBus {
       sequenceGaps: number;
       rateLimitedMessages: number;
       publisherRateLimited: number;
+      keyRateLimited: number;
       pausedMessages: number;
       circuitBrokenMessages: number;
       rejectedMessages: number;
@@ -14752,6 +14786,33 @@ export class EventBus {
    * sequence number and subscribers see no gap.
    */
   private totalPublisherRateLimited = 0;
+  /**
+   * Per-key publish rate limits (EB-234), keyed by the exact string
+   * passed to `setKeyRateLimit` — either a concrete topic name or a
+   * wildcard pattern. Match resolution is identical to the per-topic
+   * rate-limit rules: an exact-topic rule wins over any pattern;
+   * between patterns the earliest-registered rule wins.
+   */
+  private keyRateLimitRules = new Map<string, { messagesPerSec: number; burst: number }>();
+  /**
+   * Compiled matchers for the wildcard entries in `keyRateLimitRules`,
+   * kept apart from the subscriber pattern cache and the other rule
+   * caches so key-rate-limit configuration never inflates
+   * `patternCacheSize`.
+   */
+  private keyRateLimitMatcherCache = new Map<string, RegExp>();
+  /**
+   * Token buckets per (concrete topic, key), nested so a topic or key
+   * containing a separator byte can never collide with another pair.
+   * Created lazily on the first keyed publish that falls under a rule
+   * and refilled from the injected clock (`EventBusOptions.now`), so
+   * key rate limiting is deterministic in tests. Setting or clearing
+   * any rule drops every bucket (the EB-19 precedent): a changed rule
+   * starts from a fresh budget rather than inheriting a half-spent one.
+   */
+  private keyRateLimitBuckets = new Map<string, Map<string, TokenBucket>>();
+  /** Messages shed by per-key publish-side rate limiting (global total). */
+  private totalKeyRateLimited = 0;
   /**
    * Active topic-pause rules (EB-88), keyed by the exact string passed to
    * `pauseTopic` — either a concrete topic name or a wildcard pattern.
@@ -18612,6 +18673,71 @@ export class EventBus {
   }
 
   /**
+   * Caps how many messages per second may be published for one key on
+   * topics matching `topicPattern` (EB-234, real-time systems / backend
+   * engineering): a per-(topic, key) token bucket at the publish side,
+   * so one hot key (one hot user, device, or order book) cannot starve
+   * the other keys on the same topic. `topicPattern` accepts the same
+   * wildcard syntax as `subscribe` (or an exact topic name). The first
+   * `burst` keyed messages publish instantly; afterwards the bucket
+   * refills at `messagesPerSec` per second, independently per key.
+   *
+   * Only keyed publishes (`PublishOptions.key`) are subject to the
+   * gate — unkeyed messages pass through untouched, as do keyed
+   * messages on topics with no matching rule. A publish that finds its
+   * key's bucket empty is shed in the admission phase, after the global
+   * rate-limit gate and before sequence-number assignment: it is never
+   * fanned out, never written to the durable log, never queued, consumes
+   * no sequence number (subscribers see no gap), and burns no per-topic
+   * rate-limit token; `publish` returns 0 for it. The shed is counted
+   * in `TopicStats.keyRateLimited` (and the global total) and surfaced
+   * on the admission-rejection hook with reason `'key-rate-limit'`.
+   * Re-setting a rule replaces it and resets every key budget (the
+   * EB-19 precedent). Throws when `topicPattern` is empty, when `opts`
+   * is not an object, when `messagesPerSec` is not a positive finite
+   * number, or when `burst` is not a positive finite number.
+   *
+   * Pipeline position, and why it is last: the gate runs after every
+   * other admission gate (including the global rate limit), so only
+   * publishes that would otherwise be admitted consume key budget, and
+   * a key shed never burns a topic rate-limit token — the two counters
+   * can never double-count the same publish. `publishBatch` sheds
+   * over-budget entries one by one while the rest still publish;
+   * `publishDelayed` fails fast at schedule time (the token is spent
+   * then, so the pre-admitted due-time fan-out neither re-checks nor
+   * burns budget again); `publishAtomic` checks the batch in shadow
+   * admission and consumes the reserved tokens at commit, mirroring
+   * the global rate limit (EB-180).
+   */
+  setKeyRateLimit(topicPattern: string, opts: { messagesPerSec: number; burst?: number }): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (typeof opts !== 'object' || opts === null || Array.isArray(opts)) {
+      throw new RangeError('setKeyRateLimit: opts must be an object with messagesPerSec');
+    }
+    if (!Number.isFinite(opts.messagesPerSec) || opts.messagesPerSec <= 0) {
+      throw new RangeError('setKeyRateLimit: messagesPerSec must be a positive finite number of messages per second');
+    }
+    const burst = opts.burst ?? Math.max(1, Math.ceil(opts.messagesPerSec));
+    if (!Number.isFinite(burst) || burst <= 0) {
+      throw new RangeError('setKeyRateLimit: burst must be a positive finite number of messages');
+    }
+    this.keyRateLimitRules.set(topicPattern, { messagesPerSec: opts.messagesPerSec, burst });
+    this.keyRateLimitBuckets.clear();
+  }
+
+  /**
+   * Removes the key-rate-limit rule previously registered for
+   * `topicPattern`. Returns true when a rule existed and was removed.
+   */
+  clearKeyRateLimit(topicPattern: string): boolean {
+    const removed = this.keyRateLimitRules.delete(topicPattern);
+    if (removed) this.keyRateLimitBuckets.clear();
+    return removed;
+  }
+
+  /**
    * Sets the allowed lateness in milliseconds for event-time watermark
    * tracking (EB-59) on one topic or topic pattern. `topicPattern`
    * accepts the same wildcard syntax as `subscribe` (or an exact topic
@@ -19871,6 +19997,26 @@ export class EventBus {
       if (matcher == null) {
         matcher = compilePattern(pattern);
         this.rateLimitMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return limit;
+    }
+    return undefined;
+  }
+
+  /**
+   * Returns the key rate limit that applies to `topic`, or `undefined`
+   * when no rule matches. Same precedence as `rateLimitForTopic`:
+   * exact-topic rules win over patterns, earliest-registered matching
+   * pattern wins.
+   */
+  private keyRateLimitForTopic(topic: string): { messagesPerSec: number; burst: number } | undefined {
+    const exact = this.keyRateLimitRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, limit] of this.keyRateLimitRules) {
+      let matcher = this.keyRateLimitMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.keyRateLimitMatcherCache.set(pattern, matcher);
       }
       if (matcher.test(topic)) return limit;
     }
@@ -22273,6 +22419,7 @@ export class EventBus {
         sequenceGaps: 0,
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
+        keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
         rejectedMessages: 0,
@@ -30577,6 +30724,8 @@ export class EventBus {
       opts?.schemaVersion,
       new Map<TenantQuotaRule, { messages: number; bytes: number }>(),
       { reserved: 0 },
+      opts?.key,
+      new Map<string, number>(),
     );
     if (verdict !== undefined) {
       return { admitted: false, reason: verdict.reason, failedGate: verdict.failedGate };
@@ -30897,6 +31046,11 @@ export class EventBus {
     // bucket minus the batch's own reservations, and the commit phase
     // consumes the reserved tokens.
     const globalShadowBudget = { reserved: 0 };
+    // Per-key publish rate-limit reservations for this batch (EB-234):
+    // keyed by (topic, key), so a batch cannot overdraft one key's
+    // bucket with its own entries; the commit phase consumes the
+    // reserved tokens.
+    const keyShadowBudget = new Map<string, number>();
     // Per-key sequence numbers are drawn in entry order (publish order)
     // against a shadow cursor: a rejected batch leaves the live cursors —
     // and every subscriber's key baseline — exactly untouched.
@@ -31014,6 +31168,8 @@ export class EventBus {
         entries[index].schemaVersion,
         quotaShadowBudget,
         globalShadowBudget,
+        entries[index].key,
+        keyShadowBudget,
       );
       if (shadowSpanStart !== undefined) {
         this.admissionLatency!.record(
@@ -31040,6 +31196,8 @@ export class EventBus {
         else if (reason === 'payload-too-large') this.countPayloadTooLarge(topic, payload, publisherId);
         else if (reason === 'publisher-rate-limit')
           this.countPublisherRateLimited(topic, payload, publisherId);
+        else if (reason === 'key-rate-limit')
+          this.countKeyRateLimited(topic, payload, publisherId);
         else if (reason === 'topic-paused') this.countTopicPaused(topic, payload, publisherId);
         else if (reason === 'tenant-quota') {
           // The shadow verdict matched the alias-resolved topic; count
@@ -31240,6 +31398,14 @@ export class EventBus {
         // synchronously back to back, so the reserved tokens are still
         // there — the take cannot fail.
         this.globalPublishRateLimiter?.tryTake();
+        // Per-key publish rate limiting (EB-234): the shadow
+        // admission verified the budget against the batch's
+        // reservations; the commit consumes the reserved tokens
+        // (pre-admitted `fanOut` skips the gate, so this is the only
+        // accounting point for atomic entries). The phase-1 loop and
+        // the commit loop run synchronously back to back, so the
+        // reserved tokens are still there — the take cannot fail.
+        this.takeKeyToken(resolvedTopics[index], key);
       }
       committed.push({ topic: resolvedTopics[index], seq: commitOutcome.seq ?? 0 });
     }
@@ -31358,6 +31524,8 @@ export class EventBus {
     schemaVersion: number | undefined,
     quotaShadow: Map<TenantQuotaRule, { messages: number; bytes: number }>,
     globalShadow: { reserved: number },
+    key?: string,
+    keyShadowBudget?: Map<string, number>,
   ): { reason: AtomicRejectReason; failedGate: PreviewGateName } | undefined {
     // Topic pause (EB-88) is the first shadow gate, mirroring `fanOut`:
     // any paused entry — shed or queue mode — rejects the whole batch. A
@@ -31430,8 +31598,9 @@ export class EventBus {
     // usage it verified here.
     if (this.checkTenantQuota(topic, payload, 'shadow', quotaShadow) !== undefined)
       return { reason: 'tenant-quota', failedGate: 'tenant-quota' };
-    // Bus-level global publish rate limit (EB-180): the last shadow
-    // gate, mirroring `fanOut` — after every per-topic gate, so only
+    // Bus-level global publish rate limit (EB-180): the shadow gate
+    // before the per-key gate, mirroring `fanOut` — after every
+    // per-topic gate, so only
     // publishes that would otherwise be admitted consume global budget.
     // The peek/reserve mirrors the live gate without mutating the
     // bucket: a rejected batch or a preview creates no global budget
@@ -31442,6 +31611,26 @@ export class EventBus {
       if (globalLimiter.availableTokens - globalShadow.reserved < 1)
         return { reason: 'global-rate-limit', failedGate: 'global-rate-limit' };
       globalShadow.reserved += 1;
+    }
+    // Per-key publish rate limiting (EB-234): the last shadow gate,
+    // after the topic rate-limit gate — a key shed never burns a topic
+    // token, mirroring the live path. The peek/reserve mirrors
+    // `takeKeyToken` without mutating the live bucket, keyed by
+    // (topic, key) so two keys on one topic never share a reservation;
+    // unkeyed entries and topics with no rule are skipped.
+    if (key !== undefined && keyShadowBudget !== undefined) {
+      const keyLimit = this.keyRateLimitForTopic(topic);
+      if (keyLimit !== undefined) {
+        let bucket = this.keyRateLimitBuckets.get(topic)?.get(key);
+        if (bucket === undefined) {
+          bucket = new TokenBucket(keyLimit.burst, keyLimit.messagesPerSec, this.now);
+        }
+        const bucketKey = `${topic}\0${key}`;
+        const reserved = keyShadowBudget.get(bucketKey) ?? 0;
+        if (bucket.availableTokens - reserved < 1)
+          return { reason: 'key-rate-limit', failedGate: 'key-rate-limit' };
+        keyShadowBudget.set(bucketKey, reserved + 1);
+      }
     }
     return undefined;
   }
@@ -31665,6 +31854,20 @@ export class EventBus {
       return undefined;
     }
     this.admissionGateRecord(topic, 'publisher-rate-limit', delayedRateLimitStart);
+    // Fail fast on the per-key rate limit (EB-234): an over-budget key
+    // never becomes a scheduled delivery — no id, nothing in the heap,
+    // nothing on disk. The token is spent at schedule time, so the
+    // due-time fan-out (pre-admitted) neither re-checks nor burns
+    // budget again. Counted the same way a `publish` key-rate-limit
+    // shed is, with reason `'key-rate-limit'`. Unkeyed schedules and
+    // topics with no rule are unaffected.
+    const delayedKeyRateLimitStart = this.admissionGateStart();
+    if (this.takeKeyToken(topic, opts.key) !== undefined) {
+      this.admissionGateRecord(topic, 'key-rate-limit', delayedKeyRateLimitStart);
+      this.countKeyRateLimited(topic, payload, publisherId);
+      return undefined;
+    }
+    this.admissionGateRecord(topic, 'key-rate-limit', delayedKeyRateLimitStart);
     // Fail fast on ACL: an unauthorized publish never becomes a scheduled
     // delivery — no id, nothing in the heap, nothing on disk. Counted the
     // same way a `publish` ACL denial is.
@@ -33843,6 +34046,52 @@ export class EventBus {
   }
 
   /**
+   * Takes one token from the (topic, key) rate-limit bucket (EB-234),
+   * creating the bucket lazily from the configured rule on first use —
+   * refilled from the injected clock (`EventBusOptions.now`), so the
+   * gate stays deterministic in tests. Returns `'key-rate-limit'` when
+   * the topic has a configured rule and the key's bucket was empty (no
+   * token taken), `undefined` when the publish may proceed — either a
+   * token was taken, the publish is unkeyed, or no rule matches the
+   * topic. This never counts and never fires the hook: the caller
+   * decides how to surface the shed, so the fail-fast `publishDelayed`
+   * path, the shadow admission, and the `fanOut` admission gate share
+   * the same budget semantics.
+   */
+  private takeKeyToken(topic: string, key: string | undefined): 'key-rate-limit' | undefined {
+    if (key === undefined) return undefined;
+    const limit = this.keyRateLimitForTopic(topic);
+    if (limit === undefined) return undefined;
+    let byKey = this.keyRateLimitBuckets.get(topic);
+    if (byKey === undefined) {
+      byKey = new Map<string, TokenBucket>();
+      this.keyRateLimitBuckets.set(topic, byKey);
+    }
+    let bucket = byKey.get(key);
+    if (bucket === undefined) {
+      bucket = new TokenBucket(limit.burst, limit.messagesPerSec, this.now);
+      byKey.set(key, bucket);
+    }
+    return bucket.take() ? undefined : 'key-rate-limit';
+  }
+
+  /**
+   * Counts one publish shed by per-key publish-side rate limiting
+   * (EB-234) against the topic and the global total, then fires the
+   * admission-rejection hook. The shed happens before admission: the
+   * payload never becomes a message — no sequence number is consumed
+   * (subscribers see no gap), the durable log never sees it, and it
+   * burns no topic rate-limit budget. The per-topic stats entry is
+   * created here when the topic has never published anything yet (see
+   * `countSchemaRejection`).
+   */
+  private countKeyRateLimited(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).keyRateLimited += 1;
+    this.totalKeyRateLimited += 1;
+    this.emitAdmissionRejected(topic, 'key-rate-limit', payload, publisherId);
+  }
+
+  /**
    * Counts one publish shed by publish-side adaptive sampling (EB-38)
    * against the topic and the global total, then fires the
    * admission-rejection hook. The shed happens in the admission phase —
@@ -35282,6 +35531,7 @@ export class EventBus {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
+      keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
       rejectedMessages: 0,
@@ -35429,6 +35679,7 @@ export class EventBus {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
+      keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
       rejectedMessages: 0,
@@ -35599,6 +35850,7 @@ export class EventBus {
         sequenceGaps: 0,
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
+        keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
         rejectedMessages: 0,
@@ -35753,6 +36005,7 @@ export class EventBus {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
+      keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
       rejectedMessages: 0,
@@ -39088,6 +39341,28 @@ export class EventBus {
         }
         this.admissionGateRecord(topic, 'global-rate-limit', globalRateLimitStart);
       }
+      // Per-key publish rate limiting (EB-234): the last
+      // pre-admission gate — after the global rate limit, so only
+      // publishes that would otherwise be admitted consume key budget,
+      // and before sequence-number assignment and the per-topic
+      // rate-limit budget below, so a key shed burns no topic token
+      // and the two counters never double-count one publish. Only
+      // keyed publishes are subject to it; unkeyed publishes pass
+      // through untouched. Skipped for pre-admitted re-fan-outs and
+      // admission-DLQ records, like the gates above (the delayed
+      // schedule-time gate and the atomic shadow admission cover those
+      // paths instead).
+      if (key !== undefined) {
+        const keyRateLimitStart = this.admissionGateStart();
+        if (this.takeKeyToken(topic, key) !== undefined) {
+          this.admissionGateRecord(topic, 'key-rate-limit', keyRateLimitStart);
+          this.countKeyRateLimited(topic, payload, publisherId);
+          auditPublish(false, undefined, 'key-rate-limit');
+          recordAdmissionSpan();
+          return { matched: 0, accepted: 0, admitted: false, rejectReason: 'key-rate-limit' };
+        }
+        this.admissionGateRecord(topic, 'key-rate-limit', keyRateLimitStart);
+      }
       // All gates passed: the admission decision is final here. The
       // total-span sample stops before sequence-number assignment, the
       // durable log and fan-out below.
@@ -41085,6 +41360,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
+      keyRateLimited: this.totalKeyRateLimited,
       sampledMessages: this.totalSampled,
       pausedMessages: this.totalPaused,
       circuitBrokenMessages: this.totalCircuitBroken,
@@ -41469,6 +41745,7 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         publisherRateLimited: stats.publisherRateLimited,
+        keyRateLimited: stats.keyRateLimited,
         sampledMessages: stats.sampledMessages,
         pausedMessages: stats.pausedMessages,
         circuitBrokenMessages: stats.circuitBrokenMessages,
