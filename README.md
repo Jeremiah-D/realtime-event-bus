@@ -5080,6 +5080,42 @@ orthogonal to the EB-112 lag SLO (the SLO alerts on lag, this
 places work by lag) and to sticky's minimal-migration guarantee.
 (Real-time systems: lag-aware partition placement.)
 
+A fifth built-in assigns by configured member weight (EB-235,
+`createWeightedPartitionAssignor` in `src/assignor.ts`):
+
+```ts
+import { createWeightedPartitionAssignor } from './src/assignor.ts';
+
+bus.subscribeToGroup('g', 'orders.*', handler, {
+  partitions: 12,
+  // 'm-a' takes twice the share of 'm-b'; 'm-c' has no entry and
+  // takes one unit share instead of starving.
+  assignor: createWeightedPartitionAssignor({
+    memberWeights: { 'm-a': 2, 'm-b': 1 },
+  }),
+});
+```
+
+Weights are normalized, so `{ a: 2, b: 1 }` and `{ a: 4, b: 2 }`
+assign identically, and a zero, negative, non-finite, or non-numeric
+weight throws `RangeError` at construction. Targets come from the
+largest-remainder method over the normalized shares, so every member
+lands within one partition of its exact proportional share and the
+targets always sum to the partition count; an empty map is the equal
+split, which makes weighted the generalization of sticky's balance
+rather than a rival to it. The assignment is deterministic with no
+jitter — a fresh assignment depends only on the weight set and the
+member set, not on roster order — and a weight-change rebalance is
+minimally migrating: like sticky it keeps every partition whose owner
+is still below its new target, so exactly the changed-share portion
+moves and a member whose target is unchanged keeps every partition.
+Like zone-aware and lag-aware it cannot be selected by the
+`assignment` string alone: weights are operator data, so the factory's
+assignor is passed through the `assignor` field (or resolved by name
+with its options via `resolveBuiltinPartitionAssignor('weighted',
+options)`).
+(Real-time systems: partition load balancing.)
+
 Semantics notes:
 
 - `assign(partitions, members, previous)` must be pure and deterministic;

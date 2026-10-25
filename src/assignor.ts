@@ -38,6 +38,12 @@
  * the `assignment` string alone either. It is otherwise a first-class
  * built-in with the same contract, resolvable by name with its
  * options via `resolveBuiltinPartitionAssignor('lag-aware', options)`.
+ * A fifth built-in, the weighted assignor (EB-235), is constructed
+ * with per-member weights — `createWeightedPartitionAssignor({
+ * memberWeights })` — because weights are operator data, not a bare
+ * string option either. It is otherwise a first-class built-in with
+ * the same contract, resolvable by name with its options via
+ * `resolveBuiltinPartitionAssignor('weighted', options)`.
  * An assignor should be pure and deterministic: same
  * `{ partitions, members, previous }` must yield the same assignment, so
  * every computation agrees without coordination. `previous` carries the
@@ -255,10 +261,10 @@ function zoneScore(partition: number, zone: string): bigint {
  * Like rendezvous, this assignor is stateless with respect to
  * `previous`: it is a pure function of the roster and the zone
  * topology, so every computation agrees without coordination. It is
- * orthogonal to both other built-ins — rendezvous has no zone
+ * orthogonal to the other built-ins — rendezvous has no zone
  * preference at all, and sticky's minimal-migration guarantee is a
- * different axis (a future sticky+zone combination would be a fourth
- * strategy, not a change to this one).
+ * different axis (a future sticky+zone combination would be a
+ * separate strategy, not a change to this one).
  */
 export function zoneAwareAssignment(
   partitions: number,
@@ -476,7 +482,7 @@ function validateLagSample(
  * the EB-112 lag SLO: the SLO is alerting on lag, this is
  * placement steered by lag, and sticky's minimal-migration
  * guarantee is a different axis (a future sticky+lag combination
- * would be a fifth strategy, not a change to this one).
+ * would be a separate strategy, not a change to this one).
  */
 export function lagAwareAssignment(
   partitions: number,
@@ -579,6 +585,187 @@ export function createLagAwarePartitionAssignor(
   };
 }
 
+/**
+ * Weights for the weighted assignor (EB-235).
+ */
+export interface WeightedAssignorOptions {
+  /**
+   * Member id -> partition-share weight. Weights are normalized, so
+   * `{ a: 2, b: 1 }` and `{ a: 4, b: 2 }` assign identically. A member
+   * absent from the map gets weight 1 — the equal-split baseline — so
+   * an empty or absent map is exactly the equal split, and a partially
+   * covered roster gives unlisted members one unit share instead of
+   * starving or excluding them. Entries for members that never join
+   * are ignored, so the map may cover the full deployment roster up
+   * front. Validated eagerly: a zero, negative, non-finite, or
+   * non-numeric weight throws `RangeError` at construction.
+   */
+  readonly memberWeights?: Readonly<Record<string, number>>;
+}
+
+/**
+ * Validates weighted options and returns the normalized form: the
+ * weight map as a `Map` (own entries only, so a member id like
+ * `'toString'` can never pick up an inherited property). Throws
+ * `RangeError` on a bad shape or a bad weight — eagerly, so a bad map
+ * fails at construction, not at the first rebalance.
+ */
+function normalizeWeightedOptions(
+  options: WeightedAssignorOptions | undefined,
+): Map<string, number> {
+  const weights = new Map<string, number>();
+  if (options === undefined) return weights;
+  if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    throw new RangeError('weighted assignor: options must be an object with { memberWeights }');
+  }
+  const { memberWeights } = options;
+  if (memberWeights !== undefined) {
+    if (typeof memberWeights !== 'object' || memberWeights === null || Array.isArray(memberWeights)) {
+      throw new RangeError('weighted assignor: `memberWeights` must be an object mapping member id -> weight');
+    }
+    for (const [member, value] of Object.entries(memberWeights)) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        throw new RangeError(
+          `weighted assignor: weight of member '${member}' must be a finite number > 0`,
+        );
+      }
+      weights.set(member, value);
+    }
+  }
+  return weights;
+}
+
+/**
+ * Weighted assignment (EB-235), as a pure function.
+ *
+ * Each member's target load is its normalized share of the partitions
+ * (`weight / total weight`), rounded by the largest-remainder method:
+ * every member gets `floor(P * share)`, and the leftover partitions go
+ * one each to the largest fractional remainders, ties broken by sorted
+ * member order — so the targets always sum to exactly `P`, and a
+ * member's load is within one of its exact proportional share. The
+ * roster is sorted lexicographically first (canonical order), so a
+ * fresh assignment is a pure function of the weight set and the member
+ * set — roster order and join order cannot change it, and there is no
+ * jitter or randomness anywhere in the computation.
+ *
+ * Minimal migration on a weight-change rebalance: like sticky, the
+ * keep phase (ascending partition order) lets a partition stay with
+ * its previous owner while that owner is still a member and still
+ * below its new target, and the pool phase hands the rest to the
+ * least-loaded member below its target, ties by sorted member order.
+ * Each member therefore retains `min(target, previously owned)` of
+ * its partitions — the maximum any assignment meeting the new
+ * targets can retain — so exactly the changed-share portion moves:
+ * a member whose target grew keeps everything and gains, a member
+ * whose target shrank sheds exactly the excess, and a member whose
+ * target is unchanged keeps every partition.
+ *
+ * It is orthogonal to the other built-ins: rendezvous has no share
+ * control at all, sticky's balance is the special case of equal
+ * weights, and zone/lag placement steers by topology or lag rather
+ * than by configured share (a future weighted+sticky combination
+ * would be a separate strategy, not a change to this one).
+ */
+export function weightedAssignment(
+  partitions: number,
+  members: string[],
+  weights: ReadonlyMap<string, number>,
+  previous?: ReadonlyMap<number, string>,
+): Map<number, string> {
+  const assignment = new Map<number, string>();
+  if (partitions <= 0 || members.length === 0) return assignment;
+  for (const [member, value] of weights) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new RangeError(
+        `weighted assignor: weight of member '${member}' must be a finite number > 0`,
+      );
+    }
+  }
+  const roster = [...new Set(members)].sort();
+  let total = 0;
+  for (const m of roster) total += weights.get(m) ?? 1;
+  // Largest-remainder targets: floor first, then one leftover each
+  // to the largest fractional remainders (sorted member order breaks
+  // remainder ties, so the targets are fully deterministic).
+  const target = new Map<string, number>();
+  const remainders: Array<{ member: string; remainder: number }> = [];
+  let assigned = 0;
+  for (const m of roster) {
+    const exact = (partitions * (weights.get(m) ?? 1)) / total;
+    const floor = Math.floor(exact);
+    target.set(m, floor);
+    assigned += floor;
+    remainders.push({ member: m, remainder: exact - floor });
+  }
+  remainders.sort((a, b) => {
+    if (a.remainder !== b.remainder) return b.remainder - a.remainder;
+    return a.member < b.member ? -1 : a.member > b.member ? 1 : 0;
+  });
+  for (let i = 0; i < partitions - assigned; i++) {
+    const entry = remainders[i] as { member: string; remainder: number };
+    target.set(entry.member, (target.get(entry.member) as number) + 1);
+  }
+
+  const load = new Map<string, number>();
+  for (const m of roster) load.set(m, 0);
+  // Keep phase: maximally sticky under the new targets.
+  const pooled: number[] = [];
+  for (let p = 0; p < partitions; p++) {
+    const owner = previous?.get(p);
+    if (owner !== undefined && target.has(owner) && (load.get(owner) as number) < (target.get(owner) as number)) {
+      assignment.set(p, owner);
+      load.set(owner, (load.get(owner) as number) + 1);
+    } else {
+      pooled.push(p);
+    }
+  }
+  // Pool phase: orphaned and share-shed partitions fill targets,
+  // least-loaded first, ties by sorted member order.
+  for (const p of pooled) {
+    let chosen: string | undefined;
+    let chosenLoad = Infinity;
+    for (const m of roster) {
+      const memberLoad = load.get(m) as number;
+      if (memberLoad < (target.get(m) as number) && memberLoad < chosenLoad) {
+        chosen = m;
+        chosenLoad = memberLoad;
+      }
+    }
+    // Unreachable: sum(targets) == partitions == kept + pooled.
+    if (chosen === undefined) {
+      throw new Error('weightedAssignment: no member below target (unreachable)');
+    }
+    assignment.set(p, chosen);
+    load.set(chosen, (load.get(chosen) as number) + 1);
+  }
+  return assignment;
+}
+
+/**
+ * The weighted built-in as a `PartitionAssignor` (EB-235), named
+ * `'weighted'`. Options are validated eagerly, so a bad weight map
+ * fails at construction — not at the first rebalance. Omitting the
+ * options (or the map) is the equal split. Pass the result as
+ * `GroupSubscribeOptions.assignor`; the group's first member fixes
+ * it like any other assignor.
+ */
+export function createWeightedPartitionAssignor(
+  options?: WeightedAssignorOptions,
+): PartitionAssignor {
+  const weights = normalizeWeightedOptions(options);
+  return {
+    name: 'weighted',
+    assign(
+      partitions: number,
+      members: string[],
+      previous?: ReadonlyMap<number, string>,
+    ): Map<number, string> {
+      return weightedAssignment(partitions, members, weights, previous);
+    },
+  };
+}
+
 /** Resolves one of the built-in strategy names to its assignor. */
 export function resolveBuiltinPartitionAssignor(
   name: 'rendezvous' | 'sticky',
@@ -592,8 +779,12 @@ export function resolveBuiltinPartitionAssignor(
   options: LagAwareAssignorOptions,
 ): LagAwarePartitionAssignor;
 export function resolveBuiltinPartitionAssignor(
-  name: 'rendezvous' | 'sticky' | 'zone-aware' | 'lag-aware',
-  options?: ZoneAwareAssignorOptions | LagAwareAssignorOptions,
+  name: 'weighted',
+  options?: WeightedAssignorOptions,
+): PartitionAssignor;
+export function resolveBuiltinPartitionAssignor(
+  name: 'rendezvous' | 'sticky' | 'zone-aware' | 'lag-aware' | 'weighted',
+  options?: ZoneAwareAssignorOptions | LagAwareAssignorOptions | WeightedAssignorOptions,
 ): PartitionAssignor {
   if (name === 'sticky') return stickyPartitionAssignor;
   if (name === 'zone-aware') {
@@ -611,6 +802,9 @@ export function resolveBuiltinPartitionAssignor(
       );
     }
     return createLagAwarePartitionAssignor(options as LagAwareAssignorOptions);
+  }
+  if (name === 'weighted') {
+    return createWeightedPartitionAssignor(options as WeightedAssignorOptions | undefined);
   }
   return rendezvousPartitionAssignor;
 }
