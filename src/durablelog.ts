@@ -1598,6 +1598,20 @@ export interface ForkTopicOptions {
   keyedLatest?: boolean;
 }
 
+/** Result of [`DurableTopicLog.mergeTopics`] (EB-226). */
+export interface MergeTopicsResult {
+  /** The two topics the history was merged from (unchanged by the merge). */
+  sourceTopics: [string, string];
+  /** The new topic holding the merged history. */
+  targetTopic: string;
+  /** Number of records copied into the target. */
+  copied: number;
+  /** Each source topic's last seq at merge time, in source order. */
+  sourceLastSeqs: [number, number];
+  /** The target topic's last seq after the merge (0 when nothing copied). */
+  targetLastSeq: number;
+}
+
 /** Result of [`DurableTopicLog.forkTopic`] (EB-224). */
 export interface ForkTopicResult {
   /** The topic the history was copied from (unchanged by the fork). */
@@ -4287,6 +4301,96 @@ export class DurableTopicLog {
       fromSeq: o.fromSeq,
       fromTime: o.fromTime,
       keyedLatest: o.keyedLatest ?? false,
+    };
+  }
+
+  /**
+   * Merges two topics' live histories into a new topic (EB-226):
+   * `mergeTopics('orders.eu', 'orders.us', 'orders.all')` copies
+   * both sources' live messages into the target with a fresh
+   * per-partition sequence space, ordered by publish timestamp
+   * (ties break toward the first source, then source seq — the
+   * merge is stable, so neither source's internal order ever
+   * inverts). The sources are untouched: this method only reads
+   * them — tombstoning them is the bus's job (`EventBus.
+   * mergeTopics`), which is why the merge, unlike the fork, has
+   * no filter options: a merge is a whole-history union, and a
+   * filtered merge would silently drop one source's tail.
+   * Signatures are dropped like the fork's (a merged record is a
+   * new record in a new topic, not a re-attestation of the old
+   * one), seq-0 families and archived segments are excluded like
+   * the fork's, and a failed merge purges the partial target —
+   * a consumer that found half a merged history would trust it.
+   */
+  mergeTopics(
+    sourceA: string,
+    sourceB: string,
+    targetTopic: string,
+  ): MergeTopicsResult {
+    if (!this.topicsSeen.has(sourceA)) {
+      throw new RangeError(`mergeTopics: unknown source topic "${sourceA}"`);
+    }
+    if (!this.topicsSeen.has(sourceB)) {
+      throw new RangeError(`mergeTopics: unknown source topic "${sourceB}"`);
+    }
+    if (this.topicsSeen.has(targetTopic)) {
+      throw new RangeError(`mergeTopics: target topic "${targetTopic}" is already in use`);
+    }
+    const targetEnc = encodeURIComponent(targetTopic);
+    const targetLiveKey = `${targetEnc}.log`;
+    const targetSegmentPrefix = `${targetEnc}.seg-`;
+    const keys = this.backend.list();
+    if (keys.includes(targetLiveKey) || keys.some((k) => k.startsWith(targetSegmentPrefix))) {
+      throw new RangeError(`mergeTopics: target topic "${targetTopic}" already has log files`);
+    }
+    // Raw live records in source seq order (not the `readSince`
+    // view: that view applies the log's key-compaction dedup, which
+    // would silently change the merge's contents with the log's
+    // compaction setting — the merge's order below is explicit).
+    // The first source's records come first so the stable sort
+    // below breaks timestamp ties toward it.
+    const recordsA = this.readFileRecordsSince(sourceA, 0).filter(
+      (rec) => rec.seq >= 1,
+    );
+    const recordsB = this.readFileRecordsSince(sourceB, 0).filter(
+      (rec) => rec.seq >= 1,
+    );
+    const merged = [...recordsA, ...recordsB].sort((x, y) => x.at - y.at);
+    const sourceALastSeq = this.lastSeq(sourceA);
+    const sourceBLastSeq = this.lastSeq(sourceB);
+    // Re-seq per partition from 1, in merged timestamp order.
+    const nextSeqByPartition = new Map<number, number>();
+    let copied = 0;
+    try {
+      for (const rec of merged) {
+        const partition = rec.partition ?? 0;
+        const seq = (nextSeqByPartition.get(partition) ?? 0) + 1;
+        nextSeqByPartition.set(partition, seq);
+        const { signature, publisherSignature, ...rest } = rec;
+        void signature;
+        void publisherSignature;
+        const ok = this.append({ ...rest, topic: targetTopic, seq });
+        if (!ok) {
+          throw new Error(`mergeTopics: failed to append record seq ${rec.seq} to "${targetTopic}"`);
+        }
+        copied += 1;
+      }
+    } catch (err) {
+      // All-or-nothing, like the fork: purge best effort; the
+      // throw below is the signal regardless.
+      try {
+        this.purgeTopic(targetTopic);
+      } catch {
+        // The purge itself failed; the original error still reports.
+      }
+      throw err;
+    }
+    return {
+      sourceTopics: [sourceA, sourceB],
+      targetTopic,
+      copied,
+      sourceLastSeqs: [sourceALastSeq, sourceBLastSeq],
+      targetLastSeq: this.lastSeq(targetTopic),
     };
   }
 

@@ -6183,6 +6183,62 @@ copy), to seek (EB-130, a subscriber position, not a topic copy),
 and to mirror (cross-bus replication, not a local fork). (Real-time
 systems: blue-green migration / topic evolution.)
 
+## Topic merge (EB-226)
+
+`mergeTopics(sourceA, sourceB, targetTopic)` (`src/bus.ts`,
+`DurableTopicLog.mergeTopics` in `src/durablelog.ts`) unions two
+topics' live histories into a brand-new topic, once, and then
+retires both sources — the multi-to-one counterpart of the EB-224
+fork, not a variant of it: a fork copies one history and leaves
+the source live; a merge unions two histories and tombstones both
+sources. The region-consolidation / shard-combining primitive:
+merge the regional topics, point consumers at the union, and never
+worry about a stale regional name accepting writes again.
+
+```ts
+bus.publish('orders.eu', order); // seq 1..2
+bus.publish('orders.us', order); // seq 1..2
+const r = bus.mergeTopics('orders.eu', 'orders.us', 'orders.all');
+// r.copied === 4, r.targetLastSeq === 4, r.sourceLastSeqs === [2, 2]
+bus.publish('orders.all', order); // seq 5 on the union, in its own space
+bus.publish('orders.eu', order); // refused: 0 delivered, 'alias-retired'
+```
+
+What the merge copies, and what it does not:
+
+- **Live message records only** (`seq >= 1`) from both sources,
+  re-seqed from 1 per partition in merged publish-timestamp order
+  (ties break toward the first source, so neither source's
+  internal order ever inverts), so the union reads as a topic
+  that was always the union. Message metadata travels like the
+  fork's; signatures do not travel, for the same reason.
+- **No filter options**: a merge is a whole-history union, and a
+  filtered merge would silently drop one source's tail. Seq-0
+  runtime state, archived segments, subscribers, rules and
+  retained state are not copied, like the fork.
+- **The sources are retired, not deleted**: each source keeps its
+  durable history replayable but carries a deletion tombstone
+  afterwards, so new publishes to a source are refused with
+  `'alias-retired'` (the EB-126 publish gate) — merged-away names
+  are read-only, never silently writable. Subscribers are never
+  moved to the union: a merge that silently moved consumers would
+  change delivery without anyone subscribing.
+
+Fail-closed: unknown sources, sources with no durable log, an
+already-used target, duplicate names, or a target equal to a
+source all throw `RangeError` before any copy; a failed append
+mid-copy purges the partial target. The call provisions the
+target's lifecycle record, seeds its sequence counters from the
+merged log (so the next publish continues the union's numbering),
+and is audited as `topics_merged` with `mergeSources` in the
+detail — the merge's provenance record (queryable via
+`getSubscriptionAudit({ action: 'topics_merged' })`). Orthogonal
+to the EB-224 fork (one history, source stays live), to
+`renameTopic` (EB-142, one history under a new name), to the
+EB-44 migration alias (ongoing dual routing, both names live),
+and to EB-90's in-topic partitions (this is topic-level, not
+partition-level). (Real-time systems: topic governance.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into

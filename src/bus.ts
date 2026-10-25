@@ -156,7 +156,7 @@ import {
   type RemediationActionResult,
   type RemediationReport,
 } from './remediate.ts';
-import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type SegmentRotationOptions } from './durablelog.ts';
+import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type SegmentRotationOptions } from './durablelog.ts';
 import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
 import {
@@ -35056,6 +35056,162 @@ export class EventBus {
       },
     });
     return { ...result, lifecycleProvisioned: created };
+  }
+
+  /**
+   * Merges two topics' live histories into a new topic (EB-226):
+   * `mergeTopics('orders.eu', 'orders.us', 'orders.all')` unions
+   * both histories into the target with a fresh per-partition
+   * sequence space, ordered by publish timestamp (see
+   * `DurableTopicLog.mergeTopics` for the order and the
+   * all-or-nothing copy), then retires both sources: each source
+   * keeps its durable history replayable but carries a deletion
+   * tombstone afterwards, so new publishes to a source are
+   * refused with `'alias-retired'` (the EB-126 publish gate) —
+   * merged-away names are read-only, never silently writable.
+   *
+   * This is the multi-to-one counterpart of `forkTopic`, not a
+   * variant of it: a fork copies one history and leaves the
+   * source live; a merge unions two histories and retires both
+   * sources. It is also distinct from `renameTopic` (one history
+   * under a new name, EB-142), from the EB-44 migration alias
+   * (ongoing dual routing, both names live), and from EB-90's
+   * in-topic partitions (this is topic-level, not partition-level).
+   * Like the fork, the merge copies history only: the target
+   * starts with no subscribers, no rules and no retained state —
+   * subscribers are never moved, because a merge that silently
+   * moved consumers would change delivery without anyone
+   * subscribing. The target's TTL, schema, rate-limit and
+   * compression rules are whatever the caller configures
+   * afterwards through the usual per-topic APIs.
+   *
+   * Ordering mirrors `forkTopic`: the durable log merges first
+   * (it re-validates and throws before mutating on any failure,
+   * so a failed merge leaves the bus untouched), then the bus
+   * seeds the target's sequence counters and stats from the
+   * merged log (the `recoverLogState` pattern, scoped to one
+   * topic), provisions the target's lifecycle record, tombstones
+   * both sources, and audits `topics_merged` with the merge
+   * sources in the detail — the merge's provenance record.
+   * Fail-closed before any copy: unknown sources, sources with no
+   * durable log, an already-used target, or duplicate names all
+   * throw `RangeError`.
+   */
+  mergeTopics(
+    sourceA: string,
+    sourceB: string,
+    targetTopic: string,
+    opts?: { actor?: string },
+  ): MergeTopicsResult & { lifecycleProvisioned: boolean; sourcesTombstoned: boolean } {
+    assertValidLifecycleTopicName(sourceA, 'mergeTopics');
+    assertValidLifecycleTopicName(sourceB, 'mergeTopics');
+    assertValidLifecycleTopicName(targetTopic, 'mergeTopics');
+    for (const name of [sourceA, sourceB, targetTopic]) {
+      if (name.includes('/')) {
+        throw new RangeError('mergeTopics: topics must be concrete global topic names, not namespaced topics');
+      }
+    }
+    if (sourceA === sourceB) {
+      throw new RangeError('mergeTopics: source topics must differ');
+    }
+    if (targetTopic === sourceA || targetTopic === sourceB) {
+      throw new RangeError('mergeTopics: target topic must differ from both sources');
+    }
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'mergeTopics');
+    if (!this.topicHasState(sourceA)) {
+      throw new RangeError(`mergeTopics: unknown source topic "${sourceA}"`);
+    }
+    if (!this.topicHasState(sourceB)) {
+      throw new RangeError(`mergeTopics: unknown source topic "${sourceB}"`);
+    }
+    if (this.topicHasState(targetTopic)) {
+      throw new RangeError(`mergeTopics: target topic "${targetTopic}" is already in use`);
+    }
+    const log = this.durableLogForTopic(sourceA);
+    if (log === undefined) {
+      throw new RangeError('mergeTopics: merge requires a durable log (no durableLogDir configured)');
+    }
+    if (!log.topics().includes(sourceA) || !log.topics().includes(sourceB)) {
+      throw new RangeError('mergeTopics: each source topic must have a durable log');
+    }
+    // Durable log first: it throws before mutating on any failure.
+    const result = log.mergeTopics(sourceA, sourceB, targetTopic);
+    // Seed the target's sequence counters from the merged log (the
+    // recoverLogState pattern, scoped to one topic): per-partition
+    // highs, falling back to the topic max for pre-partitioning
+    // logs, so the next publish continues the merged numbering
+    // instead of restarting at 1 and colliding with merged seqs.
+    const partitionSeqs = log.recoveredPartitionSeqs(targetTopic);
+    if (partitionSeqs.size === 0) {
+      if (result.targetLastSeq > 0) {
+        this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, 0), result.targetLastSeq);
+        this.seedPartitionPublished(targetTopic, 0, result.targetLastSeq);
+      }
+    } else {
+      for (const [partition, seq] of partitionSeqs) {
+        this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, partition), seq);
+        this.seedPartitionPublished(targetTopic, partition, seq);
+      }
+    }
+    this.topicStats.set(targetTopic, {
+      subscriberCount: 0,
+      publishedMessages: log.messageCount(targetTopic),
+      expiredMessages: 0,
+      missedDeadlineMessages: 0,
+      lastSeq: result.targetLastSeq,
+      sequenceGaps: 0,
+      rateLimitedMessages: 0,
+      publisherRateLimited: 0,
+      pausedMessages: 0,
+      circuitBrokenMessages: 0,
+      rejectedMessages: 0,
+      lateMessages: 0,
+      duplicateMessages: 0,
+      casMismatches: 0,
+      idempotentHits: 0,
+      aliasRetiredMessages: 0,
+      lineageCycleRejections: 0,
+      redactedFields: 0,
+      filteredMessages: 0,
+      sampledDeliveries: 0,
+      sampleDropped: 0,
+      dedupDropped: 0,
+      compressedMessages: 0,
+      compressedBytesBefore: 0,
+      compressedBytesAfter: 0,
+      compressionTimeMs: 0,
+      lanes: {
+        queued: zeroedLaneCounts(),
+        delivered: zeroedLaneCounts(),
+        dropped: zeroedLaneCounts(),
+      },
+    });
+    const { created } = this.topicLifecycle.provision(targetTopic, undefined, this.now());
+    // Retire both sources: a live provisioning is removed, a
+    // never-provisioned source gains a tombstone record — either
+    // way the name ends deleted, so the EB-126 publish gate
+    // refuses new publishes while replay still reads history.
+    const now = this.now();
+    for (const source of [sourceA, sourceB]) {
+      if (!this.topicLifecycle.remove(source, now, false)) {
+        this.topicLifecycle.tombstone(source, now, false);
+      }
+    }
+    const sourcesTombstoned =
+      this.topicLifecycle.isDeleted(sourceA) && this.topicLifecycle.isDeleted(sourceB);
+    this.auditSubscription({
+      action: 'topics_merged',
+      actor,
+      topic: targetTopic,
+      detail: {
+        mergeSources: [sourceA, sourceB],
+        copied: result.copied,
+        sourceLastSeqs: result.sourceLastSeqs,
+        targetLastSeq: result.targetLastSeq,
+      },
+    });
+    return { ...result, lifecycleProvisioned: created, sourcesTombstoned };
   }
 
   /**
