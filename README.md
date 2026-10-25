@@ -3626,6 +3626,43 @@ How it works:
   `delayed_cancelled` (`{ cancelled, delayIds, topicPattern }`), including
   the empty case, so the operator action is always on record.
 
+## Cancelling delayed deliveries by topic and key
+
+`cancelDelayedByKey(topicPattern, key)` (`src/bus.ts`, EB-236) cancels
+every pending delayed delivery scheduled for one topic — or for every
+concrete topic matching a wildcard pattern — that carries one
+compaction key, in a single call:
+
+```ts
+bus.publishDelayed('orders.eu', order, { delayMs: 60_000, key: 'user-42' });
+bus.publishDelayed('orders.eu', other, { delayMs: 60_000, key: 'user-99' });
+bus.cancelDelayedByKey('orders.*', 'user-42'); // -> { cancelled: 1, delayIds: [...] }
+```
+
+How it works:
+
+- **Scope** — both filters must match: the entry's concrete topic must
+  match the pattern (exact topic, or the same wildcard syntax as
+  `subscribe`) and the entry's key must equal `key`. Unkeyed schedules
+  are never matched, and schedules for other keys or topics are
+  untouched — the topic scope keeps a bulk key cancellation from
+  reaching into unrelated topics that happen to share a key.
+- **Result** — `{ cancelled, delayIds }`, the same shape as
+  `cancelDelayedByTopic`, with ids in schedule order. Only pending,
+  not-yet-fanned-out schedules count; already fanned out, expired, or
+  cancelled schedules are not counted, and a repeat call counts each
+  schedule at most once. Non-string arguments throw `TypeError`, empty
+  ones `RangeError`.
+- **Key order** — each cancellation reuses `cancelDelayed`, so every
+  cancelled schedule is tombstoned to the durable log and releases
+  its subscribers' per-key expectations: a buffered successor for the
+  same key is enqueued instead of hanging forever, while other keys'
+  sequences are unaffected.
+- **Observability** — recorded in the subscription audit log as
+  `delayed_cancelled` (`{ cancelled, delayIds, topicPattern, key }`),
+  including the empty case. This is orthogonal to
+  `cancelDelayedByTopic` (topic alone): this is topic and key together.
+
 ## Publish-side partition routing
 
 `setTopicPartitions(topicPattern, n)` (`src/bus.ts`, EB-90) gives a topic

@@ -32129,6 +32129,80 @@ export class EventBus {
   }
 
   /**
+   * Cancels every pending delayed delivery scheduled for one topic or
+   * topic pattern with one compaction key (EB-236): the messages will
+   * never fan out. Returns `{ cancelled, delayIds }` — the number of
+   * schedules cancelled and their ids in schedule order, the same
+   * shape as `cancelDelayedByTopic`.
+   *
+   * Both filters must match: the entry's concrete topic must match
+   * `topicPattern` (exact topic, or the same wildcard syntax as
+   * `subscribe`) and the entry's key must equal `key`. A schedule
+   * without a key is never matched — keyed cancellation only ever
+   * touches keyed schedules — and a schedule for another key on the
+   * same topic is untouched. Only pending, not-yet-fanned-out
+   * schedules are cancelled: entries that already fanned out,
+   * already expired, or were already cancelled are not counted,
+   * and calling the same cancellation twice counts each schedule
+   * at most once — the second call finds nothing pending and
+   * returns `{ cancelled: 0, delayIds: [] }`.
+   *
+   * Each cancellation reuses `cancelDelayed`, so every cancelled
+   * schedule is tombstoned to the durable log (the EB-24
+   * convention) — a restart never resurrects them — and keyed
+   * schedules release their subscribers' per-key expectations, so
+   * a buffered successor for the same key is enqueued instead of
+   * hanging forever. Cancelling one key never disturbs another
+   * key's sequence: `keySeq` order for untouched keys is
+   * unaffected, and the released key's own successors advance
+   * past the cancelled schedules exactly as a single
+   * `cancelDelayed` would. An empty result returns
+   * `{ cancelled: 0, delayIds: [] }` — never a throw. Recorded in
+   * the subscription audit log as `delayed_cancelled`
+   * (`{ cancelled, delayIds, topicPattern, key }`).
+   *
+   * Orthogonal to `cancelDelayedByTopic`: that cancels by topic
+   * alone, this cancels by topic and key together — the topic
+   * scope keeps a bulk key cancellation from reaching into
+   * unrelated topics that happen to share a key.
+   *
+   * Throws `TypeError` when `topicPattern` or `key` is not a
+   * string, `RangeError` when either is empty.
+   */
+  cancelDelayedByKey(topicPattern: string, key: string): { cancelled: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('cancelDelayedByKey: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('cancelDelayedByKey: topicPattern must be a non-empty string');
+    }
+    if (typeof key !== 'string') {
+      throw new TypeError('cancelDelayedByKey: key must be a string');
+    }
+    if (key.length === 0) {
+      throw new RangeError('cancelDelayedByKey: key must be a non-empty string');
+    }
+    const matcher = compilePattern(topicPattern);
+    const delayIds: string[] = [];
+    // `delayedById` holds exactly the pending schedules, in schedule
+    // order; deleting during iteration is safe on a Map. `cancelDelayed`
+    // can only return false for an id that left the pending set, which
+    // cannot happen mid-iteration here — the guard is defensive.
+    for (const [delayId, entry] of this.delayedById) {
+      if (entry.key === key && (entry.topic === topicPattern || matcher.test(entry.topic))) {
+        if (this.cancelDelayed(delayId)) delayIds.push(delayId);
+      }
+    }
+    this.auditSubscription({
+      action: 'delayed_cancelled',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { cancelled: delayIds.length, delayIds, topicPattern, key },
+    });
+    return { cancelled: delayIds.length, delayIds };
+  }
+
+  /**
    * Sets the same-tick fan-out priority for delayed deliveries on one
    * topic or topic pattern (EB-219): when a single sweep pass finds
    * several schedules due at once, entries for higher-priority topics
