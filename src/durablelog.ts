@@ -292,6 +292,16 @@ export interface DurableLogRecord {
    */
   publisherSignature?: { kid: string; sig: string };
   /**
+   * EB-227: the topic this record was split from, present exactly on
+   * records written by [`DurableTopicLog.splitTopics`]. A split copy
+   * is a new record in a new topic, so it carries its provenance
+   * explicitly: a reader of either split target can tell which
+   * source topic the record came from without consulting the audit
+   * log. Advisory metadata like `messageId` — a malformed value on
+   * disk is dropped on parse rather than failing the line.
+   */
+  splitSource?: string;
+  /**
    * The published payload: the JSON value for ordinary messages, the raw
    * bytes (`Uint8Array`) for binary messages (EB-92, persisted as a v2
    * line), or the compression envelope when the publish was compressed.
@@ -776,6 +786,11 @@ interface LogLine {
    * exactly when the publish carried a signed publisher identity.
    */
   publisherSignature?: { kid: string; sig: string };
+  /**
+   * Split provenance (see `DurableLogRecord.splitSource`, EB-227):
+   * the topic a split copy was split from.
+   */
+  splitSource?: string;
   /**
    * Priority lane (see `DurableLogRecord.lane`, EB-122): `'urgent'` or
    * `'bulk'`, present exactly when the publish carried a non-normal
@@ -1610,6 +1625,40 @@ export interface MergeTopicsResult {
   sourceLastSeqs: [number, number];
   /** The target topic's last seq after the merge (0 when nothing copied). */
   targetLastSeq: number;
+}
+
+/**
+ * Predicate for [`DurableTopicLog.splitTopics`] (EB-227): called once
+ * per live source record, in source seq order, before anything is
+ * copied — so a throwing predicate leaves both targets untouched.
+ * Receives the full log record (payload, seq, publish timestamp,
+ * headers, key, partition, …), not just the payload, because a split
+ * criterion is often metadata ("all keyed records", "everything
+ * before this timestamp") rather than payload content. Returns true
+ * for records that go to the first target, false for the second.
+ */
+export type SplitTopicPredicate = (record: DurableLogRecord) => boolean;
+
+/** Result of [`DurableTopicLog.splitTopics`] (EB-227). */
+export interface SplitTopicsResult {
+  /** The topic the history was split from (unchanged by the split). */
+  sourceTopic: string;
+  /** The target holding the records the predicate matched. */
+  targetA: string;
+  /** The target holding the records the predicate did not match. */
+  targetB: string;
+  /** Records copied into the first target. */
+  copiedA: number;
+  /** Records copied into the second target. */
+  copiedB: number;
+  /** Total records copied (`copiedA + copiedB`, always the source's live count). */
+  copied: number;
+  /** The source topic's last seq at split time (its history is untouched). */
+  sourceLastSeq: number;
+  /** The first target's last seq after the split (0 when nothing matched). */
+  targetALastSeq: number;
+  /** The second target's last seq after the split (0 when everything matched). */
+  targetBLastSeq: number;
 }
 
 /** Result of [`DurableTopicLog.forkTopic`] (EB-224). */
@@ -4395,6 +4444,144 @@ export class DurableTopicLog {
   }
 
   /**
+   * Splits one topic's live history into two new topics by a single
+   * predicate (EB-227): `splitTopics('events', isError, 'events.err',
+   * 'events.ok')` copies every live record exactly once — matches to
+   * the first target, non-matches to the second — so the split is
+   * lossless and disjoint by construction, with no record dropped
+   * and none duplicated. This is the one-to-two counterpart of
+   * `mergeTopics` (two-to-one) and the partitioning counterpart of
+   * `forkTopic` (one-to-one copy, source stays live): unlike the
+   * fork, a split retires its source — tombstoning it is the bus's
+   * job (`EventBus.splitTopic`), mirroring the merge — and unlike
+   * EB-90's in-topic partitions, the split produces two independent
+   * topics, each with its own sequence space.
+   *
+   * Each target is re-seqed per partition from 1, in source seq
+   * order, so each target reads as a topic that was always that
+   * target. Message metadata travels like the fork's (payload,
+   * headers, messageId, publisherId, eventTime, partition, lane,
+   * key and keySeq, causal clock, expiry deadline); signatures
+   * are dropped like the fork's (a re-seqed copy under a new topic
+   * is a different signed statement). Every copied record is
+   * stamped `splitSource` with the source topic — the split's
+   * provenance record on the record itself, not just in the audit
+   * log. Seq-0 families and archived segments are excluded like
+   * the fork's.
+   *
+   * Fail-closed, before any copy: an unknown source, an
+   * already-known target, a target with stray log files on disk,
+   * duplicate names, or a non-function predicate all throw
+   * `RangeError` with both targets untouched. The predicate runs
+   * over the whole history before the first append, so a throwing
+   * predicate also leaves both targets untouched; a failed append
+   * mid-copy purges both partial targets, like the fork — a split
+   * is all copied records or no split.
+   */
+  splitTopics(
+    sourceTopic: string,
+    predicate: SplitTopicPredicate,
+    targetA: string,
+    targetB: string,
+  ): SplitTopicsResult {
+    if (!this.topicsSeen.has(sourceTopic)) {
+      throw new RangeError(`splitTopics: unknown source topic "${sourceTopic}"`);
+    }
+    if (typeof predicate !== 'function') {
+      throw new RangeError('splitTopics: predicate must be a function');
+    }
+    if (sourceTopic === targetA || sourceTopic === targetB) {
+      throw new RangeError('splitTopics: target topics must differ from the source topic');
+    }
+    if (targetA === targetB) {
+      throw new RangeError('splitTopics: target topics must differ');
+    }
+    if (this.topicsSeen.has(targetA)) {
+      throw new RangeError(`splitTopics: target topic "${targetA}" is already in use`);
+    }
+    if (this.topicsSeen.has(targetB)) {
+      throw new RangeError(`splitTopics: target topic "${targetB}" is already in use`);
+    }
+    const keys = this.backend.list();
+    for (const targetTopic of [targetA, targetB]) {
+      const targetEnc = encodeURIComponent(targetTopic);
+      if (
+        keys.includes(`${targetEnc}.log`) ||
+        keys.some((k) => k.startsWith(`${targetEnc}.seg-`))
+      ) {
+        throw new RangeError(`splitTopics: target topic "${targetTopic}" already has log files`);
+      }
+    }
+    // Raw live records in source seq order (not the `readSince`
+    // view, for the same key-compaction reason as the fork's).
+    const sourceRecords = this.readFileRecordsSince(sourceTopic, 0).filter(
+      (rec) => rec.seq >= 1,
+    );
+    const sourceLastSeq = this.lastSeq(sourceTopic);
+    // Partition first, copy second: the predicate is evaluated
+    // exactly once per record and any throw aborts before either
+    // target gains a record — a half-split pair would be worse
+    // than no split, because the two targets must jointly cover
+    // the source exactly once.
+    const recordsA: DurableLogRecord[] = [];
+    const recordsB: DurableLogRecord[] = [];
+    for (const rec of sourceRecords) {
+      if (predicate(rec)) recordsA.push(rec);
+      else recordsB.push(rec);
+    }
+    let copiedA = 0;
+    let copiedB = 0;
+    try {
+      for (const [records, targetTopic] of [
+        [recordsA, targetA],
+        [recordsB, targetB],
+      ] as const) {
+        const nextSeqByPartition = new Map<number, number>();
+        for (const rec of records) {
+          const partition = rec.partition ?? 0;
+          const seq = (nextSeqByPartition.get(partition) ?? 0) + 1;
+          nextSeqByPartition.set(partition, seq);
+          const { signature, publisherSignature, ...rest } = rec;
+          void signature;
+          void publisherSignature;
+          const ok = this.append({
+            ...rest,
+            topic: targetTopic,
+            seq,
+            splitSource: sourceTopic,
+          });
+          if (!ok) {
+            throw new Error(`splitTopics: failed to append record seq ${rec.seq} to "${targetTopic}"`);
+          }
+          if (targetTopic === targetA) copiedA += 1;
+          else copiedB += 1;
+        }
+      }
+    } catch (err) {
+      // All-or-nothing across both targets, like the fork's purge.
+      for (const targetTopic of [targetA, targetB]) {
+        try {
+          this.purgeTopic(targetTopic);
+        } catch {
+          // The purge itself failed; the original error still reports.
+        }
+      }
+      throw err;
+    }
+    return {
+      sourceTopic,
+      targetA,
+      targetB,
+      copiedA,
+      copiedB,
+      copied: copiedA + copiedB,
+      sourceLastSeq,
+      targetALastSeq: this.lastSeq(targetA),
+      targetBLastSeq: this.lastSeq(targetB),
+    };
+  }
+
+  /**
    * Scans the offset journal and rebuilds the in-memory checkpoint index:
    * the highest committed seq per (group, topic) wins, so a restarted bus
    * resumes from where its consumers committed, not from zero. Corrupt
@@ -5119,6 +5306,7 @@ function logLineOf(record: DurableLogRecord): LogLine {
     line.signature = { kid: record.signature.kid, sig: record.signature.sig };
   if (record.publisherSignature !== undefined)
     line.publisherSignature = { kid: record.publisherSignature.kid, sig: record.publisherSignature.sig };
+  if (record.splitSource !== undefined) line.splitSource = record.splitSource;
   // The priority lane (EB-122): written only for non-normal lanes —
   // absent means `normal`, so pre-lane lines stay byte-identical.
   if (record.lane === 'urgent' || record.lane === 'bulk') line.lane = record.lane;
@@ -5493,6 +5681,14 @@ function parseLogLine(line: string, expectedTopic: string): DurableLogRecord | n
       kid: signature['kid'] as string,
       sig: signature['sig'] as string,
     };
+  }
+  if (o['splitSource'] !== undefined) {
+    // Split provenance (EB-227) is advisory metadata like `messageId`:
+    // a malformed value is dropped (the record replays without
+    // provenance) rather than failing the whole line.
+    if (typeof o['splitSource'] === 'string' && (o['splitSource'] as string).length > 0) {
+      record.splitSource = o['splitSource'] as string;
+    }
   }
   if (o['publisherSignature'] !== undefined) {
     // Same integrity-metadata rule as `signature`: a malformed value

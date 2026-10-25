@@ -6239,6 +6239,74 @@ EB-44 migration alias (ongoing dual routing, both names live),
 and to EB-90's in-topic partitions (this is topic-level, not
 partition-level). (Real-time systems: topic governance.)
 
+## Topic split (EB-227)
+
+`splitTopic(sourceTopic, predicate, targetA, targetB)` (`src/bus.ts`,
+`DurableTopicLog.splitTopics` in `src/durablelog.ts`) partitions one
+topic's live history into two brand-new topics by a single
+predicate — matches to the first target, the rest to the second —
+once, and then retires the source. The one-to-two counterpart of
+the EB-226 merge, not a variant of it: a merge unions two
+histories and retires both sources; a split partitions one history
+and retires its one source. The stream-partitioning primitive:
+split a mixed topic by severity, region, or tenant, point consumers
+at the two clean topics, and never worry about the mixed name
+accepting writes again.
+
+```ts
+bus.publish('events', { level: 'error', msg: 'e1' }); // seq 1..2
+bus.publish('events', { level: 'info', msg: 'i1' });
+const r = bus.splitTopic('events', (r) => r.payload.level === 'error', 'events.err', 'events.ok');
+// r.copiedA === 1, r.copiedB === 1, r.copied === 2
+bus.publish('events.err', err); // seq 2 on the error split, in its own space
+bus.publish('events.ok', info); // seq 2 on the ok split, in its own space
+bus.publish('events', x); // refused: 0 delivered, 'alias-retired'
+```
+
+What the split copies, and what it does not:
+
+- **Every live message exactly once** (`seq >= 1`): the single
+  predicate is total — a record goes to A or to B, never both and
+  never neither — so the split is lossless and disjoint by
+  construction, with no filter that could silently drop a tail.
+  Each target is re-seqed from 1 per partition in source seq
+  order, so each target reads as a topic that was always that
+  target. Message metadata travels like the fork's; signatures do
+  not travel, for the same reason.
+- **Provenance on the record**: every copied record is stamped
+  `splitSource` with the source topic, so either target's history
+  carries its origin without consulting the audit log. Seq-0
+  runtime state, archived segments, subscribers, rules and
+  retained state are not copied, like the fork.
+- **The source is retired, not deleted**: it keeps its durable
+  history replayable but carries a deletion tombstone afterwards,
+  so new publishes to it are refused with `'alias-retired'` (the
+  EB-126 publish gate) — split-away names are read-only, never
+  silently writable. Subscribers are never moved: a split that
+  silently moved consumers would change delivery without anyone
+  subscribing. The predicate receives the full log record, so a
+  split criterion may judge metadata (key, timestamp, headers) as
+  well as payload content.
+
+Fail-closed: an unknown source, an already-retired source, a
+source with no durable log, already-used targets, duplicate
+names, or a non-function predicate all throw `RangeError` before
+any copy; the predicate runs over the whole history before the
+first append, so a throwing predicate leaves both targets
+untouched, and a failed append mid-copy purges both partial
+targets. The call provisions both targets' lifecycle records,
+seeds both targets' sequence counters from the split logs (so
+each target's next publish continues its own numbering), and is
+audited as `topics_split` with `splitSource` in the detail — the
+split's provenance record (queryable via
+`getSubscriptionAudit({ action: 'topics_split' })`). Orthogonal
+to the EB-224 fork (one history copied whole, source stays live),
+to the EB-226 merge (two histories into one), to `renameTopic`
+(EB-142, one history under a new name), to the EB-44 migration
+alias (ongoing dual routing, both names live), and to EB-90's
+in-topic partitions (this is topic-level, not partition-level).
+(Real-time systems: topic governance.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into

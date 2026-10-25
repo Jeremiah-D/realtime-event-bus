@@ -156,7 +156,7 @@ import {
   type RemediationActionResult,
   type RemediationReport,
 } from './remediate.ts';
-import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type SegmentRotationOptions } from './durablelog.ts';
+import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
 import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
 import {
@@ -35212,6 +35212,181 @@ export class EventBus {
       },
     });
     return { ...result, lifecycleProvisioned: created, sourcesTombstoned };
+  }
+
+  /**
+   * Splits one topic's live history into two topics by a single
+   * predicate (EB-227): `splitTopic('events', (r) => r.payload.level
+   * === 'error', 'events.err', 'events.ok')` routes every live
+   * record exactly once — matches to the first target, the rest to
+   * the second — so the split is lossless and disjoint by
+   * construction, then retires the source: the source keeps its
+   * durable history replayable but carries a deletion tombstone
+   * afterwards, so new publishes to it are refused with
+   * `'alias-retired'` (the EB-126 publish gate) — split-away names
+   * are read-only, never silently writable.
+   *
+   * This is the one-to-two counterpart of `mergeTopics`, not a
+   * variant of it: a merge unions two histories and retires both
+   * sources; a split partitions one history and retires its one
+   * source. It is also distinct from `forkTopic` (one history
+   * copied whole, source stays live), from `renameTopic` (one
+   * history under a new name, EB-142), from the EB-44 migration
+   * alias (ongoing dual routing, both names live), and from EB-90's
+   * in-topic partitions (this is topic-level, not partition-level:
+   * each target gets its own per-partition sequence space).
+   * Like the fork and the merge, the split copies history only:
+   * the targets start with no subscribers, no rules and no retained
+   * state — subscribers are never moved, because a split that
+   * silently moved consumers would change delivery without anyone
+   * subscribing. Each copied record is stamped `splitSource` with
+   * the source topic (see `DurableTopicLog.splitTopics`), so either
+   * target's history carries its provenance on the record itself.
+   *
+   * Ordering mirrors `mergeTopics`: the durable log splits first
+   * (it evaluates the predicate over the whole history and throws
+   * before mutating on any failure, so a failed split leaves the
+   * bus untouched), then the bus seeds both targets' sequence
+   * counters and stats from the split logs (the `recoverLogState`
+   * pattern, scoped to each target), provisions both targets'
+   * lifecycle records, tombstones the source, and audits
+   * `topics_split` with the split source in the detail — the
+   * split's provenance record. Fail-closed before any copy: an
+   * unknown source, an already-retired source, sources with no
+   * durable log, already-used targets, duplicate names, or a
+   * non-function predicate all throw `RangeError`.
+   */
+  splitTopic(
+    sourceTopic: string,
+    predicate: SplitTopicPredicate,
+    targetA: string,
+    targetB: string,
+    opts?: { actor?: string },
+  ): SplitTopicsResult & { lifecycleProvisioned: boolean; sourceTombstoned: boolean } {
+    assertValidLifecycleTopicName(sourceTopic, 'splitTopic');
+    assertValidLifecycleTopicName(targetA, 'splitTopic');
+    assertValidLifecycleTopicName(targetB, 'splitTopic');
+    for (const name of [sourceTopic, targetA, targetB]) {
+      if (name.includes('/')) {
+        throw new RangeError('splitTopic: topics must be concrete global topic names, not namespaced topics');
+      }
+    }
+    if (sourceTopic === targetA || sourceTopic === targetB) {
+      throw new RangeError('splitTopic: target topics must differ from the source topic');
+    }
+    if (targetA === targetB) {
+      throw new RangeError('splitTopic: target topics must differ');
+    }
+    if (typeof predicate !== 'function') {
+      throw new RangeError('splitTopic: predicate must be a function');
+    }
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'splitTopic');
+    if (!this.topicHasState(sourceTopic)) {
+      throw new RangeError(`splitTopic: unknown source topic "${sourceTopic}"`);
+    }
+    if (this.topicLifecycle.isDeleted(sourceTopic)) {
+      throw new RangeError(`splitTopic: source topic "${sourceTopic}" is already retired`);
+    }
+    if (this.topicHasState(targetA)) {
+      throw new RangeError(`splitTopic: target topic "${targetA}" is already in use`);
+    }
+    if (this.topicHasState(targetB)) {
+      throw new RangeError(`splitTopic: target topic "${targetB}" is already in use`);
+    }
+    const log = this.durableLogForTopic(sourceTopic);
+    if (log === undefined) {
+      throw new RangeError('splitTopic: split requires a durable log (no durableLogDir configured)');
+    }
+    if (!log.topics().includes(sourceTopic)) {
+      throw new RangeError(`splitTopic: source topic "${sourceTopic}" has no durable log`);
+    }
+    // Durable log first: it throws before mutating on any failure.
+    const result = log.splitTopics(sourceTopic, predicate, targetA, targetB);
+    // Seed both targets' sequence counters and stats from the split
+    // logs (the recoverLogState pattern, scoped to each target), so
+    // each target's next publish continues its own numbering
+    // instead of restarting at 1 and colliding with split seqs.
+    const targetLastSeqs: Array<[string, number]> = [
+      [targetA, result.targetALastSeq],
+      [targetB, result.targetBLastSeq],
+    ];
+    for (const [targetTopic, targetLastSeq] of targetLastSeqs) {
+      const partitionSeqs = log.recoveredPartitionSeqs(targetTopic);
+      if (partitionSeqs.size === 0) {
+        if (targetLastSeq > 0) {
+          this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, 0), targetLastSeq);
+          this.seedPartitionPublished(targetTopic, 0, targetLastSeq);
+        }
+      } else {
+        for (const [partition, seq] of partitionSeqs) {
+          this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, partition), seq);
+          this.seedPartitionPublished(targetTopic, partition, seq);
+        }
+      }
+      this.topicStats.set(targetTopic, {
+        subscriberCount: 0,
+        publishedMessages: log.messageCount(targetTopic),
+        expiredMessages: 0,
+        missedDeadlineMessages: 0,
+        lastSeq: targetLastSeq,
+        sequenceGaps: 0,
+        rateLimitedMessages: 0,
+        publisherRateLimited: 0,
+        pausedMessages: 0,
+        circuitBrokenMessages: 0,
+        rejectedMessages: 0,
+        lateMessages: 0,
+        duplicateMessages: 0,
+        casMismatches: 0,
+        idempotentHits: 0,
+        aliasRetiredMessages: 0,
+        lineageCycleRejections: 0,
+        redactedFields: 0,
+        filteredMessages: 0,
+        sampledDeliveries: 0,
+        sampleDropped: 0,
+        dedupDropped: 0,
+        compressedMessages: 0,
+        compressedBytesBefore: 0,
+        compressedBytesAfter: 0,
+        compressionTimeMs: 0,
+        lanes: {
+          queued: zeroedLaneCounts(),
+          delivered: zeroedLaneCounts(),
+          dropped: zeroedLaneCounts(),
+        },
+      });
+    }
+    const provisionedA = this.topicLifecycle.provision(targetA, undefined, this.now()).created;
+    const provisionedB = this.topicLifecycle.provision(targetB, undefined, this.now()).created;
+    // Retire the source, like the merge retires both of its sources:
+    // a live provisioning is removed, a never-provisioned source
+    // gains a tombstone record — either way the name ends deleted,
+    // so the EB-126 publish gate refuses new publishes while replay
+    // still reads history.
+    const now = this.now();
+    if (!this.topicLifecycle.remove(sourceTopic, now, false)) {
+      this.topicLifecycle.tombstone(sourceTopic, now, false);
+    }
+    const sourceTombstoned = this.topicLifecycle.isDeleted(sourceTopic);
+    this.auditSubscription({
+      action: 'topics_split',
+      actor,
+      topic: targetA,
+      detail: {
+        splitSource: sourceTopic,
+        targetA,
+        targetB,
+        copiedA: result.copiedA,
+        copiedB: result.copiedB,
+        copied: result.copied,
+        sourceLastSeq: result.sourceLastSeq,
+        targetALastSeq: result.targetALastSeq,
+        targetBLastSeq: result.targetBLastSeq,
+      },
+    });
+    return { ...result, lifecycleProvisioned: provisionedA && provisionedB, sourceTombstoned };
   }
 
   /**

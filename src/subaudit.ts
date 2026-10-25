@@ -67,6 +67,7 @@ export type SubscriptionAuditAction =
   | 'topic_renamed'
   | 'topic_forked'
   | 'topics_merged'
+  | 'topics_split'
   | 'backpressure_dropped'
   | 'signature_verification_failed'
   | 'retention_updated'
@@ -285,6 +286,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'topic_renamed',
   'topic_forked',
   'topics_merged',
+  'topics_split',
   'backpressure_dropped',
   'signature_verification_failed',
   'retention_updated',
