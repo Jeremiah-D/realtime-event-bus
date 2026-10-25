@@ -1403,6 +1403,19 @@ export interface CompositeSubscribeOptions {
   exclude?: string[];
 }
 
+/**
+ * Key range for a key-range subscription (see
+ * `SubscribeOptions.keyRange`, EB-232): `[start, end)` under string
+ * lexicographic comparison. Either end may be omitted for an
+ * unbounded side; both omitted matches every keyed message.
+ */
+export interface KeyRangeOptions {
+  /** Inclusive lower bound; omitted means unbounded below. */
+  start?: string;
+  /** Exclusive upper bound; omitted means unbounded above. */
+  end?: string;
+}
+
 export interface SubscribeOptions {
   /** Per-subscriber bounded queue capacity (default 100). */
   queueSize?: number;
@@ -1474,6 +1487,31 @@ export interface SubscribeOptions {
    * `RangeError` at subscribe time.
    */
   subscriberMaxPayloadBytes?: number;
+  /**
+   * Opt-in key-range subscription (EB-232): the subscriber only
+   * receives keyed messages (`PublishOptions.key`, EB-36) whose key
+   * falls in `[start, end)` under string lexicographic comparison
+   * (JavaScript `<` on UTF-16 code units). Either end may be omitted
+   * for an unbounded side: `{ start: 'm' }` receives every key from
+   * `'m'` upward, `{ end: 'm' }` every key below `'m'`, and `{}` —
+   * both ends omitted — is a valid no-op range that matches every
+   * keyed message. Only keyed delivery is affected: a keyless message
+   * has no key to compare, so it never matches a key-range
+   * subscription, and a subscription without `keyRange` is untouched
+   * (it receives keyed and keyless messages as before). The range
+   * decision runs before delivery — before the window hold, the
+   * causal gate and the keyed ordering gate — so an out-of-range
+   * message never enters the per-key reorder buffer and never
+   * disturbs per-key sequence order; in-range messages keep the
+   * usual per-key `keySeq` ordering, and the range composes with
+   * ack, dedup and filters exactly like any other subscriber-side
+   * narrowing (a skipped message counts as filtered: never queued,
+   * no throttle or credit budget burned, no ack obligation, and the
+   * per-topic baseline advances over it so it never surfaces as a
+   * sequence gap). Both ends present with `start >= end` throws
+   * `RangeError` at subscribe time; a non-string end throws too.
+   */
+  keyRange?: KeyRangeOptions;
   /**
    * Opt-in subscription lease, in milliseconds (see `src/lease.ts`,
    * EB-69): the subscription automatically unsubscribes when the lease
@@ -6717,6 +6755,14 @@ export interface BusStats {
    */
   rampingSubscribers: number;
   /**
+   * Live subscriptions with a key range (see
+   * `SubscribeOptions.keyRange`, EB-232): subscribers that only
+   * receive keyed messages whose key falls in their `[start, end)`
+   * range. 0 when no subscription opted in — the field is always
+   * present, so readers never need a fallback.
+   */
+  keyRangeSubscribers: number;
+  /**
    * Per-subscriber sliding-window rate-limit backlog (see
    * `SubscribeOptions.rateLimit`): one row per subscriber with the limit
    * enabled, carrying the messages currently held back for lack of window
@@ -7964,6 +8010,14 @@ interface Subscriber {
    * the gate is inert.
    */
   subscriberMaxPayloadBytes?: number;
+  /**
+   * Key range for this subscription (see
+   * `SubscribeOptions.keyRange`, EB-232). Undefined means no range
+   * narrowing — the subscriber receives keyed and keyless messages
+   * as before. Present only when the subscriber opted in, so a
+   * non-opt-in subscriber pays nothing for it in the fan-out path.
+   */
+  keyRange?: KeyRangeOptions;
   /**
    * The most recent message this subscriber's delivery-sampling gate
    * skipped (EB-152), by identity. The group fan-out checks it right
@@ -22343,6 +22397,7 @@ export class EventBus {
         ['ackLatency', opts?.ackLatency],
         ['maxInflight', opts?.maxInflight],
         ['topicFairness', opts?.topicFairness],
+        ['keyRange', opts?.keyRange],
       ];
       for (const [name, value] of incompatible) {
         if (value !== undefined && value !== false) {
@@ -22363,6 +22418,27 @@ export class EventBus {
       (!Number.isInteger(subscriberMaxPayloadBytes) || subscriberMaxPayloadBytes <= 0)
     ) {
       throw new RangeError('subscribe: subscriberMaxPayloadBytes must be a positive integer number of bytes');
+    }
+    // Key-range subscription (EB-232): validated before anything
+    // registers, so a throw leaves no half-registered subscriber behind.
+    const keyRange = opts?.keyRange;
+    if (keyRange !== undefined) {
+      if (typeof keyRange !== 'object' || keyRange === null) {
+        throw new RangeError('subscribe: keyRange must be an object with optional start/end strings');
+      }
+      if (keyRange.start !== undefined && typeof keyRange.start !== 'string') {
+        throw new RangeError('subscribe: keyRange.start must be a string');
+      }
+      if (keyRange.end !== undefined && typeof keyRange.end !== 'string') {
+        throw new RangeError('subscribe: keyRange.end must be a string');
+      }
+      if (
+        keyRange.start !== undefined &&
+        keyRange.end !== undefined &&
+        keyRange.start >= keyRange.end
+      ) {
+        throw new RangeError('subscribe: keyRange.start must be < keyRange.end');
+      }
     }
     // Subscription lease (EB-69): validated before anything registers, so
     // a throw leaves no half-registered subscriber behind.
@@ -22739,6 +22815,10 @@ export class EventBus {
       // cap; when absent the delivery gate inherits the topic's EB-120
       // payload cap at delivery time.
       subscriberMaxPayloadBytes,
+      // Key-range subscription (EB-232): the resolved range, stored
+      // as given — the caller-owned object is never aliased, so later
+      // mutations of `opts.keyRange` cannot change the subscription.
+      keyRange: keyRange === undefined ? undefined : { ...keyRange },
       // Time-travel replay catch-up (EB-203): mirrors the subscribe
       // option — `replayRange` pauses this subscriber's live drain
       // while it replays history, when true.
@@ -36871,6 +36951,30 @@ export class EventBus {
       if (barrierGate === undefined) return false;
       return this.admitBarrier(subscriber, barrierGate, msg, barrier.epoch);
     }
+    // Key-range subscription (EB-232): the range decision runs before
+    // delivery — before the window hold, the barrier hold, the causal
+    // gate and the keyed ordering gate — so an out-of-range message
+    // never enters the per-key reorder buffer and never disturbs
+    // per-key sequence order, and a keyless message (no key to
+    // compare) never matches a key-range subscription. A skip is a
+    // deliberate subscriber-side narrowing with filter-like
+    // semantics: never queued, no throttle or credit budget burned,
+    // no ack obligation, and the per-topic baseline advances over it
+    // so it never surfaces as a sequence gap (see countFiltered).
+    // Barrier control messages never reach this gate — they returned
+    // above — so a cut marker can never be swallowed by a range.
+    const keyRange = subscriber.keyRange;
+    if (keyRange !== undefined) {
+      const key = keyed?.key;
+      if (
+        key === undefined ||
+        (keyRange.start !== undefined && key < keyRange.start) ||
+        (keyRange.end !== undefined && key >= keyRange.end)
+      ) {
+        this.countFiltered(subscriber, msg.topic, msg.seq, msg.epoch ?? '', msg.partition ?? 0);
+        return false;
+      }
+    }
     // Delivery-window gate (EB-230): runs after the schema gate and
     // after barrier control handling — a cut marker must never wait
     // for a calendar — and before the barrier / causal / keyed gates,
@@ -40492,6 +40596,7 @@ export class EventBus {
     let replayThrottled = 0;
     let creditExhaustedSubscribers = 0;
     let rampingSubscribers = 0;
+    let keyRangeSubscribers = 0;
     let migratingSubscribers = 0;
     let drainingSubscribers = 0;
     const deliveryLatency: BusStats['deliveryLatency'] = [];
@@ -40556,6 +40661,9 @@ export class EventBus {
       if (subscriber.credits?.exhaustedLatch === true) creditExhaustedSubscribers += 1;
       const slowStart = subscriber.slowStart;
       if (slowStart !== undefined && !slowStart.isComplete(ratesNow)) rampingSubscribers += 1;
+      // Key-range subscription (EB-232): live subscriptions that opted
+      // into a key range.
+      if (subscriber.keyRange !== undefined) keyRangeSubscribers += 1;
       // Subscriber labels (EB-213): fold this subscription's labels into
       // the per-(key, value) aggregation — a subscriber with N labels
       // contributes to N rows, which is what makes the dimension a proper
@@ -41119,6 +41227,7 @@ export class EventBus {
       replayThrottled,
       creditExhaustedSubscribers,
       rampingSubscribers,
+      keyRangeSubscribers,
       // Request–reply RPC (EB-178): lifetime counters plus the live
       // waiter count — pending requests that would time out or be
       // rejected by close().

@@ -6489,6 +6489,37 @@ window) and to WR-52 (the relay's inbound quiet hours, not a
 bus subscriber window). (Real-time systems: subscriber-side
 traffic shaping.)
 
+## Key-range subscriptions (EB-232)
+
+`SubscribeOptions.keyRange` narrows a subscription to one slice of
+the key space: only keyed messages (`PublishOptions.key`, EB-36)
+whose key falls in `[start, end)` under string lexicographic
+comparison are delivered. Either end may be omitted for an unbounded
+side, and `{}` matches every keyed message.
+
+```ts
+bus.subscribe('orders.**', handler, {
+  keyRange: { start: 'b', end: 'd' }, // 'b', 'c' — never 'a', 'd', or keyless
+});
+```
+
+Only keyed delivery is affected: a keyless message has no key to
+compare, so it never matches a key-range subscription, and a
+subscription without `keyRange` receives keyed and keyless messages
+exactly as before. The range decision runs before delivery — before
+the window hold, the causal gate and the keyed ordering gate — so an
+out-of-range message never enters the per-key reorder buffer and
+never disturbs per-key `keySeq` order; in-range messages keep the
+usual per-key ordering, and the range composes with ack, dedup and
+content filters. A skip counts as filtered: never queued, no throttle
+or credit budget burned, no ack obligation on reliable subscriptions,
+and the per-topic baseline advances over it so it never surfaces as a
+sequence gap. Both ends present with `start >= end` throws `RangeError`
+at subscribe time, as does a non-string end; a key range cannot be
+combined with a shadow subscription. `getStats().keyRangeSubscribers`
+counts live key-range subscriptions. (Real-time systems: key-range
+subscription.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into
