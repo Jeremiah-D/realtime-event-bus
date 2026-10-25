@@ -280,6 +280,11 @@ import {
 } from './namespace.ts';
 import { DelayHeap, type DelayedEntry } from './delayed.ts';
 import {
+  DeliveryWindowGate,
+  resolveDeliveryWindowOptions,
+  type DeliveryWindowOptions,
+} from './delivery-window.ts';
+import {
   parseCronExpression,
   nextCronOccurrence,
   type CronSchedule,
@@ -549,6 +554,21 @@ export { compileFilterExpression } from './filterexpr.ts';
 export type { CompiledFilterExpression, FilterOperator, FilterPathSegment } from './filterexpr.ts';
 export { NO_FILTER_VERSION, TopicFilterVersions } from './filter-version.ts';
 export type { FilterVersionRecord, FilterVersionedRecord } from './filter-version.ts';
+export { DeliveryWindowGate } from './delivery-window.ts';
+export type {
+  DeliveryWindow,
+  DeliveryWindowHeld,
+  DeliveryWindowOptions,
+  ResolvedDeliveryWindow,
+  ResolvedDeliveryWindowOptions,
+} from './delivery-window.ts';
+export {
+  isInDeliveryWindow,
+  isInDeliveryWindows,
+  nextDeliveryWindowOpenMs,
+  resolveDeliveryWindow,
+  resolveDeliveryWindowOptions,
+} from './delivery-window.ts';
 export type { SchemaMigrateFn, SchemaMigrationStep } from './schemamigrate.ts';
 export type {
   StreamJoinHow,
@@ -2547,6 +2567,39 @@ export interface SubscribeOptions {
    * never see barrier control messages at all.
    */
   barrier?: boolean | BarrierSubscribeOptions;
+  /**
+   * Opt-in subscriber delivery windows (EB-230, see
+   * `src/delivery-window.ts`): a recurring `HH:MM-HH:MM` calendar
+   * shape for this subscriber, with weekday sets and an IANA time
+   * zone per window. Messages published while every window is
+   * closed wait in a pre-queue hold — never dropped, never
+   * queued — and flush in arrival order when a window opens
+   * (on the next arrival for this subscriber, or when the
+   * operator calls `flushDeliveryWindows()`). Absent (or an
+   * empty window list) means all-day delivery, exactly as
+   * before.
+   *
+   * The hold is pre-queue, so it consumes no backpressure
+   * budget and no throttle credit; backpressure, filters and
+   * throttles still apply at flush time, when the message
+   * finally enters the normal pipeline. A held message has no
+   * delivery handle yet, so a reliable subscriber's ack timer
+   * starts at flush, not at arrival — window waiting never
+   * counts toward an ack timeout — and its TTL is not extended
+   * by the hold, so a message that expires while waiting is
+   * dropped as expired at flush, never delivered stale.
+   * Durable-log replays and
+   * backfills bypass the gate (history catch-up is not live
+   * shaping), and barrier control messages bypass it too.
+   * `maxHoldMs` caps the wait: once the oldest held message
+   * has waited longer than it, new arrivals are refused
+   * fail-closed (counted in `getStats().deliveryWindow`,
+   * never silently dropped) while the already-held messages
+   * still flush when the window opens. Unsubscribing discards
+   * the hold with the subscriber, like any undelivered backlog.
+   * Malformed windows throw `RangeError` at subscribe time.
+   */
+  deliveryWindows?: DeliveryWindowOptions;
   /**
    * Opt-in subscriber-side batch delivery. When enabled, the drain
    * collects up to `maxSize` queued messages and invokes the handler once
@@ -7034,6 +7087,37 @@ export interface BusStats {
     overflowedHolds: number;
   };
   /**
+   * Delivery-window gate state (see `SubscribeOptions.deliveryWindows`,
+   * EB-230). Always present — zeros when no subscriber opted into
+   * delivery windows.
+   */
+  deliveryWindow: {
+    /**
+     * Messages currently held behind closed windows, across all
+     * subscribers — the live window backlog.
+     */
+    heldMessages: number;
+    /**
+     * Held messages that already exceed their subscriber's
+     * `maxHoldMs` — the overlong backlog that will refuse new
+     * arrivals until the window opens.
+     */
+    overlongMessages: number;
+    /**
+     * Messages ever held by delivery windows (cumulative).
+     */
+    heldTotal: number;
+    /**
+     * Messages ever flushed from delivery windows (cumulative).
+     */
+    flushedMessages: number;
+    /**
+     * Arrivals refused by the max-hold fail-closed rule
+     * (cumulative).
+     */
+    rejectedMessages: number;
+  };
+  /**
    * The hottest per-(subscriber, key) ordering streams by current
    * reorder-buffer depth (see `SubscribeOptions.keyHotspot` and
    * `src/keyhotspot.ts`), hottest first — at most `HOT_KEYS_LIMIT` (10)
@@ -8027,6 +8111,14 @@ interface Subscriber {
    * zero overhead, zero behavior change.
    */
   barrier?: BarrierGateState;
+  /**
+   * Per-subscriber delivery-window gate (see
+   * `SubscribeOptions.deliveryWindows`, EB-230). Present only when
+   * the subscriber opted in — without it the subscriber holds
+   * nothing and every message flows as before: zero overhead,
+   * zero behavior change.
+   */
+  deliveryWindow?: DeliveryWindowGate;
   /**
    * Per-subscriber health probing state (see `SubscribeOptions.healthProbe`).
    * Absent when the probe is disabled for this subscriber.
@@ -14169,6 +14261,22 @@ export class EventBus {
    * once and the barrier disarmed. Monotonic.
    */
   private totalBarrierOverflows = 0;
+  /**
+   * Delivery-window holds (EB-230) — messages that arrived while a
+   * subscriber's windows were closed and waited in the pre-queue
+   * hold. Monotonic.
+   */
+  private totalWindowHeld = 0;
+  /**
+   * Delivery-window flushes (EB-230) — held messages re-injected
+   * into the pipeline when a window opened. Monotonic.
+   */
+  private totalWindowFlushed = 0;
+  /**
+   * Delivery-window refusals (EB-230) — arrivals refused by the
+   * max-hold fail-closed rule. Monotonic.
+   */
+  private totalWindowRejected = 0;
   /**
    * Per-topic sliding-window publish rate table (see `src/rates.ts`).
    * Sampled once per accepted publish in `fanOut` — after the admission
@@ -22389,6 +22497,12 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const barrier = resolveBarrierOptions(opts?.barrier);
+    // Delivery windows (EB-230): validated before anything
+    // registers, so a throw leaves no half-registered subscriber
+    // behind.
+    const deliveryWindowOpts = resolveDeliveryWindowOptions(opts?.deliveryWindows);
+    const deliveryWindow =
+      deliveryWindowOpts === undefined ? undefined : new DeliveryWindowGate(deliveryWindowOpts);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const batch = resolveBatchDeliveryOptions(opts?.batch);
@@ -22673,6 +22787,8 @@ export class EventBus {
       causal,
       // Barrier cut-marker gate (EB-98): opt-in per subscriber.
       barrier,
+      // Delivery-window gate (EB-230): opt-in per subscriber.
+      deliveryWindow,
       batch,
       window,
       sessionWindow,
@@ -36755,6 +36871,46 @@ export class EventBus {
       if (barrierGate === undefined) return false;
       return this.admitBarrier(subscriber, barrierGate, msg, barrier.epoch);
     }
+    // Delivery-window gate (EB-230): runs after the schema gate and
+    // after barrier control handling — a cut marker must never wait
+    // for a calendar — and before the barrier / causal / keyed gates,
+    // so a flushed message re-enters the full pipeline. A held message
+    // has no delivery handle yet, so a reliable subscriber's ack timer
+    // starts at flush, not at arrival; its TTL is not extended by the
+    // hold, so a message that expires while waiting is dropped as
+    // expired at flush, never delivered stale.
+    const windowGate = subscriber.deliveryWindow;
+    if (windowGate !== undefined) {
+      const nowMs = this.now();
+      if (windowGate.isOpen(nowMs)) {
+        const held = windowGate.flush(nowMs);
+        if (held.length > 0) {
+          this.totalWindowFlushed += held.length;
+          for (const h of held) {
+            this.deliverToSubscriber(
+              subscriber,
+              h.msg as BusMessage,
+              h.expiresAt,
+              h.rawPayload,
+              h.keyed,
+              h.causal,
+            );
+          }
+          this.scheduleFlush();
+        }
+      } else {
+        const outcome = windowGate.hold(
+          { msg, expiresAt, rawPayload, keyed, causal, heldAtMs: nowMs },
+          nowMs,
+        );
+        if (outcome === 'rejected') {
+          this.totalWindowRejected += 1;
+          return false;
+        }
+        this.totalWindowHeld += 1;
+        return true;
+      }
+    }
     if (barrierGate !== undefined && barrierGate.armedEpoch !== null) {
       // A barrier is armed: this message arrived after the cut in
       // delivery order — hold it behind the barrier until the barrier
@@ -40282,6 +40438,41 @@ export class EventBus {
   }
 
   /**
+   * Flushes every delivery-window hold whose windows are open on the
+   * bus clock (EB-230): held messages re-enter the normal pipeline
+   * in arrival order, per subscriber. A no-op for subscribers whose
+   * windows are still closed, and for subscribers without windows.
+   * The bus also flushes on the next arrival for a windowed
+   * subscriber, so this call is the operator's way to release a
+   * backlog the moment a window opens without waiting for new
+   * traffic. Returns how many held messages were flushed.
+   */
+  flushDeliveryWindows(): number {
+    const nowMs = this.now();
+    let flushed = 0;
+    for (const subscriber of this.subscribers.values()) {
+      const gate = subscriber.deliveryWindow;
+      if (gate === undefined) continue;
+      const held = gate.flush(nowMs);
+      if (held.length === 0) continue;
+      this.totalWindowFlushed += held.length;
+      flushed += held.length;
+      for (const h of held) {
+        this.deliverToSubscriber(
+          subscriber,
+          h.msg as BusMessage,
+          h.expiresAt,
+          h.rawPayload,
+          h.keyed,
+          h.causal,
+        );
+      }
+    }
+    if (flushed > 0) this.scheduleFlush();
+    return flushed;
+  }
+
+  /**
    * Returns a point-in-time snapshot of live bus metrics: active
    * subscriptions (total and per pattern) plus per-topic fan-out widths and
    * publish counts. The snapshot is a plain-data copy — mutating it does
@@ -40333,6 +40524,8 @@ export class EventBus {
     >();
     let causalBufferDepth = 0;
     let barrierHeldMessages = 0;
+    let windowHeldMessages = 0;
+    let windowOverlongMessages = 0;
     for (const subscriber of this.subscribers.values()) {
       unackedDeliveries += subscriber.reliable?.tracker.unackedCount ?? 0;
       // Subscription migration (EB-82): a paused-for-export subscription
@@ -40432,6 +40625,14 @@ export class EventBus {
       const barrierGate = subscriber.barrier;
       if (barrierGate !== undefined) {
         barrierHeldMessages += barrierGate.held.length;
+      }
+      // Delivery-window hold depth (EB-230): messages currently
+      // waiting for a window, per opted-in subscriber, plus how many
+      // of them already exceed the subscriber's max hold.
+      const windowGate = subscriber.deliveryWindow;
+      if (windowGate !== undefined) {
+        windowHeldMessages += windowGate.heldMessages;
+        windowOverlongMessages += windowGate.overlongCount(ratesNow);
       }
       const rateLimit = subscriber.rateLimit;
       if (rateLimit != null) {
@@ -40973,6 +41174,13 @@ export class EventBus {
         heldMessages: barrierHeldMessages,
         releasedMessages: this.totalBarrierReleased,
         overflowedHolds: this.totalBarrierOverflows,
+      },
+      deliveryWindow: {
+        heldMessages: windowHeldMessages,
+        overlongMessages: windowOverlongMessages,
+        heldTotal: this.totalWindowHeld,
+        flushedMessages: this.totalWindowFlushed,
+        rejectedMessages: this.totalWindowRejected,
       },
       hotKeys: hottestKeys,
       // Subscriber labels (EB-213): per-(key, value) live-subscription and

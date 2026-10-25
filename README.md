@@ -6409,6 +6409,51 @@ validates one schema version, not the predicate), and to EB-147
 subscriber-side predicate). (Real-time systems: subscription
 filter governance.)
 
+## Subscriber delivery windows (EB-230)
+
+`SubscribeOptions.deliveryWindows` (`src/delivery-window.ts`,
+re-exported from `src/bus.ts`) gives a subscriber a recurring
+calendar shape: messages published outside its windows wait in a
+pre-queue hold and flush in arrival order when a window opens —
+on the next arrival for that subscriber, or when the operator
+calls `flushDeliveryWindows()`.
+
+```ts
+bus.subscribe('market.**', handler, {
+  deliveryWindows: {
+    windows: [{ start: '09:00', end: '17:00', days: [1, 2, 3, 4, 5], timeZone: 'UTC' }],
+    maxHoldMs: 3_600_000,
+  },
+});
+```
+
+Window rules: `start` is inclusive, `end` is exclusive; an
+overnight window (`22:00-02:00`) spans midnight, with the
+after-midnight hours belonging to the day the window started;
+`start` equal to `end` means the whole listed day, never an
+empty window; `days` defaults to every weekday and `timeZone`
+defaults to `UTC`, and an unknown zone throws `RangeError` at
+subscribe time instead of silently falling back to the server's
+zone. The hold is pre-queue, like the EB-98 barrier hold: it
+consumes no backpressure budget and no throttle credit, and
+backpressure, filters and throttles still apply at flush time.
+A held message has no delivery handle yet, so a reliable
+subscriber's ack timer starts at flush — window waiting never
+counts toward an ack timeout — and its TTL is not extended by
+the hold, so a message that expires while waiting is dropped
+as expired at flush. `maxHoldMs` caps the wait: once the
+oldest held message has waited longer than it, new arrivals
+are refused fail-closed (counted in
+`getStats().deliveryWindow`, never silently dropped) while the
+already-held messages still flush on open. Durable-log
+replays and backfills bypass the gate (history catch-up is not
+live shaping), as do barrier control messages; unsubscribing
+discards the hold with the subscriber. Orthogonal to
+`delayed.ts` (a one-shot future fan-out, not a recurring
+window) and to WR-52 (the relay's inbound quiet hours, not a
+bus subscriber window). (Real-time systems: subscriber-side
+traffic shaping.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into
