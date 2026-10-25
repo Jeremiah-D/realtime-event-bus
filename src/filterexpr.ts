@@ -73,6 +73,13 @@ export interface CompiledFilterExpression {
   /** The original expression source, verbatim. */
   readonly source: string;
   /**
+   * The filter-version stamp assigned by the caller (EB-229), when
+   * one was given. Versioning lives in `filter-version.ts`; this
+   * field is only the stamp — the predicate itself is version-free,
+   * so the same compiled form is reusable across versions.
+   */
+  readonly version: number | undefined;
+  /**
    * Evaluates the expression against a message payload. Returns `false`
    * (never throws) when a field is missing, types mismatch, or the
    * payload is not an object.
@@ -633,13 +640,36 @@ function evaluate(node: AstNode, payload: unknown): boolean {
  * Compiles a filter expression into a reusable predicate.
  *
  * @param expr the expression source, e.g. `type == "trade" && price > 100`.
+ * @param options.version an optional version stamp (EB-229), recorded
+ * on the returned object so a versioned predicate carries its version
+ * with it. Must be a positive integer when given.
  * @returns the compiled expression; `test(payload)` evaluates it and
  * never throws.
  * @throws `TypeError` when `expr` is not a string.
  * @throws `RangeError` when the expression is empty, has a syntax error,
- * uses an unknown operator, or carries an invalid regex.
+ * uses an unknown operator, carries an invalid regex, or carries an
+ * invalid version stamp.
  */
-export function compileFilterExpression(expr: string): CompiledFilterExpression {
+export function compileFilterExpression(
+  expr: string,
+  options?: { version?: number },
+): CompiledFilterExpression {
+  if (typeof expr !== 'string') {
+    throw new TypeError('filterExpr must be a string');
+  }
+  if (expr.length > MAX_EXPR_LENGTH) {
+    throw new RangeError(`filterExpr: expression exceeds ${MAX_EXPR_LENGTH} characters`);
+  }
+  if (expr.trim().length === 0) {
+    throw new RangeError('filterExpr: expression must not be empty');
+  }
+  const version = options?.version;
+  if (
+    version !== undefined &&
+    (!Number.isInteger(version) || (version as number) < 1)
+  ) {
+    throw new RangeError(`filterExpr: version must be a positive integer, got ${version}`);
+  }
   if (typeof expr !== 'string') {
     throw new TypeError('filterExpr must be a string');
   }
@@ -661,5 +691,5 @@ export function compileFilterExpression(expr: string): CompiledFilterExpression 
       return false;
     }
   };
-  return { source: expr, test };
+  return { source: expr, version, test };
 }

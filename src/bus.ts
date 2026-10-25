@@ -547,6 +547,8 @@ export type {
 export { assertValidSigningKeys, SIGNING_KID_PATTERN, SIGNATURE_HEX_LENGTH } from './signing.ts';
 export { compileFilterExpression } from './filterexpr.ts';
 export type { CompiledFilterExpression, FilterOperator, FilterPathSegment } from './filterexpr.ts';
+export { NO_FILTER_VERSION, TopicFilterVersions } from './filter-version.ts';
+export type { FilterVersionRecord, FilterVersionedRecord } from './filter-version.ts';
 export type { SchemaMigrateFn, SchemaMigrationStep } from './schemamigrate.ts';
 export type {
   StreamJoinHow,

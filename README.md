@@ -6371,6 +6371,44 @@ landable format), to EB-91 (configuration snapshots, not
 messages), and to EB-163 (remote segment storage, not an
 export interface). (Real-time systems: topic data migration.)
 
+## Versioned filter expressions (EB-229)
+
+`TopicFilterVersions` (`src/filter-version.ts`, re-exported from
+`src/bus.ts`) gives a topic's subscription filter predicate a
+versioned lifecycle, so a predicate change never silently rewrites
+what history meant. The first predicate for a topic is version 1;
+`updateTopicFilter(topic, expr)` appends version N+1 and keeps
+every older version for audit (`history()`); `rollback(topic,
+version)` appends a new version copying that historical version's
+source — the counter never rewinds, so the rollback itself is part
+of the audit trail. `compileFilterExpression` gains an optional
+`version` stamp (EB-123's predicate language is unchanged) so a
+compiled predicate carries its version with it.
+
+```ts
+const versions = new TopicFilterVersions();
+versions.createTopicFilter('trades', 'price > 100');
+versions.updateTopicFilter('trades', 'price > 200');
+versions.rollback('trades', 1); // v3 copies 'price > 100'
+versions.currentVersion('trades'); // 3
+```
+
+Replay and backfill never consult the current predicate.
+`stamp(topic, payload)` records the version in force at admit
+time, and `evaluateRecord(topic, record)` re-evaluates the record
+under exactly that version — a record admitted under v1 stays
+admitted under v1 even after the predicate tightens to v2. A
+stamp for an unknown version fails closed (`false`) instead of
+falling back to the current predicate, and a record admitted with
+no filter in force stamps version 0, which always evaluates to
+admitted: replay must not invent a filter after the fact.
+Orthogonal to EB-95 (the schema compatibility gate judges message
+structure, not the predicate), to EB-20 (SchemaValidator
+validates one schema version, not the predicate), and to EB-147
+(the publish-side transform rewrites payloads; this versions the
+subscriber-side predicate). (Real-time systems: subscription
+filter governance.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into
