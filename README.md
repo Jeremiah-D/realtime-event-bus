@@ -5020,6 +5020,41 @@ declarations are operator data, so the factory's assignor is passed
 through the `assignor` field (or resolved by name with its options via
 `resolveBuiltinPartitionAssignor('zone-aware', options)`).
 
+A fourth built-in steers by consumer lag (EB-231,
+`createLagAwarePartitionAssignor` in `src/assignor.ts`):
+
+```ts
+import { createLagAwarePartitionAssignor } from './src/assignor.ts';
+
+bus.subscribeToGroup('g', 'orders.*', handler, {
+  partitions: 12,
+  // Static snapshot, or a lagProvider sampled on every rebalance.
+  assignor: createLagAwarePartitionAssignor({
+    memberLag: { 'm-a': 0, 'm-b': 120 },
+  }),
+});
+```
+
+Per partition the member with the lowest current consumer lag wins —
+a member falling behind stops receiving new partitions until it
+catches up — and lag ties break by rendezvous hashing, so equal
+lags reproduce the plain `'rendezvous'` assignment exactly. Members
+with no lag entry rank at the worst observed lag, so they still
+compete through the tie-break instead of starving or monopolizing.
+When no lag data exists at all (no provider sample and no static
+map, or a sample covering no roster member) the assignment falls
+back to rendezvous, and a throwing or malformed provider sample
+does the same: a sampling failure never blocks a rebalance, it is
+counted in `fallbackCount()` and reported to the optional
+`onFallback` hook (`'no-lag-data'` vs `'sample-error'`). Like
+zone-aware it cannot be selected by the `assignment` string alone:
+lag is live operator data, so the factory's assignor is passed
+through the `assignor` field (or resolved by name with its options
+via `resolveBuiltinPartitionAssignor('lag-aware', options)`). It is
+orthogonal to the EB-112 lag SLO (the SLO alerts on lag, this
+places work by lag) and to sticky's minimal-migration guarantee.
+(Real-time systems: lag-aware partition placement.)
+
 Semantics notes:
 
 - `assign(partitions, members, previous)` must be pure and deterministic;

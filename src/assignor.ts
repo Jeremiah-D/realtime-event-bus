@@ -30,6 +30,14 @@
  * first-class built-in with the same pure, deterministic contract, and
  * it is resolvable by name with its options via
  * `resolveBuiltinPartitionAssignor('zone-aware', options)`.
+ * A fourth built-in, the lag-aware assignor (EB-231), is constructed
+ * with per-member consumer lag —
+ * `createLagAwarePartitionAssignor({ memberLag })` or with a
+ * `lagProvider` sampled on every rebalance — because lag is live
+ * operator data, not a bare string option: it cannot be selected by
+ * the `assignment` string alone either. It is otherwise a first-class
+ * built-in with the same contract, resolvable by name with its
+ * options via `resolveBuiltinPartitionAssignor('lag-aware', options)`.
  * An assignor should be pure and deterministic: same
  * `{ partitions, members, previous }` must yield the same assignment, so
  * every computation agrees without coordination. `previous` carries the
@@ -319,6 +327,258 @@ export function createZoneAwarePartitionAssignor(
   };
 }
 
+/**
+ * Why a member's lag fell back to rendezvous instead of steering the
+ * assignment: `'no-lag-data'` when no usable lag sample exists at all
+ * (no provider sample and no static map, or a sample that covers no
+ * roster member), `'sample-error'` when the provider threw or returned
+ * an unusable sample (not a map, or an entry that is not a finite
+ * number `>= 0`). Either way the rebalance still happens — the
+ * fallback is counted, never fatal.
+ */
+export type LagAwareFallbackReason = 'no-lag-data' | 'sample-error';
+
+/**
+ * Lag data for the lag-aware assignor (EB-231). Exactly one source is
+ * needed; when both are given the provider is consulted first and the
+ * static map is the fallback when the provider returns `undefined` or
+ * an empty map (a throwing or malformed provider sample does not fall
+ * back to the static map — it is a sample error, see below).
+ */
+export interface LagAwareAssignorOptions {
+  /**
+   * Static per-member lag snapshot (messages behind, `>= 0`):
+   * member id -> current consumer lag. Entries for members that never
+   * join are ignored, so the map may cover the full deployment
+   * roster up front. The values are conceptually the EB-48 group-lag
+   * rows attributed to members by the operator — the assignor itself
+   * never reads the bus, it only consumes the numbers it is given.
+   * Validated eagerly: a negative, non-finite, or non-numeric entry
+   * throws `RangeError` at construction.
+   */
+  readonly memberLag?: Readonly<Record<string, number>>;
+  /**
+   * Live lag source, consulted on every `assign` call: returns the
+   * current member id -> lag map, or `undefined` when no fresh sample
+   * is available (the static map, when given, is then used). A
+   * throwing provider, or a sample that is not a map of finite
+   * numbers `>= 0`, is a sample error: the assignment degrades to
+   * rendezvous for that rebalance and the fallback is counted — it
+   * never blocks the rebalance and never throws out of `assign`.
+   */
+  readonly lagProvider?: () => ReadonlyMap<string, number> | undefined;
+  /**
+   * Best-effort fallback hook, called once per degraded assignment
+   * with the reason (and the provider's error, for `'sample-error'`).
+   * A throwing hook is swallowed: monitoring must never break the
+   * rebalance path.
+   */
+  readonly onFallback?: (reason: LagAwareFallbackReason, error?: unknown) => void;
+}
+
+/**
+ * The lag-aware built-in as a `PartitionAssignor`, with its fallback
+ * accounting: `fallbackCount()` reports how many assignments so far
+ * degraded to rendezvous (no lag data, or a failed lag sample).
+ */
+export interface LagAwarePartitionAssignor extends PartitionAssignor {
+  readonly name: 'lag-aware';
+  /** Assignments so far that degraded to rendezvous (see `LagAwareFallbackReason`). */
+  fallbackCount(): number;
+}
+
+/**
+ * Validates lag-aware options and returns the normalized form: the
+ * static map as a `Map` (own entries only, so a member id like
+ * `'toString'` can never pick up an inherited property) plus the
+ * provider and fallback hook untouched. Throws `RangeError` on a bad
+ * shape or a bad static lag value — eagerly, so a bad map fails at
+ * construction, not at the first rebalance.
+ */
+function normalizeLagAwareOptions(
+  options: LagAwareAssignorOptions,
+): {
+  staticLag: Map<string, number>;
+  lagProvider?: () => ReadonlyMap<string, number> | undefined;
+  onFallback?: (reason: LagAwareFallbackReason, error?: unknown) => void;
+} {
+  if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    throw new RangeError('lag-aware assignor: options must be an object');
+  }
+  const { memberLag, lagProvider, onFallback } = options;
+  const staticLag = new Map<string, number>();
+  if (memberLag !== undefined) {
+    if (typeof memberLag !== 'object' || memberLag === null || Array.isArray(memberLag)) {
+      throw new RangeError('lag-aware assignor: `memberLag` must be an object mapping member id -> lag');
+    }
+    for (const [member, value] of Object.entries(memberLag)) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw new RangeError(
+          `lag-aware assignor: lag of member '${member}' must be a finite number >= 0`,
+        );
+      }
+      staticLag.set(member, value);
+    }
+  }
+  if (lagProvider !== undefined && typeof lagProvider !== 'function') {
+    throw new RangeError('lag-aware assignor: `lagProvider` must be a function when set');
+  }
+  if (onFallback !== undefined && typeof onFallback !== 'function') {
+    throw new RangeError('lag-aware assignor: `onFallback` must be a function when set');
+  }
+  return { staticLag, lagProvider, onFallback };
+}
+
+/**
+ * Validates one provider sample. Returns the sample as a `Map` when
+ * every entry is a string member id mapped to a finite number `>= 0`,
+ * and `undefined` when the sample is unusable — not a map, or any bad
+ * entry — so the caller can degrade to rendezvous instead of trusting
+ * a half-valid sample.
+ */
+function validateLagSample(
+  sample: ReadonlyMap<string, number>,
+): Map<string, number> | undefined {
+  if (!(sample instanceof Map)) return undefined;
+  const out = new Map<string, number>();
+  for (const [member, value] of sample) {
+    if (typeof member !== 'string' || typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return undefined;
+    }
+    out.set(member, value);
+  }
+  return out;
+}
+
+/**
+ * Lag-aware assignment (EB-231), as a pure function.
+ *
+ * Per partition, the member with the lowest current consumer lag
+ * wins — a member falling behind stops receiving new partitions
+ * until it catches up, which is the point: new work goes to the
+ * members that are keeping up. Lag ties are broken by the same
+ * rendezvous hashing used for members, so the tie-break is total
+ * and deterministic, and when every member's lag is equal the result
+ * is byte-identical to the plain `'rendezvous'` assignment.
+ *
+ * Members with no lag entry rank at the worst observed lag: they
+ * still compete (via the rendezvous tie-break against the worst-lag
+ * members) instead of starving behind sampled members or
+ * monopolizing work as an assumed zero. When no roster member has a
+ * lag entry at all there is nothing to steer by, so the assignment
+ * is the plain rendezvous assignment — the same fallback the
+ * factory counts as `'no-lag-data'`.
+ *
+ * Like rendezvous and zone-aware, this assignor is stateless with
+ * respect to `previous`: it is a pure function of the roster and
+ * the lag snapshot, so every computation agrees without
+ * coordination. It is orthogonal to both other built-ins and to
+ * the EB-112 lag SLO: the SLO is alerting on lag, this is
+ * placement steered by lag, and sticky's minimal-migration
+ * guarantee is a different axis (a future sticky+lag combination
+ * would be a fifth strategy, not a change to this one).
+ */
+export function lagAwareAssignment(
+  partitions: number,
+  members: string[],
+  lag: ReadonlyMap<string, number>,
+): Map<number, string> {
+  const assignment = new Map<number, string>();
+  if (partitions <= 0 || members.length === 0) return assignment;
+  let worst = -1;
+  for (const m of members) {
+    const value = lag.get(m);
+    if (value !== undefined && value > worst) worst = value;
+  }
+  if (worst < 0) {
+    // No roster member has lag data: nothing to steer by.
+    return rendezvousPartitionAssignor.assign(partitions, members);
+  }
+  for (let p = 0; p < partitions; p++) {
+    let best: string | undefined;
+    let bestLag = Infinity;
+    let bestScore = -1n;
+    for (const m of members) {
+      const memberLag = lag.get(m) ?? worst;
+      const score = rendezvousScore(p, m);
+      // Lowest lag wins; ties go to the highest rendezvous score,
+      // roster order breaks the (astronomically unlikely) remainder.
+      if (memberLag < bestLag || (memberLag === bestLag && score > bestScore)) {
+        best = m;
+        bestLag = memberLag;
+        bestScore = score;
+      }
+    }
+    if (best !== undefined) assignment.set(p, best);
+  }
+  return assignment;
+}
+
+/**
+ * The lag-aware built-in as a `PartitionAssignor` (EB-231), named
+ * `'lag-aware'`. Options are validated eagerly, so a bad static map
+ * fails at construction — not at the first rebalance. A provider
+ * sample failure never fails the rebalance: the assignment for that
+ * rebalance degrades to rendezvous, `fallbackCount()` increments,
+ * and `onFallback` fires (best-effort). Pass the result as
+ * `GroupSubscribeOptions.assignor`; the group's first member fixes
+ * it like any other assignor.
+ */
+export function createLagAwarePartitionAssignor(
+  options: LagAwareAssignorOptions,
+): LagAwarePartitionAssignor {
+  const { staticLag, lagProvider, onFallback } = normalizeLagAwareOptions(options);
+  let fallbacks = 0;
+  const degrade = (
+    reason: LagAwareFallbackReason,
+    partitions: number,
+    members: string[],
+    error?: unknown,
+  ): Map<number, string> => {
+    fallbacks += 1;
+    if (onFallback !== undefined) {
+      try {
+        onFallback(reason, error);
+      } catch {
+        // Monitoring is best-effort: a throwing hook must not
+        // propagate into the rebalance path.
+      }
+    }
+    return rendezvousPartitionAssignor.assign(partitions, members);
+  };
+  return {
+    name: 'lag-aware',
+    fallbackCount: () => fallbacks,
+    assign(partitions: number, members: string[]): Map<number, string> {
+      if (partitions <= 0 || members.length === 0) return new Map<number, string>();
+      let sample: Map<string, number> | undefined;
+      if (lagProvider !== undefined) {
+        try {
+          const provided = lagProvider();
+          if (provided !== undefined) {
+            sample = validateLagSample(provided);
+            if (sample === undefined) {
+              return degrade('sample-error', partitions, members);
+            }
+          }
+        } catch (err) {
+          return degrade('sample-error', partitions, members, err);
+        }
+      }
+      if (sample === undefined || sample.size === 0) {
+        sample = staticLag.size > 0 ? staticLag : undefined;
+      }
+      if (sample === undefined) {
+        return degrade('no-lag-data', partitions, members);
+      }
+      if (!members.some((m) => sample.has(m))) {
+        return degrade('no-lag-data', partitions, members);
+      }
+      return lagAwareAssignment(partitions, members, sample);
+    },
+  };
+}
+
 /** Resolves one of the built-in strategy names to its assignor. */
 export function resolveBuiltinPartitionAssignor(
   name: 'rendezvous' | 'sticky',
@@ -328,8 +588,12 @@ export function resolveBuiltinPartitionAssignor(
   options: ZoneAwareAssignorOptions,
 ): PartitionAssignor;
 export function resolveBuiltinPartitionAssignor(
-  name: 'rendezvous' | 'sticky' | 'zone-aware',
-  options?: ZoneAwareAssignorOptions,
+  name: 'lag-aware',
+  options: LagAwareAssignorOptions,
+): LagAwarePartitionAssignor;
+export function resolveBuiltinPartitionAssignor(
+  name: 'rendezvous' | 'sticky' | 'zone-aware' | 'lag-aware',
+  options?: ZoneAwareAssignorOptions | LagAwareAssignorOptions,
 ): PartitionAssignor {
   if (name === 'sticky') return stickyPartitionAssignor;
   if (name === 'zone-aware') {
@@ -338,7 +602,15 @@ export function resolveBuiltinPartitionAssignor(
         `resolveBuiltinPartitionAssignor: 'zone-aware' requires zone declarations — pass { memberZones } as the second argument (or use createZoneAwarePartitionAssignor)`,
       );
     }
-    return createZoneAwarePartitionAssignor(options);
+    return createZoneAwarePartitionAssignor(options as ZoneAwareAssignorOptions);
+  }
+  if (name === 'lag-aware') {
+    if (options === undefined) {
+      throw new RangeError(
+        `resolveBuiltinPartitionAssignor: 'lag-aware' requires lag data — pass { memberLag } or { lagProvider } as the second argument (or use createLagAwarePartitionAssignor)`,
+      );
+    }
+    return createLagAwarePartitionAssignor(options as LagAwareAssignorOptions);
   }
   return rendezvousPartitionAssignor;
 }
