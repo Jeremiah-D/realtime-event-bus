@@ -3525,6 +3525,20 @@ export class DurableTopicLog {
    * untouched, and seq-0 schedule records (timer intents, requested via a
    * negative bound by delayed-delivery recovery) are never deduped.
    */
+  /**
+   * EB-228: raw live records for `topic` in file (ascending seq)
+   * order, with no key-compaction view applied — the export
+   * counterpart of the fork/merge/split raw reads, which use
+   * `readFileRecordsSince` for exactly this reason: a migration
+   * export that silently dropped superseded keyed values would
+   * not be a migration. Archived segments are not included (the
+   * export is the live log's snapshot, like the fork's), and
+   * seq-0 schedule records are the caller's to filter.
+   */
+  readLiveRecords(topic: string): DurableLogRecord[] {
+    return this.readFileRecordsSince(topic, 0);
+  }
+
   readSince(
     topic: string,
     fromSeqExclusive: number,

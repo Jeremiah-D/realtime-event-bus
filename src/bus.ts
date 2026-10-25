@@ -157,6 +157,7 @@ import {
   type RemediationReport,
 } from './remediate.ts';
 import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
+import { exportTopicData as exportTopicDataFromLog, importTopicData as importTopicDataIntoLog, type ImportTopicDataResult } from './topic-data-export.ts';
 import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
 import {
@@ -35387,6 +35388,141 @@ export class EventBus {
       },
     });
     return { ...result, lifecycleProvisioned: provisionedA && provisionedB, sourceTombstoned };
+  }
+
+  /**
+   * Exports one topic's durable-log history as JSONL (EB-228):
+   * one line per live message record, in seq order, each line
+   * carrying only `seq`/`payload`/`key`/`timestamp` — see
+   * `src/topic-data-export.ts` for the format, the signature
+   * rule, and what is deliberately not exported. Read-only: it
+   * changes no topic state and provisions nothing. Fail-closed:
+   * an unknown topic or a history holding a binary record both
+   * throw `RangeError`. A topic the bus knows but with no durable
+   * records — e.g. the target of an empty import — exports as
+   * the empty string, not an error: no history is an empty
+   * history, not a missing topic.
+   */
+  exportTopicData(topic: string): string {
+    assertValidLifecycleTopicName(topic, 'exportTopicData');
+    if (topic.includes('/')) {
+      throw new RangeError('exportTopicData: topic must be a concrete global topic name, not a namespaced topic');
+    }
+    if (!this.topicHasState(topic)) {
+      throw new RangeError(`exportTopicData: unknown topic "${topic}"`);
+    }
+    const log = this.durableLogForTopic(topic);
+    if (log === undefined) {
+      throw new RangeError('exportTopicData: export requires a durable log (no durableLogDir configured)');
+    }
+    if (!log.topics().includes(topic)) {
+      return '';
+    }
+    return exportTopicDataFromLog(log, topic);
+  }
+
+  /**
+   * Imports JSONL topic data into a brand-new topic (EB-228):
+   * `importTopicData('orders.v2', jsonl)` replays the batch in
+   * order, renumbering seq from 1, so the target reads as a
+   * topic that was always the target — the migration counterpart
+   * of `forkTopic` (same log, in-process) for history arriving
+   * from another bus, a file, or an object store. See
+   * `src/topic-data-export.ts` for the format and the
+   * fail-closed batch rules (an already-used target or any bad
+   * record throws `RangeError` with zero records written).
+   *
+   * Ordering mirrors `forkTopic`: the durable log imports
+   * first (it validates the whole batch before writing, so a
+   * failed import leaves the bus untouched), then the bus seeds
+   * the target's sequence counters and stats from the imported
+   * log (the `recoverLogState` pattern, scoped to one topic),
+   * provisions the target's lifecycle record, and audits
+   * `topic_data_imported` — so a subsequent publish continues
+   * the target's numbering instead of restarting at 1 and
+   * colliding with imported seqs. The target starts with no
+   * subscribers, no rules and no retained state, like the fork's
+   * target: subscribers are never moved by an import.
+   */
+  importTopicData(
+    targetTopic: string,
+    records: string | unknown[],
+    opts?: { actor?: string },
+  ): ImportTopicDataResult & { lifecycleProvisioned: boolean } {
+    assertValidLifecycleTopicName(targetTopic, 'importTopicData');
+    if (targetTopic.includes('/')) {
+      throw new RangeError('importTopicData: targetTopic must be a concrete global topic name, not a namespaced topic');
+    }
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'importTopicData');
+    if (this.topicHasState(targetTopic)) {
+      throw new RangeError(`importTopicData: target topic "${targetTopic}" is already in use`);
+    }
+    const log = this.durableLogForTopic(targetTopic);
+    if (log === undefined) {
+      throw new RangeError('importTopicData: import requires a durable log (no durableLogDir configured)');
+    }
+    // Durable log first: it throws before mutating on any failure.
+    const result = importTopicDataIntoLog(log, targetTopic, records);
+    // Seed the target's sequence counters from the imported log
+    // (the recoverLogState pattern, scoped to one topic), so the
+    // next publish continues the target's numbering.
+    const partitionSeqs = log.recoveredPartitionSeqs(targetTopic);
+    if (partitionSeqs.size === 0) {
+      if (result.targetLastSeq > 0) {
+        this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, 0), result.targetLastSeq);
+        this.seedPartitionPublished(targetTopic, 0, result.targetLastSeq);
+      }
+    } else {
+      for (const [partition, seq] of partitionSeqs) {
+        this.topicSeq.set(EventBus.partitionSeqKey(targetTopic, partition), seq);
+        this.seedPartitionPublished(targetTopic, partition, seq);
+      }
+    }
+    this.topicStats.set(targetTopic, {
+      subscriberCount: 0,
+      publishedMessages: log.messageCount(targetTopic),
+      expiredMessages: 0,
+      missedDeadlineMessages: 0,
+      lastSeq: result.targetLastSeq,
+      sequenceGaps: 0,
+      rateLimitedMessages: 0,
+      publisherRateLimited: 0,
+      pausedMessages: 0,
+      circuitBrokenMessages: 0,
+      rejectedMessages: 0,
+      lateMessages: 0,
+      duplicateMessages: 0,
+      casMismatches: 0,
+      idempotentHits: 0,
+      aliasRetiredMessages: 0,
+      lineageCycleRejections: 0,
+      redactedFields: 0,
+      filteredMessages: 0,
+      sampledDeliveries: 0,
+      sampleDropped: 0,
+      dedupDropped: 0,
+      compressedMessages: 0,
+      compressedBytesBefore: 0,
+      compressedBytesAfter: 0,
+      compressionTimeMs: 0,
+      lanes: {
+        queued: zeroedLaneCounts(),
+        delivered: zeroedLaneCounts(),
+        dropped: zeroedLaneCounts(),
+      },
+    });
+    const { created } = this.topicLifecycle.provision(targetTopic, undefined, this.now());
+    this.auditSubscription({
+      action: 'topic_data_imported',
+      actor,
+      topic: targetTopic,
+      detail: {
+        imported: result.imported,
+        targetLastSeq: result.targetLastSeq,
+      },
+    });
+    return { ...result, lifecycleProvisioned: created };
   }
 
   /**

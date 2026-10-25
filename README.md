@@ -6307,6 +6307,70 @@ alias (ongoing dual routing, both names live), and to EB-90's
 in-topic partitions (this is topic-level, not partition-level).
 (Real-time systems: topic governance.)
 
+## Topic data export/import (EB-228)
+
+`exportTopicData(topic)` / `importTopicData(targetTopic, records)`
+(`src/bus.ts`, `src/topic-data-export.ts`) move a topic's history
+as portable JSONL — the migration primitive: export one bus's
+topic to a file or an object store, import it into a brand-new
+topic on another bus, another environment, or under a new name,
+with no live connection between the two. The history moves;
+neither bus stays up for the other.
+
+```ts
+bus.publish('orders', order); // seq 1..3
+const jsonl = bus.exportTopicData('orders');
+// {"seq":1,"payload":{...},"timestamp":1730000001000}
+// {"seq":2,"payload":{...},"key":"eu","timestamp":1730000002000}
+const r = otherBus.importTopicData('orders.v2', jsonl);
+// r.imported === 3, r.targetLastSeq === 3
+otherBus.publish('orders.v2', order); // seq 4 on the target, in its own space
+```
+
+What the format carries, and what it does not:
+
+- **Live message records only** (`seq >= 1`), in seq order, one
+  JSON object per line with exactly four fields —
+  `seq`/`payload`/`key`/`timestamp`. The source seq is
+  provenance only: import renumbers from 1 in batch order, so
+  the target reads as a topic that was always the target.
+  Payloads travel verbatim as stored; keys travel with their
+  records. Seq-0 runtime state (delayed schedules, retained
+  state, pause buffers, recurring jobs), archived segments,
+  subscribers, rules and retained state are not exported, like
+  the fork.
+- **Signatures never migrate**: `signature` /
+  `publisherSignature` (EB-84 / EB-97) bind (topic, seq, wire
+  bytes), and an imported record is a new record under a new
+  topic with a new seq — a migrated signature would fail
+  verification on the target, or worse, look verified until
+  checked. Imported records are unsigned, following the
+  EB-226/EB-227 convention. Binary records (EB-92) cannot be
+  represented in JSONL at all, so an export that meets one
+  fails closed instead of emitting a mangled payload.
+
+Fail-closed: an unknown export topic, an already-used import
+target, or any bad record (unparseable line, non-object,
+missing payload, non-positive-integer seq, invalid timestamp
+or key) all throw `RangeError`. The batch validates completely
+before the first write, so one bad record rejects the whole
+batch with zero records written — a rejected batch leaves no
+partial target behind, and the same name imports cleanly
+afterwards. A failed append mid-copy purges the partial target.
+The import provisions the target's lifecycle record, seeds its
+sequence counters from the imported log (so the next publish
+continues the target's numbering), and is audited as
+`topic_data_imported`. A topic the bus knows but with no
+durable records — e.g. the target of an empty import — exports
+as the empty string: no history is an empty history, not a
+missing topic. Orthogonal to the EB-224 fork, EB-226 merge and
+EB-227 split (same-log, in-process history moves with full
+record metadata), to EB-82 (subscription snapshots, not
+message history), to EB-148 (the pull read path, not a
+landable format), to EB-91 (configuration snapshots, not
+messages), and to EB-163 (remote segment storage, not an
+export interface). (Real-time systems: topic data migration.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into
