@@ -32793,6 +32793,103 @@ export class EventBus {
   }
 
   /**
+   * Aggregates pending delayed deliveries for one compaction key,
+   * grouped by concrete topic (EB-248): returns `{ total, byTopic }`,
+   * where `byTopic` holds one `{ topic, pending, earliestDeliverAt }`
+   * row per topic with at least one counted schedule for this key, in
+   * first-appearance schedule order, and `total` is the sum of the
+   * rows' `pending` counts. The same `DelayedStats` shape as
+   * `getDelayedStats`, cut by key instead of by topic alone.
+   *
+   * Read-only, strictly, like `listDelayed` and `getDelayedStats`:
+   * aggregating never fans anything out, never touches the timer
+   * heap, consumes no sequence number, counts nothing in
+   * `getStats()`, writes no audit record, and never sweeps — so it
+   * also never drops an expired entry or arms a timer as a side
+   * effect, and it carries no payload, only the key's topics,
+   * counts, and due times.
+   *
+   * What counts as pending is exactly `listDelayed`'s definition,
+   * so this agrees with `listDelayed(key)` entry for entry:
+   * fanned-out, cancelled, and sweep-dropped schedules are gone
+   * from the pending set and never counted; a due entry past its
+   * effective deadline (the sweep's rule: the schedule-time TTL
+   * deadline, or the per-message absolute deadline when earlier;
+   * an EDF-class schedule's EDF deadline never expires it, only
+   * its TTL deadline can) is likewise excluded even before the
+   * next sweep runs; and an entry past its deadline but not yet
+   * due is still pending and still counted. An unkeyed schedule
+   * never matches a key, so it never appears here.
+   *
+   * `topicPattern` is optional: omitted, every topic carrying this
+   * key is aggregated. Given, it is an exact topic or the same
+   * wildcard syntax as `subscribe` (the `cancelDelayedByTopic`
+   * convention), so one key's backlog can be scoped to one topic
+   * family without touching other topics that share the key.
+   *
+   * Orthogonal to `getDelayedStats` (that aggregates all keys per
+   * topic, this cuts one key's schedules per topic), to
+   * `listDelayed` (that enumerates one snapshot row per schedule,
+   * this aggregates counts), and to `rescheduleDelayedByKey`
+   * (that moves a key's schedules, this only reads them).
+   *
+   * Throws `TypeError` when `key` or `topicPattern` is not a
+   * string, `RangeError` when either is empty.
+   */
+  getDelayedStatsByKey(key: string, topicPattern?: string): DelayedStats {
+    if (typeof key !== 'string') {
+      throw new TypeError('getDelayedStatsByKey: key must be a string');
+    }
+    if (key.length === 0) {
+      throw new RangeError('getDelayedStatsByKey: key must be a non-empty string');
+    }
+    if (topicPattern !== undefined) {
+      if (typeof topicPattern !== 'string') {
+        throw new TypeError('getDelayedStatsByKey: topicPattern must be a string');
+      }
+      if (topicPattern.length === 0) {
+        throw new RangeError('getDelayedStatsByKey: topicPattern must be a non-empty string');
+      }
+    }
+    const matcher = topicPattern === undefined ? undefined : compilePattern(topicPattern);
+    const nowMs = this.now();
+    const byTopic: DelayedTopicStats[] = [];
+    const rows = new Map<string, DelayedTopicStats>();
+    // `delayedById` holds exactly the pending schedules, in schedule
+    // order: fanned-out, cancelled, and sweep-dropped entries are
+    // already gone, so iterating it (without mutating it) is the
+    // read-only pending set by construction.
+    for (const entry of this.delayedById.values()) {
+      if (entry.key !== key) continue;
+      if (matcher !== undefined && entry.topic !== topicPattern && !matcher.test(entry.topic)) continue;
+      // Mirror the sweep's expiry rule, without sweeping: a due entry
+      // past its effective deadline would be dropped, never delivered.
+      if (entry.deliverAt <= nowMs) {
+        const sweepDeadline =
+          entry.edfDeadline !== undefined
+            ? entry.expiresAt
+            : entry.deadline === undefined
+              ? entry.expiresAt
+              : entry.expiresAt === undefined
+                ? entry.deadline
+                : Math.min(entry.expiresAt, entry.deadline);
+        if (sweepDeadline !== undefined && nowMs >= sweepDeadline) continue;
+      }
+      let row = rows.get(entry.topic);
+      if (row === undefined) {
+        row = { topic: entry.topic, pending: 0, earliestDeliverAt: entry.deliverAt };
+        rows.set(entry.topic, row);
+        byTopic.push(row);
+      }
+      row.pending += 1;
+      if (entry.deliverAt < row.earliestDeliverAt) row.earliestDeliverAt = entry.deliverAt;
+    }
+    let total = 0;
+    for (const row of byTopic) total += row.pending;
+    return { total, byTopic };
+  }
+
+  /**
    * Extends the TTL/deadline of a pending delayed delivery
    * (EB-247): the schedule keeps its delay id, topic, key,
    * payload, `deliverAt`, and per-key sequence number — only its
