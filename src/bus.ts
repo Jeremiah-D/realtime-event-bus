@@ -33338,6 +33338,156 @@ export class EventBus {
   }
 
   /**
+   * Extends the TTL/deadline of every pending delayed delivery for
+   * one topic or topic pattern (EB-251): the bulk form of
+   * `extendDelayedTtl` (EB-247), scoped the way
+   * `getDelayedStats` scopes an aggregation — by topic alone, so
+   * extending a topic's waiting messages never reaches into
+   * unrelated topics. One uniform `ttlMs` or `deadlineAt`
+   * applies to every hit schedule.
+   *
+   * Each hit goes through `extendDelayedTtl` itself, so the
+   * per-schedule semantics are exactly the single-schedule ones:
+   * only the life moves — never `deliverAt`, never a heap
+   * re-entry, never a key-sequence renumber, never a fan-out —
+   * and each hit is audited by that call as
+   * `delayed_ttl_extended`. The `ttlMs` form extends a
+   * per-message TTL (counting from fan-out time, so it
+   * lengthens the delivered message's life but does not rescue
+   * a schedule from its schedule-time expiry); the
+   * `deadlineAt` form extends the absolute deadline and lifts
+   * any earlier schedule-time TTL deadline to the same instant;
+   * an EDF-class schedule's EDF deadline is never extended —
+   * its `deadlineAt` form extends only a schedule-time TTL
+   * deadline when one exists.
+   *
+   * Fail-closed as a batch, exactly like `extendDelayedTtlByKey`:
+   * the topic pattern and the timing are validated first, then
+   * every hit is checked for extendability before anything is
+   * extended — a hit carrying nothing the given form can extend,
+   * or a new deadline earlier than that hit's governing
+   * deadline, throws `RangeError` with the pending set
+   * untouched, so a bad bulk extension can never half-extend
+   * a topic's queue. Only pending schedules count: entries
+   * that already fanned out, were already cancelled, or were
+   * already dropped as expired are not in the pending set and
+   * are not counted. "Pending" here is `extendDelayedTtl`'s
+   * definition — still filed in the pending set — not the
+   * read-only `listDelayed` definition: a due entry awaiting
+   * its sweep is still extendable, and extending it can rescue
+   * it from expiry exactly as a single `extendDelayedTtl`
+   * would. The batch is synchronous and extension never
+   * sweeps, so no hit can fan out between validation and
+   * application; an empty result returns `{ extended: 0,
+   * delayIds: [] }` — never a throw. Returns `{ extended,
+   * delayIds }` — the number of schedules extended and their
+   * ids in schedule order, the same shape as
+   * `extendDelayedTtlByKey`'s result.
+   *
+   * Orthogonal to `extendDelayedTtlByKey` (that scopes by
+   * topic and key together, this scopes by topic alone) and to
+   * `extendDelayedTtl` (that extends one schedule by id, this
+   * extends a topic's schedules in bulk). Like the single
+   * extension it is not persisted: restart recovery rebuilds
+   * the original TTL/deadline.
+   *
+   * Throws `TypeError` when `topicPattern` is not a string,
+   * `RangeError` when it is empty, when neither or both of
+   * `ttlMs`/`deadlineAt` are given, when the timing is
+   * illegal, or when any hit schedule cannot take the
+   * extension.
+   */
+  extendDelayedTtlByTopic(
+    topicPattern: string,
+    opts: { ttlMs?: number; deadlineAt?: number },
+  ): { extended: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('extendDelayedTtlByTopic: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('extendDelayedTtlByTopic: topicPattern must be a non-empty string');
+    }
+    // Validate the timing once, before anything moves: exactly one
+    // form, with the same value rules as `extendDelayedTtl`.
+    const hasTtlMs = opts?.ttlMs !== undefined;
+    const hasDeadlineAt = opts?.deadlineAt !== undefined;
+    if (hasTtlMs === hasDeadlineAt) {
+      throw new RangeError('extendDelayedTtlByTopic requires exactly one of ttlMs or deadlineAt');
+    }
+    if (hasTtlMs) validateTtlMs(opts.ttlMs, 'extendDelayedTtlByTopic');
+    if (hasDeadlineAt) validateDeadline(opts.deadlineAt, 'deadlineAt', 'extendDelayedTtlByTopic');
+    // Collect first, extend second: `delayedById` holds exactly the
+    // pending schedules, in schedule order, and extension mutates
+    // entries in place without touching the pending set — so the
+    // collected ids stay valid through the whole batch, and the
+    // pre-validation below is what makes a failure all-or-nothing.
+    const matcher = compilePattern(topicPattern);
+    const hits: string[] = [];
+    for (const [delayId, entry] of this.delayedById) {
+      if (entry.topic === topicPattern || matcher.test(entry.topic)) {
+        hits.push(delayId);
+      }
+    }
+    // Full pre-validation, mirroring `extendDelayedTtl`'s checks
+    // entry by entry, before any mutation: a single unextendable
+    // hit fails the whole batch with zero changes.
+    if (hasTtlMs) {
+      const ttlMs = opts.ttlMs as number;
+      for (const delayId of hits) {
+        const entry = this.delayedById.get(delayId) as DelayedEntry;
+        if (entry.ttlMs === undefined) {
+          throw new RangeError(
+            'extendDelayedTtlByTopic: a matched schedule carries no per-message ttlMs to extend',
+          );
+        }
+        if (ttlMs < entry.ttlMs) {
+          throw new RangeError(
+            'extendDelayedTtlByTopic: ttlMs must not be smaller than the current ttlMs',
+          );
+        }
+      }
+    } else {
+      const deadlineAt = opts.deadlineAt as number;
+      for (const delayId of hits) {
+        const entry = this.delayedById.get(delayId) as DelayedEntry;
+        if (entry.edfDeadline !== undefined) {
+          if (entry.expiresAt === undefined) {
+            throw new RangeError(
+              'extendDelayedTtlByTopic: a matched EDF schedule carries no TTL deadline to extend',
+            );
+          }
+          if (deadlineAt < entry.expiresAt) {
+            throw new RangeError(
+              'extendDelayedTtlByTopic: deadlineAt must not be earlier than the current deadline',
+            );
+          }
+        } else {
+          const governing = entry.deadline ?? entry.expiresAt;
+          if (governing === undefined) {
+            throw new RangeError(
+              'extendDelayedTtlByTopic: a matched schedule carries no deadline or TTL deadline to extend',
+            );
+          }
+          if (deadlineAt < governing) {
+            throw new RangeError(
+              'extendDelayedTtlByTopic: deadlineAt must not be earlier than the current deadline',
+            );
+          }
+        }
+      }
+    }
+    const delayIds: string[] = [];
+    for (const delayId of hits) {
+      // Each call re-validates its own entry and audits as
+      // `delayed_ttl_extended`; pre-validation above guarantees
+      // none of them can throw, so the batch applies in full.
+      this.extendDelayedTtl(delayId, opts);
+      delayIds.push(delayId);
+    }
+    return { extended: delayIds.length, delayIds };
+  }
+
+  /**
    * Moves a pending delayed delivery to a new due time (EB-242): the
    * schedule keeps its delay id, topic, key, payload, and every other
    * schedule-time attribute — only `deliverAt` changes — and re-enters
