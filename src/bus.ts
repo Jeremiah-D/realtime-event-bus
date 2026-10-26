@@ -16347,6 +16347,25 @@ export class EventBus {
    */
   private delayedTopicPriorityMatcherCache = new Map<string, RegExp>();
   /**
+   * Held delayed-delivery topics (EB-250), keyed by the exact string
+   * passed to `holdDelayedTopic` — either a concrete topic name or a
+   * wildcard pattern. While a topic is held, the sweep skips its due
+   * schedules instead of fanning them out (see `sweepDelayed`): held
+   * entries stay in the pending set, keep their `deliverAt`,
+   * deadline, and key sequence, and fan out on the first sweep after
+   * `resumeDelayedTopic`. Empty means the feature is off entirely.
+   * Held state is in-memory only, like the priority map above: a
+   * restart rebuilds the schedules unheld, so a hold that must
+   * survive a restart is re-applied after recovery.
+   */
+  private delayedHeldTopics = new Set<string>();
+  /**
+   * Compiled matchers for the wildcard entries in
+   * `delayedHeldTopics`, kept apart from the subscriber pattern
+   * cache so hold configuration never inflates `patternCacheSize`.
+   */
+  private delayedHeldMatcherCache = new Map<string, RegExp>();
+  /**
    * Live recurring jobs by their `scheduleRecurring` id, in schedule
    * order. Dormant post-restart jobs (see `recoverRecurring`) also live
    * here — they carry no timer and never fire — until the application
@@ -21517,6 +21536,116 @@ export class EventBus {
       detail: { mode: rule.mode, drainedMessages: drained },
     });
     return true;
+  }
+
+  /**
+   * Holds the delayed-delivery sweep for one topic or pattern
+   * (EB-250): due schedules for matching topics stop fanning out
+   * until `resumeDelayedTopic`, but nothing else changes. Held
+   * entries stay in the pending set — `listDelayed` and
+   * `getDelayedStats` still count them, `getStats().pendingDelayed`
+   * is unchanged — and keep their `deliverAt`, deadline, TTL, and
+   * key sequence verbatim, so resuming fans them out exactly as
+   * scheduled (an entry past its deadline at resume time is
+   * dropped as expired by the unchanged sweep rule, never
+   * delivered late). A schedule that becomes due while held is
+   * likewise held, not expired, not shed, and not buffered: the
+   * hold check runs before the sweep's expiry and pause handling,
+   * so a held entry is never discarded by either. New
+   * `publishDelayed` schedules for a held topic still schedule
+   * normally — the hold governs only the sweep fan-out of
+   * already-scheduled entries, never schedule admission.
+   *
+   * Orthogonal to `pauseTopic` (EB-88): that governs new-publish
+   * admission (shed/queue) for live and delayed publishes, while
+   * this governs only the fan-out of schedules already waiting in
+   * the timer heap. A topic can be both paused and held: a new
+   * publish is shed or queued by the pause rule, and a waiting
+   * schedule is held by this rule, each independently.
+   *
+   * Returns true when the pattern was newly held. Holding an
+   * already-held pattern is an idempotent no-op returning false
+   * and writing no second audit record. Audited as
+   * `delayed_topic_held` (`{ topicPattern }`) on a new hold only.
+   * Held state is in-memory only: a restart rebuilds schedules
+   * unheld (see `delayedHeldTopics`).
+   *
+   * Throws `TypeError` when `topicPattern` is not a string,
+   * `RangeError` when it is empty.
+   */
+  holdDelayedTopic(topicPattern: string): boolean {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('holdDelayedTopic: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('holdDelayedTopic: topicPattern must be a non-empty string');
+    }
+    if (this.delayedHeldTopics.has(topicPattern)) return false;
+    this.delayedHeldTopics.add(topicPattern);
+    this.auditSubscription({
+      action: 'delayed_topic_held',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { topicPattern },
+    });
+    return true;
+  }
+
+  /**
+   * Resumes the delayed-delivery sweep for a pattern held by
+   * `holdDelayedTopic` (EB-250): due schedules for matching topics
+   * fan out on the next sweep, in their original heap order and
+   * with their original `deliverAt`, deadline, and key sequence.
+   * Overdue entries fan out on that sweep unless their deadline
+   * already passed, in which case the unchanged sweep expiry rule
+   * drops them — resuming never resurrects an expired schedule
+   * and never re-stamps a due time.
+   *
+   * Returns true when a hold existed and was removed. Resuming a
+   * pattern that is not held is an idempotent no-op returning
+   * false and writing no audit record. Audited as
+   * `delayed_topic_resumed` (`{ topicPattern }`) on a real resume
+   * only. Note the resume itself fans nothing out: the next sweep
+   * (a tick, or any publish that flushes the timer) does.
+   *
+   * Throws `TypeError` when `topicPattern` is not a string,
+   * `RangeError` when it is empty.
+   */
+  resumeDelayedTopic(topicPattern: string): boolean {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('resumeDelayedTopic: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('resumeDelayedTopic: topicPattern must be a non-empty string');
+    }
+    if (!this.delayedHeldTopics.delete(topicPattern)) return false;
+    this.auditSubscription({
+      action: 'delayed_topic_resumed',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { topicPattern },
+    });
+    return true;
+  }
+
+  /**
+   * Returns true when `topic` matches a pattern held by
+   * `holdDelayedTopic`: an exact held topic wins, otherwise the
+   * earliest-registered matching wildcard pattern wins (the same
+   * precedence as `pauseForTopic`). Held-state lookup only — it
+   * never sweeps, fans out, or audits.
+   */
+  private delayedHeldForTopic(topic: string): boolean {
+    if (this.delayedHeldTopics.has(topic)) return true;
+    for (const pattern of this.delayedHeldTopics) {
+      let matcher = this.delayedHeldMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.delayedHeldMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return true;
+    }
+    return false;
   }
 
   /**
@@ -34014,6 +34143,18 @@ export class EventBus {
     // lazily here, and the first not-yet-due entry stops the drain
     // exactly as the old peek loop did.
     const due: DelayedEntry[] = [];
+    // EB-250: due entries for held topics are set aside, not fanned
+    // out, not expired, not shed, and not buffered — and crucially
+    // not removed from `delayedById`, so they stay pending (and
+    // counted by `listDelayed`/`getDelayedStats`) with their
+    // `deliverAt`, deadline, and key sequence untouched. They are
+    // pushed back into the heap below, in pop order, so their
+    // relative order survives and the next sweep re-encounters
+    // them first (their `deliverAt` still orders them). Setting
+    // them aside instead of stopping at the first held head keeps
+    // other due topics fanning out in the same pass: a held head
+    // must never block an unrelated topic behind it in the heap.
+    const heldAside: DelayedEntry[] = [];
     for (;;) {
       const top = this.delayHeap.peek();
       if (top == null) break;
@@ -34025,9 +34166,14 @@ export class EventBus {
       }
       if (top.deliverAt > nowMs) break;
       this.delayHeap.pop();
+      if (this.delayedHeldForTopic(top.topic)) {
+        heldAside.push(top);
+        continue;
+      }
       this.delayedById.delete(top.id);
       due.push(top);
     }
+    for (const entry of heldAside) this.delayHeap.push(entry);
     // Same-tick ordering by topic priority, highest first. The sort is
     // stable over heap order (deliverAt, then schedule order), so
     // entries for one topic — which always resolve to one priority —

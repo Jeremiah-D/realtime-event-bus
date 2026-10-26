@@ -80,6 +80,8 @@ export type SubscriptionAuditAction =
   | 'delayed_cancelled'
   | 'delayed_rescheduled'
   | 'delayed_ttl_extended'
+  | 'delayed_topic_held'
+  | 'delayed_topic_resumed'
   | 'partition_rule_set'
   | 'partition_rule_cleared'
   | 'partition_expansion'
@@ -163,6 +165,8 @@ export type SubscriptionAuditAction =
  * - `topic_paused`: `{ mode: 'shed'|'queue' }` (the `pattern` field carries the rule key)
  * - `topic_resumed`: `{ mode: 'shed'|'queue', drainedMessages: <count> }` (the `pattern` field carries the rule key)
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
+ * - `delayed_topic_held`: `{ topicPattern: <string> }` — the delayed-delivery sweep was held for the pattern (EB-250; the `pattern` field carries the rule key)
+ * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `config_applied`: `{ applied: <string[]> }` — paths applied by
  *   `applyConfig` (EB-91), in application order; empty on a no-op
  * - `config_rolled_back`: `{ failedPath: <string>, applied: <string[]>,
@@ -305,6 +309,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_cancelled',
   'delayed_rescheduled',
   'delayed_ttl_extended',
+  'delayed_topic_held',
+  'delayed_topic_resumed',
   'partition_rule_set',
   'partition_rule_cleared',
   'partition_expansion',
