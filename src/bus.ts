@@ -32594,6 +32594,126 @@ export class EventBus {
   }
 
   /**
+   * Moves every pending delayed delivery for one topic or topic pattern
+   * carrying one compaction key to a new due time (EB-244): the bulk
+   * form of `rescheduleDelayed` (EB-242), scoped the way
+   * `cancelDelayedByKey` (EB-236) scopes a bulk cancel — by topic and
+   * key together, so moving one key's waiting messages never reaches
+   * into unrelated topics that happen to share the key.
+   *
+   * Each moved schedule keeps its delay id, topic, key, payload, and
+   * every other schedule-time attribute — only `deliverAt` changes —
+   * because each move goes through `rescheduleDelayed` itself: the
+   * old heap node is retired lazily and a fresh entry object re-enters
+   * the heap at the new due time, the per-key sequence number is
+   * preserved (successors are never unblocked early or reordered by
+   * the move), and TTL/deadline state is preserved verbatim (a
+   * schedule moved past its deadline expires at its new due time,
+   * exactly as a schedule originally due there would). All moved
+   * schedules share one target due time: a relative `delayMs` is
+   * priced once against the bus clock at call time, so every entry
+   * lands on the same `deliverAt` instead of drifting across the
+   * calls. A new due time at or before now fans out on the next
+   * flush, like a single `rescheduleDelayed` to a due time.
+   *
+   * Only pending, not-yet-fanned-out schedules move: entries that
+   * already fanned out, already expired, or were already cancelled
+   * are not in `delayedById` and are not counted. A move is not a
+   * delete, so the moved schedules are still pending afterwards, at
+   * the new due time — calling the same move twice with the same
+   * arguments is a no-op in effect (the schedules are re-moved to
+   * the due time they already carry). An unkeyed schedule never
+   * matches a key. Returns `{ rescheduled, delayIds }`
+   * — the number of schedules moved and their ids in schedule order,
+   * the same shape as `cancelDelayedByKey`'s result; an empty result
+   * returns `{ rescheduled: 0, delayIds: [] }` — never a throw.
+   *
+   * Fail-closed on timing: the topic pattern, the key, and the timing
+   * are all validated before any schedule moves — both or neither of
+   * `delayMs`/`deliverAt`, a negative or non-finite value throws
+   * `RangeError` with the pending set untouched, so a bad bulk move
+   * can never half-move a key's queue. Each moved schedule is
+   * audited by the `rescheduleDelayed` call itself as
+   * `delayed_rescheduled` (`{ delayId, topic, oldDeliverAt,
+   * deliverAt }`); a failed or empty bulk move audits nothing,
+   * because it changed nothing. The same durability caveat as
+   * `rescheduleDelayed` applies per schedule: the move itself is not
+   * persisted, and restart recovery rebuilds the original due time.
+   *
+   * Orthogonal to `rescheduleDelayed` (that moves one schedule by
+   * id, this moves a key's schedules by topic and key) and to
+   * `cancelDelayedByKey` (that deletes, this moves).
+   *
+   * Throws `TypeError` when `topicPattern` or `key` is not a string,
+   * `RangeError` when either is empty or the timing is illegal.
+   */
+  rescheduleDelayedByKey(
+    topicPattern: string,
+    key: string,
+    opts: { delayMs?: number; deliverAt?: number },
+  ): { rescheduled: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('rescheduleDelayedByKey: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('rescheduleDelayedByKey: topicPattern must be a non-empty string');
+    }
+    if (typeof key !== 'string') {
+      throw new TypeError('rescheduleDelayedByKey: key must be a string');
+    }
+    if (key.length === 0) {
+      throw new RangeError('rescheduleDelayedByKey: key must be a non-empty string');
+    }
+    // Validate the timing once, before anything moves: a relative
+    // delay is priced once against the bus clock at call time, so
+    // every moved schedule lands on the same deliverAt.
+    const hasDelayMs = opts?.delayMs !== undefined;
+    const hasDeliverAt = opts?.deliverAt !== undefined;
+    if (hasDelayMs === hasDeliverAt) {
+      throw new RangeError('rescheduleDelayedByKey requires exactly one of delayMs or deliverAt');
+    }
+    let deliverAt: number;
+    if (hasDelayMs) {
+      const delayMs = opts.delayMs as number;
+      if (!Number.isFinite(delayMs) || delayMs < 0) {
+        throw new RangeError('delayMs must be a non-negative finite number of milliseconds');
+      }
+      deliverAt = this.now() + delayMs;
+    } else {
+      deliverAt = opts.deliverAt as number;
+      if (!Number.isFinite(deliverAt)) {
+        throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
+      }
+    }
+    // Collect first, move second: `delayedById` holds exactly the
+    // pending schedules, in schedule order, and `rescheduleDelayed`
+    // replaces each entry object — collecting the ids up front is
+    // what keeps the iteration stable and the move all-or-nothing
+    // per schedule (a hit cannot leave the pending set mid-batch,
+    // since this call is synchronous and `rescheduleDelayed` only
+    // throws for an id that is no longer pending).
+    const matcher = compilePattern(topicPattern);
+    const hits: string[] = [];
+    for (const [delayId, entry] of this.delayedById) {
+      if (entry.key === key && (entry.topic === topicPattern || matcher.test(entry.topic))) {
+        hits.push(delayId);
+      }
+    }
+    const delayIds: string[] = [];
+    for (const delayId of hits) {
+      // Each `rescheduleDelayed` sweeps, so a hit that was already due
+      // when the batch started may fan out before its turn — it
+      // delivered at its old due time, so it is left delivered and
+      // not counted, rather than throwing mid-batch after earlier
+      // hits already moved.
+      if (!this.delayedById.has(delayId)) continue;
+      this.rescheduleDelayed(delayId, { deliverAt });
+      delayIds.push(delayId);
+    }
+    return { rescheduled: delayIds.length, delayIds };
+  }
+
+  /**
    * Schedules a batch of delayed deliveries in one call (EB-243):
    * returns one delay id per entry, in entry order, each schedule
    * carrying exactly the single-schedule semantics of
