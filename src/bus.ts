@@ -16366,6 +16366,29 @@ export class EventBus {
    */
   private delayedHeldMatcherCache = new Map<string, RegExp>();
   /**
+   * Held delayed-delivery (topic pattern, key) pairs (EB-252),
+   * keyed by the JSON pair of the exact strings passed to
+   * `holdDelayedByKey` — a concrete topic name or a wildcard
+   * pattern, plus one compaction key. While a pair is held, the
+   * sweep skips due schedules for matching topics carrying that
+   * key instead of fanning them out (see `sweepDelayed`): held
+   * entries stay in the pending set, keep their `deliverAt`,
+   * deadline, TTL, and key sequence, and fan out on the first
+   * sweep after `resumeDelayedByKey`. Empty means the feature is
+   * off entirely. Held state is in-memory only, like the
+   * topic-hold set above: a restart rebuilds the schedules
+   * unheld, so a hold that must survive a restart is re-applied
+   * after recovery.
+   */
+  private delayedHeldKeys = new Set<string>();
+  /**
+   * Compiled matchers for the wildcard patterns in
+   * `delayedHeldKeys`, kept apart from the subscriber pattern
+   * cache so hold configuration never inflates
+   * `patternCacheSize`.
+   */
+  private delayedHeldKeyMatcherCache = new Map<string, RegExp>();
+  /**
    * Live recurring jobs by their `scheduleRecurring` id, in schedule
    * order. Dormant post-restart jobs (see `recoverRecurring`) also live
    * here — they carry no timer and never fire — until the application
@@ -21629,6 +21652,115 @@ export class EventBus {
   }
 
   /**
+   * Holds the delayed-delivery sweep for one compaction key in
+   * one topic or pattern (EB-252): due schedules for matching
+   * topics carrying this key stop fanning out until
+   * `resumeDelayedByKey`, but nothing else changes. Held
+   * entries stay in the pending set — `listDelayed`,
+   * `getDelayedStats`, and `getDelayedStatsByKey` still count
+   * them, `getStats().pendingDelayed` is unchanged — and keep
+   * their `deliverAt`, deadline, TTL, and key sequence verbatim,
+   * so resuming fans them out exactly as scheduled (an entry
+   * past its deadline at resume time is dropped as expired by
+   * the unchanged sweep rule, never delivered late). A schedule
+   * that becomes due while held is likewise held, not expired,
+   * not shed, and not buffered: the hold check runs before the
+   * sweep's expiry and pause handling, so a held entry is never
+   * discarded by either. New `publishDelayed` schedules for a
+   * held topic and key still schedule normally — the hold
+   * governs only the sweep fan-out of already-scheduled
+   * entries, never schedule admission. Schedules for the same
+   * topic with a different key, and schedules for the same key
+   * in a non-matching topic, fan out normally: the hold is
+   * scoped by topic and key together.
+   *
+   * Orthogonal to `holdDelayedTopic` (EB-250): that holds a
+   * whole topic, this holds one key within a topic or pattern,
+   * and the two compose — an entry held by either stays held
+   * until its own hold is resumed, and resuming one never
+   * releases the other.
+   *
+   * Returns true when the pair was newly held. Holding an
+   * already-held pair is an idempotent no-op returning false
+   * and writing no second audit record. Audited as
+   * `delayed_key_held` (`{ topicPattern, key }`) on a new hold
+   * only. Held state is in-memory only: a restart rebuilds
+   * schedules unheld (see `delayedHeldKeys`).
+   *
+   * Throws `TypeError` when `topicPattern` or `key` is not a
+   * string, `RangeError` when either is empty.
+   */
+  holdDelayedByKey(topicPattern: string, key: string): boolean {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('holdDelayedByKey: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('holdDelayedByKey: topicPattern must be a non-empty string');
+    }
+    if (typeof key !== 'string') {
+      throw new TypeError('holdDelayedByKey: key must be a string');
+    }
+    if (key.length === 0) {
+      throw new RangeError('holdDelayedByKey: key must be a non-empty string');
+    }
+    const heldKey = JSON.stringify([topicPattern, key]);
+    if (this.delayedHeldKeys.has(heldKey)) return false;
+    this.delayedHeldKeys.add(heldKey);
+    this.auditSubscription({
+      action: 'delayed_key_held',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { topicPattern, key },
+    });
+    return true;
+  }
+
+  /**
+   * Resumes the delayed-delivery sweep for a pair held by
+   * `holdDelayedByKey` (EB-252): due schedules for matching
+   * topics carrying that key fan out on the next sweep, in
+   * their original heap order and with their original
+   * `deliverAt`, deadline, and key sequence. Overdue entries
+   * fan out on that sweep unless their deadline already passed,
+   * in which case the unchanged sweep expiry rule drops them —
+   * resuming never resurrects an expired schedule and never
+   * re-stamps a due time.
+   *
+   * Returns true when a hold existed and was removed. Resuming
+   * a pair that is not held is an idempotent no-op returning
+   * false and writing no audit record. Audited as
+   * `delayed_key_resumed` (`{ topicPattern, key }`) on a real
+   * resume only. Note the resume itself fans nothing out: the
+   * next sweep (a tick, or any publish that flushes the timer)
+   * does.
+   *
+   * Throws `TypeError` when `topicPattern` or `key` is not a
+   * string, `RangeError` when either is empty.
+   */
+  resumeDelayedByKey(topicPattern: string, key: string): boolean {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('resumeDelayedByKey: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('resumeDelayedByKey: topicPattern must be a non-empty string');
+    }
+    if (typeof key !== 'string') {
+      throw new TypeError('resumeDelayedByKey: key must be a string');
+    }
+    if (key.length === 0) {
+      throw new RangeError('resumeDelayedByKey: key must be a non-empty string');
+    }
+    if (!this.delayedHeldKeys.delete(JSON.stringify([topicPattern, key]))) return false;
+    this.auditSubscription({
+      action: 'delayed_key_resumed',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { topicPattern, key },
+    });
+    return true;
+  }
+
+  /**
    * Returns true when `topic` matches a pattern held by
    * `holdDelayedTopic`: an exact held topic wins, otherwise the
    * earliest-registered matching wildcard pattern wins (the same
@@ -21642,6 +21774,28 @@ export class EventBus {
       if (matcher == null) {
         matcher = compilePattern(pattern);
         this.delayedHeldMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Returns true when `topic` and `key` match a pair held by
+   * `holdDelayedByKey`: the held key must equal `key` exactly,
+   * and the held pattern must equal the topic exactly or match
+   * it as a wildcard. Held-state lookup only — it never sweeps,
+   * fans out, or audits.
+   */
+  private delayedHeldForKey(topic: string, key: string): boolean {
+    for (const heldKey of this.delayedHeldKeys) {
+      const [pattern, heldKeyValue] = JSON.parse(heldKey) as [string, string];
+      if (heldKeyValue !== key) continue;
+      if (pattern === topic) return true;
+      let matcher = this.delayedHeldKeyMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.delayedHeldKeyMatcherCache.set(pattern, matcher);
       }
       if (matcher.test(topic)) return true;
     }
@@ -34317,6 +34471,14 @@ export class EventBus {
       if (top.deliverAt > nowMs) break;
       this.delayHeap.pop();
       if (this.delayedHeldForTopic(top.topic)) {
+        heldAside.push(top);
+        continue;
+      }
+      // EB-252: a key-held entry is set aside exactly like a
+      // topic-held one — same heldAside push-back, same pending
+      // status, same untouched timing — so one held key never
+      // blocks an unrelated key behind it in the heap.
+      if (top.key !== undefined && this.delayedHeldForKey(top.topic, top.key)) {
         heldAside.push(top);
         continue;
       }

@@ -82,6 +82,8 @@ export type SubscriptionAuditAction =
   | 'delayed_ttl_extended'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
+  | 'delayed_key_held'
+  | 'delayed_key_resumed'
   | 'partition_rule_set'
   | 'partition_rule_cleared'
   | 'partition_expansion'
@@ -167,6 +169,8 @@ export type SubscriptionAuditAction =
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
  * - `delayed_topic_held`: `{ topicPattern: <string> }` — the delayed-delivery sweep was held for the pattern (EB-250; the `pattern` field carries the rule key)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
+ * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
+ * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
  * - `config_applied`: `{ applied: <string[]> }` — paths applied by
  *   `applyConfig` (EB-91), in application order; empty on a no-op
  * - `config_rolled_back`: `{ failedPath: <string>, applied: <string[]>,
@@ -311,6 +315,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_ttl_extended',
   'delayed_topic_held',
   'delayed_topic_resumed',
+  'delayed_key_held',
+  'delayed_key_resumed',
   'partition_rule_set',
   'partition_rule_cleared',
   'partition_expansion',
