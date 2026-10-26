@@ -3116,6 +3116,89 @@ function assertValidSubscriptionSnapshot(snap: unknown): asserts snap is Subscri
 }
 
 /**
+ * Top-level fields a genuine `SubscriptionSnapshot` carries (EB-82).
+ * `importSubscriptionSnapshot` (EB-245) rejects anything else: a
+ * snapshot smuggled in with extra fields is not a format this bus
+ * produced, and silently carrying it would let a stale or foreign
+ * schema restore subscriptions this instance never agreed to.
+ */
+const SUBSCRIPTION_SNAPSHOT_FIELDS = new Set([
+  'kind',
+  'version',
+  'handoffToken',
+  'pattern',
+  'patterns',
+  'namespace',
+  'reliable',
+  'options',
+  'unsupportedOptions',
+  'ackCommittedSeq',
+  'leaseRemainingMs',
+  'stats',
+  'pendingMessages',
+  'exportedAtMs',
+]);
+
+/**
+ * Subscription-snapshot restore (EB-245): the strict validator for
+ * `importSubscriptionSnapshot`. Starts from EB-82's
+ * `assertValidSubscriptionSnapshot` and adds the checks a config-only
+ * restore needs before it writes anything:
+ *
+ * - unknown top-level fields are rejected (EB-82 tolerates them);
+ * - `stats` must be a well-formed backlog reading (EB-82 never looks
+ *   at it) and `exportedAtMs` a finite non-negative timestamp;
+ * - function-valued option entries are rejected: genuine exports
+ *   carry only the serializable subset, with functions listed in
+ *   `unsupportedOptions` instead.
+ *
+ * Anything failing here throws `RangeError` before any subscription
+ * is created, so a bad snapshot — or a bad batch containing one —
+ * writes nothing at all.
+ */
+function assertValidSubscriptionSnapshotStrict(snap: unknown): asserts snap is SubscriptionSnapshot {
+  const fail = (why: string): never => {
+    throw new RangeError(`importSubscriptionSnapshot: invalid snapshot (${why})`);
+  };
+  try {
+    assertValidSubscriptionSnapshot(snap);
+  } catch (err) {
+    // Re-prefix EB-82's failures so every strict-validation error
+    // names the entry point that actually rejected the snapshot.
+    if (err instanceof RangeError) {
+      throw new RangeError(
+        err.message.replace(/^importSubscription: /, 'importSubscriptionSnapshot: '),
+      );
+    }
+    throw err;
+  }
+  const s = snap as Record<string, unknown>;
+  for (const key of Object.keys(s)) {
+    if (!SUBSCRIPTION_SNAPSHOT_FIELDS.has(key)) fail(`unknown field ${key}`);
+  }
+  const stats = s.stats;
+  if (stats === null || typeof stats !== 'object' || Array.isArray(stats)) {
+    fail('bad stats');
+  }
+  for (const field of ['queueDepth', 'droppedCount', 'expiredCount', 'unackedCount', 'queueBytes']) {
+    const value = (stats as Record<string, unknown>)[field];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      fail(`bad stats.${field}`);
+    }
+  }
+  if (
+    typeof s.exportedAtMs !== 'number' ||
+    !Number.isFinite(s.exportedAtMs) ||
+    s.exportedAtMs < 0
+  ) {
+    fail('bad exportedAtMs');
+  }
+  for (const value of Object.values(s.options as Record<string, unknown>)) {
+    if (typeof value === 'function') fail('function-valued option');
+  }
+}
+
+/**
  * Subscription migration (EB-82): one outstanding export on the source
  * instance, keyed by handoff token until `completeMigration` or
  * `cancelMigration` runs.
@@ -4596,6 +4679,14 @@ export interface SubscriptionSnapshot {
   pendingMessages: BusMessage[];
   /** Bus-clock reading (`EventBusOptions.now`) at export. */
   exportedAtMs: number;
+}
+
+/** Result of `EventBus.importSubscriptionSnapshot` (EB-245). */
+export interface SubscriptionSnapshotImportResult {
+  /** Snapshots whose subscription definition was (re)created by this call. */
+  restored: number;
+  /** Snapshots skipped because their subscription already exists on this instance. */
+  skipped: number;
 }
 
 /** Result of `EventBus.importSubscription` (EB-82). */
@@ -14192,6 +14283,17 @@ export class EventBus {
    * the target, however many times it is presented.
    */
   private readonly importedHandoffTokens = new Set<string>();
+  /**
+   * Handoff tokens already restored by THIS instance through
+   * `importSubscriptionSnapshot` (EB-245), mapped to the restored
+   * subscription's id. Kept apart from `importedHandoffTokens`: a
+   * config-only restore (no backlog replay) is a different consumption
+   * mode from the EB-82 live migration, so one does not consume the
+   * other. A token whose subscription is gone (unsubscribed, lease or
+   * idle expiry) restores again on re-presentation instead of
+   * counting as skipped.
+   */
+  private readonly restoredSubscriptionSnapshots = new Map<string, string>();
   /**
    * Compiled topic patterns, keyed by the exact pattern string. Each distinct
    * pattern is compiled once and the RegExp is shared by every subscriber on
@@ -23980,6 +24082,111 @@ export class EventBus {
     this.importedHandoffTokens.add(snapshot.handoffToken);
     this.scheduleFlush();
     return { subId: subscription.id, handoffToken: snapshot.handoffToken };
+  }
+
+  /**
+   * Restores subscription DEFINITIONS from `exportSubscription`
+   * snapshots (EB-245) — the config-migration counterpart to EB-82's
+   * live migration. Where `importSubscription` moves a live
+   * subscription with its backlog, this one rebuilds only the
+   * subscription itself (topic pattern, namespace, serializable
+   * options, remaining lease): `pendingMessages` are validated for
+   * shape but never enqueued, so no historical message is replayed
+   * and a stale backlog can never redeliver into a fresh instance.
+   * This is the disaster-recovery shape: rebuild a whole
+   * subscription topology from stored snapshots without resurrecting
+   * old traffic.
+   *
+   * The input is one snapshot or a batch of them. Validation is
+   * strict and atomic: every snapshot is checked up front (EB-82
+   * format, version 1, unknown top-level fields rejected, well-formed
+   * stats and exportedAtMs, no function-valued options), so a single
+   * bad snapshot fails the whole batch with zero writes — nothing is
+   * created, no token is recorded. Subscribe-path failures (unknown
+   * namespace, ACL denial, invalid option values) still fail fast
+   * exactly like a fresh subscribe; entries restored before such a
+   * failure stay restored, and re-presenting the batch skips them
+   * instead of double-subscribing.
+   *
+   * Idempotency is keyed by handoff token, tracked separately from
+   * EB-82's single-use import: presenting a snapshot whose restored
+   * subscription still exists counts as `skipped`, never a second
+   * subscription. A token whose subscription is gone (unsubscribed,
+   * lease or idle expiry) restores again. A snapshot restored here
+   * does not consume the EB-82 import token, and vice versa — the
+   * two are different consumption modes of the same format.
+   *
+   * The handler cannot travel in the snapshot (functions do not
+   * cross instances) and must be supplied here, as in EB-82. A
+   * multi-pattern snapshot that also claims reliable is rejected,
+   * exactly like `importSubscription`.
+   */
+  importSubscriptionSnapshot(
+    snapshots: SubscriptionSnapshot | SubscriptionSnapshot[],
+    handler:
+      | MessageHandler
+      | ReliableMessageHandler
+      | BatchMessageHandler
+      | ReliableBatchMessageHandler,
+  ): SubscriptionSnapshotImportResult {
+    const list = Array.isArray(snapshots) ? snapshots : [snapshots];
+    // Atomic strict validation first: no snapshot, no write, until
+    // every entry in the batch has passed.
+    for (const snapshot of list) {
+      assertValidSubscriptionSnapshotStrict(snapshot);
+    }
+    if (typeof handler !== 'function') {
+      throw new RangeError('importSubscriptionSnapshot: handler must be a function');
+    }
+    let restored = 0;
+    let skipped = 0;
+    for (const snapshot of list) {
+      const existingId = this.restoredSubscriptionSnapshots.get(snapshot.handoffToken);
+      if (existingId !== undefined && this.subscribers.get(existingId) !== undefined) {
+        skipped++;
+        continue;
+      }
+      const importOpts: Record<string, unknown> = { ...snapshot.options };
+      if (snapshot.namespace !== undefined) importOpts.namespace = snapshot.namespace;
+      if (snapshot.leaseRemainingMs > 0) {
+        importOpts.leaseMs = Math.max(1, Math.floor(snapshot.leaseRemainingMs));
+      } else {
+        delete importOpts.leaseMs;
+      }
+      delete importOpts.resumeFromSeq;
+      delete importOpts.resumeFromTime;
+      if (snapshot.patterns !== undefined && snapshot.reliable) {
+        throw new RangeError(
+          'importSubscriptionSnapshot: multi-pattern snapshots are never reliable',
+        );
+      }
+      const subscription = snapshot.reliable
+        ? this.subscribeReliable(
+            snapshot.pattern,
+            handler as ReliableMessageHandler,
+            importOpts as ReliableSubscribeOptions,
+          )
+        : snapshot.patterns !== undefined
+          ? this.subscribe(snapshot.patterns, handler as MessageHandler, importOpts as SubscribeOptions)
+          : this.subscribe(snapshot.pattern, handler as MessageHandler, importOpts as SubscribeOptions);
+      const subscriber = this.subscribers.get(subscription.id);
+      if (subscriber === undefined) {
+        throw new Error(
+          `importSubscriptionSnapshot: subscription ${subscription.id} vanished after subscribe`,
+        );
+      }
+      const reliable = subscriber.reliable;
+      if (reliable !== undefined && snapshot.ackCommittedSeq !== undefined) {
+        reliable.tracker.seedHighestSeq(snapshot.ackCommittedSeq);
+      }
+      // Deliberately no backlog replay: unlike EB-82, pendingMessages
+      // stay out of the queue — this restore rebuilds definitions
+      // only, and old traffic must not come back to life.
+      this.restoredSubscriptionSnapshots.set(snapshot.handoffToken, subscription.id);
+      restored++;
+    }
+    this.scheduleFlush();
+    return { restored, skipped };
   }
 
   /**

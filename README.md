@@ -2521,6 +2521,21 @@ unknown namespaces, ACL denials and invalid options fail fast exactly like
 a fresh subscribe; a failed import consumes no token, so you can fix the
 cause and retry.
 
+**Config-only restore (EB-245).** `importSubscriptionSnapshot(snapshotOrBatch, handler)`
+rebuilds subscription *definitions* from stored snapshots without moving any
+traffic: the pattern, namespace, serializable options and remaining lease are
+restored, but `pendingMessages` are validated and never enqueued — no historical
+message is replayed, so a disaster-recovery rebuild cannot resurrect stale
+backlog. Validation is strict and atomic: every snapshot in a batch is checked
+up front (format, version 1, unknown top-level fields rejected, well-formed
+stats), so one bad snapshot fails the whole batch with zero writes. Restore is
+idempotent per handoff token and returns `{ restored, skipped }` — presenting a
+snapshot whose restored subscription still exists counts as skipped, never a
+second subscription. This is the counterpart to the live migration above: use
+`importSubscription` when a subscription moves with its backlog, and
+`importSubscriptionSnapshot` when a whole subscription topology is rebuilt from
+stored snapshots.
+
 Honest boundaries — read before relying on them:
 
 - **Non-serializable options don't migrate.** Content filters and
