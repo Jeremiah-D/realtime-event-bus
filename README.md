@@ -2060,7 +2060,11 @@ library.
   adaptive throttling, delivery shaping, ACK) still apply to each committed
   message. A throwing validator propagates to the caller, always during
   admission, so a throw can never leave a half-committed batch. An empty
-  batch is a no-op.
+  batch is a no-op. `publishAtomic(entries, { traceparent })` (EB-237)
+  runs one trace id through the whole batch: entries that carry their own
+  `traceparent` keep it, entries without one inherit the batch value, so a
+  multi-topic batch correlates end to end as a single trace; a non-string
+  batch traceparent throws `RangeError` before anything is admitted.
 - **Publish-side idempotent dedup window** (in `src/bus.ts`, via
   `publishIdempotent(topic, payload, { messageId })`): within
   `EventBusOptions.idempotencyWindowMs` (default 60 s), a `(topic,

@@ -11976,6 +11976,21 @@ export interface AtomicPublishResult {
 }
 
 /**
+ * Options for `EventBus.publishAtomic` (EB-237): a batch-level
+ * `traceparent` that one trace id runs through the whole batch with.
+ * Entries that carry their own `traceparent` keep it; entries without
+ * one inherit the batch value, so a multi-topic batch can be correlated
+ * end to end as a single trace instead of one fresh trace per entry.
+ * Validated like any per-entry `traceparent` (a non-string throws
+ * `RangeError` before anything is admitted); absent means the previous
+ * behavior — every entry traces on its own.
+ */
+export interface PublishAtomicOptions {
+  /** W3C `traceparent` header value shared by entries without their own. */
+  traceparent?: string;
+}
+
+/**
  * One accepted entry of a `PublishReceipt` (EB-190): the topic as the
  * caller addressed it and the per-topic sequence number stamped at
  * fan-out. An upstream holding the receipt can reconcile "accepted"
@@ -31025,6 +31040,7 @@ export class EventBus {
     entries: Array<BatchMessage>,
     lineages: Array<MessageLineage | undefined>,
     collectAll: boolean,
+    batchTraceparent?: string,
   ): AtomicAdmitOutcome {
     // Phase 1: admit the whole batch against shadow state.
     const shadowBudget = new Map<string, number>();
@@ -31127,7 +31143,7 @@ export class EventBus {
             resolvedTopic,
             payload,
             entries[index].publisherId,
-            traceIdOfTraceparent(entries[index].traceparent),
+            traceIdOfTraceparent(entries[index].traceparent ?? batchTraceparent),
             shadowVerdict,
           );
           const abortOutcome = failEntry(index, topic, reason);
@@ -31187,8 +31203,9 @@ export class EventBus {
         const reason = verdict.reason;
         const publisherId = entries[index].publisherId;
         // EB-139: the DLQ record correlates with the failing entry's own
-        // traceparent when it carried one.
-        const entryTraceId = traceIdOfTraceparent(entries[index].traceparent);
+        // traceparent when it carried one, else the batch traceparent
+        // (EB-237) — so a rejected batch still correlates as one trace.
+        const entryTraceId = traceIdOfTraceparent(entries[index].traceparent ?? batchTraceparent);
         if (reason === 'schema') this.countSchemaRejection(topic, payload, publisherId, entryTraceId);
         else if (reason === 'acl') this.countAclDenied(topic, payload, publisherId, entryTraceId);
         else if (reason === 'alias-retired') this.countAliasRetired(topic, payload, publisherId);
@@ -31301,6 +31318,7 @@ export class EventBus {
     entries: Array<BatchMessage>,
     lineages: Array<MessageLineage | undefined>,
     admit: AtomicAdmitOutcome,
+    batchTraceparent?: string,
   ): Array<{ topic: string; seq: number }> {
     const { resolvedTopics, admittedPayloads, keyCursors, keySeqs } = admit;
     const committed: Array<{ topic: string; seq: number }> = [];
@@ -31310,6 +31328,9 @@ export class EventBus {
     for (let index = 0; index < entries.length; index++) {
       const { key, traceparent, messageId, eventTime, publisherId, schemaVersion, partitionKey, partition, ttlMs } =
         entries[index];
+      // EB-237: an entry without its own traceparent inherits the batch
+      // traceparent, so one trace id runs through the whole batch.
+      const effectiveTraceparent = traceparent ?? batchTraceparent;
       // Deprecated-schema accounting (EB-86): the shadow admission ran
       // the validator, so the commit only re-resolves the version
       // bookkeeping — an aborted batch never reaches here, so every
@@ -31327,7 +31348,7 @@ export class EventBus {
         undefined,
         key,
         keySeqs[index],
-        traceparent,
+        effectiveTraceparent,
         messageId,
         false,
         undefined,
@@ -31413,26 +31434,38 @@ export class EventBus {
     return committed;
   }
 
-  publishAtomic(entries: Array<BatchMessage>): AtomicPublishResult {
+  /**
+   * Publishes an atomic batch across topics (EB-237): all-or-nothing
+   * fan-out for multi-topic batches — subscribers either see every
+   * entry or none, each topic stamps its own independent `seq` and
+   * durable-log record, and a rejected batch leaves zero side effects.
+   * With `opts.traceparent` one trace id runs through the whole batch:
+   * entries that carry their own `traceparent` keep it, entries without
+   * one inherit the batch value (see `PublishAtomicOptions`).
+   */
+  publishAtomic(entries: Array<BatchMessage>, opts?: PublishAtomicOptions): AtomicPublishResult {
     // EB-154: a closed bus refuses new work synchronously — never a
     // silent queue.
     this.assertNotClosed('publish', entries.length > 0 ? entries[0].topic : '<batch>');
     // Chaos (EB-103): see publish — evaluated once per atomic batch.
     if (this.checkChaosAdmission()) return { published: 0 };
     if (entries.length === 0) return { published: 0 };
+    // EB-237: the batch traceparent validates before anything is
+    // admitted, like the per-entry traceparents below.
+    validateTraceparent(opts?.traceparent, 'publishAtomic');
     // Key validation first: a throw must leave zero state behind, and
     // validation mutates nothing. Shared with `publishBatch` (see
     // `validateBatchEntries`) — the validators are identical.
     const atomicLineages = this.validateBatchEntries(entries, 'publishAtomic');
     // Phase 1: admit the whole batch against shadow state — abort on the
     // first failing entry, the classic atomic contract.
-    const admit = this.admitAtomicBatch(entries, atomicLineages, false);
+    const admit = this.admitAtomicBatch(entries, atomicLineages, false, opts?.traceparent);
     if (admit.firstRejection !== undefined) {
       return { published: 0, rejected: admit.firstRejection };
     }
     // Phase 2: everything was admitted — commit through the normal
     // publish path in one synchronous turn, then flush once.
-    this.commitAtomicBatch(entries, atomicLineages, admit);
+    this.commitAtomicBatch(entries, atomicLineages, admit, opts?.traceparent);
     return { published: entries.length };
   }
 
