@@ -284,6 +284,7 @@ import {
   type DelayedInspection,
   type DelayedStats,
   type DelayedTopicStats,
+  type DelayedTtlExtension,
 } from './delayed.ts';
 import {
   DeliveryWindowGate,
@@ -32789,6 +32790,172 @@ export class EventBus {
     let total = 0;
     for (const row of byTopic) total += row.pending;
     return { total, byTopic };
+  }
+
+  /**
+   * Extends the TTL/deadline of a pending delayed delivery
+   * (EB-247): the schedule keeps its delay id, topic, key,
+   * payload, `deliverAt`, and per-key sequence number — only its
+   * life changes, so the entry is mutated in place, never
+   * re-enters the timer heap (the heap orders by `deliverAt`
+   * alone), and no sequence number is consumed.
+   *
+   * Exactly one of `ttlMs` / `deadlineAt` must be given, and the
+   * extension only ever lengthens life, never shortens it —
+   * fail-closed, with every check before any mutation, so a
+   * failed extension leaves the original TTL/deadline intact:
+   *
+   * - `ttlMs` extends a per-message TTL (EB-149): the schedule
+   *   must already carry a `ttlMs`, and the new value must be a
+   *   non-negative integer no smaller than the old one. The new
+   *   duration counts from fan-out time, exactly as the original
+   *   did — so extending it lengthens the delivered message's
+   *   life, but it does NOT rescue a schedule from its
+   *   schedule-time expiry: if the schedule-time TTL deadline
+   *   or absolute deadline passes before the due time, the sweep
+   *   still drops it. Waiting life is extended with the
+   *   `deadlineAt` form instead.
+   * - `deadlineAt` extends the schedule's absolute deadline: the
+   *   schedule must carry a per-message absolute deadline or a
+   *   schedule-time TTL deadline, and the new instant must be no
+   *   earlier than the governing one (the per-message deadline
+   *   when present, otherwise the schedule-time TTL deadline).
+   *   The per-message deadline, when present, moves to the new
+   *   instant, and any schedule-time TTL deadline earlier than
+   *   the new instant is lifted to the same instant — otherwise
+   *   the earlier TTL deadline would still expire the schedule
+   *   first and the extension would be a no-op in effect.
+   *   Neither field is ever lowered. An EDF-class schedule's EDF
+   *   deadline (EB-204) is a scheduling deadline, not an expiry
+   *   deadline, so it is never extended by this method: for an
+   *   EDF schedule the `deadlineAt` form extends only its
+   *   schedule-time TTL deadline when one exists, and throws
+   *   when it has none — like a schedule with no TTL/deadline
+   *   at all — because extending its EDF deadline would change
+   *   its delivery classification, not its life.
+   *
+   * Fail-closed, unlike `cancelDelayed`'s no-op `false`: an
+   * unknown id — never scheduled, already fanned out, already
+   * cancelled, or already dropped as expired — throws
+   * `RangeError` and changes nothing, so a caller can never
+   * silently "extend" a message that is already gone. The
+   * extension does not sweep or fan anything out: a due entry
+   * whose deadline was just extended delivers on the next sweep
+   * or flush, like any other due entry. Recorded in the
+   * subscription audit log as `delayed_ttl_extended`
+   * (`{ delayId, topic, ttlMs, oldTtlMs }` or
+   * `{ delayId, topic, deadlineAt, oldDeadlineAt }`); a failed
+   * extension records nothing, because it changed nothing.
+   *
+   * The same durability caveat as `rescheduleDelayed` applies:
+   * the extension itself is not persisted — restart recovery
+   * rebuilds the schedule from the first schedule record, with
+   * its original TTL/deadline — so an extension that must
+   * survive a restart is done as cancel plus re-schedule
+   * instead. Orthogonal to `rescheduleDelayed` (that moves the
+   * due time, this moves only the life) and to the EB-195
+   * schedule-time jitter (that spreads due times at schedule
+   * time, this extends life after scheduling).
+   *
+   * Returns `{ delayId, topic, ttlMs }` for the `ttlMs` form or
+   * `{ delayId, topic, deadlineAt }` for the `deadlineAt` form.
+   *
+   * Throws `TypeError` when `delayId` is not a string,
+   * `RangeError` when the id is unknown/no longer pending, when
+   * neither or both of `ttlMs`/`deadlineAt` are given, when the
+   * timing is illegal, when the schedule carries nothing the
+   * given form can extend, or when the new value would shorten
+   * the schedule's life.
+   */
+  extendDelayedTtl(
+    delayId: string,
+    opts: { ttlMs?: number; deadlineAt?: number },
+  ): DelayedTtlExtension {
+    if (typeof delayId !== 'string') {
+      throw new TypeError('extendDelayedTtl: delayId must be a string');
+    }
+    const hasTtlMs = opts?.ttlMs !== undefined;
+    const hasDeadlineAt = opts?.deadlineAt !== undefined;
+    if (hasTtlMs === hasDeadlineAt) {
+      throw new RangeError('extendDelayedTtl requires exactly one of ttlMs or deadlineAt');
+    }
+    if (hasTtlMs) validateTtlMs(opts.ttlMs, 'extendDelayedTtl');
+    if (hasDeadlineAt) validateDeadline(opts.deadlineAt, 'deadlineAt', 'extendDelayedTtl');
+    const entry = this.delayedById.get(delayId);
+    if (entry == null) {
+      throw new RangeError(
+        `extendDelayedTtl: unknown or no longer pending delayId ${JSON.stringify(delayId)}`,
+      );
+    }
+    // Every check above and below runs before any mutation: a failed
+    // extension leaves the original TTL/deadline intact.
+    if (hasTtlMs) {
+      const ttlMs = opts.ttlMs as number;
+      if (entry.ttlMs === undefined) {
+        throw new RangeError(
+          'extendDelayedTtl: schedule carries no per-message ttlMs to extend',
+        );
+      }
+      if (ttlMs < entry.ttlMs) {
+        throw new RangeError('extendDelayedTtl: ttlMs must not be smaller than the current ttlMs');
+      }
+      const oldTtlMs = entry.ttlMs;
+      entry.ttlMs = ttlMs;
+      this.auditSubscription({
+        action: 'delayed_ttl_extended',
+        actor: 'system',
+        pattern: entry.topic,
+        detail: { delayId, topic: entry.topic, ttlMs, oldTtlMs },
+      });
+      return { delayId, topic: entry.topic, ttlMs };
+    }
+    const deadlineAt = opts.deadlineAt as number;
+    // EDF-class schedules (EB-204) carry a scheduling deadline that
+    // never expires them: only their schedule-time TTL deadline, when
+    // present, is an expiry deadline this form can extend.
+    if (entry.edfDeadline !== undefined) {
+      if (entry.expiresAt === undefined) {
+        throw new RangeError(
+          'extendDelayedTtl: EDF schedule carries no TTL deadline to extend',
+        );
+      }
+      if (deadlineAt < entry.expiresAt) {
+        throw new RangeError(
+          'extendDelayedTtl: deadlineAt must not be earlier than the current deadline',
+        );
+      }
+      const oldDeadlineAt = entry.expiresAt;
+      entry.expiresAt = deadlineAt;
+      this.auditSubscription({
+        action: 'delayed_ttl_extended',
+        actor: 'system',
+        pattern: entry.topic,
+        detail: { delayId, topic: entry.topic, deadlineAt, oldDeadlineAt },
+      });
+      return { delayId, topic: entry.topic, deadlineAt };
+    }
+    const oldDeadlineAt = entry.deadline ?? entry.expiresAt;
+    if (oldDeadlineAt === undefined) {
+      throw new RangeError(
+        'extendDelayedTtl: schedule carries no deadline or TTL deadline to extend',
+      );
+    }
+    if (deadlineAt < oldDeadlineAt) {
+      throw new RangeError(
+        'extendDelayedTtl: deadlineAt must not be earlier than the current deadline',
+      );
+    }
+    if (entry.deadline !== undefined) entry.deadline = deadlineAt;
+    if (entry.expiresAt !== undefined && entry.expiresAt < deadlineAt) {
+      entry.expiresAt = deadlineAt;
+    }
+    this.auditSubscription({
+      action: 'delayed_ttl_extended',
+      actor: 'system',
+      pattern: entry.topic,
+      detail: { delayId, topic: entry.topic, deadlineAt, oldDeadlineAt },
+    });
+    return { delayId, topic: entry.topic, deadlineAt };
   }
 
   /**

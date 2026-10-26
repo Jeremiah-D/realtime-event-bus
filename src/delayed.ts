@@ -162,6 +162,24 @@ export interface DelayedStats {
   byTopic: DelayedTopicStats[];
 }
 
+/**
+ * The `extendDelayedTtl` result (EB-247): the extended schedule's
+ * identity plus the new TTL/deadline value — `ttlMs` for a
+ * per-message TTL extension, `deadlineAt` for an absolute-deadline
+ * extension (including a schedule-time TTL deadline lifted to that
+ * instant).
+ */
+export interface DelayedTtlExtension {
+  /** Opaque handle returned by `publishDelayed` (`delayed-1`, …). */
+  delayId: string;
+  /** Concrete topic the message will be published to at its due time. */
+  topic: string;
+  /** New per-message TTL duration, when the `ttlMs` form was used. */
+  ttlMs?: number;
+  /** New absolute deadline instant, when the `deadlineAt` form was used. */
+  deadlineAt?: number;
+}
+
 interface HeapNode {
   entry: DelayedEntry;
   /** Insertion order; breaks `deliverAt` ties deterministically. */
