@@ -2295,7 +2295,26 @@ library.
   `setTopicTtl` convention (exact topic wins over patterns, earliest
   matching pattern wins); unmatched topics resolve to 0. With no
   priorities configured the sweep keeps its exact heap order — the
-  feature is default-off with zero behavior change.
+  feature is default-off with zero behavior change. Read-only delayed-delivery
+  inspection (EB-241, via `listDelayed(topicPattern?, { key? })`): snapshots every
+  still-pending schedule as `{ delayId, topic, key, deliverAt, remainingMs }` —
+  identity and timing only, never the payload — in schedule order, so operators
+  can govern the delayed queue (what is waiting, for which topic/key, and for
+  how long) without disturbing it: listing fans nothing out, touches no heap,
+  consumes no sequence number, counts nothing, and never sweeps, so it cannot
+  drop an expired entry or arm a timer as a side effect. Only genuinely
+  pending schedules appear — fanned-out, cancelled, and sweep-dropped entries
+  never do, and a due entry past its effective deadline is excluded even
+  before the next sweep runs, while a not-yet-due entry past its deadline is
+  still pending (still cancellable, still counted by `pendingDelayed`) and
+  still listed. Topic matching follows the `cancelDelayedByTopic` convention
+  (exact topic or the same wildcard syntax as `subscribe`); a `key` filter
+  narrows to that compaction key within the topic scope, and unkeyed
+  schedules never match a key. Orthogonal to the cancel family: this only
+  reads — cancelling still goes through `cancelDelayed` /
+  `cancelDelayedByTopic` / `cancelDelayedByKey` / `cancelDelayedByPredicate`,
+  whose semantics are unchanged. A non-string pattern/key throws `TypeError`,
+  an empty one `RangeError`.
 - **Shadow subscriber traffic mirroring** (in `src/bus.ts`, via
   `subscribe(pattern, handler, { shadow: true | { queueSize?,
   dropPolicy? } })`): the subscription becomes a shadow subscriber — it

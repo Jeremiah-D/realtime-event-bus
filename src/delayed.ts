@@ -113,6 +113,28 @@ export interface DelayedEntry {
   priority?: MessageLane;
 }
 
+/**
+ * One entry of the `listDelayed` read-only snapshot (EB-241): the
+ * schedule's identity and timing only — never the payload, so an
+ * inspection cannot leak, retain, or mutate message contents.
+ */
+export interface DelayedInspection {
+  /** Opaque handle returned by `publishDelayed` (`delayed-1`, …). */
+  delayId: string;
+  /** Concrete topic the message will be published to at its due time. */
+  topic: string;
+  /** Compaction key, or `undefined` for an unkeyed schedule. */
+  key?: string;
+  /** Bus-clock timestamp in milliseconds when the message becomes due. */
+  deliverAt: number;
+  /**
+   * Milliseconds until the due time on the bus clock (`deliverAt -
+   * now`); negative when the entry is already due but no sweep has
+   * fanned it out yet.
+   */
+  remainingMs: number;
+}
+
 interface HeapNode {
   entry: DelayedEntry;
   /** Insertion order; breaks `deliverAt` ties deterministically. */

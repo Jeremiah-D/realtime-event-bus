@@ -278,7 +278,7 @@ import {
   type NamespaceOptions,
   type NamespaceStats,
 } from './namespace.ts';
-import { DelayHeap, type DelayedEntry } from './delayed.ts';
+import { DelayHeap, type DelayedEntry, type DelayedInspection } from './delayed.ts';
 import {
   DeliveryWindowGate,
   resolveDeliveryWindowOptions,
@@ -32369,6 +32369,98 @@ export class EventBus {
       detail: { cancelled: delayIds.length, delayIds, topicPattern },
     });
     return { cancelled: delayIds.length, delayIds };
+  }
+
+  /**
+   * Lists pending delayed deliveries as a read-only snapshot (EB-241):
+   * one `{ delayId, topic, key, deliverAt, remainingMs }` per pending
+   * schedule, in schedule order, with no payload — inspecting the
+   * queue never exposes message contents.
+   *
+   * Read-only, strictly: listing never fans anything out, never touches
+   * the timer heap, consumes no sequence number, counts nothing in
+   * `getStats()`, writes no audit record, and never sweeps — so it also
+   * never drops an expired entry or arms a timer as a side effect.
+   * `remainingMs` is `deliverAt` minus the bus clock at call time.
+   *
+   * Only genuinely still-pending schedules are listed: entries that
+   * already fanned out, were already cancelled, or were already
+   * dropped as expired are no longer in the pending set and never
+   * appear. An entry the next sweep would drop as expired — already
+   * due (`deliverAt` reached) and past its effective deadline (the
+   * sweep's rule: the schedule-time TTL deadline, or the per-message
+   * absolute deadline when earlier; an EDF-class schedule's EDF
+   * deadline never expires it, only its TTL deadline can) — is
+   * likewise excluded, even though the sweep has not run yet; listing
+   * reports what would still deliver, not what the heap still holds.
+   * An entry past its deadline but not yet due is still pending
+   * (still cancellable, still counted by `pendingDelayed`) and is
+   * still listed — expiry is a sweep-time determination, and listing
+   * never performs a sweep.
+   *
+   * `topicPattern` is optional: omitted, every pending schedule is
+   * listed. Given, it is an exact topic or the same wildcard syntax as
+   * `subscribe` (the `cancelDelayedByTopic` convention). `opts.key`
+   * further narrows to schedules carrying exactly that compaction
+   * key; an unkeyed schedule never matches a key filter. Orthogonal
+   * to the cancel family: this only reads — use `cancelDelayed` /
+   * `cancelDelayedByTopic` / `cancelDelayedByKey` /
+   * `cancelDelayedByPredicate` to remove schedules, whose semantics
+   * are unchanged.
+   *
+   * Throws `TypeError` when `topicPattern` or `opts.key` is not a
+   * string, `RangeError` when either is empty.
+   */
+  listDelayed(topicPattern?: string, opts?: { key?: string }): DelayedInspection[] {
+    if (topicPattern !== undefined) {
+      if (typeof topicPattern !== 'string') {
+        throw new TypeError('listDelayed: topicPattern must be a string');
+      }
+      if (topicPattern.length === 0) {
+        throw new RangeError('listDelayed: topicPattern must be a non-empty string');
+      }
+    }
+    const key = opts?.key;
+    if (key !== undefined) {
+      if (typeof key !== 'string') {
+        throw new TypeError('listDelayed: key must be a string');
+      }
+      if (key.length === 0) {
+        throw new RangeError('listDelayed: key must be a non-empty string');
+      }
+    }
+    const matcher = topicPattern === undefined ? undefined : compilePattern(topicPattern);
+    const nowMs = this.now();
+    const out: DelayedInspection[] = [];
+    // `delayedById` holds exactly the pending schedules, in schedule
+    // order: fanned-out, cancelled, and sweep-dropped entries are
+    // already gone, so iterating it (without mutating it) is the
+    // read-only pending set by construction.
+    for (const [delayId, entry] of this.delayedById) {
+      if (matcher !== undefined && entry.topic !== topicPattern && !matcher.test(entry.topic)) continue;
+      if (key !== undefined && entry.key !== key) continue;
+      // Mirror the sweep's expiry rule, without sweeping: a due entry
+      // past its effective deadline would be dropped, never delivered.
+      if (entry.deliverAt <= nowMs) {
+        const sweepDeadline =
+          entry.edfDeadline !== undefined
+            ? entry.expiresAt
+            : entry.deadline === undefined
+              ? entry.expiresAt
+              : entry.expiresAt === undefined
+                ? entry.deadline
+                : Math.min(entry.expiresAt, entry.deadline);
+        if (sweepDeadline !== undefined && nowMs >= sweepDeadline) continue;
+      }
+      out.push({
+        delayId,
+        topic: entry.topic,
+        key: entry.key,
+        deliverAt: entry.deliverAt,
+        remainingMs: entry.deliverAt - nowMs,
+      });
+    }
+    return out;
   }
 
   /**
