@@ -278,7 +278,13 @@ import {
   type NamespaceOptions,
   type NamespaceStats,
 } from './namespace.ts';
-import { DelayHeap, type DelayedEntry, type DelayedInspection } from './delayed.ts';
+import {
+  DelayHeap,
+  type DelayedEntry,
+  type DelayedInspection,
+  type DelayedStats,
+  type DelayedTopicStats,
+} from './delayed.ts';
 import {
   DeliveryWindowGate,
   resolveDeliveryWindowOptions,
@@ -32691,6 +32697,98 @@ export class EventBus {
       });
     }
     return out;
+  }
+
+  /**
+   * Aggregates pending delayed deliveries by concrete topic
+   * (EB-246): returns `{ total, byTopic }`, where `byTopic` holds
+   * one `{ topic, pending, earliestDeliverAt }` row per topic with
+   * at least one counted schedule, in first-appearance schedule
+   * order, and `total` is the sum of the rows' `pending` counts.
+   *
+   * Read-only, strictly, like `listDelayed`: aggregating never fans
+   * anything out, never touches the timer heap, consumes no
+   * sequence number, counts nothing in `getStats()`, writes no
+   * audit record, and never sweeps — so it also never drops an
+   * expired entry or arms a timer as a side effect, and it
+   * carries no payload, only topics, counts, and due times.
+   *
+   * What counts as pending is exactly `listDelayed`'s definition,
+   * so the two agree entry for entry: fanned-out, cancelled, and
+   * sweep-dropped schedules are gone from the pending set and
+   * never counted; a due entry past its effective deadline (the
+   * sweep's rule: the schedule-time TTL deadline, or the
+   * per-message absolute deadline when earlier; an EDF-class
+   * schedule's EDF deadline never expires it, only its TTL
+   * deadline can) is likewise excluded even before the next
+   * sweep runs, because it would never deliver; and an entry
+   * past its deadline but not yet due is still pending (still
+   * cancellable) and still counted. One stated divergence:
+   * `getStats().pendingDelayed` counts the raw pending-set size
+   * and therefore still includes a due-expired entry awaiting
+   * its sweep, so `getDelayedStats().total` can be smaller than
+   * `pendingDelayed` in exactly that window — the stats report
+   * what would still deliver, like `listDelayed` does.
+   *
+   * Orthogonal to `listDelayed` (that enumerates one snapshot
+   * row per schedule, this aggregates counts per topic), to
+   * `getStats().pendingDelayed` (that is a single global number
+   * with no per-topic breakdown), and to the EB-136 schedule
+   * skew observability (that measures fan-out lateness, this
+   * counts what is still waiting).
+   *
+   * `topicPattern` is optional: omitted, every pending schedule
+   * is aggregated. Given, it is an exact topic or the same
+   * wildcard syntax as `subscribe` (the `cancelDelayedByTopic`
+   * convention).
+   *
+   * Throws `TypeError` when `topicPattern` is not a string,
+   * `RangeError` when it is empty.
+   */
+  getDelayedStats(topicPattern?: string): DelayedStats {
+    if (topicPattern !== undefined) {
+      if (typeof topicPattern !== 'string') {
+        throw new TypeError('getDelayedStats: topicPattern must be a string');
+      }
+      if (topicPattern.length === 0) {
+        throw new RangeError('getDelayedStats: topicPattern must be a non-empty string');
+      }
+    }
+    const matcher = topicPattern === undefined ? undefined : compilePattern(topicPattern);
+    const nowMs = this.now();
+    const byTopic: DelayedTopicStats[] = [];
+    const rows = new Map<string, DelayedTopicStats>();
+    // `delayedById` holds exactly the pending schedules, in schedule
+    // order: fanned-out, cancelled, and sweep-dropped entries are
+    // already gone, so iterating it (without mutating it) is the
+    // read-only pending set by construction.
+    for (const entry of this.delayedById.values()) {
+      if (matcher !== undefined && entry.topic !== topicPattern && !matcher.test(entry.topic)) continue;
+      // Mirror the sweep's expiry rule, without sweeping: a due entry
+      // past its effective deadline would be dropped, never delivered.
+      if (entry.deliverAt <= nowMs) {
+        const sweepDeadline =
+          entry.edfDeadline !== undefined
+            ? entry.expiresAt
+            : entry.deadline === undefined
+              ? entry.expiresAt
+              : entry.expiresAt === undefined
+                ? entry.deadline
+                : Math.min(entry.expiresAt, entry.deadline);
+        if (sweepDeadline !== undefined && nowMs >= sweepDeadline) continue;
+      }
+      let row = rows.get(entry.topic);
+      if (row === undefined) {
+        row = { topic: entry.topic, pending: 0, earliestDeliverAt: entry.deliverAt };
+        rows.set(entry.topic, row);
+        byTopic.push(row);
+      }
+      row.pending += 1;
+      if (entry.deliverAt < row.earliestDeliverAt) row.earliestDeliverAt = entry.deliverAt;
+    }
+    let total = 0;
+    for (const row of byTopic) total += row.pending;
+    return { total, byTopic };
   }
 
   /**

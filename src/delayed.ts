@@ -135,6 +135,33 @@ export interface DelayedInspection {
   remainingMs: number;
 }
 
+/**
+ * One per-topic row of the `getDelayedStats` aggregation (EB-246):
+ * how many still-pending schedules a concrete topic holds, and the
+ * earliest due time among them — identity and timing only, never a
+ * payload, so a stats call cannot leak message contents.
+ */
+export interface DelayedTopicStats {
+  /** Concrete topic the pending schedules will be published to. */
+  topic: string;
+  /** Number of still-pending schedules for this topic. */
+  pending: number;
+  /** Earliest `deliverAt` among this topic's counted schedules. */
+  earliestDeliverAt: number;
+}
+
+/**
+ * The `getDelayedStats` aggregation (EB-246): a global pending total
+ * plus one row per concrete topic that holds pending schedules, in
+ * first-appearance schedule order.
+ */
+export interface DelayedStats {
+  /** Total still-pending schedules across all counted topics. */
+  total: number;
+  /** One row per concrete topic with at least one counted schedule. */
+  byTopic: DelayedTopicStats[];
+}
+
 interface HeapNode {
   entry: DelayedEntry;
   /** Insertion order; breaks `deliverAt` ties deterministically. */
