@@ -32269,6 +32269,97 @@ export class EventBus {
   }
 
   /**
+   * Cancels every pending delayed delivery scheduled for one topic or
+   * topic pattern whose payload/key satisfies a caller predicate
+   * (EB-239): the messages will never fan out. Returns
+   * `{ cancelled, delayIds }` — the number of schedules cancelled and
+   * their ids in schedule order, the same shape as
+   * `cancelDelayedByTopic` and `cancelDelayedByKey`.
+   *
+   * The predicate is called once per topic-matching pending entry as
+   * `predicate(entry.payload, entry.key)` — the payload exactly as
+   * passed to `publishDelayed` (verbatim reference, not a copy) and the
+   * entry's compaction key, or `undefined` for an unkeyed schedule —
+   * and a truthy return marks that entry for cancellation. Entries
+   * whose topic does not match `topicPattern` are never evaluated:
+   * the predicate only ever sees entries inside the topic scope.
+   * Only pending, not-yet-fanned-out schedules are cancelled:
+   * entries that already fanned out, already expired, or were
+   * already cancelled are not in `delayedById` and are not counted,
+   * and calling the same cancellation twice counts each schedule
+   * at most once — the second call finds nothing pending and
+   * returns `{ cancelled: 0, delayIds: [] }`.
+   *
+   * Fail-closed on a throwing predicate: all matching entries are
+   * evaluated before anything is cancelled, so when the predicate
+   * throws for any entry, the predicate's error propagates and
+   * zero schedules are cancelled — a half-cancelled batch is
+   * impossible, and the caller can retry with a fixed predicate
+   * against the untouched pending set.
+   *
+   * Each cancellation reuses `cancelDelayed`, so every cancelled
+   * schedule is tombstoned to the durable log (the EB-24
+   * convention) — a restart never resurrects them — and keyed
+   * schedules release their subscribers' per-key expectations, so
+   * a buffered successor for the same key is enqueued instead of
+   * hanging forever. An empty result returns
+   * `{ cancelled: 0, delayIds: [] }` — never a throw. Recorded in
+   * the subscription audit log as `delayed_cancelled`
+   * (`{ cancelled, delayIds, topicPattern }`); a predicate function
+   * is not serializable, so it is not recorded in the detail — the
+   * topic scope and the outcome are. A throwing predicate records
+   * nothing: the failed batch left no effect to audit.
+   *
+   * Orthogonal to the other bulk cancellations: `cancelDelayed`
+   * cancels by id, `cancelDelayedByTopic` by topic alone, and
+   * `cancelDelayedByKey` (EB-236) by topic and key — this cancels
+   * by topic and by what the message carries, so an operator can
+   * drop, say, every pending low-priority order on a topic without
+   * knowing their keys or ids in advance.
+   *
+   * Throws `TypeError` when `topicPattern` is not a string or
+   * `predicate` is not a function, `RangeError` when
+   * `topicPattern` is empty.
+   */
+  cancelDelayedByPredicate(
+    topicPattern: string,
+    predicate: (payload: unknown, key: string | undefined) => unknown,
+  ): { cancelled: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('cancelDelayedByPredicate: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('cancelDelayedByPredicate: topicPattern must be a non-empty string');
+    }
+    if (typeof predicate !== 'function') {
+      throw new TypeError('cancelDelayedByPredicate: predicate must be a function');
+    }
+    const matcher = compilePattern(topicPattern);
+    // Evaluate first, cancel second: `delayedById` holds exactly the
+    // pending schedules, in schedule order. Collecting every hit
+    // before any `cancelDelayed` call is what makes a throwing
+    // predicate fail closed — the throw propagates before the
+    // pending set is touched at all.
+    const hits: string[] = [];
+    for (const [delayId, entry] of this.delayedById) {
+      if (entry.topic === topicPattern || matcher.test(entry.topic)) {
+        if (predicate(entry.payload, entry.key)) hits.push(delayId);
+      }
+    }
+    const delayIds: string[] = [];
+    for (const delayId of hits) {
+      if (this.cancelDelayed(delayId)) delayIds.push(delayId);
+    }
+    this.auditSubscription({
+      action: 'delayed_cancelled',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { cancelled: delayIds.length, delayIds, topicPattern },
+    });
+    return { cancelled: delayIds.length, delayIds };
+  }
+
+  /**
    * Sets the same-tick fan-out priority for delayed deliveries on one
    * topic or topic pattern (EB-219): when a single sweep pass finds
    * several schedules due at once, entries for higher-priority topics

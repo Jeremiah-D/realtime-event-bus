@@ -3667,6 +3667,54 @@ How it works:
   including the empty case. This is orthogonal to
   `cancelDelayedByTopic` (topic alone): this is topic and key together.
 
+## Cancelling delayed deliveries by predicate
+
+`cancelDelayedByPredicate(topicPattern, predicate)` (`src/bus.ts`,
+EB-239) cancels every pending delayed delivery scheduled for one topic
+— or for every concrete topic matching a wildcard pattern — whose
+payload/key satisfies a caller predicate, in a single call:
+
+```ts
+bus.publishDelayed('orders.eu', { kind: 'order', priority: 'low' }, { delayMs: 60_000 });
+bus.publishDelayed('orders.eu', { kind: 'order', priority: 'high' }, { delayMs: 60_000 });
+bus.cancelDelayedByPredicate('orders.*', (payload) => payload.priority === 'low');
+// -> { cancelled: 1, delayIds: [...] }
+```
+
+How it works:
+
+- **Scope** — the predicate is called once per topic-matching pending
+  entry as `predicate(entry.payload, entry.key)`: the payload exactly
+  as passed to `publishDelayed` and the entry's compaction key, or
+  `undefined` for an unkeyed schedule. A truthy return marks the entry
+  for cancellation. Entries outside the topic scope are never evaluated.
+- **Fail-closed** — all matching entries are evaluated before anything
+  is cancelled, so when the predicate throws for any entry, its error
+  propagates and zero schedules are cancelled: a half-cancelled batch
+  is impossible, and a retry with a fixed predicate runs against the
+  untouched pending set.
+- **Result** — `{ cancelled, delayIds }`, the same shape as
+  `cancelDelayedByTopic`, with ids in schedule order. Only pending,
+  not-yet-fanned-out schedules count; already fanned out, expired, or
+  cancelled schedules are not counted, and a repeat call counts each
+  schedule at most once. A non-function predicate throws `TypeError`,
+  a non-string pattern `TypeError`, an empty pattern `RangeError`.
+- **Durability and key order** — each cancellation reuses
+  `cancelDelayed`, so every cancelled schedule is tombstoned to the
+  durable log and releases its subscribers' per-key expectations: a
+  buffered successor for the same key is enqueued instead of hanging
+  forever, while other keys' sequences are unaffected.
+- **Observability** — recorded in the subscription audit log as
+  `delayed_cancelled` (`{ cancelled, delayIds, topicPattern }`),
+  including the empty case; the predicate itself is not recorded, since
+  a function is not serializable. A throwing predicate records nothing,
+  because the failed batch left no effect to audit. This is orthogonal
+  to the other bulk cancellations: `cancelDelayed` cancels by id,
+  `cancelDelayedByTopic` by topic alone, `cancelDelayedByKey` (EB-236)
+  by topic and key — this cancels by topic and by what the message
+  carries, so an operator can drop a class of pending messages without
+  knowing their keys or ids in advance.
+
 ## Publish-side partition routing
 
 `setTopicPartitions(topicPattern, n)` (`src/bus.ts`, EB-90) gives a topic
