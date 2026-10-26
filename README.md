@@ -2314,7 +2314,24 @@ library.
   reads — cancelling still goes through `cancelDelayed` /
   `cancelDelayedByTopic` / `cancelDelayedByKey` / `cancelDelayedByPredicate`,
   whose semantics are unchanged. A non-string pattern/key throws `TypeError`,
-  an empty one `RangeError`.
+  an empty one `RangeError`. Delayed-delivery rescheduling (EB-242, via
+  `rescheduleDelayed(delayId, { delayMs | deliverAt })`): moves a pending
+  schedule to a new due time while keeping its delay id, topic, key,
+  payload, and every other schedule-time attribute — only `deliverAt`
+  changes — so operators can defer or expedite a waiting message without
+  cancelling and re-creating it (which would renumber its key sequence
+  and lose its id). The old heap node is retired lazily and a fresh entry
+  object re-enters the heap at the new due time; a new due time at or
+  before now fans out on the next flush, and TTL/deadline state is
+  preserved verbatim, so a schedule moved past its deadline expires at
+  its new due time instead of delivering late. Unknown, fanned-out, or
+  cancelled ids throw `RangeError` (fail-closed, unlike `cancelDelayed`'s
+  no-op `false`), illegal timing throws before anything changes, and a
+  successful move is audited as `delayed_rescheduled` (`{ delayId,
+  topic, oldDeliverAt, deliverAt }`). One stated caveat: the reschedule
+  itself is not persisted — restart recovery rebuilds the original due
+  time from the first schedule record — so a reschedule that must
+  survive a restart is done as cancel plus re-schedule instead.
 - **Shadow subscriber traffic mirroring** (in `src/bus.ts`, via
   `subscribe(pattern, handler, { shadow: true | { queueSize?,
   dropPolicy? } })`): the subscription becomes a shadow subscriber — it

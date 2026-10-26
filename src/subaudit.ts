@@ -78,6 +78,7 @@ export type SubscriptionAuditAction =
   | 'topic_paused'
   | 'topic_resumed'
   | 'delayed_cancelled'
+  | 'delayed_rescheduled'
   | 'partition_rule_set'
   | 'partition_rule_cleared'
   | 'partition_expansion'
@@ -301,6 +302,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'topic_paused',
   'topic_resumed',
   'delayed_cancelled',
+  'delayed_rescheduled',
   'partition_rule_set',
   'partition_rule_cleared',
   'partition_expansion',

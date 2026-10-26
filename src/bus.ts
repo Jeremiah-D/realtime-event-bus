@@ -32464,6 +32464,113 @@ export class EventBus {
   }
 
   /**
+   * Moves a pending delayed delivery to a new due time (EB-242): the
+   * schedule keeps its delay id, topic, key, payload, and every other
+   * schedule-time attribute — only `deliverAt` changes — and re-enters
+   * the timer heap at the new due time, so it fans out exactly when the
+   * new due time arrives and never at the old one.
+   *
+   * Mechanics: the heap supports push/peek/pop only, never an in-place
+   * removal, so the old heap node is retired the lazy way — the old
+   * entry object is marked cancelled (the sweep discards it when it
+   * surfaces, exactly like a `cancelDelayed` node) — and a fresh entry
+   * object carrying every field of the old one, with the new
+   * `deliverAt`, is filed under the same id and pushed onto the heap.
+   * The per-key sequence number is preserved, not renumbered: a
+   * rescheduled keyed message keeps its schedule-order position, so
+   * its successors are never unblocked early or reordered by the move.
+   * TTL/deadline state is likewise preserved verbatim — rescheduling
+   * moves the due time, it does not extend the message's life — so a
+   * schedule moved past its deadline is dropped as expired at its new
+   * due time, exactly as a schedule originally due there would be. A
+   * new due time at or before now fans out on the next flush, exactly
+   * like `publishDelayed` with `delayMs: 0` (the sweep below runs for
+   * that reason).
+   *
+   * Fail-closed, unlike `cancelDelayed`'s no-op `false`: an unknown id
+   * — never scheduled, already fanned out, already cancelled, or
+   * already dropped as expired — throws `RangeError` and changes
+   * nothing, so a caller can never silently "reschedule" a message
+   * that is already gone. Illegal timing (both or neither of
+   * `delayMs`/`deliverAt`, a negative or non-finite value) throws
+   * `RangeError` before the pending set is touched, so a failed
+   * reschedule leaves the original due time intact. Recorded in the
+   * subscription audit log as `delayed_rescheduled`
+   * (`{ delayId, topic, oldDeliverAt, deliverAt }`); a failed
+   * reschedule records nothing, because it changed nothing.
+   *
+   * Durability caveat, stated plainly: the reschedule itself is not
+   * persisted. Recovery (`recoverDelayed`) rebuilds a schedule from
+   * the first schedule record for its id, so a restart rebuilds the
+   * ORIGINAL due time, not the rescheduled one — rescheduling is in
+   * the same in-memory-only class as `traceparent`/`lineage` on a
+   * schedule. Changing recovery to last-record-wins would alter the
+   * tombstone semantics every other delayed path relies on, so it is
+   * deliberately out of scope here; operators who need a reschedule
+   * to survive a restart cancel and re-schedule instead.
+   *
+   * Orthogonal to the cancel family (those delete, this moves) and to
+   * `listDelayed` (that only reads, this only writes the due time).
+   *
+   * Throws `TypeError` when `delayId` is not a string, `RangeError`
+   * when the id is unknown/no longer pending or the timing is illegal.
+   */
+  rescheduleDelayed(
+    delayId: string,
+    opts: { delayMs?: number; deliverAt?: number },
+  ): void {
+    if (typeof delayId !== 'string') {
+      throw new TypeError('rescheduleDelayed: delayId must be a string');
+    }
+    const nowMs = this.now();
+    const hasDelayMs = opts?.delayMs !== undefined;
+    const hasDeliverAt = opts?.deliverAt !== undefined;
+    if (hasDelayMs === hasDeliverAt) {
+      throw new RangeError('rescheduleDelayed requires exactly one of delayMs or deliverAt');
+    }
+    let deliverAt: number;
+    if (hasDelayMs) {
+      const delayMs = opts.delayMs as number;
+      if (!Number.isFinite(delayMs) || delayMs < 0) {
+        throw new RangeError('delayMs must be a non-negative finite number of milliseconds');
+      }
+      deliverAt = nowMs + delayMs;
+    } else {
+      deliverAt = opts.deliverAt as number;
+      if (!Number.isFinite(deliverAt)) {
+        throw new RangeError('deliverAt must be a finite bus-clock timestamp in milliseconds');
+      }
+    }
+    const oldEntry = this.delayedById.get(delayId);
+    if (oldEntry == null) {
+      throw new RangeError(
+        `rescheduleDelayed: unknown or no longer pending delayId ${JSON.stringify(delayId)}`,
+      );
+    }
+    const oldDeliverAt = oldEntry.deliverAt;
+    // Retire the old heap node lazily, then file the replacement under
+    // the same id. The old object must not be mutated into the new
+    // entry: the sweep discards a node exactly when its entry is
+    // marked cancelled, so reusing the object would discard the
+    // replacement too. A fresh object with `cancelled: false` is what
+    // keeps the schedule alive at its new due time.
+    oldEntry.cancelled = true;
+    const entry: DelayedEntry = { ...oldEntry, deliverAt, cancelled: false };
+    this.delayedById.set(delayId, entry);
+    this.delayHeap.push(entry);
+    this.auditSubscription({
+      action: 'delayed_rescheduled',
+      actor: 'system',
+      pattern: entry.topic,
+      detail: { delayId, topic: entry.topic, oldDeliverAt, deliverAt },
+    });
+    // An already-due new time fans out on the next flush, like
+    // `publishDelayed`; a future time only re-arms the timer (the
+    // sweep re-arms via `armDelayTimer` and finds nothing due).
+    this.sweepDelayed(nowMs);
+  }
+
+  /**
    * Sets the same-tick fan-out priority for delayed deliveries on one
    * topic or topic pattern (EB-219): when a single sweep pass finds
    * several schedules due at once, entries for higher-priority topics
