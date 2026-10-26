@@ -2674,6 +2674,14 @@ npm test
   cut), diagnostics go through normal admission (ACL denial suppresses
   without affecting the DLQ move), admission-time counting, and the
   `eventbus_diagnostic_events_total` exposition series.
+- `test/deadletter-replay-topic.test.ts` — dead-letter replay to a repair
+  topic (EB-240): retarget republishes as a normal publish (target-topic
+  admission and sequence number, original `messageId`/`key`/trace id and
+  origin-topic lineage preserved, faulty subscriber never re-delivered),
+  unchanged requeue without `targetTopic`, invalid targets throw before
+  mutation, refused repair admissions restore the entry, approval parking
+  with the target attached (and clean rejection back to the DLQ), and
+  replay-rate-limit gating of retargets.
 - `test/poison.test.ts` — poison-message diagnosability on the DLQ:
   `lastError` records the handler's thrown message (or `nack`/`ack-timeout`
   when nothing was thrown) and always describes the final failure, batch
@@ -6720,6 +6728,28 @@ replaces the bucket with a fresh burst. Invalid limits throw
 `RangeError`, unknown subscribers and DLQ-less subscribers throw.
 System auto-replay (EB-134) is not an operator replay and is not
 gated. (Backend engineering: dead-letter governance.)
+
+## Dead-letter replay to a repair topic (EB-240)
+
+`replayDeadLetter(subId, seq, { targetTopic })` retargets a
+dead-lettered message instead of requeueing it to the faulty
+subscriber: the entry is republished to the repair topic as a
+normal publish — the target topic's admission gates run, the
+admitted message consumes the target topic's sequence number,
+and the original payload, `messageId`, `key`, and trace id ride
+along (the trace id continues as a `traceparent` with a fresh
+span id, the bridge-forward convention, and the origin topic
+rides as the message lineage). Without `targetTopic` the
+pre-EB-240 requeue semantics are unchanged. A retarget is still
+an operator replay, so it composes with approval (EB-233: the
+request parks with its target attached and only approval
+publishes it) and with the replay rate limit (EB-238: the
+publish attempt takes one token). A refused repair-topic
+admission restores the entry to the DLQ in arrival order and
+returns `false` — a refused repair never drops the message —
+and an invalid `targetTopic` throws `RangeError` before
+anything is mutated. (Real-time systems: dead-letter
+governance.)
 
 ## Payload size histograms (EB-143)
 

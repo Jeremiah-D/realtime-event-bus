@@ -3888,6 +3888,18 @@ export interface DeadLetterStats {
 }
 
 /**
+ * Options for `EventBus.replayDeadLetter` retargeting (EB-240).
+ */
+export interface DeadLetterReplayOptions {
+  /**
+   * Repair topic the dead-lettered message is republished to, as a
+   * normal publish, instead of being requeued to the original (faulty)
+   * subscriber. Absent means the pre-EB-240 requeue semantics.
+   */
+  targetTopic?: string;
+}
+
+/**
  * Options for `EventBus.setDeadLetterReplayRateLimit` (EB-238): the
  * token-bucket shape for operator dead-letter replays. Both numbers
  * must be positive and finite, else the call throws `RangeError`.
@@ -8674,7 +8686,7 @@ interface SubscriberDeadLetter {
    * delivery: only `approveDeadLetterReplay` requeues it, and only
    * `rejectDeadLetterReplay` returns it to the DLQ.
    */
-  pendingApprovals: Map<number, DeadLetterEntry & { msg: BusMessage }>;
+  pendingApprovals: Map<number, DeadLetterEntry & { msg: BusMessage; replayTargetTopic?: string }>;
   /**
    * Opt-in operator replay rate-limit bucket (EB-238), set by
    * `setDeadLetterReplayRateLimit`. Undefined means unlimited: the
@@ -42969,9 +42981,93 @@ export class EventBus {
    * with reason `'approval_queue_full'`. An already-pending entry is
    * not in the DLQ anymore, so a second request for it returns false.
    */
-  replayDeadLetter(subId: string, seq: number): boolean {
+  /**
+   * Publishes one dead-lettered entry to a repair topic (EB-240) as a
+   * normal publish through `tryPublish`: the target topic's admission
+   * gates run (ACL, schema, rate limits, ...), the admitted message
+   * consumes the target topic's sequence number, and the original
+   * payload is carried verbatim. The original message identity rides
+   * along — `key` and `messageId` as publish options, the trace id
+   * as a continued `traceparent` (a fresh span id, the bridge-forward
+   * convention, since the DLQ stores the trace id but not the parent
+   * span), and the origin topic as the message lineage (the entry's
+   * own lineage when it had one, otherwise a fresh lineage rooted at
+   * the dead-lettered topic). A non-admission is a `TryPublishResult`
+   * with `admitted: false`, never a throw, so the caller can restore
+   * the entry; a throw (closed bus, invalid publish options, ...) also
+   * propagates to the caller, which restores the entry first.
+   */
+  private publishRetargetDeadLetter(
+    record: DeadLetterEntry & { msg: BusMessage },
+    targetTopic: string,
+  ): TryPublishResult {
+    const msg = record.msg;
+    const traceparent =
+      record.traceId !== undefined && /^[0-9a-f]{32}$/.test(record.traceId)
+        ? formatTraceparent(record.traceId, newSpanId())
+        : undefined;
+    return this.tryPublish(targetTopic, record.payload, {
+      ...(msg.key !== undefined ? { key: msg.key } : {}),
+      ...(msg.messageId !== undefined ? { messageId: msg.messageId } : {}),
+      ...(msg.publisherId !== undefined ? { publisherId: msg.publisherId } : {}),
+      ...(traceparent !== undefined ? { traceparent } : {}),
+      lineage: msg.lineage ?? { originTopic: record.topic, hops: [] },
+    });
+  }
+
+  /**
+   * Hands one dead-lettered message back to the subscriber's queue for
+   * another delivery attempt (see
+   * `ReliableSubscribeOptions.deadLetter`). The message keeps its
+   * original per-topic `seq` (no false sequence gap) and its original
+   * TTL deadline — a message whose deadline already passed is dropped as
+   * expired on the next drain, not resurrected. The replayed message
+   * gets a fresh redelivery budget: if it fails again it is requeued up
+   * to `maxRedeliveries` times before returning to the DLQ.
+   *
+   * Returns true when the entry was found and requeued, false when the
+   * subscriber has no DLQ or no entry with that `seq`. Throws on an
+   * unknown subscriber id.
+   *
+   * EB-145: with `maxAgeMs` configured, an expired entry is not
+   * resurrected — the lazy sweep drops it first (counted in
+   * `BusStats.dlqExpiredMessages`) and the call returns false.
+   *
+   * EB-233: with `requireApproval` configured, a replay does NOT
+   * requeue directly — the entry moves to the pending-approval queue
+   * and this call returns true to mean "request accepted for approval"
+   * (not "delivered"); only `approveDeadLetterReplay` requeues it.
+   * When the approval queue is full the entry stays in the DLQ, the
+   * call returns false, and `dead_letter_replay_rejected` is audited
+   * with reason `'approval_queue_full'`. An already-pending entry is
+   * not in the DLQ anymore, so a second request for it returns false.
+   *
+   * EB-240: with `opts.targetTopic` given, the entry is NOT requeued
+   * to the original subscriber at all — it is republished to the
+   * repair topic as a normal publish (see
+   * `publishRetargetDeadLetter`): target-topic admission, target-topic
+   * sequence number, original `messageId` / `key` / trace id and
+   * origin-topic lineage preserved. Without `targetTopic` the
+   * pre-EB-240 requeue semantics are unchanged. A retarget is still
+   * an operator replay, so it composes with EB-233 and EB-238
+   * unchanged: under `requireApproval` the request parks in the
+   * pending-approval queue (with its target attached) and only
+   * `approveDeadLetterReplay` publishes it; under a replay rate
+   * limit the publish attempt takes one token, and an over-budget
+   * request leaves the entry exactly where it was. A target-topic
+   * admission refusal restores the entry to the DLQ in arrival
+   * order and returns false — a refused repair never drops the
+   * message — and a publish throw restores the entry before
+   * rethrowing. An invalid `targetTopic` (non-string or empty)
+   * throws `RangeError` before anything is mutated.
+   */
+  replayDeadLetter(subId: string, seq: number, opts?: DeadLetterReplayOptions): boolean {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const targetTopic = opts?.targetTopic;
+    if (targetTopic !== undefined && (typeof targetTopic !== 'string' || targetTopic === '')) {
+      throw new RangeError('replayDeadLetter: targetTopic must be a non-empty string');
+    }
     const dlq = subscriber.deadLetter;
     if (dlq == null) return false;
     this.sweepExpiredDlqEntries(dlq);
@@ -42988,13 +43084,16 @@ export class EventBus {
       clearTimeout(pendingTimer);
       dlq.pendingAutoReplays.delete(seq);
     }
+    const restoreToDlq = (): void => {
+      const at = dlq.entries.findIndex((e) => e.seq > record.seq);
+      if (at === -1) dlq.entries.push(record);
+      else dlq.entries.splice(at, 0, record);
+    };
     if (dlq.requireApproval) {
       if (dlq.pendingApprovals.size >= dlq.maxPending) {
         // Queue full: refuse the request, entry back in the DLQ in
         // arrival order (seq order), audited as a rejection.
-        const at = dlq.entries.findIndex((e) => e.seq > record.seq);
-        if (at === -1) dlq.entries.push(record);
-        else dlq.entries.splice(at, 0, record);
+        restoreToDlq();
         this.auditSubscription({
           action: 'dead_letter_replay_rejected',
           actor: 'operator',
@@ -43005,14 +43104,17 @@ export class EventBus {
         });
         return false;
       }
-      dlq.pendingApprovals.set(seq, record);
+      dlq.pendingApprovals.set(
+        seq,
+        targetTopic === undefined ? record : { ...record, replayTargetTopic: targetTopic },
+      );
       this.auditSubscription({
         action: 'dead_letter_replay_requested',
         actor: 'operator',
         subId: subscriber.id,
         pattern: subscriber.pattern,
         topic: record.topic,
-        detail: { seq },
+        detail: { seq, ...(targetTopic === undefined ? {} : { targetTopic }) },
       });
       return true;
     }
@@ -43021,10 +43123,25 @@ export class EventBus {
     // not dropped and not jumping the queue; the deferral counts in
     // getDeadLetterStats.
     if (!this.tryTakeDeadLetterReplayToken(dlq)) {
-      const at = dlq.entries.findIndex((e) => e.seq > record.seq);
-      if (at === -1) dlq.entries.push(record);
-      else dlq.entries.splice(at, 0, record);
+      restoreToDlq();
       return false;
+    }
+    if (targetTopic !== undefined) {
+      let outcome: TryPublishResult;
+      try {
+        outcome = this.publishRetargetDeadLetter(record, targetTopic);
+      } catch (err) {
+        restoreToDlq();
+        throw err;
+      }
+      if (!outcome.admitted) {
+        restoreToDlq();
+        return false;
+      }
+      dlq.autoReplayAttemptsInFlight.delete(record.msg);
+      subscriber.reliable?.redeliveries.delete(record.msg);
+      subscriber.reliable?.lastFailure.delete(record.msg);
+      return true;
     }
     dlq.autoReplayAttemptsInFlight.delete(record.msg);
     // Fresh retry budget: the operator's replay is a new chance, not a
@@ -43091,7 +43208,9 @@ export class EventBus {
    * the entry exactly as a direct `replayDeadLetter` would — same
    * per-message semantics (original per-topic `seq`, original TTL
    * deadline, fresh redelivery budget, dedup bypassed). Audited as
-   * `dead_letter_replay_approved`.
+   * `dead_letter_replay_approved`. EB-240: a parked retarget request
+   * instead publishes to its repair topic (see `publishRetargetDeadLetter`)
+   * and stays parked until that publish is admitted.
    *
    * Returns true when a pending request with that `seq` was approved
    * and requeued, false when the subscriber has no DLQ, no pending
@@ -43113,6 +43232,33 @@ export class EventBus {
     // approval stays parked in request order, never dropped, and a
     // later approve inside budget requeues it.
     if (!this.tryTakeDeadLetterReplayToken(dlq)) return false;
+    // EB-240: a parked retarget publishes to its repair topic instead
+    // of requeueing to the original subscriber. The request stays
+    // parked until the publish is admitted — a refused or throwing
+    // publish never loses the entry — and only an admitted publish
+    // consumes the pending request.
+    if (record.replayTargetTopic !== undefined) {
+      let outcome: TryPublishResult;
+      try {
+        outcome = this.publishRetargetDeadLetter(record, record.replayTargetTopic);
+      } catch (err) {
+        throw err;
+      }
+      if (!outcome.admitted) return false;
+      dlq.pendingApprovals.delete(seq);
+      dlq.autoReplayAttemptsInFlight.delete(record.msg);
+      subscriber.reliable?.redeliveries.delete(record.msg);
+      subscriber.reliable?.lastFailure.delete(record.msg);
+      this.auditSubscription({
+        action: 'dead_letter_replay_approved',
+        actor: 'operator',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        topic: record.topic,
+        detail: { seq, targetTopic: record.replayTargetTopic },
+      });
+      return true;
+    }
     dlq.pendingApprovals.delete(seq);
     dlq.autoReplayAttemptsInFlight.delete(record.msg);
     subscriber.reliable?.redeliveries.delete(record.msg);
@@ -43150,9 +43296,13 @@ export class EventBus {
     const record = dlq.pendingApprovals.get(seq);
     if (record === undefined) return false;
     dlq.pendingApprovals.delete(seq);
+    // EB-240: the pending record's internal retarget field must not
+    // leak into the DLQ entry snapshot — strip it on the way back.
+    const { msg, replayTargetTopic: _retarget, ...entry } = record;
+    const restored = { ...entry, msg };
     const at = dlq.entries.findIndex((e) => e.seq > record.seq);
-    if (at === -1) dlq.entries.push(record);
-    else dlq.entries.splice(at, 0, record);
+    if (at === -1) dlq.entries.push(restored);
+    else dlq.entries.splice(at, 0, restored);
     this.auditSubscription({
       action: 'dead_letter_replay_rejected',
       actor: 'operator',
@@ -43178,7 +43328,7 @@ export class EventBus {
     const dlq = subscriber.deadLetter;
     if (dlq == null) return [];
     this.sweepExpiredDlqEntries(dlq);
-    return [...dlq.pendingApprovals.values()].map(({ msg: _msg, ...entry }) => ({ ...entry }));
+    return [...dlq.pendingApprovals.values()].map(({ msg: _msg, replayTargetTopic: _retarget, ...entry }) => ({ ...entry }));
   }
 
   /**
