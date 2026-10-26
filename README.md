@@ -6653,6 +6653,26 @@ All three transitions audit (`dead_letter_replay_requested`
   operator replay. (Backend engineering: dead-letter
   governance.)
 
+## Dead-letter replay rate limit (EB-238)
+
+`setDeadLetterReplayRateLimit(subId, { messagesPerSec, burst })`
+opts one subscriber into a token-bucket cap on operator replays:
+every direct `replayDeadLetter` requeue and every approved
+`approveDeadLetterReplay` takes one token, so an approved replay
+cannot dodge the limit and approval parking itself is not gated
+(parking is not a requeue). An over-budget request is deferred,
+never dropped and never jumping the queue — the entry stays
+exactly where it was (in the DLQ for a direct replay, parked in
+request order for an approval) until a later request inside budget
+requeues it, and each deferral counts in
+`getDeadLetterStats().replayRateLimited`. Rejecting a parked replay
+is never gated. The bucket runs on the bus clock, so window refills
+are deterministic under an injected `now`; re-setting the limit
+replaces the bucket with a fresh burst. Invalid limits throw
+`RangeError`, unknown subscribers and DLQ-less subscribers throw.
+System auto-replay (EB-134) is not an operator replay and is not
+gated. (Backend engineering: dead-letter governance.)
+
 ## Payload size histograms (EB-143)
 
 `setTopicPayloadHistogram(topicPattern, { buckets })` opts topics into

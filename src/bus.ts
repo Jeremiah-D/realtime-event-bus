@@ -3879,6 +3879,24 @@ export interface DeadLetterStats {
   requireApproval: boolean;
   /** Bound for the pending-approval queue. */
   maxPending: number;
+  /**
+   * Operator replay requests deferred by the replay rate limit (EB-238)
+   * — deferred, never dropped: the entry stays where it was until a
+   * later request inside budget requeues it.
+   */
+  replayRateLimited: number;
+}
+
+/**
+ * Options for `EventBus.setDeadLetterReplayRateLimit` (EB-238): the
+ * token-bucket shape for operator dead-letter replays. Both numbers
+ * must be positive and finite, else the call throws `RangeError`.
+ */
+export interface DeadLetterReplayRateLimitOptions {
+  /** Sustained replay rate, in replays per second. */
+  messagesPerSec: number;
+  /** Burst capacity: replays that may fire at once after idle time. */
+  burst: number;
 }
 
 /** Snapshot delivered to `DeadLetterOptions.onDeadLetter`. */
@@ -8657,6 +8675,18 @@ interface SubscriberDeadLetter {
    * `rejectDeadLetterReplay` returns it to the DLQ.
    */
   pendingApprovals: Map<number, DeadLetterEntry & { msg: BusMessage }>;
+  /**
+   * Opt-in operator replay rate-limit bucket (EB-238), set by
+   * `setDeadLetterReplayRateLimit`. Undefined means unlimited: the
+   * pre-EB-238 behavior. The bucket runs on the bus clock, so tests
+   * with an injected `now` refill deterministically.
+   */
+  replayRateLimitBucket?: TokenBucket;
+  /**
+   * Operator replay requests deferred by the replay rate limit
+   * (EB-238), cumulative. Reported by `getDeadLetterStats`.
+   */
+  replayRateLimited: number;
 }
 
 /**
@@ -24922,6 +24952,9 @@ export class EventBus {
         autoReplayAttemptsInFlight: new Map(),
         // EB-233: replay-approval queue starts empty per subscriber.
         pendingApprovals: new Map(),
+        // EB-238: no replay rate limit by default; deferred-replay
+        // counter starts at zero.
+        replayRateLimited: 0,
       };
     }
     // Tracks one delivery, wrapping the handle so the ack-latency tracker
@@ -42892,6 +42925,16 @@ export class EventBus {
       });
       return true;
     }
+    // EB-238: an over-budget direct replay is deferred before any
+    // mutation — the entry returns to the DLQ in arrival (seq) order,
+    // not dropped and not jumping the queue; the deferral counts in
+    // getDeadLetterStats.
+    if (!this.tryTakeDeadLetterReplayToken(dlq)) {
+      const at = dlq.entries.findIndex((e) => e.seq > record.seq);
+      if (at === -1) dlq.entries.push(record);
+      else dlq.entries.splice(at, 0, record);
+      return false;
+    }
     dlq.autoReplayAttemptsInFlight.delete(record.msg);
     // Fresh retry budget: the operator's replay is a new chance, not a
     // continuation of the poison run — and it bypasses the dedup window
@@ -42902,6 +42945,54 @@ export class EventBus {
     this.enqueueMessage(subscriber, record.msg, this.messageDeadlines.get(record.msg), true);
     this.scheduleFlush();
     return true;
+  }
+
+  /**
+   * Sets an opt-in rate limit on operator dead-letter replays for one
+   * subscriber (EB-238): a token bucket of `burst` tokens refilling at
+   * `messagesPerSec`, on the bus clock (injectable via
+   * `EventBusOptions.now`, so window refills are deterministic in
+   * tests). Both the direct `replayDeadLetter` requeue and an approved
+   * `approveDeadLetterReplay` take one token; approval alone does not
+   * bypass the limit. A request over budget is deferred, not dropped
+   * and not jumped ahead: the entry stays exactly where it was — in
+   * the DLQ for a direct replay, parked in request order for an
+   * approval — and a later request inside budget requeues it. Each
+   * deferral counts in `getDeadLetterStats().replayRateLimited`.
+   * System-initiated EB-134 auto-replays are not operator replays and
+   * are not gated. Re-setting replaces the bucket (fresh burst); the
+   * deferred counter is cumulative and never reset by this call.
+   *
+   * Throws on an unknown subscriber id, on a subscriber without a
+   * dead-letter queue (a limit with nothing to gate would be a silent
+   * misconfiguration), and `RangeError` on a non-positive or
+   * non-finite `messagesPerSec` / `burst`.
+   */
+  setDeadLetterReplayRateLimit(subId: string, opts: DeadLetterReplayRateLimitOptions): void {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) throw new Error(`subscriber has no dead-letter queue: ${subId}`);
+    if (!Number.isFinite(opts.messagesPerSec) || opts.messagesPerSec <= 0) {
+      throw new RangeError('messagesPerSec must be a positive finite number');
+    }
+    if (!Number.isFinite(opts.burst) || opts.burst <= 0) {
+      throw new RangeError('burst must be a positive finite number');
+    }
+    dlq.replayRateLimitBucket = new TokenBucket(opts.burst, opts.messagesPerSec, this.now);
+  }
+
+  /**
+   * Takes one dead-letter replay token for a subscriber (EB-238).
+   * Returns true when replays are unlimited or a token was available;
+   * on a deferral counts it and returns false, consuming nothing.
+   */
+  private tryTakeDeadLetterReplayToken(dlq: SubscriberDeadLetter): boolean {
+    const bucket = dlq.replayRateLimitBucket;
+    if (bucket === undefined) return true;
+    if (bucket.take()) return true;
+    dlq.replayRateLimited += 1;
+    return false;
   }
 
   /**
@@ -42927,6 +43018,10 @@ export class EventBus {
     this.sweepExpiredDlqEntries(dlq);
     const record = dlq.pendingApprovals.get(seq);
     if (record === undefined) return false;
+    // EB-238: an approved replay is still rate-limited — a deferred
+    // approval stays parked in request order, never dropped, and a
+    // later approve inside budget requeues it.
+    if (!this.tryTakeDeadLetterReplayToken(dlq)) return false;
     dlq.pendingApprovals.delete(seq);
     dlq.autoReplayAttemptsInFlight.delete(record.msg);
     subscriber.reliable?.redeliveries.delete(record.msg);
@@ -43005,7 +43100,7 @@ export class EventBus {
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     const dlq = subscriber.deadLetter;
     if (dlq == null) {
-      return { entries: 0, pendingApprovals: 0, requireApproval: false, maxPending: 100 };
+      return { entries: 0, pendingApprovals: 0, requireApproval: false, maxPending: 100, replayRateLimited: 0 };
     }
     this.sweepExpiredDlqEntries(dlq);
     return {
@@ -43013,6 +43108,7 @@ export class EventBus {
       pendingApprovals: dlq.pendingApprovals.size,
       requireApproval: dlq.requireApproval,
       maxPending: dlq.maxPending,
+      replayRateLimited: dlq.replayRateLimited,
     };
   }
 

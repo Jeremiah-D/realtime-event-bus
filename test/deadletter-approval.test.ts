@@ -61,7 +61,8 @@ test('EB-233: replay under requireApproval parks the entry instead of delivering
     pendingApprovals: 1,
     requireApproval: true,
     maxPending: 100,
-  });
+    replayRateLimited: 0,
+  })
   const audit = setup.bus.getSubscriptionAudit({ action: 'dead_letter_replay_requested' });
   assert.equal(audit.length, 1);
   assert.equal(audit[0].detail?.seq, entry.seq);
@@ -134,7 +135,8 @@ test('EB-233: a full approval queue refuses the new request and leaves the entry
     pendingApprovals: 1,
     requireApproval: true,
     maxPending: 1,
-  });
+    replayRateLimited: 0,
+  })
 });
 
 test('EB-233: without requireApproval replay still delivers immediately (backward compatible)', async () => {
@@ -151,7 +153,8 @@ test('EB-233: without requireApproval replay still delivers immediately (backwar
     pendingApprovals: 0,
     requireApproval: false,
     maxPending: 100,
-  });
+    replayRateLimited: 0,
+  })
 });
 
 test('EB-233: a pending approval ages out under maxAgeMs and can no longer be approved', async () => {
@@ -193,7 +196,8 @@ test('EB-233: invalid approval options throw before subscribing, and unknown sub
     pendingApprovals: 0,
     requireApproval: false,
     maxPending: 100,
-  });
+    replayRateLimited: 0,
+  })
   assert.equal(bus.approveDeadLetterReplay(plain.id, 1), false);
   assert.equal(bus.rejectDeadLetterReplay(plain.id, 1), false);
 });
