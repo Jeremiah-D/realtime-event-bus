@@ -12810,6 +12810,29 @@ export interface PublishDelayedOptions {
 }
 
 /**
+ * One message in a `publishDelayedBatch` batch (EB-243): the topic and
+ * payload of one delayed schedule, plus its timing and optional
+ * compaction key. The batch carries only this subset of
+ * `PublishDelayedOptions` — the single-schedule options (`ttlMs`,
+ * `deadlineAt`/`deadlineMs`, `traceparent`, `priority`, jitter, …) stay
+ * on `publishDelayed`; a batch entry that needs them is scheduled
+ * individually. Timing follows the `publishDelayed` rule exactly: one
+ * of `delayMs` / `deliverAt`, never both, never neither.
+ */
+export interface DelayedBatchMessage {
+  /** Concrete topic the message will be published to at its due time. */
+  topic: string;
+  /** Payload as passed to `publishDelayed`; fanned out verbatim when due. */
+  payload: unknown;
+  /** Relative delay in milliseconds on the bus clock (see `delayMs`). */
+  delayMs?: number;
+  /** Absolute bus-clock timestamp in milliseconds (see `deliverAt`). */
+  deliverAt?: number;
+  /** Compaction key (see `PublishDelayedOptions.key`). */
+  key?: string;
+}
+
+/**
  * Carried from a delayed schedule into its fan-out: at its due time the
  * message enters the normal publish pipeline — sequence stamping,
  * rate-limit budget, compression, durable log, fan-out — exactly as if it
@@ -32568,6 +32591,102 @@ export class EventBus {
     // `publishDelayed`; a future time only re-arms the timer (the
     // sweep re-arms via `armDelayTimer` and finds nothing due).
     this.sweepDelayed(nowMs);
+  }
+
+  /**
+   * Schedules a batch of delayed deliveries in one call (EB-243):
+   * returns one delay id per entry, in entry order, each schedule
+   * carrying exactly the single-schedule semantics of
+   * `publishDelayed` for its topic/payload/key/timing.
+   *
+   * Atomicity follows the `publishBatch` convention, strengthened to
+   * fit a delay-id contract: every entry is fully validated BEFORE
+   * anything is scheduled — a non-array batch, a non-object entry, a
+   * non-string or empty topic, both or neither of
+   * `delayMs`/`deliverAt`, a negative/non-finite timing value, or an
+   * illegal key throws with zero schedules created. Then each entry is
+   * scheduled through `publishDelayed` itself, so per-entry admission
+   * (alias resolution, redaction, schema, rate limits, TTL stamping,
+   * durable-log persistence) is identical to scheduling it alone.
+   * Because the return contract is one delay id per entry, an entry
+   * that passes validation but is refused by admission (a shed, a
+   * schema rejection, a chaos fault — all of which `publishDelayed`
+   * reports as `undefined`, not a throw) cannot be represented in the
+   * result: the batch rolls back every entry it already scheduled
+   * (via `cancelDelayed`, so tombstones and key-sequence releases
+   * apply exactly as a normal cancel) and throws, leaving zero
+   * schedules behind. A `publishDelayed` throw mid-batch rolls back
+   * the same way and rethrows. An empty batch returns `[]` — zero
+   * scheduling, trivially consistent.
+   *
+   * Orthogonal to `publishBatch` (that fans out immediately, this
+   * schedules for later) and to `publishDelayed` (that schedules one,
+   * this schedules many with all-or-nothing validation).
+   *
+   * Throws `TypeError` when the batch is not an array or an entry is
+   * not an object, `RangeError` for illegal topics/timing/keys, and
+   * `Error` when an entry is refused by admission after validation
+   * (the batch is rolled back first).
+   */
+  publishDelayedBatch(entries: DelayedBatchMessage[]): string[] {
+    if (!Array.isArray(entries)) {
+      throw new TypeError('publishDelayedBatch: entries must be an array');
+    }
+    if (entries.length === 0) return [];
+    // Phase 1 — validate everything, schedule nothing.
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+      if (entry == null || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new TypeError(`publishDelayedBatch: entry ${index} must be an object`);
+      }
+      if (typeof entry.topic !== 'string') {
+        throw new TypeError(`publishDelayedBatch: entry ${index} topic must be a string`);
+      }
+      if (entry.topic.length === 0) {
+        throw new RangeError(`publishDelayedBatch: entry ${index} topic must be a non-empty string`);
+      }
+      const hasDelayMs = entry.delayMs !== undefined;
+      const hasDeliverAt = entry.deliverAt !== undefined;
+      if (hasDelayMs === hasDeliverAt) {
+        throw new RangeError(
+          `publishDelayedBatch: entry ${index} requires exactly one of delayMs or deliverAt`,
+        );
+      }
+      if (hasDelayMs) {
+        if (!Number.isFinite(entry.delayMs as number) || (entry.delayMs as number) < 0) {
+          throw new RangeError(
+            `publishDelayedBatch: entry ${index} delayMs must be a non-negative finite number of milliseconds`,
+          );
+        }
+      } else if (!Number.isFinite(entry.deliverAt as number)) {
+        throw new RangeError(
+          `publishDelayedBatch: entry ${index} deliverAt must be a finite bus-clock timestamp in milliseconds`,
+        );
+      }
+      validateMessageKey(entry.key, 'publishDelayedBatch');
+    }
+    // Phase 2 — schedule through `publishDelayed`, one by one, rolling
+    // back on any refusal or throw so a failed batch leaves nothing.
+    const delayIds: string[] = [];
+    try {
+      for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index];
+        const delayId = this.publishDelayed(entry.topic, entry.payload, {
+          ...(entry.delayMs !== undefined ? { delayMs: entry.delayMs } : { deliverAt: entry.deliverAt }),
+          ...(entry.key === undefined ? {} : { key: entry.key }),
+        });
+        if (delayId === undefined) {
+          throw new Error(
+            `publishDelayedBatch: entry ${index} for topic "${entry.topic}" was not admitted; the batch was rolled back`,
+          );
+        }
+        delayIds.push(delayId);
+      }
+    } catch (error) {
+      for (const delayId of delayIds) this.cancelDelayed(delayId);
+      throw error;
+    }
+    return delayIds;
   }
 
   /**

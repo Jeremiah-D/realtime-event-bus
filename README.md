@@ -2332,6 +2332,21 @@ library.
   itself is not persisted — restart recovery rebuilds the original due
   time from the first schedule record — so a reschedule that must
   survive a restart is done as cancel plus re-schedule instead.
+  Delayed batch publishing (EB-243, via `publishDelayedBatch(entries)`):
+  schedules many delayed deliveries in one call and returns one delay id
+  per entry, in entry order, each entry carrying exactly the
+  single-schedule semantics of `publishDelayed` for its topic, payload,
+  key, and timing (`delayMs` or `deliverAt`, exactly one). The batch
+  carries only that subset of delayed options — TTL, deadlines,
+  traceparent, lanes, and jitter stay on single schedules. Atomicity
+  follows the `publishBatch` convention, strengthened to fit a delay-id
+  contract: every entry is fully validated before anything is
+  scheduled, so one illegal entry rejects the whole batch with zero
+  schedules; and because the result must be one id per entry, an entry
+  that passes validation but is refused by admission (a shed, a schema
+  rejection, a chaos fault) rolls back every entry already scheduled
+  via `cancelDelayed` and throws, again leaving zero schedules behind.
+  An empty batch returns `[]`.
 - **Shadow subscriber traffic mirroring** (in `src/bus.ts`, via
   `subscribe(pattern, handler, { shadow: true | { queueSize?,
   dropPolicy? } })`): the subscription becomes a shadow subscriber — it
