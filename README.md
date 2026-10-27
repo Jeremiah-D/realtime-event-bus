@@ -2295,9 +2295,25 @@ library.
   `setTopicTtl` convention (exact topic wins over patterns, earliest
   matching pattern wins); unmatched topics resolve to 0. With no
   priorities configured the sweep keeps its exact heap order — the
-  feature is default-off with zero behavior change. Read-only delayed-delivery
+  feature is default-off with zero behavior change. Delayed-delivery
+  priority by key (EB-253, via `setDelayedPriorityByKey(topicPattern, key, priority)` /
+  `clearDelayedPriorityByKey(topicPattern, key)`): the key-level form of
+  EB-219 — a matching key rule overrides any topic-level rule for that
+  schedule (the key is more specific than the topic), and a schedule
+  with no matching key rule falls back to the topic-level priority (0
+  when neither matches); an unkeyed schedule never matches a key rule.
+  Resolution is live at sweep/list time, not stamped at schedule time,
+  so a rule set after scheduling applies to that schedule, a schedule
+  published while a rule stands carries it until the rule is cleared,
+  and clearing restores the topic-level priority. Within key rules an
+  exact topic pattern wins over wildcard patterns, and between patterns
+  the earliest-registered matching rule wins. Held schedules
+  (EB-250/EB-252) keep their effective priority while held and fan out
+  by it on the first sweep after resume; same-key cross-topic delivery
+  still follows per-key order (EB-252), priority only orders the
+  fan-out attempts. Read-only delayed-delivery
   inspection (EB-241, via `listDelayed(topicPattern?, { key? })`): snapshots every
-  still-pending schedule as `{ delayId, topic, key, deliverAt, remainingMs }` —
+  still-pending schedule as `{ delayId, topic, key, deliverAt, remainingMs, priority }` —
   identity and timing only, never the payload — in schedule order, so operators
   can govern the delayed queue (what is waiting, for which topic/key, and for
   how long) without disturbing it: listing fans nothing out, touches no heap,
@@ -2889,6 +2905,15 @@ npm test
   TTL-expired schedule, unset topics fall back to default ordering,
   default-off zero behavior change, pattern/exact/earliest-pattern
   resolution, argument validation, and clearing restores heap order.
+- `test/delayed-priority-by-key.test.ts` — delayed-delivery same-tick
+  priority by key (EB-253): a key rule beats a topic rule in the same
+  tick (upward and downward) with other keys falling back to the topic
+  rule, pattern/exact/earliest-pattern resolution, unkeyed schedules
+  never matching a key rule, `listDelayed` disclosing the effective
+  priority and clearing restoring the topic priority, argument
+  validation, rules applying to already-scheduled and to
+  not-yet-scheduled entries until cleared, same-(topic, key) FIFO,
+  and held schedules keeping their priority through hold and resume.
 - `test/schedule-skew.test.ts` — delayed-delivery schedule-skew observability
   (EB-136): skew sampling (`now - deliverAt`) on the real fan-out path only,
   nearest-rank p50/p99 over the window, oldest-first eviction past

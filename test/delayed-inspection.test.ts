@@ -36,7 +36,15 @@ test('listDelayed returns a payload-free snapshot in schedule order with due tim
     assert.ok(!('payload' in entry), 'snapshot must not carry payload');
     assert.ok(!JSON.stringify(entry).includes('must-not-leak'));
   }
-  assert.deepEqual(Object.keys(listed[0]).sort(), ['delayId', 'deliverAt', 'key', 'remainingMs', 'topic']);
+  // EB-253 adds the effective fan-out priority to every row (0 here: no rule set).
+  assert.deepEqual(Object.keys(listed[0]).sort(), [
+    'delayId',
+    'deliverAt',
+    'key',
+    'priority',
+    'remainingMs',
+    'topic',
+  ]);
   assert.equal(listed[0].key, undefined); // unkeyed schedule: key present, undefined
 });
 

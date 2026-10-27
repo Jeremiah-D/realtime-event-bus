@@ -133,6 +133,17 @@ export interface DelayedInspection {
    * fanned it out yet.
    */
   remainingMs: number;
+  /**
+   * Effective same-tick fan-out priority (EB-253): the key-level rule
+   * from `setDelayedPriorityByKey` when one matches this schedule's
+   * (topic, key), else the topic-level rule from
+   * `setDelayedTopicPriority` when one matches, else 0. Resolved live
+   * at listing time, so a rule set or cleared after scheduling is
+   * reflected here and in the next sweep's ordering. Unkeyed
+   * schedules never match a key rule and always resolve through the
+   * topic rule.
+   */
+  priority: number;
 }
 
 /**

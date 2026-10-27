@@ -16347,6 +16347,29 @@ export class EventBus {
    */
   private delayedTopicPriorityMatcherCache = new Map<string, RegExp>();
   /**
+   * Delayed-delivery key priorities (EB-253), keyed by the JSON pair
+   * of the exact strings passed to `setDelayedPriorityByKey` — a
+   * concrete topic name or a wildcard pattern, plus one compaction
+   * key. A matching key rule overrides the topic-level priority
+   * from `delayedTopicPriorities` (the key is more specific than the
+   * topic), and an unkeyed schedule never matches one. Resolution is
+   * live at sweep/list time, so a rule set after scheduling applies
+   * to that schedule, a rule cleared later stops applying, and a
+   * schedule published while a rule stands carries it until the rule
+   * is cleared. Empty means the feature is off entirely. Held state
+   * is in-memory only, like the topic-priority map above: a restart
+   * rebuilds the schedules with no key priorities, so rules that
+   * must survive a restart are re-applied after recovery.
+   */
+  private delayedKeyPriorities = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in
+   * `delayedKeyPriorities`, kept apart from the subscriber pattern
+   * cache so priority configuration never inflates
+   * `patternCacheSize`.
+   */
+  private delayedKeyPriorityMatcherCache = new Map<string, RegExp>();
+  /**
    * Held delayed-delivery topics (EB-250), keyed by the exact string
    * passed to `holdDelayedTopic` — either a concrete topic name or a
    * wildcard pattern. While a topic is held, the sweep skips its due
@@ -32893,9 +32916,11 @@ export class EventBus {
 
   /**
    * Lists pending delayed deliveries as a read-only snapshot (EB-241):
-   * one `{ delayId, topic, key, deliverAt, remainingMs }` per pending
-   * schedule, in schedule order, with no payload — inspecting the
-   * queue never exposes message contents.
+   * one `{ delayId, topic, key, deliverAt, remainingMs, priority }`
+   * per pending schedule, in schedule order, with no payload —
+   * inspecting the queue never exposes message contents. `priority`
+   * is the schedule's effective same-tick fan-out priority (EB-253):
+   * a matching key rule, else the topic-level rule, else 0.
    *
    * Read-only, strictly: listing never fans anything out, never touches
    * the timer heap, consumes no sequence number, counts nothing in
@@ -32978,6 +33003,7 @@ export class EventBus {
         key: entry.key,
         deliverAt: entry.deliverAt,
         remainingMs: entry.deliverAt - nowMs,
+        priority: this.delayedPriorityForEntry(entry.topic, entry.key),
       });
     }
     return out;
@@ -34015,6 +34041,101 @@ export class EventBus {
   }
 
   /**
+   * Sets the same-tick fan-out priority for delayed deliveries
+   * carrying one compaction key on one topic or topic pattern
+   * (EB-253): the key-level form of `setDelayedTopicPriority`
+   * (EB-219). When a single sweep pass finds several schedules due
+   * at once, a schedule whose (topic, key) matches a key rule fans
+   * out by that rule's priority, which overrides any topic-level
+   * rule for its topic — the key is more specific than the topic —
+   * and a schedule with no matching key rule falls back to the
+   * topic-level priority (0 when no rule matches either). An
+   * unkeyed schedule never matches a key rule.
+   *
+   * Priority affects only the ordering inside one sweep pass, with
+   * exactly the EB-219 guarantees: it never changes when a schedule
+   * becomes due, never resets or extends any TTL/deadline, never
+   * reorders entries across different passes, and never reorders
+   * entries for the same (topic, key) — the sort is stable over
+   * heap order, so same-key FIFO holds. It is resolved live at
+   * sweep time, not stamped at schedule time: a rule set after
+   * scheduling applies to that schedule, a schedule published
+   * while a rule stands carries it until the rule is cleared, and
+   * clearing a rule restores the topic-level priority (or 0) for
+   * every affected schedule, including ones already scheduled.
+   * Held schedules (EB-250/EB-252) keep their effective priority
+   * while held — the hold only defers fan-out — and fan out by it
+   * on the first sweep after resume. `listDelayed` discloses each
+   * schedule's effective priority.
+   *
+   * Within key rules, an exact-topic-pattern rule wins over any
+   * wildcard pattern; between patterns the earliest-registered
+   * matching rule wins — the same resolution as
+   * `delayedTopicPriorityForTopic`. Re-setting a rule replaces it.
+   * Throws `TypeError` when `topicPattern` or `key` is not a
+   * string, `RangeError` when either is empty or `priority` is
+   * not finite.
+   */
+  setDelayedPriorityByKey(topicPattern: string, key: string, priority: number): void {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('setDelayedPriorityByKey: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('setDelayedPriorityByKey: topicPattern must be a non-empty string');
+    }
+    if (typeof key !== 'string') {
+      throw new TypeError('setDelayedPriorityByKey: key must be a string');
+    }
+    if (key.length === 0) {
+      throw new RangeError('setDelayedPriorityByKey: key must be a non-empty string');
+    }
+    if (!Number.isFinite(priority)) {
+      throw new RangeError('setDelayedPriorityByKey: priority must be a finite number');
+    }
+    this.delayedKeyPriorities.set(JSON.stringify([topicPattern, key]), priority);
+  }
+
+  /**
+   * Removes the delayed-delivery key priority previously registered
+   * for (`topicPattern`, `key`). Returns true when a rule existed
+   * and was removed; after removal the affected schedules fall back
+   * to the topic-level priority (or 0).
+   */
+  clearDelayedPriorityByKey(topicPattern: string, key: string): boolean {
+    const removed = this.delayedKeyPriorities.delete(JSON.stringify([topicPattern, key]));
+    if (removed) this.delayedKeyPriorityMatcherCache.delete(topicPattern);
+    return removed;
+  }
+
+  /**
+   * Returns the effective delayed-delivery fan-out priority for a
+   * schedule on `topic` carrying `key`: a matching key rule wins
+   * over any topic-level rule; with no matching key rule the
+   * topic-level priority applies; with neither, 0. An unkeyed
+   * schedule never matches a key rule. Within key rules an exact
+   * topic-pattern rule wins over patterns, and between patterns
+   * the earliest-registered matching rule wins.
+   */
+  private delayedPriorityForEntry(topic: string, key: string | undefined): number {
+    if (key !== undefined) {
+      const exact = this.delayedKeyPriorities.get(JSON.stringify([topic, key]));
+      if (exact !== undefined) return exact;
+      for (const [pair, priority] of this.delayedKeyPriorities) {
+        const [pattern, heldKey] = JSON.parse(pair) as [string, string];
+        if (heldKey !== key) continue;
+        if (pattern === topic) continue; // exact pair already checked above
+        let matcher = this.delayedKeyPriorityMatcherCache.get(pattern);
+        if (matcher == null) {
+          matcher = compilePattern(pattern);
+          this.delayedKeyPriorityMatcherCache.set(pattern, matcher);
+        }
+        if (matcher.test(topic)) return priority;
+      }
+    }
+    return this.delayedTopicPriorityForTopic(topic);
+  }
+
+  /**
    * Returns the delayed-delivery fan-out priority that applies to
    * `topic`, or 0 when no rule matches. An exact-topic rule wins over
    * patterns; between patterns the earliest-registered matching rule
@@ -34486,20 +34607,23 @@ export class EventBus {
       due.push(top);
     }
     for (const entry of heldAside) this.delayHeap.push(entry);
-    // Same-tick ordering by topic priority, highest first. The sort is
-    // stable over heap order (deliverAt, then schedule order), so
-    // entries for one topic — which always resolve to one priority —
-    // keep their FIFO order, and with no priorities configured the
-    // batch keeps its exact heap order (the loop below is skipped when
-    // the map is empty, so the default-off path is byte-identical in
-    // behavior). Priority never gates eligibility: every entry here
-    // was already due, and the per-entry expiry/pause/fan-out handling
-    // below runs unchanged, in the new order.
-    if (this.delayedTopicPriorities.size > 0 && due.length > 1) {
+    // Same-tick ordering by effective priority, highest first. The
+    // sort is stable over heap order (deliverAt, then schedule
+    // order), so entries for one (topic, key) — which always resolve
+    // to one priority — keep their FIFO order, and with no
+    // priorities configured the batch keeps its exact heap order
+    // (the loop below is skipped when both maps are empty, so the
+    // default-off path is byte-identical in behavior). The
+    // effective priority is the key-level rule when one matches
+    // (EB-253), else the topic-level rule (EB-219). Priority never
+    // gates eligibility: every entry here was already due, and the
+    // per-entry expiry/pause/fan-out handling below runs unchanged,
+    // in the new order.
+    if ((this.delayedTopicPriorities.size > 0 || this.delayedKeyPriorities.size > 0) && due.length > 1) {
       const ranked = due.map((entry, index) => ({
         entry,
         index,
-        priority: this.delayedTopicPriorityForTopic(entry.topic),
+        priority: this.delayedPriorityForEntry(entry.topic, entry.key),
       }));
       ranked.sort((a, b) => b.priority - a.priority || a.index - b.index);
       due.length = 0;
