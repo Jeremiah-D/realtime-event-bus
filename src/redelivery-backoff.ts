@@ -166,6 +166,16 @@ export class RedeliveryBackoff {
   }
 
   /**
+   * The normalized config this scheduler delays with (EB-261): a
+   * fresh copy, so callers can audit or compare a revision without
+   * mutating the live scheduler — revising a subscription replaces
+   * the scheduler instance, never mutates this config in place.
+   */
+  get currentConfig(): NormalizedRedeliveryBackoffConfig {
+    return { ...this.config };
+  }
+
+  /**
    * The delay in milliseconds before redelivery attempt `attempt`
    * (1-based: attempt 1 is the first redelivery) is requeued:
    * `min(capMs, baseMs * 2^(attempt - 1))`, clamped to the timer

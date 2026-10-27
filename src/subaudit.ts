@@ -82,6 +82,7 @@ export type SubscriptionAuditAction =
   | 'delayed_ttl_extended'
   | 'ack_deadline_extended'
   | 'ack_timeout_revised'
+  | 'redelivery_backoff_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -172,6 +173,7 @@ export type SubscriptionAuditAction =
  * - `delayed_topic_held`: `{ topicPattern: <string> }` — the delayed-delivery sweep was held for the pattern (EB-250; the `pattern` field carries the rule key)
  * - `ack_deadline_extended`: `{ seq, extensionMs, deadlineMs }` — one outstanding reliable delivery's ack timeout was reset (EB-255; `subId` carries the subscriber, `deadlineMs` is the new bus-clock deadline)
  * - `ack_timeout_revised`: `{ ackTimeoutMs, oldAckTimeoutMs }` — a reliable subscriber's ack-timeout default for future deliveries was revised (EB-259; already-armed timers are untouched)
+ * - `redelivery_backoff_revised`: `{ redeliveryBackoff: <normalized config or null>, oldRedeliveryBackoff: <normalized config or null> }` — a reliable subscriber's redelivery-backoff policy for future redeliveries was revised (EB-261; `null` on either side means "no backoff, requeue immediately"; already-armed backoff delays keep the delay they were armed with)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -319,6 +321,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_ttl_extended',
   'ack_deadline_extended',
   'ack_timeout_revised',
+  'redelivery_backoff_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',

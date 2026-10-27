@@ -24973,6 +24973,80 @@ export class EventBus {
   }
 
   /**
+   * Revises the redelivery-backoff policy of one reliable subscriber
+   * (EB-261): every redelivery scheduled after this call waits out
+   * the new policy's delay instead of the value the subscriber was
+   * created with (or last revised to). Passing `null` clears the
+   * policy — later redeliveries requeue immediately, the pre-EB-220
+   * behavior — and a subscriber that never opted in gains a policy
+   * here without re-subscribing. The revision replaces the
+   * subscriber's backoff scheduler instance; the delays already
+   * armed for in-flight redeliveries are untouched, because those
+   * timers live in `pendingRedeliveryBackoffs`, not on the scheduler
+   * — a revision never shortens or lengthens a delay already
+   * counting down, exactly like `setAckTimeout` (EB-259) never
+   * moves an already-armed ack timer.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable
+   * subscriber, and an illegal config (the EB-220
+   * `validateRedeliveryBackoff` rules: non-object, missing or
+   * illegal `baseMs`, `capMs` below `baseMs` or non-finite,
+   * non-boolean `jitter`) all throw `RangeError` with the live
+   * policy and the audit log untouched — `undefined` is not a
+   * clear, only `null` is, so an omitted argument fails instead
+   * of silently disabling the brake. Nothing else moves — no
+   * message, sequence, redelivery count, ack timeout, or armed
+   * timer is touched. Audited as `redelivery_backoff_revised`
+   * (`{ redeliveryBackoff, oldRedeliveryBackoff }`, each the
+   * normalized config or `null` for "no backoff") on success.
+   *
+   * Orthogonal to `setAckTimeout` (EB-259): that revises the ack
+   * timer for future deliveries, this revises the wait before a
+   * redelivery is requeued, and the two compose — a slow
+   * consumer's ack deadline and its redelivery spacing move
+   * independently.
+   *
+   * Throws `RangeError` for an unknown / non-reliable subscriber
+   * or an illegal backoff config.
+   */
+  setRedeliveryBackoff(subId: string, config: RedeliveryBackoffConfig | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setRedeliveryBackoff: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setRedeliveryBackoff: unknown subscriber: ${subId}`);
+    }
+    const reliable = subscriber.reliable;
+    if (reliable == null) {
+      throw new RangeError('setRedeliveryBackoff: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    // Validate before touching anything: `validateRedeliveryBackoff`
+    // returns `undefined` for an absent value, but here absent is
+    // not a clear — only an explicit `null` clears the policy.
+    const normalized =
+      config === null ? undefined : validateRedeliveryBackoff(config, 'setRedeliveryBackoff');
+    if (config !== null && normalized === undefined) {
+      throw new RangeError('setRedeliveryBackoff: redeliveryBackoff must be an object with baseMs, or null to clear it');
+    }
+    const oldRedeliveryBackoff = reliable.redeliveryBackoff?.currentConfig ?? null;
+    reliable.redeliveryBackoff =
+      normalized === undefined
+        ? undefined
+        : new RedeliveryBackoff(normalized, { now: this.now, timers: retryLadderTimers });
+    this.auditSubscription({
+      action: 'redelivery_backoff_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        redeliveryBackoff: normalized ?? null,
+        oldRedeliveryBackoff,
+      },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

@@ -7904,6 +7904,21 @@ Semantics:
   before teardown. Unlike the ladder, a degraded subscriber (EB-18)
   does not re-arm the delay: the message is already queued by the
   requeue and simply waits out the pause in the backlog.
+- **Revisable after subscribe (EB-261, via
+  `setRedeliveryBackoff(subId, config | null)`).** A reliable
+  subscriber's backoff policy for future redeliveries can be changed
+  without re-subscribing — including adding a policy to a subscriber
+  created without one — and `null` clears it back to immediate
+  requeueing. Delays already armed keep the delay they were armed
+  with (a revision never shortens or lengthens a countdown already
+  running), mirroring `setAckTimeout` (EB-259) for ack timers. It is
+  fail-closed like the others (an unknown or non-reliable subscriber,
+  or an illegal config under the EB-220 rules, throws `RangeError`
+  with the live policy and the audit log untouched; `undefined` is
+  not a clear, only `null` is), and every success is audited as
+  `redelivery_backoff_revised`
+  (`{ redeliveryBackoff, oldRedeliveryBackoff }`, each the
+  normalized config or `null`).
 
 ## Per-key TTL for the keyed-compacted durable log (EB-221)
 
