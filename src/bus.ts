@@ -24923,6 +24923,56 @@ export class EventBus {
   }
 
   /**
+   * Revises the ack-timeout default of one reliable subscriber
+   * (EB-259): every delivery tracked after this call arms its
+   * ack-timeout timer with the new `ackTimeoutMs` instead of the
+   * value the subscriber was created with (or last revised to).
+   * Deliveries already outstanding keep the timer they were armed
+   * with — a revision never shortens or lengthens an in-flight
+   * deadline — so a slow consumer's live deliveries are extended
+   * with `extendAckDeadline` (EB-255, one delivery) or
+   * `extendAckDeadlines` (EB-257, a batch) instead, and the two
+   * tools stay orthogonal: this one sets the default for the
+   * future, those move timers already running.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable
+   * subscriber, and a non-positive / non-finite `ackTimeoutMs` all
+   * throw `RangeError` with the tracker's value and the audit log
+   * untouched. Nothing else moves — no message, sequence,
+   * redelivery count, or outstanding timer is touched. Audited as
+   * `ack_timeout_revised` (`{ ackTimeoutMs, oldAckTimeoutMs }`) on
+   * success.
+   *
+   * Throws `RangeError` for an unknown / non-reliable subscriber or
+   * an illegal timeout value.
+   */
+  setAckTimeout(subId: string, ackTimeoutMs: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setAckTimeout: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setAckTimeout: unknown subscriber: ${subId}`);
+    }
+    const reliable = subscriber.reliable;
+    if (reliable == null) {
+      throw new RangeError('setAckTimeout: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    if (!Number.isFinite(ackTimeoutMs) || ackTimeoutMs <= 0) {
+      throw new RangeError('setAckTimeout: ackTimeoutMs must be a positive finite number of milliseconds');
+    }
+    const oldAckTimeoutMs = reliable.tracker.currentAckTimeoutMs;
+    reliable.tracker.setAckTimeoutMs(ackTimeoutMs);
+    this.auditSubscription({
+      action: 'ack_timeout_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { ackTimeoutMs, oldAckTimeoutMs },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

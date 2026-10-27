@@ -146,6 +146,17 @@ library.
   `seq`, or one malformed entry, rejects the whole batch with no timer
   touched and no audit written — and returns
   `{ extended, seqs }` in batch order (an empty batch is a no-op). The
+  subscription-level default itself can be revised with
+  `setAckTimeout(subId, ackTimeoutMs)` (EB-259): deliveries tracked
+  after the call arm their timers with the new value, while
+  already-outstanding deliveries keep the timer they were armed with —
+  extending those stays `extendAckDeadline`'s job, so the default
+  revision and the live-timer extension stay orthogonal. It is
+  fail-closed like the others (an unknown or non-reliable subscriber,
+  or a non-positive / non-finite value, throws `RangeError` with the
+  old default and the audit log untouched), and every success is
+  audited as `ack_timeout_revised`
+  (`{ ackTimeoutMs, oldAckTimeoutMs }`). The
   diagnostic goes through the normal publish
   pipeline (ACL, schema validation, rate limiting); an admission rejection
   suppresses it without affecting the DLQ move, and a dead-lettered

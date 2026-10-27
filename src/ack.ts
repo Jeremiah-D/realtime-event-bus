@@ -108,7 +108,7 @@ interface PendingDelivery<T> {
  * unsubscribe so a gone subscriber never receives phantom redeliveries.
  */
 export class AckTracker<T> {
-  private readonly ackTimeoutMs: number;
+  private ackTimeoutMs: number;
   private readonly onRedeliver: (msg: T, reason: RedeliveryReason) => void;
   private readonly onSettle?: () => void;
   private readonly onAck?: () => void;
@@ -147,6 +147,33 @@ export class AckTracker<T> {
    */
   get highestSeq(): number {
     return this.nextSeq;
+  }
+
+  /**
+   * The subscription-level ack timeout currently applied to new
+   * deliveries (EB-259): the value `track()` arms each fresh
+   * delivery's timer with. Revised by `setAckTimeoutMs`; already-armed
+   * timers keep the value they were armed with.
+   */
+  get currentAckTimeoutMs(): number {
+    return this.ackTimeoutMs;
+  }
+
+  /**
+   * Revises the subscription-level ack timeout for future deliveries
+   * (EB-259): only the default for new `track()` calls moves — the
+   * timers already armed for outstanding deliveries are untouched,
+   * so a slow consumer's in-flight deliveries keep their original
+   * deadline (extending those stays `extendAckDeadline`'s job, and
+   * batch-extending them stays `extendAckDeadlines`'s). Throws
+   * `RangeError` when the new value is not a positive finite number
+   * of milliseconds, leaving the current value intact.
+   */
+  setAckTimeoutMs(ackTimeoutMs: number): void {
+    if (!Number.isFinite(ackTimeoutMs) || ackTimeoutMs <= 0) {
+      throw new RangeError('setAckTimeoutMs: ackTimeoutMs must be a positive finite number of milliseconds');
+    }
+    this.ackTimeoutMs = ackTimeoutMs;
   }
 
   /**
