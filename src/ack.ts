@@ -301,6 +301,36 @@ export class AckTracker<T> {
   }
 
   /**
+   * Extends the ack deadline of one outstanding delivery (EB-255): the
+   * delivery's ack-timeout timer is cancelled and restarted with
+   * `extensionMs`, measured from this call. Only the timer moves — the
+   * message, its sequence, and its redelivery count are untouched, and
+   * the subscription-level `ackTimeoutMs` (the initial timeout for new
+   * deliveries) is unchanged.
+   *
+   * Returns `true` when the delivery was outstanding and its timer was
+   * reset. Returns `false` when `seq` was never tracked, was already
+   * acked, or already timed out and requeued — those records are gone
+   * from the pending map, so there is no timer left to extend, and the
+   * caller must treat the delivery as settled (fail-closed: no silent
+   * extension of a delivery that no longer exists). Throws `RangeError`
+   * when `extensionMs` is not a positive finite number.
+   */
+  extendAckDeadline(seq: number, extensionMs: number): boolean {
+    if (!Number.isFinite(extensionMs) || extensionMs <= 0) {
+      throw new RangeError('extendAckDeadline: extensionMs must be a positive finite number of milliseconds');
+    }
+    const record = this.pending.get(seq);
+    if (record === undefined || record.settled) return false;
+    if (record.timer !== undefined) clearTimeout(record.timer);
+    record.timer = setTimeout(() => this.settleOne(seq, record, true, 'ack-timeout'), extensionMs);
+    // An unacked delivery must not keep the process alive on its own.
+    const handle = record.timer as unknown as { unref?: () => unknown };
+    if (typeof handle.unref === 'function') handle.unref();
+    return true;
+  }
+
+  /**
    * Cancels every outstanding timer without requeueing. Returns how many
    * deliveries were outstanding.
    */

@@ -24668,6 +24668,99 @@ export class EventBus {
   }
 
   /**
+   * Extends the ack deadline of one outstanding reliable delivery
+   * (EB-255): the delivery's ack-timeout timer is cancelled and
+   * restarted, so a slow consumer that is still working gets more time
+   * before the bus requeues the message — without acking, nacking, or
+   * touching the message, its sequence, or its redelivery count.
+   *
+   * Exactly one of the two option forms must be given:
+   * - `{ extensionMs }` — restart the timer for this many milliseconds
+   *   from now;
+   * - `{ newDeadlineMs }` — a bus-clock (`EventBusOptions.now`)
+   *   timestamp the new deadline expires at; it must be in the future,
+   *   and the timer runs for `newDeadlineMs - now()`.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable subscriber,
+   * a `seq` that was never delivered, was already acked, or already
+   * timed out and requeued, and any malformed option (neither or both
+   * forms, a non-positive / non-finite `extensionMs`, a past or
+   * non-finite `newDeadlineMs`) all throw `RangeError` — nothing is
+   * extended and no audit record is written. All validation runs
+   * before the tracker is touched, so a rejected call cannot disturb
+   * another delivery's timer.
+   *
+   * Orthogonal to `ackTimeoutMs` (the subscription-level initial
+   * timeout for new deliveries — this extends one live delivery at
+   * runtime) and to `ackBatch` / `nackBatch` (those settle deliveries;
+   * this only defers one). Audited as `ack_deadline_extended`
+   * (`{ seq, extensionMs, deadlineMs }`) on success. Returns `true`
+   * when the deadline was extended.
+   */
+  extendAckDeadline(
+    subId: string,
+    seq: number,
+    options: { extensionMs?: number; newDeadlineMs?: number },
+  ): boolean {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('extendAckDeadline: subId must be a non-empty string');
+    }
+    if (!Number.isInteger(seq) || seq <= 0) {
+      throw new RangeError('extendAckDeadline: seq must be a positive integer delivery sequence');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`extendAckDeadline: unknown subscriber: ${subId}`);
+    }
+    const reliable = subscriber.reliable;
+    if (reliable == null) {
+      throw new RangeError('extendAckDeadline: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      throw new RangeError('extendAckDeadline: options must be an object with exactly one of extensionMs or newDeadlineMs');
+    }
+    const hasExtension = options.extensionMs !== undefined;
+    const hasDeadline = options.newDeadlineMs !== undefined;
+    if (hasExtension === hasDeadline) {
+      throw new RangeError('extendAckDeadline: pass exactly one of extensionMs or newDeadlineMs');
+    }
+    const nowMs = this.now();
+    let extensionMs: number;
+    let deadlineMs: number;
+    if (hasExtension) {
+      if (!Number.isFinite(options.extensionMs) || (options.extensionMs as number) <= 0) {
+        throw new RangeError('extendAckDeadline: extensionMs must be a positive finite number of milliseconds');
+      }
+      extensionMs = options.extensionMs as number;
+      deadlineMs = nowMs + extensionMs;
+    } else {
+      if (!Number.isFinite(options.newDeadlineMs)) {
+        throw new RangeError('extendAckDeadline: newDeadlineMs must be a finite bus-clock timestamp');
+      }
+      deadlineMs = options.newDeadlineMs as number;
+      if (deadlineMs <= nowMs) {
+        throw new RangeError('extendAckDeadline: newDeadlineMs must be in the future');
+      }
+      extensionMs = deadlineMs - nowMs;
+    }
+    const extended = reliable.tracker.extendAckDeadline(seq, extensionMs);
+    if (!extended) {
+      throw new RangeError(
+        `extendAckDeadline: seq ${seq} is not outstanding for this subscriber ` +
+          `(never delivered, already acked, or already timed out and requeued)`,
+      );
+    }
+    this.auditSubscription({
+      action: 'ack_deadline_extended',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { seq, extensionMs, deadlineMs },
+    });
+    return true;
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

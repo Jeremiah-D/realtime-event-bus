@@ -128,7 +128,16 @@ library.
   pollutes the rest of the batch). Returns the number actually settled;
   unknown subscriber returns 0, non-reliable subscriber throws
   `RangeError`. `getStats().ackBatches` / `getStats().nackBatches` count
-  the calls. The
+  the calls. A slow consumer that is still working can call
+  `extendAckDeadline(subId, seq, { extensionMs })` (EB-255) — or
+  `{ newDeadlineMs }` for an absolute bus-clock deadline — to restart
+  one outstanding delivery's ack-timeout timer without acking,
+  nacking, or touching the message, its sequence, or its redelivery
+  count; the subscription-level `ackTimeoutMs` is unchanged. It is
+  fail-closed: an already-acked, already-timed-out, or unknown `seq`,
+  an unknown or non-reliable subscriber, and any malformed option all
+  throw `RangeError`, and every success is audited as
+  `ack_deadline_extended` (`{ seq, extensionMs, deadlineMs }`). The
   diagnostic goes through the normal publish
   pipeline (ACL, schema validation, rate limiting); an admission rejection
   suppresses it without affecting the DLQ move, and a dead-lettered
