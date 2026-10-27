@@ -4126,6 +4126,30 @@ export interface PartitionRebalanceInfo {
 }
 
 /**
+ * Read-only snapshot of one consumer group's partition assignment
+ * (EB-256), as returned by `getGroupAssignment`. `members` are roster
+ * keys in join order (the `instanceId` for static members, the
+ * subscription id otherwise); `assignments` are the partitions owned
+ * by each member, in ascending partition order. For a classic
+ * round-robin group (no `partitions` option) `assignments` is empty —
+ * there is no partition placement to report — while `strategy` still
+ * names the group's assignor. The snapshot is a detached copy:
+ * mutating it never affects the group.
+ */
+export interface GroupAssignmentSnapshot {
+  /** The consumer group id. */
+  groupId: string;
+  /** The competing set's topic pattern. */
+  pattern: string;
+  /** Assignor that produced the assignment (`PartitionAssignor.name`). */
+  strategy: string;
+  /** Current roster keys, in join order. */
+  members: string[];
+  /** Partition -> owner roster key, in ascending partition order. */
+  assignments: Array<{ partition: number; memberId: string }>;
+}
+
+/**
  * The result of `EventBus.setGroupPartitionCount` (EB-210): a
  * partition-count expansion of one partitioned consumer group.
  */
@@ -28228,6 +28252,78 @@ export class EventBus {
    */
   getGroupMembers(groupId: string, pattern: string): string[] {
     return [...(this.groupMembers.get(EventBus.groupKey(groupId, pattern)) ?? [])];
+  }
+
+  /**
+   * Returns a read-only snapshot of one consumer group's partition
+   * assignment (EB-256): `{ groupId, pattern, strategy, members,
+   * assignments }`. `members` are the roster keys in join order (the
+   * `instanceId` for static members, the subscription id otherwise);
+   * `assignments` are the partitions owned by each member, in
+   * ascending partition order; `strategy` is the group's assignor name
+   * — read, never changed, by this call.
+   *
+   * Purely observational: it triggers no rebalance, fires no
+   * `onRebalance`, changes no assignment, and consumes no sequence —
+   * calling it twice in a row returns an equal snapshot, and the
+   * returned object is a detached copy, so mutating it never affects
+   * the group. A classic round-robin group (no `partitions` option)
+   * reports an empty `assignments` list — there is no partition
+   * placement to report — while still naming its strategy and roster.
+   *
+   * `pattern` is optional: when omitted and the group has exactly one
+   * competing set, that set is reported; when the group has several
+   * sets (same `groupId`, different patterns), the caller must name
+   * one — ambiguity is a `RangeError`, not a guess at a set. An
+   * unknown group (no live members on the named pattern, or no sets
+   * at all) throws `RangeError` fail-closed, like
+   * `setGroupMaxMembers`. Orthogonal to `onRebalance` (that pushes a
+   * `GroupRebalanceEvent` when membership changes; this pulls the
+   * current placement at any time), to group-lag observation (that
+   * reports per-member lag; this reports the placement map), and to
+   * the assignor strategies themselves (the snapshot only reads the
+   * strategy name — it never selects or replaces one).
+   */
+  getGroupAssignment(groupId: string, pattern?: string): GroupAssignmentSnapshot {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('getGroupAssignment: groupId must be a non-empty string');
+    }
+    if (pattern !== undefined && (typeof pattern !== 'string' || pattern.length === 0)) {
+      throw new RangeError('getGroupAssignment: pattern must be a non-empty string when given');
+    }
+    let key: string;
+    let resolvedPattern: string;
+    if (pattern !== undefined) {
+      key = EventBus.groupKey(groupId, pattern);
+      if (!this.groupMembers.has(key)) {
+        throw new RangeError(`getGroupAssignment: unknown consumer group "${groupId}" on pattern "${pattern}"`);
+      }
+      resolvedPattern = pattern;
+    } else {
+      const prefix = `${groupId}\0`;
+      const keys = [...this.groupMembers.keys()].filter((k) => k.startsWith(prefix));
+      if (keys.length === 0) {
+        throw new RangeError(`getGroupAssignment: unknown consumer group "${groupId}"`);
+      }
+      if (keys.length > 1) {
+        throw new RangeError(
+          `getGroupAssignment: consumer group "${groupId}" has ${keys.length} competing sets — pass the pattern to select one`,
+        );
+      }
+      key = keys[0] as string;
+      resolvedPattern = key.slice(prefix.length);
+    }
+    const members = [...(this.groupMembers.get(key) as string[])];
+    const assignments = [...this.partitionAssignment(key).entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([partition, memberId]) => ({ partition, memberId }));
+    return {
+      groupId,
+      pattern: resolvedPattern,
+      strategy: this.groupAssignorName(key),
+      members,
+      assignments,
+    };
   }
 
   /**

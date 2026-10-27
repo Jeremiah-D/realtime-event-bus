@@ -5043,6 +5043,22 @@ Details worth knowing:
   its `instanceId`; `subscription.instanceId` is readable from the
   returned `Subscription`.
 
+## Consumer-group assignment snapshot (EB-256)
+
+`getGroupAssignment(groupId, pattern?)` returns a read-only snapshot
+of one consumer group's placement — `{ groupId, pattern, strategy,
+members, assignments }` — without triggering a rebalance, firing
+`onRebalance`, changing any assignment, or consuming any sequence:
+`members` are the roster keys in join order (`instanceId` for static
+members, subscription id otherwise), `assignments` are the partitions
+owned by each member in ascending partition order, and `strategy` is
+the group's assignor name, read but never changed. A classic
+round-robin group reports an empty `assignments` list. `pattern` may
+be omitted when the group has exactly one competing set; a group with
+several sets requires it, and an unknown group throws `RangeError`
+fail-closed — ambiguity is never guessed at. The snapshot is a
+detached copy, so mutating it never affects the group.
+
 ## Chaos testing (EB-103)
 
 **Test / pre-production use only.** The deterministic fault-injection
