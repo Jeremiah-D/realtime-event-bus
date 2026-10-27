@@ -16436,6 +16436,20 @@ export class EventBus {
    */
   private delayedHeldKeyMatcherCache = new Map<string, RegExp>();
   /**
+   * Predicate-held delayed-delivery schedules (EB-262), by delay id.
+   * Unlike the topic and key holds above — which are standing rules
+   * the sweep consults for every due entry — a predicate hold is a
+   * snapshot: only the pending schedules matching at hold time are
+   * recorded here, so a schedule published after the hold is never
+   * held by it and fans out normally. A held id stays in
+   * `delayedById` (still counted by `listDelayed`/`getDelayedStats`)
+   * and the sweep sets it aside like any other held entry, keeping
+   * its `deliverAt`, deadline, TTL, and key sequence verbatim.
+   * Held state is in-memory only: a restart rebuilds schedules
+   * unheld, like the topic and key holds.
+   */
+  private delayedHeldPredicateIds = new Set<string>();
+  /**
    * Live recurring jobs by their `scheduleRecurring` id, in schedule
    * order. Dormant post-restart jobs (see `recoverRecurring`) also live
    * here — they carry no timer and never fire — until the application
@@ -21805,6 +21819,177 @@ export class EventBus {
       detail: { topicPattern, key },
     });
     return true;
+  }
+
+  /**
+   * Holds the delayed-delivery sweep for every still-pending
+   * schedule in one topic or pattern whose payload/key satisfies
+   * a caller predicate (EB-262): the predicate-scoped form of the
+   * sweep hold, combining the hold semantics of `holdDelayedTopic`
+   * (EB-250) / `holdDelayedByKey` (EB-252) with the predicate
+   * shape of `cancelDelayedByPredicate` (EB-239) —
+   * `predicate(payload, key)` is called once per topic-matching
+   * pending entry, with the payload exactly as passed to
+   * `publishDelayed` and the entry's compaction key, or
+   * `undefined` for an unkeyed schedule; a truthy return marks
+   * the entry for the hold. Entries outside the topic scope are
+   * never evaluated.
+   *
+   * A held entry stays in the pending set — `listDelayed`,
+   * `getDelayedStats`, and `getDelayedStatsByKey` still count it,
+   * `getStats().pendingDelayed` is unchanged — and keeps its
+   * `deliverAt`, deadline, TTL, and key sequence verbatim, so
+   * resuming fans it out exactly as scheduled (an entry past its
+   * deadline at resume time is dropped as expired by the
+   * unchanged sweep rule, never delivered late). A schedule that
+   * becomes due while held is likewise held, not expired, not
+   * shed, and not buffered: the hold check runs before the
+   * sweep's expiry and pause handling, so a held entry is never
+   * discarded by either. The hold is a snapshot, not a standing
+   * rule: only schedules pending at hold time are recorded, so a
+   * new `publishDelayed` schedule during the hold still schedules
+   * normally and fans out on its own due time — the hold governs
+   * only the sweep fan-out of the schedules it captured, never
+   * schedule admission.
+   *
+   * The predicate hold is an independent hold source: resuming it
+   * releases only the predicate hold, and an entry also held by
+   * topic or key stays held until that hold is resumed too — and
+   * vice versa, resuming a topic/key hold never releases a
+   * predicate hold. Re-holding an already predicate-held entry
+   * is an idempotent no-op: it is not counted twice and writes
+   * no second audit record. Each newly held schedule is audited
+   * as `delayed_predicate_held` (`{ topicPattern, delayId }`).
+   * Held state is in-memory only: a restart rebuilds schedules
+   * unheld (see `delayedHeldPredicateIds`).
+   *
+   * Fail-closed like `cancelDelayedByPredicate`: the pattern and
+   * predicate are validated first, then every topic-matching
+   * entry is evaluated before anything is held, so a throwing
+   * predicate propagates with zero schedules held.
+   *
+   * Returns `{ held, delayIds }` in schedule order; an empty
+   * match returns `{ held: 0, delayIds: [] }`, never a throw.
+   *
+   * Throws `TypeError` when `topicPattern` is not a string or
+   * `predicate` is not a function, `RangeError` when
+   * `topicPattern` is empty.
+   */
+  holdDelayedByPredicate(
+    topicPattern: string,
+    predicate: (payload: unknown, key: string | undefined) => unknown,
+  ): { held: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('holdDelayedByPredicate: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('holdDelayedByPredicate: topicPattern must be a non-empty string');
+    }
+    if (typeof predicate !== 'function') {
+      throw new TypeError('holdDelayedByPredicate: predicate must be a function');
+    }
+    const matcher = compilePattern(topicPattern);
+    // Evaluate first, hold second: `delayedById` holds exactly the
+    // pending schedules, in schedule order. Collecting every hit
+    // before any hold is what makes a throwing predicate fail
+    // closed — the throw propagates before the held set is touched
+    // at all.
+    const hits: string[] = [];
+    for (const [delayId, entry] of this.delayedById) {
+      if (entry.topic === topicPattern || matcher.test(entry.topic)) {
+        if (predicate(entry.payload, entry.key)) hits.push(delayId);
+      }
+    }
+    const delayIds: string[] = [];
+    for (const delayId of hits) {
+      // Idempotent: an already-held entry is not counted twice
+      // and writes no second audit record.
+      if (this.delayedHeldPredicateIds.has(delayId)) continue;
+      this.delayedHeldPredicateIds.add(delayId);
+      const entry = this.delayedById.get(delayId);
+      this.auditSubscription({
+        action: 'delayed_predicate_held',
+        actor: 'system',
+        pattern: topicPattern,
+        topic: entry?.topic,
+        detail: { topicPattern, delayId },
+      });
+      delayIds.push(delayId);
+    }
+    return { held: delayIds.length, delayIds };
+  }
+
+  /**
+   * Releases the predicate hold of `holdDelayedByPredicate`
+   * (EB-262): the predicate is re-evaluated over the currently
+   * predicate-held schedules in the topic scope, and every entry
+   * it still selects is released — due schedules fan out on the
+   * next sweep, in their original heap order and with their
+   * original `deliverAt`, deadline, and key sequence (an entry
+   * past its deadline at resume time is dropped as expired by
+   * the unchanged sweep rule, never delivered late). A held
+   * entry the predicate no longer selects stays held: resume
+   * releases only what the predicate still matches, so releasing
+   * the rest needs a predicate that selects them. An entry also
+   * held by topic or key stays held after this release, and
+   * resuming a topic/key hold never releases a predicate hold
+   * — the hold sources compose independently. The resume itself
+   * fans nothing out: the next sweep (a tick, or any publish
+   * that flushes the timer) does.
+   *
+   * Fail-closed like the hold: the pattern and predicate are
+   * validated first, then every in-scope held entry is evaluated
+   * before anything is released, so a throwing predicate
+   * propagates with zero schedules released. Each released
+   * schedule is audited as `delayed_predicate_resumed`
+   * (`{ topicPattern, delayId }`).
+   *
+   * Returns `{ resumed, delayIds }` in schedule order; no held
+   * entry selected returns `{ resumed: 0, delayIds: [] }`, never
+   * a throw.
+   *
+   * Throws `TypeError` when `topicPattern` is not a string or
+   * `predicate` is not a function, `RangeError` when
+   * `topicPattern` is empty.
+   */
+  resumeDelayedByPredicate(
+    topicPattern: string,
+    predicate: (payload: unknown, key: string | undefined) => unknown,
+  ): { resumed: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('resumeDelayedByPredicate: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('resumeDelayedByPredicate: topicPattern must be a non-empty string');
+    }
+    if (typeof predicate !== 'function') {
+      throw new TypeError('resumeDelayedByPredicate: predicate must be a function');
+    }
+    const matcher = compilePattern(topicPattern);
+    // Evaluate first, release second, over the held set only:
+    // `delayedById` iteration gives schedule order, and entries
+    // outside the topic scope are never evaluated — so a
+    // throwing predicate propagates before any hold is released.
+    const hits: string[] = [];
+    for (const [delayId, entry] of this.delayedById) {
+      if (!this.delayedHeldPredicateIds.has(delayId)) continue;
+      if (entry.topic !== topicPattern && !matcher.test(entry.topic)) continue;
+      if (predicate(entry.payload, entry.key)) hits.push(delayId);
+    }
+    const delayIds: string[] = [];
+    for (const delayId of hits) {
+      this.delayedHeldPredicateIds.delete(delayId);
+      const entry = this.delayedById.get(delayId);
+      this.auditSubscription({
+        action: 'delayed_predicate_resumed',
+        actor: 'system',
+        pattern: topicPattern,
+        topic: entry?.topic,
+        detail: { topicPattern, delayId },
+      });
+      delayIds.push(delayId);
+    }
+    return { resumed: delayIds.length, delayIds };
   }
 
   /**
@@ -35453,6 +35638,17 @@ export class EventBus {
       // status, same untouched timing — so one held key never
       // blocks an unrelated key behind it in the heap.
       if (top.key !== undefined && this.delayedHeldForKey(top.topic, top.key)) {
+        heldAside.push(top);
+        continue;
+      }
+      // EB-262: a predicate-held entry is set aside exactly like a
+      // topic- or key-held one — same heldAside push-back, same
+      // pending status, same untouched timing — so one held
+      // schedule never blocks an unrelated schedule behind it in
+      // the heap, and the independent hold sources compose: an
+      // entry held by any source stays held until that source
+      // releases it.
+      if (this.delayedHeldPredicateIds.has(top.id)) {
         heldAside.push(top);
         continue;
       }

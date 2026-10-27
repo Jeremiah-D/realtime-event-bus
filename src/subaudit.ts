@@ -87,6 +87,8 @@ export type SubscriptionAuditAction =
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
   | 'delayed_key_resumed'
+  | 'delayed_predicate_held'
+  | 'delayed_predicate_resumed'
   | 'partition_rule_set'
   | 'partition_rule_cleared'
   | 'partition_expansion'
@@ -177,6 +179,8 @@ export type SubscriptionAuditAction =
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
+ * - `delayed_predicate_held`: `{ topicPattern: <string>, delayId: <string> }` — one pending delayed schedule was held by predicate (EB-262; the `pattern` field carries the topic pattern, `topic` the schedule's concrete topic, one event per held schedule)
+ * - `delayed_predicate_resumed`: `{ topicPattern: <string>, delayId: <string> }` — one predicate-held delayed schedule was released (EB-262; same field convention as the hold event)
  * - `config_applied`: `{ applied: <string[]> }` — paths applied by
  *   `applyConfig` (EB-91), in application order; empty on a no-op
  * - `config_rolled_back`: `{ failedPath: <string>, applied: <string[]>,
@@ -326,6 +330,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_topic_resumed',
   'delayed_key_held',
   'delayed_key_resumed',
+  'delayed_predicate_held',
+  'delayed_predicate_resumed',
   'partition_rule_set',
   'partition_rule_cleared',
   'partition_expansion',
