@@ -34045,6 +34045,161 @@ export class EventBus {
   }
 
   /**
+   * Extends the TTL/deadline of every pending delayed delivery for
+   * one topic or topic pattern whose payload/key satisfies a caller
+   * predicate (EB-260): the predicate-scoped bulk form of
+   * `extendDelayedTtl` (EB-247), combining its life-extension
+   * semantics with the predicate shape of
+   * `rescheduleDelayedByPredicate` (EB-258) — `predicate(payload,
+   * key)` is called once per topic-matching pending entry, with the
+   * payload exactly as passed to `publishDelayed` and the entry's
+   * compaction key, or `undefined` for an unkeyed schedule; a truthy
+   * return marks the entry for the extension. Entries outside the
+   * topic scope are never evaluated.
+   *
+   * Each hit goes through `extendDelayedTtl` itself, so the
+   * per-schedule semantics are exactly the single-schedule ones:
+   * only the life moves — never `deliverAt`, never a heap
+   * re-entry, never a key-sequence renumber, never a fan-out —
+   * and each hit is audited by that call as
+   * `delayed_ttl_extended`. The `ttlMs` form extends a per-message
+   * TTL (counting from fan-out time); the `deadlineAt` form extends
+   * the absolute deadline and lifts any earlier schedule-time TTL
+   * deadline to the same instant; an EDF-class schedule's EDF
+   * deadline is never extended — its `deadlineAt` form extends
+   * only a schedule-time TTL deadline when one exists. Held
+   * schedules (EB-250/EB-252) are still extendable: a hold only
+   * gates sweep fan-out, not the life, so a held schedule keeps
+   * its hold after the extension and fans out at its due time on
+   * the first sweep after resume.
+   *
+   * Fail-closed as a batch: the topic pattern, the predicate, and
+   * the timing are validated first, then every topic-matching entry
+   * is evaluated before anything is extended — a predicate that
+   * throws for any entry propagates with zero schedules extended —
+   * and then every hit is checked for extendability before anything
+   * is extended — a hit carrying nothing the given form can extend,
+   * or a new deadline earlier than that hit's governing deadline,
+   * throws `RangeError` with the pending set untouched, so a bad
+   * bulk extension can never half-extend a predicate's queue.
+   * Only pending schedules count: entries that already fanned out,
+   * were already cancelled, or were already dropped as expired are
+   * not in the pending set and are not counted. The batch is
+   * synchronous and extension never sweeps, so no hit can fan out
+   * between validation and application; an empty result returns
+   * `{ extended: 0, delayIds: [] }` — never a throw. Returns
+   * `{ extended, delayIds }` — the number of schedules extended
+   * and their ids in schedule order, the same shape as
+   * `extendDelayedTtlByTopic`'s result.
+   *
+   * Orthogonal to `extendDelayedTtlByKey` / `extendDelayedTtlByTopic`
+   * (those scope by key / topic, this scopes by what the message
+   * carries) and to `rescheduleDelayedByPredicate` (that moves the
+   * due time, this moves only the life).
+   *
+   * Throws `TypeError` when `topicPattern` is not a string or
+   * `predicate` is not a function, `RangeError` when the pattern is
+   * empty, when neither or both of `ttlMs`/`deadlineAt` are given,
+   * when the timing is illegal, or when any hit schedule cannot take
+   * the extension.
+   */
+  extendDelayedTtlByPredicate(
+    topicPattern: string,
+    predicate: (payload: unknown, key: string | undefined) => unknown,
+    opts: { ttlMs?: number; deadlineAt?: number },
+  ): { extended: number; delayIds: string[] } {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('extendDelayedTtlByPredicate: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('extendDelayedTtlByPredicate: topicPattern must be a non-empty string');
+    }
+    if (typeof predicate !== 'function') {
+      throw new TypeError('extendDelayedTtlByPredicate: predicate must be a function');
+    }
+    // Validate the timing once, before anything is evaluated or
+    // extended: exactly one form, with the same value rules as
+    // `extendDelayedTtl` — a bad timing never triggers a predicate
+    // call.
+    const hasTtlMs = opts?.ttlMs !== undefined;
+    const hasDeadlineAt = opts?.deadlineAt !== undefined;
+    if (hasTtlMs === hasDeadlineAt) {
+      throw new RangeError('extendDelayedTtlByPredicate requires exactly one of ttlMs or deadlineAt');
+    }
+    if (hasTtlMs) validateTtlMs(opts.ttlMs, 'extendDelayedTtlByPredicate');
+    if (hasDeadlineAt) validateDeadline(opts.deadlineAt, 'deadlineAt', 'extendDelayedTtlByPredicate');
+    // Evaluate first, extend second: `delayedById` holds exactly the
+    // pending schedules, in schedule order. Collecting every hit
+    // before any `extendDelayedTtl` call is what makes a throwing
+    // predicate fail closed — the throw propagates before the
+    // pending set is touched at all.
+    const matcher = compilePattern(topicPattern);
+    const hits: string[] = [];
+    for (const [delayId, entry] of this.delayedById) {
+      if (entry.topic === topicPattern || matcher.test(entry.topic)) {
+        if (predicate(entry.payload, entry.key)) hits.push(delayId);
+      }
+    }
+    // Full pre-validation, mirroring `extendDelayedTtl`'s checks
+    // entry by entry, before any mutation: a single unextendable
+    // hit fails the whole batch with zero changes.
+    if (hasTtlMs) {
+      const ttlMs = opts.ttlMs as number;
+      for (const delayId of hits) {
+        const entry = this.delayedById.get(delayId) as DelayedEntry;
+        if (entry.ttlMs === undefined) {
+          throw new RangeError(
+            'extendDelayedTtlByPredicate: a matched schedule carries no per-message ttlMs to extend',
+          );
+        }
+        if (ttlMs < entry.ttlMs) {
+          throw new RangeError(
+            'extendDelayedTtlByPredicate: ttlMs must not be smaller than the current ttlMs',
+          );
+        }
+      }
+    } else {
+      const deadlineAt = opts.deadlineAt as number;
+      for (const delayId of hits) {
+        const entry = this.delayedById.get(delayId) as DelayedEntry;
+        if (entry.edfDeadline !== undefined) {
+          if (entry.expiresAt === undefined) {
+            throw new RangeError(
+              'extendDelayedTtlByPredicate: a matched EDF schedule carries no TTL deadline to extend',
+            );
+          }
+          if (deadlineAt < entry.expiresAt) {
+            throw new RangeError(
+              'extendDelayedTtlByPredicate: deadlineAt must not be earlier than the current deadline',
+            );
+          }
+        } else {
+          const governing = entry.deadline ?? entry.expiresAt;
+          if (governing === undefined) {
+            throw new RangeError(
+              'extendDelayedTtlByPredicate: a matched schedule carries no deadline or TTL deadline to extend',
+            );
+          }
+          if (deadlineAt < governing) {
+            throw new RangeError(
+              'extendDelayedTtlByPredicate: deadlineAt must not be earlier than the current deadline',
+            );
+          }
+        }
+      }
+    }
+    const delayIds: string[] = [];
+    for (const delayId of hits) {
+      // Each call re-validates its own entry and audits as
+      // `delayed_ttl_extended`; pre-validation above guarantees
+      // none of them can throw, so the batch applies in full.
+      this.extendDelayedTtl(delayId, opts);
+      delayIds.push(delayId);
+    }
+    return { extended: delayIds.length, delayIds };
+  }
+
+  /**
    * Moves a pending delayed delivery to a new due time (EB-242): the
    * schedule keeps its delay id, topic, key, payload, and every other
    * schedule-time attribute — only `deliverAt` changes — and re-enters
