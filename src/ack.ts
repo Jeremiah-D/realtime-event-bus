@@ -301,6 +301,17 @@ export class AckTracker<T> {
   }
 
   /**
+   * Whether `seq` is currently outstanding (EB-257): present in the
+   * pending map and not settled. A peek only — it never touches a
+   * timer — so a batch caller can validate every entry before
+   * extending any of them, keeping a rejected batch fail-closed.
+   */
+  isOutstanding(seq: number): boolean {
+    const record = this.pending.get(seq);
+    return record !== undefined && !record.settled;
+  }
+
+  /**
    * Extends the ack deadline of one outstanding delivery (EB-255): the
    * delivery's ack-timeout timer is cancelled and restarted with
    * `extensionMs`, measured from this call. Only the timer moves — the

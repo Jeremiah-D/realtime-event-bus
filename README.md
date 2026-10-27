@@ -137,7 +137,15 @@ library.
   fail-closed: an already-acked, already-timed-out, or unknown `seq`,
   an unknown or non-reliable subscriber, and any malformed option all
   throw `RangeError`, and every success is audited as
-  `ack_deadline_extended` (`{ seq, extensionMs, deadlineMs }`). The
+  `ack_deadline_extended` (`{ seq, extensionMs, deadlineMs }`). The batch
+  form `extendAckDeadlines(subId, [{ seq, extensionMs | newDeadlineMs }])`
+  (EB-257) extends several outstanding deliveries on one reliable
+  subscriber in one call, with the same per-entry semantics and
+  per-entry `ack_deadline_extended` audit; it is fail-closed as a
+  batch — one unknown, already-acked, already-timed-out, or duplicate
+  `seq`, or one malformed entry, rejects the whole batch with no timer
+  touched and no audit written — and returns
+  `{ extended, seqs }` in batch order (an empty batch is a no-op). The
   diagnostic goes through the normal publish
   pipeline (ACL, schema validation, rate limiting); an admission rejection
   suppresses it without affecting the DLQ move, and a dead-lettered

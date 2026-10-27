@@ -24785,6 +24785,144 @@ export class EventBus {
   }
 
   /**
+   * Batch-extends the ack deadlines of several outstanding deliveries
+   * on one reliable subscriber (EB-257): the bulk form of
+   * `extendAckDeadline` (EB-255), so a slow consumer working through
+   * a batch of deliveries can defer all of them in one call instead
+   * of one call per delivery.
+   *
+   * Each entry is `{ seq, extensionMs }` or `{ seq, newDeadlineMs }`,
+   * with exactly the single-entry semantics: `extensionMs` restarts
+   * that delivery's timer for that many milliseconds from now, and
+   * `newDeadlineMs` is an absolute bus-clock timestamp it must be in
+   * the future. A relative `extensionMs` is priced against the bus
+   * clock once at call time, so every entry in the batch lands on a
+   * deadline computed from the same `now()` reading. Each entry only
+   * resets that delivery's ack-timeout timer — never the message, its
+   * sequence, its redelivery count, or the subscription-level
+   * `ackTimeoutMs` — and each extended entry is audited separately
+   * as `ack_deadline_extended` (`{ seq, extensionMs, deadlineMs }`),
+   * exactly like a single `extendAckDeadline` call.
+   *
+   * Fail-closed batch mode, unlike `ackBatch` / `nackBatch` (which
+   * settle the valid handles and then report the invalid ones): the
+   * subscriber, every entry's shape and timing, every `seq`'s
+   * outstanding state, and duplicate `seq`s are all validated
+   * before any timer is touched, so a single bad entry — an unknown
+   * subscriber, a non-reliable subscriber, an unknown / already-acked
+   * / already-timed-out-and-requeued `seq`, a duplicate `seq`, or a
+   * malformed option (neither or both timing forms, a non-positive /
+   * non-finite `extensionMs`, a past or non-finite `newDeadlineMs`)
+   * — rejects the whole batch with `RangeError` (a non-array batch or
+   * a non-object entry throws `TypeError`), every timer stays on its
+   * original deadline, and no audit record is written. An empty array
+   * is a no-op returning `{ extended: 0, seqs: [] }` with no audit.
+   *
+   * Returns `{ extended, seqs }` — the number of deliveries extended
+   * and their sequences in batch order, the same shape family as
+   * `rescheduleDelayedByKey`'s `{ rescheduled, delayIds }`.
+   * Orthogonal to `extendAckDeadline` (that extends one delivery,
+   * this extends a batch) and to `ackBatch` / `nackBatch` (those
+   * settle deliveries, this only defers them).
+   *
+   * Throws `TypeError` when the batch is not an array or an entry is
+   * not an object, `RangeError` for an unknown / non-reliable
+   * subscriber, a non-outstanding or duplicate `seq`, or illegal
+   * timing.
+   */
+  extendAckDeadlines(
+    subId: string,
+    entries: Array<{ seq: number; extensionMs?: number; newDeadlineMs?: number }>,
+  ): { extended: number; seqs: number[] } {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('extendAckDeadlines: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`extendAckDeadlines: unknown subscriber: ${subId}`);
+    }
+    const reliable = subscriber.reliable;
+    if (reliable == null) {
+      throw new RangeError('extendAckDeadlines: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    if (!Array.isArray(entries)) {
+      throw new TypeError('extendAckDeadlines: entries must be an array');
+    }
+    if (entries.length === 0) return { extended: 0, seqs: [] };
+    // Validate the whole batch before touching any timer: shape and
+    // timing first, then outstanding state, then duplicates — a
+    // rejected batch must leave every timer and the audit log
+    // exactly as they were.
+    const nowMs = this.now();
+    const normalized: Array<{ seq: number; extensionMs: number; deadlineMs: number }> = [];
+    const seen = new Set<number>();
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new TypeError(`extendAckDeadlines: entry ${index} must be an object`);
+      }
+      if (!Number.isInteger(entry.seq) || (entry.seq as number) <= 0) {
+        throw new RangeError(`extendAckDeadlines: entry ${index} seq must be a positive integer delivery sequence`);
+      }
+      const seq = entry.seq as number;
+      if (seen.has(seq)) {
+        throw new RangeError(`extendAckDeadlines: entry ${index} duplicates seq ${seq}`);
+      }
+      seen.add(seq);
+      const hasExtension = entry.extensionMs !== undefined;
+      const hasDeadline = entry.newDeadlineMs !== undefined;
+      if (hasExtension === hasDeadline) {
+        throw new RangeError(`extendAckDeadlines: entry ${index} must pass exactly one of extensionMs or newDeadlineMs`);
+      }
+      let extensionMs: number;
+      let deadlineMs: number;
+      if (hasExtension) {
+        if (!Number.isFinite(entry.extensionMs) || (entry.extensionMs as number) <= 0) {
+          throw new RangeError(`extendAckDeadlines: entry ${index} extensionMs must be a positive finite number of milliseconds`);
+        }
+        extensionMs = entry.extensionMs as number;
+        deadlineMs = nowMs + extensionMs;
+      } else {
+        if (!Number.isFinite(entry.newDeadlineMs)) {
+          throw new RangeError(`extendAckDeadlines: entry ${index} newDeadlineMs must be a finite bus-clock timestamp`);
+        }
+        deadlineMs = entry.newDeadlineMs as number;
+        if (deadlineMs <= nowMs) {
+          throw new RangeError(`extendAckDeadlines: entry ${index} newDeadlineMs must be in the future`);
+        }
+        extensionMs = deadlineMs - nowMs;
+      }
+      normalized.push({ seq, extensionMs, deadlineMs });
+    }
+    for (const { seq } of normalized) {
+      if (!reliable.tracker.isOutstanding(seq)) {
+        throw new RangeError(
+          `extendAckDeadlines: seq ${seq} is not outstanding for this subscriber ` +
+            `(never delivered, already acked, or already timed out and requeued)`,
+        );
+      }
+    }
+    // All validation passed and this call is synchronous, so no timer
+    // can fire mid-batch: every extension below lands.
+    const seqs: number[] = [];
+    for (const { seq, extensionMs, deadlineMs } of normalized) {
+      const extended = reliable.tracker.extendAckDeadline(seq, extensionMs);
+      if (!extended) {
+        throw new RangeError(`extendAckDeadlines: seq ${seq} ceased to be outstanding mid-batch`);
+      }
+      this.auditSubscription({
+        action: 'ack_deadline_extended',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { seq, extensionMs, deadlineMs },
+      });
+      seqs.push(seq);
+    }
+    return { extended: seqs.length, seqs };
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
