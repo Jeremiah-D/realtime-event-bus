@@ -25715,6 +25715,118 @@ export class EventBus {
   }
 
   /**
+   * Revises the adaptive-throttle rates of one throttled subscriber
+   * (EB-268): a throttled subscriber can retune its publish-side
+   * shedding without re-subscribing. The revision is partial: a rate
+   * left out keeps its current value, and only `minRatePerSec` /
+   * `maxRatePerSec` / `initialRatePerSec` ever move — `throttledDrops`,
+   * the observed drain rate, the queue, and the backpressure state
+   * are untouched. The three rates are stored live on the throttle
+   * state, so the next engagement reads them: a current excursion
+   * keeps its bucket and its enforced rate until it ends (the bucket
+   * is created at engagement time and is never retuned), and the
+   * observed drain rate recorded when that excursion ends is clamped
+   * to the revised bounds before it seeds the next engagement — the
+   * same clamping `engageThrottle` already applies at engagement
+   * time, so a stored initial below a raised floor (or above a
+   * lowered ceiling) is clamped when it is used, not rewritten here.
+   * Passing `null` clears the throttling: the subscriber returns to
+   * unthrottled publish (the publish-side gate is the throttle state
+   * itself), and a later revision is refused until the subscriber
+   * opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `throttle`, a non-object value, an illegal rate
+   * (`min` / `initial` non-finite or <= 0, `max` non-positive and not
+   * `Infinity`, or `min` above `max`), and `undefined` — only an
+   * explicit `null` clears — all throw `RangeError` with the live
+   * rates, the live bucket, the drop count, and the audit log
+   * untouched. The validation mirrors `resolveThrottleOptions`.
+   * Audited as `throttle_revised` (`{ throttle:
+   * { minRatePerSec, maxRatePerSec, initialRatePerSec } | null,
+   * oldThrottle: { minRatePerSec, maxRatePerSec, initialRatePerSec } }`,
+   * `null` for a clear) on success.
+   *
+   * Orthogonal to the subscribe-time throttling of EB-14 (this
+   * revises it, that sets it), and to the delivery-shaping rate of
+   * EB-21 / `setDeliveryShaping` (EB-266): shaping paces queued
+   * deliveries at drain time, this sheds fresh publishes while the
+   * queue is under backpressure.
+   *
+   * Throws `RangeError` for an unknown / unthrottled subscriber or an
+   * illegal throttle value.
+   */
+  setThrottle(subId: string, opts: ThrottleOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setThrottle: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setThrottle: unknown subscriber: ${subId}`);
+    }
+    const throttle = subscriber.throttle;
+    if (throttle == null) {
+      throw new RangeError('setThrottle: subscriber has no throttle set');
+    }
+    const oldThrottle: ThrottleOptions = {
+      minRatePerSec: throttle.minRatePerSec,
+      maxRatePerSec: throttle.maxRatePerSec,
+      initialRatePerSec: throttle.initialRatePerSec,
+    };
+    if (opts === null) {
+      subscriber.throttle = undefined;
+      this.auditSubscription({
+        action: 'throttle_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { throttle: null, oldThrottle },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a partial object keeps the
+    // rates it leaves out, so resolution happens here, against the
+    // live values, before any rate moves. Bounds mirror
+    // `resolveThrottleOptions`: `max` may be `Infinity`, the rest must
+    // be positive and finite, and `min` must not exceed `max`.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setThrottle: throttle must be an object with minRatePerSec and/or maxRatePerSec and/or initialRatePerSec, or null to clear it');
+    }
+    const minRatePerSec = opts.minRatePerSec ?? throttle.minRatePerSec;
+    const maxRatePerSec = opts.maxRatePerSec ?? throttle.maxRatePerSec;
+    const initialRatePerSec = opts.initialRatePerSec ?? throttle.initialRatePerSec;
+    if (!Number.isFinite(minRatePerSec) || minRatePerSec <= 0) {
+      throw new RangeError('throttle.minRatePerSec must be a positive finite number of messages/sec');
+    }
+    if (!(maxRatePerSec === Infinity || (Number.isFinite(maxRatePerSec) && maxRatePerSec > 0))) {
+      throw new RangeError('throttle.maxRatePerSec must be a positive number of messages/sec');
+    }
+    if (minRatePerSec > maxRatePerSec) {
+      throw new RangeError('throttle.minRatePerSec must not exceed throttle.maxRatePerSec');
+    }
+    if (!Number.isFinite(initialRatePerSec) || initialRatePerSec <= 0) {
+      throw new RangeError('throttle.initialRatePerSec must be a positive finite number of messages/sec');
+    }
+    // Only the three rates move: the current excursion's bucket and
+    // enforced rate, the drop count, the observed drain rate, and the
+    // queue are untouched, and the next engagement reads these live.
+    throttle.minRatePerSec = minRatePerSec;
+    throttle.maxRatePerSec = maxRatePerSec;
+    throttle.initialRatePerSec = initialRatePerSec;
+    this.auditSubscription({
+      action: 'throttle_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        throttle: { minRatePerSec, maxRatePerSec, initialRatePerSec },
+        oldThrottle,
+      },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

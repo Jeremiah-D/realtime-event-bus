@@ -766,6 +766,24 @@ library.
   (`{ minRatePerSec, maxRatePerSec, initialRatePerSec }`); invalid rates
   throw `RangeError` from `subscribe`. Disabled by default — existing
   backpressure behavior is unchanged unless a subscriber opts in.
+  Revisable after subscribe (EB-268, via
+  `setThrottle(subId, opts | null)`): a throttled subscriber's rates can
+  be retuned without re-subscribing — the revision is partial (a rate
+  left out keeps its value) and only the three rates ever move: the drop
+  count, the observed drain rate, the queue, and the backpressure state
+  are untouched. A current excursion keeps its bucket and enforced rate
+  until it ends, and the new rates apply from the next engagement (the
+  observed drain rate recorded when the excursion ends is clamped to the
+  revised bounds before it seeds the next one). `null` clears the
+  throttling back to unthrottled publish. It is fail-closed (an unknown
+  subscriber, a subscriber that never opted into throttling, or an
+  illegal rate throws `RangeError` with the live rates, bucket, drop
+  count, and audit log untouched; `undefined` is not a clear, only `null`
+  is, and a revision after a clear is refused until the subscriber opts
+  in again at subscribe time), and every success is audited as
+  `throttle_revised` (`{ throttle: { minRatePerSec, maxRatePerSec,
+  initialRatePerSec } | null, oldThrottle: { ... } }`). (Real-time
+  systems: subscription governance.)
 - **`src/reconnect.ts` — `ReconnectController`**: connection state machine
   (`idle → connecting → connected → backoff → connecting …`) with an
   injectable `BackoffStrategy` (`ReconnectOptions.strategy`). The default is

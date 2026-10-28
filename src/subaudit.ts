@@ -88,6 +88,7 @@ export type SubscriptionAuditAction =
   | 'filter_revised'
   | 'delivery_shaping_revised'
   | 'health_probe_revised'
+  | 'throttle_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -186,6 +187,7 @@ export type SubscriptionAuditAction =
  * - `filter_revised`: `{ filter: 'set' | null, oldFilter: 'set' }` — a filtered subscriber's content predicate was revised (EB-265; `null` means the predicate was cleared back to unfiltered delivery; the predicate itself is a function and is never serialized into the audit record; already-queued messages keep their original admission, and durable replay reads the live predicate per record)
  * - `delivery_shaping_revised`: `{ deliveryShaping: { messagesPerSec, burst } | null, oldDeliveryShaping: { messagesPerSec, burst } }` — a shaped subscriber's delivery-shaping rate was revised (EB-266; `null` means the shaping was cleared back to unshaped delivery; a partial revision keeps the fields it leaves out; the bucket keeps its stored budget, capped at the new burst, and the new rate applies from the next refill; queued messages and the in-flight count are untouched)
  * - `health_probe_revised`: `{ healthProbe: { maxConsecutiveFailures, processingTimeoutMs?, autoResumeAfterMs? } | null, oldHealthProbe: { ... } }` — a probed subscriber's health-probe parameters were revised (EB-267; `null` means the probe was cleared back to unprobed delivery and a degraded pause it held is released; a partial revision keeps the fields it leaves out; the consecutive-failure counter and the degraded flag are untouched; the new timeout budget applies to the next handler call, a tightened threshold trips on the next failure, and a new cooldown applies from the next degradation)
+ * - `throttle_revised`: `{ throttle: { minRatePerSec, maxRatePerSec, initialRatePerSec } | null, oldThrottle: { minRatePerSec, maxRatePerSec, initialRatePerSec } }` — a throttled subscriber's adaptive-throttle rates were revised (EB-268; `null` means the throttling was cleared back to unthrottled publish; a partial revision keeps the rates it leaves out; a current excursion keeps its bucket and enforced rate until it ends, and the new rates apply from the next engagement; the drop count, the observed drain rate, and the queue are untouched)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -341,6 +343,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'filter_revised',
   'delivery_shaping_revised',
   'health_probe_revised',
+  'throttle_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',
