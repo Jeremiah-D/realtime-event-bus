@@ -1747,6 +1747,25 @@ library.
   backlog held back by the window via `rateLimitedWaiting`. `maxMessages`
   must be an integer >= 1 and `perWindowMs` a positive finite number of
   milliseconds — invalid values throw `RangeError` from `subscribe`.
+  Revisable after subscribe (EB-271, via
+  `setRateLimit(subId, opts | null)`): a rate-limited subscriber's
+  ceiling can be retuned without re-subscribing — only the limiter
+  instance is replaced (the state object is retained, so an
+  already-armed re-flush timer stays valid), and the window starts
+  fresh: tightening never retroactively blocks what was already
+  delivered, and loosening admits held messages up to the new max on
+  the next flush. The revision must be complete (both bounds
+  required, no partial revision), and passing the current values
+  still resets the window. `null` clears the limit back to unlimited
+  after cancelling the armed re-flush timer, and a revision after a
+  clear is refused until the subscriber opts in again at subscribe
+  time. It is fail-closed (an unknown subscriber, a subscriber that
+  never opted into a limit, or an illegal bound throws `RangeError`
+  with the live limiter and audit log untouched; `undefined` is not a
+  clear, only `null` is), and every success is audited as
+  `rate_limit_revised` (`{ rateLimit: { maxMessages, perWindowMs } |
+  null, oldRateLimit: { maxMessages, perWindowMs } }`). (Real-time
+  systems: delivery governance.)
   Disabled by default.
 - **Per-subscriber max in-flight deliveries** (in `src/bus.ts`, opt-in via
   `subscribe(..., { maxInflight: N })`): caps how many handler invocations

@@ -9994,6 +9994,16 @@ function isThenable(value: unknown): value is Promise<unknown> {
  */
 interface RateWindowState {
   limiter: SlidingWindowLimiter;
+  /**
+   * The bounds the live limiter was built with (EB-271, for
+   * `EventBus.setRateLimit`): the limiter's fields are private with no
+   * getters, so the state carries its own bounds for the revision
+   * audit's old values — and for the revision to replace them in
+   * place alongside the limiter.
+   */
+  maxMessages: number;
+  /** The window width the live limiter was built with (see above). */
+  perWindowMs: number;
   /** True while queued messages are held back for lack of window budget. */
   rateLimiting: boolean;
   /** Pending re-flush timer, armed while `rateLimiting` is true. */
@@ -10020,6 +10030,8 @@ function resolveRateLimitOptions(opt: RateLimitOptions | undefined): RateWindowS
   }
   return {
     limiter: new SlidingWindowLimiter(maxMessages, perWindowMs),
+    maxMessages,
+    perWindowMs,
     rateLimiting: false,
     timer: undefined,
   };
@@ -26038,6 +26050,119 @@ export class EventBus {
       pattern: subscriber.pattern,
       detail: { retryLadder: validated, oldRetryLadder },
     });
+  }
+
+  /**
+   * Revises the sliding-window delivery rate limit of one
+   * rate-limited subscriber (EB-271): a subscriber that opted into
+   * `rateLimit` can retune its hard ceiling without re-subscribing.
+   * Only the limiter instance is replaced — the `RateWindowState`
+   * object itself is retained, so an already-armed re-flush timer
+   * (whose callback holds that state object and reads its limiter
+   * live on every fire) stays valid instead of being orphaned — and
+   * the window starts fresh: deliveries counted under the old window
+   * no longer count, so tightening never retroactively blocks what
+   * was already delivered, and loosening admits held messages up to
+   * the new max on the flush this schedules. The revision must be
+   * complete — both `maxMessages` and `perWindowMs` are required,
+   * there is no partial revision (the limiter's fields are private
+   * with no getters, so there is no clean read path for a half
+   * revision to merge against) — and bounds are exactly
+   * `resolveRateLimitOptions`'s, reused rather than restated. Passing
+   * the current values is not a no-op: replacing the limiter resets
+   * the window counts, so it is audited like any other revision.
+   * Passing `null` clears the limit: the armed re-flush timer is
+   * cancelled first, via `clearRateLimitTimer`, while the state is
+   * still attached — clearing after removal would orphan the timer —
+   * and only then is the state removed, so held messages drain
+   * ungated on the flush this schedules. A revision after a clear is
+   * refused until the subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `rateLimit`, a non-object value, an incomplete or
+   * illegal bound (non-integer / < 1 `maxMessages`, non-finite /
+   * <= 0 `perWindowMs`), and `undefined` — only an explicit `null`
+   * clears — all throw `RangeError` with the live limiter, the armed
+   * timer, and the audit log untouched. Audited as
+   * `rate_limit_revised` (`{ rateLimit: { maxMessages, perWindowMs }
+   * | null, oldRateLimit: { maxMessages, perWindowMs } }`, `null`
+   * for a clear) on success.
+   *
+   * Orthogonal to the subscribe-time window of EB-43 (this revises
+   * it, that sets it), to `setDeliveryShaping` (EB-266) (that token
+   * bucket paces the drain, this hard-caps it per window), to
+   * `setThrottle` (EB-268) (that sheds publish-side adaptively, this
+   * holds deliveries subscriber-side without shedding), and to
+   * `setMaxInflight` (EB-264) (that bounds unsettled invocations,
+   * this bounds deliveries per time window).
+   *
+   * Throws `RangeError` for an unknown / un-limited subscriber or an
+   * illegal rate-limit value.
+   */
+  setRateLimit(subId: string, opts: RateLimitOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setRateLimit: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setRateLimit: unknown subscriber: ${subId}`);
+    }
+    const state = subscriber.rateLimit;
+    if (state == null) {
+      throw new RangeError('setRateLimit: subscriber has no rateLimit set');
+    }
+    const oldRateLimit: RateLimitOptions = {
+      maxMessages: state.maxMessages,
+      perWindowMs: state.perWindowMs,
+    };
+    if (opts === null) {
+      // Cancel the armed re-flush timer while the state is still
+      // attached — clearing after removal would orphan the timer,
+      // whose callback holds this very state object.
+      this.clearRateLimitTimer(subscriber);
+      subscriber.rateLimit = undefined;
+      this.auditSubscription({
+        action: 'rate_limit_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { rateLimit: null, oldRateLimit },
+      });
+      // Held messages are no longer gated at all.
+      this.scheduleFlush();
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and the revision must be
+    // complete, so resolution happens here, against
+    // `resolveRateLimitOptions`'s bounds, before anything moves.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setRateLimit: rateLimit must be an object with maxMessages and perWindowMs, or null to clear it');
+    }
+    const resolved = resolveRateLimitOptions(opts);
+    // `resolveRateLimitOptions` never returns undefined for an object
+    // input, but keep the guard explicit for the type checker.
+    if (resolved === undefined) {
+      throw new RangeError('setRateLimit: rateLimit must be an object with maxMessages and perWindowMs, or null to clear it');
+    }
+    // Only the limiter instance moves, plus the bounds the state
+    // carries for it: the state object, its `rateLimiting` flag, and
+    // any armed timer are untouched, and the drain reads the new
+    // limiter live on the flush below.
+    state.limiter = resolved.limiter;
+    state.maxMessages = resolved.maxMessages;
+    state.perWindowMs = resolved.perWindowMs;
+    this.auditSubscription({
+      action: 'rate_limit_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        rateLimit: { maxMessages: state.maxMessages, perWindowMs: state.perWindowMs },
+        oldRateLimit,
+      },
+    });
+    this.scheduleFlush();
   }
 
   /**
