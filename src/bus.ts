@@ -25827,6 +25827,114 @@ export class EventBus {
   }
 
   /**
+   * Revises the batch-delivery parameters of one batched subscriber
+   * (EB-269): a batched subscriber can retune its micro-batch
+   * collection without re-subscribing. The revision is partial: a
+   * field left out keeps its current value, and only `maxSize` /
+   * `maxWaitMs` ever move — the pending batch and the queue are
+   * untouched. Both fields are stored live on the batch state, so
+   * the drain reads them on its next collection round: the room
+   * calculation (`maxSize - pending.length`) is live, so a shrunken
+   * `maxSize` delivers an already-over-limit pending batch whole
+   * before collecting anything new, and a grown `maxSize` lets the
+   * next round collect further; a new `maxWaitMs` applies from the
+   * next linger arming, because an already-armed linger timer was
+   * created with the old wait and `armBatchTimer` never retunes a
+   * live timer. Passing `null` clears batching: the pending partial
+   * batch is delivered immediately (never discarded), the linger
+   * timer is cancelled, and later messages go straight to the
+   * handler one at a time; a later revision is refused until the
+   * subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `batch`, a non-object value, an illegal size or wait
+   * (bounds mirror `resolveBatchDeliveryOptions`: `maxSize` a
+   * positive integer, `maxWaitMs` a finite number `>= 0`), and
+   * `undefined` — only an explicit `null` clears — all throw
+   * `RangeError` with the live parameters, the pending batch, the
+   * queue, and the audit log untouched. Audited as `batch_revised`
+   * (`{ batch: { maxSize, maxWaitMs } | null, oldBatch:
+   * { maxSize, maxWaitMs } }`, `null` for a clear) on success.
+   *
+   * Orthogonal to the subscribe-time batching (this revises it),
+   * to the delivery-shaping rate of EB-266 (that paces the drain,
+   * this sizes the batch it collects), and to the in-flight cap of
+   * EB-67 / `setMaxInflight` (EB-264) (that bounds concurrent
+   * handler invocations, this bounds messages per invocation).
+   *
+   * Throws `RangeError` for an unknown / unbatched subscriber or an
+   * illegal batch value.
+   */
+  setBatch(subId: string, opts: BatchDeliveryOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setBatch: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setBatch: unknown subscriber: ${subId}`);
+    }
+    const batch = subscriber.batch;
+    if (batch == null) {
+      throw new RangeError('setBatch: subscriber has no batch set');
+    }
+    const oldBatch: BatchDeliveryOptions = {
+      maxSize: batch.maxSize,
+      maxWaitMs: batch.maxWaitMs,
+    };
+    if (opts === null) {
+      // Deliver the pending partial batch first — never discard it —
+      // and let `deliverBatch` cancel the linger timer; only then
+      // drop the batch state, so later messages drain one at a time.
+      if (batch.pending.length > 0) {
+        this.deliverBatch(subscriber, this.now());
+      } else {
+        this.clearBatchTimer(subscriber);
+      }
+      subscriber.batch = undefined;
+      this.auditSubscription({
+        action: 'batch_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { batch: null, oldBatch },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a partial object keeps the
+    // fields it leaves out, so resolution happens here, against the
+    // live values, before any field moves. Bounds are exactly
+    // `resolveBatchDeliveryOptions`'s, reused rather than restated.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setBatch: batch must be an object with maxSize and/or maxWaitMs, or null to clear it');
+    }
+    const resolved = resolveBatchDeliveryOptions({
+      maxSize: opts.maxSize ?? batch.maxSize,
+      maxWaitMs: opts.maxWaitMs ?? batch.maxWaitMs,
+    });
+    // `resolveBatchDeliveryOptions` never returns undefined for an
+    // object input, but keep the guard explicit for the type checker.
+    if (resolved === undefined) {
+      throw new RangeError('setBatch: batch must be an object with maxSize and/or maxWaitMs, or null to clear it');
+    }
+    // Only the two parameters move: the pending batch, its linger
+    // timer, and the queue are untouched, and the drain reads these
+    // live on its next collection round.
+    batch.maxSize = resolved.maxSize;
+    batch.maxWaitMs = resolved.maxWaitMs;
+    this.auditSubscription({
+      action: 'batch_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        batch: { maxSize: batch.maxSize, maxWaitMs: batch.maxWaitMs },
+        oldBatch,
+      },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

@@ -2094,6 +2094,26 @@ library.
   sampling records every message individually; a message that expires
   while its batch is filling is dropped as expired at hand-off, not
   resurrected. Invalid options throw `RangeError` from `subscribe`.
+  Revisable after subscribe (EB-269, via
+  `setBatch(subId, opts | null)`): a batched subscriber's `maxSize` /
+  `maxWaitMs` can be retuned without re-subscribing — the revision is
+  partial (a field left out keeps its value) and only the two
+  parameters ever move: the pending batch and the queue are untouched.
+  The new size applies from the next collection round (a shrunken size
+  delivers an already-over-limit pending batch whole before collecting
+  anything new), and a new wait applies from the next linger arming
+  (an already-armed timer keeps its old wait). `null` clears batching
+  back to one-at-a-time delivery, after immediately delivering the
+  pending partial batch — never discarding it — and cancelling the
+  linger timer. It is fail-closed (an unknown subscriber, a subscriber
+  that never opted into batching, or an illegal size/wait throws
+  `RangeError` with the live parameters, pending batch, queue, and
+  audit log untouched; `undefined` is not a clear, only `null` is, and
+  a revision after a clear is refused until the subscriber opts in
+  again at subscribe time), and every success is audited as
+  `batch_revised` (`{ batch: { maxSize, maxWaitMs } | null, oldBatch:
+  { maxSize, maxWaitMs } }`). (Real-time systems: delivery
+  governance.)
   Disabled by default. `bench/batch.bench.ts` measures the before/after
   throughput — see [Benchmark](#benchmark).
 - **Subscriber tumbling-window aggregation** (in `src/bus.ts`, opt-in via
