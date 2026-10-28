@@ -7431,6 +7431,22 @@ Semantics:
   ack never cancels a pending rung. Unsubscribing clears armed rungs.
 - **Observability.** `getStats()` exposes `ladderPending` (messages with
   an armed rung) and `ladderAttempts` (cumulative rung deliveries fired).
+- **Revisable after subscribe (EB-270, via
+  `setRetryLadder(subId, delays | null)`).** Only a reliable subscriber
+  that already opted into a ladder can be revised, and only the ladder
+  instance is replaced (delays are defensively copied): an already-armed
+  rung still fires once on its old delay, and the next rung arms from
+  the new ladder — a degraded pause re-arms the same rung from the live
+  ladder too — while pending rungs, messages, sequences, TTL deadlines,
+  and redelivery counts are untouched. `null` or an empty array clears
+  the ladder back to immediate dead-lettering on budget exhaustion,
+  except that an already-armed rung still fires once and dead-letters
+  on its failure. Fail-closed (unknown, non-reliable, or ladderless
+  subscribers, illegal delays, and `undefined` all throw `RangeError`
+  with the live ladder and audit log untouched, and a revision after a
+  clear is refused); every success is audited as `retry_ladder_revised`
+  (`{ retryLadder: number[] | null, oldRetryLadder: number[] }`).
+  (Real-time systems: reliable delivery.)
 - **Orthogonal to EB-47 hotspot detection.** A rung redelivery re-enters
   the normal pipeline, so a keyed message that keeps missing its
   predecessor keeps tripping the hotspot threshold per rung — expected:

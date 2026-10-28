@@ -25935,6 +25935,112 @@ export class EventBus {
   }
 
   /**
+   * Revises the pre-DLQ retry ladder of one reliable subscriber
+   * (EB-270): a subscriber that opted into `deadLetter.retryLadder`
+   * can retune its rung delays without re-subscribing. Only the
+   * ladder instance is replaced — the delays are defensively copied
+   * by `validateRetryLadder` and again by the `RetryLadder`
+   * constructor, so mutating the caller's array afterwards cannot
+   * move a rung. The pending ladder entries and their armed timers
+   * are untouched, and the scheduling paths read the ladder live:
+   * an already-armed rung fires once on its old delay, and when
+   * that rung's delivery fails, the next rung is armed from the new
+   * ladder (`enterRetryLadderOrDeadLetter` reads `dlq.retryLadder`
+   * at arm time, and a degraded pause re-arms the same rung from
+   * the live ladder in `fireLadderRung`). A message, its `seq`,
+   * its TTL deadline, and its redelivery count are never touched
+   * by a revision. Passing `null` — or an empty array, which
+   * `validateRetryLadder` already maps to disabled (EB-155) —
+   * clears the ladder: future budget exhaustions dead-letter
+   * immediately, while an already-armed rung still fires once and
+   * dead-letters on its failure instead of walking a new rung.
+   * A revision after a clear is refused until the subscriber opts
+   * in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable
+   * subscription, a reliable subscription without a dead-letter
+   * queue or without a ladder, a non-array value, an illegal rung
+   * delay (bounds mirror `validateRetryLadder`: each delay a
+   * non-negative finite number), and `undefined` — only an explicit
+   * `null` or an empty array clears — all throw `RangeError` with
+   * the live ladder, the pending rungs, and the audit log
+   * untouched. Audited as `retry_ladder_revised`
+   * (`{ retryLadder: number[] | null, oldRetryLadder: number[] }`,
+   * `null` for a clear) on success.
+   *
+   * Orthogonal to the subscribe-time ladder of EB-155 (this
+   * revises it, that sets it), and to the redelivery backoff of
+   * EB-220 / `setRedeliveryBackoff` (EB-261) (that spaces instant
+   * redeliveries, this spaces the delayed rungs after the instant
+   * budget is spent).
+   *
+   * Throws `RangeError` for an unknown / non-reliable / ladderless
+   * subscriber or an illegal ladder value.
+   */
+  setRetryLadder(subId: string, delays: number[] | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setRetryLadder: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setRetryLadder: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.reliable == null) {
+      throw new RangeError('setRetryLadder: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    const dlq = subscriber.deadLetter;
+    if (dlq == null || dlq.retryLadder == null) {
+      throw new RangeError('setRetryLadder: subscriber has no deadLetter.retryLadder set');
+    }
+    const oldLadder = dlq.retryLadder;
+    const oldRetryLadder: number[] = Array.from({ length: oldLadder.size }, (_, i) => oldLadder.delayFor(i));
+    if (delays === null) {
+      dlq.retryLadder = undefined;
+      this.auditSubscription({
+        action: 'retry_ladder_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { retryLadder: null, oldRetryLadder },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` or an empty array clears — and
+    // `validateRetryLadder` returns `undefined` for an empty array,
+    // which is exactly the clear case, not an error.
+    if (delays === undefined) {
+      throw new RangeError('setRetryLadder: retryLadder must be an array of delay milliseconds, or null (or an empty array) to clear it');
+    }
+    const validated = validateRetryLadder(delays, 'setRetryLadder');
+    if (validated === undefined) {
+      // Empty array: clear, exactly like `null` — future budget
+      // exhaustions dead-letter immediately, while an already-armed
+      // rung still fires once (the pending entries are untouched).
+      dlq.retryLadder = undefined;
+      this.auditSubscription({
+        action: 'retry_ladder_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { retryLadder: null, oldRetryLadder },
+      });
+      return;
+    }
+    // Only the ladder instance moves: pending entries keep their
+    // rung indexes and armed timers, and the scheduling paths read
+    // this instance live on the next arm / re-arm.
+    dlq.retryLadder = new RetryLadder(validated, { now: this.now, timers: retryLadderTimers });
+    this.auditSubscription({
+      action: 'retry_ladder_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { retryLadder: validated, oldRetryLadder },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
