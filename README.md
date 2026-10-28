@@ -6278,6 +6278,24 @@ mirrors (uncounted there, like `filter`). Like `filter`, it is a string
 and therefore survives subscription migration snapshots; unlike
 `filter`, it needs no code on the receiving side.
 
+The code predicate `filter` itself is revisable after subscribe (EB-265,
+via `setFilter(subId, predicate | null)`): a filtered subscriber's
+predicate can be replaced without re-subscribing — the fan-out paths
+read it live, so the next message is judged by the new predicate, and
+durable replay reads it per record, so a revision during a throttled
+replay pause judges the records still to come. Only the predicate
+moves: already-queued messages keep the admission they received under
+the old predicate, and backpressure state is untouched. `null` clears
+the predicate back to unfiltered delivery. It is fail-closed (an
+unknown subscriber, a subscriber that never opted into a filter, a
+non-function predicate, or `undefined` throws `RangeError` with the live
+predicate and the audit log untouched; only `null` clears, and a
+revision after a clear is refused until the subscriber opts in again
+at subscribe time), and every success is audited as `filter_revised`
+(`{ filter: 'set' | null, oldFilter: 'set' }` — the predicate is a
+function, so only its set/cleared state is recorded, never its source).
+(Real-time systems: subscription governance.)
+
 ## Recurring publishes (cron) (EB-124)
 
 `bus.scheduleRecurring(topic, payloadFactory, cronExpr, opts?)` registers a

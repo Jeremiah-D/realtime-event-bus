@@ -25422,6 +25422,75 @@ export class EventBus {
   }
 
   /**
+   * Revises the content filter predicate of one filtered subscriber
+   * (EB-265): the fan-out paths read `subscriber.filter` live, so the
+   * new predicate judges the very next fanned-out message — no
+   * re-subscribe, no drain, no re-queue. Passing `null` clears the
+   * predicate: the subscriber returns to unfiltered delivery and the
+   * filter is removed, so a later revision is refused until the
+   * subscriber opts in again at subscribe time.
+   *
+   * Only the predicate moves: messages already queued keep the
+   * admission they received under the old predicate — a revision
+   * never re-evaluates the queue, never drops or reorders a queued
+   * message, and never touches backpressure state (queue, blocked
+   * flag, drop counters). Durable-log replay shares the same live
+   * read: `admitReplayRecords` reads `subscriber.filter` per record
+   * instead of capturing it once per pass, so a revision during a
+   * throttled replay pause applies to the records still to come,
+   * and a pass started after the revision evaluates the new
+   * predicate throughout.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `filter`, a non-function predicate, and `undefined`
+   * — only an explicit `null` clears — all throw `RangeError` with
+   * the live predicate and the audit log untouched. Audited as
+   * `filter_revised` (`{ filter: 'set' | null, oldFilter: 'set' }`;
+   * the predicate itself is a function and is never serialized into
+   * the audit record — only its set/cleared state is recorded).
+   *
+   * Orthogonal to `setHeaderFilter` (EB-153), which revises the
+   * header-routing rules, to `filterExpr` (EB-123), the declarative
+   * expression that composes with this predicate by AND, and to
+   * `setDeliveryWindow` (EB-263) / `setMaxInflight` (EB-264), which
+   * revise delivery gates downstream of admission: this revises
+   * admission itself, and the two compose — a message the new
+   * predicate admits still waits behind the window and the
+   * in-flight cap.
+   *
+   * Throws `RangeError` for an unknown / unfiltered subscriber or
+   * an illegal predicate value.
+   */
+  setFilter(subId: string, predicate: MessageFilter | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setFilter: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setFilter: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.filter === undefined) {
+      throw new RangeError('setFilter: subscriber has no filter set');
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a non-function value
+    // can never judge a message, so both fail closed here.
+    if (predicate !== null && typeof predicate !== 'function') {
+      throw new RangeError('setFilter: filter must be a function, or null to clear it');
+    }
+    // Only the predicate moves; the queue, backpressure state, and
+    // every other gate keep exactly what they had.
+    subscriber.filter = predicate === null ? undefined : predicate;
+    this.auditSubscription({
+      action: 'filter_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { filter: predicate === null ? null : 'set', oldFilter: 'set' },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
@@ -29851,7 +29920,12 @@ export class EventBus {
         }
       }
     }
-    const filter = subscriber.filter;
+    // NB (EB-265): the content predicate is deliberately NOT captured
+    // here. It is read per record below (`subscriber.filter`), so a
+    // `setFilter` revision during a throttled replay pause applies to
+    // the records still to come instead of the whole pass judging
+    // under the stale predicate. `filterExpr` stays captured: it is
+    // not revisable after subscribe.
     const filterExpr = subscriber.filterExpr;
     const replaySampleRate = subscriber.deliverySampleRate;
     // Durable-log replay throttle (EB-164): only resume replays
@@ -29957,7 +30031,7 @@ export class EventBus {
             // the size gate after the composite check.
             const replayCap = this.subscriberPayloadCapFor(subscriber, rec.topic);
             let replayRawPayload: unknown;
-            if (filter !== undefined || filterExpr !== undefined || replayCap !== undefined) {
+            if (subscriber.filter !== undefined || filterExpr !== undefined || replayCap !== undefined) {
               // The log holds the wire payload — resolve a binary record's
               // v2 bytes first (a binary+compressed record's bytes encode
               // the envelope), then open a DEK-sealed envelope (EB-179) and
@@ -29989,7 +30063,11 @@ export class EventBus {
                 ? this.inflateReplayEnvelope(openedPayload, rec)
                 : openedPayload;
               replayRawPayload = rawPayload;
-              if (filter !== undefined && !filter(rawPayload, rec.topic)) {
+              // Per-record live read (EB-265): see the capture note at
+              // the top of this function — a revision during a
+              // throttled pause judges the remaining records.
+              const liveFilter = subscriber.filter;
+              if (liveFilter !== undefined && !liveFilter(rawPayload, rec.topic)) {
                 this.countFiltered(subscriber, rec.topic, rec.seq, '', rec.partition ?? 0);
                 // A filtered replayed message is deliberately skipped: advance
                 // the key baseline past it like the live path does, or a later
