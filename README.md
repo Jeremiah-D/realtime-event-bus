@@ -1702,6 +1702,21 @@ library.
   `getStats()` exposes per-subscriber usage via `inFlightUsage`. Must be an
   integer >= 1 — anything else throws `RangeError` from `subscribe`, as do
   combinations with `batch` or `shadow`. Disabled by default.
+  Revisable after subscribe (EB-264, via
+  `setMaxInflight(subId, max | null)`): a capped subscriber's cap
+  can be changed without re-subscribing — the drain reads the
+  live cap, so queued messages become admittable on the next
+  flush, and `null` clears the cap back to unlimited. Only the cap
+  moves: the live in-flight count is untouched (a lowered cap
+  never evicts an invocation already unsettled), and the
+  subscribe-time delivery-concurrency cap keeps its value even
+  when it defaulted from `maxInflight`. It is fail-closed (an
+  unknown subscriber, a subscriber that never opted into a cap,
+  or a non-integer / < 1 value throws `RangeError` with the live
+  cap and the audit log untouched; `undefined` is not a clear,
+  only `null` is), and every success is audited as
+  `max_inflight_revised` (`{ maxInflight, oldMaxInflight }`,
+  `null` for a clear).
 - **Per-subscriber handler-concurrency cap** (in `src/bus.ts`, via
   `subscribe(..., { maxConcurrentDeliveries: N })`, EB-159): caps how many
   handler invocations may *execute* at once per subscriber. Defaults to 1 —
