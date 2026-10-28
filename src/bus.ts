@@ -26166,6 +26166,116 @@ export class EventBus {
   }
 
   /**
+   * Revises the drain priority of one subscriber (EB-272): every
+   * subscriber carries a resolved priority (the default is
+   * `'normal'` / weight 2), so unlike the other EB-263–EB-271
+   * revisions there is no "only if already set" gate — an unknown
+   * subscriber id is still fail-closed, but any live subscriber can
+   * be revised. The drain reads the live weight on every flush
+   * round, so the new weight orders the very next round — a
+   * promotion serves earlier, a demotion later — while the DRR
+   * deficit carryover is untouched (a weight change earns no
+   * historical credit) and no drain budget moves: priority reorders
+   * visits, it never changes how much a visit drains. Passing `null`
+   * restores the default `'normal'` / weight 2. A revision with the
+   * current weight *and* label is a no-op: no audit, no flush, and
+   * the non-default count untouched — but a label-only change at the
+   * same weight (say `'normal'` to a custom weight of 2) is a real
+   * revision and is audited, because the observability class moves
+   * even though the order does not.
+   *
+   * The one hard invariant is the drain fast path: `drainVisitOrder`
+   * serves in plain subscription order while `nonDefaultPriorityCount`
+   * is zero, so a revision that crosses the default boundary must
+   * move the count with the weight — default to non-default arms the
+   * DRR path, non-default to default disarms it when the last
+   * non-default weight leaves, and a same-side revision leaves it
+   * exactly where it was. "Default side" means weight 2, whatever the
+   * label says: a custom weight of 2 is on the default side, so
+   * revising between `'normal'` and a custom 2 never moves the count
+   * — getting this wrong would silently ignore a revised weight
+   * (missed increment, fast path) or silently keep the DRR path
+   * armed past the last non-default weight (missed decrement).
+   *
+   * Fail-closed: an unknown subscriber id, an illegal priority
+   * (anything but `'low' | 'normal' | 'high'` or a positive integer
+   * weight), and `undefined` — only an explicit `null` restores the
+   * default — all throw `RangeError` with the live weight, the live
+   * label, the non-default count, and the audit log untouched.
+   * Audited as `delivery_priority_revised` (`{ deliveryPriority:
+   * { weight, label }, oldDeliveryPriority: { weight, label } }`,
+   * with a `null` restore recorded as the default) on success.
+   *
+   * Orthogonal to the subscribe-time priority of EB-166 (this
+   * revises it, that sets it), to `setTopicFairness` (EB-135) (that
+   * weights topics within one subscriber, this weights subscribers
+   * against each other in the drain), and to `setDeliveryShaping` /
+   * `setMaxInflight` (EB-266 / EB-264) (those gate how much a visit
+   * drains, this orders the visits).
+   *
+   * Throws `RangeError` for an unknown subscriber or an illegal
+   * priority value.
+   */
+  setDeliveryPriority(subId: string, priority: 'low' | 'normal' | 'high' | number | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeliveryPriority: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeliveryPriority: unknown subscriber: ${subId}`);
+    }
+    const oldWeight = subscriber.priorityWeight;
+    const oldLabel = subscriber.priorityLabel;
+    // Validate before touching anything: `undefined` is not a
+    // restore — only an explicit `null` restores — and any other
+    // value resolves through `resolveDeliveryPriority`, reused
+    // rather than restated.
+    if (priority === undefined) {
+      throw new RangeError("setDeliveryPriority: deliveryPriority must be 'low', 'normal', 'high' or a positive integer weight, or null to restore the default");
+    }
+    const resolved: ResolvedDeliveryPriority | undefined =
+      priority === null
+        ? { weight: DEFAULT_DELIVERY_PRIORITY_WEIGHT, label: 'normal' }
+        : resolveDeliveryPriority(priority, 'setDeliveryPriority');
+    // `resolveDeliveryPriority` returns undefined only for an
+    // undefined input, already rejected above, but keep the guard
+    // explicit for the type checker.
+    if (resolved === undefined) {
+      throw new RangeError("setDeliveryPriority: deliveryPriority must be 'low', 'normal', 'high' or a positive integer weight, or null to restore the default");
+    }
+    // Same weight and label: a no-op — no audit, no flush, and the
+    // non-default count untouched.
+    if (resolved.weight === oldWeight && resolved.label === oldLabel) {
+      return;
+    }
+    // The fast path keys on the non-default count, so a revision
+    // that crosses the default boundary moves it with the weight;
+    // a same-side revision (including a label-only change at weight
+    // 2) leaves it exactly where it was.
+    const wasDefault = oldWeight === DEFAULT_DELIVERY_PRIORITY_WEIGHT;
+    const isDefault = resolved.weight === DEFAULT_DELIVERY_PRIORITY_WEIGHT;
+    if (wasDefault && !isDefault) {
+      this.nonDefaultPriorityCount += 1;
+    } else if (!wasDefault && isDefault) {
+      this.nonDefaultPriorityCount -= 1;
+    }
+    subscriber.priorityWeight = resolved.weight;
+    subscriber.priorityLabel = resolved.label;
+    this.auditSubscription({
+      action: 'delivery_priority_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        deliveryPriority: { weight: resolved.weight, label: resolved.label },
+        oldDeliveryPriority: { weight: oldWeight, label: oldLabel },
+      },
+    });
+    // A queued backlog is re-ordered at the next flush round.
+    this.scheduleFlush();
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

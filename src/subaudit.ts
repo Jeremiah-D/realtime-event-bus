@@ -92,6 +92,7 @@ export type SubscriptionAuditAction =
   | 'batch_revised'
   | 'retry_ladder_revised'
   | 'rate_limit_revised'
+  | 'delivery_priority_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -194,6 +195,7 @@ export type SubscriptionAuditAction =
  * - `batch_revised`: `{ batch: { maxSize, maxWaitMs } | null, oldBatch: { maxSize, maxWaitMs } }` — a batched subscriber's batch-delivery parameters were revised (EB-269; `null` means batching was cleared back to one-at-a-time delivery, after immediately delivering the pending partial batch; a partial revision keeps the fields it leaves out; the new maxSize applies from the next collection round, with an already-over-limit pending batch delivered whole first, and a new maxWaitMs applies from the next linger arming; the pending batch and the queue are untouched by a revision)
  * - `retry_ladder_revised`: `{ retryLadder: number[] | null, oldRetryLadder: number[] }` — a reliable subscriber's pre-DLQ retry ladder was revised (EB-270; `null` means the ladder was cleared back to immediate dead-lettering on budget exhaustion, by an explicit `null` or an empty array; only the ladder instance is replaced, so an already-armed rung still fires once on its old delay and the next rung arms from the new ladder, and a degraded pause re-arms the same rung from the live ladder; pending rungs, messages, sequences, TTL deadlines, and redelivery counts are untouched)
  * - `rate_limit_revised`: `{ rateLimit: { maxMessages, perWindowMs } | null, oldRateLimit: { maxMessages, perWindowMs } }` — a rate-limited subscriber's sliding-window ceiling was revised (EB-271; `null` means the limit was cleared back to unlimited, after cancelling the armed re-flush timer; only the limiter instance is replaced and the state object retained, so an already-armed re-flush timer stays valid and the window starts fresh — tightening never retroactively blocks what was already delivered, loosening admits held messages on the next flush; the revision must be complete, and passing the current values still resets the window)
+ * - `delivery_priority_revised`: `{ deliveryPriority: { weight, label }, oldDeliveryPriority: { weight, label } }` — a subscriber's drain priority was revised (EB-272; `null` restores the default `'normal'` / weight 2, recorded as the default; the drain reads the live weight from the next flush round, the DRR deficit carryover is untouched, and a revision crossing the default boundary moves the non-default count with the weight so the fast path never silently ignores a revised weight; the same weight and label is a no-op with no audit)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -353,6 +355,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'batch_revised',
   'retry_ladder_revised',
   'rate_limit_revised',
+  'delivery_priority_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',

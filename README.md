@@ -6260,6 +6260,27 @@ Semantics:
   `eventbus_subscriber_priority_dispatch_total{class}` — only when a
   non-default class has at least one dispatch, so buses without drain
   priorities render byte-identical exposition to before.
+- **Revisable after subscribe (EB-272, via
+  `setDeliveryPriority(subId, priority | null)`).** Every subscriber
+  carries a resolved priority (default `'normal'` / weight 2), so any
+  live subscriber can be revised — there is no "only if already set"
+  gate. The drain reads the live weight, so the new weight orders the
+  very next flush round, while the DRR deficit carryover is untouched
+  (a weight change earns no historical credit) and no drain budget
+  moves. `null` restores the default. A revision with the current
+  weight *and* label is a no-op with no audit; a label-only change at
+  the same weight (say `'normal'` to a custom weight of 2) is audited,
+  because the observability class moves even though the order does
+  not. The revision moves the non-default count with the weight
+  across the default boundary (weight 2, whatever the label says) —
+  otherwise the fast path (plain subscription order while the count
+  is zero) would silently ignore a revised weight. It is fail-closed
+  (an unknown subscriber, an illegal priority, or `undefined` throws
+  `RangeError` with the live weight, label, count, and audit log
+  untouched), and every success is audited as
+  `delivery_priority_revised` (`{ deliveryPriority: { weight, label },
+  oldDeliveryPriority: { weight, label } }`, with a `null` restore
+  recorded as the default). (Real-time systems: delivery governance.)
 
 ## Multi-pattern aggregate subscriptions (EB-137)
 
