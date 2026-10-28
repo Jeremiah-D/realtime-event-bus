@@ -25232,6 +25232,117 @@ export class EventBus {
   }
 
   /**
+   * Revises the delivery windows of one windowed subscriber (EB-263):
+   * the subscriber's window gate is replaced, so the delivery-side
+   * read points — which read the live gate in `deliverToSubscriber`,
+   * `flushDeliveryWindows`, and `getStats` — see the new windows
+   * immediately, with no re-subscribe. Passing `null` clears the
+   * windows: the subscriber returns to all-day delivery and the gate
+   * is removed, so a later revision is refused until the subscriber
+   * opts in again at subscribe time.
+   *
+   * Held messages are never lost across the swap: they move into
+   * the replacement gate in arrival order with their original
+   * `heldAtMs`, so a max-hold clock keeps running from the original
+   * arrival. When the new windows are already open at revision
+   * time, the moved messages flush immediately; when they are
+   * still closed, they wait in the new gate like any arrival. On a
+   * clear, every held message is released immediately — all-day
+   * delivery has nothing to wait for. Already-delivered messages
+   * are untouched: a revision never recalls a message whose
+   * handler invocation already started.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `deliveryWindows`, an illegal window set (the EB-230
+   * `resolveDeliveryWindowOptions` rules), and `undefined` — only an
+   * explicit `null` clears — all throw `RangeError` with the live
+   * gate and the audit log untouched. Nothing else moves — no
+   * topic, filter, throttle, or in-flight count is touched.
+   * Audited as `delivery_window_revised` (`{ deliveryWindows,
+   * oldDeliveryWindows }`, each the resolved windows, or `null`
+   * for a clear) on success.
+   *
+   * Orthogonal to `setAckTimeout` (EB-259) and
+   * `setRedeliveryBackoff` (EB-261): those revise reliable-delivery
+   * timing, this revises the calendar gate a message passes before
+   * delivery starts, and the two compose — a held message's ack
+   * timer still starts at flush, not at arrival.
+   *
+   * Throws `RangeError` for an unknown / windowless subscriber or
+   * an illegal window set.
+   */
+  setDeliveryWindow(subId: string, windows: DeliveryWindowOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeliveryWindow: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeliveryWindow: unknown subscriber: ${subId}`);
+    }
+    const oldGate = subscriber.deliveryWindow;
+    if (oldGate === undefined) {
+      throw new RangeError('setDeliveryWindow: subscriber has no deliveryWindows set');
+    }
+    // Validate before touching anything: `resolveDeliveryWindowOptions`
+    // returns `undefined` for an absent value, but here absent is not
+    // a clear — only an explicit `null` clears the windows.
+    const resolved = windows === null ? undefined : resolveDeliveryWindowOptions(windows);
+    if (windows !== null && resolved === undefined) {
+      throw new RangeError('setDeliveryWindow: deliveryWindows must be an object with a windows array, or null to clear it');
+    }
+    const serialize = (
+      gateWindows: readonly { startMin: number; endMin: number; days: ReadonlySet<number>; timeZone: string }[],
+      maxHoldMs: number | undefined,
+    ): Record<string, unknown> => {
+      const out: Record<string, unknown> = {
+        windows: gateWindows.map((w) => ({
+          startMin: w.startMin,
+          endMin: w.endMin,
+          days: [...w.days].sort((a, b) => a - b),
+          timeZone: w.timeZone,
+        })),
+      };
+      if (maxHoldMs !== undefined) out.maxHoldMs = maxHoldMs;
+      return out;
+    };
+    const oldDeliveryWindows = serialize(oldGate.windows, oldGate.maxHoldMs);
+    const held = oldGate.takeHeld();
+    let toDeliver: ReturnType<DeliveryWindowGate['flush']> = [];
+    let newDeliveryWindows: Record<string, unknown> | null = null;
+    if (resolved === undefined) {
+      subscriber.deliveryWindow = undefined;
+      toDeliver = held;
+    } else {
+      const gate = new DeliveryWindowGate(resolved);
+      gate.adoptHeld(held);
+      subscriber.deliveryWindow = gate;
+      newDeliveryWindows = serialize(resolved.windows, resolved.maxHoldMs);
+      toDeliver = gate.flush(this.now());
+    }
+    this.auditSubscription({
+      action: 'delivery_window_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { deliveryWindows: newDeliveryWindows, oldDeliveryWindows },
+    });
+    if (toDeliver.length > 0) {
+      this.totalWindowFlushed += toDeliver.length;
+      for (const h of toDeliver) {
+        this.deliverToSubscriber(
+          subscriber,
+          h.msg as BusMessage,
+          h.expiresAt,
+          h.rawPayload,
+          h.keyed,
+          h.causal,
+        );
+      }
+      this.scheduleFlush();
+    }
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

@@ -6793,7 +6793,22 @@ are refused fail-closed (counted in
 already-held messages still flush on open. Durable-log
 replays and backfills bypass the gate (history catch-up is not
 live shaping), as do barrier control messages; unsubscribing
-discards the hold with the subscriber. Orthogonal to
+discards the hold with the subscriber. Revisable after subscribe
+(EB-263, via `setDeliveryWindow(subId, windows | null)`): a
+windowed subscriber's windows can be changed without
+re-subscribing — the gate is replaced, so the new windows take
+effect immediately, and `null` clears the windows back to all-day
+delivery. Held messages move into the new gate in arrival order
+(their max-hold clock keeps running from the original arrival);
+when the new windows are already open they flush at once, and on
+a clear they are released immediately — a revision never drops a
+held message or recalls one already delivered. It is fail-closed
+(an unknown subscriber, a subscriber that never opted into
+windows, or an illegal window set throws `RangeError` with the
+live gate and the audit log untouched; `undefined` is not a clear,
+only `null` is), and every success is audited as
+`delivery_window_revised` (`{ deliveryWindows, oldDeliveryWindows }`,
+each the resolved windows, or `null` for a clear). Orthogonal to
 `delayed.ts` (a one-shot future fan-out, not a recurring
 window) and to WR-52 (the relay's inbound quiet hours, not a
 bus subscriber window). (Real-time systems: subscriber-side

@@ -315,4 +315,31 @@ export class DeliveryWindowGate {
     this.flushedCount += out.length;
     return out;
   }
+
+  /**
+   * Removes and returns everything currently held, regardless of
+   * whether the windows are open (EB-263): the revision path uses
+   * this to move held messages into a replacement gate — or, on a
+   * clear, straight into delivery — so a window revision never
+   * silently drops a held message. `heldCount` keeps counting this
+   * gate's ever-held history; the receiving gate counts adopted
+   * entries in its own `heldCount` via `adoptHeld`.
+   */
+  takeHeld(): DeliveryWindowHeld[] {
+    const out = this.held;
+    this.held = [];
+    return out;
+  }
+
+  /**
+   * Adopts entries taken from a previous gate (EB-263): arrival
+   * order and `heldAtMs` are preserved, so the new gate's max-hold
+   * clock keeps running from the original arrival, not from the
+   * revision. The adopted entries count toward this gate's
+   * `heldCount`, so lifetime hold accounting survives the swap.
+   */
+  adoptHeld(entries: DeliveryWindowHeld[]): void {
+    for (const entry of entries) this.held.push(entry);
+    this.heldCount += entries.length;
+  }
 }
