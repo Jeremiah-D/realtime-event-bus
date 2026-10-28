@@ -1944,7 +1944,28 @@ library.
   `eventbus_lag_watermark_ms{subscriber,pattern}` gauges (four series per
   monitored subscriber). `onLag` without `thresholdMs` throws `RangeError`
   (a callback that could never fire); other invalid options throw
-  `RangeError`/`TypeError` from `subscribe`. Disabled by default.
+  `RangeError`/`TypeError` from `subscribe`. Revisable after subscribe
+  (EB-273, via `setLagMonitor(subId, opts | null)`): a monitored
+  subscriber's window, threshold, and alert callback can be retuned
+  without re-subscribing — the revision is partial (a field left out
+  keeps its value), and only those three parameters move: the dwell
+  samples, the enqueue stamps, and the `alerted` excursion latch are
+  untouched, so shrinking the window evicts only the oldest samples,
+  a revision never re-fires an armed excursion, and the new threshold
+  applies from the next watermark evaluation (evaluated on every
+  enqueue and drain). A revision identical to the current parameters
+  is a no-op with no audit. `null` clears monitoring entirely, and a
+  revision after a clear is refused until the subscriber opts in again
+  at subscribe time. It is fail-closed (an unknown subscriber, a
+  subscriber that never opted into monitoring, an illegal window or
+  threshold, or an `onLag` callback with no threshold to arm it —
+  including revising `onLag` alone on a threshold-less subscription —
+  throws `RangeError` with the live parameters, samples, latch, and
+  audit log untouched; `undefined` is not a clear, only `null` is),
+  and every success is audited as `lag_monitor_revised`
+  (`{ lagMonitor: { windowSize, thresholdMs?, onLag: 'set'? } | null,
+  oldLagMonitor: { ... } }`, the callback recorded by presence only).
+  (Real-time systems: delivery governance.) Disabled by default.
 - **Per-(subscriber, key) hotspot monitoring** (in `src/keyhotspot.ts`, opt-in
   via `subscribe(..., { keyHotspot: true })`): samples the depth of each of
   the subscription's keyed ordering reorder buffers (see `PublishOptions.key`)

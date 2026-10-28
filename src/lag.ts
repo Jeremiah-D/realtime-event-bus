@@ -122,7 +122,9 @@ function quantileRank(sorted: number[], q: number): number {
  */
 export class LagTracker {
   private readonly samples: number[] = [];
-  private readonly windowSize: number;
+  // Mutable only via `resize` (EB-273): the bound is part of the
+  // revision surface, the sample array itself is never replaced.
+  private windowSize: number;
   private sumMs = 0;
 
   constructor(windowSize = 1024) {
@@ -141,6 +143,31 @@ export class LagTracker {
       const evicted = this.samples.splice(0, this.samples.length - this.windowSize);
       for (const e of evicted) this.sumMs -= e;
     }
+  }
+
+  /** The window bound the tracker currently enforces (EB-273). */
+  windowSizeLimit(): number {
+    return this.windowSize;
+  }
+
+  /**
+   * Retunes the window bound in place (EB-273, `setLagMonitor`):
+   * shrinking evicts the oldest samples past the new bound — the
+   * same oldest-first eviction `record` applies — so the surviving
+   * samples stay in arrival order and the mean stays exact; growing
+   * only raises the bound and keeps every sample. The tracker
+   * object itself never moves, so a subscriber's dwell history
+   * survives a window revision.
+   */
+  resize(windowSize: number): void {
+    if (!Number.isInteger(windowSize) || windowSize <= 0) {
+      throw new RangeError('windowSize must be a positive integer');
+    }
+    if (windowSize < this.samples.length) {
+      const evicted = this.samples.splice(0, this.samples.length - windowSize);
+      for (const e of evicted) this.sumMs -= e;
+    }
+    this.windowSize = windowSize;
   }
 
   /** Summarizes the current window. Percentiles use nearest-rank. */

@@ -26276,6 +26276,125 @@ export class EventBus {
   }
 
   /**
+   * Revises the lag watermark monitoring of one subscriber (EB-273):
+   * a subscriber that opted into `lagMonitor` can retune its window,
+   * threshold, and alert callback without re-subscribing. The
+   * revision is partial: a field left out keeps its current value,
+   * and only those three parameters ever move — the dwell samples,
+   * the per-message enqueue stamps, and the `alerted` excursion
+   * latch are untouched, so a revision never re-fires an already
+   * armed excursion and never replays history. Shrinking
+   * `windowSize` evicts only the oldest samples (the tracker's
+   * bounded-window semantics, via `LagTracker.resize`); growing it
+   * keeps every sample. The new threshold applies from the next
+   * watermark evaluation — the watermark is evaluated on every
+   * enqueue and every drain, so the next bus activity after the
+   * revision already observes the new threshold, with no
+   * retroactive alert for a watermark that crossed it earlier.
+   * Passing `null` clears monitoring entirely: the subscriber
+   * leaves `getStats().lag`, and a later revision is refused
+   * until the subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into monitoring, a non-object value, an illegal window
+   * (not a positive integer), an illegal threshold (negative or
+   * non-finite), and an `onLag` callback with no threshold to arm
+   * it — including revising `onLag` alone on a threshold-less
+   * subscription — and `undefined` — only an explicit `null`
+   * clears — all throw `RangeError` with the live parameters, the
+   * samples, the latch, and the audit log untouched. Validation
+   * reuses `resolveLagMonitorOptions` against the merged
+   * (current + revised) parameters, so the bounds are exactly the
+   * subscribe-time ones; its `TypeError` for a non-function
+   * callback is normalized to `RangeError` here. A revision
+   * identical to the current parameters is a no-op: no audit, and
+   * no sample evicted even when the window is restated.
+   * Audited as `lag_monitor_revised` (`{ lagMonitor:
+   * { windowSize, thresholdMs?, onLag: 'set'? } | null, oldLagMonitor:
+   * { windowSize, thresholdMs?, onLag: 'set'? } }`, the callback
+   * recorded by presence only, never serialized).
+   *
+   * Orthogonal to the subscribe-time monitor of EB-35 (this revises
+   * it, that sets it), and to `lagForecast` (EB-183, that predicts
+   * a crossing, this observes the current watermark).
+   *
+   * Throws `RangeError` for an unknown / unmonitored subscriber or
+   * an illegal monitoring value.
+   */
+  setLagMonitor(subId: string, opts: LagMonitorOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setLagMonitor: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setLagMonitor: unknown subscriber: ${subId}`);
+    }
+    const lag = subscriber.lag;
+    if (lag == null) {
+      throw new RangeError('setLagMonitor: subscriber has no lagMonitor set');
+    }
+    const snapshotLag = (state: SubscriberLagState) => ({
+      windowSize: state.tracker.windowSizeLimit(),
+      ...(state.thresholdMs !== undefined ? { thresholdMs: state.thresholdMs } : {}),
+      ...(state.onLag !== undefined ? { onLag: 'set' as const } : {}),
+    });
+    const oldLagMonitor = snapshotLag(lag);
+    if (opts === null) {
+      subscriber.lag = undefined;
+      this.auditSubscription({
+        action: 'lag_monitor_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { lagMonitor: null, oldLagMonitor },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the merged parameters, before any field moves.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setLagMonitor: lagMonitor must be an object with windowSize and/or thresholdMs and/or onLag, or null to clear it');
+    }
+    const merged: LagMonitorOptions = {
+      windowSize: opts.windowSize ?? lag.tracker.windowSizeLimit(),
+      thresholdMs: opts.thresholdMs ?? lag.thresholdMs,
+      onLag: opts.onLag ?? lag.onLag,
+    };
+    try {
+      resolveLagMonitorOptions(merged);
+    } catch (err) {
+      throw new RangeError(`setLagMonitor: ${(err as Error).message}`);
+    }
+    // Identical parameters: a no-op — no audit, and no resize
+    // (a restated window must not evict anything).
+    if (
+      merged.windowSize === lag.tracker.windowSizeLimit() &&
+      merged.thresholdMs === lag.thresholdMs &&
+      merged.onLag === lag.onLag
+    ) {
+      return;
+    }
+    // Only the three parameters move, in place: the state object,
+    // its enqueue stamps, its samples (past the resize eviction),
+    // and its alerted latch are untouched, and the watermark
+    // evaluation paths read the new values live.
+    if (merged.windowSize !== lag.tracker.windowSizeLimit()) {
+      lag.tracker.resize(merged.windowSize as number);
+    }
+    lag.thresholdMs = merged.thresholdMs;
+    lag.onLag = merged.onLag;
+    this.auditSubscription({
+      action: 'lag_monitor_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { lagMonitor: snapshotLag(lag), oldLagMonitor },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
