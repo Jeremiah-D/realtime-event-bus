@@ -87,6 +87,7 @@ export type SubscriptionAuditAction =
   | 'max_inflight_revised'
   | 'filter_revised'
   | 'delivery_shaping_revised'
+  | 'health_probe_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -184,6 +185,7 @@ export type SubscriptionAuditAction =
  * - `max_inflight_revised`: `{ maxInflight: <number or null>, oldMaxInflight: <number> }` — a capped subscriber's max in-flight cap was revised (EB-264; `null` means the cap was cleared back to unlimited; the live in-flight count and the subscribe-time delivery-concurrency cap are untouched)
  * - `filter_revised`: `{ filter: 'set' | null, oldFilter: 'set' }` — a filtered subscriber's content predicate was revised (EB-265; `null` means the predicate was cleared back to unfiltered delivery; the predicate itself is a function and is never serialized into the audit record; already-queued messages keep their original admission, and durable replay reads the live predicate per record)
  * - `delivery_shaping_revised`: `{ deliveryShaping: { messagesPerSec, burst } | null, oldDeliveryShaping: { messagesPerSec, burst } }` — a shaped subscriber's delivery-shaping rate was revised (EB-266; `null` means the shaping was cleared back to unshaped delivery; a partial revision keeps the fields it leaves out; the bucket keeps its stored budget, capped at the new burst, and the new rate applies from the next refill; queued messages and the in-flight count are untouched)
+ * - `health_probe_revised`: `{ healthProbe: { maxConsecutiveFailures, processingTimeoutMs?, autoResumeAfterMs? } | null, oldHealthProbe: { ... } }` — a probed subscriber's health-probe parameters were revised (EB-267; `null` means the probe was cleared back to unprobed delivery and a degraded pause it held is released; a partial revision keeps the fields it leaves out; the consecutive-failure counter and the degraded flag are untouched; the new timeout budget applies to the next handler call, a tightened threshold trips on the next failure, and a new cooldown applies from the next degradation)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -338,6 +340,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'max_inflight_revised',
   'filter_revised',
   'delivery_shaping_revised',
+  'health_probe_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',

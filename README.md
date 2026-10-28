@@ -802,6 +802,26 @@ library.
   per-subscriber state. Invalid probe options throw `RangeError` from
   `subscribe`. Disabled by default — a throwing handler behaves exactly as
   before unless a subscriber opts in.
+  Revisable after subscribe (EB-267, via
+  `setHealthProbe(subId, opts | null)`): a probed subscriber's failure
+  budget can be retuned without re-subscribing — the revision is partial
+  (a field left out keeps its value) and only `maxConsecutiveFailures` /
+  `processingTimeoutMs` / `autoResumeAfterMs` ever move: the
+  consecutive-failure counter and the degraded flag are untouched. The
+  probe fields are read live, so a new timeout budget applies to the next
+  handler call, a tightened threshold trips on the next failure (never
+  retroactively), and a new cooldown applies from the next degradation
+  (an already-armed timer keeps its cooldown). `null` clears the probe
+  back to unprobed delivery, cancelling a pending auto-resume timer and
+  releasing a degraded pause it held (a manual pause is separate and
+  survives). It is fail-closed (an unknown subscriber, a subscriber that
+  never opted into probing, or an illegal value throws `RangeError` with
+  the live probe, counter, and audit log untouched; `undefined` is not a
+  clear, only `null` is, and a revision after a clear is refused until
+  the subscriber opts in again at subscribe time), and every success is
+  audited as `health_probe_revised` (`{ healthProbe: { ... } | null,
+  oldHealthProbe: { ... } }`). (Real-time systems: subscription
+  governance.)
 - **Slow-handler offload** (in `src/bus.ts`, opt-in via
   `subscribe(..., { slowHandler: { thresholdMs } })`, EB-191): the bus times
   every handler invocation with the bus clock — an invocation whose

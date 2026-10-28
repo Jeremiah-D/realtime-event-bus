@@ -25599,6 +25599,122 @@ export class EventBus {
   }
 
   /**
+   * Revises the health-probe parameters of one probed subscriber
+   * (EB-267): a probed subscriber can retune its failure budget without
+   * re-subscribing. The revision is partial: a field left out keeps its
+   * current value, and only `maxConsecutiveFailures` /
+   * `processingTimeoutMs` / `autoResumeAfterMs` ever move — the
+   * `consecutiveFailures` counter and the `degraded` flag are untouched.
+   * The probe fields are read live on every handler invocation (the
+   * timeout budget) and on every failure accounting (the threshold),
+   * so a new timeout budget applies to the next handler call and a
+   * tightened threshold trips on the next failure (a counter already
+   * at or above the new threshold does not degrade retroactively —
+   * degradation is only evaluated when a failure is recorded). A new
+   * `autoResumeAfterMs` applies from the next degradation: an
+   * already-armed auto-resume timer keeps the cooldown it was armed
+   * with. Passing `null` clears the probe: the subscriber returns to
+   * unprobed delivery, a pending auto-resume timer is cancelled (the
+   * same cleanup unsubscribe performs), and the degraded gate — which
+   * is the probe itself — releases, so a preserved backlog drains on
+   * the next flush. A manual EB-113 pause is separate and is not
+   * released by clearing the probe. A later revision is refused until
+   * the subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `healthProbe`, a non-object value, an illegal
+   * threshold (non-integer or < 1) or timeout / cooldown (non-finite
+   * or <= 0), and `undefined` — only an explicit `null` clears — all
+   * throw `RangeError` with the live probe, the live counter, and the
+   * audit log untouched. Audited as `health_probe_revised`
+   * (`{ healthProbe: { maxConsecutiveFailures, processingTimeoutMs?,
+   * autoResumeAfterMs? } | null, oldHealthProbe: { ... } }`, `null`
+   * for a clear; optional fields appear only when set) on success.
+   *
+   * Orthogonal to the subscribe-time probing of EB-18 (this revises
+   * it, that sets it), and to the handler fault isolation of EB-197
+   * (its own error budget and quarantine gate are untouched).
+   *
+   * Throws `RangeError` for an unknown / unprobed subscriber or an
+   * illegal probe value.
+   */
+  setHealthProbe(subId: string, opts: HealthProbeOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setHealthProbe: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setHealthProbe: unknown subscriber: ${subId}`);
+    }
+    const health = subscriber.health;
+    if (health == null) {
+      throw new RangeError('setHealthProbe: subscriber has no healthProbe set');
+    }
+    const snapshotProbe = (probe: HealthProbeState): HealthProbeOptions => ({
+      maxConsecutiveFailures: probe.maxConsecutiveFailures,
+      ...(probe.processingTimeoutMs !== undefined
+        ? { processingTimeoutMs: probe.processingTimeoutMs }
+        : {}),
+      ...(probe.autoResumeAfterMs !== undefined ? { autoResumeAfterMs: probe.autoResumeAfterMs } : {}),
+    });
+    const oldHealthProbe = snapshotProbe(health);
+    if (opts === null) {
+      // Drop a pending auto-resume timer with the probe: the timer
+      // closure still holds the old state object, and resumeDelivery
+      // would no-op on the missing probe, but a cleared subscriber
+      // should not keep a wake-up at all (same as unsubscribe).
+      if (health.autoResumeTimer !== undefined) {
+        clearTimeout(health.autoResumeTimer);
+        health.autoResumeTimer = undefined;
+      }
+      subscriber.health = undefined;
+      this.auditSubscription({
+        action: 'health_probe_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { healthProbe: null, oldHealthProbe },
+      });
+      // The degraded gate is the probe itself: clearing it releases a
+      // paused subscriber, so the preserved backlog drains promptly.
+      this.scheduleFlush();
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a partial object keeps the
+    // fields it leaves out, so resolution happens here, against the
+    // live values, before any field moves.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setHealthProbe: healthProbe must be an object with maxConsecutiveFailures and/or processingTimeoutMs and/or autoResumeAfterMs, or null to clear it');
+    }
+    const maxConsecutiveFailures = opts.maxConsecutiveFailures ?? health.maxConsecutiveFailures;
+    const processingTimeoutMs = opts.processingTimeoutMs ?? health.processingTimeoutMs;
+    const autoResumeAfterMs = opts.autoResumeAfterMs ?? health.autoResumeAfterMs;
+    if (!Number.isInteger(maxConsecutiveFailures) || maxConsecutiveFailures < 1) {
+      throw new RangeError('healthProbe.maxConsecutiveFailures must be a positive integer');
+    }
+    if (processingTimeoutMs !== undefined && (!Number.isFinite(processingTimeoutMs) || processingTimeoutMs <= 0)) {
+      throw new RangeError('healthProbe.processingTimeoutMs must be a positive finite number of milliseconds');
+    }
+    if (autoResumeAfterMs !== undefined && (!Number.isFinite(autoResumeAfterMs) || autoResumeAfterMs <= 0)) {
+      throw new RangeError('healthProbe.autoResumeAfterMs must be a positive finite number of milliseconds');
+    }
+    // Only the three parameters move: the consecutive-failure counter
+    // and the degraded flag keep counting exactly as before, and the
+    // handler / degrade paths pick the new values up live.
+    health.maxConsecutiveFailures = maxConsecutiveFailures;
+    health.processingTimeoutMs = processingTimeoutMs;
+    health.autoResumeAfterMs = autoResumeAfterMs;
+    this.auditSubscription({
+      action: 'health_probe_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { healthProbe: snapshotProbe(health), oldHealthProbe },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
