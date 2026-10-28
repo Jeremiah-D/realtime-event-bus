@@ -20,8 +20,11 @@
 export class TokenBucket {
   private tokens: number;
   private lastRefillMs: number;
-  private readonly capacityTokens: number;
-  private readonly refillTokensPerMs: number;
+  // Mutable (EB-266): `retune` changes the capacity and refill rate of a
+  // live bucket without resetting it — every other bucket still treats
+  // these as fixed after construction.
+  private capacityTokens: number;
+  private refillTokensPerMs: number;
   private readonly now: () => number;
 
   constructor(capacityTokens: number, refillTokensPerSec: number, now: () => number = Date.now) {
@@ -71,6 +74,31 @@ export class TokenBucket {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Retunes a live bucket (EB-266, for `EventBus.setDeliveryShaping`):
+   * changes the capacity and the refill rate without resetting the
+   * stored budget. Tokens banked so far are first refilled at the old
+   * rate up to now, then capped at the new capacity — a lowered burst
+   * never banks more than the new burst, and a raised burst does not
+   * refill the bucket to full: the new rate only applies from the
+   * next refill, via the same lazy-refill clock. Throws `RangeError`
+   * for a non-positive or non-finite capacity or rate, before
+   * anything is touched.
+   */
+  retune(capacityTokens: number, refillTokensPerSec: number): void {
+    if (!Number.isFinite(capacityTokens) || capacityTokens <= 0) {
+      throw new RangeError('capacityTokens must be a positive finite number');
+    }
+    if (!Number.isFinite(refillTokensPerSec) || refillTokensPerSec <= 0) {
+      throw new RangeError('refillTokensPerSec must be a positive finite number');
+    }
+    const nowMs = this.now();
+    this.tokens = Math.min(capacityTokens, this.refilledTokens(nowMs));
+    this.capacityTokens = capacityTokens;
+    this.refillTokensPerMs = refillTokensPerSec / 1000;
+    this.lastRefillMs = nowMs;
   }
 
   /** Tokens after lazily refilling up to `nowMs`, capped at capacity. */

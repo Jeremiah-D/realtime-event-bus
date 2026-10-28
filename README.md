@@ -1646,6 +1646,27 @@ library.
   draining the backlog when no new publishes arrive; `getStats()` reports
   actively-shaped subscribers via `shapedSubscribers`. Invalid options throw
   `RangeError` from `subscribe`. Disabled by default.
+  Revisable after subscribe (EB-266, via
+  `setDeliveryShaping(subId, opts | null)`): a shaped subscriber's rate
+  can be changed without re-subscribing — the drain reads the live
+  bucket, so the new rate paces the next flush round. The revision is
+  partial (a field left out keeps its value; the burst is never
+  silently recomputed from a new rate), and only the rate moves:
+  queued messages stay queued in order and the in-flight count is
+  untouched. The bucket keeps its stored budget across the change
+  (banked tokens are refilled at the old rate up to now, then capped
+  at the new burst — a raised burst does not refill the bucket to
+  full, and the new rate applies from the next refill), and `null`
+  clears the shaping back to unshaped delivery. It is fail-closed (an
+  unknown subscriber, a subscriber that never opted into shaping, a
+  non-object value, or a non-finite / <= 0 rate or burst throws
+  `RangeError` with the live rate, budget, and audit log untouched;
+  `undefined` is not a clear, only `null` is, and a revision after a
+  clear is refused until the subscriber opts in again at subscribe
+  time), and every success is audited as `delivery_shaping_revised`
+  (`{ deliveryShaping: { messagesPerSec, burst } | null,
+  oldDeliveryShaping: { messagesPerSec, burst } }`). (Real-time
+  systems: delivery governance.)
 - **Subscriber slow-start** (in `src/slowstart.ts`, opt-in via
   `subscribe(..., { slowStart: true })`): cold-start protection for a fresh
   subscription. After the subscription is created, delivery is paced by a

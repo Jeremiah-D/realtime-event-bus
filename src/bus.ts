@@ -25491,6 +25491,114 @@ export class EventBus {
   }
 
   /**
+   * Revises the delivery-shaping rate of one shaped subscriber
+   * (EB-266): the drain reads the live bucket, so the new rate paces
+   * the next flush round — no re-subscribe. The revision is partial:
+   * a field left out keeps its current value (a bare `burst` keeps
+   * the old rate, and the burst is never silently recomputed from a
+   * new rate the way the subscribe-time default is), so only
+   * `messagesPerSec` / `burst` ever move. Passing `null` clears the
+   * shaping: the subscriber returns to unshaped delivery and the
+   * shaping state is removed, so a later revision is refused until
+   * the subscriber opts in again at subscribe time.
+   *
+   * Only the rate moves: queued messages stay queued in order, the
+   * in-flight count is untouched, and no message is dropped or
+   * reordered by the revision. The bucket keeps its stored budget
+   * across the change (`TokenBucket.retune`): tokens banked so far
+   * are refilled at the old rate up to now and then capped at the
+   * new burst — a raised burst does not refill the bucket to full,
+   * and a lowered burst never banks more than the new burst — and
+   * the new rate applies from the next lazy refill. An armed
+   * re-flush timer is left alone: it re-evaluates the live bucket
+   * when it fires (re-arming at the new rate if still dry), and a
+   * flush scheduled here delivers immediately whenever the retuned
+   * budget already allows it.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `deliveryShaping`, a non-object value, an illegal
+   * rate or burst (non-finite or <= 0), and `undefined` — only an
+   * explicit `null` clears — all throw `RangeError` with the live
+   * rate, the live budget, and the audit log untouched. Audited as
+   * `delivery_shaping_revised` (`{ deliveryShaping:
+   * { messagesPerSec, burst } | null, oldDeliveryShaping:
+   * { messagesPerSec, burst } }`, `null` for a clear) on success.
+   *
+   * Orthogonal to the subscribe-time shaping of EB-21 (this revises
+   * it, that sets it), to the slow-start ramp of EB-75 (the ramp
+   * keeps its own gate and its subscribe-time target — a revision
+   * here never re-arms or retargets a ramp already running), and to
+   * the sliding-window hard cap of EB-43 (a separate limiter that
+   * still bounds every delivery the retuned bucket admits).
+   *
+   * Throws `RangeError` for an unknown / unshaped subscriber or an
+   * illegal shaping value.
+   */
+  setDeliveryShaping(subId: string, opts: DeliveryShapingOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeliveryShaping: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeliveryShaping: unknown subscriber: ${subId}`);
+    }
+    const shaping = subscriber.deliveryShaping;
+    if (shaping == null) {
+      throw new RangeError('setDeliveryShaping: subscriber has no deliveryShaping set');
+    }
+    const oldDeliveryShaping = { messagesPerSec: shaping.messagesPerSec, burst: shaping.burst };
+    if (opts === null) {
+      // Drop the armed re-flush timer with the state: the timer
+      // callback re-reads the live state and would no-op, but a
+      // cleared subscriber should not keep a wake-up at all.
+      this.clearShapingTimer(subscriber);
+      subscriber.deliveryShaping = undefined;
+      this.auditSubscription({
+        action: 'delivery_shaping_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { deliveryShaping: null, oldDeliveryShaping },
+      });
+      // The cleared subscriber is unshaped now: queued messages
+      // become admittable on this flush.
+      this.scheduleFlush();
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the live values, before the bucket is retuned.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setDeliveryShaping: deliveryShaping must be an object with messagesPerSec and/or burst, or null to clear it');
+    }
+    const messagesPerSec = opts.messagesPerSec ?? shaping.messagesPerSec;
+    const burst = opts.burst ?? shaping.burst;
+    if (!Number.isFinite(messagesPerSec) || messagesPerSec <= 0) {
+      throw new RangeError('deliveryShaping.messagesPerSec must be a positive finite number of messages/sec');
+    }
+    if (!Number.isFinite(burst) || burst <= 0) {
+      throw new RangeError('deliveryShaping.burst must be a positive finite number of messages');
+    }
+    // Only the rate moves: the bucket keeps its stored budget
+    // (capped at the new burst), the queue and the in-flight count
+    // are untouched, and the drain picks the new rate up live.
+    shaping.bucket.retune(burst, messagesPerSec);
+    shaping.messagesPerSec = messagesPerSec;
+    shaping.burst = burst;
+    this.auditSubscription({
+      action: 'delivery_shaping_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { deliveryShaping: { messagesPerSec, burst }, oldDeliveryShaping },
+    });
+    // A raised rate or burst may have made queued messages
+    // admittable; a lowered one simply admits nothing new.
+    this.scheduleFlush();
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
