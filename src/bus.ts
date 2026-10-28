@@ -26395,6 +26395,114 @@ export class EventBus {
   }
 
   /**
+   * Revises the slow-handler offload of one subscriber (EB-274): a
+   * subscriber that opted into `slowHandler` can retune its
+   * threshold and callback without re-subscribing. The revision is
+   * partial: a field left out keeps its current value, and only
+   * those two parameters ever move. The state object is mutated
+   * in place — never replaced — so an armed macrotask continuation
+   * keeps its `continueArmed` flag: revising while a continuation
+   * is pending neither drops it (the remaining messages still
+   * drain, exactly once, in order) nor stacks a second one. The
+   * new threshold applies from the next handler execution, because
+   * `slowHandlerTripped` reads the live threshold on every
+   * invocation — a tightened threshold trips on the next slow
+   * call, a loosened one stops tripping, and already-recorded
+   * observations (`getStats().slowHandlers`) are never rewritten.
+   * Passing `null` clears the offload: later invocations are
+   * untimed, an already-armed continuation still drains its
+   * remaining messages (its timer holds the old state object and
+   * the drain checks the live subscription), but no new trip can
+   * arm, and a later revision is refused until the subscriber
+   * opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into the offload, a non-object value, an illegal
+   * threshold (not a positive finite number), a non-function
+   * callback, and `undefined` — only an explicit `null` clears —
+   * all throw `RangeError` with the live threshold, the live
+   * callback, the armed flag, and the audit log untouched.
+   * Validation reuses `resolveSlowHandlerOptions` against the
+   * merged (current + revised) parameters, so the bounds are
+   * exactly the subscribe-time ones. A revision identical to the
+   * current parameters is a no-op: no audit, and the armed flag
+   * untouched. Audited as `slow_handler_revised`
+   * (`{ slowHandler: { thresholdMs, onSlowHandler: 'set'? } |
+   * null, oldSlowHandler: { thresholdMs, onSlowHandler: 'set'? } }`,
+   * the callback recorded by presence only, never serialized).
+   *
+   * Orthogonal to the subscribe-time offload of EB-191 (this
+   * revises it, that sets it), and to `healthProbe` (EB-267, that
+   * times failures and timeouts for degradation, this times
+   * synchronous slowness for offload).
+   *
+   * Throws `RangeError` for an unknown / offload-less subscriber
+   * or an illegal offload value.
+   */
+  setSlowHandler(subId: string, opts: SlowHandlerOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setSlowHandler: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setSlowHandler: unknown subscriber: ${subId}`);
+    }
+    const watch = subscriber.slowHandler;
+    if (watch == null) {
+      throw new RangeError('setSlowHandler: subscriber has no slowHandler set');
+    }
+    const snapshotSlow = (state: SlowHandlerState) => ({
+      thresholdMs: state.thresholdMs,
+      ...(state.onSlowHandler !== undefined ? { onSlowHandler: 'set' as const } : {}),
+    });
+    const oldSlowHandler = snapshotSlow(watch);
+    if (opts === null) {
+      subscriber.slowHandler = undefined;
+      this.auditSubscription({
+        action: 'slow_handler_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { slowHandler: null, oldSlowHandler },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the merged parameters, before any field moves.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setSlowHandler: slowHandler must be an object with thresholdMs and/or onSlowHandler, or null to clear it');
+    }
+    const resolved = resolveSlowHandlerOptions({
+      thresholdMs: opts.thresholdMs ?? watch.thresholdMs,
+      onSlowHandler: opts.onSlowHandler ?? watch.onSlowHandler,
+    });
+    // `resolveSlowHandlerOptions` never returns undefined for an
+    // object input, but keep the guard explicit for the type checker.
+    if (resolved === undefined) {
+      throw new RangeError('setSlowHandler: slowHandler must be an object with thresholdMs and/or onSlowHandler, or null to clear it');
+    }
+    // Identical parameters: a no-op — no audit, and the armed flag
+    // untouched.
+    if (resolved.thresholdMs === watch.thresholdMs && resolved.onSlowHandler === watch.onSlowHandler) {
+      return;
+    }
+    // Only the two parameters move, in place: the state object and
+    // its `continueArmed` flag are untouched, and the drain reads
+    // the new threshold live on the next invocation.
+    watch.thresholdMs = resolved.thresholdMs;
+    watch.onSlowHandler = resolved.onSlowHandler;
+    this.auditSubscription({
+      action: 'slow_handler_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { slowHandler: snapshotSlow(watch), oldSlowHandler },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

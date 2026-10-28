@@ -94,6 +94,7 @@ export type SubscriptionAuditAction =
   | 'rate_limit_revised'
   | 'delivery_priority_revised'
   | 'lag_monitor_revised'
+  | 'slow_handler_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -198,6 +199,7 @@ export type SubscriptionAuditAction =
  * - `rate_limit_revised`: `{ rateLimit: { maxMessages, perWindowMs } | null, oldRateLimit: { maxMessages, perWindowMs } }` — a rate-limited subscriber's sliding-window ceiling was revised (EB-271; `null` means the limit was cleared back to unlimited, after cancelling the armed re-flush timer; only the limiter instance is replaced and the state object retained, so an already-armed re-flush timer stays valid and the window starts fresh — tightening never retroactively blocks what was already delivered, loosening admits held messages on the next flush; the revision must be complete, and passing the current values still resets the window)
  * - `delivery_priority_revised`: `{ deliveryPriority: { weight, label }, oldDeliveryPriority: { weight, label } }` — a subscriber's drain priority was revised (EB-272; `null` restores the default `'normal'` / weight 2, recorded as the default; the drain reads the live weight from the next flush round, the DRR deficit carryover is untouched, and a revision crossing the default boundary moves the non-default count with the weight so the fast path never silently ignores a revised weight; the same weight and label is a no-op with no audit)
  * - `lag_monitor_revised`: `{ lagMonitor: { windowSize, thresholdMs?, onLag: 'set'? } | null, oldLagMonitor: { windowSize, thresholdMs?, onLag: 'set'? } }` — a lag-monitored subscriber's watermark parameters were revised (EB-273; `null` means monitoring was cleared, and a revision after a clear is refused until the subscriber opts in again at subscribe time; a partial revision keeps the fields it leaves out; the callback itself is never serialized, only its presence; the dwell samples, the enqueue stamps, and the alerted latch are untouched — shrinking the window evicts only the oldest samples, and the new threshold applies from the next watermark evaluation; a revision identical to the current parameters is a no-op with no audit)
+ * - `slow_handler_revised`: `{ slowHandler: { thresholdMs, onSlowHandler: 'set'? } | null, oldSlowHandler: { thresholdMs, onSlowHandler: 'set'? } }` — a slow-handler subscriber's offload threshold and callback were revised (EB-274; `null` means the offload was cleared, and a revision after a clear is refused until the subscriber opts in again at subscribe time; a partial revision keeps the fields it leaves out; the callback itself is never serialized, only its presence; the state object is mutated in place, so an armed macrotask continuation keeps its `continueArmed` flag and the new threshold applies from the next handler execution; a revision identical to the current parameters is a no-op with no audit)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -359,6 +361,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'rate_limit_revised',
   'delivery_priority_revised',
   'lag_monitor_revised',
+  'slow_handler_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',

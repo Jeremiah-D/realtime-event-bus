@@ -854,9 +854,30 @@ library.
   continuation; nothing is dropped, and the slow message itself was
   already delivered. Composes with health probing: the probe still times
   `processingTimeoutMs` on the handler itself, independently of the
-  offload. Invalid options throw `RangeError` from `subscribe`. Applies
-  to single-message drains (batched subscribers collect before they
-  invoke); disabled by default.
+  offload. Invalid options throw `RangeError` from `subscribe`. Revisable
+  after subscribe (EB-274, via `setSlowHandler(subId, opts | null)`): a
+  subscriber that opted into the offload can retune its threshold and
+  callback without re-subscribing — the revision is partial (a field
+  left out keeps its value), and the state object is mutated in place,
+  so an armed macrotask continuation keeps its `continueArmed` flag:
+  revising while a continuation is pending neither drops it nor stacks
+  a second one, and the new threshold applies from the next handler
+  execution (already-recorded observations are never rewritten). A
+  revision identical to the current parameters is a no-op with no
+  audit. `null` clears the offload (an already-armed continuation
+  still drains its remaining messages, but no new trip can arm), and a
+  revision after a clear is refused until the subscriber opts in again
+  at subscribe time. It is fail-closed (an unknown subscriber, a
+  subscriber that never opted into the offload, an illegal threshold,
+  or a non-function callback throws `RangeError` with the live
+  threshold, callback, armed flag, and audit log untouched;
+  `undefined` is not a clear, only `null` is), and every success is
+  audited as `slow_handler_revised`
+  (`{ slowHandler: { thresholdMs, onSlowHandler: 'set'? } | null,
+  oldSlowHandler: { ... } }`, the callback recorded by presence only).
+  (Real-time systems: delivery governance.) Applies to single-message
+  drains (batched subscribers collect before they invoke); disabled by
+  default.
 - **Handler fault isolation** (in `src/bus.ts`, opt-in via
   `subscribe(..., { handlerFaultIsolation: true })`, EB-197):
   per-subscriber consecutive error budget with automatic quarantine. A
