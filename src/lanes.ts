@@ -197,7 +197,7 @@ export class LaneQueue<T> {
    * reaching `bulkStarvationRounds` force-interleaves one bulk message.
    */
   private bulkStarvedRounds = 0;
-  private readonly maxBytes?: number;
+  private maxBytes?: number;
   private readonly byteSize: (item: T) => number;
   private bytesTotal = 0;
   private readonly onHighWaterMark?: (size: number) => void;
@@ -345,6 +345,30 @@ export class LaneQueue<T> {
       this.highWaterMarkReached = true;
     }
     this.maybeFireDrained();
+  }
+
+  /**
+   * Adjusts the aggregate byte budget at runtime (EB-282, via
+   * `EventBus.setQueueMaxBytes`). Queued entries are untouched — shrinking
+   * below the current buffered bytes evicts nothing; the new budget
+   * governs only future `push` calls, which shed or refuse per `policy`
+   * once the aggregate would exceed it. Growing admits immediately.
+   * Clearing (`undefined`) removes the byte dimension entirely, leaving
+   * only the count capacity as the admission constraint, and resets the
+   * tracked total to 0 so `queueBytes` reads 0 with no budget configured
+   * (later drains then have nothing to subtract). A defined budget keeps
+   * the tracked total as-is: the bus only revises subscriptions that
+   * already carry a budget, so the total is already measured. Throws
+   * `RangeError` for a non-positive-finite budget.
+   */
+  setMaxBytes(maxBytes: number | undefined): void {
+    if (maxBytes !== undefined && (!Number.isFinite(maxBytes) || maxBytes <= 0)) {
+      throw new RangeError('maxBytes must be a positive finite number of bytes, or undefined to clear it');
+    }
+    this.maxBytes = maxBytes;
+    if (maxBytes === undefined) {
+      this.bytesTotal = 0;
+    }
   }
 
   /**

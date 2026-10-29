@@ -775,6 +775,33 @@ library.
   the byte budget (EB-282, that revises `queueMaxBytes`, this revises
   the message-count capacity). (Real-time systems: delivery
   governance.)
+  Revisable after subscribe (EB-282, via
+  `setQueueMaxBytes(subId, bytes | null)`): a subscriber's queue byte
+  budget can be retuned without re-subscribing — but only
+  subscriptions that already carry one (`queueMaxBytes` is opt-in),
+  so a never-set budget, and a budget cleared by an earlier revision,
+  both throw `RangeError` until the subscriber opts in again at
+  subscribe time. `null` clears back to no byte dimension, never to a
+  default — only the message-count capacity constrains admission
+  afterwards. Only the budget moves, in place: the queue object, its
+  already-queued messages and their buffered-byte accounting, the
+  count capacity, `dropPolicy`, `highWaterMarkRatio`, and the
+  backpressure tier are untouched, so shrinking below the current
+  buffered bytes evicts nothing and the new budget governs only
+  future admissions — an over-budget newcomer sheds per the standing
+  policy (`'drop-newest'` refuses it outright; `'drop-oldest'`
+  sheds the oldest backlog to make room), and byte-budget sheds never
+  arm the default `'block'` tier. Growing admits immediately. A
+  revision identical to the current budget is a no-op with no audit.
+  It is fail-closed (an unknown subscriber, an unset budget, a
+  non-positive-finite budget, or `undefined` — only an explicit
+  `null` clears — throws `RangeError` with the live budget, the
+  queue, and the audit log untouched), and every success is audited
+  as `queue_max_bytes_revised`
+  (`{ queueMaxBytes: <number> | null, oldQueueMaxBytes: <number> }`).
+  Orthogonal to the count capacity (EB-281, that revises `queueSize`,
+  this revises the byte budget). (Real-time systems: delivery
+  governance.)
 - **`src/throttle.ts` — `TokenBucket` + adaptive publish-side throttling**:
   opt-in per subscriber via `subscribe(..., { throttle: true })`. When the
   subscriber's queue crosses the high-water mark, the bus rate-limits how many

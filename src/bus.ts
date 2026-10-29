@@ -8085,6 +8085,15 @@ interface Subscriber {
   /** The queue's count capacity, for saturation checks at enqueue time. */
   queueCapacity: number;
   /**
+   * The queue's byte budget, when the subscription opted into one (see
+   * `SubscribeOptions.queueMaxBytes`, EB-282): `undefined` means no byte
+   * dimension — only the count capacity constrains admission. Mirrored
+   * live by `setQueueMaxBytes`; the queue's own `maxBytes` is the
+   * enforcement point, this field is the opt-in gate and the audit's
+   * old-value source.
+   */
+  queueMaxBytes?: number;
+  /**
    * Operator-defined `key=value` labels (see `SubscribeOptions.labels`,
    * EB-213): pure metadata, never consulted by matching, admission,
    * ordering or delivery. Hot-updatable via `setSubscriberLabels`;
@@ -23783,6 +23792,7 @@ export class EventBus {
       blocked: false,
       blockedCount: 0,
       queueCapacity: capacity,
+      queueMaxBytes,
       // Subscriber labels (EB-213): the subscriber owns a fresh copy —
       // the caller's object is never aliased, so later mutations of
       // `opts.labels` cannot change the subscription's metadata.
@@ -27407,6 +27417,90 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { queueSize: newQueueSize, oldQueueSize },
+    });
+  }
+
+  /**
+   * Revises one subscriber's queue byte budget (EB-282): the opt-in
+   * counterpart of `setQueueSize` (EB-281, that revises the
+   * message-count capacity, this revises the byte budget). Only
+   * subscriptions that already carry a `queueMaxBytes` budget can be
+   * revised — the budget is opt-in, so a subscription without one has
+   * no byte dimension to retune, and a revision after a clear is
+   * refused until the subscriber opts in again at subscribe time (the
+   * EB-279/EB-280 precedent). Only the budget moves, in place: the
+   * queue object, its already-queued messages and their buffered-byte
+   * accounting, the count capacity, `dropPolicy`,
+   * `highWaterMarkRatio`, and the backpressure tier are untouched.
+   * Shrinking below the current buffered bytes evicts nothing: the
+   * backlog stays over the new budget until it drains, and the new
+   * budget governs only future admissions — an over-budget newcomer
+   * sheds per the standing `dropPolicy` (`'drop-newest'` refuses it
+   * outright; `'drop-oldest'` sheds the oldest backlog to make room),
+   * exactly as at subscribe time. Byte-budget sheds never arm the
+   * default `'block'` tier (only count saturation does), so a byte
+   * revision never touches the blocked flag. Growing admits
+   * immediately: the next publish sees the new headroom with no drain
+   * required.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription with no
+   * budget set, a non-positive-finite budget (0, negative, `NaN`,
+   * `Infinity`, or a non-number), and `undefined` — only an explicit
+   * `null` clears — all throw `RangeError` with the live budget, the
+   * queue, and the audit log untouched. A revision identical to the
+   * current budget is a no-op with no audit. Audited as
+   * `queue_max_bytes_revised` (`{ queueMaxBytes: <number> | null,
+   * oldQueueMaxBytes: <number> }`, `null` meaning the budget was
+   * cleared back to no byte dimension).
+   *
+   * Orthogonal to `setQueueSize` (EB-281, that revises the
+   * message-count capacity, this revises the byte budget) and to the
+   * queue mechanism itself (EB-83, that sets the budget at subscribe
+   * time, this revises it).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unset budget,
+   * or an illegal budget.
+   */
+  setQueueMaxBytes(subId: string, bytes: number | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setQueueMaxBytes: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setQueueMaxBytes: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a non-number never moves
+    // the live budget.
+    if (bytes !== null && (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0)) {
+      throw new RangeError('setQueueMaxBytes: bytes must be a positive finite number, or null to clear it');
+    }
+    // Opt-in gate: only a subscription that already carries a budget
+    // can be revised — a never-set budget, and a budget cleared by an
+    // earlier revision, both refuse until the subscriber opts in again
+    // at subscribe time.
+    if (subscriber.queueMaxBytes === undefined) {
+      throw new RangeError('setQueueMaxBytes: subscriber has no queue byte budget set');
+    }
+    const oldQueueMaxBytes = subscriber.queueMaxBytes;
+    const newQueueMaxBytes = bytes === null ? undefined : bytes;
+    // Identical budget: a no-op — no audit, and no queue state moves.
+    if (newQueueMaxBytes === oldQueueMaxBytes) {
+      return;
+    }
+    // Only the budget moves, in both places admission reads it: the
+    // subscriber field (the opt-in gate and audit source) and the
+    // queue's own aggregate byte gate (`LaneQueue.push`). The queue
+    // object itself is never replaced, so the backlog and its byte
+    // accounting survive intact.
+    subscriber.queueMaxBytes = newQueueMaxBytes;
+    subscriber.queue.setMaxBytes(newQueueMaxBytes);
+    this.auditSubscription({
+      action: 'queue_max_bytes_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { queueMaxBytes: newQueueMaxBytes ?? null, oldQueueMaxBytes },
     });
   }
 
