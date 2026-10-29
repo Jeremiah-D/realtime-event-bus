@@ -10470,6 +10470,34 @@ interface SubscriberSessionWindowState {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * Partial session-window revision for `setSessionWindow` (EB-280):
+ * any field left out keeps its current value. Only `gapMs` and
+ * `maxSessionsPerKey` ever move. `aggregate` and `field` are accepted
+ * syntactically so a caller can restate the current values, but any
+ * value that differs from the live configuration is rejected with
+ * `RangeError` before anything moves: changing the fold or the
+ * extracted field would reinterpret the messages already folded into
+ * the open sessions, so a live subscriber can never change them —
+ * re-subscribing is the only way to a different fold or field.
+ */
+export interface SessionWindowRevisionOptions {
+  /** Inactivity gap in milliseconds; must be a positive finite number when provided. */
+  gapMs?: number;
+  /** Maximum concurrently open sessions; must be a positive integer when provided. */
+  maxSessionsPerKey?: number;
+  /**
+   * Restatement of the subscribe-time fold only: a value different
+   * from the live `aggregate` throws `RangeError`.
+   */
+  aggregate?: WindowAggregateKind;
+  /**
+   * Restatement of the subscribe-time field only: a value extracting
+   * a different path than the live `fieldPath` throws `RangeError`.
+   */
+  field?: string;
+}
+
 /** Default bound on concurrently open sessions per session-windowed subscription. */
 const DEFAULT_MAX_SESSIONS_PER_KEY = 1024;
 
@@ -27139,6 +27167,153 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { ackLatency: snapshotAckLatency(ackLatency), oldAckLatency },
+    });
+  }
+
+  /**
+   * Revises the session-window parameters of one subscriber (EB-280):
+   * a subscriber that opted into `sessionWindow` can retune its
+   * activity gap and its open-session bound without re-subscribing.
+   * The revision is partial: a field left out keeps its current
+   * value, and only `gapMs` and `maxSessionsPerKey` ever move — the
+   * state object is mutated in place, so the open `sessions` map is
+   * untouched: shrinking `maxSessionsPerKey` evicts nothing (the new
+   * bound governs only the next session opening, which evicts the
+   * least-recently active session exactly as at subscribe time), and
+   * widening it restores nothing. The new gap governs the next
+   * activity-gap judgment — an arrival reads the live `gapMs`, so a
+   * tightened gap closes a quiet session on the next arrival and a
+   * loosened gap keeps it open; the already-armed sweep timer keeps
+   * its original delay, but its fire-time check also reads the live
+   * gap and re-arms under the new gap while sessions remain open.
+   * The aggregate fold and the extracted field never move: an
+   * `aggregate` or `field` that differs from the live configuration
+   * throws `RangeError` with the live configuration untouched, because
+   * reinterpreting the fold or the field would change the meaning of
+   * the messages already folded into the open sessions; restating
+   * the current values is allowed and is a no-op when nothing else
+   * moves.
+   *
+   * Passing `null` clears session windowing entirely: the sweep
+   * timer is cancelled and the open sessions are discarded with the
+   * state (like unsubscribing), later publishes travel the normal
+   * raw delivery path, and a later revision is refused until the
+   * subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into session windowing, a non-object value, an illegal
+   * merged value (a non-positive or non-finite gap, a
+   * non-positive-integer session bound, a forbidden field segment),
+   * an aggregate/field change, and `undefined` — only an explicit
+   * `null` clears — all throw `RangeError` with the live
+   * configuration, the open sessions, and the audit log untouched.
+   * Validation reuses `resolveSessionWindowOptions` against the
+   * merged (current + revised) parameters, so the bounds are exactly
+   * the subscribe-time ones. A revision identical to the current
+   * parameters is a no-op: no audit, and no session evicted even
+   * when the bound is restated. Audited as
+   * `session_window_revised` (`{ sessionWindow: { gapMs, aggregate,
+   * field?, maxSessionsPerKey } | null, oldSessionWindow: { ... } }`,
+   * the field recorded only when one was set at subscribe time).
+   *
+   * Orthogonal to `setLagForecast` (EB-278, that revises the backlog
+   * forecast, this revises the session aggregation) and to the
+   * session-window mechanism itself (EB-188, that sets it at
+   * subscribe time, this revises it).
+   *
+   * Throws `RangeError` for an unknown / non-session-windowed
+   * subscriber or an illegal session-window value.
+   */
+  setSessionWindow(subId: string, opts: SessionWindowRevisionOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setSessionWindow: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setSessionWindow: unknown subscriber: ${subId}`);
+    }
+    const sessionWindow = subscriber.sessionWindow;
+    if (sessionWindow == null) {
+      throw new RangeError('setSessionWindow: subscriber has no sessionWindow set');
+    }
+    const snapshotSessionWindow = (state: SubscriberSessionWindowState) => ({
+      gapMs: state.gapMs,
+      aggregate: state.aggregate,
+      ...(state.fieldPath !== undefined ? { field: state.fieldPath.join('.') } : {}),
+      maxSessionsPerKey: state.maxSessionsPerKey,
+    });
+    const oldSessionWindow = snapshotSessionWindow(sessionWindow);
+    if (opts === null) {
+      this.clearSessionWindowTimer(subscriber);
+      subscriber.sessionWindow = undefined;
+      this.auditSubscription({
+        action: 'session_window_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { sessionWindow: null, oldSessionWindow },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the merged parameters, before any field moves.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setSessionWindow: sessionWindow must be an object with gapMs and/or maxSessionsPerKey, or null to clear it');
+    }
+    if (opts.aggregate !== undefined && opts.aggregate !== sessionWindow.aggregate) {
+      throw new RangeError('setSessionWindow: changing aggregate would reinterpret in-flight sessions');
+    }
+    if (opts.field !== undefined) {
+      let revisedFieldPath: string[] | undefined;
+      try {
+        revisedFieldPath = parseWindowFieldPath(opts.field);
+      } catch (err) {
+        throw new RangeError(`setSessionWindow: ${(err as Error).message}`);
+      }
+      const currentField = sessionWindow.fieldPath?.join('.');
+      const revisedField = revisedFieldPath?.join('.');
+      if (revisedField !== currentField) {
+        throw new RangeError('setSessionWindow: changing field would reinterpret in-flight sessions');
+      }
+    }
+    const mergedGapMs = opts.gapMs ?? sessionWindow.gapMs;
+    const mergedMaxSessionsPerKey = opts.maxSessionsPerKey ?? sessionWindow.maxSessionsPerKey;
+    try {
+      const resolved = resolveSessionWindowOptions({
+        gapMs: mergedGapMs,
+        aggregate: sessionWindow.aggregate,
+        ...(sessionWindow.fieldPath !== undefined
+          ? { field: sessionWindow.fieldPath.join('.') }
+          : {}),
+        maxSessionsPerKey: mergedMaxSessionsPerKey,
+      });
+      if (resolved === undefined) {
+        throw new RangeError('setSessionWindow: sessionWindow must be an object with gapMs and/or maxSessionsPerKey, or null to clear it');
+      }
+    } catch (err) {
+      throw new RangeError(`setSessionWindow: ${(err as Error).message}`);
+    }
+    // Identical parameters: a no-op — no audit, and no session
+    // evicted even when the bound is restated.
+    if (
+      mergedGapMs === sessionWindow.gapMs &&
+      mergedMaxSessionsPerKey === sessionWindow.maxSessionsPerKey
+    ) {
+      return;
+    }
+    // Only the two parameters move, in place: the state object, its
+    // open sessions, and its sweep timer are untouched, and the next
+    // activity-gap judgment reads the new values live.
+    sessionWindow.gapMs = mergedGapMs;
+    sessionWindow.maxSessionsPerKey = mergedMaxSessionsPerKey;
+    this.auditSubscription({
+      action: 'session_window_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { sessionWindow: snapshotSessionWindow(sessionWindow), oldSessionWindow },
     });
   }
 

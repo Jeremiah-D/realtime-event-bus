@@ -2311,6 +2311,30 @@ library.
   sessions by replay order. Session and tumbling windows cannot be
   combined on one subscription (`RangeError`). `getStats().aggregatedSessionWindows` counts completed sessions. Invalid options
   throw `RangeError` from `subscribe`. Disabled by default.
+  Revisable after subscribe (EB-280, via
+  `setSessionWindow(subId, opts | null)`): a session-windowed
+  subscriber's activity gap and open-session bound can be retuned
+  without re-subscribing — the revision is partial (a field left out
+  keeps its value), and only those two parameters move, in place:
+  the open sessions are untouched, so shrinking the bound evicts
+  nothing (the new bound governs only the next session opening) and
+  the new gap governs the next activity-gap judgment. The aggregate
+  fold and the extracted field never move — a differing `aggregate`
+  or `field` throws `RangeError` with the live configuration
+  untouched, because changing either would reinterpret the messages
+  already folded into the open sessions. A revision identical to the
+  current parameters is a no-op with no audit. `null` clears session
+  windowing entirely (the sweep timer is cancelled and the open
+  sessions discarded), and a revision after a clear is refused until
+  the subscriber opts in again at subscribe time. It is fail-closed
+  (an unknown subscriber, a subscriber that never opted into session
+  windowing, or an illegal merged value throws `RangeError` with the
+  live configuration, the open sessions, and the audit log untouched;
+  `undefined` is not a clear, only `null` is), and every success is
+  audited as `session_window_revised` (`{ sessionWindow: { gapMs,
+  aggregate, field?, maxSessionsPerKey } | null, oldSessionWindow:
+  { ... } }`). Orthogonal to the session-window mechanism itself
+  (EB-188, that sets it at subscribe time, this revises it).
 - **Atomic cross-topic batch publish** (in `src/bus.ts`, via
   `publishAtomic(entries)`): all-or-nothing fan-out for multi-message
   batches — subscribers either see every message or none. Admission runs in

@@ -100,6 +100,7 @@ export type SubscriptionAuditAction =
   | 'delivery_concurrency_revised'
   | 'lag_forecast_revised'
   | 'ack_latency_revised'
+  | 'session_window_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -210,6 +211,7 @@ export type SubscriptionAuditAction =
  * - `delivery_concurrency_revised`: `{ deliveryConcurrency: <number>, oldDeliveryConcurrency: <number> }` — a subscriber's handler-concurrency cap was revised (EB-277; always armed with default 1, so there is no opt-in gate — a subscription without an explicitly set cap can be revised; `null` restores the parse-chain default, the current `maxInflight` cap or 1; only `state.max` moves, `inFlight` and `keysInFlight` are untouched, so lowering never revokes in-flight calls and raising is picked up immediately by the live-max read in `tryAcquireDeliverySlot` plus a scheduled flush; same-key ordering is unchanged; a revision identical to the current cap is a no-op with no audit)
  * - `lag_forecast_revised`: `{ lagForecast: { windowSize, minSamples, thresholdMs?, forecastHorizonMs?, onLagForecast: 'set'? } | null, oldLagForecast: { ... } }` — a forecast-enabled subscriber's lag-forecast parameters were revised (EB-278; `null` means forecasting was cleared, and a revision after a clear is refused until the subscriber opts in again at subscribe time; a partial revision keeps the fields it leaves out; the callback itself is never serialized, only its presence; the state object is mutated in place, so the enqueue stamps and the alerted latch are untouched — shrinking the window evicts only the oldest samples, widening restores nothing, and the new parameters apply from the next accepted enqueue's forecast evaluation, with the latch clearing or re-arming self-consistently under them; a revision identical to the current parameters is a no-op with no audit)
  * - `ack_latency_revised`: `{ ackLatency: { windowSize, ackSloMs, onAckSloMiss: 'set'? } | null, oldAckLatency: { ... } }` — an ack-latency-enabled subscriber's sampling parameters were revised (EB-279; `null` means sampling was cleared, and a revision after a clear is refused until the subscriber opts in again at subscribe time; a partial revision keeps the fields it leaves out; the callback itself is never serialized, only its presence; the tracker instance is mutated in place, so the per-message accept clocks and the already-recorded samples are untouched — shrinking the window evicts only the oldest samples, widening restores nothing, retuning the SLO re-scores the retained samples, and the new parameters apply from the next accepted enqueue and the next ack sample; a revision identical to the current parameters is a no-op with no audit)
+ * - `session_window_revised`: `{ sessionWindow: { gapMs, aggregate, field?, maxSessionsPerKey } | null, oldSessionWindow: { ... } }` — a session-windowed subscriber's activity gap and open-session bound were revised (EB-280; `null` means session windowing was cleared, the sweep timer cancelled and the open sessions discarded, and a revision after a clear is refused until the subscriber opts in again at subscribe time; a partial revision keeps the fields it leaves out; the field is recorded only when one was set at subscribe time; the aggregate fold and the extracted field never move — a differing `aggregate` or `field` throws `RangeError` with the live configuration untouched, because changing either would reinterpret the messages already folded into the open sessions; the state object is mutated in place, so the open sessions are untouched — shrinking the bound evicts nothing and the new bound governs only the next session opening, and the new gap governs the next activity-gap judgment; a revision identical to the current parameters is a no-op with no audit)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -377,6 +379,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delivery_concurrency_revised',
   'lag_forecast_revised',
   'ack_latency_revised',
+  'session_window_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',
