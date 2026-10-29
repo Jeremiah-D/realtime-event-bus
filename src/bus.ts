@@ -26726,6 +26726,89 @@ export class EventBus {
   }
 
   /**
+   * Revises the handler-concurrency cap of one subscriber (EB-277):
+   * a subscriber can retune how many handler invocations may execute
+   * at once without re-subscribing. The one explicit exception to
+   * the EB-263–EB-276 revision precedents: delivery concurrency is
+   * ALWAYS armed for every subscription (default 1), so there is no
+   * "only-if-already-set" gate — a subscription that never set
+   * `maxConcurrentDeliveries` explicitly can still be revised, and
+   * `null` restores the parse-chain default (the current
+   * `maxInflight` cap, otherwise 1) rather than clearing the gate.
+   *
+   * Only `state.max` ever moves, in place: `inFlight` and
+   * `keysInFlight` are untouched, so lowering the cap never revokes
+   * an in-flight call — it only stops the drain from opening new
+   * ones until settlements bring the count back under the cap — and
+   * raising the cap is picked up immediately, because
+   * `tryAcquireDeliverySlot` reads the live `max` and this method
+   * schedules a flush so queued callers are admitted on the next
+   * drain round. Same-key ordering is unchanged: the per-key
+   * serialization in `tryAcquireDeliverySlot` reads the same
+   * `keysInFlight` map, which no revision touches.
+   *
+   * Fail-closed: an unknown subscriber id, an `undefined` value —
+   * only an explicit `null` restores the default — and an illegal
+   * cap (not a positive integer, validated by reusing
+   * `resolveDeliveryConcurrencyOptions`, exactly the subscribe-time
+   * bounds) all throw `RangeError` with the live cap, the live
+   * counts, and the audit log untouched. A revision identical to
+   * the current cap is a no-op: no audit, no flush. Audited as
+   * `delivery_concurrency_revised`
+   * (`{ deliveryConcurrency, oldDeliveryConcurrency }`).
+   *
+   * Orthogonal to `setMaxInflight` (EB-264, that caps the unsettled
+   * invocation window, this caps handler execution parallelism) and
+   * to the concurrency gate mechanism itself (EB-159, that sets the
+   * gate at subscribe time, this revises it).
+   *
+   * Throws `RangeError` for an unknown subscriber or an illegal cap.
+   */
+  setDeliveryConcurrency(subId: string, max: number | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeliveryConcurrency: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeliveryConcurrency: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: `undefined` is not a
+    // restore — only an explicit `null` restores the parse-chain
+    // default — and the bounds are exactly the subscribe-time ones.
+    if ((max as unknown) === undefined) {
+      throw new RangeError('setDeliveryConcurrency: maxConcurrentDeliveries must be an integer >= 1, or null to restore the default');
+    }
+    let resolved: number;
+    try {
+      resolved =
+        max === null
+          ? resolveDeliveryConcurrencyOptions(subscriber.maxInflight?.max)
+          : resolveDeliveryConcurrencyOptions(max);
+    } catch (err) {
+      throw new RangeError(`setDeliveryConcurrency: ${(err as Error).message}`);
+    }
+    const state = subscriber.deliveryConcurrency;
+    const oldDeliveryConcurrency = state.max;
+    // Identical cap: a no-op — no audit, no flush.
+    if (resolved === oldDeliveryConcurrency) {
+      return;
+    }
+    // Only the cap moves, in place: `inFlight` and `keysInFlight`
+    // keep counting the invocations already executing.
+    state.max = resolved;
+    this.auditSubscription({
+      action: 'delivery_concurrency_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { deliveryConcurrency: resolved, oldDeliveryConcurrency },
+    });
+    // A raised cap may have made queued messages admittable; a
+    // lowered cap simply admits nothing new.
+    this.scheduleFlush();
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

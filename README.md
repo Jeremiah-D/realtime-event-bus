@@ -1864,7 +1864,25 @@ library.
   is never silently neutered by the new default; an explicit value here
   always wins.
   Must be an integer >= 1 — anything else throws `RangeError` from
-  `subscribe`.
+  `subscribe`. Revisable after subscribe (EB-277, via
+  `setDeliveryConcurrency(subId, max | null)`): the cap is always armed
+  (default 1), so unlike the EB-263–EB-276 precedents there is no
+  only-if-already-set gate — a subscription that never set the option
+  explicitly can still be revised. Only `state.max` moves, in place, so
+  `inFlight` and `keysInFlight` are untouched: lowering never revokes an
+  in-flight call, raising is picked up immediately because
+  `tryAcquireDeliverySlot` reads the live max (plus a scheduled flush so
+  queued callers are admitted), and same-key ordering is unchanged. A
+  revision identical to the current cap is a no-op with no audit.
+  `null` restores the parse-chain default (the current `maxInflight`
+  cap, otherwise 1). It is fail-closed (an unknown subscriber, an
+  `undefined` value — only an explicit `null` restores the default — or
+  a non-integer / < 1 cap throws `RangeError` with the live cap, the
+  live counts, and the audit log untouched), and every success is
+  audited as `delivery_concurrency_revised`
+  (`{ deliveryConcurrency, oldDeliveryConcurrency }`). Orthogonal to
+  `setMaxInflight` (that caps the unsettled window, this caps handler
+  execution parallelism).
 - **Per-subscriber delivery-latency sampling** (in `src/latency.ts`, opt-in
   via `subscribe(..., { deliveryLatency: true })`): measures each delivered
   message's queue dwell — from enqueue into the subscriber's queue to the

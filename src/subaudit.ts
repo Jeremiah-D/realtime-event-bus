@@ -97,6 +97,7 @@ export type SubscriptionAuditAction =
   | 'slow_handler_revised'
   | 'handler_fault_isolation_revised'
   | 'delivery_latency_revised'
+  | 'delivery_concurrency_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -204,6 +205,7 @@ export type SubscriptionAuditAction =
  * - `slow_handler_revised`: `{ slowHandler: { thresholdMs, onSlowHandler: 'set'? } | null, oldSlowHandler: { thresholdMs, onSlowHandler: 'set'? } }` — a slow-handler subscriber's offload threshold and callback were revised (EB-274; `null` means the offload was cleared, and a revision after a clear is refused until the subscriber opts in again at subscribe time; a partial revision keeps the fields it leaves out; the callback itself is never serialized, only its presence; the state object is mutated in place, so an armed macrotask continuation keeps its `continueArmed` flag and the new threshold applies from the next handler execution; a revision identical to the current parameters is a no-op with no audit)
  * - `handler_fault_isolation_revised`: `{ handlerFaultIsolation: { maxConsecutiveErrors, onQuarantined: 'set'? } | null, oldHandlerFaultIsolation: { maxConsecutiveErrors, onQuarantined: 'set'? } }` — an isolated subscriber's error budget and quarantine callback were revised (EB-275; `null` means the isolation was cleared, refused while the subscriber is quarantined — it must be resumed via `resumeQuarantined` first — and a revision after a clear is refused until the subscriber opts in again at subscribe time; a partial revision keeps the fields it leaves out; the callback itself is never serialized, only its presence; the state object is mutated in place, so the consecutive-error counter and the quarantined latch are untouched and the new budget applies from the next handler-failure evaluation; a revision identical to the current parameters is a no-op with no audit)
  * - `delivery_latency_revised`: `{ deliveryLatency: { windowSize } | null, oldDeliveryLatency: { windowSize } }` — a sampled subscriber's delivery-latency window size was revised (EB-276; `null` means sampling was cleared, and a revision after a clear is refused until the subscriber opts in again at subscribe time; shrinking the window evicts only the oldest samples, widening evicts nothing, and the enqueue clocks of in-flight messages are untouched — the new window applies from the next sample and summary; a revision identical to the current window is a no-op with no audit)
+ * - `delivery_concurrency_revised`: `{ deliveryConcurrency: <number>, oldDeliveryConcurrency: <number> }` — a subscriber's handler-concurrency cap was revised (EB-277; always armed with default 1, so there is no opt-in gate — a subscription without an explicitly set cap can be revised; `null` restores the parse-chain default, the current `maxInflight` cap or 1; only `state.max` moves, `inFlight` and `keysInFlight` are untouched, so lowering never revokes in-flight calls and raising is picked up immediately by the live-max read in `tryAcquireDeliverySlot` plus a scheduled flush; same-key ordering is unchanged; a revision identical to the current cap is a no-op with no audit)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -368,6 +370,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'slow_handler_revised',
   'handler_fault_isolation_revised',
   'delivery_latency_revised',
+  'delivery_concurrency_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',
