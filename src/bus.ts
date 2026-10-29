@@ -26503,6 +26503,128 @@ export class EventBus {
   }
 
   /**
+   * Revises the handler fault isolation of one subscriber (EB-275): a
+   * subscriber that opted into `handlerFaultIsolation` can retune its
+   * consecutive-error budget and quarantine callback without
+   * re-subscribing. The revision is partial: a field left out keeps
+   * its current value, and only those two parameters ever move. The
+   * state object is mutated in place — never replaced — so the
+   * consecutive-error counter and the quarantined latch are
+   * preserved: revising neither resets the count nor un-quarantines
+   * a quarantined subscriber, and recovery stays on the
+   * `resumeQuarantined` path only. The new budget applies from the
+   * next handler-failure evaluation, because
+   * `noteHandlerFaultOutcome` reads the live `maxConsecutiveErrors`
+   * on every failure — tightening does not retroactively count past
+   * failures (a count already below the old budget but at the new
+   * one still needs one more failure to trip), and loosening
+   * requires more failures to trip. A success still resets the
+   * counter to 0, exactly as before.
+   *
+   * Passing `null` clears the isolation — but never for a subscriber
+   * that is already quarantined: clearing must not bypass the
+   * quarantine audit, so a quarantined subscriber must be resumed
+   * via `resumeQuarantined` first, and only then can the isolation
+   * be cleared. After a successful clear, a further revision is
+   * refused until the subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into the isolation, a non-object value, an illegal budget
+   * (not a positive integer), a non-function callback, and
+   * `undefined` — only an explicit `null` clears — all throw
+   * `RangeError` with the live budget, the live callback, the
+   * counter, the latch, and the audit log untouched. Validation
+   * reuses `resolveHandlerFaultIsolationOptions` against the merged
+   * (current + revised) parameters, so the bounds are exactly the
+   * subscribe-time ones. A revision identical to the current
+   * parameters is a no-op: no audit, and the counter and latch
+   * untouched. Audited as `handler_fault_isolation_revised`
+   * (`{ handlerFaultIsolation: { maxConsecutiveErrors,
+   * onQuarantined: 'set'? } | null, oldHandlerFaultIsolation:
+   * { maxConsecutiveErrors, onQuarantined: 'set'? } }`, the callback
+   * recorded by presence only, never serialized).
+   *
+   * Orthogonal to the subscribe-time isolation of EB-197 (this
+   * revises it, that sets it), and to `resumeQuarantined` (that
+   * clears a quarantine, this retunes the budget that trips it).
+   *
+   * Throws `RangeError` for an unknown / isolation-less subscriber
+   * or an illegal isolation value.
+   */
+  setHandlerFaultIsolation(subId: string, opts: HandlerFaultIsolationOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setHandlerFaultIsolation: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setHandlerFaultIsolation: unknown subscriber: ${subId}`);
+    }
+    const isolation = subscriber.faultIsolation;
+    if (isolation == null) {
+      throw new RangeError('setHandlerFaultIsolation: subscriber has no handlerFaultIsolation set');
+    }
+    const snapshotIsolation = (state: HandlerFaultIsolationState) => ({
+      maxConsecutiveErrors: state.maxConsecutiveErrors,
+      ...(state.onQuarantined !== undefined ? { onQuarantined: 'set' as const } : {}),
+    });
+    const oldHandlerFaultIsolation = snapshotIsolation(isolation);
+    if (opts === null) {
+      if (isolation.quarantined) {
+        throw new RangeError(
+          'setHandlerFaultIsolation: cannot clear handlerFaultIsolation while the subscriber is quarantined; resumeQuarantined first',
+        );
+      }
+      subscriber.faultIsolation = undefined;
+      this.auditSubscription({
+        action: 'handler_fault_isolation_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { handlerFaultIsolation: null, oldHandlerFaultIsolation },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the merged parameters, before any field moves.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setHandlerFaultIsolation: handlerFaultIsolation must be an object with maxConsecutiveErrors and/or onQuarantined, or null to clear it');
+    }
+    const resolved = resolveHandlerFaultIsolationOptions({
+      maxConsecutiveErrors: opts.maxConsecutiveErrors ?? isolation.maxConsecutiveErrors,
+      onQuarantined: opts.onQuarantined ?? isolation.onQuarantined,
+    });
+    // `resolveHandlerFaultIsolationOptions` never returns undefined
+    // for an object input, but keep the guard explicit for the type
+    // checker.
+    if (resolved === undefined) {
+      throw new RangeError('setHandlerFaultIsolation: handlerFaultIsolation must be an object with maxConsecutiveErrors and/or onQuarantined, or null to clear it');
+    }
+    // Identical parameters: a no-op — no audit, and the counter and
+    // latch untouched.
+    if (
+      resolved.maxConsecutiveErrors === isolation.maxConsecutiveErrors &&
+      resolved.onQuarantined === isolation.onQuarantined
+    ) {
+      return;
+    }
+    // Only the two parameters move, in place: the state object, its
+    // consecutive-error counter, and its quarantined latch are
+    // untouched, and the failure path reads the new budget live on
+    // the next handler failure.
+    isolation.maxConsecutiveErrors = resolved.maxConsecutiveErrors;
+    isolation.onQuarantined = resolved.onQuarantined;
+    this.auditSubscription({
+      action: 'handler_fault_isolation_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { handlerFaultIsolation: snapshotIsolation(isolation), oldHandlerFaultIsolation },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

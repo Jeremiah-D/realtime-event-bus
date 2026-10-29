@@ -906,6 +906,29 @@ library.
   vice versa). Invalid options throw `RangeError` from `subscribe`.
   Applies to single-message drains; the retained-snapshot catch-up path
   keeps its existing throw isolation and never feeds the budget.
+  Revisable after subscribe (EB-275, via
+  `setHandlerFaultIsolation(subId, opts | null)`): a subscriber that opted
+  into the isolation can retune its error budget and quarantine callback
+  without re-subscribing — the revision is partial (a field left out keeps
+  its value), and the state object is mutated in place, so the
+  consecutive-error counter and the quarantined latch are preserved:
+  revising neither resets the count nor un-quarantines a subscriber, and
+  the new budget applies from the next handler-failure evaluation (a
+  tightened budget does not retroactively count past failures, a loosened
+  one requires more failures to trip; recovery stays on the
+  `resumeQuarantined` path only). A revision identical to the current
+  parameters is a no-op with no audit. `null` clears the isolation, but
+  never for a quarantined subscriber — it must be resumed first, so
+  clearing cannot bypass the quarantine audit — and a revision after a
+  clear is refused until the subscriber opts in again at subscribe time.
+  It is fail-closed (an unknown subscriber, a subscriber that never opted
+  into the isolation, an illegal budget, or a non-function callback throws
+  `RangeError` with the live budget, callback, counter, latch, and audit
+  log untouched; `undefined` is not a clear, only `null` is), and every
+  success is audited as `handler_fault_isolation_revised`
+  (`{ handlerFaultIsolation: { maxConsecutiveErrors, onQuarantined: 'set'? }
+  | null, oldHandlerFaultIsolation: { ... } }`, the callback recorded by
+  presence only).
   Disabled by default.
 - **Nack-reason aggregation** (in `src/bus.ts` + `src/metrics.ts`, always
   on for reliable subscriptions): every redelivery is classified into
