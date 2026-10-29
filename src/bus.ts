@@ -26625,6 +26625,107 @@ export class EventBus {
   }
 
   /**
+   * Revises the delivery-latency sampling of one subscriber (EB-276):
+   * a subscriber that opted into `deliveryLatency` can retune its
+   * sample-window size without re-subscribing. Only the window bound
+   * ever moves, and it moves in place via
+   * `DeliveryLatencyTracker.resize`: shrinking evicts only the
+   * oldest samples past the new bound (the sample array itself is
+   * never replaced, and the sum is decremented in sync so the mean
+   * stays exact), widening evicts nothing. The revision preserves
+   * the `enqueuedAt` WeakMap — the state object is never replaced —
+   * so in-flight messages keep the enqueue clocks they were stamped
+   * with, and their dwell is measured from the original enqueue,
+   * not from the revision. The new window takes effect from the
+   * next sample and the next summary, because `record` and
+   * `summary` read the live tracker.
+   *
+   * Passing `null` clears sampling entirely: later deliveries are
+   * unsampled, and a revision after a clear is refused until the
+   * subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into sampling, a non-object value, an illegal window size
+   * (not a positive integer), and `undefined` — only an explicit
+   * `null` clears — all throw `RangeError` with the live window,
+   * the samples, the enqueue clocks, and the audit log untouched.
+   * Validation reuses `resolveDeliveryLatencyOptions` against the
+   * merged (current + revised) window, so the bounds are exactly
+   * the subscribe-time ones. A revision identical to the current
+   * window is a no-op: no audit, and no sample evicted even when
+   * the window is restated. Audited as `delivery_latency_revised`
+   * (`{ deliveryLatency: { windowSize } | null, oldDeliveryLatency:
+   * { windowSize } }`).
+   *
+   * Orthogonal to the subscribe-time sampling of EB-31 (this
+   * revises it, that sets it), and to `latencySlo` (EB-53, that
+   * samples handler processing time, this samples queue dwell) and
+   * `ackLatency` (that samples the accepted→ack round trip, this
+   * samples enqueue→hand-off dwell).
+   *
+   * Throws `RangeError` for an unknown / unsampled subscriber or an
+   * illegal window size.
+   */
+  setDeliveryLatency(subId: string, opts: DeliveryLatencyOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeliveryLatency: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeliveryLatency: unknown subscriber: ${subId}`);
+    }
+    const latency = subscriber.latency;
+    if (latency == null) {
+      throw new RangeError('setDeliveryLatency: subscriber has no deliveryLatency set');
+    }
+    const snapshotLatency = (state: SubscriberLatencyState) => ({
+      windowSize: state.tracker.windowSizeLimit(),
+    });
+    const oldDeliveryLatency = snapshotLatency(latency);
+    if (opts === null) {
+      subscriber.latency = undefined;
+      this.auditSubscription({
+        action: 'delivery_latency_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { deliveryLatency: null, oldDeliveryLatency },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — so resolution happens here,
+    // against the merged window, before anything moves. The resolved
+    // state is discarded: only its validation is reused, the live
+    // tracker and its enqueue clocks are never replaced.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setDeliveryLatency: deliveryLatency must be an object with windowSize, or null to clear it');
+    }
+    const mergedWindowSize = opts.windowSize ?? latency.tracker.windowSizeLimit();
+    try {
+      resolveDeliveryLatencyOptions({ windowSize: mergedWindowSize });
+    } catch (err) {
+      throw new RangeError(`setDeliveryLatency: ${(err as Error).message}`);
+    }
+    // Identical window: a no-op — no audit, and no resize (a
+    // restated window must not evict anything).
+    if (mergedWindowSize === latency.tracker.windowSizeLimit()) {
+      return;
+    }
+    // Only the bound moves, in place: the tracker object, its
+    // surviving samples, and the enqueue clocks are untouched, and
+    // the next sample and summary read the new window live.
+    latency.tracker.resize(mergedWindowSize);
+    this.auditSubscription({
+      action: 'delivery_latency_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { deliveryLatency: snapshotLatency(latency), oldDeliveryLatency },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

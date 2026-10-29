@@ -74,12 +74,39 @@ function quantileRank(sorted: number[], q: number): number {
  */
 export class DeliveryLatencyTracker {
   private readonly samples: number[] = [];
-  private readonly windowSize: number;
+  // Mutable only via `resize` (EB-276): the bound is part of the
+  // revision surface, the sample array itself is never replaced.
+  private windowSize: number;
   private sumMs = 0;
 
   constructor(windowSize = 1024) {
     if (!Number.isInteger(windowSize) || windowSize <= 0) {
       throw new RangeError('windowSize must be a positive integer');
+    }
+    this.windowSize = windowSize;
+  }
+
+  /** The window bound the tracker currently enforces (EB-276). */
+  windowSizeLimit(): number {
+    return this.windowSize;
+  }
+
+  /**
+   * Retunes the window bound in place (EB-276, `setDeliveryLatency`):
+   * shrinking evicts the oldest samples past the new bound — the
+   * same oldest-first eviction `record` applies — so the surviving
+   * samples stay in arrival order and the mean stays exact; growing
+   * only raises the bound and keeps every sample. The tracker
+   * object itself never moves, so a subscriber's latency history
+   * survives a window revision.
+   */
+  resize(windowSize: number): void {
+    if (!Number.isInteger(windowSize) || windowSize <= 0) {
+      throw new RangeError('windowSize must be a positive integer');
+    }
+    if (windowSize < this.samples.length) {
+      const evicted = this.samples.splice(0, this.samples.length - windowSize);
+      for (const e of evicted) this.sumMs -= e;
     }
     this.windowSize = windowSize;
   }

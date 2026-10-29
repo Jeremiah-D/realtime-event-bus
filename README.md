@@ -1881,7 +1881,25 @@ library.
   `eventbus_delivery_latency_ms{quantile="0.5"|"0.95"|"0.99",subscriber,pattern}`
   and `eventbus_delivery_latency_samples{subscriber,pattern}` gauges (four
   series per tracked subscriber; untracked subscribers add none). Invalid
-  options throw `RangeError` from `subscribe`. Disabled by default.
+  options throw `RangeError` from `subscribe`. Revisable after subscribe
+  (EB-276, via `setDeliveryLatency(subId, opts | null)`): a sampled
+  subscriber's window size can be retuned without re-subscribing — only
+  the bound moves, in place via `DeliveryLatencyTracker.resize`, so
+  shrinking evicts only the oldest samples (the sample array itself is
+  never replaced and the sum is decremented in sync, keeping the mean
+  exact), widening evicts nothing, and the enqueue clocks of in-flight
+  messages are untouched (their dwell is still measured from the original
+  enqueue). The new window applies from the next sample and summary. A
+  revision identical to the current window is a no-op with no audit.
+  `null` clears sampling entirely, and a revision after a clear is refused
+  until the subscriber opts in again at subscribe time. It is fail-closed
+  (an unknown subscriber, a subscriber that never opted into sampling, or
+  an illegal window size throws `RangeError` with the live window,
+  samples, enqueue clocks, and audit log untouched; `undefined` is not a
+  clear, only `null` is), and every success is audited as
+  `delivery_latency_revised`
+  (`{ deliveryLatency: { windowSize } | null, oldDeliveryLatency:
+  { windowSize } }`). Disabled by default.
 - **t-digest quantile sketch** (in `src/tdigest.ts`, `TDigest`, EB-199):
   zero-dependency streaming quantile estimator for high-cardinality
   latency measurement. Where `DeliveryLatencyTracker` keeps an exact
