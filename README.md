@@ -1958,6 +1958,32 @@ library.
   synchronously with the sample, the SLO, and the subscriber's identity.
   Invalid options throw `RangeError` from `subscribe`. Disabled by
   default.
+  Revisable after subscribe (EB-279, via
+  `setAckLatency(subId, opts | null)`): an ack-latency-enabled
+  subscriber's window, SLO, and miss callback can be retuned without
+  re-subscribing — the revision is partial (a field left out keeps its
+  value), and only those three parameters move, in place: the tracker
+  instance is never replaced, so the per-message accept clocks and the
+  already-recorded samples are untouched, shrinking the window evicts
+  only the oldest samples (via `AckLatencyTracker.resize`), widening
+  restores nothing, retuning the SLO re-scores the retained samples
+  (via `AckLatencyTracker.retune`), and a replaced callback keeps the
+  same `subscriberId` / `pattern` context. The new parameters apply
+  from the next accepted enqueue and the next ack sample. A revision
+  identical to the current parameters is a no-op with no audit.
+  `null` clears sampling entirely, and a revision after a clear is
+  refused until the subscriber opts in again at subscribe time. It is
+  fail-closed (an unknown subscriber, a subscriber that never opted
+  into sampling, or an illegal merged value throws `RangeError` with
+  the live parameters, samples, clocks, and audit log untouched;
+  `undefined` is not a clear, only `null` is), and every success is
+  audited as `ack_latency_revised` (`{ ackLatency: { windowSize,
+  ackSloMs, onAckSloMiss: 'set'? } | null, oldAckLatency: { ... } }`,
+  the callback recorded by presence only). Orthogonal to
+  `setDeliveryLatency` (EB-276, that revises the enqueue→hand-off
+  queue-dwell sampling, this revises the accepted→ack full-round-trip
+  sampling) and to the sampling mechanism itself (EB-40, that sets it
+  at subscribe time, this revises it).
 - **Per-subscriber handler processing-latency p99 SLO alerting** (in
   `src/latency.ts` + `src/bus.ts`, opt-in via
   `subscribe(..., { latencySlo: { p99ThresholdMs: 50 } })`): measures each

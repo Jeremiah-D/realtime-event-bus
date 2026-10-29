@@ -10601,6 +10601,34 @@ function resolveDeliveryLatencyOptions(
  */
 interface SubscriberAckLatencyState {
   tracker: AckLatencyTracker;
+  /**
+   * The live SLO in milliseconds (EB-279 revision surface): always
+   * defined — subscribe defaults it to 30000 — and kept in sync with
+   * the tracker's own SLO by `setAckLatency`, so merged revisions and
+   * no-op comparisons read it without digging into the tracker.
+   */
+  sloMs: number;
+  /**
+   * The subscriber's raw SLO-miss callback (EB-279 revision surface):
+   * the tracker holds the identity-enriching wrapper built from this,
+   * so no-op comparisons compare raw callbacks, never wrappers.
+   */
+  onAckSloMiss?: (event: AckSloMiss) => void;
+}
+
+/**
+ * Partial ack-latency revision for `setAckLatency` (EB-279): any field
+ * left out keeps its current value. `windowSize` retunes the sample
+ * window, `ackSloMs` retunes the SLO the retained samples are scored
+ * against, and `onAckSloMiss` replaces the miss callback.
+ */
+export interface AckLatencyRevisionOptions {
+  /** Rolling window bound; must be a positive integer when provided. */
+  windowSize?: number;
+  /** Ack-latency SLO in milliseconds; must be positive and finite when provided. */
+  ackSloMs?: number;
+  /** Replacement SLO-miss callback; must be a function when provided. */
+  onAckSloMiss?: (event: AckSloMiss) => void;
 }
 
 /**
@@ -10644,6 +10672,8 @@ function resolveAckLatencyOptions(
       onSloMiss: (event) =>
         onAckSloMiss?.({ subscriberId, pattern, ...event }),
     }),
+    sloMs: ackSloMs ?? 30000,
+    onAckSloMiss,
   };
 }
 
@@ -26961,6 +26991,154 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { lagForecast: snapshotForecast(forecast), oldLagForecast },
+    });
+  }
+
+  /**
+   * Revises the ack-latency sampling of one subscriber (EB-279): a
+   * subscriber that opted into `ackLatency` can retune its sample
+   * window, its SLO, and its miss callback without re-subscribing.
+   * The revision is partial: a field left out keeps its current
+   * value, and only those three parameters ever move — the tracker
+   * instance is never replaced, so the per-message accept clocks
+   * (WeakMap) and the already-recorded samples are untouched: an
+   * in-flight message keeps the accept stamp it was stamped with,
+   * and its ack is measured from the original accept, scored and
+   * reported under the live SLO and callback. Shrinking
+   * `windowSize` evicts only the oldest samples (via
+   * `AckLatencyTracker.resize`, which splices in place and never
+   * replaces the sample array, and keeps `sumMs` /
+   * `withinSloCount` in sync); growing it keeps every sample and
+   * never restores samples a shrink already evicted. Retuning
+   * `ackSloMs` re-scores the retained samples against the new SLO
+   * (via `AckLatencyTracker.retune`), so `withinSlo` /
+   * `sloAttainment` reflect the new budget immediately. Replacing
+   * `onAckSloMiss` swaps in a fresh wrapper that keeps the same
+   * `subscriberId` / `pattern` context the subscribe-time wrapper
+   * carried. The new parameters apply from the next accepted
+   * enqueue's stamp and the next `sampleOnAck`, because both read
+   * the live tracker.
+   *
+   * Passing `null` clears sampling entirely: the subscriber leaves
+   * `getStats().ackLatency`, and a later revision is refused until
+   * the subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into sampling, a non-object value, an illegal merged
+   * value (a non-positive-integer window, a non-positive or
+   * non-finite SLO, a non-function callback), and `undefined` —
+   * only an explicit `null` clears — all throw `RangeError` with
+   * the live parameters, the samples, the accept clocks, and the
+   * audit log untouched. Validation reuses
+   * `resolveAckLatencyOptions` against the merged (current +
+   * revised) parameters, so the bounds are exactly the
+   * subscribe-time ones; its `TypeError` for a non-function
+   * callback is normalized to `RangeError` here. A revision
+   * identical to the current parameters is a no-op: no audit, and
+   * no sample evicted even when the window is restated. Audited as
+   * `ack_latency_revised` (`{ ackLatency: { windowSize, ackSloMs,
+   * onAckSloMiss: 'set'? } | null, oldAckLatency: { ... } }`, the
+   * callback recorded by presence only, never serialized).
+   *
+   * Orthogonal to `setDeliveryLatency` (EB-276, that revises the
+   * enqueue→hand-off queue-dwell sampling, this revises the
+   * accepted→ack full-round-trip sampling) and to the sampling
+   * mechanism itself (EB-40, that sets it at subscribe time, this
+   * revises it).
+   *
+   * Throws `RangeError` for an unknown / unsampled subscriber or an
+   * illegal ack-latency value.
+   */
+  setAckLatency(subId: string, opts: AckLatencyRevisionOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setAckLatency: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setAckLatency: unknown subscriber: ${subId}`);
+    }
+    const ackLatency = subscriber.ackLatency;
+    if (ackLatency == null) {
+      throw new RangeError('setAckLatency: subscriber has no ackLatency set');
+    }
+    const snapshotAckLatency = (state: SubscriberAckLatencyState) => ({
+      windowSize: state.tracker.windowSizeLimit(),
+      ackSloMs: state.sloMs,
+      ...(state.onAckSloMiss !== undefined ? { onAckSloMiss: 'set' as const } : {}),
+    });
+    const oldAckLatency = snapshotAckLatency(ackLatency);
+    if (opts === null) {
+      subscriber.ackLatency = undefined;
+      this.auditSubscription({
+        action: 'ack_latency_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { ackLatency: null, oldAckLatency },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the merged parameters, before any field moves. The resolved
+    // state is discarded: only its validation is reused, the live
+    // tracker, its samples, and its accept clocks are never replaced.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setAckLatency: ackLatency must be an object with windowSize and/or ackSloMs and/or onAckSloMiss, or null to clear it');
+    }
+    const mergedWindowSize = opts.windowSize ?? ackLatency.tracker.windowSizeLimit();
+    const mergedAckSloMs = opts.ackSloMs ?? ackLatency.sloMs;
+    const mergedOnAckSloMiss = opts.onAckSloMiss ?? ackLatency.onAckSloMiss;
+    try {
+      const resolved = resolveAckLatencyOptions(
+        { windowSize: mergedWindowSize },
+        mergedAckSloMs,
+        mergedOnAckSloMiss,
+        subscriber.id,
+        subscriber.pattern,
+        this.now,
+      );
+      if (resolved === undefined) {
+        throw new RangeError('setAckLatency: ackLatency must be an object with windowSize and/or ackSloMs and/or onAckSloMiss, or null to clear it');
+      }
+    } catch (err) {
+      throw new RangeError(`setAckLatency: ${(err as Error).message}`);
+    }
+    // Identical parameters: a no-op — no audit, and no resize (a
+    // restated window must not evict anything).
+    if (
+      mergedWindowSize === ackLatency.tracker.windowSizeLimit() &&
+      mergedAckSloMs === ackLatency.sloMs &&
+      mergedOnAckSloMiss === ackLatency.onAckSloMiss
+    ) {
+      return;
+    }
+    // Only the three parameters move, in place: the tracker object,
+    // its surviving samples, and its accept clocks are untouched,
+    // and the next sample reads the new values live. Resize first so
+    // the SLO re-score in `retune` runs over the retained samples.
+    if (mergedWindowSize !== ackLatency.tracker.windowSizeLimit()) {
+      ackLatency.tracker.resize(mergedWindowSize);
+    }
+    const callbackChanged = mergedOnAckSloMiss !== ackLatency.onAckSloMiss;
+    if (mergedAckSloMs !== ackLatency.sloMs || callbackChanged) {
+      ackLatency.tracker.retune(
+        mergedAckSloMs,
+        callbackChanged && mergedOnAckSloMiss !== undefined
+          ? (event) =>
+              mergedOnAckSloMiss({ subscriberId: subscriber.id, pattern: subscriber.pattern, ...event })
+          : undefined,
+      );
+    }
+    ackLatency.sloMs = mergedAckSloMs;
+    ackLatency.onAckSloMiss = mergedOnAckSloMiss;
+    this.auditSubscription({
+      action: 'ack_latency_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { ackLatency: snapshotAckLatency(ackLatency), oldAckLatency },
     });
   }
 

@@ -124,10 +124,14 @@ export interface AckLatencyTrackerOptions {
  */
 export class AckLatencyTracker {
   private readonly samples: number[] = [];
-  private readonly windowSize: number;
-  private readonly sloMs: number | undefined;
+  // Mutable only via `resize` / `retune` (EB-279): the window bound, the
+  // SLO, and the miss callback are part of the revision surface, while
+  // the sample array itself is never replaced. `sampleOnAck` reads all
+  // three live, so a revision takes effect from the next sample.
+  private windowSize: number;
+  private sloMs: number | undefined;
   private readonly now: () => number;
-  private readonly onSloMiss: ((event: AckSloMissEvent) => void) | undefined;
+  private onSloMiss: ((event: AckSloMissEvent) => void) | undefined;
   private readonly clocks = new WeakMap<object, MessageClock>();
   private sumMs = 0;
   private withinSloCount = 0;
@@ -145,6 +149,69 @@ export class AckLatencyTracker {
     this.sloMs = sloMs;
     this.now = options.now ?? Date.now;
     this.onSloMiss = options.onSloMiss;
+  }
+
+  /** The window bound the tracker currently enforces (EB-279). */
+  windowSizeLimit(): number {
+    return this.windowSize;
+  }
+
+  /** The SLO the tracker currently enforces, if any (EB-279). */
+  sloMsLimit(): number | undefined {
+    return this.sloMs;
+  }
+
+  /**
+   * Retunes the window bound in place (EB-279, `setAckLatency`):
+   * shrinking evicts only the oldest samples past the new bound — the
+   * same oldest-first eviction `sampleOnAck` applies — and the evicted
+   * samples leave `sumMs` and `withinSloCount` in sync (counted against
+   * the pre-resize SLO, which `retune` then re-derives if the SLO also
+   * moves); growing only raises the bound, keeps every sample, and
+   * never restores samples a shrink already evicted. The tracker
+   * object, its sample array, and its per-message accept clocks are
+   * never replaced, so in-flight messages keep the clocks they were
+   * stamped with and their ack is measured from the original accept.
+   */
+  resize(windowSize: number): void {
+    if (!Number.isInteger(windowSize) || windowSize <= 0) {
+      throw new RangeError('windowSize must be a positive integer');
+    }
+    if (windowSize < this.samples.length) {
+      const evicted = this.samples.splice(0, this.samples.length - windowSize);
+      for (const e of evicted) {
+        this.sumMs -= e;
+        if (this.sloMs === undefined || e <= this.sloMs) {
+          this.withinSloCount -= 1;
+        }
+      }
+    }
+    this.windowSize = windowSize;
+  }
+
+  /**
+   * Retunes the SLO and, when given, the miss callback in place
+   * (EB-279, `setAckLatency`): the retained samples are re-scored
+   * against the new SLO, so `withinSlo` / `sloAttainment` reflect the
+   * new budget immediately, without touching any sample. An omitted
+   * callback keeps the current one; the bus passes a fresh wrapper
+   * when the callback is replaced, so the subscriber-identity context
+   * the wrapper carries is never lost. In-flight accept clocks and
+   * already-recorded samples are untouched, and the next
+   * `sampleOnAck` fires (or not) under the new SLO and callback.
+   */
+  retune(sloMs: number, onSloMiss?: (event: AckSloMissEvent) => void): void {
+    if (!Number.isFinite(sloMs) || sloMs <= 0) {
+      throw new RangeError('sloMs must be a positive finite number of milliseconds');
+    }
+    this.sloMs = sloMs;
+    this.withinSloCount = 0;
+    for (const s of this.samples) {
+      if (s <= sloMs) this.withinSloCount += 1;
+    }
+    if (onSloMiss !== undefined) {
+      this.onSloMiss = onSloMiss;
+    }
   }
 
   /**
