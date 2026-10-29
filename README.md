@@ -1377,6 +1377,30 @@ library.
   uniformly: live fan-out, durable-log replay (`resumeFromSeq` /
   `resumeFromTime`), and the retained-message snapshot. Non-positive-integer
   values throw `RangeError` at subscribe time.
+  Revisable after subscribe (EB-283, via
+  `setSubscriberMaxPayloadBytes(subId, bytes | null)`): a subscriber's
+  explicit payload cap can be retuned without re-subscribing — but only
+  subscriptions that already carry one (the cap is opt-in), so a
+  never-set cap, and a cap cleared by an earlier revision, both throw
+  `RangeError` until the subscriber opts in again at subscribe time.
+  `null` clears back to inheritance of the topic's EB-120 payload cap,
+  or to no cap when the topic has none. Only the subscriber field
+  moves: `subscriberPayloadCapFor` reads the live field on every
+  delivery decision, so the new cap governs from the next delivery
+  decision, and already-delivered messages, already-skipped messages,
+  the oversize counters, and the per-topic sequence baseline are
+  untouched. A revision identical to the current cap is a no-op with
+  no audit. It is fail-closed (an unknown subscriber, an unset cap, a
+  non-positive-integer cap, or `undefined` — only an explicit `null`
+  clears — throws `RangeError` with the live cap and the audit log
+  untouched), and every success is audited as
+  `subscriber_max_payload_bytes_revised`
+  (`{ subscriberMaxPayloadBytes: <number> | null,
+  oldSubscriberMaxPayloadBytes: <number> }`). Orthogonal to the queue
+  byte budget (EB-282, that revises `queueMaxBytes`, this revises the
+  delivery payload cap) and to the topic cap (EB-120, that revises the
+  topic cap, this revises the subscriber's explicit cap). (Real-time
+  systems: delivery governance.)
 - **Per-topic sensitive-field redaction** (in `src/bus.ts`, via
   `setTopicRedaction(pattern, fields)`): admission-time masking of
   sensitive payload fields for PII/secret hygiene (backend/real-time

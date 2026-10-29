@@ -27505,6 +27505,93 @@ export class EventBus {
   }
 
   /**
+   * Revises one subscriber's explicit payload-size cap (EB-283): the
+   * opt-in counterpart of `setQueueMaxBytes` (EB-282, that revises
+   * the queue byte budget, this revises the per-delivery payload
+   * cap). Only subscriptions that already carry an explicit
+   * `subscriberMaxPayloadBytes` can be revised — the cap is opt-in,
+   * so a subscription without one has no explicit cap to retune, and
+   * a revision after a clear is refused until the subscriber opts in
+   * again at subscribe time (the EB-279/EB-280/EB-282 precedent).
+   * Only the subscriber field moves: unlike `queueMaxBytes` there is
+   * no second aggregate object to update, because
+   * `subscriberPayloadCapFor` reads the live field on every delivery
+   * decision (live fan-out, durable-log replay, and the
+   * retained-message snapshot all resolve through it), so the new
+   * cap governs from the next delivery decision with no drain or
+   * re-registration required. Already-delivered messages, already
+   * skipped messages, the oversize counters, and the per-topic
+   * sequence baseline are untouched — a skip already counted stays
+   * counted, and a narrowed-then-widened cap never resurrects a
+   * message skipped under the old cap. Shrinking below a payload
+   * already delivered changes nothing about it; growing admits the
+   * next oversize payload immediately.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription with no
+   * explicit cap set, a non-positive-integer cap (0, negative,
+   * fractional, `NaN`, `Infinity`, or a non-number), and
+   * `undefined` — only an explicit `null` clears — all throw
+   * `RangeError` with the live cap and the audit log untouched.
+   * Clearing removes the explicit cap, so the delivery gate falls
+   * back to the topic's EB-120 payload cap resolved for the
+   * message's topic at delivery time, or to no cap when the topic
+   * has none. A revision identical to the current cap is a no-op
+   * with no audit. Audited as
+   * `subscriber_max_payload_bytes_revised`
+   * (`{ subscriberMaxPayloadBytes: <number> | null,
+   * oldSubscriberMaxPayloadBytes: <number> }`, `null` meaning the
+   * explicit cap was cleared back to inheritance).
+   *
+   * Orthogonal to `setQueueMaxBytes` (EB-282, that revises the
+   * queue byte budget, this revises the delivery payload cap), to
+   * `setTopicMaxPayloadBytes` (EB-120, that revises the topic cap,
+   * this revises the subscriber's explicit cap), and to the cap
+   * mechanism itself (EB-208, that sets the cap at subscribe time,
+   * this revises it).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unset cap,
+   * or an illegal cap.
+   */
+  setSubscriberMaxPayloadBytes(subId: string, bytes: number | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setSubscriberMaxPayloadBytes: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setSubscriberMaxPayloadBytes: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a non-integer never moves
+    // the live cap (the subscribe-time validation, EB-208, is integer).
+    if (bytes !== null && (typeof bytes !== 'number' || !Number.isInteger(bytes) || bytes <= 0)) {
+      throw new RangeError('setSubscriberMaxPayloadBytes: bytes must be a positive integer, or null to clear it');
+    }
+    // Opt-in gate: only a subscription that already carries an
+    // explicit cap can be revised — a never-set cap, and a cap
+    // cleared by an earlier revision, both refuse until the
+    // subscriber opts in again at subscribe time.
+    if (subscriber.subscriberMaxPayloadBytes === undefined) {
+      throw new RangeError('setSubscriberMaxPayloadBytes: subscriber has no explicit payload cap set');
+    }
+    const oldSubscriberMaxPayloadBytes = subscriber.subscriberMaxPayloadBytes;
+    const newCap = bytes === null ? undefined : bytes;
+    // Identical cap: a no-op — no audit, and no delivery state moves.
+    if (newCap === oldSubscriberMaxPayloadBytes) {
+      return;
+    }
+    // Only the field moves; every delivery decision re-resolves the
+    // effective cap from this live field (see subscriberPayloadCapFor).
+    subscriber.subscriberMaxPayloadBytes = newCap;
+    this.auditSubscription({
+      action: 'subscriber_max_payload_bytes_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { subscriberMaxPayloadBytes: newCap ?? null, oldSubscriberMaxPayloadBytes },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
