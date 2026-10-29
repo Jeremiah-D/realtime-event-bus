@@ -8484,6 +8484,30 @@ Semantics:
 - **Observability.** `getStats().lagForecast` exposes the per-subscriber
   forecast state: current watermark, sample count, fitted slope,
   predicted time-to-threshold, confidence, and the alert latch.
+- **Revisable after subscribe** (EB-278, via
+  `setLagForecast(subId, opts | null)`): a forecast-enabled
+  subscriber's window, minimum-sample bar, threshold, horizon, and
+  alert callback can be retuned without re-subscribing — the revision
+  is partial (a field left out keeps its value), and only those five
+  parameters move, in place: the enqueue stamps and the `alerted`
+  latch are untouched, so shrinking the window evicts only the oldest
+  samples (via `LagForecastTracker.resize`, which splices in place and
+  never replaces the sample array), widening restores nothing, and the
+  new parameters apply from the next accepted enqueue's forecast
+  evaluation, with the latch clearing or re-arming self-consistently
+  under them. A revision identical to the current parameters is a
+  no-op with no audit. `null` clears forecasting entirely, and a
+  revision after a clear is refused until the subscriber opts in again
+  at subscribe time. It is fail-closed (an unknown subscriber, a
+  subscriber that never opted into forecasting, or an illegal merged
+  value throws `RangeError` with the live parameters, samples,
+  stamps, latch, and audit log untouched; `undefined` is not a clear,
+  only `null` is), and every success is audited as
+  `lag_forecast_revised` (`{ lagForecast: { windowSize, minSamples,
+  thresholdMs?, forecastHorizonMs?, onLagForecast: 'set'? } | null,
+  oldLagForecast: { ... } }`, the callback recorded by presence only).
+  Orthogonal to `setLagMonitor` (EB-273, that revises the
+  current-waterlevel monitor, this revises the trend forecast).
 - **Orthogonality.** EB-35 (current waterlevel) and EB-48 (group lag)
   observe; this predicts. Sampling costs one clock read per accepted
   enqueue for forecast-enabled subscribers only, and the clock is the

@@ -26809,6 +26809,162 @@ export class EventBus {
   }
 
   /**
+   * Revises the lag-forecast parameters of one subscriber (EB-278): a
+   * subscriber that opted into `lagForecast` can retune its window,
+   * minimum-sample bar, threshold, horizon, and alert callback
+   * without re-subscribing. The revision is partial: a field left
+   * out keeps its current value, and only those five parameters
+   * ever move — the state object is mutated in place, never
+   * replaced, so the `enqueuedAt` WeakMap and the `alerted`
+   * excursion latch are untouched: in-flight messages keep the
+   * enqueue stamps they were stamped with, an armed excursion is
+   * neither re-fired nor silently cleared by the revision itself,
+   * and the next forecast evaluation — on the next accepted
+   * enqueue or drain, reading the live threshold, horizon, and
+   * window — clears or re-arms the latch self-consistently under
+   * the new parameters. Shrinking `windowSize` evicts only the
+   * oldest samples (via `LagForecastTracker.resize`, which splices
+   * in place and never replaces the sample array); growing it
+   * keeps every sample and never restores samples a shrink already
+   * evicted. The new parameters apply from the next accepted
+   * enqueue's forecast evaluation, because `checkLagForecast` reads
+   * the live forecast state on every call.
+   *
+   * Passing `null` clears forecasting entirely: the subscriber
+   * leaves `getStats().lagForecast`, and a later revision is
+   * refused until the subscriber opts in again at subscribe time.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into forecasting, a non-object value, an illegal merged
+   * value (a non-positive-integer window, a minimum below 2 or
+   * above the window, a non-positive or non-finite threshold or
+   * horizon, a callback with no threshold to arm it — including
+   * revising `onLagForecast` alone on a threshold-less
+   * subscription), and `undefined` — only an explicit `null`
+   * clears — all throw `RangeError` with the live parameters, the
+   * samples, the enqueue stamps, the latch, and the audit log
+   * untouched. Validation reuses `resolveLagForecastOptions`
+   * against the merged (current + revised) parameters, so the
+   * bounds are exactly the subscribe-time ones; its `TypeError`
+   * for a non-function callback is normalized to `RangeError`
+   * here. A revision identical to the current parameters is a
+   * no-op: no audit, and no sample evicted even when the window
+   * is restated. Audited as `lag_forecast_revised`
+   * (`{ lagForecast: { windowSize, minSamples, thresholdMs?,
+   * forecastHorizonMs?, onLagForecast: 'set'? } | null,
+   * oldLagForecast: { ... } }`, the callback recorded by presence
+   * only, never serialized).
+   *
+   * Orthogonal to `setLagMonitor` (EB-273, that revises the
+   * current-waterlevel monitor, this revises the trend forecast)
+   * and to the forecasting mechanism itself (EB-183, that sets it
+   * at subscribe time, this revises it).
+   *
+   * Throws `RangeError` for an unknown / forecast-less subscriber
+   * or an illegal forecast value.
+   */
+  setLagForecast(subId: string, opts: LagForecastOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setLagForecast: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setLagForecast: unknown subscriber: ${subId}`);
+    }
+    const forecast = subscriber.forecast;
+    if (forecast == null) {
+      throw new RangeError('setLagForecast: subscriber has no lagForecast set');
+    }
+    const snapshotForecast = (state: SubscriberLagForecastState) => ({
+      windowSize: state.tracker.windowSizeLimit(),
+      minSamples: state.tracker.minSamplesLimit(),
+      ...(state.thresholdMs !== undefined ? { thresholdMs: state.thresholdMs } : {}),
+      ...(Number.isFinite(state.forecastHorizonMs)
+        ? { forecastHorizonMs: state.forecastHorizonMs }
+        : {}),
+      ...(state.onLagForecast !== undefined ? { onLagForecast: 'set' as const } : {}),
+    });
+    const oldLagForecast = snapshotForecast(forecast);
+    if (opts === null) {
+      subscriber.forecast = undefined;
+      this.auditSubscription({
+        action: 'lag_forecast_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { lagForecast: null, oldLagForecast },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the merged parameters, before any field moves. The live
+    // horizon's `Infinity` sentinel (neither threshold nor horizon
+    // ever set) is passed as "unset" so resolution applies its
+    // threshold default exactly as at subscribe time; the resolved
+    // state itself is discarded — only its validation (and its
+    // defaulted horizon) is reused, the live tracker, its samples,
+    // and its enqueue stamps are never replaced.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setLagForecast: lagForecast must be an object with windowSize and/or minSamples and/or thresholdMs and/or forecastHorizonMs and/or onLagForecast, or null to clear it');
+    }
+    const merged: LagForecastOptions = {
+      windowSize: opts.windowSize ?? forecast.tracker.windowSizeLimit(),
+      minSamples: opts.minSamples ?? forecast.tracker.minSamplesLimit(),
+      thresholdMs: opts.thresholdMs ?? forecast.thresholdMs,
+      forecastHorizonMs:
+        opts.forecastHorizonMs ??
+        (Number.isFinite(forecast.forecastHorizonMs) ? forecast.forecastHorizonMs : undefined),
+      onLagForecast: opts.onLagForecast ?? forecast.onLagForecast,
+    };
+    let resolved: SubscriberLagForecastState;
+    try {
+      const r = resolveLagForecastOptions(merged);
+      if (r === undefined) {
+        throw new RangeError('setLagForecast: lagForecast must be an object with windowSize and/or minSamples and/or thresholdMs and/or forecastHorizonMs and/or onLagForecast, or null to clear it');
+      }
+      resolved = r;
+    } catch (err) {
+      throw new RangeError(`setLagForecast: ${(err as Error).message}`);
+    }
+    // Identical parameters: a no-op — no audit, and no resize (a
+    // restated window must not evict anything).
+    if (
+      resolved.tracker.windowSizeLimit() === forecast.tracker.windowSizeLimit() &&
+      resolved.tracker.minSamplesLimit() === forecast.tracker.minSamplesLimit() &&
+      resolved.thresholdMs === forecast.thresholdMs &&
+      resolved.forecastHorizonMs === forecast.forecastHorizonMs &&
+      resolved.onLagForecast === forecast.onLagForecast
+    ) {
+      return;
+    }
+    // Only the five parameters move, in place: the state object,
+    // its enqueue stamps, its surviving samples, and its alerted
+    // latch are untouched, and the next forecast evaluation reads
+    // the new values live.
+    if (
+      resolved.tracker.windowSizeLimit() !== forecast.tracker.windowSizeLimit() ||
+      resolved.tracker.minSamplesLimit() !== forecast.tracker.minSamplesLimit()
+    ) {
+      forecast.tracker.resize(
+        resolved.tracker.windowSizeLimit(),
+        resolved.tracker.minSamplesLimit(),
+      );
+    }
+    forecast.thresholdMs = resolved.thresholdMs;
+    forecast.forecastHorizonMs = resolved.forecastHorizonMs;
+    forecast.onLagForecast = resolved.onLagForecast;
+    this.auditSubscription({
+      action: 'lag_forecast_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { lagForecast: snapshotForecast(forecast), oldLagForecast },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of

@@ -134,8 +134,10 @@ export interface LagForecastPrediction {
  */
 export class LagForecastTracker {
   private readonly samples: WatermarkSample[] = [];
-  private readonly windowSize: number;
-  private readonly minSamples: number;
+  // Mutable only via `resize` (EB-278): the bounds are part of the
+  // revision surface, the sample array itself is never replaced.
+  private windowSize: number;
+  private minSamples: number;
 
   constructor(windowSize = 64, minSamples = 4) {
     if (!Number.isInteger(windowSize) || windowSize <= 0) {
@@ -162,6 +164,44 @@ export class LagForecastTracker {
   /** Samples currently in the window. */
   get sampleCount(): number {
     return this.samples.length;
+  }
+
+  /** The window bound the tracker currently enforces (EB-278). */
+  windowSizeLimit(): number {
+    return this.windowSize;
+  }
+
+  /** The minimum-sample bound the tracker currently enforces (EB-278). */
+  minSamplesLimit(): number {
+    return this.minSamples;
+  }
+
+  /**
+   * Retunes the window and minimum-sample bounds in place (EB-278,
+   * `setLagForecast`): shrinking the window evicts only the oldest
+   * samples past the new bound — the same oldest-first eviction
+   * `record` applies, via `splice` so the sample array itself is
+   * never replaced — and growing only raises the bound and keeps
+   * every sample, never restoring samples a shrink already evicted.
+   * Raising `minSamples` alone changes no sample, it only raises the
+   * bar for the next fit. The tracker object itself never moves, so
+   * a subscriber's forecast history survives a parameter revision.
+   */
+  resize(windowSize: number, minSamples: number = this.minSamples): void {
+    if (!Number.isInteger(windowSize) || windowSize <= 0) {
+      throw new RangeError('lagForecast.windowSize must be a positive integer');
+    }
+    if (!Number.isInteger(minSamples) || minSamples < 2) {
+      throw new RangeError('lagForecast.minSamples must be an integer >= 2');
+    }
+    if (minSamples > windowSize) {
+      throw new RangeError('lagForecast.minSamples must not exceed lagForecast.windowSize');
+    }
+    if (windowSize < this.samples.length) {
+      this.samples.splice(0, this.samples.length - windowSize);
+    }
+    this.windowSize = windowSize;
+    this.minSamples = minSamples;
   }
 
   /**
