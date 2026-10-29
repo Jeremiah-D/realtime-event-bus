@@ -749,6 +749,32 @@ library.
   `blockedCount(subId)` per subscriber. Anything else throws `RangeError` at
   subscribe time; an explicit `dropPolicy` contradicting an explicit drop tier
   also throws.
+  Revisable after subscribe (EB-281, via
+  `setQueueSize(subId, size | null)`): a subscriber's queue count
+  capacity can be retuned without re-subscribing — every subscription
+  carries one (`queueSize`, default 100), so there is no opt-in gate
+  and `null` clears back to the default 100, never to "no capacity".
+  Only the capacity moves, in place: the queue object, its
+  already-queued messages, `dropPolicy`, `highWaterMarkRatio`,
+  `queueMaxBytes`, and the backpressure tier are untouched, so
+  shrinking below the current depth evicts nothing and the new cap
+  governs only future admissions — a shrunken queue admits nothing
+  new while at or above the cap (`'drop-newest'` refuses the newcomer
+  outright; the default `'block'` tier is armed at once, so arrivals
+  are refused until the queue recedes below the new high-water mark;
+  `'drop-oldest'` still sheds per its standing policy). Growing admits
+  immediately, and the high-water mark follows automatically
+  (`queueSize * highWaterMarkRatio`, the ratio itself unmoved). A
+  revision identical to the current effective capacity — including
+  `null` when already at 100 — is a no-op with no audit. It is
+  fail-closed (an unknown subscriber, a non-positive-integer size, or
+  `undefined` — only an explicit `null` clears — throws `RangeError`
+  with the live capacity, the queue, and the audit log untouched),
+  and every success is audited as `queue_size_revised`
+  (`{ queueSize: <number>, oldQueueSize: <number> }`). Orthogonal to
+  the byte budget (EB-282, that revises `queueMaxBytes`, this revises
+  the message-count capacity). (Real-time systems: delivery
+  governance.)
 - **`src/throttle.ts` — `TokenBucket` + adaptive publish-side throttling**:
   opt-in per subscriber via `subscribe(..., { throttle: true })`. When the
   subscriber's queue crosses the high-water mark, the bus rate-limits how many

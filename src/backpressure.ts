@@ -97,7 +97,7 @@ function defaultByteSize(item: unknown): number {
 
 export class BoundedQueue<T> {
   private entries: QueueEntry<T>[] = [];
-  private readonly capacity: number;
+  private capacity: number;
   private readonly policy: DropPolicy;
   private readonly onHighWaterMark?: (size: number) => void;
   private readonly onDrained?: (size: number) => void;
@@ -185,6 +185,25 @@ export class BoundedQueue<T> {
   setHighWaterMarkRatio(ratio: number): void {
     BoundedQueue.checkRatio(ratio);
     this.highWaterMarkFraction = ratio;
+    this.maybeFireDrained();
+  }
+
+  /**
+   * Adjusts the count capacity at runtime (EB-281, via
+   * `EventBus.setQueueSize`). Queued entries are untouched — shrinking
+   * below the current size evicts nothing; the new cap governs only
+   * future `push` calls, which shed or refuse per `policy` once the
+   * size reaches it. Growing above the current size admits immediately,
+   * and if an excursion is in flight and the queue is already below
+   * the new high-water mark, the excursion ends immediately (the
+   * `setHighWaterMarkRatio` precedent). Throws `RangeError` for a
+   * non-positive-integer capacity.
+   */
+  setCapacity(capacity: number): void {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new RangeError('capacity must be a positive integer');
+    }
+    this.capacity = capacity;
     this.maybeFireDrained();
   }
 

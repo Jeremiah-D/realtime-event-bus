@@ -23691,17 +23691,19 @@ export class EventBus {
         : {
             onHighWaterMark: (size: number) => {
               if (throttle != null) {
-                this.engageThrottle(subscriber, size, capacity);
+                this.engageThrottle(subscriber, size, subscriber.queueCapacity);
               }
               onBackpressure?.({
                 // The subscriber's live pattern, not the registration-time
                 // capture: `updateSubscriptionPattern` (EB-74) rewrites it
                 // in place, and events must name the pattern the
-                // subscription actually matches on.
+                // subscription actually matches on. Likewise the live
+                // capacity, not the subscribe-time one: `setQueueSize`
+                // (EB-281) revises it in place.
                 subscriberId: id,
                 pattern: subscriber.pattern,
                 queueSize: size,
-                capacity,
+                capacity: subscriber.queueCapacity,
                 dropped: queue.droppedCount,
               });
             },
@@ -23723,10 +23725,12 @@ export class EventBus {
               onDrained?.({
                 // Live pattern (see onBackpressure above): a hot pattern
                 // update must not leave events naming a stale pattern.
+                // Likewise the live capacity: `setQueueSize` (EB-281)
+                // revises it in place.
                 subscriberId: id,
                 pattern: subscriber.pattern,
                 queueSize: size,
-                capacity,
+                capacity: subscriber.queueCapacity,
                 dropped: queue.droppedCount,
                 highWaterMark: queue.highWaterMark,
               });
@@ -27314,6 +27318,95 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { sessionWindow: snapshotSessionWindow(sessionWindow), oldSessionWindow },
+    });
+  }
+
+  /**
+   * Revises one subscriber's queue count capacity (EB-281): every
+   * subscription carries a capacity — `SubscribeOptions.queueSize`,
+   * default 100 — so, unlike the opt-in revisions (EB-279/EB-280),
+   * there is no "unset" state and no opt-in gate: any known
+   * subscriber can be revised, and `null` clears back to the
+   * documented default 100 rather than to "no capacity". Only the
+   * capacity moves, in place: the queue object, its already-queued
+   * messages, and every other subscriber option — `dropPolicy`,
+   * `highWaterMarkRatio`, `queueMaxBytes`, the backpressure tier —
+   * are untouched. Shrinking below the current depth evicts nothing:
+   * the backlog stays over the new cap until it drains, and the new
+   * cap governs only future admissions — a shrunken queue admits
+   * nothing new while at or above the cap (`'drop-newest'` refuses
+   * the newcomer outright; `'drop-oldest'` sheds per its standing
+   * policy; the default `'block'` tier is armed at once, so arrivals
+   * are refused until the queue recedes below the new high-water
+   * mark, exactly as if saturation had been reached by an arrival).
+   * Growing admits immediately: the next publish sees the new headroom
+   * with no drain required. The high-water mark follows automatically
+   * (`queueSize * highWaterMarkRatio`, the ratio itself unmoved), so a
+   * grow that lifts the mark above the current depth ends an
+   * in-flight excursion via the usual `onDrained` path, and a shrink
+   * that saturates the queue arms the excursion latch without
+   * re-firing `onBackpressure` (the saturation is a revision fact,
+   * not a new arrival crossing the mark).
+   *
+   * Fail-closed: an unknown subscriber id, a non-positive-integer
+   * size (0, negative, fractional, `NaN`, `Infinity`, or a
+   * non-number), and `undefined` — only an explicit `null` clears —
+   * all throw `RangeError` with the live capacity, the queue, and
+   * the audit log untouched. A revision identical to the current
+   * effective capacity — including `null` when the subscriber is
+   * already at the default 100 — is a no-op with no audit. Audited as
+   * `queue_size_revised` (`{ queueSize: <number>, oldQueueSize:
+   * <number> }`).
+   *
+   * Orthogonal to `setQueueMaxBytes` (EB-282, that revises the byte
+   * budget, this revises the message-count capacity) and to the
+   * queue mechanism itself (EB-83, that sets the capacity and the
+   * backpressure tier at subscribe time, this revises the capacity).
+   *
+   * Throws `RangeError` for an unknown subscriber or an illegal size.
+   */
+  setQueueSize(subId: string, size: number | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setQueueSize: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setQueueSize: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a non-number never moves
+    // the live capacity.
+    if (size !== null && (typeof size !== 'number' || !Number.isInteger(size) || size <= 0)) {
+      throw new RangeError('setQueueSize: size must be a positive integer, or null to clear it to the default 100');
+    }
+    const oldQueueSize = subscriber.queueCapacity;
+    const newQueueSize = size === null ? 100 : size;
+    // Identical capacity: a no-op — no audit, and no queue state moves.
+    if (newQueueSize === oldQueueSize) {
+      return;
+    }
+    // Only the capacity moves, in both places admission reads it: the
+    // bus-level saturation check (`enqueueMessage`'s `wasFull`) and
+    // the queue's own aggregate gate (`LaneQueue.push`). The queue
+    // object itself is never replaced, so the backlog survives intact.
+    subscriber.queueCapacity = newQueueSize;
+    subscriber.queue.setCapacity(newQueueSize);
+    // The default `'block'` tier, saturated by the revision itself:
+    // arm the refusal at once instead of letting the next arrival
+    // shed one queued message first — the backlog is preserved, and
+    // the drain below the new high-water mark clears it via the usual
+    // `onDrained` path (the queue's excursion latch is armed by
+    // `setCapacity`, so the clear cannot wedge). Drop tiers never use
+    // this flag and are unaffected.
+    if (subscriber.backpressure === 'block' && subscriber.queue.size >= newQueueSize) {
+      subscriber.blocked = true;
+    }
+    this.auditSubscription({
+      action: 'queue_size_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { queueSize: newQueueSize, oldQueueSize },
     });
   }
 

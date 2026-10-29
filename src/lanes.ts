@@ -187,7 +187,7 @@ export interface LaneQueueOptions<T> {
  */
 export class LaneQueue<T> {
   private readonly lanes: Record<MessageLane, BoundedQueue<T>>;
-  private readonly capacity: number;
+  private capacity: number;
   private readonly policy: DropPolicy;
   private readonly weights: LaneWeights;
   private readonly bulkStarvationRounds: number;
@@ -313,6 +313,37 @@ export class LaneQueue<T> {
       throw new RangeError('highWaterMarkRatio must be a finite number in (0, 1]');
     }
     this.highWaterMarkFraction = ratio;
+    this.maybeFireDrained();
+  }
+
+  /**
+   * Adjusts the aggregate count capacity at runtime (EB-281, via
+   * `EventBus.setQueueSize`). Queued entries are untouched — shrinking
+   * below the current size evicts nothing; the new cap governs only
+   * future `push` calls, which shed or refuse per `policy` once the
+   * aggregate reaches it. The per-lane capacities move with the
+   * aggregate (they are unreachable by construction — the aggregate
+   * check gates first — but a stale lane cap would be a trap for any
+   * future direct lane push). Shrinking onto or below the current
+   * size arms the high-water-mark excursion latch without re-firing
+   * `onHighWaterMark` (the saturation is a revision fact, not a new
+   * arrival crossing the mark), so a later drain below the new mark
+   * still ends the excursion via `onDrained` — this is what lets the
+   * bus's `'block'` tier, armed by the revision, unblock on drain
+   * instead of wedging. Growing above the current size admits
+   * immediately and ends an in-flight excursion via `maybeFireDrained`
+   * when the size already sits below the new mark. Throws `RangeError`
+   * for a non-positive-integer capacity.
+   */
+  setCapacity(capacity: number): void {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new RangeError('capacity must be a positive integer');
+    }
+    this.capacity = capacity;
+    for (const lane of MESSAGE_LANES) this.lanes[lane].setCapacity(capacity);
+    if (!this.highWaterMarkReached && this.size >= this.highWaterMark) {
+      this.highWaterMarkReached = true;
+    }
     this.maybeFireDrained();
   }
 
