@@ -25834,6 +25834,86 @@ export class EventBus {
   }
 
   /**
+   * Revises one latency-SLO-tracked subscriber's p99 threshold
+   * (EB-290) without re-subscribing: `setLatencySloThreshold(subId,
+   * p99ThresholdMs)` retunes the processing-latency p99 SLO that
+   * trips `onLatencySloMiss` (see `SubscribeOptions.latencySlo`,
+   * EB-53).
+   *
+   * Only the threshold moves: `checkProcessingLatencySlo` reads the
+   * live `latencySlo.thresholdMs` after every sample — on the plain
+   * and batched invocation path (`invocationLatencySlo`) and on
+   * `ack()` completion for reliable subscriptions — so the new
+   * threshold governs from the next sample evaluation, with no
+   * drain, re-registration, or replay. The tracker window and its
+   * samples are untouched (the sampled window is never recomputed),
+   * the `onLatencySloMiss` callback is untouched, and the `alerted`
+   * latch is untouched: lowering the threshold below the live p99
+   * alerts on the next sample, while raising it never clears an
+   * already-triggered latch — the latch re-arms only when a later
+   * check sees the p99 back at or below the (live) threshold, along
+   * the existing check logic. `getStats().subscriberLatencyP99`
+   * reports the live threshold from the next snapshot.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `latencySlo` monitoring, and an illegal threshold
+   * (non-positive, non-finite, or `NaN`) all throw `RangeError` with
+   * the live threshold, the samples, the callback, the latch, and
+   * the audit log untouched — the threshold validation reuses the
+   * subscribe-time rule (`resolveLatencySloOptions`: a positive
+   * finite number), so a threshold that could not be set at
+   * subscribe time cannot be revised in later either. A revision
+   * identical to the current threshold is a no-op with no audit.
+   * Audited as `latency_slo_threshold_revised`
+   * (`{ p99ThresholdMs: <number>, oldP99ThresholdMs: <number> }`).
+   *
+   * Orthogonal to EB-31 / EB-133 (those are the SLO mechanism and
+   * the phase attribution itself, this is the threshold revision),
+   * to `setAckLatency` (EB-279, that revises the ack-latency SLO,
+   * this the processing-latency SLO), and to EB-279's sampler
+   * revision (that revises the ack sampler as a whole including
+   * `ackSloMs`, this a single `latencySlo` threshold).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, or an illegal threshold.
+   */
+  setLatencySloThreshold(subId: string, p99ThresholdMs: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setLatencySloThreshold: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setLatencySloThreshold: unknown subscriber: ${subId}`);
+    }
+    const latencySlo = subscriber.latencySlo;
+    if (latencySlo === undefined) {
+      throw new RangeError('setLatencySloThreshold: subscriber has no latencySlo monitoring set');
+    }
+    // Validate before touching anything, reusing the subscribe-time
+    // rule: a positive finite number, or the live threshold and the
+    // audit log stay exactly as they were. The resolved state is
+    // discarded — only its validation is reused; the live tracker,
+    // its samples, and the alert latch are never replaced.
+    resolveLatencySloOptions({ p99ThresholdMs });
+    // Re-affirming the current threshold is a no-op: no swap, no audit.
+    if (p99ThresholdMs === latencySlo.thresholdMs) {
+      return;
+    }
+    const oldP99ThresholdMs = latencySlo.thresholdMs;
+    // Only the threshold moves; the tracker window, the callback, and
+    // the alert latch are untouched, and every sample evaluation reads
+    // the live value from here on.
+    latencySlo.thresholdMs = p99ThresholdMs;
+    this.auditSubscription({
+      action: 'latency_slo_threshold_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { p99ThresholdMs, oldP99ThresholdMs },
+    });
+  }
+
+  /**
    * Revises the delivery-shaping rate of one shaped subscriber
    * (EB-266): the drain reads the live bucket, so the new rate paces
    * the next flush round — no re-subscribe. The revision is partial:

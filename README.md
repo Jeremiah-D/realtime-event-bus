@@ -2117,7 +2117,18 @@ library.
   `eventbus_subscriber_processing_latency_p99{subscriber,pattern}` (one
   series per tracked subscriber). `p99ThresholdMs` is required and must
   be a positive finite number; invalid options throw `RangeError` /
-  `TypeError` from `subscribe`. Disabled by default.
+  `TypeError` from `subscribe`. The threshold itself is revisable without re-subscribing (EB-290, via
+  `setLatencySloThreshold(subId, p99ThresholdMs)`): only a subscription that opted into `latencySlo` at
+  subscribe time can be retuned — a never-monitored subscription throws `RangeError`, as does any threshold
+  that fails the subscribe-time rule (a positive finite number). Only the threshold moves: the tracker
+  window and its samples, the `onLatencySloMiss` callback, and the `alerted` latch are untouched — the
+  sampled window is never recomputed — so lowering the threshold below the live p99 alerts on the next
+  sample evaluation (plain/batched invocation sampling and reliable `ack()`-completion sampling both read
+  the live threshold) while raising it never clears an already-triggered latch, which re-arms only when
+  the p99 drops back to or below the new threshold. A revision identical to the current threshold is a
+  no-op with no audit. Every success is audited as `latency_slo_threshold_revised`
+  (`{ p99ThresholdMs: <number>, oldP99ThresholdMs: <number> }`). (Real-time systems: latency SLO
+  governance.) Disabled by default.
 - **SLO-miss phase attribution** (in `src/bus.ts`, opt-in via
   `new EventBus({ processingLatencySloAlert: true })`): when a
   `latencySlo` subscriber's p99 breaches, the miss event carries a
