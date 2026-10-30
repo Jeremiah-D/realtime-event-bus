@@ -5803,6 +5803,21 @@ Semantics:
 Invalid options throw fail-fast from `subscribe` (`RangeError` for a
 negative/non-finite threshold, `TypeError` for a non-function callback).
 
+The threshold itself is revisable without re-subscribing (EB-288, via
+`setExpiringSoonThreshold(subId, expiringSoonMs)`): only a subscription
+that opted into `expiringSoon` at subscribe time can be retuned — a
+never-monitored subscription throws `RangeError`, as does any
+threshold that fails the subscribe-time rule (non-negative finite
+number). Only the threshold moves: the `onExpiringSoon` callback and
+the `alerted` latch are untouched, so a backlog that already warned
+does not re-fire when the threshold widens — the latch still clears
+only when the queue drains empty — and the new threshold governs from
+the next enqueue/drain evaluation. A revision identical to the current
+threshold is a no-op with no audit. Every success is audited as
+`expiring_soon_threshold_revised`
+(`{ expiringSoonMs: <number>, oldExpiringSoonMs: <number> }`).
+(Real-time systems: subscription governance.)
+
 ## Per-message TTL (EB-149)
 
 `PublishOptions.ttlMs` is the opt-in per-message lifetime in milliseconds,

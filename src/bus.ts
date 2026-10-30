@@ -25675,6 +25675,82 @@ export class EventBus {
   }
 
   /**
+   * Revises one expiring-soon-monitored subscriber's warning threshold
+   * (EB-288) without re-subscribing: `setExpiringSoonThreshold(subId,
+   * expiringSoonMs)` retunes the remaining-TTL window that trips
+   * `onExpiringSoon` (see `SubscribeOptions.expiringSoon`, EB-110).
+   *
+   * Only the threshold moves: `checkExpiringSoon` reads the live
+   * `expiring.expiringSoonMs` on every enqueue/drain evaluation, so
+   * the new threshold governs from the next evaluation — a widened
+   * threshold can warn on the very next enqueue, a tightened one
+   * stops warning at once — with no drain, re-registration, or
+   * replay. The `onExpiringSoon` callback and the `alerted` latch
+   * are untouched: a backlog that already fired under the old
+   * threshold does not re-fire when the threshold widens — the
+   * latch still clears only when the queue drains empty — and a
+   * fresh backlog after the drain is judged by the new threshold.
+   * Already-delivered and already-expired messages are untouched;
+   * the threshold only changes when the *next* head enters the
+   * window.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `expiringSoon` monitoring, and an illegal threshold
+   * (non-number, negative, `NaN`, or non-finite) all throw
+   * `RangeError` with the live threshold, the callback, the latch,
+   * and the audit log untouched — the threshold validation reuses
+   * the subscribe-time rule (`resolveExpiringSoonOptions`), so a
+   * threshold that could not be set at subscribe time cannot be
+   * revised in later either. A revision identical to the current
+   * threshold is a no-op with no audit. Audited as
+   * `expiring_soon_threshold_revised`
+   * (`{ expiringSoonMs: <number>, oldExpiringSoonMs: <number> }`).
+   *
+   * Orthogonal to EB-110 (that is the warning mechanism itself,
+   * this its threshold revision), and to `setTopicTtl` (EB-10, that
+   * moves the deadlines the warning measures, this moves the
+   * window that judges them).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, or an illegal threshold.
+   */
+  setExpiringSoonThreshold(subId: string, expiringSoonMs: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setExpiringSoonThreshold: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setExpiringSoonThreshold: unknown subscriber: ${subId}`);
+    }
+    const expiring = subscriber.expiring;
+    if (expiring === undefined) {
+      throw new RangeError('setExpiringSoonThreshold: subscriber has no expiringSoon monitoring set');
+    }
+    // Validate before touching anything, reusing the subscribe-time
+    // rule: a non-negative finite number, or the live threshold and
+    // the audit log stay exactly as they were.
+    if (typeof expiringSoonMs !== 'number' || !Number.isFinite(expiringSoonMs) || expiringSoonMs < 0) {
+      throw new RangeError('setExpiringSoonThreshold: expiringSoonMs must be a non-negative finite number of milliseconds');
+    }
+    // Re-affirming the current threshold is a no-op: no swap, no audit.
+    if (expiringSoonMs === expiring.expiringSoonMs) {
+      return;
+    }
+    const oldExpiringSoonMs = expiring.expiringSoonMs;
+    // Only the threshold moves; the callback and the alerted latch
+    // are untouched, and every enqueue/drain evaluation reads the
+    // live value from here on.
+    expiring.expiringSoonMs = expiringSoonMs;
+    this.auditSubscription({
+      action: 'expiring_soon_threshold_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { expiringSoonMs, oldExpiringSoonMs },
+    });
+  }
+
+  /**
    * Revises the delivery-shaping rate of one shaped subscriber
    * (EB-266): the drain reads the live bucket, so the new rate paces
    * the next flush round — no re-subscribe. The revision is partial:
