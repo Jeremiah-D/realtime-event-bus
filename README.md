@@ -2416,6 +2416,19 @@ library.
   discards the open window. `getStats().aggregatedWindows` counts
   completed windows. Invalid options throw `RangeError` from
   `subscribe`. Disabled by default.
+  The window length itself is revisable without re-subscribing (EB-293, via
+  `setWindow(subId, { windowMs })`): only a subscription that opted into `window` at
+  subscribe time can be retuned — a never-opted-in subscription throws `RangeError`, as does any length
+  that fails the subscribe-time rule (a positive finite number, via `resolveWindowOptions`). Only
+  `window.windowMs` moves: the aggregate fold and the extracted field never move (a differing
+  `aggregate` or `field` throws `RangeError`, because changing either would reinterpret the messages
+  already folded into the open window), and the open window is untouched — its `windowStart` /
+  `windowEnd` / accumulators / armed timer keep the old length, so the new length governs only from
+  the next window opening (which reads the live value): shortening the length never cuts the open
+  window early and lengthening it never extends it. A revision identical to the current length is a
+  no-op with no audit. Every success is audited as `window_revised`
+  (`{ windowMs: <number>, oldWindowMs: <number> }`). (Real-time
+  systems: window aggregation governance.)
 - **Subscriber session-window aggregation** (in `src/bus.ts`, opt-in via
   `subscribe(..., { sessionWindow: { gapMs, aggregate, field?,
   maxSessionsPerKey? } })`, EB-188): the Kafka/Flink session-window
@@ -3427,6 +3440,12 @@ npm test
   the next arrival without touching held messages first, raising the bound admitting more held
   messages at once, re-affirming the current bound as a no-op with no audit, and the revision
   changing only the bound while the epochs and held messages survive.
+- `test/window-revision.test.ts` — tumbling-window length revision (EB-293): `setWindow` fail-closed
+  preconditions (unknown / empty / non-windowed subscriber, invalid length, differing `aggregate` /
+  `field`, non-object revision) with the live length, the open window, and the audit log untouched,
+  the new length governing from the next window while the open window keeps its old end, shortening
+  the length never cutting the open window early, and re-affirming the current length (including
+  restating the fold and field) as a no-op with no audit.
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output

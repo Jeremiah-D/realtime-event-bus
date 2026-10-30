@@ -10205,6 +10205,32 @@ export interface WindowAggregateOptions {
 }
 
 /**
+ * Partial tumbling-window revision for `setWindow` (EB-293): any
+ * field left out keeps its current value. Only `windowMs` ever moves.
+ * `aggregate` and `field` are accepted syntactically so a caller can
+ * restate the current values, but any value that differs from the live
+ * configuration is rejected with `RangeError` before anything moves:
+ * changing the fold or the extracted field would reinterpret the
+ * messages already folded into the open window, so a live subscriber
+ * can never change them — re-subscribing is the only way to a
+ * different fold or field.
+ */
+export interface WindowRevisionOptions {
+  /** Window length in milliseconds; must be a positive finite number when provided. */
+  windowMs?: number;
+  /**
+   * Restatement of the subscribe-time fold only: a value different
+   * from the live `aggregate` throws `RangeError`.
+   */
+  aggregate?: WindowAggregateKind;
+  /**
+   * Restatement of the subscribe-time field only: a value extracting
+   * a different path than the live `fieldPath` throws `RangeError`.
+   */
+  field?: string;
+}
+
+/**
  * The single message a tumbling window delivers when it closes (see
  * `SubscribeOptions.window`, EB-73). It travels the subscriber's normal
  * delivery path — backpressure queue, reliable delivery, drain-time
@@ -26066,6 +26092,120 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { maxHeldMessages, oldMaxHeldMessages },
+    });
+  }
+
+  /**
+   * Revises the tumbling-window length of one windowed subscriber
+   * (EB-293) without re-subscribing: `setWindow(subId, { windowMs })`
+   * retunes how long each tumbling window lasts (see
+   * `SubscribeOptions.window`, EB-73).
+   *
+   * Only the length moves: `accumulateWindowed` reads the live
+   * `window.windowMs` when it opens a window (`windowEnd = nowMs +
+   * window.windowMs`) and `armWindowTimer` arms the close timer with
+   * the length live at open time, so the new length governs from the
+   * next window opening — an already-open window still closes on its
+   * old `windowEnd` (drain reads the live `windowEnd`, and the timer
+   * armed at open time fires on the old schedule), with its folded
+   * messages, its aggregate fold, and its extracted field untouched.
+   * The revision itself never closes, re-opens, or re-arms a window:
+   * shortening the length below the open window's remaining time does
+   * not cut it early (it still closes on the old `windowEnd` or the
+   * old timer), and lengthening it does not extend it — the next
+   * window is simply longer (or shorter), exactly like the
+   * subscribe-time length.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `window` aggregation, and an illegal length
+   * (non-positive, `NaN`, or non-finite) all throw `RangeError` with
+   * the live length, the open window, and the audit log untouched —
+   * the length validation reuses the subscribe-time rule
+   * (`resolveWindowOptions`: a positive finite number), so a length
+   * that could not be set at subscribe time cannot be revised in
+   * later either. A differing `aggregate` or `field` also throws
+   * `RangeError` before anything moves: changing the fold or the
+   * extracted field would reinterpret the messages already folded
+   * into the open window (EB-280 session-window precedent). A
+   * revision identical to the current length is a no-op with no audit.
+   * Audited as `window_revised` (`{ windowMs: <number>, oldWindowMs:
+   * <number> }`).
+   *
+   * Orthogonal to EB-73 (that is the tumbling-window mechanism
+   * itself — the fold, the close timer, and the aggregate delivery —
+   * this its length revision), to EB-280 (that revises the session
+   * window's activity gap, this the tumbling window's length), and to
+   * EB-263 (that revises the delivery-time window, this the
+   * aggregation window).
+   *
+   * Throws `RangeError` for an unknown subscriber, a non-windowed
+   * subscriber, a non-object revision, an illegal length, or a
+   * differing `aggregate` / `field`.
+   */
+  setWindow(subId: string, opts: WindowRevisionOptions): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setWindow: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setWindow: unknown subscriber: ${subId}`);
+    }
+    const window = subscriber.window;
+    if (window === undefined) {
+      throw new RangeError('setWindow: subscriber has no window aggregation set');
+    }
+    // Validate before touching anything: `undefined` is not a value —
+    // a partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged parameters, before anything
+    // moves.
+    if (typeof opts !== 'object' || opts === null || Array.isArray(opts)) {
+      throw new RangeError('setWindow: window must be an object with windowMs');
+    }
+    if (opts.aggregate !== undefined && opts.aggregate !== window.aggregate) {
+      throw new RangeError('setWindow: changing aggregate would reinterpret the in-flight window');
+    }
+    if (opts.field !== undefined) {
+      let revisedFieldPath: string[] | undefined;
+      try {
+        revisedFieldPath = parseWindowFieldPath(opts.field);
+      } catch (err) {
+        throw new RangeError(`setWindow: ${(err as Error).message}`);
+      }
+      const currentField = window.fieldPath?.join('.');
+      const revisedField = revisedFieldPath?.join('.');
+      if (revisedField !== currentField) {
+        throw new RangeError('setWindow: changing field would reinterpret the in-flight window');
+      }
+    }
+    const mergedWindowMs = opts.windowMs ?? window.windowMs;
+    try {
+      const resolved = resolveWindowOptions({
+        windowMs: mergedWindowMs,
+        aggregate: window.aggregate,
+        ...(window.fieldPath !== undefined ? { field: window.fieldPath.join('.') } : {}),
+      });
+      if (resolved === undefined) {
+        throw new RangeError('setWindow: window must be an object with windowMs');
+      }
+    } catch (err) {
+      throw new RangeError(`setWindow: ${(err as Error).message}`);
+    }
+    // Re-affirming the current length is a no-op: no swap, no audit.
+    if (mergedWindowMs === window.windowMs) {
+      return;
+    }
+    const oldWindowMs = window.windowMs;
+    // Only the length moves, in place: the state object, its open
+    // window (windowStart / windowEnd / accumulators / armed timer),
+    // and the fold are untouched, and the next window opening reads
+    // the new length live.
+    window.windowMs = mergedWindowMs;
+    this.auditSubscription({
+      action: 'window_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { windowMs: mergedWindowMs, oldWindowMs },
     });
   }
 
