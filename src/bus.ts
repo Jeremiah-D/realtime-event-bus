@@ -28051,6 +28051,202 @@ export class EventBus {
   }
 
   /**
+   * Revises a multi-pattern aggregate subscription's pattern set
+   * (EB-286) without re-subscribing: `updateSubscriptionMultiPatterns(subId, patterns)`
+   * swaps the whole OR-set the subscriber matches on, effective from the
+   * next delivery match — `fanOut` reads the live `multiPatterns` /
+   * union matcher on every publish, so already-queued messages are
+   * untouched and no replay or re-registration happens.
+   *
+   * The mirror of `updateSubscriptionPattern` (EB-74) for aggregates, and
+   * it refuses the mirror image: a single-pattern subscription throws
+   * `RangeError` here (revise it with `updateSubscriptionPattern`), just
+   * as EB-74 refuses a multi-pattern one. Unknown `subId` returns
+   * `false`, like EB-74 — no live subscription, nothing to revise.
+   *
+   * Validation runs before anything mutates, exactly like EB-74 and
+   * `subscribe`: the array must be non-empty, string-only, non-empty
+   * strings, duplicate-free (unlike `subscribe`'s silent dedup, a
+   * duplicate here is a caller error — the set is the whole point of
+   * the call, so a repeated entry must not silently vanish); every
+   * pattern resolves through the subscribe registration path — the
+   * namespace re-translation under the subscription's stored prefix
+   * (a `/` inside a namespaced pattern throws `NamespaceDeniedError`,
+   * so a hot update can never cross a namespace boundary), the
+   * compiled matcher (shared cache for global patterns, namespaced
+   * matcher under a prefix), and the prefix-index key — and every
+   * registered pattern passes the per-pattern broker ACL
+   * (`AclDeniedError`, audited via `onAuthzDenied`), so a hot update
+   * cannot bypass subscribe-time authorization. A failed call leaves
+   * the old set, its counts, its cache entries and its index buckets
+   * exactly as they were.
+   *
+   * A set-equal revision (same patterns, any order — OR-set semantics)
+   * is a no-op returning `true` with no audit: reordering an OR-set
+   * changes nothing it matches. Otherwise only the pattern set, the
+   * union matcher and the index ledgers move: prefix-index buckets and
+   * `subscribersByPattern` counts (with `patternCache` eviction when a
+   * dropped pattern's count reaches zero) are updated per added /
+   * removed pattern, retained patterns keep their counts, cache
+   * entries and buckets untouched. The queue, ACK state, lease and
+   * idle timers, health probe and sequence baselines survive untouched
+   * (EB-74's retention semantics); the primary-pattern label follows
+   * the new first pattern, and the lease / idle labels are relabelled
+   * (not re-armed) when it changes, so expiry events keep naming the
+   * live pattern. Multi-pattern subscriptions can never join a
+   * consumer group (EB-137), so no group roster moves. The advertised
+   * pattern set is refreshed, like EB-74.
+   *
+   * Orthogonal to EB-137 (that mechanism itself, this revises its set)
+   * and to EB-74 (that revises a single pattern, this a set). Audited
+   * as `multi_patterns_revised`
+   * (`{ patterns: <new registered set>, oldPatterns: <old set> }`).
+   */
+  updateSubscriptionMultiPatterns(subId: string, patterns: string[]): boolean {
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber === undefined) return false;
+    // The mirror of EB-74's multi-pattern refusal: a single-pattern
+    // subscription has no set to revise — use updateSubscriptionPattern.
+    if (subscriber.multiPatterns === undefined) {
+      throw new RangeError(
+        'updateSubscriptionMultiPatterns: cannot revise the pattern set of a single-pattern subscription — use updateSubscriptionPattern instead',
+      );
+    }
+    if (!Array.isArray(patterns) || patterns.length === 0) {
+      throw new RangeError(
+        'updateSubscriptionMultiPatterns: patterns must be a non-empty array of topic patterns',
+      );
+    }
+    const seen = new Set<string>();
+    for (const pattern of patterns) {
+      if (typeof pattern !== 'string' || pattern.length === 0) {
+        throw new RangeError(
+          'updateSubscriptionMultiPatterns: patterns must contain only non-empty pattern strings',
+        );
+      }
+      if (seen.has(pattern)) {
+        throw new RangeError(
+          `updateSubscriptionMultiPatterns: duplicate pattern ${JSON.stringify(pattern)}`,
+        );
+      }
+      seen.add(pattern);
+    }
+    const prefix = subscriber.namespacePrefix;
+    // Resolve the registered form, the matcher and the prefix-index key
+    // exactly the way `subscribe` registers them — a namespaced
+    // subscription's relative patterns are re-translated under its prefix.
+    const resolved = patterns.map((pattern) => {
+      if (prefix !== undefined) {
+        if (pattern.includes('/')) {
+          throw new NamespaceDeniedError('subscribe', prefix, { pattern });
+        }
+        const literal = EventBus.patternPrefixKey(pattern);
+        return {
+          registered: `${prefix}/${pattern}`,
+          matcher: this.compileNamespacedMatcher(prefix, pattern),
+          indexKey: literal === '' ? '' : `${prefix}/${literal}`,
+        };
+      }
+      return {
+        registered: pattern,
+        matcher: this.compiledMatcher(pattern),
+        indexKey: EventBus.patternPrefixKey(pattern),
+      };
+    });
+    const oldPatterns = subscriber.multiPatterns;
+    // Set equality (order-insensitive, OR-set semantics) is a no-op:
+    // no audit, and the stored order is left exactly as it was.
+    if (
+      oldPatterns.length === resolved.length &&
+      resolved.every((r) => oldPatterns.includes(r.registered))
+    ) {
+      return true;
+    }
+    // Broker-level ACL on every registered (translated) form, mirroring
+    // `subscribe`'s per-pattern rule: any single deny rejects the whole
+    // revision. Audited before the throw, like `subscribe`.
+    for (const r of resolved) {
+      if (!this.aclAllowsSubscribe(r.registered)) {
+        this.emitAuthzDenied('subscribe', undefined, r.registered);
+        throw new AclDeniedError('subscribe', r.registered);
+      }
+    }
+    // --- All validation done; mutate below. ---
+    const indexKeyOf = (internalPattern: string): string => {
+      if (prefix !== undefined) {
+        const relative = internalPattern.slice(prefix.length + 1);
+        const literal = EventBus.patternPrefixKey(relative);
+        return literal === '' ? '' : `${prefix}/${literal}`;
+      }
+      return EventBus.patternPrefixKey(internalPattern);
+    };
+    const newSet = new Set(resolved.map((r) => r.registered));
+    // Prefix index: drop removed patterns' buckets (evicting emptied
+    // keys, same invariant as unsubscribe), add new patterns' buckets.
+    // Retained patterns keep their bucket untouched.
+    for (const old of oldPatterns) {
+      if (newSet.has(old)) continue;
+      const bucket = this.prefixIndex.get(indexKeyOf(old));
+      if (bucket != null) {
+        bucket.delete(subId);
+        if (bucket.size === 0) this.prefixIndex.delete(indexKeyOf(old));
+      }
+    }
+    for (const r of resolved) {
+      if (oldPatterns.includes(r.registered)) continue;
+      let bucket = this.prefixIndex.get(r.indexKey);
+      if (bucket == null) {
+        bucket = new Set<string>();
+        this.prefixIndex.set(r.indexKey, bucket);
+      }
+      bucket.add(subId);
+    }
+    // Pattern counts + compile cache (unsubscribe's lifecycle): removed
+    // patterns decrement and evict at zero; added patterns increment.
+    // Retained patterns keep count and cache entry untouched.
+    for (const old of oldPatterns) {
+      if (newSet.has(old)) continue;
+      const remaining = (this.subscribersByPattern.get(old) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.subscribersByPattern.delete(old);
+        this.patternCache.delete(old);
+      } else {
+        this.subscribersByPattern.set(old, remaining);
+      }
+    }
+    for (const r of resolved) {
+      if (oldPatterns.includes(r.registered)) continue;
+      this.subscribersByPattern.set(r.registered, (this.subscribersByPattern.get(r.registered) ?? 0) + 1);
+    }
+    // The subscriber itself: pattern set + union matcher swap in place.
+    // The queue, sequence baselines, lease, idle window, health probe,
+    // reliable ACK state and every opt-in survive untouched.
+    subscriber.multiPatterns = resolved.map((r) => r.registered);
+    subscriber.matcher = unionPatternMatchers(resolved.map((r) => r.matcher));
+    // The primary-pattern label follows the new first pattern; the
+    // lease / idle timers themselves are preserved (relabelled, not
+    // re-armed), exactly like EB-74.
+    const newPrimary = resolved[0].registered;
+    if (subscriber.pattern !== newPrimary) {
+      subscriber.pattern = newPrimary;
+      this.leases.relabelPattern(subId, newPrimary);
+      this.idleReclaimer.relabelPattern(subId, newPrimary);
+    }
+    // The advertised pattern set may have changed.
+    this.advertiseClusterPatterns();
+    // Subscription lifecycle audit (EB-78): this entry names the set
+    // change itself.
+    this.auditSubscription({
+      action: 'multi_patterns_revised',
+      subId,
+      pattern: newPrimary,
+      actor: 'system',
+      detail: { patterns: [...subscriber.multiPatterns], oldPatterns: [...oldPatterns] },
+    });
+    return true;
+  }
+
+  /**
    * Moves a consumer-group member from `(groupId, oldPattern)` to
    * `(groupId, newPattern)` without touching the subscriber object
    * itself (EB-74). The leave side mirrors the group unsubscribe path —

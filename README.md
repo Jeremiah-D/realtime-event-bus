@@ -6580,6 +6580,27 @@ Semantics:
   subscribes; `updateSubscriptionPattern` refuses aggregates
   (`RangeError`); migration snapshots carry `patterns` so
   `exportSubscription`/`importSubscription` rebuild the aggregate.
+- **Revisable after subscribe (EB-286, via
+  `updateSubscriptionMultiPatterns(subId, patterns)`):** a
+  multi-pattern subscription's whole pattern set can be swapped
+  without re-subscribing — the mirror of EB-74 for aggregates, and
+  it refuses the mirror image (a single-pattern subscription throws
+  `RangeError` and must use `updateSubscriptionPattern`; an unknown
+  `subId` returns `false`). The array must be non-empty, string-only,
+  non-empty and duplicate-free (unlike `subscribe`'s silent dedup, a
+  duplicate here is a caller error), every pattern resolves through
+  the subscribe registration path (namespace re-translation, compiled
+  matcher, prefix-index key) and passes the per-pattern broker ACL,
+  all before anything mutates — so a failed call leaves the old set,
+  its counts, its cache entries and its index buckets untouched. A
+  set-equal revision in any order is a no-op with no audit; otherwise
+  only the pattern set, the union matcher and the index ledgers move
+  (retained patterns keep count, cache entry and bucket), the queue,
+  ACK state, lease and idle timers, health probe and sequence
+  baselines survive untouched, and the new set governs from the next
+  delivery match. Every success is audited as
+  `multi_patterns_revised` (`{ patterns: <new set>, oldPatterns:
+  <old set> }`). (Real-time systems: subscription governance.)
 
 ## Subscription filter expressions (EB-123)
 
