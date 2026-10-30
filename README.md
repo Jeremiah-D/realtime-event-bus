@@ -7225,6 +7225,31 @@ combined with a shadow subscription. `getStats().keyRangeSubscribers`
 counts live key-range subscriptions. (Real-time systems: key-range
 subscription.)
 
+Revisable after subscribe (EB-284, via
+`setKeyRange(subId, range | null)`): a subscription's key range can
+be retuned without re-subscribing — but only subscriptions that
+already carry one (the range is opt-in), so a never-set range, and a
+range cleared by an earlier revision, both throw `RangeError` until
+the subscriber opts in again at subscribe time. `null` clears back
+to no narrowing, which is what restores keyless delivery. Only the
+subscriber field moves: `deliverToSubscriber` reads the live range on
+every delivery decision, so the new range governs from the next
+delivery decision, already-delivered messages are untouched, and a
+skip keeps the filtered semantics (never queued, no throttle or
+credit budget burned, no ack obligation, baseline advances over it).
+A revision identical to the current range is a no-op with no audit,
+and `{}` counts as a real range — it matches every keyed message
+while still excluding keyless ones — not as a clear. It is
+fail-closed (an unknown subscriber, an unset range, a non-object
+range, a non-string end, `start >= end`, or `undefined` — only an
+explicit `null` clears — throws `RangeError` with the live range and
+the audit log untouched), and every success is audited as
+`key_range_revised` (`{ keyRange: { start?, end? } | null,
+oldKeyRange: { start?, end? } }`). Orthogonal to content filtering
+(`setFilter`/`setHeaderFilter` revise what matches, this revises
+which keys match). (Real-time systems: key-range subscription
+governance.)
+
 ## Dead-letter replay approval (EB-233)
 
 `replayDeadLetter` used to redeliver immediately: any operator

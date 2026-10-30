@@ -27592,6 +27592,106 @@ export class EventBus {
   }
 
   /**
+   * Revises a subscription's key range (EB-284) without re-subscribing:
+   * `setKeyRange(subId, range | null)` retunes the `[start, end)`
+   * slice (see `SubscribeOptions.keyRange`, EB-232) that a keyed
+   * subscription accepts.
+   *
+   * Fail-closed: an unknown subscriber id, an empty id, a
+   * subscription with no key range set, a non-object range, a
+   * non-string `start`/`end`, both ends present with `start >= end`,
+   * and `undefined` — only an explicit `null` clears — all throw
+   * `RangeError` with the live range and the audit log untouched.
+   * Clearing removes the range, so the subscription receives keyed
+   * and keyless messages exactly as before (a keyless message never
+   * matches a key-range subscription, so a clear is what restores
+   * keyless delivery). A revision identical to the current range is
+   * a no-op with no audit — `{}` is a real range (it matches every
+   * keyed message while still excluding keyless ones), not a clear,
+   * so it only equals another `{}`. Only the `subscriber.keyRange`
+   * field moves: `deliverToSubscriber` reads the live range on every
+   * delivery decision, so the new range governs from the next
+   * delivery decision (a window hold's flush re-entry re-decides
+   * under the same gate), already-delivered messages are untouched,
+   * and a skip keeps the existing `countFiltered` semantics (never
+   * queued, no throttle or credit budget burned, no ack obligation,
+   * and the per-topic baseline advances over it so it never surfaces
+   * as a sequence gap).
+   *
+   * Orthogonal to `setFilter`/`setHeaderFilter` (those revise content
+   * filtering, this revises the key range), and to the range
+   * mechanism itself (EB-232, that sets the range at subscribe time,
+   * this revises it). Audited as `key_range_revised`
+   * (`{ keyRange: { start?, end? } | null,
+   * oldKeyRange: { start?, end? } }`, `null` meaning the range was
+   * cleared back to no narrowing).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unset range,
+   * or an illegal range.
+   */
+  setKeyRange(subId: string, range: KeyRangeOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setKeyRange: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setKeyRange: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and an illegal range never
+    // moves the live range (the subscribe-time validation, EB-232,
+    // is reused verbatim).
+    if (range !== null) {
+      if (typeof range !== 'object' || range === null) {
+        throw new RangeError('setKeyRange: range must be an object with optional start/end strings, or null to clear it');
+      }
+      if (range.start !== undefined && typeof range.start !== 'string') {
+        throw new RangeError('setKeyRange: range.start must be a string');
+      }
+      if (range.end !== undefined && typeof range.end !== 'string') {
+        throw new RangeError('setKeyRange: range.end must be a string');
+      }
+      if (range.start !== undefined && range.end !== undefined && range.start >= range.end) {
+        throw new RangeError('setKeyRange: range.start must be < range.end');
+      }
+    }
+    // Opt-in gate: only a subscription that already carries a key
+    // range can be revised — a never-set range, and a range cleared
+    // by an earlier revision, both refuse until the subscriber opts
+    // in again at subscribe time.
+    if (subscriber.keyRange === undefined) {
+      throw new RangeError('setKeyRange: subscriber has no key range set');
+    }
+    const oldKeyRange = subscriber.keyRange;
+    // Copy the input, as subscribe does, so later mutations of the
+    // caller's object cannot move the subscription.
+    const newRange = range === null ? undefined : { ...range };
+    // Identical range: a no-op — no audit, and no delivery state
+    // moves. `{}` only equals another `{}`; a clear never equals a
+    // set range, since the old range is always defined past the gate.
+    if (
+      newRange !== undefined &&
+      oldKeyRange.start === newRange.start &&
+      oldKeyRange.end === newRange.end
+    ) {
+      return;
+    }
+    // Only the field moves; every delivery decision re-reads the
+    // live range (see deliverToSubscriber).
+    subscriber.keyRange = newRange;
+    this.auditSubscription({
+      action: 'key_range_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        keyRange: newRange === undefined ? null : { ...newRange },
+        oldKeyRange: { ...oldKeyRange },
+      },
+    });
+  }
+
+  /**
    * Batch-acks an arbitrary set of delivery handles (EB-107): one call
    * settles the whole set, amortizing the per-message bookkeeping of
    * individual `ack()` calls. The out-of-order / subset complement of
