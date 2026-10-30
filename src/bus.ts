@@ -25860,6 +25860,110 @@ export class EventBus {
   }
 
   /**
+   * Revises one key-hotspot-monitored subscriber's auto-mitigation
+   * recovery depth (EB-294) without re-subscribing:
+   * `setKeyHotspotRecoverDepth(subId, recoverDepth)` retunes the
+   * buffer depth strictly below which an engaged per-key mitigation
+   * releases (see `SubscribeOptions.keyHotspot`, EB-47 / EB-115).
+   *
+   * Only the recovery depth moves: `checkKeyHotspot` reads the live
+   * `keyHotspot.mitigate.recoverDepth` on every keyed-delivery
+   * evaluation (`deliverKeyed` growth and `cascadeKeyExpected`
+   * shrink), so the new depth governs from the next evaluation —
+   * a raised depth releases an engaged mitigation sooner (the next
+   * evaluation whose buffer depth is already below it releases at
+   * once), a lowered one keeps the mitigation engaged until the
+   * buffer drains further — with no drain, re-registration, or
+   * replay. The `thresholdDepth`, the `onKeyHotspot` /
+   * `onHotKeyMitigated` callbacks, and the `mitigatedKeys` latch are
+   * untouched: an already-mitigated key is neither released nor
+   * re-armed by the revision itself — the release decision is taken
+   * at the next evaluation, which reads the live depth. `0` means
+   * no automatic release: the buffer can never drain strictly below
+   * zero, so a mitigation engaged under a zero recovery depth stays
+   * engaged until the subscription is removed. `getStats().hotKeys`
+   * reports the live recovery depth on the next engagement event.
+   *
+   * This also repairs the inverted hysteresis band an EB-289
+   * threshold revision can leave behind: lowering the threshold
+   * leaves `recoverDepth` at its subscribe-time snapshot, which may
+   * then exceed the live threshold. The new depth is capped at the
+   * live threshold, so revising it down to at most the threshold
+   * restores `recoverDepth <= thresholdDepth`.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `keyHotspot` monitoring, a subscription whose
+   * monitoring runs detection-only (no `autoMitigate`), and an
+   * illegal depth (negative, non-integer, `NaN`, non-finite, or
+   * above the live threshold) all throw `RangeError` with the live
+   * depth, the threshold, the callbacks, the latch, and the audit
+   * log untouched — the depth validation reuses the subscribe-time
+   * rule (`resolveKeyHotspotOptions`: a non-negative integer at most
+   * the threshold), so a depth that could not be set at subscribe
+   * time cannot be revised in later either. A revision identical to
+   * the current depth is a no-op with no audit. Audited as
+   * `key_hotspot_recover_depth_revised`
+   * (`{ recoverDepth: <number>, oldRecoverDepth: <number> }`).
+   *
+   * Orthogonal to EB-115 (that is the hotspot mechanism itself —
+   * detection and auto-mitigation — this its recovery-depth
+   * revision), and to EB-289 (that retunes the alert threshold,
+   * this the mitigation release depth).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, a detection-only subscriber, or an illegal depth.
+   */
+  setKeyHotspotRecoverDepth(subId: string, recoverDepth: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setKeyHotspotRecoverDepth: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setKeyHotspotRecoverDepth: unknown subscriber: ${subId}`);
+    }
+    const keyHotspot = subscriber.keyHotspot;
+    if (keyHotspot === undefined) {
+      throw new RangeError('setKeyHotspotRecoverDepth: subscriber has no keyHotspot monitoring set');
+    }
+    const mitigate = keyHotspot.mitigate;
+    if (mitigate === undefined) {
+      throw new RangeError('setKeyHotspotRecoverDepth: subscriber has no keyHotspot auto-mitigation enabled');
+    }
+    // Validate before touching anything, reusing the subscribe-time
+    // rule against the LIVE threshold: a non-negative integer at most
+    // the current thresholdDepth, or the live depth and the audit log
+    // stay exactly as they were. (An EB-289 threshold revision can
+    // leave the snapshotted recoverDepth above the live threshold;
+    // the cap is the live threshold, so this revision can repair
+    // that inverted hysteresis band.)
+    if (
+      !Number.isInteger(recoverDepth) ||
+      recoverDepth < 0 ||
+      recoverDepth > keyHotspot.thresholdDepth
+    ) {
+      throw new RangeError(
+        'setKeyHotspotRecoverDepth: recoverDepth must be a non-negative integer at most the live thresholdDepth',
+      );
+    }
+    // Re-affirming the current depth is a no-op: no swap, no audit.
+    if (recoverDepth === mitigate.recoverDepth) {
+      return;
+    }
+    const oldRecoverDepth = mitigate.recoverDepth;
+    // Only the recovery depth moves; the threshold, the callbacks,
+    // and the mitigated-keys latch are untouched, and every
+    // keyed-delivery evaluation reads the live value from here on.
+    mitigate.recoverDepth = recoverDepth;
+    this.auditSubscription({
+      action: 'key_hotspot_recover_depth_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { recoverDepth, oldRecoverDepth },
+    });
+  }
+
+  /**
    * Revises one latency-SLO-tracked subscriber's p99 threshold
    * (EB-290) without re-subscribing: `setLatencySloThreshold(subId,
    * p99ThresholdMs)` retunes the processing-latency p99 SLO that

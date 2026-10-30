@@ -2227,6 +2227,20 @@ library.
   A revision identical to the current threshold is a no-op with no
   audit. Every success is audited as `key_hotspot_threshold_revised`
   (`{ thresholdDepth: <number>, oldThresholdDepth: <number> }`).
+  The recovery depth is revisable the same way (EB-294, via
+  `setKeyHotspotRecoverDepth(subId, recoverDepth)`): only a subscription
+  that opted into `keyHotspot` with `autoMitigate` enabled can be
+  retuned — a detection-only subscription throws `RangeError`, as does
+  any depth that fails the subscribe-time rule (a non-negative integer
+  at most the live threshold). Only the recovery depth moves: the
+  threshold, the callbacks, and the `mitigatedKeys` latch are untouched
+  — an already-mitigated key is neither released nor re-armed by the
+  revision itself, the release decision is taken at the next
+  keyed-delivery evaluation reading the live depth, and `0` means no
+  automatic release. A revision identical to the current depth is a
+  no-op with no audit. Every success is audited as
+  `key_hotspot_recover_depth_revised`
+  (`{ recoverDepth: <number>, oldRecoverDepth: <number> }`).
   (Real-time systems: key-hotspot governance.) Disabled by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
   `new EventBus({ trace: true })`): one trace per sampled publish, threading
@@ -3446,6 +3460,13 @@ npm test
   the new length governing from the next window while the open window keeps its old end, shortening
   the length never cutting the open window early, and re-affirming the current length (including
   restating the fold and field) as a no-op with no audit.
+- `test/keyhotspot-recover-depth.test.ts` — key-hotspot auto-mitigation recovery-depth revision
+  (EB-294): `setKeyHotspotRecoverDepth` fail-closed preconditions (unknown / empty / unmonitored /
+  detection-only subscriber, invalid depth, depth above the live threshold) with the live depth and
+  the audit log untouched, re-affirming the current depth as a no-op with no audit, the revised
+  depth audited and carried by the next engagement, repairing an EB-289 inverted hysteresis band,
+  lowering the depth keeping an engaged mitigation engaged until a partial drain, raising it
+  releasing sooner, and `recoverDepth` 0 meaning no automatic release.
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output
