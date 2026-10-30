@@ -6692,6 +6692,26 @@ at subscribe time), and every success is audited as `filter_revised`
 function, so only its set/cleared state is recorded, never its source).
 (Real-time systems: subscription governance.)
 
+The expression itself is revisable the same way (EB-287, via
+`setFilterExpr(subId, expr | null)`): a subscription that opted into
+`filterExpr` at subscribe time can swap its expression without
+re-subscribing — live, durable replay (read per record, so a revision
+during a throttled replay pause judges the records still to come),
+retained snapshot, and shadow paths all read the live compiled
+expression, so the next fan-out is judged by the new expression and
+already-queued messages keep their original admission. The new
+expression is compiled through the subscribe path before anything
+mutates (a non-string throws `TypeError`, an illegal expression throws
+`RangeError`, and the live expression is untouched on failure). Only
+the expression moves; the `filter` predicate is untouched. `null`
+clears back to unfiltered delivery, and a revision after a clear is
+refused until the subscriber opts in again at subscribe time. A
+revision whose source string equals the current expression is a no-op
+with no audit. Every success is audited as `filter_expr_revised`
+(`{ filterExpr: <new source> | null, oldFilterExpr: <old source> }` —
+the expression is data, so both sources are recorded verbatim).
+(Real-time systems: subscription governance.)
+
 ## Recurring publishes (cron) (EB-124)
 
 `bus.scheduleRecurring(topic, payloadFactory, cronExpr, opts?)` registers a

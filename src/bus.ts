@@ -8471,10 +8471,11 @@ interface Subscriber {
   /**
    * Compiled subscription filter expression (see
    * `SubscribeOptions.filterExpr`, EB-123). Absent when the subscriber
-   * has no expression filter. Compiled once at subscribe time; every
-   * fan-out path (live delivery, durable-log replay, retained snapshot,
-   * shadow mirror) evaluates it right after the predicate `filter` —
-   * both must accept for the message to be queued.
+   * has no expression filter. Compiled at subscribe time, revisable
+   * via `setFilterExpr` (EB-287); every fan-out path (live delivery,
+   * durable-log replay, retained snapshot, shadow mirror) evaluates
+   * it right after the predicate `filter` — both must accept for the
+   * message to be queued.
    */
   filterExpr?: CompiledFilterExpression;
   /**
@@ -25582,6 +25583,98 @@ export class EventBus {
   }
 
   /**
+   * Revises a subscription's declarative filter expression (EB-287)
+   * without re-subscribing: `setFilterExpr(subId, expr | null)` swaps
+   * the compiled expression the subscriber is judged by, effective
+   * from the next fan-out — every admission path (live delivery,
+   * durable-log replay, retained snapshot, shadow mirror) reads the
+   * live `subscriber.filterExpr` on every message, so already-queued
+   * messages are untouched and no replay or re-registration happens.
+   * The replay path reads the expression per record (EB-265's live
+   * read, extended from the predicate to the expression by this
+   * item), so a revision during a throttled replay pause judges the
+   * records still to come.
+   *
+   * The mirror of `setFilter` (EB-265) for the declarative
+   * expression: only a subscription that opted into `filterExpr` at
+   * subscribe time can be revised — a subscription that never set
+   * one throws `RangeError` (an expression-less subscription
+   * receives everything, and installing an expression here would be
+   * a subscribe-time opt-in by another name). An explicit `null`
+   * clears back to unfiltered delivery, and a revision after a
+   * clear is refused until the subscriber opts in again at
+   * subscribe time, exactly like `setFilter`'s clear.
+   *
+   * Validation runs before anything mutates, reusing the subscribe
+   * path: the new expression is compiled with
+   * `compileFilterExpression` first — a non-string throws
+   * `TypeError`, an illegal expression throws `RangeError` — and a
+   * failed call leaves the live expression and the audit log
+   * untouched. Only `subscriber.filterExpr` moves; the queue,
+   * backpressure state, and every other gate keep exactly what
+   * they had, and the predicate `filter` is untouched (the two
+   * compose with AND, before and after the revision). A revision
+   * whose source string equals the current expression's source is
+   * a no-op with no audit: recompiling an identical expression
+   * changes nothing it matches.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `filterExpr`, and `undefined` — only an explicit
+   * `null` clears — all throw `RangeError` with the live expression
+   * and the audit log untouched. Audited as `filter_expr_revised`
+   * (`{ filterExpr: <new source> | null, oldFilterExpr: <old
+   * source> }`; the expression is data, so both sources are
+   * recorded verbatim).
+   *
+   * Orthogonal to `setFilter` (EB-265, that revises the code
+   * predicate, this the declarative expression), to EB-123 (that is
+   * the expression mechanism itself, this its revision), and to
+   * EB-229 (that versions topic-level filter predicates — a
+   * separate version chain, untouched by a subscription-level
+   * revision, which compiles without a version stamp exactly like
+   * `subscribe` does).
+   *
+   * Throws `RangeError` for an unknown / expression-less subscriber
+   * or `undefined`, `TypeError` for a non-string expression, and
+   * `RangeError` for an illegal expression.
+   */
+  setFilterExpr(subId: string, expr: string | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setFilterExpr: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setFilterExpr: unknown subscriber: ${subId}`);
+    }
+    const current = subscriber.filterExpr;
+    if (current === undefined) {
+      throw new RangeError('setFilterExpr: subscriber has no filterExpr set');
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and the new expression is
+    // compiled before the swap, so a bad expression can never leave
+    // a half-revised subscriber behind.
+    if (typeof expr === 'undefined') {
+      throw new RangeError('setFilterExpr: filterExpr must be a string, or null to clear it');
+    }
+    const compiled = expr === null ? undefined : compileFilterExpression(expr);
+    // Re-affirming the current expression string is a no-op: no
+    // swap, no audit.
+    if (compiled !== undefined && compiled.source === current.source) {
+      return;
+    }
+    const oldSource = current.source;
+    subscriber.filterExpr = compiled;
+    this.auditSubscription({
+      action: 'filter_expr_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { filterExpr: expr, oldFilterExpr: oldSource },
+    });
+  }
+
+  /**
    * Revises the delivery-shaping rate of one shaped subscriber
    * (EB-266): the drain reads the live bucket, so the new rate paces
    * the next flush round — no re-subscribe. The revision is partial:
@@ -32408,13 +32501,12 @@ export class EventBus {
         }
       }
     }
-    // NB (EB-265): the content predicate is deliberately NOT captured
-    // here. It is read per record below (`subscriber.filter`), so a
-    // `setFilter` revision during a throttled replay pause applies to
-    // the records still to come instead of the whole pass judging
-    // under the stale predicate. `filterExpr` stays captured: it is
-    // not revisable after subscribe.
-    const filterExpr = subscriber.filterExpr;
+    // NB (EB-265/EB-287): neither admission predicate is captured
+    // here. Both are read per record below (`subscriber.filter`,
+    // `subscriber.filterExpr`), so a `setFilter` / `setFilterExpr`
+    // revision during a throttled replay pause applies to the
+    // records still to come instead of the whole pass judging
+    // under a stale predicate.
     const replaySampleRate = subscriber.deliverySampleRate;
     // Durable-log replay throttle (EB-164): only resume replays
     // (`trackProgress`) run throttled — the migration replay is a
@@ -32519,7 +32611,7 @@ export class EventBus {
             // the size gate after the composite check.
             const replayCap = this.subscriberPayloadCapFor(subscriber, rec.topic);
             let replayRawPayload: unknown;
-            if (subscriber.filter !== undefined || filterExpr !== undefined || replayCap !== undefined) {
+            if (subscriber.filter !== undefined || subscriber.filterExpr !== undefined || replayCap !== undefined) {
               // The log holds the wire payload — resolve a binary record's
               // v2 bytes first (a binary+compressed record's bytes encode
               // the envelope), then open a DEK-sealed envelope (EB-179) and
@@ -32572,7 +32664,11 @@ export class EventBus {
                 countReplaySkipped();
                 continue;
               }
-              if (filterExpr !== undefined && !filterExpr.test(rawPayload)) {
+              // Per-record live read (EB-287): see the capture note at
+              // the top of this function — a revision during a
+              // throttled pause judges the remaining records.
+              const liveFilterExpr = subscriber.filterExpr;
+              if (liveFilterExpr !== undefined && !liveFilterExpr.test(rawPayload)) {
                 // Filter-expression (EB-123) rejection on replay: the same
                 // deliberate-skip semantics as the predicate filter above —
                 // never queued, baseline advanced, key/causal baselines
