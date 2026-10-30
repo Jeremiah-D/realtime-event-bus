@@ -25994,6 +25994,82 @@ export class EventBus {
   }
 
   /**
+   * Revises the barrier hold bound of one barrier-opted-in subscriber
+   * (EB-292) without re-subscribing: `setBarrier(subId,
+   * maxHeldMessages)` retunes how many messages may be held behind one
+   * armed barrier (see `SubscribeOptions.barrier`, EB-98).
+   *
+   * Only the bound moves: `holdBehindBarrier` reads the live
+   * `gate.maxHeldMessages` on every hold decision (`if (gate.held.length
+   * >= gate.maxHeldMessages)`), so the new bound governs from the next
+   * hold decision — lowering it below the live held count fails open on
+   * the next arrival (everything held so far is released at once, the
+   * barrier is disarmed, and the cut is abandoned, exactly like the
+   * subscribe-time bound, counted in
+   * `getStats().barrier.overflowedHolds`), while raising it admits more
+   * held messages at once — with no drain, re-registration, or replay,
+   * and no active cleanup: already-held messages stay held until the
+   * armed barrier is handed to the handler or a later arrival
+   * overflows the new bound. The epoch tracking (`lastEpoch`,
+   * `armedEpoch`) and the held buffer itself are untouched.
+   * `getStats().barrier.heldMessages` reports the live bound's effect
+   * from the next snapshot.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `barrier` delivery, and an illegal bound (non-positive,
+   * non-integer, `NaN`, or non-finite) all throw `RangeError` with the
+   * live bound, the held messages, the epoch tracking, and the audit
+   * log untouched — the bound validation reuses the subscribe-time rule
+   * (a positive integer), so a bound that could not be set at subscribe
+   * time cannot be revised in later either. A revision identical to the
+   * current bound is a no-op with no audit. Audited as `barrier_revised`
+   * (`{ maxHeldMessages: <number>, oldMaxHeldMessages: <number> }`).
+   *
+   * Orthogonal to EB-98 (that is the barrier mechanism itself — the
+   * cut marker, arming, and the hold/release gate — this its hold-bound
+   * revision), and to EB-291 (that revises the causal buffer bound,
+   * this the barrier hold bound).
+   *
+   * Throws `RangeError` for an unknown subscriber, a non-barrier
+   * subscriber, or an illegal bound.
+   */
+  setBarrier(subId: string, maxHeldMessages: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setBarrier: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setBarrier: unknown subscriber: ${subId}`);
+    }
+    const barrier = subscriber.barrier;
+    if (barrier === undefined) {
+      throw new RangeError('setBarrier: subscriber has no barrier delivery set');
+    }
+    // Validate before touching anything, reusing the subscribe-time
+    // rule: a positive integer, or the live bound, the held messages,
+    // the epoch tracking, and the audit log stay exactly as they were.
+    if (!Number.isInteger(maxHeldMessages) || maxHeldMessages <= 0) {
+      throw new RangeError('setBarrier: maxHeldMessages must be a positive integer');
+    }
+    // Re-affirming the current bound is a no-op: no swap, no audit.
+    if (maxHeldMessages === barrier.maxHeldMessages) {
+      return;
+    }
+    const oldMaxHeldMessages = barrier.maxHeldMessages;
+    // Only the bound moves; the epoch tracking (`lastEpoch`,
+    // `armedEpoch`) and the already-held messages are untouched, and
+    // every hold decision reads the live value from here on.
+    barrier.maxHeldMessages = maxHeldMessages;
+    this.auditSubscription({
+      action: 'barrier_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { maxHeldMessages, oldMaxHeldMessages },
+    });
+  }
+
+  /**
    * Revises the delivery-shaping rate of one shaped subscriber
    * (EB-266): the drain reads the live bucket, so the new rate paces
    * the next flush round — no re-subscribe. The revision is partial:

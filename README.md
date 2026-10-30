@@ -2654,6 +2654,17 @@ library.
   1000) — on overflow the gate fails open (releases everything held,
   disarms, counted in `getStats().barrier.overflowedHolds`); a barrier
   shed by backpressure before delivery also releases fail-open.
+  The bound itself is revisable without re-subscribing (EB-292, via
+  `setBarrier(subId, maxHeldMessages)`): only a subscription that opted into `barrier` at
+  subscribe time can be retuned — a never-opted-in subscription throws `RangeError`, as does any bound
+  that fails the subscribe-time rule (a positive integer). Only the bound moves: the epoch tracking
+  (`lastEpoch`, `armedEpoch`) and the already-held messages are untouched, so lowering the bound below
+  the live held count fails open on the next arrival (everything held is released at once and the
+  barrier is disarmed, exactly like the subscribe-time bound) while raising it admits more held
+  messages at once — no active cleanup, no drain, no re-registration. A revision identical to the
+  current bound is a no-op with no audit. Every success is audited as `barrier_revised`
+  (`{ maxHeldMessages: <number>, oldMaxHeldMessages: <number> }`). (Real-time
+  systems: barrier delivery governance.)
   `getStats().barrier` reports `{ publishedBarriers, droppedBarriers,
   heldMessages, releasedMessages, overflowedHolds }`. See "Barrier cut
   markers" below for the delayed / retained / replay combination matrix.
@@ -3410,6 +3421,12 @@ npm test
   messages first, raising the bound admitting more early arrivals at once, re-affirming the current
   bound as a no-op with no audit, and the revised bound applying per source while other sources are
   untouched.
+- `test/barrier-revision.test.ts` — barrier hold-bound revision (EB-292): `setBarrier` fail-closed
+  preconditions (unknown / empty / non-barrier subscriber, invalid bound) with the live bound, the
+  held messages, the epoch tracking, and the audit log untouched, lowering the bound failing open on
+  the next arrival without touching held messages first, raising the bound admitting more held
+  messages at once, re-affirming the current bound as a no-op with no audit, and the revision
+  changing only the bound while the epochs and held messages survive.
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output
@@ -5091,6 +5108,20 @@ reports `{ publishedBarriers, droppedBarriers, heldMessages,
 releasedMessages, overflowedHolds }`. Invalid epochs (non-integer,
 negative) and hold bounds throw `RangeError` fail-fast, before anything
 is mutated.
+
+The hold bound is revisable without re-subscribing (EB-292, via
+`setBarrier(subId, maxHeldMessages)`): only a barrier-opted-in
+subscription can be retuned — a never-opted-in subscription throws
+`RangeError`, as does any bound that fails the subscribe-time rule (a
+positive integer). Only `barrier.maxHeldMessages` moves: the epoch
+tracking (`lastEpoch`, `armedEpoch`) and the already-held messages are
+untouched, so lowering the bound below the live held count fails open on
+the next arrival (everything held is released at once and the barrier is
+disarmed, exactly like the subscribe-time bound) while raising it admits
+more held messages at once — no active cleanup, no drain, no
+re-registration. A revision identical to the current bound is a no-op
+with no audit. Every success is audited as `barrier_revised`
+(`{ maxHeldMessages: <number>, oldMaxHeldMessages: <number> }`).
 
 ## WebSocket gateway (EB-99)
 
