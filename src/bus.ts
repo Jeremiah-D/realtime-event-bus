@@ -25751,6 +25751,89 @@ export class EventBus {
   }
 
   /**
+   * Revises one key-hotspot-monitored subscriber's alert threshold
+   * (EB-289) without re-subscribing: `setKeyHotspotThreshold(subId,
+   * thresholdDepth)` retunes the reorder-buffer depth that trips
+   * `onKeyHotspot` (see `SubscribeOptions.keyHotspot`, EB-47).
+   *
+   * Only the threshold moves: `checkKeyHotspot` reads the live
+   * `keyHotspot.thresholdDepth` on every keyed-delivery evaluation
+   * (`deliverKeyed` growth and `cascadeKeyExpected` shrink), so the
+   * new threshold governs from the next keyed-delivery evaluation —
+   * a lowered threshold can alert on the very next out-of-order
+   * arrival, a raised one stops alerting at once — with no drain,
+   * re-registration, or replay. The `onKeyHotspot` callback and the
+   * `autoMitigate` configuration are untouched: `recoverDepth` was
+   * snapshotted at subscribe time (defaulting to the old threshold,
+   * per `HotKeyMitigateOptions`) and is not recomputed from the new
+   * threshold, so a mitigation engaged under the old threshold
+   * releases at the depth it was configured with, not the revised
+   * one. The alert latch is untouched too: it re-arms only when the
+   * buffer depth drops below the (live) threshold — lowering the
+   * threshold below the live buffer depth makes the next evaluation
+   * alert, while raising the threshold never clears an
+   * already-triggered latch. `getStats().hotKeys` reports the live
+   * threshold from the next snapshot.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `keyHotspot` monitoring, and an illegal threshold
+   * (non-positive, non-integer, `NaN`, or non-finite) all throw
+   * `RangeError` with the live threshold, the callback, the
+   * mitigation configuration, the latch, and the audit log
+   * untouched — the threshold validation reuses the subscribe-time
+   * rule (`resolveKeyHotspotOptions`), so a threshold that could not
+   * be set at subscribe time cannot be revised in later either. A
+   * revision identical to the current threshold is a no-op with no
+   * audit. Audited as `key_hotspot_threshold_revised`
+   * (`{ thresholdDepth: <number>, oldThresholdDepth: <number> }`).
+   *
+   * Orthogonal to EB-115 (that is the hotspot mechanism itself —
+   * detection and auto-mitigation — this its threshold revision),
+   * and to `setLagMonitor` / `setLagForecast` (those retune the
+   * consumer-side lag watermark, this the keyed reorder-buffer
+   * depth).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, or an illegal threshold.
+   */
+  setKeyHotspotThreshold(subId: string, thresholdDepth: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setKeyHotspotThreshold: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setKeyHotspotThreshold: unknown subscriber: ${subId}`);
+    }
+    const keyHotspot = subscriber.keyHotspot;
+    if (keyHotspot === undefined) {
+      throw new RangeError('setKeyHotspotThreshold: subscriber has no keyHotspot monitoring set');
+    }
+    // Validate before touching anything, reusing the subscribe-time
+    // rule: a positive integer, or the live threshold and the audit
+    // log stay exactly as they were.
+    if (!Number.isInteger(thresholdDepth) || thresholdDepth <= 0) {
+      throw new RangeError('setKeyHotspotThreshold: thresholdDepth must be a positive integer');
+    }
+    // Re-affirming the current threshold is a no-op: no swap, no audit.
+    if (thresholdDepth === keyHotspot.thresholdDepth) {
+      return;
+    }
+    const oldThresholdDepth = keyHotspot.thresholdDepth;
+    // Only the threshold moves; the callback, the mitigation
+    // configuration (including the subscribe-time recoverDepth
+    // snapshot), and the alert latch are untouched, and every
+    // keyed-delivery evaluation reads the live value from here on.
+    keyHotspot.thresholdDepth = thresholdDepth;
+    this.auditSubscription({
+      action: 'key_hotspot_threshold_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { thresholdDepth, oldThresholdDepth },
+    });
+  }
+
+  /**
    * Revises the delivery-shaping rate of one shaped subscriber
    * (EB-266): the drain reads the live bucket, so the new rate paces
    * the next flush round — no re-subscribe. The revision is partial:

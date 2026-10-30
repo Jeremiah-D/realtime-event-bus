@@ -2200,8 +2200,23 @@ library.
   below `recoverDepth` (default: the alert threshold). Other keys are
   untouched; `getStats().hotKeyMitigations` / `.hotKeyShedMessages` count
   engagements and sheds, and each `hotKeys` entry reports `mitigated`. Only monitored subscriptions are sampled;
-  invalid options throw `RangeError`/`TypeError` from `subscribe`. Disabled
-  by default.
+  invalid options throw `RangeError`/`TypeError` from `subscribe`. The
+  threshold itself is revisable without re-subscribing (EB-289, via
+  `setKeyHotspotThreshold(subId, thresholdDepth)`): only a subscription
+  that opted into `keyHotspot` at subscribe time can be retuned — a
+  never-monitored subscription throws `RangeError`, as does any
+  threshold that fails the subscribe-time rule (a positive integer).
+  Only the threshold moves: the `onKeyHotspot` callback and the
+  `autoMitigate` configuration are untouched — `recoverDepth` stays at
+  its subscribe-time snapshot and is not recomputed from the new
+  threshold — and the alert latch still re-arms only when the buffer
+  depth drops below the (live) threshold, so lowering the threshold
+  below the live buffer depth alerts on the next keyed-delivery
+  evaluation while raising it never clears an already-triggered latch.
+  A revision identical to the current threshold is a no-op with no
+  audit. Every success is audited as `key_hotspot_threshold_revised`
+  (`{ thresholdDepth: <number>, oldThresholdDepth: <number> }`).
+  (Real-time systems: key-hotspot governance.) Disabled by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
   `new EventBus({ trace: true })`): one trace per sampled publish, threading
   the message through `bus.publish` → `bus.admission` → `bus.fanout` →
