@@ -2618,6 +2618,17 @@ library.
   without the opt-in the subscriber builds no buffers and tracks no
   clocks: zero overhead, zero behavior change. Invalid clocks
   (non-integer, negative) and buffer bounds throw `RangeError`.
+  The bound itself is revisable without re-subscribing (EB-291, via
+  `setCausal(subId, maxBufferPerSource)`): only a subscription that opted into `causal` at
+  subscribe time can be retuned — a never-opted-in subscription throws `RangeError`, as does any bound
+  that fails the subscribe-time rule (a positive integer). Only the bound moves: the per-source
+  expectations, the skipped-clock sets, and the already-buffered messages are untouched, so lowering
+  the bound below the live buffer depth sheds on the next arrival from that source (the oldest buffered
+  message is dropped and the expectation advances past it, exactly like the subscribe-time bound) while
+  raising it admits more early arrivals at once — no active cleanup, no drain, no re-registration. A
+  revision identical to the current bound is a no-op with no audit. Every success is audited as
+  `causal_revised` (`{ maxBufferPerSource: <number>, oldMaxBufferPerSource: <number> }`). (Real-time
+  systems: causal delivery governance.)
 - **Barrier cut markers** (EB-98, in `src/bus.ts`, via
   `publish(topic, payload, { barrier: { epoch } })` and opt-in
   `subscribe(pattern, handler, { barrier: true | { maxHeldMessages? } })`):
@@ -3393,6 +3404,12 @@ npm test
   subsequence, `RangeError` on invalid clocks/buffer bounds, the clock
   persisting on the durable log with replay restoring happens-before
   order, and the Prometheus exposition.
+- `test/causal-revision.test.ts` — causal buffer-bound revision (EB-291): `setCausal` fail-closed
+  preconditions (unknown / empty / non-causal subscriber, invalid bound) with the live bound and the
+  audit log untouched, lowering the bound shedding on the next arrival without touching buffered
+  messages first, raising the bound admitting more early arrivals at once, re-affirming the current
+  bound as a no-op with no audit, and the revised bound applying per source while other sources are
+  untouched.
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output

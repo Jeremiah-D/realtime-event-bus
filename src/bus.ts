@@ -25914,6 +25914,86 @@ export class EventBus {
   }
 
   /**
+   * Revises one causal subscriber's per-source buffer bound
+   * (EB-291) without re-subscribing: `setCausal(subId,
+   * maxBufferPerSource)` retunes the reorder-buffer bound that
+   * drops the oldest buffered message when an early arrival
+   * would exceed it (see `SubscribeOptions.causal`, EB-62).
+   *
+   * Only the bound moves: `deliverCausal` reads the live
+   * `gate.maxBufferPerSource` on every early arrival (`while
+   * (buffer.size > gate.maxBufferPerSource)`), so the new bound
+   * governs from the next arrival — lowering it below the live
+   * buffer depth sheds on the next arrival from that source
+   * (the oldest buffered message is dropped and the expectation
+   * advances past it, exactly like the subscribe-time bound,
+   * releasing whatever the advance unblocks), while raising it
+   * admits more early arrivals at once — with no drain,
+   * re-registration, or replay, and no active cleanup: already
+   * buffered messages stay buffered until their turn comes or a
+   * later arrival sheds them. The per-source expectations, the
+   * skipped-clock sets, and the buffered messages themselves are
+   * untouched. `causalBufferDepth(subId)` and
+   * `getStats().causalBuffer` report the live bound's effect
+   * from the next snapshot.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that
+   * never opted into `causal` delivery, and an illegal bound
+   * (non-positive, non-integer, `NaN`, or non-finite) all throw
+   * `RangeError` with the live bound, the buffers, the
+   * expectations, and the audit log untouched — the bound
+   * validation reuses the subscribe-time rule (a positive
+   * integer), so a bound that could not be set at subscribe
+   * time cannot be revised in later either. A revision
+   * identical to the current bound is a no-op with no audit.
+   * Audited as `causal_revised` (`{ maxBufferPerSource:
+   * <number>, oldMaxBufferPerSource: <number> }`).
+   *
+   * Orthogonal to EB-62 (that is the causal mechanism itself —
+   * happens-before delivery and the bounded buffer — this its
+   * bound revision), and to EB-292 (that revises the barrier
+   * hold bound, this the causal buffer bound).
+   *
+   * Throws `RangeError` for an unknown subscriber, a
+   * non-causal subscriber, or an illegal bound.
+   */
+  setCausal(subId: string, maxBufferPerSource: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setCausal: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setCausal: unknown subscriber: ${subId}`);
+    }
+    const causal = subscriber.causal;
+    if (causal === undefined) {
+      throw new RangeError('setCausal: subscriber has no causal delivery set');
+    }
+    // Validate before touching anything, reusing the subscribe-time
+    // rule: a positive integer, or the live bound, the buffers, and
+    // the audit log stay exactly as they were.
+    if (!Number.isInteger(maxBufferPerSource) || maxBufferPerSource <= 0) {
+      throw new RangeError('setCausal: maxBufferPerSource must be a positive integer');
+    }
+    // Re-affirming the current bound is a no-op: no swap, no audit.
+    if (maxBufferPerSource === causal.maxBufferPerSource) {
+      return;
+    }
+    const oldMaxBufferPerSource = causal.maxBufferPerSource;
+    // Only the bound moves; the expectations, the skipped-clock
+    // sets, and the already-buffered messages are untouched, and
+    // every early arrival reads the live value from here on.
+    causal.maxBufferPerSource = maxBufferPerSource;
+    this.auditSubscription({
+      action: 'causal_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { maxBufferPerSource, oldMaxBufferPerSource },
+    });
+  }
+
+  /**
    * Revises the delivery-shaping rate of one shaped subscriber
    * (EB-266): the drain reads the live bucket, so the new rate paces
    * the next flush round — no re-subscribe. The revision is partial:
