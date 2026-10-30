@@ -105,6 +105,7 @@ export type SubscriptionAuditAction =
   | 'queue_max_bytes_revised'
   | 'subscriber_max_payload_bytes_revised'
   | 'key_range_revised'
+  | 'backpressure_tier_revised'
   | 'delayed_topic_held'
   | 'delayed_topic_resumed'
   | 'delayed_key_held'
@@ -220,6 +221,7 @@ export type SubscriptionAuditAction =
  * - `queue_max_bytes_revised`: `{ queueMaxBytes: <number> | null, oldQueueMaxBytes: <number> }` — a subscriber's queue byte budget was revised (EB-282; only subscriptions that already carry a `queueMaxBytes` budget can be revised — a never-set budget, and a budget cleared by an earlier revision, both refuse until the subscriber opts in again at subscribe time, and `null` clears back to no byte dimension, never to a default; the queue object is mutated in place, so the already-queued messages and their buffered-byte accounting are untouched — shrinking below the current buffered bytes evicts nothing and the new budget governs only future admissions, with over-budget newcomers shedding per the standing `dropPolicy` and never arming the `'block'` tier, and growing admits immediately; the count capacity, `dropPolicy`, `highWaterMarkRatio`, and the backpressure tier never move; a revision identical to the current budget is a no-op with no audit)
  * - `subscriber_max_payload_bytes_revised`: `{ subscriberMaxPayloadBytes: <number> | null, oldSubscriberMaxPayloadBytes: <number> }` — a subscriber's explicit payload-size cap was revised (EB-283; only subscriptions that already carry an explicit `subscriberMaxPayloadBytes` can be revised — a never-set cap, and a cap cleared by an earlier revision, both refuse until the subscriber opts in again at subscribe time, and `null` clears back to inheritance of the topic's EB-120 payload cap, or to no cap when the topic has none; only the subscriber field moves — `subscriberPayloadCapFor` reads the live field on every delivery decision, so the new cap governs from the next delivery decision, and already-delivered messages, already-skipped messages, the oversize counters, and the per-topic sequence baseline are untouched; a revision identical to the current cap is a no-op with no audit)
  * - `key_range_revised`: `{ keyRange: { start?, end? } | null, oldKeyRange: { start?, end? } }` — a subscription's key range was revised (EB-284; only subscriptions that already carry a `keyRange` can be revised — a never-set range, and a range cleared by an earlier revision, both refuse until the subscriber opts in again at subscribe time, and `null` clears back to no narrowing, which is what restores keyless delivery; only the subscriber field moves — `deliverToSubscriber` reads the live range on every delivery decision, so the new range governs from the next delivery decision, and already-delivered messages are untouched while skips keep the `countFiltered` semantics; a revision identical to the current range is a no-op with no audit, and `{}` counts as a real range — it matches every keyed message while still excluding keyless ones — not as a clear)
+ * - `backpressure_tier_revised`: `{ backpressure: <tier>, oldBackpressure: <tier> }` — a subscription's slow-consumer backpressure tier was revised (EB-285; there is no opt-in gate — every subscription always carries an already-resolved tier, default `'block'` — so there is no "unset" state; only the subscriber tier moves — `queueSize`, `queueMaxBytes`, `dropPolicy`, and `highWaterMarkRatio` never move, already-queued messages are untouched, and the new tier governs from the next enqueue admission decision, with the tier deciding block-vs-drop when full and the standing `dropPolicy` deciding which message is dropped; the revision itself neither arms nor clears the `'block'` latch — a blocked subscriber still refuses arrivals until the queue recedes below the high-water mark, when the usual `onDrained` path clears it; a revision identical to the current tier is a no-op with no audit)
  * - `delayed_topic_resumed`: `{ topicPattern: <string> }` — the delayed-delivery sweep hold was lifted (EB-250; the `pattern` field carries the rule key)
  * - `delayed_key_held`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep was held for one key in the pattern (EB-252; the `pattern` field carries the topic pattern)
  * - `delayed_key_resumed`: `{ topicPattern: <string>, key: <string> }` — the delayed-delivery sweep hold for one key in the pattern was lifted (EB-252; the `pattern` field carries the topic pattern)
@@ -392,6 +394,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'queue_max_bytes_revised',
   'subscriber_max_payload_bytes_revised',
   'key_range_revised',
+  'backpressure_tier_revised',
   'delayed_topic_held',
   'delayed_topic_resumed',
   'delayed_key_held',

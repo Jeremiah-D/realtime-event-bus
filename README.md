@@ -749,6 +749,34 @@ library.
   `blockedCount(subId)` per subscriber. Anything else throws `RangeError` at
   subscribe time; an explicit `dropPolicy` contradicting an explicit drop tier
   also throws.
+  Revisable after subscribe (EB-285, via
+  `setBackpressureTier(subId, tier)`): a subscription's backpressure
+  tier can be retuned without re-subscribing — and there is no
+  opt-in gate, because every subscription always carries an
+  already-resolved tier (default `'block'`). Only the tier moves:
+  `queueSize`, `queueMaxBytes`, `dropPolicy`, and
+  `highWaterMarkRatio` are untouched, already-queued messages are
+  untouched, and the new tier governs from the next enqueue
+  admission decision — the tier decides block-vs-drop when full,
+  the standing `dropPolicy` decides which message is dropped, so a
+  revised drop tier still sheds per the standing policy. The
+  revision itself neither arms nor clears the `'block'` latch: a
+  subscriber already saturated when revised to `'block'` does not
+  block until the next admission saturates, and a blocked
+  subscriber revised away from `'block'` still refuses arrivals
+  (and keeps its `blockedCount`) until the queue recedes below the
+  high-water mark, when the usual drain path clears the latch. A
+  revision identical to the current tier is a no-op with no audit.
+  It is fail-closed (an unknown subscriber or a tier outside
+  `'drop-oldest' | 'drop-newest' | 'block'` throws `RangeError`
+  with the live tier and the audit log untouched — the
+  subscribe-time dropPolicy-conflict check is not re-applied, since
+  the revision must not move `dropPolicy`), and every success is
+  audited as `backpressure_tier_revised`
+  (`{ backpressure: <tier>, oldBackpressure: <tier> }`).
+  Orthogonal to the capacity (EB-281, that revises `queueSize`,
+  this revises the full-queue behavior). (Real-time systems:
+  delivery governance.)
   Revisable after subscribe (EB-281, via
   `setQueueSize(subId, size | null)`): a subscriber's queue count
   capacity can be retuned without re-subscribing — every subscription

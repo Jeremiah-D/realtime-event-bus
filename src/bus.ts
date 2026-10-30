@@ -23717,34 +23717,41 @@ export class EventBus {
               });
             },
           }),
-      ...(onDrained == null && throttle == null && backpressure !== 'block'
-        ? {}
-        : {
-            onDrained: (size: number) => {
-              // EB-83: the 'block' tier unblocks here — the queue receded
-              // below the high-water mark, so the subscriber may accept
-              // new arrivals again. Cleared before the throttle/user hooks
-              // so observers see the already-unblocked state.
-              if (backpressure === 'block' && subscriber.blocked) {
-                subscriber.blocked = false;
-              }
-              if (throttle != null) {
-                this.releaseThrottle(subscriber, size);
-              }
-              onDrained?.({
-                // Live pattern (see onBackpressure above): a hot pattern
-                // update must not leave events naming a stale pattern.
-                // Likewise the live capacity: `setQueueSize` (EB-281)
-                // revises it in place.
-                subscriberId: id,
-                pattern: subscriber.pattern,
-                queueSize: size,
-                capacity: subscriber.queueCapacity,
-                dropped: queue.droppedCount,
-                highWaterMark: queue.highWaterMark,
-              });
-            },
-          }),
+      // EB-285: the drain hook is installed for every subscription, not
+      // only for subscribe-time 'block' tiers — a tier revised to
+      // 'block' after subscribe must be able to unblock again, and a
+      // latch armed under 'block' must clear even after the tier was
+      // revised away (the latch can only be armed while the tier is
+      // 'block', and only the drain-below-the-mark event ends it).
+      // For subscriptions that can never block the wrapper is a no-op
+      // (blocked is already false, no throttle, no user hook).
+      onDrained: (size: number) => {
+        // EB-83: the 'block' tier unblocks here — the queue receded
+        // below the high-water mark, so the subscriber may accept
+        // new arrivals again. Cleared before the throttle/user hooks
+        // so observers see the already-unblocked state. The clear
+        // is tier-agnostic since EB-285 (see above): a blocked
+        // latch is not wedged by a tier revision in either
+        // direction.
+        if (subscriber.blocked) {
+          subscriber.blocked = false;
+        }
+        if (throttle != null) {
+          this.releaseThrottle(subscriber, size);
+        }
+        onDrained?.({
+          // Live pattern (see onBackpressure above): a hot pattern
+          // update must not leave events naming a stale pattern.
+          // Likewise the live capacity: `setQueueSize` (EB-281)
+          // revises it in place.
+          subscriberId: id,
+          pattern: subscriber.pattern,
+          queueSize: size,
+          capacity: subscriber.queueCapacity,
+          dropped: queue.droppedCount,
+          highWaterMark: queue.highWaterMark,
+        });
+      },
     });
     // Per-topic subscriber caps (EB-81): enforced after every other
     // subscribe-time validation and before anything registers — a throw
@@ -27687,6 +27694,90 @@ export class EventBus {
       detail: {
         keyRange: newRange === undefined ? null : { ...newRange },
         oldKeyRange: { ...oldKeyRange },
+      },
+    });
+  }
+
+  /**
+   * Revises a subscription's slow-consumer backpressure tier (EB-285)
+   * without re-subscribing: `setBackpressureTier(subId, tier)` retunes
+   * what happens when the subscriber's bounded queue is full at
+   * enqueue time (see `SubscribeOptions.backpressure`, EB-83).
+   *
+   * There is no opt-in gate: every subscription always carries an
+   * already-resolved tier — `resolveBackpressurePolicy` settled it at
+   * subscribe time, defaulting to `'block'` — so there is no "unset"
+   * state and no revision is ever refused for lacking a tier. The
+   * tier is validated with the subscribe-time validation
+   * (`assertValidBackpressurePolicy`, EB-83): anything outside
+   * `'drop-oldest' | 'drop-newest' | 'block'` throws `RangeError`
+   * with the live tier and the audit log untouched. The
+   * subscribe-time dropPolicy-conflict check is deliberately NOT
+   * re-applied: the revision must not move `dropPolicy`, and the two
+   * are orthogonal — the tier decides block-vs-drop when full, the
+   * standing `dropPolicy` (baked into the queue's shed policy at
+   * subscribe time) decides which message is dropped — so a revised
+   * drop tier sheds per the standing `dropPolicy`, never per the
+   * tier's name.
+   *
+   * Only `subscriber.backpressure` moves: `queueSize`,
+   * `queueMaxBytes`, `dropPolicy`, and `highWaterMarkRatio` never
+   * move, already-queued messages are untouched, and the new tier
+   * governs from the next enqueue admission decision — `enqueueMessage`
+   * reads the live tier when arming the `'block'` refusal
+   * (`backpressure === 'block' && wasFull`) and the blocked gate
+   * refuses while latched. The revision itself neither arms nor
+   * clears the latch: switching to `'block'` while already saturated
+   * does not block until the next admission saturates, and switching
+   * away from `'block'` while blocked neither wakes blocked
+   * publishers nor discards `blockedCount` — the latch still refuses
+   * arrivals until the queue recedes below the high-water mark, when
+   * the usual `onDrained` path clears it (that path is tier-agnostic
+   * since EB-285: the latch can only ever be armed while the tier is
+   * `'block'`, and only the drain-below-the-mark event ends it,
+   * whatever tier is live by then; the hook is installed for every
+   * subscription so a tier revised to `'block'` after subscribe can
+   * unblock again instead of wedging). A revision identical to the
+   * current tier is a no-op with no audit.
+   *
+   * Orthogonal to `setQueueSize` (EB-281, that revises the count
+   * capacity, this revises the full-queue behavior) and to the tier
+   * mechanism itself (EB-83, that sets the tier at subscribe time,
+   * this revises it). Audited as `backpressure_tier_revised`
+   * (`{ backpressure: <tier>, oldBackpressure: <tier> }`).
+   *
+   * Throws `RangeError` for an unknown subscriber or an illegal tier.
+   */
+  setBackpressureTier(subId: string, tier: BackpressurePolicy): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setBackpressureTier: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setBackpressureTier: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: reuse the subscribe-time
+    // tier validation (EB-83) verbatim — an illegal tier never moves
+    // the live tier. The dropPolicy-conflict check is not re-applied
+    // (see the doc comment): the revision must not move dropPolicy.
+    assertValidBackpressurePolicy(tier, 'setBackpressureTier');
+    const oldBackpressure = subscriber.backpressure;
+    // Identical tier: a no-op — no audit, and no delivery state moves
+    // (in particular the blocked latch is neither armed nor cleared).
+    if (tier === oldBackpressure) {
+      return;
+    }
+    // Only the tier moves; every admission decision re-reads the live
+    // tier (see enqueueMessage), and the blocked latch is untouched.
+    subscriber.backpressure = tier;
+    this.auditSubscription({
+      action: 'backpressure_tier_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        backpressure: tier,
+        oldBackpressure,
       },
     });
   }
