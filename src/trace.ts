@@ -158,6 +158,25 @@ export interface ResolvedTraceOptions {
 }
 
 /**
+ * Bus-level revision for head-based trace tuning (EB-311). Only the two
+ * numeric bounds move — `sampler`, `onTraceSpan`, and `archive` are
+ * fixed at construction and are not revisable here.
+ */
+export interface TraceRevision {
+  /**
+   * Fixed head-based sampling rate: the fraction of admitted publishes
+   * that start a trace. Must be a finite number in [0, 1] when
+   * provided — the construction-time rule.
+   */
+  sampleRate?: number;
+  /**
+   * Ring-buffer capacity for `getStats().traceSpans`. Must be a
+   * positive integer when provided — the construction-time rule.
+   */
+  bufferSize?: number;
+}
+
+/**
  * Minimal subscriber identity a trace span needs. The bus's private
  * `Subscriber` satisfies this structurally.
  */
@@ -298,19 +317,64 @@ export interface SampledTraceContext {
  * allocation-free.
  */
 export class TraceRecorder {
-  private readonly sampleRate: number;
+  // Live-tuned by `retune` (EB-311): the sampling decision and the ring
+  // write read these fields on every call, so a revision governs from
+  // the next sample / next span without draining or rebuilding anything.
+  // `sampler` and `onTraceSpan` stay fixed for the recorder's lifetime.
+  private sampleRate: number;
   private readonly sampler: TraceSampler | undefined;
   private readonly onTraceSpan: ((span: TraceSpan) => void) | undefined;
   private readonly traces = new WeakMap<object, MessageTraceState>();
   private readonly ring: TraceSpan[] = [];
   private ringHead = 0;
-  private readonly capacity: number;
+  private capacity: number;
 
   constructor(resolved: ResolvedTraceOptions) {
     this.sampleRate = resolved.sampleRate;
     this.sampler = resolved.sampler;
     this.onTraceSpan = resolved.onTraceSpan;
     this.capacity = resolved.bufferSize;
+  }
+
+  /** The two live tuning values, for bus-level revision (EB-311). */
+  current(): { sampleRate: number; bufferSize: number } {
+    return { sampleRate: this.sampleRate, bufferSize: this.capacity };
+  }
+
+  /**
+   * Retunes the sampling rate and the ring capacity live (EB-311). The
+   * caller must have validated `next` through `resolveTraceOptions`
+   * first — this method applies unconditionally. In-flight trace
+   * records (the `WeakMap` of open publishes) are untouched, and the
+   * new rate governs from the next `sample()` call, which reads the
+   * live rate on every decision. Shrinking the capacity does not trim
+   * the ring: the spans already buffered stay buffered until the next
+   * span covers the excess down to the live bound (see `emit`), so a
+   * shrink is never a loss of history at retune time — and growing
+   * keeps every buffered span too. A capacity change re-lays a wrapped
+   * ring into oldest-first order first, so the ring head never points
+   * into a half-grown buffer: the next write after a grow appends in
+   * chronological order, and the next write after a shrink overwrites
+   * the oldest retained span under the new bound.
+   */
+  retune(next: { sampleRate: number; bufferSize: number }): void {
+    this.sampleRate = next.sampleRate;
+    if (next.bufferSize !== this.capacity) {
+      if (this.ringHead !== 0) {
+        // The ring wrapped under the old capacity: re-lay it into
+        // oldest-first order so the head no longer points mid-buffer —
+        // otherwise a grow would append after the newest span in array
+        // order but before it in chronological order. The snapshot
+        // must be taken before the capacity moves: under the new
+        // capacity the ring would read as never-wrapped and come back
+        // in raw array order.
+        const ordered = this.snapshot();
+        this.ring.length = 0;
+        this.ring.push(...ordered);
+        this.ringHead = 0;
+      }
+      this.capacity = next.bufferSize;
+    }
   }
 
   /**
@@ -534,8 +598,25 @@ export class TraceRecorder {
     if (state !== undefined) state.openAck = undefined;
   }
 
-  /** Emits a span: ring buffer first, then the `onTraceSpan` callback. */
+  /**
+   * Emits a span: ring buffer first, then the `onTraceSpan` callback.
+   * The write wraps at the live capacity, so a revised `bufferSize`
+   * governs from the next span. A ring left overfull by a shrink
+   * (EB-311) keeps its retained spans until this span arrives: the
+   * excess oldest are covered down to the live bound first — keeping
+   * the newest `capacity - 1` — so the ring lands back within the
+   * bound with this span included, oldest evicted first from here on.
+   */
   private emit(span: TraceSpan): void {
+    if (this.ring.length > this.capacity) {
+      // Overfull after a shrink: the retained spans survived the
+      // retune itself, but this span covers the excess — keep the
+      // newest `capacity - 1` so the ring lands within the live bound.
+      const kept = this.capacity > 1 ? this.snapshot().slice(-(this.capacity - 1)) : [];
+      this.ring.length = 0;
+      this.ring.push(...kept);
+      this.ringHead = 0;
+    }
     if (this.ring.length < this.capacity) {
       this.ring.push(span);
     } else {

@@ -2272,7 +2272,18 @@ library.
   `getStats().traceSpans` (oldest evicted first, `bufferSize` default
   1024). Disabled by default, and the disabled path is allocation-free
   (one branch per instrumentation site — no WeakMap lookup, no clock read).
-  Invalid options throw `RangeError` from the constructor.
+  Invalid options throw `RangeError` from the constructor. Retune live
+  with `setTrace({ sampleRate?, bufferSize? })` (EB-311): only the fields
+  provided move, the rest keep their live values, and the new values
+  govern from the next decision — the next publish samples at the live
+  rate and the next span write wraps at the live capacity. `sampler`,
+  `onTraceSpan`, and `archive` are not revisable. Shrinking `bufferSize`
+  keeps the buffered spans until the next span covers the excess down to
+  the live bound; growing keeps every buffered span in chronological
+  order. Only a bus that enabled `trace` can be revised (otherwise
+  `RangeError`); illegal values fail closed with the live tuning
+  untouched; an identical or empty revision is a no-op with no audit.
+  Audited as `trace_revised` (old and new values).
 - **Tail-based delivery-pipeline trace sampling** (in `src/tail-sampling.ts`,
   via `new EventBus({ tailSampling: true })`): the complement to head-based
   sampling above. Every admitted publish opens a trace whose spans buffer

@@ -372,6 +372,7 @@ import {
   resolveTraceOptions,
   validateTraceparent,
   type TraceOptions,
+  type TraceRevision,
   type TraceSpan,
 } from './trace.ts';
 import {
@@ -20796,6 +20797,88 @@ export class EventBus {
         oldMaxOpenTraces: current.maxOpenTraces,
         maxSpansPerTrace,
         oldMaxSpansPerTrace: current.maxSpansPerTrace,
+        bufferSize,
+        oldBufferSize: current.bufferSize,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level head-based trace tuning live (EB-311)
+   * without restarting the bus: `setTrace({ sampleRate?, bufferSize?
+   * })` retunes how aggressively admitted publishes start a trace and
+   * how many spans the ring buffer keeps (see
+   * `EventBusOptions.trace`, EB-45).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * `sampler`, `onTraceSpan`, and `archive` are not revisable here —
+   * they are the sampling decision, the observer channel, and the
+   * journal identity fixed at construction. In-flight trace records
+   * are untouched: a publish already sampled keeps its trace, and the
+   * new values govern from the next decision onward — the next
+   * `sample()` reads the live `sampleRate`, and the next span write
+   * wraps at the live `bufferSize`. Shrinking `bufferSize` does not
+   * trim the ring at retune time — the buffered spans stay buffered
+   * until the next span covers the excess down to the live bound, so
+   * the next append evicts the oldest under the new bound — while
+   * growing it keeps every buffered span in chronological order.
+   *
+   * Fail-closed: a bus that never enabled `trace`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the live
+   * tuning and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveTraceOptions`: the rate a finite
+   * number in [0, 1], the buffer a positive integer) against the
+   * merged values, so a value that could not be set at construction
+   * cannot be revised in later either — and a failed call changes
+   * nothing at all: when only one field is provided only that field is
+   * validated and moved, and an illegal value in either field leaves
+   * every live value exactly as it was. A revision that provides
+   * neither field, and a revision identical to the current tuning, are
+   * both no-ops with no audit. Audited as `trace_revised`
+   * (`{ sampleRate, oldSampleRate, bufferSize, oldBufferSize }`).
+   *
+   * Orthogonal to EB-167 (that is the trace span archive journal —
+   * this the sampling and buffer tuning), and to EB-296 (that retunes
+   * tail sampling — this the head-based trace).
+   *
+   * Throws `RangeError` when trace is not enabled, for a non-object
+   * revision, or for an illegal `sampleRate` / `bufferSize`.
+   */
+  setTrace(opts: TraceRevision): void {
+    const recorder = this.trace;
+    if (recorder === undefined) {
+      throw new RangeError('setTrace: trace is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setTrace: revision must be an object with sampleRate and/or bufferSize',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = recorder.current();
+    const sampleRate = opts.sampleRate ?? current.sampleRate;
+    const bufferSize = opts.bufferSize ?? current.bufferSize;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (sampleRate === current.sampleRate && bufferSize === current.bufferSize) {
+      return;
+    }
+    const resolved = resolveTraceOptions({ sampleRate, bufferSize }, 'setTrace');
+    if (resolved === undefined) {
+      throw new RangeError('setTrace: trace is not enabled on this bus');
+    }
+    recorder.retune(resolved);
+    this.auditSubscription({
+      action: 'trace_revised',
+      actor: 'system',
+      detail: {
+        sampleRate,
+        oldSampleRate: current.sampleRate,
         bufferSize,
         oldBufferSize: current.bufferSize,
       },
