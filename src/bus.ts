@@ -231,6 +231,7 @@ import {
 import {
   PartitionHealthTracker,
   resolvePartitionHealthOptions,
+  type PartitionHealthRevision,
   type PartitionHealthRow,
 } from './partitionhealth.ts';
 import {
@@ -20740,6 +20741,106 @@ export class EventBus {
         oldMaxSpansPerTrace: current.maxSpansPerTrace,
         bufferSize,
         oldBufferSize: current.bufferSize,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level partition-health tuning live (EB-298) without
+   * restarting the bus: `setPartitionHealth({ windowSize?,
+   * unhealthyThreshold?, minSamples?, cooldownSuccesses? })` retunes
+   * how aggressively partitions are condemned unhealthy and how long
+   * their recovery cool-down runs (see
+   * `EventBusOptions.partitionHealth`, EB-217).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * In-flight outcome windows are untouched: already-recorded
+   * outcomes stay recorded, and the new values govern from the next
+   * `record` onward — a tightened `windowSize` truncates the oldest
+   * outcomes down to the new window at the next report, a tightened
+   * `unhealthyThreshold` / `minSamples` condemns at the next classify,
+   * and a revised `cooldownSuccesses` arms the cool-down of the next
+   * condemnation (an in-flight cool-down counter is not rewritten).
+   *
+   * Fail-closed: a bus that never enabled `partitionHealth`, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. Validation
+   * reuses the construction-time rule
+   * (`resolvePartitionHealthOptions`: the window a positive integer,
+   * the threshold a number in (0, 1], `minSamples` a positive integer
+   * no larger than the merged window, the cool-down a positive
+   * integer) against the merged values, so a value that could not be
+   * set at construction cannot be revised in later either — and a
+   * failed call changes nothing at all: when only one field is
+   * provided only that field is validated and moved, and an illegal
+   * value in either field leaves every live value exactly as it was.
+   * A revision that provides neither field, and a revision identical
+   * to the current tuning, are both no-ops with no audit. Audited as
+   * `partition_health_revised` (`{ windowSize, oldWindowSize,
+   * unhealthyThreshold, oldUnhealthyThreshold, minSamples,
+   * oldMinSamples, cooldownSuccesses, oldCooldownSuccesses }`).
+   *
+   * Orthogonal to EB-85 (that is the durable log's retention bound —
+   * this the partition health tuning), and to `setTopicPartitions`
+   * (that retunes the partition count — this the health observation).
+   *
+   * Throws `RangeError` when partition health is not enabled, for a
+   * non-object revision, or for an illegal `windowSize` /
+   * `unhealthyThreshold` / `minSamples` / `cooldownSuccesses`.
+   */
+  setPartitionHealth(opts: PartitionHealthRevision): void {
+    const tracker = this.partitionHealthTracker;
+    if (tracker === undefined) {
+      throw new RangeError('setPartitionHealth: partitionHealth is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setPartitionHealth: revision must be an object with windowSize and/or unhealthyThreshold and/or minSamples and/or cooldownSuccesses',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = tracker.current();
+    const windowSize = opts.windowSize ?? current.windowSize;
+    const unhealthyThreshold = opts.unhealthyThreshold ?? current.unhealthyThreshold;
+    const minSamples = opts.minSamples ?? current.minSamples;
+    const cooldownSuccesses = opts.cooldownSuccesses ?? current.cooldownSuccesses;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      windowSize === current.windowSize &&
+      unhealthyThreshold === current.unhealthyThreshold &&
+      minSamples === current.minSamples &&
+      cooldownSuccesses === current.cooldownSuccesses
+    ) {
+      return;
+    }
+    const resolved = resolvePartitionHealthOptions({
+      windowSize,
+      unhealthyThreshold,
+      minSamples,
+      cooldownSuccesses,
+    });
+    if (resolved === undefined) {
+      throw new RangeError('setPartitionHealth: partitionHealth is not enabled on this bus');
+    }
+    tracker.retune(resolved);
+    this.auditSubscription({
+      action: 'partition_health_revised',
+      actor: 'system',
+      detail: {
+        windowSize,
+        oldWindowSize: current.windowSize,
+        unhealthyThreshold,
+        oldUnhealthyThreshold: current.unhealthyThreshold,
+        minSamples,
+        oldMinSamples: current.minSamples,
+        cooldownSuccesses,
+        oldCooldownSuccesses: current.cooldownSuccesses,
       },
     });
   }

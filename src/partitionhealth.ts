@@ -83,6 +83,38 @@ export interface ResolvedPartitionHealthOptions {
 }
 
 /**
+ * Revision for the bus-level partition-health tuning (see
+ * `EventBus.setPartitionHealth`, EB-298). Only the fields provided move;
+ * the rest keep their live values.
+ */
+export interface PartitionHealthRevision {
+  /**
+   * Sliding window of the most recent outcomes kept per (topic,
+   * partition). Must be a positive integer when provided — the
+   * construction-time rule.
+   */
+  windowSize?: number;
+  /**
+   * The bad-outcome rate at or above which a partition is marked
+   * unhealthy. Must be a number in (0, 1] when provided — the
+   * construction-time rule.
+   */
+  unhealthyThreshold?: number;
+  /**
+   * Minimum outcomes in the window before a partition can be marked
+   * unhealthy. Must be a positive integer no larger than the (merged)
+   * `windowSize` when provided — the construction-time rule.
+   */
+  minSamples?: number;
+  /**
+   * Consecutive successful outcomes required to recover an unhealthy
+   * partition. Must be a positive integer when provided — the
+   * construction-time rule.
+   */
+  cooldownSuccesses?: number;
+}
+
+/**
  * Validates `EventBusOptions.partitionHealth` fail-fast. Returns
  * `undefined` when the option is absent (tracking disabled); throws
  * `TypeError`/`RangeError` on a malformed options object so a bad
@@ -160,11 +192,36 @@ export interface PartitionHealthRow {
  * healthy by definition — health is only ever ascribed, never assumed.
  */
 export class PartitionHealthTracker {
-  private readonly opts: ResolvedPartitionHealthOptions;
+  // Live-tuned by `retune` (EB-298): `record` reads these fields on
+  // every call, so a revision governs from the next outcome without
+  // draining or rebuilding any record — the records table (in-flight
+  // outcome windows, cool-down counters) is untouched by a retune.
+  private opts: ResolvedPartitionHealthOptions;
   private readonly records = new Map<string, PartitionHealthRecord>();
 
   constructor(opts: ResolvedPartitionHealthOptions) {
     this.opts = opts;
+  }
+
+  /** The four live tuning values, for bus-level revision (EB-298). */
+  current(): ResolvedPartitionHealthOptions {
+    return { ...this.opts };
+  }
+
+  /**
+   * Retunes the four numeric bounds live (EB-298). The caller must have
+   * validated `next` through `resolvePartitionHealthOptions` first —
+   * this method applies unconditionally. The records table is untouched:
+   * already-recorded outcomes stay recorded, and the new values govern
+   * from the next `record` onward — a tightened `windowSize` truncates
+   * the oldest outcomes down to the new window at the next record, a
+   * tightened `unhealthyThreshold`/`minSamples` condemns at the next
+   * classify, and a revised `cooldownSuccesses` arms the cool-down of
+   * the next condemnation (an in-flight cool-down counter is not
+   * rewritten).
+   */
+  retune(next: ResolvedPartitionHealthOptions): void {
+    this.opts = { ...next };
   }
 
   private key(topic: string, partition: number): string {
@@ -193,7 +250,11 @@ export class PartitionHealthTracker {
   record(topic: string, partition: number, outcome: PartitionOutcome): void {
     const r = this.recordFor(topic, partition);
     r.outcomes.push(outcome);
-    if (r.outcomes.length > this.opts.windowSize) {
+    // Evict down to the live window: in the steady state this removes
+    // at most one oldest outcome per record, and after a retune that
+    // tightened `windowSize` (EB-298) it converges to the new window
+    // at the next record instead of staying oversized forever.
+    while (r.outcomes.length > this.opts.windowSize) {
       const evicted = r.outcomes.shift() as PartitionOutcome;
       if (evicted === 'failure') r.failures -= 1;
       else if (evicted === 'timeout') r.timeouts -= 1;

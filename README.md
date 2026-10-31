@@ -4438,6 +4438,17 @@ How it works:
   `eventbus_partition_skipped_unhealthy_total{topic,partition}` (only
   emitted after the first skip). Without the option everything is
   disabled: no health state, no rerouting, no new stats or series.
+  Retune live with `setPartitionHealth({ windowSize?,
+  unhealthyThreshold?, minSamples?, cooldownSuccesses? })` (EB-298):
+  only the fields provided move, the rest keep their live values, and
+  the new values govern from the next report — a tightened window
+  truncates the oldest outcomes down to the new window at the next report, a tightened
+  threshold/minSamples condemns at the next classify, and a revised
+  cool-down arms the next condemnation (an in-flight cool-down counter
+  is not rewritten). Only a bus that enabled `partitionHealth` can be
+  revised (otherwise `RangeError`); illegal values fail closed with the
+  live tuning untouched; an identical or empty revision is a no-op with
+  no audit. Audited as `partition_health_revised` (old and new values).
 - **Scope note** — partition routing is a publish-side admission
   decision: delayed schedules, pause-buffered messages, and bridge/cluster
   ingress fan out as ordinary (partition-0) publishes.
