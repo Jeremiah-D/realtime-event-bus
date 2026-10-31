@@ -91,6 +91,39 @@ export interface AdmissionLatencyOptions {
   slowAdmissionThresholdMs?: number;
 }
 
+/**
+ * Revision for the bus-level admission-latency tuning (see
+ * `EventBus.setAdmissionLatency`, EB-304). Only the fields provided
+ * move; the rest keep their live values.
+ */
+export interface AdmissionLatencyRevision {
+  /**
+   * How many of the most recent total-span samples to keep per topic.
+   * Must be a positive integer when provided — the construction-time
+   * rule.
+   */
+  windowSize?: number;
+  /**
+   * How many of the most recent per-gate samples to keep per
+   * (topic, gate). Must be a positive integer when provided — the
+   * construction-time rule.
+   */
+  gateWindowSize?: number;
+  /**
+   * A total-span sample at or above this many milliseconds counts as a
+   * slow admission. Must be a non-negative finite number when
+   * provided — the construction-time rule.
+   */
+  slowAdmissionThresholdMs?: number;
+}
+
+/** `AdmissionLatencyOptions` with defaults resolved to live values. */
+export interface ResolvedAdmissionLatencyOptions {
+  windowSize: number;
+  gateWindowSize: number;
+  slowAdmissionThresholdMs: number;
+}
+
 /** A latency distribution summary over one sample window. */
 export interface AdmissionLatencyStats {
   /** Samples currently in the window. */
@@ -129,8 +162,18 @@ function quantileRank(sorted: number[], q: number): number {
 /** Bounded rolling window of millisecond samples with slow counting. */
 class SampleWindow {
   private readonly samples: number[] = [];
-  private readonly windowSize: number;
-  private readonly slowThresholdMs: number;
+  // Whether each sample counted as slow under the threshold in force
+  // when it was recorded, kept in lockstep with `samples`. The slow
+  // threshold is live-tuned by `retune` (EB-304) and applies from the
+  // next `record` onward, so an evicted sample must adjust the slow
+  // counter by the verdict it was recorded under — not by the live
+  // threshold, which may have moved since.
+  private readonly slowFlags: boolean[] = [];
+  // Live-tuned by `retune` (EB-304): `record` reads these fields on
+  // every call, so a revision governs from the next sample without
+  // draining or rebuilding the window.
+  private windowSize: number;
+  private slowThresholdMs: number;
   private sumMs = 0;
   private slow = 0;
 
@@ -139,16 +182,32 @@ class SampleWindow {
     this.slowThresholdMs = slowThresholdMs;
   }
 
+  /**
+   * Retunes the window bound and the slow threshold live (EB-304). The
+   * samples are untouched: a tightened window truncates the oldest
+   * samples down to the new bound at the next `record`, and the new
+   * slow threshold counts from the next `record` onward — samples
+   * already counted keep the verdict they were recorded under.
+   */
+  retune(windowSize: number, slowThresholdMs: number): void {
+    this.windowSize = windowSize;
+    this.slowThresholdMs = slowThresholdMs;
+  }
+
   record(latencyMs: number): void {
     const sample = Math.max(0, latencyMs);
     this.samples.push(sample);
     this.sumMs += sample;
-    if (sample >= this.slowThresholdMs) this.slow += 1;
-    if (this.samples.length > this.windowSize) {
-      const evicted = this.samples.splice(0, this.samples.length - this.windowSize);
-      for (const e of evicted) {
-        this.sumMs -= e;
-        if (e >= this.slowThresholdMs) this.slow -= 1;
+    const slow = sample >= this.slowThresholdMs;
+    this.slowFlags.push(slow);
+    if (slow) this.slow += 1;
+    const overflow = this.samples.length - this.windowSize;
+    if (overflow > 0) {
+      const evicted = this.samples.splice(0, overflow);
+      const evictedFlags = this.slowFlags.splice(0, overflow);
+      for (const e of evicted) this.sumMs -= e;
+      for (const f of evictedFlags) {
+        if (f) this.slow -= 1;
       }
     }
   }
@@ -189,9 +248,13 @@ class SampleWindow {
 export class AdmissionLatencyTracker {
   private readonly totals = new Map<string, SampleWindow>();
   private readonly gates = new Map<string, Map<AdmissionGate, SampleWindow>>();
-  private readonly windowSize: number;
-  private readonly gateWindowSize: number;
-  private readonly slowThresholdMs: number;
+  // Live-tuned by `retune` (EB-304): `record`/`recordGate` read these
+  // fields on every call, so a revision governs from the next sample
+  // without draining or rebuilding any window — the samples are
+  // untouched by a retune.
+  private windowSize: number;
+  private gateWindowSize: number;
+  private slowThresholdMs: number;
 
   constructor(options?: AdmissionLatencyOptions) {
     const windowSize = options?.windowSize ?? 1024;
@@ -211,6 +274,40 @@ export class AdmissionLatencyTracker {
     this.windowSize = windowSize;
     this.gateWindowSize = gateWindowSize;
     this.slowThresholdMs = slowThresholdMs;
+  }
+
+  /** The three live tuning values, for bus-level revision (EB-304). */
+  current(): ResolvedAdmissionLatencyOptions {
+    return {
+      windowSize: this.windowSize,
+      gateWindowSize: this.gateWindowSize,
+      slowAdmissionThresholdMs: this.slowThresholdMs,
+    };
+  }
+
+  /**
+   * Retunes the three bounds live (EB-304). The caller must have
+   * validated `next` through `resolveAdmissionLatencyOptions` first —
+   * this method applies unconditionally. The samples are untouched:
+   * every live window is retuned in place, so a tightened window
+   * truncates the oldest samples down to the new bound at the next
+   * `record`/`recordGate`, and the new slow threshold counts from the
+   * next sample onward (samples already counted keep the verdict they
+   * were recorded under); windows created after the retune are built
+   * at the new bounds.
+   */
+  retune(next: ResolvedAdmissionLatencyOptions): void {
+    this.windowSize = next.windowSize;
+    this.gateWindowSize = next.gateWindowSize;
+    this.slowThresholdMs = next.slowAdmissionThresholdMs;
+    for (const window of this.totals.values()) {
+      window.retune(next.windowSize, next.slowAdmissionThresholdMs);
+    }
+    for (const perGate of this.gates.values()) {
+      for (const window of perGate.values()) {
+        window.retune(next.gateWindowSize, next.slowAdmissionThresholdMs);
+      }
+    }
   }
 
   /** Records one total admission-span sample for a topic. */

@@ -8903,6 +8903,18 @@ Semantics:
   clock (`EventBusOptions.now`), so tests drive deterministic values
   with a controllable clock; a backwards clock clamps samples at 0.
 
+Retune live with `bus.setAdmissionLatency({ windowSize?,
+gateWindowSize?, slowAdmissionThresholdMs? })` (EB-304): only the
+fields provided move, the rest keep their live values — a tightened
+window truncates the oldest samples down to the new bound at the next
+recorded sample, and a revised slow threshold counts from the next
+sample onward (samples already counted keep the verdict they were
+recorded under); only a bus that already enabled `publishLatency` can
+be revised (otherwise `RangeError`); illegal values fail closed with
+the live tuning untouched; an identical or empty revision is a no-op
+with no audit. Audited as `admission_latency_revised` (old and new
+values).
+
 ## Subscriber lag forecasting (EB-183)
 
 Opt-in predictive lag monitoring (`src/forecast.ts`): where the lag

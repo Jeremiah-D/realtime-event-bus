@@ -485,6 +485,7 @@ import {
   resolveAdmissionLatencyOptions,
   type AdmissionGate,
   type AdmissionLatencyOptions,
+  type AdmissionLatencyRevision,
   type AdmissionLatencyStats,
 } from './publishlatency.ts';
 export type {
@@ -21327,6 +21328,108 @@ export class EventBus {
         oldAlertThresholdMs: current.alertThresholdMs,
         hasOnScheduleSkew: onScheduleSkew !== undefined,
         oldHasOnScheduleSkew: current.onScheduleSkew !== undefined,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level admission-latency observation tuning live
+   * (EB-304) without restarting the bus: `setAdmissionLatency({
+   * windowSize?, gateWindowSize?, slowAdmissionThresholdMs? })` retunes
+   * how many of the most recent total-span samples the bus keeps per
+   * topic, how many per-gate samples it keeps per (topic, gate), and
+   * what counts as a slow admission (see
+   * `EventBusOptions.publishLatency`, EB-182).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The samples are untouched: a tightened window truncates the oldest
+   * samples down to the new bound at the next recorded sample, and a
+   * revised slow threshold counts from the next sample onward —
+   * samples already counted keep the verdict they were recorded under,
+   * so the slow counter can never go negative or stale when a
+   * threshold change and a window tightening meet at an eviction. The
+   * new values govern from the next publish admission onward; windows
+   * created after the retune are built at the new bounds.
+   *
+   * Fail-closed: a bus that never enabled `publishLatency`, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. Validation
+   * reuses the construction-time rule
+   * (`resolveAdmissionLatencyOptions`: the windows positive integers,
+   * the threshold a non-negative finite number) against the merged
+   * values, so a value that could not be set at construction cannot be
+   * revised in later either — and a failed call changes nothing at
+   * all: when only one field is provided only that field is validated
+   * and moved, and an illegal value in any field leaves every live
+   * value exactly as it was. A revision that provides neither field,
+   * and a revision identical to the current tuning, are both no-ops
+   * with no audit. Audited as `admission_latency_revised`
+   * (`{ windowSize, oldWindowSize, gateWindowSize, oldGateWindowSize,
+   * slowAdmissionThresholdMs, oldSlowAdmissionThresholdMs }`).
+   *
+   * Orthogonal to EB-303 (that retunes schedule-skew observation —
+   * this the admission-latency observation), and to EB-296/EB-298/
+   * EB-299/EB-300/EB-301/EB-302 (those retune other bus-level
+   * parameters — this the admission-latency tuning).
+   *
+   * Throws `RangeError` when publish-side admission latency sampling
+   * is not enabled, for a non-object revision, or for an illegal
+   * `windowSize` / `gateWindowSize` / `slowAdmissionThresholdMs`.
+   */
+  setAdmissionLatency(opts: AdmissionLatencyRevision): void {
+    const tracker = this.admissionLatency;
+    if (tracker === undefined) {
+      throw new RangeError('setAdmissionLatency: publishLatency is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setAdmissionLatency: revision must be an object with windowSize and/or gateWindowSize and/or slowAdmissionThresholdMs',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = tracker.current();
+    const windowSize = opts.windowSize ?? current.windowSize;
+    const gateWindowSize = opts.gateWindowSize ?? current.gateWindowSize;
+    const slowAdmissionThresholdMs =
+      opts.slowAdmissionThresholdMs ?? current.slowAdmissionThresholdMs;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      windowSize === current.windowSize &&
+      gateWindowSize === current.gateWindowSize &&
+      slowAdmissionThresholdMs === current.slowAdmissionThresholdMs
+    ) {
+      return;
+    }
+    const resolved = resolveAdmissionLatencyOptions({
+      windowSize,
+      gateWindowSize,
+      slowAdmissionThresholdMs,
+    });
+    if (resolved === undefined) {
+      throw new RangeError('setAdmissionLatency: publishLatency is not enabled on this bus');
+    }
+    tracker.retune({
+      windowSize: resolved.windowSize ?? current.windowSize,
+      gateWindowSize: resolved.gateWindowSize ?? current.gateWindowSize,
+      slowAdmissionThresholdMs:
+        resolved.slowAdmissionThresholdMs ?? current.slowAdmissionThresholdMs,
+    });
+    this.auditSubscription({
+      action: 'admission_latency_revised',
+      actor: 'system',
+      detail: {
+        windowSize,
+        oldWindowSize: current.windowSize,
+        gateWindowSize,
+        oldGateWindowSize: current.gateWindowSize,
+        slowAdmissionThresholdMs,
+        oldSlowAdmissionThresholdMs: current.slowAdmissionThresholdMs,
       },
     });
   }
