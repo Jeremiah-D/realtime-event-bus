@@ -94,6 +94,38 @@ export interface ResolvedOtlpSpanExporterOptions {
   maxBuffered: number;
 }
 
+/**
+ * Revision for the bus-level OTLP export tuning (see
+ * `EventBus.setOtlp`, EB-299). Only the fields provided move; the rest
+ * keep their live values. `endpoint`, `headers`, and `serviceName` are
+ * not revisable here — they are the export destination and identity
+ * fixed at construction — and neither is `flushIntervalMs`: the flush
+ * timer is armed once at construction, so changing the interval means
+ * rebuilding the exporter (and the bus).
+ */
+export interface OtlpRevision {
+  /**
+   * Export-side sampling rate. Must be a finite number in [0, 1] when
+   * provided — the construction-time rule.
+   */
+  sampleRate?: number;
+  /**
+   * Spans per export POST. Must be a positive integer when provided —
+   * the construction-time rule.
+   */
+  batchSize?: number;
+  /**
+   * Per-request timeout in milliseconds. Must be a finite number > 0
+   * when provided — the construction-time rule.
+   */
+  timeoutMs?: number;
+  /**
+   * Maximum buffered spans. Must be a positive integer when provided —
+   * the construction-time rule.
+   */
+  maxBuffered?: number;
+}
+
 /** Exporter counters, surfaced as `getStats().otlp`. */
 export interface OtlpSpanExportStats {
   /** The configured endpoint, as a string. */
@@ -250,12 +282,21 @@ function encodeBatch(serviceName: string, batch: TraceSpan[]): string {
  */
 export class OtlpSpanExporter {
   private readonly endpoint: URL;
-  private readonly sampleRate: number;
-  private readonly batchSize: number;
-  private readonly timeoutMs: number;
+  // Live-tuned by `retune` (EB-299): every use point reads these fields
+  // on each call — `exportSpan` samples at the live `sampleRate` and
+  // drops the oldest past the live `maxBuffered`, flushes at the live
+  // `batchSize`, `flushInner` slices at the live `batchSize`, and
+  // `postBatch` times out at the live `timeoutMs` — so a revision
+  // governs from the next admission/flush/POST without draining or
+  // rebuilding the exporter. `endpoint`, `headers`, and `serviceName`
+  // stay fixed for the exporter's lifetime.
+  private sampleRate: number;
+  private batchSize: number;
+  private readonly flushIntervalMs: number;
+  private timeoutMs: number;
   private readonly headers: Record<string, string>;
   private readonly serviceName: string;
-  private readonly maxBuffered: number;
+  private maxBuffered: number;
   private readonly buffer: TraceSpan[] = [];
   private readonly timer: ReturnType<typeof setInterval>;
   private flushPromise: Promise<void> | undefined;
@@ -267,6 +308,7 @@ export class OtlpSpanExporter {
     this.endpoint = resolved.endpoint;
     this.sampleRate = resolved.sampleRate;
     this.batchSize = resolved.batchSize;
+    this.flushIntervalMs = resolved.flushIntervalMs;
     this.timeoutMs = resolved.timeoutMs;
     this.headers = resolved.headers;
     this.serviceName = resolved.serviceName;
@@ -276,6 +318,39 @@ export class OtlpSpanExporter {
       void this.flush();
     }, resolved.flushIntervalMs);
     if (typeof this.timer.unref === 'function') this.timer.unref();
+  }
+
+  /** The live export tuning, for bus-level revision (EB-299). */
+  current(): ResolvedOtlpSpanExporterOptions {
+    return {
+      endpoint: this.endpoint,
+      sampleRate: this.sampleRate,
+      batchSize: this.batchSize,
+      flushIntervalMs: this.flushIntervalMs,
+      timeoutMs: this.timeoutMs,
+      headers: { ...this.headers },
+      serviceName: this.serviceName,
+      maxBuffered: this.maxBuffered,
+    };
+  }
+
+  /**
+   * Retunes the four numeric export bounds live (EB-299). The caller
+   * must have validated `next` through `resolveOtlpOptions` first —
+   * this method applies unconditionally. In-flight buffered spans are
+   * untouched: already-buffered spans stay buffered, and the new values
+   * govern from the next decision onward — the next span admission
+   * samples at the live `sampleRate` and drops the oldest past the live
+   * `maxBuffered`, the next flush triggers and slices at the live
+   * `batchSize`, and the next export POST times out at the live
+   * `timeoutMs`. `endpoint`, `headers`, `serviceName`, and
+   * `flushIntervalMs` are never moved here.
+   */
+  retune(next: ResolvedOtlpSpanExporterOptions): void {
+    this.sampleRate = next.sampleRate;
+    this.batchSize = next.batchSize;
+    this.timeoutMs = next.timeoutMs;
+    this.maxBuffered = next.maxBuffered;
   }
 
   /**

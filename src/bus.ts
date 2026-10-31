@@ -378,6 +378,7 @@ import {
 import {
   OtlpSpanExporter,
   resolveOtlpOptions,
+  type OtlpRevision,
   type OtlpSpanExporterOptions,
   type OtlpSpanExportStats,
 } from './otlp.ts';
@@ -20841,6 +20842,115 @@ export class EventBus {
         oldMinSamples: current.minSamples,
         cooldownSuccesses,
         oldCooldownSuccesses: current.cooldownSuccesses,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level OTLP export tuning live (EB-299) without
+   * restarting the bus: `setOtlp({ sampleRate?, batchSize?, timeoutMs?,
+   * maxBuffered? })` retunes how aggressively spans are sampled for
+   * export, how large each export POST is, how long a POST may take,
+   * and how much memory the export buffer may hold (see
+   * `EventBusOptions.otlp`, EB-105).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * In-flight buffered spans are untouched: already-buffered spans
+   * stay buffered, and the new values govern from the next decision
+   * onward — the next span admission samples at the live `sampleRate`
+   * and drops the oldest past the live `maxBuffered`, the next flush
+   * triggers and slices at the live `batchSize`, and the next export
+   * POST times out at the live `timeoutMs`. `endpoint`, `headers`, and
+   * `serviceName` are not revisable here — they are the export
+   * destination and identity fixed at construction — and neither is
+   * `flushIntervalMs`: the flush timer is armed once at construction,
+   * so changing the interval means rebuilding the exporter (and the
+   * bus).
+   *
+   * Fail-closed: a bus that never enabled `otlp`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the live
+   * tuning and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveOtlpOptions`: the rate a finite
+   * number in [0, 1], `batchSize`/`maxBuffered` positive integers,
+   * `timeoutMs` a positive finite number) against the merged values,
+   * so a value that could not be set at construction cannot be revised
+   * in later either — and a failed call changes nothing at all: when
+   * only one field is provided only that field is validated and moved,
+   * and an illegal value in either field leaves every live value
+   * exactly as it was. A revision that provides neither field, and a
+   * revision identical to the current tuning, are both no-ops with no
+   * audit. Audited as `otlp_revised` (`{ sampleRate, oldSampleRate,
+   * batchSize, oldBatchSize, timeoutMs, oldTimeoutMs, maxBuffered,
+   * oldMaxBuffered }`).
+   *
+   * Orthogonal to EB-105 (that is the OTLP export mechanism itself —
+   * this the export tuning), and to `setTailSampling` (that retunes
+   * which traces are kept — this how many of the kept spans ship).
+   *
+   * Throws `RangeError` when OTLP export is not enabled, for a
+   * non-object revision, or for an illegal `sampleRate` / `batchSize` /
+   * `timeoutMs` / `maxBuffered`.
+   */
+  setOtlp(opts: OtlpRevision): void {
+    const exporter = this.otlpExporter;
+    if (exporter === undefined) {
+      throw new RangeError('setOtlp: otlp is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setOtlp: revision must be an object with sampleRate and/or batchSize and/or timeoutMs and/or maxBuffered',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = exporter.current();
+    const sampleRate = opts.sampleRate ?? current.sampleRate;
+    const batchSize = opts.batchSize ?? current.batchSize;
+    const timeoutMs = opts.timeoutMs ?? current.timeoutMs;
+    const maxBuffered = opts.maxBuffered ?? current.maxBuffered;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      sampleRate === current.sampleRate &&
+      batchSize === current.batchSize &&
+      timeoutMs === current.timeoutMs &&
+      maxBuffered === current.maxBuffered
+    ) {
+      return;
+    }
+    const resolved = resolveOtlpOptions(
+      {
+        endpoint: current.endpoint.toString(),
+        sampleRate,
+        batchSize,
+        flushIntervalMs: current.flushIntervalMs,
+        timeoutMs,
+        headers: { ...current.headers },
+        serviceName: current.serviceName,
+        maxBuffered,
+      },
+      'setOtlp',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setOtlp: otlp is not enabled on this bus');
+    }
+    exporter.retune(resolved);
+    this.auditSubscription({
+      action: 'otlp_revised',
+      actor: 'system',
+      detail: {
+        sampleRate,
+        oldSampleRate: current.sampleRate,
+        batchSize,
+        oldBatchSize: current.batchSize,
+        timeoutMs,
+        oldTimeoutMs: current.timeoutMs,
+        maxBuffered,
+        oldMaxBuffered: current.maxBuffered,
       },
     });
   }

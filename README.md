@@ -5719,6 +5719,15 @@ Semantics notes:
 - `bus.flushOtlp()` drains the buffer deterministically — the hook for
   tests and graceful shutdown. Invalid options throw `RangeError` from
   the constructor.
+- `bus.setOtlp({ sampleRate?, batchSize?, timeoutMs?, maxBuffered? })`
+  (EB-299) retunes the export live without restarting the bus — only a
+  bus that already enabled `otlp` can be revised (a never-enabled bus
+  throws `RangeError`); illegal values fail closed with the live tuning
+  untouched; an identical or empty revision is a no-op with no audit
+  (audited as `otlp_revised`); in-flight buffered spans are retained
+  and the new values govern from the next admission/flush/POST.
+  `endpoint`, `headers`, `serviceName`, and `flushIntervalMs` are not
+  revisable here — the flush timer is armed once at construction.
 
 ## Trace span archive journal (EB-167)
 
