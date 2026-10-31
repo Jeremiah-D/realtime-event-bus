@@ -164,7 +164,8 @@ export type SubscriptionAuditAction =
   | 'auto_remediate_rebalance'
   | 'auto_remediate_run'
   | 'auto_remediate_revised'
-  | 'ops_alert_revised';
+  | 'ops_alert_revised'
+  | 'admission_webhook_revised';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -224,6 +225,7 @@ export type SubscriptionAuditAction =
  *   a revision identical to the current schedule, are both no-ops with
  *   no audit)
  * - `ops_alert_revised`: `{ dedupWindowMs, oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs, oldRetryBaseMs, gatewayDisconnectThreshold, oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs, oldGatewayDisconnectWindowMs }` — the bus-level ops-alert tuning was revised (EB-307; only a bus that already enabled `opsAlert` can be revised — a never-enabled bus refuses until the outlet is opted into at construction, since it holds no alerter at all; the new values reuse the construction-time validation (`resolveOpsAlerterOptions`: the windows and the backoff base positive finite numbers, the attempts and the threshold positive integers), so a failed call leaves the live tuning untouched, and only the fields provided move — a partial revision keeps the fields it leaves out, and an illegal value in any field leaves every live value exactly as it was; only the five numeric bounds move — the `sink` / `secret` / `keyId` / `busId` are untouched, and neither is the `now` clock — and in-flight state is untouched, so the new values govern from the next note onward — the next dedup check reads the live window, the next disconnect note truncates at the live storm window and trips at the live threshold, and the next delivery attempt budgets at the live maxAttempts and backs off at the live retryBaseMs (a backoff timer already armed keeps the delay it was armed with); a revision that provides neither field, and a revision identical to the current tuning, are both no-ops with no audit)
+ * - `admission_webhook_revised`: `{ timeoutMs, oldTimeoutMs, failureMode, oldFailureMode, headersChanged }` — the bus-level external admission webhook tuning was revised (EB-308; only a bus that already enabled `admissionWebhook` can be revised — a never-enabled bus refuses until the hook is opted into at construction, since it holds no endpoint at all; the new values reuse the construction-time validation (`validateAdmissionWebhookOptions`: the timeout a positive finite number, the failure mode `'fail-open'`/`'fail-closed'`, the headers a string-to-string map), so a failed call leaves the live tuning untouched, and only the fields provided move — a partial revision keeps the fields it leaves out, and an illegal value in any field leaves every live value exactly as it was; only `timeoutMs` / `failureMode` / `headers` move — the `url` is untouched — and a revision swaps in a fresh merged options object, so the new timeout governs from the next `decideAdmission` call, the new failure mode from the next timeout or transport failure, and the new headers from the next decision request, while a publish already blocked in its webhook call keeps the timeout it was called with; header values are never written to the audit log (they may carry bearer tokens) — only whether the header set moved is recorded; a revision that provides neither field, and a revision identical to the current tuning, are both no-ops with no audit)
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -510,6 +512,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'auto_remediate_run',
   'auto_remediate_revised',
   'ops_alert_revised',
+  'admission_webhook_revised',
   'dead_letter_replay_requested',
   'dead_letter_replay_approved',
   'dead_letter_replay_rejected',

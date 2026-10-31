@@ -34,6 +34,7 @@ import {
   decideAdmission,
   type AdmissionWebhookOptions,
   type AdmissionWebhookRequest,
+  type AdmissionWebhookRevision,
 } from './admission-webhook.ts';
 import {
   LineageDepthSampler,
@@ -1302,6 +1303,28 @@ function validateHeaders(headers: Record<string, string> | undefined, caller: st
       );
     }
   }
+}
+
+/**
+ * Value-equality for string-to-string header maps (EB-308): `undefined`
+ * equals `undefined`, and two defined maps are equal when they carry
+ * the same keys with the same values, regardless of key order — so a
+ * reordered copy of the same header set is still the same tuning and a
+ * `setAdmissionWebhook` re-affirmation stays a no-op.
+ */
+function sameHeaders(
+  a: Record<string, string> | undefined,
+  b: Record<string, string> | undefined,
+): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
 }
 
 /**
@@ -14428,9 +14451,14 @@ export class EventBus {
   /**
    * External admission webhook config (EB-157): `undefined` when the
    * operator did not configure one — the webhook gate is a single
-   * undefined check and publish behaves exactly as before.
+   * undefined check and publish behaves exactly as before. Live-tuned
+   * by `setAdmissionWebhook` (EB-308): the field is not `readonly`
+   * because a revision swaps in a fresh merged options object, and the
+   * admission check reads this field on every publish
+   * (`checkAdmissionWebhook`), so a revision governs from the next
+   * `decideAdmission` call.
    */
-  private readonly admissionWebhook: AdmissionWebhookOptions | undefined;
+  private admissionWebhook: AdmissionWebhookOptions | undefined;
   /**
    * Maintenance mode flag (EB-158): set by `enterMaintenance()`,
    * cleared by `exitMaintenance()`. While set, fresh publishes shed
@@ -21772,6 +21800,121 @@ export class EventBus {
         oldGatewayDisconnectThreshold: current.gatewayDisconnectThreshold,
         gatewayDisconnectWindowMs,
         oldGatewayDisconnectWindowMs: current.gatewayDisconnectWindowMs,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level external admission webhook tuning live
+   * (EB-308) without restarting the bus: `setAdmissionWebhook({
+   * timeoutMs?, failureMode?, headers? })` retunes how long the bus
+   * waits for the policy endpoint, what a timeout or transport failure
+   * does, and which extra headers the decision request carries (see
+   * `EventBusOptions.admissionWebhook`, EB-157).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * `url` is not revisable here — it is the policy endpoint's
+   * identity fixed at construction. A revision swaps in a fresh merged
+   * options object (the caller's objects are never mutated, and the
+   * construction-time object is never aliased); the admission check
+   * reads the live field on every publish, so the new timeout governs
+   * from the next `decideAdmission` call, the new failure mode from
+   * the next timeout or transport failure, and the new headers from
+   * the next decision request. In-flight publishes are untouched: a
+   * worker already blocked in `Atomics.wait` keeps the timeout it was
+   * called with.
+   *
+   * Fail-closed: a bus that never enabled `admissionWebhook`, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. Validation
+   * reuses the construction-time rule
+   * (`validateAdmissionWebhookOptions`: the timeout a positive finite
+   * number, the failure mode `'fail-open'`/`'fail-closed'`, the
+   * headers a string-to-string map) against the merged values, so a
+   * value that could not be set at construction cannot be revised in
+   * later either — and a failed call changes nothing at all: when
+   * only one field is provided only that field is validated and moved,
+   * and an illegal value in any field leaves every live value exactly
+   * as it was. (The validator reports some illegal shapes as
+   * `TypeError`; this method normalizes those to `RangeError` so the
+   * revision API has one failure type.) A revision that provides
+   * neither field, and a revision identical to the current tuning, are
+   * both no-ops with no audit. Audited as `admission_webhook_revised`
+   * (`{ timeoutMs, oldTimeoutMs, failureMode, oldFailureMode,
+   * headersChanged }`) — header values are never written to the audit
+   * log (they may carry bearer tokens); only whether the header set
+   * moved is recorded.
+   *
+   * Orthogonal to EB-157 (that is the admission webhook mechanism
+   * itself — this the webhook's tuning), and to EB-296 (that retunes
+   * tail sampling — this the admission webhook).
+   *
+   * Throws `RangeError` when the admission webhook is not enabled,
+   * for a non-object revision, or for an illegal `timeoutMs` /
+   * `failureMode` / `headers`.
+   */
+  setAdmissionWebhook(opts: AdmissionWebhookRevision): void {
+    const current = this.admissionWebhook;
+    if (current === undefined) {
+      throw new RangeError('setAdmissionWebhook: admissionWebhook is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setAdmissionWebhook: revision must be an object with timeoutMs and/or failureMode and/or headers',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const timeoutMs = opts.timeoutMs ?? current.timeoutMs ?? 1000;
+    const failureMode = opts.failureMode ?? current.failureMode ?? 'fail-closed';
+    const headers = opts.headers ?? current.headers;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    // Headers compare by value (key order-insensitive): a reordered
+    // copy of the same set is still the same tuning.
+    if (
+      timeoutMs === (current.timeoutMs ?? 1000) &&
+      failureMode === (current.failureMode ?? 'fail-closed') &&
+      sameHeaders(headers, current.headers)
+    ) {
+      return;
+    }
+    // Validate the merged values exactly as passed — before copying
+    // them — so a non-object `headers` (e.g. a string) is rejected
+    // instead of being silently spread into an object.
+    const merged: AdmissionWebhookOptions = {
+      url: current.url,
+      timeoutMs,
+      failureMode,
+      ...(headers === undefined ? {} : { headers }),
+    };
+    try {
+      validateAdmissionWebhookOptions(merged, 'setAdmissionWebhook');
+    } catch (err) {
+      if (err instanceof TypeError) {
+        throw new RangeError(err.message);
+      }
+      throw err;
+    }
+    // Copy the header map on assignment so later mutation of the
+    // caller's object cannot move the live tuning without an audit.
+    this.admissionWebhook = {
+      ...merged,
+      ...(merged.headers === undefined ? {} : { headers: { ...merged.headers } }),
+    };
+    this.auditSubscription({
+      action: 'admission_webhook_revised',
+      actor: 'system',
+      detail: {
+        timeoutMs,
+        oldTimeoutMs: current.timeoutMs ?? 1000,
+        failureMode,
+        oldFailureMode: current.failureMode ?? 'fail-closed',
+        headersChanged: !sameHeaders(headers, current.headers),
       },
     });
   }

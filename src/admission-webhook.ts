@@ -50,6 +50,34 @@ export interface AdmissionWebhookOptions {
 }
 
 /**
+ * A partial bus-level revision of the admission webhook tuning, for
+ * `EventBus.setAdmissionWebhook` (EB-308). Only the fields provided
+ * move; the rest keep their live values. `url` is not revisable here —
+ * it is the policy endpoint's identity fixed at construction.
+ */
+export interface AdmissionWebhookRevision {
+  /**
+   * Milliseconds to wait for the webhook response before applying
+   * `failureMode`. Must be a finite number > 0 when provided — the
+   * construction-time rule.
+   */
+  timeoutMs?: number;
+  /**
+   * What to do when the webhook times out or the request fails. Must
+   * be `'fail-open'` or `'fail-closed'` when provided — the
+   * construction-time rule.
+   */
+  failureMode?: 'fail-open' | 'fail-closed';
+  /**
+   * Extra headers sent with the decision request. Must map strings to
+   * strings when provided — the construction-time rule. Replaces the
+   * whole header set; there is no per-header merge. Header values are
+   * never logged or audited.
+   */
+  headers?: Record<string, string>;
+}
+
+/**
  * The decision request POSTed to the webhook. Carries the admission
  * context — never the payload body (the hook is a policy channel, and
  * large or sensitive payloads never travel through it).

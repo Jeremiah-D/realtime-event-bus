@@ -8962,6 +8962,19 @@ the live tuning untouched; an identical or empty revision is a no-op
 with no audit. Audited as `admission_latency_revised` (old and new
 values).
 
+Retune the admission webhook live with `bus.setAdmissionWebhook({
+timeoutMs?, failureMode?, headers? })` (EB-308): only the fields
+provided move — the `url` is the policy endpoint's identity and is not
+revisable; the new timeout governs from the next decision, the new
+failure mode from the next timeout or transport failure, and the new
+headers from the next decision request; only a bus that already
+enabled `admissionWebhook` can be revised (otherwise `RangeError`);
+illegal values fail closed with the live tuning untouched; an identical
+or empty revision is a no-op with no audit. Audited as
+`admission_webhook_revised` (`{ timeoutMs, oldTimeoutMs, failureMode,
+oldFailureMode, headersChanged }`) — header values are never written
+to the audit log (they may carry bearer tokens).
+
 ## Subscriber lag forecasting (EB-183)
 
 Opt-in predictive lag monitoring (`src/forecast.ts`): where the lag
