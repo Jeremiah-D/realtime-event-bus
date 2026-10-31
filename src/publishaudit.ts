@@ -109,6 +109,33 @@ export interface PublishAuditOptions {
   now?: () => number;
 }
 
+/** The two numeric bounds of the publish-audit tuning, in resolved form. */
+export interface PublishAuditTuning {
+  /** Bounded in-memory read view; oldest entries evicted first. */
+  maxEntries: number;
+  /** Live-file byte budget; the file rotates past it. */
+  maxBytes: number;
+}
+
+/**
+ * A partial bus-level revision of the publish-audit tuning, for
+ * `EventBus.setPublishAudit` (EB-309). Only the fields provided move;
+ * the rest keep their live values. The journal directory and the clock
+ * are not revisable here — they are fixed at construction.
+ */
+export interface PublishAuditRevision {
+  /**
+   * Bounded in-memory read view. Must be a positive integer when
+   * provided — the construction-time rule.
+   */
+  maxEntries?: number;
+  /**
+   * Live-file byte budget. Must be a positive finite number of bytes
+   * when provided — the construction-time rule.
+   */
+  maxBytes?: number;
+}
+
 function utcDay(at: number): string {
   const d = new Date(at);
   const y = d.getUTCFullYear();
@@ -203,8 +230,12 @@ export function parsePublishAuditLine(line: string): PublishAuditEntry | undefin
 
 export class PublishAuditLog {
   private readonly dir: string;
-  private readonly maxEntries: number;
-  private readonly maxBytes: number;
+  // Live-tuned by `retune` (EB-309): the record and rotation sites
+  // read these fields on every call, so a revision governs from the
+  // next record without draining or rebuilding the journal. `dir` and
+  // `now` stay fixed for the log's lifetime.
+  private maxEntries: number;
+  private maxBytes: number;
   private readonly now: () => number;
   private readonly entries: PublishAuditEntry[] = [];
   private diskWriteErrors = 0;
@@ -240,6 +271,37 @@ export class PublishAuditLog {
     this.maxBytes = maxBytes;
     this.now = now;
     this.recover();
+  }
+
+  /** The two live tuning values, for bus-level revision (EB-309). */
+  current(): PublishAuditTuning {
+    return { maxEntries: this.maxEntries, maxBytes: this.maxBytes };
+  }
+
+  /**
+   * Retunes the two numeric bounds live (EB-309). The caller passes
+   * the merged values (current values with the revision applied); this
+   * method re-validates them with the construction-time rule
+   * (`maxEntries` a positive integer, `maxBytes` a positive finite
+   * number of bytes — note the constructor accepts any positive finite
+   * byte budget, not only integers, and so does this) and applies them
+   * only when valid, so a failed call leaves every live value
+   * untouched. In-flight entries are retained, never cleared or
+   * rewritten: shrinking `maxEntries` does not evict immediately —
+   * the next `record()` evicts down to the live bound — and a revised
+   * `maxBytes` is honored by the next `record()`'s rotation check, so
+   * a tightened budget may rotate the live file at the next record
+   * while a loosened one simply defers the next rotation.
+   */
+  retune(next: PublishAuditTuning): void {
+    if (!Number.isInteger(next.maxEntries) || next.maxEntries < 1) {
+      throw new RangeError('publishAuditMaxEntries must be a positive integer');
+    }
+    if (!Number.isFinite(next.maxBytes) || next.maxBytes < 1) {
+      throw new RangeError('publishAuditMaxBytes must be a positive finite number of bytes');
+    }
+    this.maxEntries = next.maxEntries;
+    this.maxBytes = next.maxBytes;
   }
 
   /**

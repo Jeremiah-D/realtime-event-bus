@@ -378,6 +378,7 @@ import {
   type PublishAuditEntry,
   type PublishAuditOptions,
   type PublishAuditQuery,
+  type PublishAuditRevision,
 } from './publishaudit.ts';
 import { type ChainVerification } from './auditchain.ts';
 import {
@@ -21915,6 +21916,85 @@ export class EventBus {
         failureMode,
         oldFailureMode: current.failureMode ?? 'fail-closed',
         headersChanged: !sameHeaders(headers, current.headers),
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level publish audit journal tuning live (EB-309)
+   * without restarting the bus: `setPublishAudit({ maxEntries?,
+   * maxBytes? })` retunes how many admission records the in-memory
+   * read view keeps and how large the live journal file may grow
+   * before it rotates (see `EventBusOptions.publishAudit`, EB-138).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The journal directory and the clock are not revisable here — they
+   * are fixed at construction. The log object itself is never
+   * replaced: the revision retunes its two bounds in place, and the
+   * record and rotation sites already read those bounds live, so the
+   * new values govern from the next record onward. In-flight entries
+   * are retained, never cleared or rewritten: shrinking `maxEntries`
+   * does not evict immediately — the next record evicts down to the
+   * live bound — and a revised `maxBytes` is honored by the next
+   * record's rotation check, so a tightened budget may rotate the
+   * live file at the next record while a loosened one simply defers
+   * the next rotation.
+   *
+   * Fail-closed: a bus that never enabled `publishAudit`, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. Validation
+   * reuses the construction-time rule (`maxEntries` a positive
+   * integer, `maxBytes` a positive finite number of bytes) against
+   * the merged values, so a value that could not be set at
+   * construction cannot be revised in later either — and a failed
+   * call changes nothing at all: when only one field is provided only
+   * that field is validated and moved, and an illegal value in any
+   * field leaves every live value exactly as it was. A revision that
+   * provides neither field, and a revision identical to the current
+   * tuning, are both no-ops with no audit. Audited as
+   * `publish_audit_revised` (`{ maxEntries, oldMaxEntries, maxBytes,
+   * oldMaxBytes }`).
+   *
+   * Orthogonal to EB-138 (that is the publish audit journal itself —
+   * this the journal's tuning), and to EB-296 (that retunes tail
+   * sampling — this the publish audit).
+   *
+   * Throws `RangeError` when the publish audit is not enabled, for a
+   * non-object revision, or for an illegal `maxEntries` / `maxBytes`.
+   */
+  setPublishAudit(opts: PublishAuditRevision): void {
+    const log = this.publishAudit;
+    if (log === undefined) {
+      throw new RangeError('setPublishAudit: publishAudit is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setPublishAudit: revision must be an object with maxEntries and/or maxBytes',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = log.current();
+    const maxEntries = opts.maxEntries ?? current.maxEntries;
+    const maxBytes = opts.maxBytes ?? current.maxBytes;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (maxEntries === current.maxEntries && maxBytes === current.maxBytes) {
+      return;
+    }
+    log.retune({ maxEntries, maxBytes });
+    this.auditSubscription({
+      action: 'publish_audit_revised',
+      actor: 'system',
+      detail: {
+        maxEntries,
+        oldMaxEntries: current.maxEntries,
+        maxBytes,
+        oldMaxBytes: current.maxBytes,
       },
     });
   }

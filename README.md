@@ -4830,6 +4830,19 @@ Details:
 - **Tamper-evident hash chain** — every record carries a `prevHash` /
   `hash` link; see "Audit log hash chain (EB-198)" below.
 
+Retune live with `bus.setPublishAudit({ maxEntries?, maxBytes? })`
+(EB-309): only the fields provided move; the new values govern from
+the next record onward — a tightened `maxEntries` evicts down to the
+new bound at the next record (in-flight entries are never cleared or
+rewritten), and a revised `maxBytes` is honored by the next record's
+rotation check, so a tightened budget may rotate the live file at the
+next record while a loosened one simply defers the next rotation; only
+a bus that already enabled `publishAudit` can be revised (otherwise
+`RangeError`); illegal values fail closed with the live tuning
+untouched; an identical or empty revision is a no-op with no audit.
+Audited as `publish_audit_revised` (`{ maxEntries, oldMaxEntries,
+maxBytes, oldMaxBytes }`).
+
 ## Subscriber-queue drop journal (EB-225)
 
 Aggregate counters (`getStats().droppedMessages`) say how many
