@@ -172,6 +172,69 @@ interface ResolvedScenario {
   rate: number;
   latencyMs?: number;
   rng: () => number;
+  /** The caller's scenario as given (copied) — for `current()` and revision comparison. */
+  source: ChaosScenario;
+}
+
+/**
+ * Canonical (fully defaulted) form of a chaos scenario, for revision
+ * comparison and audit detail (EB-300): an omitted `seed` is the
+ * default seed, so two scenarios that differ only by spelling the
+ * default seed compare equal.
+ */
+export interface CanonicalChaosScenario {
+  type: ChaosFaultType;
+  target: ChaosTarget;
+  rate: number;
+  seed: number;
+  latencyMs?: number;
+}
+
+/** Defaults one scenario: fills the seed, drops nothing else. */
+export function canonicalChaosScenario(scenario: ChaosScenario): CanonicalChaosScenario {
+  const out: CanonicalChaosScenario = {
+    type: scenario.type,
+    target: scenario.target,
+    rate: scenario.rate,
+    seed: scenario.seed ?? DEFAULT_SEED,
+  };
+  if (scenario.latencyMs !== undefined) out.latencyMs = scenario.latencyMs;
+  return out;
+}
+
+/**
+ * Whether two scenario lists are the same revision (EB-300): same
+ * length, same order, same canonical form per scenario. Callers must
+ * have validated both lists through `assertValidChaosScenario` first.
+ */
+export function chaosScenariosEqual(
+  a: readonly ChaosScenario[],
+  b: readonly ChaosScenario[],
+): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((s, i) => {
+    const x = canonicalChaosScenario(s);
+    const y = canonicalChaosScenario(b[i]);
+    return (
+      x.type === y.type &&
+      x.target === y.target &&
+      x.rate === y.rate &&
+      x.seed === y.seed &&
+      x.latencyMs === y.latencyMs
+    );
+  });
+}
+
+/** Resolves scenarios into evaluation state: one private RNG stream per scenario. */
+function resolveScenarios(scenarios: ChaosScenario[]): ResolvedScenario[] {
+  return scenarios.map((s) => ({
+    type: s.type,
+    target: s.target,
+    rate: s.rate,
+    latencyMs: s.latencyMs,
+    rng: mulberry32(s.seed ?? DEFAULT_SEED),
+    source: { ...s },
+  }));
 }
 
 export interface ChaosFault {
@@ -185,7 +248,11 @@ export interface ChaosFault {
  * of (seed, evaluation order) — deterministic across runs.
  */
 export class FaultInjector {
-  private readonly scenarios: ResolvedScenario[];
+  // Live-tuned by `retune` (EB-300): the whole scenario list is
+  // replaced, each scenario with a fresh private RNG stream from its
+  // seed, so the fault sequence restarts deterministically from the new
+  // seeds. The injection counters are retained, not reset.
+  private scenarios: ResolvedScenario[];
   private injected = 0;
   private readonly byTarget: Record<ChaosTarget, number> = {
     handler: 0,
@@ -194,13 +261,29 @@ export class FaultInjector {
   };
 
   constructor(scenarios: ChaosScenario[]) {
-    this.scenarios = scenarios.map((s) => ({
-      type: s.type,
-      target: s.target,
-      rate: s.rate,
-      latencyMs: s.latencyMs,
-      rng: mulberry32(s.seed ?? DEFAULT_SEED),
-    }));
+    this.scenarios = resolveScenarios(scenarios);
+  }
+
+  /** The live scenario list, for bus-level revision (EB-300). Copies — mutating them is safe. */
+  current(): ChaosScenario[] {
+    return this.scenarios.map((s) => ({ ...s.source }));
+  }
+
+  /**
+   * Replaces the scenario list live (EB-300). The caller must have
+   * validated `scenarios` through `assertValidChaosScenario` first —
+   * this method applies unconditionally. Each scenario gets a fresh
+   * private RNG stream from its seed, so the fault sequence restarts
+   * deterministically from the new seeds; the injection counters are
+   * retained, not reset. An empty list disables injection (`faultFor`
+   * always returns `null`) while keeping the injector — and its
+   * counters — alive, so a later revision can re-arm it without
+   * rebuilding the bus. An already-triggered in-flight fault is
+   * unaffected: the retune only changes what the next `faultFor`
+   * evaluation sees.
+   */
+  retune(scenarios: ChaosScenario[]): void {
+    this.scenarios = resolveScenarios(scenarios);
   }
 
   /** True when at least one scenario targets `target`. Lets call sites skip evaluation entirely. */

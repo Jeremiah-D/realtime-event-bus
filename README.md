@@ -5669,6 +5669,17 @@ Semantics notes:
   (`{ injected, byTarget }`), present only when scenarios were
   configured. Without chaos the stats shape — and everything else — is
   byte-for-byte identical to before.
+- `bus.setChaos(scenarios)` (EB-300) replaces the scenario list live
+  without restarting the bus — only a bus that already enabled `chaos`
+  can be revised (a never-enabled bus throws `RangeError`: it holds no
+  injector at all); scenarios reuse the construction-time validation
+  and a failed call leaves the live scenarios untouched; an empty list
+  disables injection while keeping the injector and its counters alive
+  (a later revision can re-arm it); each scenario's RNG stream restarts
+  from its seed, so the fault sequence restarts deterministically, and
+  the counters are retained, not reset; an already-triggered in-flight
+  fault is unaffected; an identical revision is a no-op with no audit
+  (audited as `chaos_revised`).
 
 ## OTLP span export (EB-105)
 

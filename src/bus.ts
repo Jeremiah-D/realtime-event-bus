@@ -429,7 +429,10 @@ import {
   type CompiledFilterExpression,
 } from './filterexpr.ts';
 import {
+  assertValidChaosScenario,
+  canonicalChaosScenario,
   ChaosInjectionError,
+  chaosScenariosEqual,
   resolveChaosOptions,
   type ChaosFaultType,
   type ChaosOptions,
@@ -20951,6 +20954,83 @@ export class EventBus {
         oldTimeoutMs: current.timeoutMs,
         maxBuffered,
         oldMaxBuffered: current.maxBuffered,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level fault-injection scenarios live (EB-300)
+   * without restarting the bus: `setChaos(scenarios)` replaces the
+   * whole scenario list (see `EventBusOptions.chaos`, EB-103).
+   *
+   * Only a bus that already enabled `chaos` can be revised — a bus
+   * built without scenarios holds no injector at all and refuses with
+   * `RangeError` until chaos is opted into at construction. An empty
+   * list disables injection: the injector stays (and its counters stay
+   * with it), `faultFor` returns `null` for every target, and a later
+   * revision can re-arm it — this is distinct from a bus constructed
+   * with no scenarios, which never builds an injector.
+   *
+   * Each scenario in the new list gets a fresh private RNG stream from
+   * its seed, so the fault sequence restarts deterministically from the
+   * new seeds — re-revising to the same seed reproduces the same fault
+   * sequence bit for bit. The injection counters (`injected`,
+   * `byTarget`) are retained, not reset. An already-triggered
+   * in-flight fault is unaffected: the retune only changes what the
+   * next `faultFor` evaluation sees (an armed drain-`latency`
+   * deferral still fires its deferred drain).
+   *
+   * Fail-closed: a bus that never enabled `chaos`, a non-array
+   * revision, and an illegal scenario all throw `RangeError` with the
+   * live scenarios and the audit log untouched. Validation reuses the
+   * construction-time rule (`assertValidChaosScenario`: the
+   * type/target pair supported, `rate` a finite number in [0, 1],
+   * `latencyMs` a positive finite number for `'latency'` faults and
+   * absent otherwise, `seed` a finite number) for every scenario, so
+   * a scenario that could not be set at construction cannot be revised
+   * in later either — and a failed call changes nothing at all. A
+   * revision identical to the current scenarios (same list, same order,
+   * same canonical form — an omitted seed equals the default seed),
+   * and an absent revision, are both no-ops with no audit. Audited as
+   * `chaos_revised` (`{ scenarios, oldScenarios }`, each scenario in
+   * canonical form with its seed defaulted).
+   *
+   * Orthogonal to EB-103 (that is the fault-injection mechanism
+   * itself — this the scenario list), and to `setTailSampling` (that
+   * retunes trace sampling — this fault injection).
+   *
+   * Throws `RangeError` when chaos is not enabled, for a non-array
+   * revision, or for any illegal scenario.
+   */
+  setChaos(scenarios: ChaosScenario[]): void {
+    const injector = this.chaos;
+    if (injector === undefined) {
+      throw new RangeError('setChaos: chaos is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (scenarios == null) {
+      return;
+    }
+    if (!Array.isArray(scenarios)) {
+      throw new RangeError('setChaos: revision must be an array of chaos scenarios');
+    }
+    // Validate before touching anything: a failed call leaves every
+    // live scenario — and the RNG streams behind them — exactly as
+    // they were.
+    scenarios.forEach((s, i) => assertValidChaosScenario(s, `setChaos.scenarios[${i}]`));
+    const current = injector.current();
+    // Re-affirming the current scenarios is a no-op: no retune (the
+    // RNG streams keep running), no audit.
+    if (chaosScenariosEqual(scenarios, current)) {
+      return;
+    }
+    injector.retune(scenarios);
+    this.auditSubscription({
+      action: 'chaos_revised',
+      actor: 'system',
+      detail: {
+        scenarios: scenarios.map((s) => canonicalChaosScenario(s)),
+        oldScenarios: current.map((s) => canonicalChaosScenario(s)),
       },
     });
   }
