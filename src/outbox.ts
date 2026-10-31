@@ -226,6 +226,65 @@ export interface OutboxRelayOptions {
 }
 
 /**
+ * Validated outbox relay tuning: every field resolved to its live value.
+ */
+export interface ResolvedOutboxRelayOptions {
+  pollIntervalMs: number;
+  batchSize: number;
+  probeLimit: number;
+}
+
+/**
+ * Revision for the attached outbox relay's tuning (see
+ * `EventBus.setOutboxRelay`, EB-302). Only the fields provided move;
+ * the rest keep their live values.
+ */
+export interface OutboxRelayRevision {
+  /**
+   * Poll interval for the background drain timer, in ms. `0` or
+   * negative disables the timer. Must be a non-NaN number when
+   * provided — the construction-time rule.
+   */
+  pollIntervalMs?: number;
+  /**
+   * Max records per drain cycle. Must be an integer >= 1 when
+   * provided — the construction-time rule.
+   */
+  batchSize?: number;
+  /**
+   * Cap on the `pending` probe in `getLag()`. Must be an integer >= 1
+   * when provided — the construction-time rule.
+   */
+  probeLimit?: number;
+}
+
+/**
+ * Validates `OutboxRelayOptions` fail-fast, applying the
+ * construction-time defaults (`pollIntervalMs` 100, `batchSize` 100,
+ * `probeLimit` 10000). Used by the constructor and by
+ * `EventBus.setOutboxRelay` (EB-302) so a revision is validated by
+ * exactly the rule a value would have to pass at construction.
+ */
+export function resolveOutboxRelayOptions(
+  raw: OutboxRelayOptions | undefined,
+  where = 'OutboxRelay',
+): ResolvedOutboxRelayOptions {
+  const batchSize = raw?.batchSize ?? 100;
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new RangeError(`${where}: batchSize must be an integer >= 1`);
+  }
+  const probeLimit = raw?.probeLimit ?? 10000;
+  if (!Number.isInteger(probeLimit) || probeLimit < 1) {
+    throw new RangeError(`${where}: probeLimit must be an integer >= 1`);
+  }
+  const pollIntervalMs = raw?.pollIntervalMs ?? 100;
+  if (typeof pollIntervalMs !== 'number' || Number.isNaN(pollIntervalMs)) {
+    throw new RangeError(`${where}: pollIntervalMs must be a number`);
+  }
+  return { pollIntervalMs, batchSize, probeLimit };
+}
+
+/**
  * Outcome of one `drain()` cycle.
  */
 export interface OutboxDrainResult {
@@ -259,9 +318,15 @@ export interface OutboxLag {
 export class OutboxRelay {
   private readonly bus: EventBus;
   private readonly store: OutboxStore;
-  private readonly pollIntervalMs: number;
-  private readonly batchSize: number;
-  private readonly probeLimit: number;
+  // Live-tuned by `retune` (EB-302): `drain` reads `batchSize` on
+  // every cycle and `getLag` reads `probeLimit` on every probe, so a
+  // revision governs from the next drain/probe without draining or
+  // rebuilding the relay; `pollIntervalMs` re-arms the poll timer when
+  // the relay is running. The cursor and the relayed count are
+  // untouched by a retune.
+  private pollIntervalMs: number;
+  private batchSize: number;
+  private probeLimit: number;
   private readonly now: () => number;
   private readonly setTimerFn: (fn: () => void, ms: number) => unknown;
   private readonly clearTimerFn: (handle: unknown) => void;
@@ -279,23 +344,12 @@ export class OutboxRelay {
     if (store === undefined || store === null) {
       throw new TypeError('OutboxRelay: store is required');
     }
-    const batchSize = opts.batchSize ?? 100;
-    if (!Number.isInteger(batchSize) || batchSize < 1) {
-      throw new RangeError('OutboxRelay: batchSize must be an integer >= 1');
-    }
-    const probeLimit = opts.probeLimit ?? 10000;
-    if (!Number.isInteger(probeLimit) || probeLimit < 1) {
-      throw new RangeError('OutboxRelay: probeLimit must be an integer >= 1');
-    }
-    const pollIntervalMs = opts.pollIntervalMs ?? 100;
-    if (typeof pollIntervalMs !== 'number' || Number.isNaN(pollIntervalMs)) {
-      throw new RangeError('OutboxRelay: pollIntervalMs must be a number');
-    }
+    const resolved = resolveOutboxRelayOptions(opts, 'OutboxRelay');
     this.bus = bus;
     this.store = store;
-    this.pollIntervalMs = pollIntervalMs;
-    this.batchSize = batchSize;
-    this.probeLimit = probeLimit;
+    this.pollIntervalMs = resolved.pollIntervalMs;
+    this.batchSize = resolved.batchSize;
+    this.probeLimit = resolved.probeLimit;
     // The clock defaults to wall time; `attachOutboxRelay` injects the
     // bus's own clock so lag accounting follows `EventBusOptions.now`.
     this.now = opts.now ?? Date.now;
@@ -304,6 +358,37 @@ export class OutboxRelay {
     this.clearTimerFn = opts.clearTimer ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>));
     this.onRelayError = opts.onRelayError;
     this.onRelayed = opts.onRelayed;
+  }
+
+  /** The three live relay tuning values, for bus-level revision (EB-302). */
+  current(): ResolvedOutboxRelayOptions {
+    return {
+      pollIntervalMs: this.pollIntervalMs,
+      batchSize: this.batchSize,
+      probeLimit: this.probeLimit,
+    };
+  }
+
+  /**
+   * Retunes the three relay parameters live (EB-302). The caller must
+   * have validated `next` through `resolveOutboxRelayOptions` first —
+   * this method applies unconditionally. The cursor and the relayed
+   * count are untouched: a new `batchSize` governs from the next drain
+   * cycle and a new `probeLimit` from the next `getLag()` probe. When
+   * the relay is running and `pollIntervalMs` moved, the poll timer is
+   * re-armed at the new interval — the old timer is cleared and a new
+   * one armed, with no extra drain triggered; a stopped relay picks
+   * the new interval up at the next `start()`.
+   */
+  retune(next: ResolvedOutboxRelayOptions): void {
+    const pollChanged = next.pollIntervalMs !== this.pollIntervalMs;
+    this.pollIntervalMs = next.pollIntervalMs;
+    this.batchSize = next.batchSize;
+    this.probeLimit = next.probeLimit;
+    if (this.started && pollChanged) {
+      this.disarmTimer();
+      this.armTimer();
+    }
   }
 
   /**
@@ -316,6 +401,20 @@ export class OutboxRelay {
     this.started = true;
     this.cursor = this.store.recover().cursor;
     this.drain();
+    this.armTimer();
+  }
+
+  /**
+   * Stop the poll timer. In-flight state is untouched — the durable
+   * cursor already reflects every committed batch.
+   */
+  stop(): void {
+    this.disarmTimer();
+    this.started = false;
+  }
+
+  /** Arms the poll timer at the live `pollIntervalMs` (no-op when disabled). */
+  private armTimer(): void {
     if (this.pollIntervalMs > 0) {
       const handle = this.setTimerFn(() => this.drain(), this.pollIntervalMs);
       // Never hold the process open for a background poll.
@@ -327,16 +426,12 @@ export class OutboxRelay {
     }
   }
 
-  /**
-   * Stop the poll timer. In-flight state is untouched — the durable
-   * cursor already reflects every committed batch.
-   */
-  stop(): void {
+  /** Clears the poll timer when one is armed. */
+  private disarmTimer(): void {
     if (this.timer !== undefined) {
       this.clearTimerFn(this.timer);
       this.timer = undefined;
     }
-    this.started = false;
   }
 
   /**

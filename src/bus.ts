@@ -159,7 +159,13 @@ import {
 } from './remediate.ts';
 import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
 import { exportTopicData as exportTopicDataFromLog, importTopicData as importTopicDataIntoLog, type ImportTopicDataResult } from './topic-data-export.ts';
-import { OutboxRelay, type OutboxRelayOptions, type OutboxStore } from './outbox.ts';
+import {
+  OutboxRelay,
+  resolveOutboxRelayOptions,
+  type OutboxRelayOptions,
+  type OutboxRelayRevision,
+  type OutboxStore,
+} from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
 import {
   RotatingDekEncryptor,
@@ -21124,6 +21130,97 @@ export class EventBus {
         oldMessagesPerSecond: current.messagesPerSecond,
         burst,
         oldBurst: current.burst,
+      },
+    });
+  }
+
+  /**
+   * Revises the attached outbox relay's tuning live (EB-302) without
+   * restarting the bus or re-attaching the relay:
+   * `setOutboxRelay({ pollIntervalMs?, batchSize?, probeLimit? })`
+   * retunes how often the relay polls, how many records each drain
+   * cycle commits, and how deep the lag probe looks (see
+   * `attachOutboxRelay`, EB-102).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The cursor and the relayed count are untouched: a new `batchSize`
+   * governs from the next drain cycle and a new `probeLimit` from the
+   * next `getLag()` probe. When the relay is running and
+   * `pollIntervalMs` moves, the poll timer is re-armed at the new
+   * interval — the old timer is cleared and a new one armed, with no
+   * extra drain triggered; a stopped relay picks the new interval up
+   * at the next `start()`. Setting `pollIntervalMs` to `0` (or a
+   * negative number) disables the poll timer while running: the relay
+   * then drains only on explicit `drain()` calls until a later
+   * revision re-arms it.
+   *
+   * Fail-closed: a bus with no outbox relay attached, a non-object
+   * revision, and an illegal value all throw `RangeError` with the
+   * live tuning and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveOutboxRelayOptions`:
+   * `batchSize`/`probeLimit` integers >= 1, `pollIntervalMs` a
+   * non-NaN number) against the merged values, so a value that could
+   * not be set at construction cannot be revised in later either —
+   * and a failed call changes nothing at all: when only one field is
+   * provided only that field is validated and moved, and an illegal
+   * value in any field leaves every live value exactly as it was. A
+   * revision that provides neither field, and a revision identical to
+   * the current tuning, are both no-ops with no audit. Audited as
+   * `outbox_relay_revised` (`{ pollIntervalMs, oldPollIntervalMs,
+   * batchSize, oldBatchSize, probeLimit, oldProbeLimit }`).
+   *
+   * Orthogonal to EB-102 (that is the outbox relay mechanism itself —
+   * this the relay tuning), and to EB-296–EB-301 (those retune other
+   * bus-level parameters — this the outbox relay).
+   *
+   * Throws `RangeError` when no outbox relay is attached, for a
+   * non-object revision, or for an illegal `pollIntervalMs` /
+   * `batchSize` / `probeLimit`.
+   */
+  setOutboxRelay(opts: OutboxRelayRevision): void {
+    const relay = this.outboxRelay;
+    if (relay === undefined) {
+      throw new RangeError('setOutboxRelay: no outbox relay is attached to this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setOutboxRelay: revision must be an object with pollIntervalMs and/or batchSize and/or probeLimit',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = relay.current();
+    const pollIntervalMs = opts.pollIntervalMs ?? current.pollIntervalMs;
+    const batchSize = opts.batchSize ?? current.batchSize;
+    const probeLimit = opts.probeLimit ?? current.probeLimit;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      pollIntervalMs === current.pollIntervalMs &&
+      batchSize === current.batchSize &&
+      probeLimit === current.probeLimit
+    ) {
+      return;
+    }
+    const resolved = resolveOutboxRelayOptions(
+      { pollIntervalMs, batchSize, probeLimit },
+      'setOutboxRelay',
+    );
+    relay.retune(resolved);
+    this.auditSubscription({
+      action: 'outbox_relay_revised',
+      actor: 'system',
+      detail: {
+        pollIntervalMs,
+        oldPollIntervalMs: current.pollIntervalMs,
+        batchSize,
+        oldBatchSize: current.batchSize,
+        probeLimit,
+        oldProbeLimit: current.probeLimit,
       },
     });
   }

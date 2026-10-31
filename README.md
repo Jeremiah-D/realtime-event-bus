@@ -5544,6 +5544,18 @@ Lag is observable: `bus.getStats()` exposes `outboxPending`,
 `eventbus_outbox_relayed_total` — alert on a climbing lag with a stuck
 cursor.
 
+Retune live with `bus.setOutboxRelay({ pollIntervalMs?, batchSize?,
+probeLimit? })` (EB-302): only the fields provided move, the rest keep
+their live values — a new `batchSize` governs from the next drain cycle
+and a new `probeLimit` from the next `getLag()` probe, and a revised
+`pollIntervalMs` re-arms the poll timer when the relay is running (no
+extra drain; a stopped relay picks the new interval up at the next
+`start()`); `0` disables the timer while running. The cursor and the
+relayed count are untouched. Only a bus with an attached relay can be
+revised (otherwise `RangeError`); illegal values fail closed with the
+live tuning untouched; an identical or empty revision is a no-op with no
+audit. Audited as `outbox_relay_revised` (old and new values).
+
 SQL shape for a Postgres-backed store:
 
 ```sql
