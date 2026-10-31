@@ -101,6 +101,16 @@ export interface ResolvedBridgeHealthOptions {
 }
 
 /**
+ * Partial revision for `EventBus.setBridgeHealth` (EB-305). Only the
+ * fields provided move; `now` / `setTimer` / `clearTimer` are fixed at
+ * construction and are not revisable here.
+ */
+export interface BridgeHealthRevision {
+  intervalMs?: number;
+  failureThreshold?: number;
+}
+
+/**
  * Validates `BridgeOptions.health` the way the constructor would:
  * throws `RangeError` on the first problem — a broken health config
  * fails at construction time, never mid-probe. Returns `undefined`
@@ -166,8 +176,14 @@ export interface BridgeHealthMonitorCallbacks {
  */
 export class BridgeHealthMonitor {
   private readonly transport: BridgeTransport;
-  private readonly intervalMs: number;
-  private readonly failureThreshold: number;
+  // Live-tuned by `retune` (EB-305): the probe schedule reads
+  // `intervalMs` on every (re-)arm and `recordFailure` reads
+  // `failureThreshold` on every failure, so a revision governs from
+  // the next probe / failure without resetting any health state.
+  // `now` / `setTimer` / `clearTimer` stay fixed for the monitor's
+  // lifetime.
+  private intervalMs: number;
+  private failureThreshold: number;
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
@@ -194,9 +210,8 @@ export class BridgeHealthMonitor {
     this.callbacks = callbacks;
   }
 
-  /** Starts periodic probing; idempotent. The first probe fires after one full interval. */
-  start(): void {
-    if (this.timer !== undefined || this.stopped) return;
+  /** Arms one probe tick at the live interval. */
+  private armTimer(): void {
     const tick = (): void => {
       this.timer = undefined;
       if (this.stopped) return;
@@ -204,10 +219,54 @@ export class BridgeHealthMonitor {
       // `finally` re-arms the schedule so one slow probe never stacks
       // another behind it.
       void this.probeOnce().finally(() => {
-        if (!this.stopped) this.timer = this.setTimer(tick, this.intervalMs);
+        if (!this.stopped) this.armTimer();
       });
     };
     this.timer = this.setTimer(tick, this.intervalMs);
+  }
+
+  /** Starts periodic probing; idempotent. The first probe fires after one full interval. */
+  start(): void {
+    if (this.timer !== undefined || this.stopped) return;
+    this.armTimer();
+  }
+
+  /** The two live tuning values, for bus-level revision (EB-305). */
+  current(): { intervalMs: number; failureThreshold: number } {
+    return { intervalMs: this.intervalMs, failureThreshold: this.failureThreshold };
+  }
+
+  /**
+   * Retunes the probe interval and failure threshold live (EB-305).
+   * The caller must have validated `next` through
+   * `resolveBridgeHealthOptions` first — this method applies
+   * unconditionally. Health state is untouched: the consecutive-failure
+   * counter, the last-probe timestamp, and the healthy/unhealthy state
+   * all survive, so a tightened threshold trips on the next failure
+   * past it (a counter already at or above the new threshold trips on
+   * the next failure, not retroactively) and a loosened one simply
+   * needs more failures from here on. When a probe timer is currently
+   * armed it is cleared and re-armed at the new interval — no extra
+   * probe fires; a probe already in flight re-arms itself at the new
+   * interval from its `finally`, and a stopped monitor stays stopped.
+   * A threshold-only revision leaves the pending probe's countdown
+   * untouched — only a moved interval re-arms the schedule.
+   */
+  retune(next: { intervalMs: number; failureThreshold: number }): void {
+    const intervalChanged = next.intervalMs !== this.intervalMs;
+    this.intervalMs = next.intervalMs;
+    this.failureThreshold = next.failureThreshold;
+    // Only a moved interval re-arms the schedule: a threshold-only
+    // revision leaves the pending probe's countdown untouched.
+    if (intervalChanged && this.timer !== undefined && !this.stopped) {
+      try {
+        this.clearTimer(this.timer);
+      } catch {
+        // A broken timer injection must never break the retune path.
+      }
+      this.timer = undefined;
+      this.armTimer();
+    }
   }
 
   /** Stops periodic probing; idempotent. In-flight probes still record their outcome. */

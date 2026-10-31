@@ -8138,6 +8138,21 @@ Semantics notes:
   path is byte-for-byte the EB-51 behavior. Invalid options throw
   `RangeError` from the constructor.
 
+Retune live with `bus.setBridgeHealth({ intervalMs?, failureThreshold? })`
+(EB-305): only the fields provided move, the rest keep their live values —
+a moved interval clears and re-arms the probe timer at the new interval
+with no extra probe fired (a probe already in flight re-arms itself at the
+new interval, and a threshold-only revision leaves the pending probe's
+countdown untouched), and a revised threshold governs from the next
+failure onward (a tightened threshold trips on the next failure past it,
+a loosened one needs more failures from here on); the health state is
+untouched — the consecutive-failure counter, the last-probe timestamp,
+and the healthy/unhealthy state all survive a revision. Only a bus that
+already enabled `bridge.health` can be revised (otherwise `RangeError`);
+illegal values fail closed with the live tuning untouched; an identical or
+empty revision is a no-op with no audit. Audited as
+`bridge_health_revised` (old and new values).
+
 ## Rebalance debounce: storm protection for consumer groups (EB-169)
 
 **Opt-in.** A group whose members flap — rolling restarts, deploy waves,

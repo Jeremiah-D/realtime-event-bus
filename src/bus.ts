@@ -411,7 +411,9 @@ import {
 } from './bloom.ts';
 import {
   BridgeHealthMonitor,
+  resolveBridgeHealthOptions,
   type BridgeHealthOptions,
+  type BridgeHealthRevision,
   type BridgeHealthStats,
 } from './bridgehealth.ts';
 import {
@@ -21430,6 +21432,93 @@ export class EventBus {
         oldGateWindowSize: current.gateWindowSize,
         slowAdmissionThresholdMs,
         oldSlowAdmissionThresholdMs: current.slowAdmissionThresholdMs,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level bridge-health monitoring tuning live (EB-305)
+   * without restarting the bus: `setBridgeHealth({ intervalMs?,
+   * failureThreshold? })` retunes how often the bridge transport is
+   * probed and how many consecutive mirror/probe failures pause
+   * outbound mirroring (see `EventBusOptions.bridge.health`, EB-168).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The health state is untouched: the consecutive-failure counter,
+   * the last-probe timestamp, and the healthy/unhealthy state all
+   * survive a revision — a tightened threshold trips on the next
+   * failure past it (a counter already at or above the new threshold
+   * trips on the next failure, not retroactively) and a loosened one
+   * simply needs more failures from here on. A moved interval re-arms
+   * the probe timer at the new interval — the old timer is cleared and
+   * a new one armed, with no extra probe fired; a probe already in
+   * flight re-arms itself at the new interval, and a threshold-only
+   * revision leaves the pending probe's countdown untouched.
+   *
+   * Fail-closed: a bus that never enabled `bridge.health`, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. Validation
+   * reuses the construction-time rule
+   * (`resolveBridgeHealthOptions`: the interval a positive finite
+   * number, the threshold a positive integer) against the merged
+   * values, so a value that could not be set at construction cannot be
+   * revised in later either — and a failed call changes nothing at
+   * all: when only one field is provided only that field is validated
+   * and moved, and an illegal value in any field leaves every live
+   * value exactly as it was. A revision that provides neither field,
+   * and a revision identical to the current tuning, are both no-ops
+   * with no audit. Audited as `bridge_health_revised`
+   * (`{ intervalMs, oldIntervalMs, failureThreshold,
+   * oldFailureThreshold }`).
+   *
+   * Orthogonal to EB-168 (that is the bridge health monitor itself —
+   * this the monitor tuning), and to EB-296–EB-304 (those retune other
+   * bus-level parameters — this the bridge health tuning).
+   *
+   * Throws `RangeError` when bridge health monitoring is not enabled,
+   * for a non-object revision, or for an illegal `intervalMs` /
+   * `failureThreshold`.
+   */
+  setBridgeHealth(opts: BridgeHealthRevision): void {
+    const monitor = this.bridgeHealth;
+    if (monitor === undefined) {
+      throw new RangeError('setBridgeHealth: bridge.health is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setBridgeHealth: revision must be an object with intervalMs and/or failureThreshold',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = monitor.current();
+    const intervalMs = opts.intervalMs ?? current.intervalMs;
+    const failureThreshold = opts.failureThreshold ?? current.failureThreshold;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (intervalMs === current.intervalMs && failureThreshold === current.failureThreshold) {
+      return;
+    }
+    const resolved = resolveBridgeHealthOptions(
+      { intervalMs, failureThreshold },
+      'setBridgeHealth',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setBridgeHealth: bridge.health is not enabled on this bus');
+    }
+    monitor.retune(resolved);
+    this.auditSubscription({
+      action: 'bridge_health_revised',
+      actor: 'system',
+      detail: {
+        intervalMs,
+        oldIntervalMs: current.intervalMs,
+        failureThreshold,
+        oldFailureThreshold: current.failureThreshold,
       },
     });
   }
