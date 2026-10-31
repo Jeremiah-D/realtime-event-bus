@@ -13,6 +13,7 @@ import {
   type LaneWeights,
   type MessageLane,
   type PriorityLanesOptions,
+  type PriorityLanesRevision,
 } from './lanes.ts';
 import { LeaseManager, type LeaseExpiredCallback, type LeaseExpiredEvent } from './lease.ts';
 import {
@@ -15568,15 +15569,18 @@ export class EventBus {
    * Per-lane drain weights for the priority-lane rotation (EB-122), from
    * `EventBusOptions.priorityLanes` (default 8:2:1). Shared by every
    * subscriber's `LaneQueue` — lanes are a bus-wide mechanism, not a
-   * per-subscription tuning.
+   * per-subscription tuning. Live-revised by `setPriorityLanes` (EB-310):
+   * not `readonly`, because a revision replaces the object and fans the
+   * new values out to every in-flight subscriber queue.
    */
-  private readonly laneWeights: LaneWeights;
+  private laneWeights: LaneWeights;
   /**
    * Bulk starvation threshold in consecutive undrained drain rounds
    * (EB-122), from `EventBusOptions.priorityLanes` (default 10). Shared
-   * by every subscriber's `LaneQueue`.
+   * by every subscriber's `LaneQueue`. Live-revised by `setPriorityLanes`
+   * (EB-310) alongside `laneWeights`.
    */
-  private readonly bulkStarvationRounds: number;
+  private bulkStarvationRounds: number;
   /**
    * Global per-lane queue-entry counters (EB-122): `laneQueued` is the
    * live backlog per lane (entries currently sitting in subscriber
@@ -21995,6 +21999,109 @@ export class EventBus {
         oldMaxEntries: current.maxEntries,
         maxBytes,
         oldMaxBytes: current.maxBytes,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level priority-lane tuning live (EB-310) without
+   * restarting the bus: `setPriorityLanes({ weights?,
+   * bulkStarvationRounds? })` retunes how the weighted round-robin
+   * drain shares each pass across the urgent / normal / bulk lanes and
+   * how long a waiting bulk lane may starve before one bulk message is
+   * force-interleaved (see `EventBusOptions.priorityLanes`, EB-122).
+   *
+   * Only the fields provided move; the rest keep their live values. A
+   * partial `weights` object moves only the lanes it names. The revision
+   * fans out to every in-flight subscriber queue (`LaneQueue.retune`)
+   * and replaces the bus's own live values, so a subscriber created
+   * after the revision builds its queue from the new tuning — while the
+   * drain sites already read the live values on every call, so the new
+   * weights govern from the next drain round. In-flight queued entries
+   * are untouched, and a bulk starvation counter already counting keeps
+   * counting against the live threshold (a tightened threshold may
+   * force-interleave on the very next round; a loosened one simply
+   * defers it).
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live tuning and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`resolvePriorityLanesOptions`: every weight a positive integer,
+   * `bulkStarvationRounds` a positive integer) against the merged
+   * values, so a value that could not be set at construction cannot be
+   * revised in later either — and a failed call changes nothing at all:
+   * when only one field is provided only that field is validated and
+   * moved, and an illegal value in any field leaves every live value
+   * exactly as it was. (A non-object `weights` is rejected outright
+   * instead of being silently dropped lane by lane — `undefined` is not
+   * a value, but a string is a value, and the wrong kind.) A revision
+   * that provides neither field, and a revision identical to the
+   * current tuning, are both no-ops with no audit. Audited as
+   * `priority_lanes_revised` (`{ weights, oldWeights,
+   * bulkStarvationRounds, oldBulkStarvationRounds }`).
+   *
+   * Orthogonal to EB-122 (that is the priority-lane mechanism itself —
+   * this the lanes' tuning), and to EB-296 (that retunes tail sampling
+   * — this the priority lanes).
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `weights` / `bulkStarvationRounds`.
+   */
+  setPriorityLanes(opts: PriorityLanesRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setPriorityLanes: revision must be an object with weights and/or bulkStarvationRounds',
+      );
+    }
+    if (
+      opts.weights !== undefined &&
+      (typeof opts.weights !== 'object' || opts.weights === null || Array.isArray(opts.weights))
+    ) {
+      throw new RangeError(
+        'setPriorityLanes: weights must be an object with urgent and/or normal and/or bulk',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const currentWeights = this.laneWeights;
+    const currentBulkStarvationRounds = this.bulkStarvationRounds;
+    const weights = {
+      urgent: opts.weights?.urgent ?? currentWeights.urgent,
+      normal: opts.weights?.normal ?? currentWeights.normal,
+      bulk: opts.weights?.bulk ?? currentWeights.bulk,
+    };
+    const bulkStarvationRounds = opts.bulkStarvationRounds ?? currentBulkStarvationRounds;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      weights.urgent === currentWeights.urgent &&
+      weights.normal === currentWeights.normal &&
+      weights.bulk === currentWeights.bulk &&
+      bulkStarvationRounds === currentBulkStarvationRounds
+    ) {
+      return;
+    }
+    const resolved = resolvePriorityLanesOptions(
+      { weights, bulkStarvationRounds },
+      'setPriorityLanes',
+    );
+    this.laneWeights = resolved.weights;
+    this.bulkStarvationRounds = resolved.bulkStarvationRounds;
+    for (const subscriber of this.subscribers.values()) {
+      subscriber.queue.retune(resolved);
+    }
+    this.auditSubscription({
+      action: 'priority_lanes_revised',
+      actor: 'system',
+      detail: {
+        weights: resolved.weights,
+        oldWeights: currentWeights,
+        bulkStarvationRounds: resolved.bulkStarvationRounds,
+        oldBulkStarvationRounds: currentBulkStarvationRounds,
       },
     });
   }

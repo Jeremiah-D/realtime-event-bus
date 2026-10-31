@@ -100,6 +100,25 @@ export interface ResolvedPriorityLanesOptions {
   bulkStarvationRounds: number;
 }
 
+/**
+ * A partial bus-level revision of the priority-lane tuning, for
+ * `EventBus.setPriorityLanes` (EB-310). Only the fields provided
+ * move; the rest keep their live values. A partial `weights` object
+ * moves only the lanes it names.
+ */
+export interface PriorityLanesRevision {
+  /**
+   * Per-lane drain weights (positive integers). Partial objects are
+   * allowed — any lane left undefined keeps its live value.
+   */
+  weights?: { urgent?: number; normal?: number; bulk?: number };
+  /**
+   * Consecutive drain rounds the bulk lane may sit nonempty-but-undrained
+   * before one bulk message is force-interleaved (positive integer).
+   */
+  bulkStarvationRounds?: number;
+}
+
 /** Fail-fast validation for `EventBusOptions.priorityLanes`. */
 export function resolvePriorityLanesOptions(
   opts: PriorityLanesOptions | undefined,
@@ -189,8 +208,12 @@ export class LaneQueue<T> {
   private readonly lanes: Record<MessageLane, BoundedQueue<T>>;
   private capacity: number;
   private readonly policy: DropPolicy;
-  private readonly weights: LaneWeights;
-  private readonly bulkStarvationRounds: number;
+  // Live-tuned by `retune` (EB-310): the drain sites read these fields
+  // on every call, so a revision governs from the next drain round
+  // without draining or rebuilding the queue. They are not `readonly`
+  // for exactly that reason — `retune` is the only writer.
+  private weights: LaneWeights;
+  private bulkStarvationRounds: number;
   /**
    * Consecutive drain rounds the bulk lane ended nonempty without
    * draining anything. Reset whenever bulk drains or the lane empties;
@@ -369,6 +392,34 @@ export class LaneQueue<T> {
     if (maxBytes === undefined) {
       this.bytesTotal = 0;
     }
+  }
+
+  /** The live tuning values, for bus-level revision (EB-310). */
+  current(): ResolvedPriorityLanesOptions {
+    return { weights: { ...this.weights }, bulkStarvationRounds: this.bulkStarvationRounds };
+  }
+
+  /**
+   * Retunes the lane weights and the bulk starvation threshold live
+   * (EB-310). The caller passes the merged values (current values with
+   * the revision applied); this method re-validates them with the
+   * construction-time rule (`resolvePriorityLanesOptions`: every weight
+   * a positive integer, `bulkStarvationRounds` a positive integer) and
+   * applies them only when valid, so a failed call leaves every live
+   * value untouched. The drain sites read these fields on every call,
+   * so the new weights govern from the next drain round — in-flight
+   * queued entries are untouched, and a starvation counter already
+   * counting keeps counting against the live threshold (a tightened
+   * threshold may force-interleave on the very next round; a loosened
+   * one simply defers it).
+   */
+  retune(next: ResolvedPriorityLanesOptions): void {
+    const resolved = resolvePriorityLanesOptions(
+      { weights: next.weights, bulkStarvationRounds: next.bulkStarvationRounds },
+      'LaneQueue.retune',
+    );
+    this.weights = resolved.weights;
+    this.bulkStarvationRounds = resolved.bulkStarvationRounds;
   }
 
   /**

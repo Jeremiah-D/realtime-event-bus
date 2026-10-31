@@ -6661,6 +6661,16 @@ Semantics:
   `bulkStarvationRounds`, the next round force-interleaves one bulk
   message ahead of the rotation. The forced message still consumes drain
   budget — the guard reorders within the budget, it never exceeds it.
+- **Live revision.** `setPriorityLanes({ weights?, bulkStarvationRounds? })`
+  (EB-310) retunes the rotation live without restarting the bus: only the
+  fields provided move, a partial `weights` object moves only the lanes it
+  names, and an identical or empty revision is a no-op with no audit. The
+  new values fan out to every in-flight subscriber queue and govern from
+  the next drain round; a subscriber created after the revision builds its
+  queue from the new tuning. A bulk starvation counter already counting
+  keeps counting against the live threshold. Illegal values throw
+  `RangeError` with the live tuning untouched. Audited as
+  `priority_lanes_revised`.
 - **FIFO within a lane; priority across lanes.** Ordering is preserved
   per lane, but an urgent message published later jumps ahead of an
   earlier bulk message. That is the documented trade-off; keep one
