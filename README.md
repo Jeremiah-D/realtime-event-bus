@@ -2277,6 +2277,18 @@ library.
   Bounded by `maxOpenTraces` (default 4096, oldest force-decided first) and
   `maxSpansPerTrace` (default 512). Disabled by default, allocation-free
   when off. Invalid options throw `RangeError` from the constructor.
+  Retune live with `setTailSampling({ successSampleRate?,
+  maxOpenTraces?, maxSpansPerTrace?, bufferSize? })` (EB-296): only the
+  fields provided move, the rest keep their live values, and the new
+  values govern from the next decision — the next trace samples at the
+  live rate, the next span buffers truncate at the live per-trace cap,
+  the next open enforces the live open-trace budget (tightening it
+  force-decides the oldest open traces), and shrinking `bufferSize`
+  trims the ring to the newest spans at once. `onTraceSpan` is not
+  revisable. Only a bus that enabled `tailSampling` can be revised
+  (otherwise `RangeError`); illegal values fail closed with the live
+  tuning untouched; an identical or empty revision is a no-op with no
+  audit. Audited as `tail_sampling_revised` (old and new values).
 - **Per-topic sliding-window publish rates** (in `src/rates.ts`, always
   on): each topic's publish rate in messages/sec over trailing 1s / 1m / 5m
   windows, load-average style (`r1s` / `r1m` / `r5m`) — the real-time signal

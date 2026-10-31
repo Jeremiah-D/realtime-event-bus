@@ -96,6 +96,36 @@ export interface ResolvedTailSamplingOptions {
 }
 
 /**
+ * Revision for the bus-level tail-sampling tuning (see
+ * `EventBus.setTailSampling`, EB-296). Only the fields provided move;
+ * the rest keep their live values. `onTraceSpan` is not revisable here
+ * — it is the observer channel fixed at construction; re-subscribing
+ * the callback means rebuilding the bus.
+ */
+export interface TailSamplingRevision {
+  /**
+   * Fraction of *successful* traces to keep. Must be a finite number
+   * in [0, 1] when provided — the construction-time rule.
+   */
+  successSampleRate?: number;
+  /**
+   * Cap on simultaneously open traces. Must be a positive integer when
+   * provided — the construction-time rule.
+   */
+  maxOpenTraces?: number;
+  /**
+   * Cap on spans buffered per trace. Must be a positive integer when
+   * provided — the construction-time rule.
+   */
+  maxSpansPerTrace?: number;
+  /**
+   * Ring-buffer capacity for `getStats().tailSampledSpans`. Must be a
+   * positive integer when provided — the construction-time rule.
+   */
+  bufferSize?: number;
+}
+
+/**
  * Normalizes `EventBusOptions.tailSampling`. Returns `undefined` when
  * disabled (absent, `null`, `false`, or `{ enabled: false }`); anything
  * else invalid throws `RangeError` at construction time.
@@ -184,16 +214,20 @@ interface TailTraceRecord {
  * what makes the disabled path allocation-free.
  */
 export class TailSampler {
-  private readonly successSampleRate: number;
+  // Live-tuned by `retune` (EB-296): the decision and admission sites
+  // read these fields on every call, so a revision governs from the next
+  // decision without draining or rebuilding any trace. `onTraceSpan` and
+  // `now` stay fixed for the sampler's lifetime.
+  private successSampleRate: number;
   private readonly onTraceSpan: ((span: TraceSpan) => void) | undefined;
-  private readonly maxOpenTraces: number;
-  private readonly maxSpansPerTrace: number;
+  private maxOpenTraces: number;
+  private maxSpansPerTrace: number;
   private readonly traces = new WeakMap<object, TailTraceRecord>();
   /** Insertion-ordered open traces, for the `maxOpenTraces` horizon. */
   private readonly openOrder = new Map<object, TailTraceRecord>();
   private readonly ring: TraceSpan[] = [];
   private ringHead = 0;
-  private readonly capacity: number;
+  private capacity: number;
   private readonly now: () => number;
 
   constructor(resolved: ResolvedTailSamplingOptions, now: () => number = Date.now) {
@@ -203,6 +237,55 @@ export class TailSampler {
     this.maxSpansPerTrace = resolved.maxSpansPerTrace;
     this.capacity = resolved.bufferSize;
     this.now = now;
+  }
+
+  /** The four live tuning values, for bus-level revision (EB-296). */
+  current(): {
+    successSampleRate: number;
+    maxOpenTraces: number;
+    maxSpansPerTrace: number;
+    bufferSize: number;
+  } {
+    return {
+      successSampleRate: this.successSampleRate,
+      maxOpenTraces: this.maxOpenTraces,
+      maxSpansPerTrace: this.maxSpansPerTrace,
+      bufferSize: this.capacity,
+    };
+  }
+
+  /**
+   * Retunes the four numeric bounds live (EB-296). The caller must have
+   * validated `next` through `resolveTailSamplingOptions` first — this
+   * method applies unconditionally. In-flight open traces are untouched:
+   * already-buffered spans stay buffered, and the new rate, per-trace
+   * cap, and open-trace budget govern from the next decision, admission,
+   * and open respectively (`maybeDecide` samples at the live rate,
+   * `bufferSpan` truncates at the live per-trace cap, `enforceOpenBudget`
+   * force-decides at the live budget). Shrinking `bufferSize` trims the
+   * ring to the newest spans at once, so the next append evicts the
+   * oldest under the new bound.
+   */
+  retune(next: {
+    successSampleRate: number;
+    maxOpenTraces: number;
+    maxSpansPerTrace: number;
+    bufferSize: number;
+  }): void {
+    this.successSampleRate = next.successSampleRate;
+    this.maxOpenTraces = next.maxOpenTraces;
+    this.maxSpansPerTrace = next.maxSpansPerTrace;
+    if (next.bufferSize !== this.capacity) {
+      this.capacity = next.bufferSize;
+      if (this.ring.length > this.capacity) {
+        // Keep the newest spans, in order; the ring is full again at the
+        // new capacity, so the next append overwrites the oldest.
+        const kept = this.snapshot().slice(-this.capacity);
+        this.ring.length = 0;
+        this.ring.push(...kept);
+        this.ringHead = 0;
+      }
+    }
   }
 
   /** Whether this message has an open (undecided) tail trace. */

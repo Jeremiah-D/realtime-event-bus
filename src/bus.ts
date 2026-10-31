@@ -81,7 +81,7 @@ import {
 export type { CompareAndSetExpected } from './caspublish.ts';
 import type { GlobalPublishRateLimitOptions } from './global-rate-limit.ts';
 import { TailSampler, resolveTailSamplingOptions } from './tail-sampling.ts';
-import type { TailSamplingOptions } from './tail-sampling.ts';
+import type { TailSamplingOptions, TailSamplingRevision } from './tail-sampling.ts';
 import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
   createSlowStartGate,
@@ -20576,6 +20576,104 @@ export class EventBus {
   }
 
   /**
+   * Revises the bus-level tail-sampling tuning live (EB-296) without
+   * restarting the bus: `setTailSampling({ successSampleRate?,
+   * maxOpenTraces?, maxSpansPerTrace?, bufferSize? })` retunes how
+   * aggressively successful traces are kept and how much memory the
+   * sampler may hold (see `EventBusOptions.tailSampling`, EB-181).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * `onTraceSpan` is not revisable here — it is the observer channel
+   * fixed at construction. In-flight open traces are untouched:
+   * already-buffered spans stay buffered, and the new values govern
+   * from the next decision onward — the next trace decision samples at
+   * the live `successSampleRate`, the next span buffers truncate at the
+   * live `maxSpansPerTrace`, the next open enforces the live
+   * `maxOpenTraces` budget (tightening it force-decides the oldest open
+   * traces on the next open), and shrinking `bufferSize` trims the ring
+   * to the newest spans at once, so the next append evicts the oldest
+   * under the new bound.
+   *
+   * Fail-closed: a bus that never enabled `tailSampling`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the live
+   * tuning and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveTailSamplingOptions`: the rate a
+   * finite number in [0, 1], the rest positive integers) against the
+   * merged values, so a value that could not be set at construction
+   * cannot be revised in later either — and a failed call changes
+   * nothing at all: when only one field is provided only that field is
+   * validated and moved, and an illegal value in either field leaves
+   * every live value exactly as it was. A revision that provides
+   * neither field, and a revision identical to the current tuning, are
+   * both no-ops with no audit. Audited as `tail_sampling_revised`
+   * (`{ successSampleRate, oldSuccessSampleRate, maxOpenTraces,
+   * oldMaxOpenTraces, maxSpansPerTrace, oldMaxSpansPerTrace,
+   * bufferSize, oldBufferSize }`).
+   *
+   * Orthogonal to EB-85 (that is the durable log's retention bound —
+   * this the tail sampler's tuning), and to `setDurableLogMaxAgeMs`
+   * (that retunes log retention — this sampling).
+   *
+   * Throws `RangeError` when tail sampling is not enabled, for a
+   * non-object revision, or for an illegal `successSampleRate` /
+   * `maxOpenTraces` / `maxSpansPerTrace` / `bufferSize`.
+   */
+  setTailSampling(opts: TailSamplingRevision): void {
+    const sampler = this.tailSampler;
+    if (sampler === undefined) {
+      throw new RangeError('setTailSampling: tailSampling is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setTailSampling: revision must be an object with successSampleRate and/or maxOpenTraces and/or maxSpansPerTrace and/or bufferSize',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = sampler.current();
+    const successSampleRate = opts.successSampleRate ?? current.successSampleRate;
+    const maxOpenTraces = opts.maxOpenTraces ?? current.maxOpenTraces;
+    const maxSpansPerTrace = opts.maxSpansPerTrace ?? current.maxSpansPerTrace;
+    const bufferSize = opts.bufferSize ?? current.bufferSize;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      successSampleRate === current.successSampleRate &&
+      maxOpenTraces === current.maxOpenTraces &&
+      maxSpansPerTrace === current.maxSpansPerTrace &&
+      bufferSize === current.bufferSize
+    ) {
+      return;
+    }
+    const resolved = resolveTailSamplingOptions(
+      { successSampleRate, maxOpenTraces, maxSpansPerTrace, bufferSize },
+      'setTailSampling',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setTailSampling: tailSampling is not enabled on this bus');
+    }
+    sampler.retune(resolved);
+    this.auditSubscription({
+      action: 'tail_sampling_revised',
+      actor: 'system',
+      detail: {
+        successSampleRate,
+        oldSuccessSampleRate: current.successSampleRate,
+        maxOpenTraces,
+        oldMaxOpenTraces: current.maxOpenTraces,
+        maxSpansPerTrace,
+        oldMaxSpansPerTrace: current.maxSpansPerTrace,
+        bufferSize,
+        oldBufferSize: current.bufferSize,
+      },
+    });
+  }
+
+  /**
    * Registers one versioned schema validator for `topicPattern` (EB-86):
    * a concrete topic name or a wildcard pattern, with the same match
    * resolution as `setTopicSchema` (exact-topic rule set wins over
@@ -29734,7 +29832,16 @@ export class EventBus {
           ...raw,
           ack: () => {
             raw.ack();
-            if (rawLive.live) this.clearRetryLadder(subscriber, msg);
+            if (rawLive.live) {
+              // Tail-based sampling (EB-181, fixed EB-296): the delivery
+              // leg closes as delivered — the instrumented branch below
+              // does this, but this branch previously never did, so a
+              // clean ack on a bus without head tracing / ack-latency /
+              // SLO left the tail trace open forever (decided only when
+              // the open-trace budget force-decided it).
+              this.tailSampler?.closeAckSpan(subscriber, msg, this.now());
+              this.clearRetryLadder(subscriber, msg);
+            }
           },
         };
         // EB-107: register even the raw handle — the consumer holds it
