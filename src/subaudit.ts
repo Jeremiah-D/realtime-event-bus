@@ -162,7 +162,8 @@ export type SubscriptionAuditAction =
   | 'auto_remediate_resume'
   | 'auto_remediate_linger_pruned'
   | 'auto_remediate_rebalance'
-  | 'auto_remediate_run';
+  | 'auto_remediate_run'
+  | 'auto_remediate_revised';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -202,6 +203,25 @@ export type SubscriptionAuditAction =
  * - `auto_remediate_run`: `{ dryRun, healthBefore, planned, applied,
  *   capped, maxActions }` — one `autoRemediate()` run's summary,
  *   including dry-run previews
+ * - `auto_remediate_revised`: `{ intervalMs, oldIntervalMs, maxActions,
+ *   oldMaxActions, dryRun, oldDryRun }` — the bus-level doctor
+ *   auto-remediation schedule was revised (EB-306; only a bus that
+ *   already enabled `autoRemediate` can be revised — a never-enabled
+ *   bus refuses until the opt-in is set at construction, since it holds
+ *   no schedule at all; the new values reuse the construction-time
+ *   validation (`assertValidRemediateSchedule`: the interval a positive
+ *   finite number, maxActions a non-negative integer), plus a boolean
+ *   check on `dryRun`, so a failed call leaves the live schedule
+ *   untouched, and only the fields provided move — a partial revision
+ *   keeps the fields it leaves out, and an illegal value in any field
+ *   leaves every live value exactly as it was; only the three schedule
+ *   values move — the construction-time `doctor` tuning is untouched —
+ *   and a moved interval clears and re-arms the timer at the new
+ *   interval with no extra run fired, while a maxActions/dryRun-only
+ *   revision leaves the pending run's countdown untouched and takes
+ *   effect on the next run; a revision that provides neither field, and
+ *   a revision identical to the current schedule, are both no-ops with
+ *   no audit)
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -486,6 +506,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'auto_remediate_linger_pruned',
   'auto_remediate_rebalance',
   'auto_remediate_run',
+  'auto_remediate_revised',
   'dead_letter_replay_requested',
   'dead_letter_replay_approved',
   'dead_letter_replay_rejected',

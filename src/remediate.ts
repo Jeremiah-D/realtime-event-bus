@@ -106,6 +106,22 @@ export interface AutoRemediateScheduleOptions extends AutoRemediateOptions {
   intervalMs: number;
 }
 
+/**
+ * A live revision of the auto-remediation schedule (EB-306): the
+ * partial update `EventBus.setAutoRemediate()` applies to a bus that
+ * already enabled the `EventBusOptions.autoRemediate` opt-in. Only the
+ * fields present move; the rest keep their live values. The `doctor`
+ * tuning is not revisable here — it was fixed at construction.
+ */
+export interface AutoRemediateRevision {
+  /** Positive finite milliseconds between remediation runs. */
+  intervalMs?: number;
+  /** Per-run action cap — a non-negative integer. */
+  maxActions?: number;
+  /** Preview only: plan without applying. */
+  dryRun?: boolean;
+}
+
 /** Default per-run action cap for `autoRemediate()`. */
 export const DEFAULT_REMEDIATE_MAX_ACTIONS = 10;
 

@@ -152,6 +152,7 @@ import {
   DEFAULT_REMEDIATE_MAX_ACTIONS,
   planRemediation,
   type AutoRemediateOptions,
+  type AutoRemediateRevision,
   type AutoRemediateScheduleOptions,
   type RemediationAction,
   type RemediationActionResult,
@@ -523,6 +524,7 @@ export type {
 } from './doctor.ts';
 export type {
   AutoRemediateOptions,
+  AutoRemediateRevision,
   AutoRemediateScheduleOptions,
   RemediationAction,
   RemediationActionKind,
@@ -7484,6 +7486,14 @@ export interface BusStats {
    * (`'disabled'` when unconfigured).
    */
   bridge: BridgeStats;
+  /**
+   * Live doctor auto-remediation schedule (EB-211, revised live by
+   * EB-306 `setAutoRemediate`): the interval between periodic
+   * `autoRemediate()` runs, the per-run action cap, and whether runs
+   * only preview. Absent when the `autoRemediate` opt-in was never
+   * configured, so snapshots from a bus without it are unchanged.
+   */
+  autoRemediate?: { intervalMs: number; maxActions: number; dryRun: boolean };
   /**
    * Stats for every concrete topic that has seen at least one publish or
    * schema rejection, in order of first publish.
@@ -16639,6 +16649,15 @@ export class EventBus {
    * Absent unless the opt-in is configured; cleared on close().
    */
   private remediateTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * Live doctor auto-remediation schedule (EB-211, revised by EB-306):
+   * the opt-in as configured at construction, as later revised by
+   * `setAutoRemediate()`. The timer closure reads this field on every
+   * tick, so a maxActions/dryRun-only revision takes effect on the
+   * next run without re-arming the timer. Absent unless the opt-in is
+   * configured.
+   */
+  private remediateSchedule: AutoRemediateScheduleOptions | undefined;
   /** Envelopes mirrored to the bridge transport (see `BridgeStats`). */
   private bridgeOutbound = 0;
   /** Bridge envelopes admitted and fanned out locally. */
@@ -16910,19 +16929,8 @@ export class EventBus {
     const remediateOpt = options?.autoRemediate;
     if (remediateOpt !== undefined) {
       assertValidRemediateSchedule(remediateOpt, 'EventBus');
-      const schedule = remediateOpt;
-      const timer = setInterval(() => {
-        try {
-          this.autoRemediate(schedule);
-        } catch {
-          // Best-effort: a failing remediation run must not kill the
-          // timer — the next run retries. The failure itself is not
-          // audited here; per-run failures surface in the run's own
-          // audit entries when they get that far.
-        }
-      }, schedule.intervalMs);
-      timer.unref();
-      this.remediateTimer = timer;
+      this.remediateSchedule = remediateOpt;
+      this.armRemediateTimer();
     }
     const resolvedGroupLag = resolveGroupLagOptions(options?.groupLag, 'EventBus');
     // EB-132: the ops alert outlet sits on top of the EB-112 lag-SLO
@@ -21519,6 +21527,141 @@ export class EventBus {
         oldIntervalMs: current.intervalMs,
         failureThreshold,
         oldFailureThreshold: current.failureThreshold,
+      },
+    });
+  }
+
+  /**
+   * (Re-)arms the doctor auto-remediation timer at the live schedule's
+   * `intervalMs` (EB-211, EB-306). Any previous timer is cleared first.
+   * The tick closure reads `this.remediateSchedule` live on every run,
+   * so a maxActions/dryRun-only revision takes effect on the next run
+   * without re-arming. The timer is unref'd (it never holds the
+   * process open) and cleared on close().
+   */
+  private armRemediateTimer(): void {
+    const schedule = this.remediateSchedule;
+    if (this.remediateTimer !== undefined) {
+      clearInterval(this.remediateTimer);
+      this.remediateTimer = undefined;
+    }
+    if (schedule === undefined) return;
+    const timer = setInterval(() => {
+      try {
+        // Read the schedule live: a revision that only moves
+        // maxActions/dryRun applies on the next run without re-arming.
+        const live = this.remediateSchedule;
+        if (live !== undefined) this.autoRemediate(live);
+      } catch {
+        // Best-effort: a failing remediation run must not kill the
+        // timer — the next run retries. The failure itself is not
+        // audited here; per-run failures surface in the run's own
+        // audit entries when they get that far.
+      }
+    }, schedule.intervalMs);
+    timer.unref();
+    this.remediateTimer = timer;
+  }
+
+  /**
+   * Revises the bus-level doctor auto-remediation schedule live
+   * (EB-306) without restarting the bus: `setAutoRemediate({
+   * intervalMs?, maxActions?, dryRun? })` retunes how often the
+   * periodic `autoRemediate()` run fires, how many actions each run
+   * may apply, and whether runs only preview (see
+   * `EventBusOptions.autoRemediate`, EB-211).
+   *
+   * Only the fields provided move; the rest keep their live values,
+   * and the construction-time `doctor` tuning is untouched — it is not
+   * revisable here. A moved interval clears and re-arms the timer at
+   * the new interval — the old timer is cleared and a new one armed,
+   * with no extra run fired; a maxActions/dryRun-only revision leaves
+   * the pending run's countdown untouched and takes effect on the next
+   * run (the tick reads the live schedule). A remediation run is
+   * synchronous, so there is no in-flight run to wait out.
+   *
+   * Fail-closed: a bus that never enabled `autoRemediate`, a bus that
+   * is already closed, a non-object revision, and an illegal value all
+   * throw `RangeError` with the live schedule and the audit log
+   * untouched. Validation reuses the construction-time rule
+   * (`assertValidRemediateSchedule`: the interval a positive finite
+   * number, maxActions a non-negative integer) against the merged
+   * values, plus a boolean check on `dryRun`, so a value that could
+   * not be set at construction cannot be revised in later either —
+   * and a failed call changes nothing at all: when only one field is
+   * provided only that field is validated and moved, and an illegal
+   * value in any field leaves every live value exactly as it was. A
+   * revision that provides neither field, and a revision identical to
+   * the current schedule, are both no-ops with no audit. Audited as
+   * `auto_remediate_revised` (`{ intervalMs, oldIntervalMs,
+   * maxActions, oldMaxActions, dryRun, oldDryRun }`).
+   *
+   * Orthogonal to EB-211 (that is the remediation run itself — this
+   * the run's schedule), and to EB-305 (that retunes bridge-health
+   * probing — this the doctor schedule).
+   *
+   * Throws `RangeError` when auto-remediation is not enabled, when the
+   * bus is closed, for a non-object revision, or for an illegal
+   * `intervalMs` / `maxActions` / `dryRun`.
+   */
+  setAutoRemediate(opts: AutoRemediateRevision): void {
+    const current = this.remediateSchedule;
+    if (current === undefined) {
+      throw new RangeError('setAutoRemediate: autoRemediate is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setAutoRemediate: revision must be an object with intervalMs and/or maxActions and/or dryRun',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const intervalMs = opts.intervalMs ?? current.intervalMs;
+    const maxActions = opts.maxActions ?? current.maxActions ?? DEFAULT_REMEDIATE_MAX_ACTIONS;
+    const dryRun = opts.dryRun ?? current.dryRun ?? false;
+    if (opts.dryRun !== undefined && typeof opts.dryRun !== 'boolean') {
+      throw new RangeError('setAutoRemediate: dryRun must be a boolean');
+    }
+    // Re-affirming the current schedule is a no-op: no re-arm, no audit.
+    const currentMaxActions = current.maxActions ?? DEFAULT_REMEDIATE_MAX_ACTIONS;
+    const currentDryRun = current.dryRun ?? false;
+    if (
+      intervalMs === current.intervalMs &&
+      maxActions === currentMaxActions &&
+      dryRun === currentDryRun
+    ) {
+      return;
+    }
+    assertValidRemediateSchedule({ intervalMs, maxActions, dryRun }, 'setAutoRemediate');
+    if (this.remediateTimer === undefined) {
+      throw new RangeError('setAutoRemediate: bus is closed');
+    }
+    const oldIntervalMs = current.intervalMs;
+    const oldMaxActions = currentMaxActions;
+    const oldDryRun = currentDryRun;
+    // Keep the construction-time `doctor` tuning: spread first, then
+    // overwrite only the revisable fields.
+    this.remediateSchedule = { ...current, intervalMs, maxActions, dryRun };
+    // Only a moved interval re-arms the timer; a maxActions/dryRun-only
+    // revision leaves the pending run's countdown untouched.
+    if (intervalMs !== oldIntervalMs) {
+      this.armRemediateTimer();
+    }
+    this.auditSubscription({
+      action: 'auto_remediate_revised',
+      actor: 'system',
+      detail: {
+        intervalMs,
+        oldIntervalMs,
+        maxActions,
+        oldMaxActions,
+        dryRun,
+        oldDryRun,
       },
     });
   }
@@ -49096,6 +49239,16 @@ export class EventBus {
           consecutiveFailures: 0,
         },
       },
+      ...(this.remediateSchedule === undefined
+        ? {}
+        : {
+            autoRemediate: {
+              intervalMs: this.remediateSchedule.intervalMs,
+              maxActions:
+                this.remediateSchedule.maxActions ?? DEFAULT_REMEDIATE_MAX_ACTIONS,
+              dryRun: this.remediateSchedule.dryRun === true,
+            },
+          }),
       aliases: [...this.topicAliases.entries()].map(([oldTopic, entry]) => ({
         oldTopic,
         newTopic: entry.newTopic,

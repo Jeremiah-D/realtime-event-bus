@@ -5507,7 +5507,20 @@ For hands-off operation, `EventBusOptions.autoRemediate` arms the same
 run on an unref'd periodic timer: `new EventBus({ autoRemediate:
 { intervalMs: 60_000, maxActions: 10 } })`. Absent the opt-in nothing is
 scheduled and the bus behaves exactly as before EB-211; the timer is
-cleared on `close()`.
+cleared on `close()`. The live schedule is observable via
+`getStats().autoRemediate` (`{ intervalMs, maxActions, dryRun }`).
+
+`bus.setAutoRemediate({ intervalMs?, maxActions?, dryRun? })` (EB-306)
+retunes that schedule live without restarting the bus — only a bus that
+already enabled the opt-in can be revised, and only the fields provided
+move (the construction-time `doctor` tuning is not revisable). A moved
+interval re-arms the timer at the new interval with no extra run fired;
+a `maxActions`/`dryRun`-only revision leaves the pending run's countdown
+untouched and takes effect on the next run. Illegal values throw
+`RangeError` with the live schedule untouched, and an identical (or
+empty) revision is a no-op with no audit. Audited as
+`auto_remediate_revised` (`{ intervalMs, oldIntervalMs, maxActions,
+oldMaxActions, dryRun, oldDryRun }`).
 
 ## Transactional outbox relay (EB-102)
 
