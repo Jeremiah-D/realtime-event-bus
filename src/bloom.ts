@@ -52,6 +52,27 @@ export interface ResolvedDedupBloomOptions {
 }
 
 /**
+ * Bus-level revision for the dedup bloom sizing (EB-312). Only the two
+ * sizing knobs move — the filter itself is rebuilt from the live dedup
+ * table on revision, so there is no separate enable/disable switch
+ * here: a bus that never enabled `dedupBloom` cannot be revised.
+ */
+export interface DedupBloomRevision {
+  /**
+   * How many distinct `(topic, messageId)` claims the rebuilt filter
+   * is sized for. Must be an integer >= 1 when provided — the
+   * construction-time rule.
+   */
+  expectedInsertions?: number;
+  /**
+   * Target false-positive rate for the rebuilt filter, 0 < p < 1. Must
+   * be in the open interval (0, 1) when provided — the
+   * construction-time rule.
+   */
+  falsePositiveRate?: number;
+}
+
+/**
  * Validates `EventBusOptions.dedupBloom` (EB-214). `true` selects the
  * defaults (sized for `idempotencyMaxEntries` at p = 0.01); `false` /
  * `undefined` disables the pre-filter; an object tunes the sizing.

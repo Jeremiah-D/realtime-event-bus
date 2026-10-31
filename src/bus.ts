@@ -413,6 +413,7 @@ import {
   BloomFilter,
   resolveDedupBloomOptions,
   type DedupBloomOptions,
+  type DedupBloomRevision,
   type ResolvedDedupBloomOptions,
 } from './bloom.ts';
 import {
@@ -15558,14 +15559,24 @@ export class EventBus {
    * every lookup probes it first — a negative answer skips the map. The
    * map stays authoritative, so the filter can never suppress wrongly.
    * `undefined` when disabled (the default): the bus then behaves exactly
-   * as before, with zero per-publish overhead.
+   * as before, with zero per-publish overhead. Live-revised by
+   * `setDedupBloom` (EB-312): a revision swaps in a freshly sized filter
+   * rebuilt from the live dedup table, so the field is not `readonly`.
    */
-  private readonly dedupBloom: BloomFilter | undefined;
+  private dedupBloom: BloomFilter | undefined;
   /**
    * The `expectedInsertions` the bloom filter was sized for (EB-214):
-   * drives the saturation guard in `refreshDedupBloom`.
+   * drives the saturation guard in `refreshDedupBloom`. Live-revised by
+   * `setDedupBloom` (EB-312) alongside the filter itself.
    */
-  private readonly dedupBloomExpectedInsertions: number;
+  private dedupBloomExpectedInsertions: number;
+  /**
+   * The `falsePositiveRate` the bloom filter was sized for (EB-214):
+   * the second half of the live sizing, kept so a partial
+   * `setDedupBloom` revision (EB-312) can merge against the current
+   * rate. `0` when the filter is disabled.
+   */
+  private dedupBloomFalsePositiveRate: number;
   /**
    * Per-lane drain weights for the priority-lane rotation (EB-122), from
    * `EventBusOptions.priorityLanes` (default 8:2:1). Shared by every
@@ -16791,6 +16802,7 @@ export class EventBus {
             dedupBloomOptions.falsePositiveRate,
           );
     this.dedupBloomExpectedInsertions = dedupBloomOptions?.expectedInsertions ?? 0;
+    this.dedupBloomFalsePositiveRate = dedupBloomOptions?.falsePositiveRate ?? 0;
     // Per-topic priority lanes (EB-122): validated fail-fast — a bad
     // weight or starvation threshold must never silently degrade the
     // drain rotation.
@@ -20881,6 +20893,111 @@ export class EventBus {
         oldSampleRate: current.sampleRate,
         bufferSize,
         oldBufferSize: current.bufferSize,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level dedup bloom sizing live (EB-312) without
+   * restarting the bus: `setDedupBloom({ expectedInsertions?,
+   * falsePositiveRate? })` resizes the EB-214 pre-filter in front of
+   * the exact EB-27 `(topic, messageId)` dedup map (see
+   * `EventBusOptions.dedupBloom`).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The revision builds a fresh `BloomFilter` at the merged sizing and
+   * rebuilds it from the live dedup table — the same rebuild path as
+   * the saturation guard (`refreshDedupBloom`, `BloomFilter.rebuild`).
+   * The map itself is the authoritative source, so the rebuild drops
+   * no dedup decision: every live claim is re-added, and only the
+   * pre-filter hit rate changes with the new sizing. The insertion
+   * count restarts from the rebuilt count (the live table size — zero
+   * when the table is empty), so stale bits accumulated since
+   * construction are gone too. In-flight publishes are untouched: a
+   * publish already admitted keeps its claim, and the new filter
+   * governs from the next probe onward.
+   *
+   * Fail-closed: a bus that never enabled `dedupBloom`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the
+   * live filter and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveDedupBloomOptions`: the sizing an
+   * integer >= 1, the rate in the open interval (0, 1)) against the
+   * merged values, so a value that could not be set at construction
+   * cannot be revised in later either — and a failed call changes
+   * nothing at all: when only one field is provided only that field is
+   * validated and moved, and an illegal value in either field leaves
+   * every live value exactly as it was. The resolver's `TypeError`
+   * (a non-object shape) is converted to `RangeError` at this layer,
+   * along the EB-303 precedent. A revision that provides neither
+   * field, and a revision identical to the current sizing, are both
+   * no-ops with no audit. Audited as `dedup_bloom_revised`
+   * (`{ expectedInsertions, oldExpectedInsertions, falsePositiveRate,
+   * oldFalsePositiveRate }`).
+   *
+   * Orthogonal to EB-214 (that is the bloom pre-filter mechanism
+   * itself — this the live resizing of it), and to EB-296 (that
+   * retunes tail sampling — this the dedup bloom).
+   *
+   * Throws `RangeError` when dedupBloom is not enabled, for a
+   * non-object revision, or for an illegal `expectedInsertions` /
+   * `falsePositiveRate`.
+   */
+  setDedupBloom(opts: DedupBloomRevision): void {
+    if (this.dedupBloom === undefined) {
+      throw new RangeError('setDedupBloom: dedupBloom is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setDedupBloom: revision must be an object with expectedInsertions and/or falsePositiveRate',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const currentExpectedInsertions = this.dedupBloomExpectedInsertions;
+    const currentFalsePositiveRate = this.dedupBloomFalsePositiveRate;
+    const expectedInsertions = opts.expectedInsertions ?? currentExpectedInsertions;
+    const falsePositiveRate = opts.falsePositiveRate ?? currentFalsePositiveRate;
+    // Re-affirming the current sizing is a no-op: no rebuild, no audit.
+    if (
+      expectedInsertions === currentExpectedInsertions &&
+      falsePositiveRate === currentFalsePositiveRate
+    ) {
+      return;
+    }
+    let resolved: ResolvedDedupBloomOptions;
+    try {
+      resolved = resolveDedupBloomOptions(
+        { expectedInsertions, falsePositiveRate },
+        this.idempotencyMaxEntries,
+        'setDedupBloom',
+      ) as ResolvedDedupBloomOptions;
+    } catch (err) {
+      if (err instanceof TypeError) {
+        throw new RangeError(err.message);
+      }
+      throw err;
+    }
+    // Fresh filter at the merged sizing, rebuilt from the live table —
+    // the map is authoritative, so no dedup decision is lost; only the
+    // pre-filter hit rate moves with the new sizing.
+    const rebuilt = new BloomFilter(resolved.expectedInsertions, resolved.falsePositiveRate);
+    rebuilt.rebuild(this.dedup.keys());
+    this.dedupBloom = rebuilt;
+    this.dedupBloomExpectedInsertions = resolved.expectedInsertions;
+    this.dedupBloomFalsePositiveRate = resolved.falsePositiveRate;
+    this.auditSubscription({
+      action: 'dedup_bloom_revised',
+      actor: 'system',
+      detail: {
+        expectedInsertions: resolved.expectedInsertions,
+        oldExpectedInsertions: currentExpectedInsertions,
+        falsePositiveRate: resolved.falsePositiveRate,
+        oldFalsePositiveRate: currentFalsePositiveRate,
       },
     });
   }

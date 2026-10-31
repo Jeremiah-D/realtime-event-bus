@@ -2584,7 +2584,16 @@ library.
   cannot delete, so a saturation guard rebuilds it from the live table
   once insertions pass 2x the sized capacity and exceed the live table
   size; a restart rebuilds it from the `__publish_dedup.jsonl` journal
-  (EB-66). `getStats().bloomStats` reports `{ enabled, insertions,
+  (EB-66). Retune live with `setDedupBloom({ expectedInsertions?,
+  falsePositiveRate? })` (EB-312): only the fields provided move, the
+  rest keep their live values, and the revision builds a fresh filter
+  at the merged sizing and rebuilds it from the live dedup table — the
+  map stays authoritative, so no dedup decision is lost and the
+  insertion count restarts from the live table size. Only a bus that
+  enabled `dedupBloom` can be revised (otherwise `RangeError`); illegal
+  values fail closed with the live filter untouched; an identical or
+  empty revision is a no-op with no audit. Audited as
+  `dedup_bloom_revised` (old and new sizing). `getStats().bloomStats` reports `{ enabled, insertions,
   estimatedFalsePositiveRate, bitSize, hashFunctions }`. Measured
   (`bench/bloom-dedup.bench.ts`, Node v24, `--expose-gc`): 100k 64-char
   messageIds retain 3.50 MiB as a `Map` vs ~19 KiB as a filter (~186x
