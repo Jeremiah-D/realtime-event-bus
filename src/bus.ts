@@ -54,6 +54,7 @@ import { TokenBucket } from './throttle.ts';
 import {
   GlobalPublishRateLimiter,
   resolveGlobalPublishRateLimit,
+  type GlobalPublishRateLimitRevision,
 } from './global-rate-limit.ts';
 import {
   computePayloadFingerprint,
@@ -21031,6 +21032,98 @@ export class EventBus {
       detail: {
         scenarios: scenarios.map((s) => canonicalChaosScenario(s)),
         oldScenarios: current.map((s) => canonicalChaosScenario(s)),
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level global publish rate limit live (EB-301)
+   * without restarting the bus: `setGlobalPublishRateLimit({
+   * messagesPerSecond?, burst? })` retunes the token bucket shared by
+   * every publish on the bus (see
+   * `EventBusOptions.globalPublishRateLimit`, EB-180).
+   *
+   * Only the fields provided move; the rest keep their live values. In
+   * particular a partial revision that only moves `messagesPerSecond`
+   * keeps the live `burst` — it is *not* recomputed from the new
+   * rate's default (`max(1, ceil(messagesPerSecond))`). The stored
+   * token budget is kept: a lowered `burst` clamps the banked tokens to
+   * the new burst, a raised `burst` does not top the bucket up, and
+   * the new rate applies from the next refill (see
+   * `TokenBucket.retune`, EB-266). The admission gates read the live
+   * limiter on every publish, so the new tuning governs from the next
+   * publish — including the `publishAtomic` shadow reservation, which
+   * peeks at the live `availableTokens`.
+   *
+   * Fail-closed: a bus that never enabled `globalPublishRateLimit`, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. Validation
+   * reuses the construction-time rule
+   * (`resolveGlobalPublishRateLimit`: the rate and the burst positive
+   * finite numbers) against the merged values, so a value that could
+   * not be set at construction cannot be revised in later either —
+   * and a failed call changes nothing at all: when only one field is
+   * provided only that field is validated and moved, and an illegal
+   * value in either field leaves every live value exactly as it was.
+   * A revision that provides neither field, and a revision identical
+   * to the current tuning, are both no-ops with no audit. Audited as
+   * `global_publish_rate_limit_revised` (`{ messagesPerSecond,
+   * oldMessagesPerSecond, burst, oldBurst }`).
+   *
+   * Orthogonal to EB-180 (that is the global rate-limit mechanism
+   * itself — this the limit tuning), and to EB-19 (that is the
+   * per-topic rate limit — this the bus-wide backstop).
+   *
+   * Throws `RangeError` when the global publish rate limit is not
+   * enabled, for a non-object revision, or for an illegal
+   * `messagesPerSecond` / `burst`.
+   */
+  setGlobalPublishRateLimit(opts: GlobalPublishRateLimitRevision): void {
+    const limiter = this.globalPublishRateLimiter;
+    if (limiter === undefined) {
+      throw new RangeError(
+        'setGlobalPublishRateLimit: globalPublishRateLimit is not enabled on this bus',
+      );
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGlobalPublishRateLimit: revision must be an object with messagesPerSecond and/or burst',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    // A partial revision keeps the live burst: it is never recomputed
+    // from the new rate's default.
+    const current = limiter.current();
+    const messagesPerSecond = opts.messagesPerSecond ?? current.messagesPerSecond;
+    const burst = opts.burst ?? current.burst;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (messagesPerSecond === current.messagesPerSecond && burst === current.burst) {
+      return;
+    }
+    const resolved = resolveGlobalPublishRateLimit(
+      { messagesPerSecond, burst },
+      'setGlobalPublishRateLimit',
+    );
+    if (resolved === undefined) {
+      throw new RangeError(
+        'setGlobalPublishRateLimit: globalPublishRateLimit is not enabled on this bus',
+      );
+    }
+    limiter.retune(resolved);
+    this.auditSubscription({
+      action: 'global_publish_rate_limit_revised',
+      actor: 'system',
+      detail: {
+        messagesPerSecond,
+        oldMessagesPerSecond: current.messagesPerSecond,
+        burst,
+        oldBurst: current.burst,
       },
     });
   }

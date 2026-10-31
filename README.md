@@ -1252,6 +1252,16 @@ library.
   `publishDelayed` draws global budget at due-time fan-out;
   `previewPublish` reports the gate without consuming budget. Absent (the
   default) means unlimited. Invalid values throw `RangeError` at construction.
+  Retune live with `setGlobalPublishRateLimit({ messagesPerSecond?,
+  burst? })` (EB-301): only the fields provided move, the rest keep their
+  live values — a rate-only revision keeps the live `burst` instead of
+  recomputing it from the new rate's default — and the stored token budget
+  is kept (a lowered burst clamps the banked tokens, a raised burst does
+  not top the bucket up, the new rate applies from the next refill). Only
+  a bus that enabled `globalPublishRateLimit` can be revised (otherwise
+  `RangeError`); illegal values fail closed with the live tuning
+  untouched; an identical or empty revision is a no-op with no audit.
+  Audited as `global_publish_rate_limit_revised` (old and new values).
 - **Per-topic subscriber caps** (in `src/bus.ts`, via
   `setTopicMaxSubscribers(pattern, maxSubscribers)`): a fail-fast guard
   against subscription storms — a runaway service subscribing in a loop, a
