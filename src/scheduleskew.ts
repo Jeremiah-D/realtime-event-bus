@@ -65,6 +65,34 @@ export interface ScheduleSkewOptions {
   onScheduleSkew?: (event: ScheduleSkewEvent) => void;
 }
 
+/**
+ * Revision for the bus-level schedule-skew tuning (see
+ * `EventBus.setScheduleSkew`, EB-303). Only the fields provided move;
+ * the rest keep their live values. `undefined` is not a value — a
+ * partial object keeps the fields it leaves out — so there is no way
+ * to unset the callback through this API: a bus that armed a callback
+ * keeps alerting until the callback is replaced by another one.
+ */
+export interface ScheduleSkewRevision {
+  /**
+   * How many of the most recent skew samples to keep. Must be a
+   * positive integer when provided — the construction-time rule.
+   */
+  windowSize?: number;
+  /**
+   * The skew alert threshold in milliseconds. Must be a non-negative
+   * finite number when provided — the construction-time rule.
+   */
+  alertThresholdMs?: number;
+  /**
+   * Fired once per sample whose skew exceeds `alertThresholdMs`. Must
+   * be a function when provided, and requires an alert threshold to
+   * be in force (provided here or already live) — the
+   * construction-time rule.
+   */
+  onScheduleSkew?: (event: ScheduleSkewEvent) => void;
+}
+
 /** One schedule-skew alert / audit observation. */
 export interface ScheduleSkewEvent {
   /**
@@ -115,13 +143,33 @@ function quantileRank(sorted: number[], q: number): number {
  */
 export class ScheduleSkewTracker {
   private readonly samples: number[] = [];
-  private readonly windowSize: number;
+  // Live-tuned by `retune` (EB-303): `record` reads this field on every
+  // call, so a revision governs from the next sample without draining
+  // or rebuilding the window — the samples are untouched by a retune.
+  private windowSize: number;
   private sumMs = 0;
 
   constructor(windowSize = 1024) {
     if (!Number.isInteger(windowSize) || windowSize <= 0) {
       throw new RangeError('windowSize must be a positive integer');
     }
+    this.windowSize = windowSize;
+  }
+
+  /** The live window bound, for bus-level revision (EB-303). */
+  current(): { windowSize: number } {
+    return { windowSize: this.windowSize };
+  }
+
+  /**
+   * Retunes the window bound live (EB-303). The caller must have
+   * validated `windowSize` through `resolveScheduleSkewOptions` first —
+   * this method applies unconditionally. The samples are untouched: a
+   * tightened window truncates the oldest samples down to the new
+   * bound at the next `record`, so the window converges to the new
+   * bound instead of staying oversized forever.
+   */
+  retune(windowSize: number): void {
     this.windowSize = windowSize;
   }
 

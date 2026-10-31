@@ -2795,7 +2795,17 @@ library.
   pause-shed/pause-buffered schedules never fan out and stay out of the
   distribution. Schedules rebuilt from the durable log sample exactly like
   live ones, and invalid options throw `RangeError`/`TypeError` from the
-  constructor. Opt-in same-tick fan-out priority (EB-219, via
+  constructor. Retune live with `bus.setScheduleSkew({ windowSize?,
+  alertThresholdMs?, onScheduleSkew? })` (EB-303): only the fields
+  provided move, the rest keep their live values — a tightened
+  `windowSize` truncates the oldest samples down to the new bound at
+  the next recorded sample, and a revised threshold / callback governs
+  from the next sweep's alert check; only a bus that already enabled
+  `scheduleSkew` can be revised (otherwise `RangeError`); illegal
+  values fail closed with the live tuning untouched; an identical or
+  empty revision is a no-op with no audit. Audited as
+  `schedule_skew_revised` (old and new values; the callback recorded
+  only as whether one is armed). Opt-in same-tick fan-out priority (EB-219, via
   `setDelayedTopicPriority(topicPattern, priority)`): when one sweep pass
   finds several schedules due at once, entries for higher-priority topics
   fan out first, so a burst of low-priority delayed traffic cannot starve

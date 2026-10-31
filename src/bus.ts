@@ -233,6 +233,7 @@ import {
   ScheduleSkewTracker,
   type ResolvedScheduleSkewOptions,
   type ScheduleSkewOptions,
+  type ScheduleSkewRevision,
   type ScheduleSkewSummaryStats,
 } from './scheduleskew.ts';
 import {
@@ -21221,6 +21222,111 @@ export class EventBus {
         oldBatchSize: current.batchSize,
         probeLimit,
         oldProbeLimit: current.probeLimit,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level schedule-skew observation tuning live (EB-303)
+   * without restarting the bus: `setScheduleSkew({ windowSize?,
+   * alertThresholdMs?, onScheduleSkew? })` retunes how many of the most
+   * recent delayed-schedule skew samples the bus keeps and when a
+   * sample is alert-worthy (see `EventBusOptions.scheduleSkew`,
+   * EB-136).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The samples are untouched: a tightened `windowSize` truncates the
+   * oldest samples down to the new bound at the next recorded sample,
+   * and a revised `alertThresholdMs` / `onScheduleSkew` governs from
+   * the next sweep's alert check — the sweep reads the live options on
+   * every fan-out, so a lowered threshold alerts on the next skew
+   * beyond it and a replaced callback fires from the next alert (the
+   * old callback never fires again). There is no way to unset the
+   * callback through this API: `undefined` is not a value, so a bus
+   * that armed a callback keeps alerting until the callback is
+   * replaced by another one.
+   *
+   * Fail-closed: a bus that never enabled `scheduleSkew`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the live
+   * tuning and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveScheduleSkewOptions`: the window a
+   * positive integer, the threshold a non-negative finite number, the
+   * callback a function that requires a threshold in force) against the
+   * merged values, so a value that could not be set at construction
+   * cannot be revised in later either — and a failed call changes
+   * nothing at all: when only one field is provided only that field is
+   * validated and moved, and an illegal value in any field leaves
+   * every live value exactly as it was. A revision that provides
+   * neither field, and a revision identical to the current tuning, are
+   * both no-ops with no audit. Audited as `schedule_skew_revised`
+   * (`{ windowSize, oldWindowSize, alertThresholdMs,
+   * oldAlertThresholdMs, hasOnScheduleSkew, oldHasOnScheduleSkew }` —
+   * the callback itself is a function, so the audit records only
+   * whether one is armed).
+   *
+   * Orthogonal to EB-296 (that retunes tail sampling — this the
+   * schedule-skew observation), and to EB-298/EB-299/EB-300/EB-301/
+   * EB-302 (those retune other bus-level parameters — this the
+   * schedule-skew tuning).
+   *
+   * Throws `RangeError` when schedule-skew sampling is not enabled,
+   * for a non-object revision, or for an illegal `windowSize` /
+   * `alertThresholdMs` / `onScheduleSkew`.
+   */
+  setScheduleSkew(opts: ScheduleSkewRevision): void {
+    const state = this.scheduleSkew;
+    if (state === undefined) {
+      throw new RangeError('setScheduleSkew: scheduleSkew is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setScheduleSkew: revision must be an object with windowSize and/or alertThresholdMs and/or onScheduleSkew',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = {
+      windowSize: state.tracker.current().windowSize,
+      alertThresholdMs: state.options.alertThresholdMs,
+      onScheduleSkew: state.options.onScheduleSkew,
+    };
+    const windowSize = opts.windowSize ?? current.windowSize;
+    const alertThresholdMs = opts.alertThresholdMs ?? current.alertThresholdMs;
+    const onScheduleSkew = opts.onScheduleSkew ?? current.onScheduleSkew;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      windowSize === current.windowSize &&
+      alertThresholdMs === current.alertThresholdMs &&
+      onScheduleSkew === current.onScheduleSkew
+    ) {
+      return;
+    }
+    // The resolver reports a non-function callback as a TypeError; the
+    // revision contract is RangeError for every illegal value.
+    if (onScheduleSkew !== undefined && typeof onScheduleSkew !== 'function') {
+      throw new RangeError('setScheduleSkew: onScheduleSkew must be a function');
+    }
+    const resolved = resolveScheduleSkewOptions({ windowSize, alertThresholdMs, onScheduleSkew });
+    if (resolved === undefined) {
+      throw new RangeError('setScheduleSkew: scheduleSkew is not enabled on this bus');
+    }
+    state.tracker.retune(resolved.windowSize);
+    state.options = resolved;
+    this.auditSubscription({
+      action: 'schedule_skew_revised',
+      actor: 'system',
+      detail: {
+        windowSize,
+        oldWindowSize: current.windowSize,
+        alertThresholdMs,
+        oldAlertThresholdMs: current.alertThresholdMs,
+        hasOnScheduleSkew: onScheduleSkew !== undefined,
+        oldHasOnScheduleSkew: current.onScheduleSkew !== undefined,
       },
     });
   }
