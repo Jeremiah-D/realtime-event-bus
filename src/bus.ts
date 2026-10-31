@@ -317,6 +317,7 @@ import {
 import {
   CepEngine,
   type SequencePatternOptions,
+  type SequencePatternRevision,
   type SequenceMatchEvent,
   type CepStats,
 } from './cep.ts';
@@ -19315,6 +19316,76 @@ export class EventBus {
    */
   clearSequence(patternId: string): boolean {
     return this.cep?.clear(patternId) ?? false;
+  }
+
+  /**
+   * Revises one defined sequence pattern's window and partial bound
+   * (EB-297) without redefining it:
+   * `updateCepSequencePattern(id, { withinMs?, maxPartialMatches? })`
+   * retunes how long a partial may take to complete and how many live
+   * partials the pattern may hold (see `defineSequence`, EB-170).
+   *
+   * Only `withinMs` / `maxPartialMatches` move: the steps, the
+   * correlation key, and the pattern id are immutable — changing the
+   * pattern definition itself requires `clearSequence` + `defineSequence`.
+   * Only the fields provided move; the rest keep their live values. The
+   * new values govern from the next observation: shrinking `withinMs`
+   * expires in-flight partials on the next observation (the lazy sweep
+   * reads the live window before every message), widening it extends
+   * their life, and tightening `maxPartialMatches` evicts the oldest
+   * partials on the next new partial. An absence step without an
+   * explicit `absenceMs` follows the live `withinMs` from the next
+   * arming, and an armed deadline re-checks the live window on fire —
+   * so a partial that outlived a shrunken window while the bus was idle
+   * is dropped instead of deriving a stale absence.
+   *
+   * Fail-closed: a bus with no patterns defined, an unknown pattern id,
+   * a non-object revision, and an illegal value all throw `RangeError`
+   * with the live values and the audit log untouched. Validation reuses
+   * the define-time rule (`withinMs` a positive finite number,
+   * `maxPartialMatches` a positive integer) against the merged values,
+   * so a value that could not be defined cannot be revised in later
+   * either — and a failed call changes nothing at all: when only one
+   * field is provided only that field is validated and moved, and an
+   * illegal value in either field leaves both live values exactly as
+   * they were. A revision that provides neither field, and a revision
+   * identical to the current values, are both no-ops with no audit.
+   * Audited as `cep_sequence_pattern_revised` (the `pattern` field
+   * carries the pattern id; `{ withinMs, oldWithinMs,
+   * maxPartialMatches, oldMaxPartialMatches }`).
+   *
+   * Orthogonal to EB-170 (that is the sequence detection mechanism
+   * itself — the pattern, the partials, the match — this its window /
+   * bound revision), and to EB-174 (that is the absence semantics —
+   * this the window / bound revision).
+   *
+   * Throws `RangeError` when no patterns are defined, for an unknown
+   * pattern id, for a non-object revision, or for an illegal `withinMs`
+   * / `maxPartialMatches`.
+   */
+  updateCepSequencePattern(patternId: string, opts: SequencePatternRevision): void {
+    if (typeof patternId !== 'string' || patternId.length === 0) {
+      throw new RangeError('updateCepSequencePattern: patternId must be a non-empty string');
+    }
+    const cep = this.cep;
+    if (cep === undefined) {
+      throw new RangeError('updateCepSequencePattern: no sequence patterns are defined on this bus');
+    }
+    const result = cep.update(patternId, opts);
+    if (!result.changed) {
+      return;
+    }
+    this.auditSubscription({
+      action: 'cep_sequence_pattern_revised',
+      actor: 'system',
+      pattern: patternId,
+      detail: {
+        withinMs: result.withinMs,
+        oldWithinMs: result.oldWithinMs,
+        maxPartialMatches: result.maxPartialMatches,
+        oldMaxPartialMatches: result.oldMaxPartialMatches,
+      },
+    });
   }
 
   /**

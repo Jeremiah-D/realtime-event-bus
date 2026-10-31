@@ -8202,6 +8202,18 @@ Semantics notes:
   derived topic stays one dot-segment) or a duplicate id throw `RangeError`
   before anything is registered. `clearSequence(id)` removes a pattern,
   drops its partials, and disarms pending absence deadlines.
+- Retune live with `updateCepSequencePattern(id, { withinMs?,
+  maxPartialMatches? })` (EB-297): only the fields provided move, the
+  steps / correlation key / id are immutable, and the new values govern
+  from the next observation — shrinking `withinMs` expires in-flight
+  partials on the next observation's lazy sweep, widening it extends
+  their life, and tightening `maxPartialMatches` evicts the oldest
+  partials on the next new partial. An absence step without an explicit
+  `absenceMs` follows the live `withinMs` from the next arming. Unknown
+  ids and illegal values throw `RangeError` with the live values
+  untouched; an identical or empty revision is a no-op with no audit.
+  Audited as `cep_sequence_pattern_revised` (the `pattern` field carries
+  the pattern id; old and new values in `detail`).
 - `getStats().cep` → `{ activePatterns, partialMatches, matches,
   absencePatterns, absenceMatches }` (present once a pattern was
   defined; the engine persists for the bus's lifetime, so clearing every

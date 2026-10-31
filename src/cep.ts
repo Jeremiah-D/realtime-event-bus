@@ -102,6 +102,27 @@ export interface SequencePatternOptions {
   maxPartialMatches?: number;
 }
 
+/**
+ * Revision for one defined sequence pattern (see
+ * `EventBus.updateCepSequencePattern`, EB-297). Only the fields provided
+ * move; the rest keep their live values. The steps, the correlation key,
+ * and the pattern id are immutable — changing the pattern definition
+ * itself requires `clear` + `define`.
+ */
+export interface SequencePatternRevision {
+  /**
+   * Maximum span in milliseconds between the first and last matched
+   * event. Must be a positive finite number when provided — the
+   * define-time rule.
+   */
+  withinMs?: number;
+  /**
+   * Bound on live partial matches for this pattern. Must be a positive
+   * integer when provided — the define-time rule.
+   */
+  maxPartialMatches?: number;
+}
+
 /** One event that completed a sequence step, carried on the match. */
 export interface CepMatchedEvent {
   /** The alias-resolved concrete topic the message was published to. */
@@ -340,6 +361,92 @@ export class CepEngine {
       for (const partial of partials) this.killPartial(pattern, partial);
     }
     return this.patterns.delete(patternId);
+  }
+
+  /**
+   * Revises one defined pattern's window and partial bound (EB-297):
+   * only `withinMs` / `maxPartialMatches` move — the steps, the
+   * correlation key, and the pattern id are immutable. The new values
+   * govern from the next observation: `observe` sweeps expired partials
+   * against the live `withinMs` before every message (shrinking the
+   * window expires in-flight partials on the next observation, widening
+   * it extends their life), `startPartial` evicts against the live
+   * `maxPartialMatches` (tightening it evicts the oldest partials on
+   * the next new partial), and an armed absence deadline re-checks the
+   * live `withinMs` on fire — an absence step without an explicit
+   * `absenceMs` follows the live window from the next arming. In-flight
+   * partials are untouched by the revision itself: already-recorded
+   * events, timers, and absence records stay as they are.
+   *
+   * Returns whether anything moved, with the old and new values for the
+   * audit record. A patch that provides neither field, and a patch
+   * identical to the current values, both report `changed: false`.
+   * Throws `RangeError` for an unknown pattern id, a non-object patch,
+   * or an illegal value — the define-time rule for the two fields
+   * (`withinMs` a positive finite number, `maxPartialMatches` a
+   * positive integer) — and a failed call leaves the live values
+   * untouched.
+   */
+  update(
+    patternId: string,
+    patch: SequencePatternRevision,
+  ): {
+    changed: boolean;
+    withinMs: number;
+    oldWithinMs: number;
+    maxPartialMatches: number;
+    oldMaxPartialMatches: number;
+  } {
+    const pattern = this.patterns.get(patternId);
+    if (pattern === undefined) {
+      throw new RangeError(`sequence pattern "${patternId}" is not defined`);
+    }
+    // An absent patch asks nothing to move.
+    if (patch == null) {
+      return {
+        changed: false,
+        withinMs: pattern.withinMs,
+        oldWithinMs: pattern.withinMs,
+        maxPartialMatches: pattern.maxPartialMatches,
+        oldMaxPartialMatches: pattern.maxPartialMatches,
+      };
+    }
+    if (typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError('sequence pattern revision must be an object with withinMs and/or maxPartialMatches');
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial patch keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const withinMs = patch.withinMs ?? pattern.withinMs;
+    const maxPartialMatches = patch.maxPartialMatches ?? pattern.maxPartialMatches;
+    // Re-affirming the current values is a no-op: no change, no audit.
+    if (withinMs === pattern.withinMs && maxPartialMatches === pattern.maxPartialMatches) {
+      return {
+        changed: false,
+        withinMs,
+        oldWithinMs: pattern.withinMs,
+        maxPartialMatches,
+        oldMaxPartialMatches: pattern.maxPartialMatches,
+      };
+    }
+    if (typeof withinMs !== 'number' || !Number.isFinite(withinMs) || withinMs <= 0) {
+      throw new RangeError('withinMs must be a positive finite number of milliseconds');
+    }
+    if (
+      typeof maxPartialMatches !== 'number' ||
+      !Number.isInteger(maxPartialMatches) ||
+      maxPartialMatches <= 0
+    ) {
+      throw new RangeError('maxPartialMatches must be a positive integer');
+    }
+    const oldWithinMs = pattern.withinMs;
+    const oldMaxPartialMatches = pattern.maxPartialMatches;
+    // Only the window and the bound move; the compiled steps, the key
+    // extractor, and the live partials are untouched, and every
+    // observation reads the live values from here on.
+    pattern.withinMs = withinMs;
+    pattern.maxPartialMatches = maxPartialMatches;
+    return { changed: true, withinMs, oldWithinMs, maxPartialMatches, oldMaxPartialMatches };
   }
 
   /** Pattern ids in definition order. */
