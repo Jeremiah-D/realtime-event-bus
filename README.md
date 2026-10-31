@@ -2578,7 +2578,26 @@ library.
   `__dedup.jsonl` — a restarted bus rehydrates it, so crash recovery cannot
   double-deliver on resume. Suppressions are counted in
   `getStats().dedupDropped` (per topic and global) and exported as
-  `eventbus_dedup_dropped_messages_total`.
+  `eventbus_dedup_dropped_messages_total`. The window is revisable
+  without re-subscribing (EB-295, via
+  `setDeduplicateMessages(subId, { windowMs?, maxEntries? })`): only a
+  subscription that opted into `deduplicateMessages` can be retuned — a
+  never-opted-in subscription throws `RangeError`, as does any value
+  that fails the subscribe-time rule (`windowMs` a positive finite
+  number, `maxEntries` a positive integer); only the fields provided
+  move, and an illegal value leaves both live values untouched. Only
+  the window and the bound move: the `consumerId` and the recorded
+  `(topic, messageId)` table are untouched — entries already seen stay
+  seen — and the new values govern from the next arrival, which reads
+  the live values: shrinking the window clears entries already past
+  the new horizon on the next arrival, widening it extends every
+  recorded entry, and tightening `maxEntries` evicts the oldest
+  entries down to the new bound on the next arrival. A revision that
+  provides neither field, and one identical to the current window, are
+  no-ops with no audit. Every success is audited as
+  `deduplicate_messages_revised`
+  (`{ windowMs: <number>, oldWindowMs: <number>, maxEntries: <number>, oldMaxEntries: <number> }`).
+  (Real-time systems: dedup window governance.)
 - **Per-key publish-order delivery** (in `src/bus.ts`, via
   `publish(topic, payload, { key })` — also on batch/atomic/delayed/idempotent
   publishes): every keyed message carries a per-key sequence number assigned
@@ -3467,6 +3486,15 @@ npm test
   depth audited and carried by the next engagement, repairing an EB-289 inverted hysteresis band,
   lowering the depth keeping an engaged mitigation engaged until a partial drain, raising it
   releasing sooner, and `recoverDepth` 0 meaning no automatic release.
+- `test/deduplicate-messages-revision.test.ts` — subscriber dedup window revision (EB-295):
+  `setDeduplicateMessages` fail-closed preconditions (unknown / empty / non-dedup subscriber,
+  non-object revision, invalid `windowMs` / `maxEntries`, one illegal field vetoing the whole
+  revision) with the live window and the audit log untouched, shrinking the window expiring
+  entries past the new horizon on the next arrival, widening it extending recorded entries,
+  tightening `maxEntries` evicting the oldest entries on the next arrival, partial revisions
+  moving only the provided field, re-affirming the current window or revising nothing as a
+  no-op with no audit, and a revision keeping the `consumerId` and the recorded entries (the
+  durable `__dedup.jsonl` journal keeps writing under the same identity).
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output

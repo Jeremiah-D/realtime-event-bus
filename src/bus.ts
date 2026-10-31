@@ -1318,6 +1318,29 @@ export interface DeduplicateMessagesOptions {
 }
 
 /**
+ * Revision for one dedup-enabled subscriber's exactly-once window
+ * (see `EventBus.setDeduplicateMessages`, EB-295). Only the fields
+ * provided move; the rest keep their live values. `consumerId` is
+ * not revisable here — it is the subscriber's durable identity, and
+ * the recorded `(topic, messageId)` table is never rebuilt by a
+ * revision.
+ */
+export interface DeduplicateMessagesRevision {
+  /**
+   * How long a delivered `messageId` stays in the window, in
+   * milliseconds on the bus clock. Must be a positive finite number
+   * when provided — the subscribe-time rule.
+   */
+  windowMs?: number;
+  /**
+   * Maximum `(topic, messageId)` entries held per subscriber; the
+   * oldest entry is evicted when full. Must be a positive integer
+   * when provided — the subscribe-time rule.
+   */
+  maxEntries?: number;
+}
+
+/**
  * Tuning for opt-in causal (happens-before) delivery (see
  * `SubscribeOptions.causal`).
  */
@@ -25856,6 +25879,112 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { thresholdDepth, oldThresholdDepth },
+    });
+  }
+
+  /**
+   * Revises one dedup-enabled subscriber's exactly-once window
+   * (EB-295) without re-subscribing:
+   * `setDeduplicateMessages(subId, { windowMs?, maxEntries? })`
+   * retunes how long a delivered `messageId` stays remembered and
+   * how many identities the window holds (see
+   * `SubscribeOptions.deduplicateMessages`, EB-70).
+   *
+   * Only `dedup.windowMs` / `dedup.maxEntries` move: the
+   * `consumerId` and the recorded `(topic, messageId)` table are
+   * untouched — entries already seen stay seen, and a durable
+   * `consumerId` keeps journaling under the same identity. Only the
+   * fields provided move; the rest keep their live values.
+   * `checkSubscriberDedup` reads the live values on every arrival,
+   * so the new window and bound govern from the next arrival with
+   * no drain, re-registration, or replay: shrinking the window
+   * clears entries already past the new horizon on the next
+   * arrival's expiry scan (the insertion-ordered table is swept
+   * from the head until the first unexpired entry), widening it
+   * extends every recorded entry to the new horizon, and tightening
+   * `maxEntries` evicts the oldest entries down to the new bound
+   * on the next arrival's bounded-eviction loop.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that
+   * never opted into `deduplicateMessages`, a non-object revision,
+   * and an illegal value all throw `RangeError` with the live
+   * window, the table, and the audit log untouched. Validation
+   * reuses the subscribe-time rule (`resolveDeduplicateMessagesOptions`:
+   * `windowMs` a positive finite number, `maxEntries` a positive
+   * integer) against the merged values, so a value that could not
+   * be set at subscribe time cannot be revised in later either —
+   * and a failed call changes nothing at all: when only one field
+   * is provided only that field is validated and moved, and an
+   * illegal value in either field leaves both live values exactly
+   * as they were. A revision that provides neither field, and a
+   * revision identical to the current window, are both no-ops with
+   * no audit. Audited as `deduplicate_messages_revised`
+   * (`{ windowMs: <number>, oldWindowMs: <number>, maxEntries:
+   * <number>, oldMaxEntries: <number> }`).
+   *
+   * Orthogonal to EB-70 (that is the dedup mechanism itself — the
+   * window, the suppression, the journal — this its window/bound
+   * revision), and to EB-279 (that retunes the ack-sampling
+   * window, this the dedup window).
+   *
+   * Throws `RangeError` for an unknown subscriber, a subscriber
+   * without dedup enabled, a non-object revision, or an illegal
+   * `windowMs` / `maxEntries`.
+   */
+  setDeduplicateMessages(subId: string, opts: DeduplicateMessagesRevision): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeduplicateMessages: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeduplicateMessages: unknown subscriber: ${subId}`);
+    }
+    const dedup = subscriber.dedup;
+    if (dedup === undefined) {
+      throw new RangeError('setDeduplicateMessages: subscriber has no deduplicateMessages enabled');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setDeduplicateMessages: revision must be an object with windowMs and/or maxEntries');
+    }
+    // Validate before touching anything: `undefined` is not a value —
+    // a partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const windowMs = opts.windowMs ?? dedup.windowMs;
+    const maxEntries = opts.maxEntries ?? dedup.maxEntries;
+    // Re-affirming the current window is a no-op: no swap, no audit.
+    if (windowMs === dedup.windowMs && maxEntries === dedup.maxEntries) {
+      return;
+    }
+    try {
+      const resolved = resolveDeduplicateMessagesOptions(
+        { windowMs, maxEntries },
+        this.idempotencyWindowMs,
+        this.durableLog != null,
+      );
+      if (resolved === undefined) {
+        throw new RangeError('setDeduplicateMessages: revision must be an object with windowMs and/or maxEntries');
+      }
+    } catch (err) {
+      if (err instanceof RangeError) throw err;
+      throw new RangeError(`setDeduplicateMessages: ${(err as Error).message}`);
+    }
+    const oldWindowMs = dedup.windowMs;
+    const oldMaxEntries = dedup.maxEntries;
+    // Only the window and the bound move; the consumerId and the
+    // recorded table are untouched, and every arrival reads the live
+    // values from here on.
+    dedup.windowMs = windowMs;
+    dedup.maxEntries = maxEntries;
+    this.auditSubscription({
+      action: 'deduplicate_messages_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { windowMs, oldWindowMs, maxEntries, oldMaxEntries },
     });
   }
 
