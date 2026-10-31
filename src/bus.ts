@@ -260,6 +260,7 @@ import {
 import {
   OpsAlerter,
   resolveOpsAlerterOptions,
+  type OpsAlertRevision,
   type OpsAlertStats,
 } from './ops-alert.ts';
 import {
@@ -21662,6 +21663,115 @@ export class EventBus {
         oldMaxActions,
         dryRun,
         oldDryRun,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level ops-alert tuning live (EB-307) without
+   * restarting the bus: `setOpsAlert({ dedupWindowMs?, maxAttempts?,
+   * retryBaseMs?, gatewayDisconnectThreshold?,
+   * gatewayDisconnectWindowMs? })` retunes how the ops outlet
+   * collapses bursts, retries deliveries, and declares gateway
+   * disconnect storms (see `EventBusOptions.opsAlert`, EB-132).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * `sink` / `secret` / `keyId` / `busId` are not revisable here —
+   * they are the delivery destination and the signing identity fixed
+   * at construction — and neither is the `now` clock. In-flight state
+   * is untouched: the dedup table keeps its entries and the in-flight
+   * disconnect times keep theirs, so the new values govern from the
+   * next note onward — the next dedup check reads the live window
+   * (shrinking it un-suppresses a (kind, key) whose last alert is
+   * already past the new horizon), the next disconnect note truncates
+   * at the live storm window and trips at the live threshold, and the
+   * next delivery attempt budgets at the live maxAttempts and backs
+   * off at the live retryBaseMs (a backoff timer already armed keeps
+   * the delay it was armed with).
+   *
+   * Fail-closed: a bus that never enabled `opsAlert`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the live
+   * tuning and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveOpsAlerterOptions`: the windows
+   * and the backoff base positive finite numbers, the attempts and the
+   * threshold positive integers) against the merged values, so a value
+   * that could not be set at construction cannot be revised in later
+   * either — and a failed call changes nothing at all: when only one
+   * field is provided only that field is validated and moved, and an
+   * illegal value in any field leaves every live value exactly as it
+   * was. A revision that provides neither field, and a revision
+   * identical to the current tuning, are both no-ops with no audit.
+   * Audited as `ops_alert_revised` (`{ dedupWindowMs,
+   * oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs,
+   * oldRetryBaseMs, gatewayDisconnectThreshold,
+   * oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs,
+   * oldGatewayDisconnectWindowMs }`).
+   *
+   * Orthogonal to EB-132 (that is the alert outlet mechanism itself —
+   * this the outlet's tuning), and to EB-296 (that retunes tail
+   * sampling — this the ops alerts).
+   *
+   * Throws `RangeError` when ops alerts are not enabled, for a
+   * non-object revision, or for an illegal `dedupWindowMs` /
+   * `maxAttempts` / `retryBaseMs` / `gatewayDisconnectThreshold` /
+   * `gatewayDisconnectWindowMs`.
+   */
+  setOpsAlert(opts: OpsAlertRevision): void {
+    const alerter = this.opsAlerter;
+    if (alerter === undefined) {
+      throw new RangeError('setOpsAlert: opsAlert is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setOpsAlert: revision must be an object with dedupWindowMs and/or maxAttempts and/or retryBaseMs and/or gatewayDisconnectThreshold and/or gatewayDisconnectWindowMs',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = alerter.current();
+    const dedupWindowMs = opts.dedupWindowMs ?? current.dedupWindowMs;
+    const maxAttempts = opts.maxAttempts ?? current.maxAttempts;
+    const retryBaseMs = opts.retryBaseMs ?? current.retryBaseMs;
+    const gatewayDisconnectThreshold =
+      opts.gatewayDisconnectThreshold ?? current.gatewayDisconnectThreshold;
+    const gatewayDisconnectWindowMs =
+      opts.gatewayDisconnectWindowMs ?? current.gatewayDisconnectWindowMs;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      dedupWindowMs === current.dedupWindowMs &&
+      maxAttempts === current.maxAttempts &&
+      retryBaseMs === current.retryBaseMs &&
+      gatewayDisconnectThreshold === current.gatewayDisconnectThreshold &&
+      gatewayDisconnectWindowMs === current.gatewayDisconnectWindowMs
+    ) {
+      return;
+    }
+    alerter.retune({
+      dedupWindowMs,
+      maxAttempts,
+      retryBaseMs,
+      gatewayDisconnectThreshold,
+      gatewayDisconnectWindowMs,
+    });
+    this.auditSubscription({
+      action: 'ops_alert_revised',
+      actor: 'system',
+      detail: {
+        dedupWindowMs,
+        oldDedupWindowMs: current.dedupWindowMs,
+        maxAttempts,
+        oldMaxAttempts: current.maxAttempts,
+        retryBaseMs,
+        oldRetryBaseMs: current.retryBaseMs,
+        gatewayDisconnectThreshold,
+        oldGatewayDisconnectThreshold: current.gatewayDisconnectThreshold,
+        gatewayDisconnectWindowMs,
+        oldGatewayDisconnectWindowMs: current.gatewayDisconnectWindowMs,
       },
     });
   }

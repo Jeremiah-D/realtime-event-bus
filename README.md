@@ -6308,6 +6308,25 @@ Semantics:
   zero behavior change. `getStats().opsAlert` reports
   `{ sent, failed, suppressed }`.
 
+`bus.setOpsAlert({ dedupWindowMs?, maxAttempts?, retryBaseMs?,
+gatewayDisconnectThreshold?, gatewayDisconnectWindowMs? })` (EB-307)
+retunes that outlet live without restarting the bus — only a bus that
+already enabled the opt-in can be revised, and only the fields
+provided move (the `sink` / `secret` / `keyId` / `busId` and the `now`
+clock are not revisable). In-flight state is untouched: the dedup
+table and the in-flight disconnect times keep their entries, so the
+new values govern from the next note onward — the next dedup check
+reads the live window, the next disconnect note truncates at the live
+storm window and trips at the live threshold, and the next delivery
+attempt budgets at the live `maxAttempts` and backs off at the live
+`retryBaseMs`. Illegal values throw `RangeError` with the live tuning
+untouched, and an identical (or empty) revision is a no-op with no
+audit. Audited as `ops_alert_revised` (`{ dedupWindowMs,
+oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs,
+oldRetryBaseMs, gatewayDisconnectThreshold,
+oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs,
+oldGatewayDisconnectWindowMs }`).
+
 ## Manual subscriber pause/resume (EB-113)
 
 `bus.pauseSubscriber(subId, { reason? })` / `bus.resumeSubscriber(subId)`

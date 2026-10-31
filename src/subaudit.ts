@@ -163,7 +163,8 @@ export type SubscriptionAuditAction =
   | 'auto_remediate_linger_pruned'
   | 'auto_remediate_rebalance'
   | 'auto_remediate_run'
-  | 'auto_remediate_revised';
+  | 'auto_remediate_revised'
+  | 'ops_alert_revised';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -222,6 +223,7 @@ export type SubscriptionAuditAction =
  *   effect on the next run; a revision that provides neither field, and
  *   a revision identical to the current schedule, are both no-ops with
  *   no audit)
+ * - `ops_alert_revised`: `{ dedupWindowMs, oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs, oldRetryBaseMs, gatewayDisconnectThreshold, oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs, oldGatewayDisconnectWindowMs }` — the bus-level ops-alert tuning was revised (EB-307; only a bus that already enabled `opsAlert` can be revised — a never-enabled bus refuses until the outlet is opted into at construction, since it holds no alerter at all; the new values reuse the construction-time validation (`resolveOpsAlerterOptions`: the windows and the backoff base positive finite numbers, the attempts and the threshold positive integers), so a failed call leaves the live tuning untouched, and only the fields provided move — a partial revision keeps the fields it leaves out, and an illegal value in any field leaves every live value exactly as it was; only the five numeric bounds move — the `sink` / `secret` / `keyId` / `busId` are untouched, and neither is the `now` clock — and in-flight state is untouched, so the new values govern from the next note onward — the next dedup check reads the live window, the next disconnect note truncates at the live storm window and trips at the live threshold, and the next delivery attempt budgets at the live maxAttempts and backs off at the live retryBaseMs (a backoff timer already armed keeps the delay it was armed with); a revision that provides neither field, and a revision identical to the current tuning, are both no-ops with no audit)
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -507,6 +509,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'auto_remediate_rebalance',
   'auto_remediate_run',
   'auto_remediate_revised',
+  'ops_alert_revised',
   'dead_letter_replay_requested',
   'dead_letter_replay_approved',
   'dead_letter_replay_rejected',

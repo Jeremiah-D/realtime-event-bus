@@ -180,8 +180,58 @@ export interface OpsAlerterOptions {
   gatewayDisconnectWindowMs?: number;
 }
 
-/** Validates options the way `EventBus` would: throws `RangeError` first. */
-export function resolveOpsAlerterOptions(
+/**
+ * A partial bus-level revision of the ops-alert tuning, for
+ * `EventBus.setOpsAlert` (EB-307). Only the fields provided move; the
+ * rest keep their live values. `sink` / `secret` / `keyId` / `busId`
+ * are not revisable here — they are the delivery destination and the
+ * signing identity fixed at construction — and neither is the `now`
+ * clock.
+ */
+export interface OpsAlertRevision {
+  /**
+   * Burst-collapse window per (kind, key). Must be a positive finite
+   * number when provided — the construction-time rule.
+   */
+  dedupWindowMs?: number;
+  /**
+   * Max delivery attempts per alert, including the first. Must be a
+   * positive integer when provided — the construction-time rule.
+   */
+  maxAttempts?: number;
+  /**
+   * Base backoff between attempts; doubled per attempt, capped at 30s.
+   * Must be a positive finite number when provided — the
+   * construction-time rule.
+   */
+  retryBaseMs?: number;
+  /**
+   * Disconnects inside the window that declare a storm. Must be a
+   * positive integer when provided — the construction-time rule.
+   */
+  gatewayDisconnectThreshold?: number;
+  /**
+   * Sliding window for the disconnect-storm detector. Must be a
+   * positive finite number when provided — the construction-time rule.
+   */
+  gatewayDisconnectWindowMs?: number;
+}
+
+/** The five numeric bounds of the ops-alert tuning, in resolved form. */
+export interface OpsAlertTuning {
+  /** Burst-collapse window per (kind, key). */
+  dedupWindowMs: number;
+  /** Max delivery attempts per alert, including the first. */
+  maxAttempts: number;
+  /** Base backoff between attempts; doubled per attempt, capped at 30s. */
+  retryBaseMs: number;
+  /** Disconnects inside the window that declare a storm. */
+  gatewayDisconnectThreshold: number;
+  /** Sliding window for the disconnect-storm detector. */
+  gatewayDisconnectWindowMs: number;
+}
+
+/** Validates options the way `EventBus` would: throws `RangeError` first. */export function resolveOpsAlerterOptions(
   options: OpsAlerterOptions,
   where: string,
 ): Required<
@@ -276,11 +326,16 @@ export class OpsAlerter {
   private readonly keyId: string | undefined;
   private readonly busId: string;
   private readonly now: () => number;
-  private readonly dedupWindowMs: number;
-  private readonly maxAttempts: number;
-  private readonly retryBaseMs: number;
-  private readonly stormThreshold: number;
-  private readonly stormWindowMs: number;
+  // Live-tuned by `retune` (EB-307): the dedup, storm, and retry sites
+  // read these fields on every call, so a revision governs from the
+  // next note without draining or rebuilding any alert. `sink`,
+  // `secret`, `keyId`, `busId`, and `now` stay fixed for the alerter's
+  // lifetime.
+  private dedupWindowMs: number;
+  private maxAttempts: number;
+  private retryBaseMs: number;
+  private stormThreshold: number;
+  private stormWindowMs: number;
   /** Last alert time per `kind\0key` — the dedup window state. */
   private readonly lastAlertAt = new Map<string, number>();
   /** Recent gateway-disconnect timestamps — the storm detector's window. */
@@ -308,6 +363,56 @@ export class OpsAlerter {
   /** Counter snapshot — mutating it changes nothing. */
   getStats(): OpsAlertStats {
     return { sent: this.sent, failed: this.failed, suppressed: this.suppressed };
+  }
+
+  /** The five live tuning values, for bus-level revision (EB-307). */
+  current(): OpsAlertTuning {
+    return {
+      dedupWindowMs: this.dedupWindowMs,
+      maxAttempts: this.maxAttempts,
+      retryBaseMs: this.retryBaseMs,
+      gatewayDisconnectThreshold: this.stormThreshold,
+      gatewayDisconnectWindowMs: this.stormWindowMs,
+    };
+  }
+
+  /**
+   * Retunes the five numeric bounds live (EB-307). The caller passes
+   * the merged values (current values with the revision applied); this
+   * method re-validates them through `resolveOpsAlerterOptions`
+   * against the alerter's own sink/secret/busId/now — the signing
+   * identity never leaves the alerter — and applies them only when
+   * valid, so a failed call leaves every live value untouched.
+   * In-flight state is untouched: the dedup table and the in-flight
+   * disconnect times keep their entries, so the new values govern from
+   * the next note onward — the next dedup check reads the live window,
+   * the next disconnect note truncates at the live storm window and
+   * trips at the live threshold, and the next delivery attempt budgets
+   * at the live maxAttempts and backs off at the live retryBaseMs.
+   * (A backoff timer already armed keeps the delay it was armed with;
+   * only the next retry schedules at the new base.)
+   */
+  retune(next: OpsAlertTuning): void {
+    const resolved = resolveOpsAlerterOptions(
+      {
+        sink: this.sink,
+        secret: this.secret,
+        keyId: this.keyId,
+        busId: this.busId,
+        now: this.now,
+        dedupWindowMs: next.dedupWindowMs,
+        maxAttempts: next.maxAttempts,
+        retryBaseMs: next.retryBaseMs,
+        gatewayDisconnectThreshold: next.gatewayDisconnectThreshold,
+        gatewayDisconnectWindowMs: next.gatewayDisconnectWindowMs,
+      },
+      'OpsAlerter.retune',
+    );
+    this.dedupWindowMs = resolved.dedupWindowMs;
+    this.maxAttempts = resolved.maxAttempts;
+    this.retryBaseMs = resolved.retryBaseMs;
+    this.stormThreshold = resolved.gatewayDisconnectThreshold;
+    this.stormWindowMs = resolved.gatewayDisconnectWindowMs;
   }
 
   /**
