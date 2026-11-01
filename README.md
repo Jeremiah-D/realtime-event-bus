@@ -4804,6 +4804,18 @@ Details:
   filters the bounded in-memory index (default 1000 entries, oldest
   evicted; `subscriptionAuditMaxEntries` tunes it). `since` is inclusive,
   `until` exclusive, `limit` keeps the most recent matches, oldest first.
+- **Retune the bound live.** `setSubscriptionAudit({ maxEntries })`
+  (EB-321) revises the in-memory retention bound without restarting the
+  bus: only the bound moves, the audit chain itself is untouched, and
+  the entries already recorded are retained — the revision event is
+  itself appended to the same log under the new bound, so a shrink is
+  already reflected when the call returns (the revision event evicts
+  the oldest rows down to the new bound) while a widened bound simply
+  retains more. Evicted rows only leave the in-memory view (the
+  on-disk files are never rewritten) and the hash chain stays valid.
+  Illegal values fail closed with the live bound untouched; an
+  identical or empty revision is a no-op with no audit. Audited as
+  `subscription_audit_revised` (old and new bound).
 - **Persistence** — `EventBusOptions.subscriptionAuditDir` opts into daily
   `audit-YYYY-MM-DD.jsonl` files (one per UTC day, created when missing);
   without it the in-memory index still records everything, but a restart

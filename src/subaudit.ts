@@ -177,7 +177,8 @@ export type SubscriptionAuditAction =
   | 'lineage_revised'
   | 'drop_journal_revised'
   | 'pull_buffer_revised'
-  | 'fan_out_chunk_size_revised';
+  | 'fan_out_chunk_size_revised'
+  | 'subscription_audit_revised';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -249,6 +250,7 @@ export type SubscriptionAuditAction =
  * - `drop_journal_revised`: `{ maxEntries, oldMaxEntries }` — the bus-level drop journal retention bound was revised (EB-318; the drop journal is always on — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidDropJournalMaxEntries`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the drop determination itself is untouched, drops are still decided by each queue path — and the rows already recorded are retained, never cleared or rewritten: shrinking does not evict immediately (the next record evicts the oldest rows down to the live bound) while a widened bound simply retains more, and lifetime totals (`total` / `byReason`) are unaffected by the revision; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
  * - `pull_buffer_revised`: `{ pullBufferSize, oldPullBufferSize }` — the bus-level pull buffer bound was revised (EB-319; pull is always on — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidPullBufferSize`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the pull mechanism itself is untouched, offsets stay caller-owned, long-poll waiters keep re-reading from their own `fromOffset`, and pull stays independent of push-ACK — and the entries already buffered are retained, never cleared or rewritten: shrinking does not evict immediately (the next publish on a topic truncates that topic's ring down to the live bound) while a widened bound simply retains more; only buses without `durableLogDir` are affected in what `pull()` returns — with a durable log `pull()` reads the log, not the ring; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
  * - `fan_out_chunk_size_revised`: `{ fanOutChunkSize, oldFanOutChunkSize }` (`null` when fully-synchronous) — the bus-level fan-out chunk size was revised (EB-320; chunking is always available — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidFanOutChunkSize`: a positive integer, or `Infinity` for the fully-synchronous default), so a failed call leaves the live size untouched; only the size moves — the fan-out itself is untouched, matching, filtering, signing, backpressure, and per-subscriber FIFO are unchanged, and barrier control messages still bypass chunking — and the new size governs from the next publish: the fan-out captures the live size at publish start, so a chain already in flight keeps the size it started with and runs its scheduled microtask chunks to completion at that size; a revision that provides no field, and a revision identical to the current size (including `Infinity` against the fully-synchronous default), are both no-ops with no audit)
+ * - `subscription_audit_revised`: `{ maxEntries, oldMaxEntries }` — the bus-level subscription audit retention bound was revised (EB-321; the subscription audit log is always on — the bus always constructs it, so there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidSubscriptionAuditMaxEntries`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the audit chain itself is untouched (`dir` / `now` and the hash chain head are unchanged) — and the entries already recorded are retained, never cleared or rewritten: shrinking does not evict immediately at the log level (the next `append` evicts the oldest rows down to the live bound) while a widened bound simply retains more, and the revision event itself is appended to the same log under the new bound, so a shrink is already reflected in the in-memory index when the call returns — the revision event is the record that evicts the oldest rows down to the new bound; evicted rows only leave the in-memory view (the on-disk files are never rewritten, and restart recovery still truncates at the live bound) and the hash chain stays valid — the oldest retained event is the segment anchor; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -549,6 +551,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'drop_journal_revised',
   'pull_buffer_revised',
   'fan_out_chunk_size_revised',
+  'subscription_audit_revised',
   'dead_letter_replay_requested',
   'dead_letter_replay_approved',
   'dead_letter_replay_rejected',
@@ -595,9 +598,23 @@ export function assertValidActor(actor: unknown, where: string): asserts actor i
   }
 }
 
+/**
+ * Validates `SubscriptionAuditOptions.maxEntries` the way the
+ * constructor would (EB-321): a positive integer. Throws `RangeError`
+ * on an illegal value — before anything is mutated. Shared by the
+ * constructor, `SubscriptionAuditLog.retune`, and
+ * `EventBus.setSubscriptionAudit`, so a value that could not be set at
+ * construction cannot be revised in later either.
+ */
+export function assertValidSubscriptionAuditMaxEntries(value: unknown): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new RangeError('subscriptionAuditMaxEntries must be a positive integer');
+  }
+}
+
 export class SubscriptionAuditLog {
   private readonly dir: string | undefined;
-  private readonly maxEntries: number;
+  private maxEntries: number;
   private readonly now: () => number;
   private readonly entries: SubscriptionAuditEvent[] = [];
   private diskWriteErrors = 0;
@@ -614,9 +631,7 @@ export class SubscriptionAuditLog {
     if (dir !== undefined && (typeof dir !== 'string' || dir.length === 0)) {
       throw new RangeError('subscriptionAuditDir must be a non-empty string');
     }
-    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
-      throw new RangeError('subscriptionAuditMaxEntries must be a positive integer');
-    }
+    assertValidSubscriptionAuditMaxEntries(maxEntries);
     if (typeof now !== 'function') {
       throw new RangeError('subscriptionAudit now must be a function');
     }
@@ -626,6 +641,26 @@ export class SubscriptionAuditLog {
     if (dir !== undefined) {
       this.recover(dir);
     }
+  }
+
+  /**
+   * Retunes the in-memory retention bound live (EB-321). Only the
+   * bound moves — the audit chain itself is untouched (`dir` / `now`
+   * and the hash chain head are unchanged), and the entries already
+   * recorded are retained, never cleared or rewritten: shrinking does
+   * not evict immediately — the next `append` evicts the oldest rows
+   * down to the live bound — while a widened bound simply retains
+   * more. Validates fail-fast with the construction-time rule, so an
+   * illegal value leaves the live bound exactly as it was.
+   */
+  retune(maxEntries: number): void {
+    assertValidSubscriptionAuditMaxEntries(maxEntries);
+    this.maxEntries = maxEntries;
+  }
+
+  /** The current retention bound — the live value `retune` moves. */
+  current(): number {
+    return this.maxEntries;
   }
 
   /**

@@ -210,6 +210,7 @@ import {
 import {
   SubscriptionAuditLog,
   assertValidActor,
+  assertValidSubscriptionAuditMaxEntries,
   type SubscriptionAuditEvent,
   type SubscriptionAuditQuery,
 } from './subaudit.ts';
@@ -1474,6 +1475,21 @@ export interface FanOutChunkSizeRevision {
    * fan-out (the spelled-out default).
    */
   fanOutChunkSize?: number;
+}
+
+/**
+ * Revision for the bus-level subscription audit retention bound (see
+ * `EventBus.setSubscriptionAudit`, EB-321). Only the field provided
+ * moves; the audit chain itself is never revised by a revision — only
+ * how many entries the in-memory index retains.
+ */
+export interface SubscriptionAuditRevision {
+  /**
+   * Maximum entries retained in the subscription audit in-memory
+   * index; the oldest entries are evicted past this bound. Must be a
+   * positive integer when provided — the construction-time rule.
+   */
+  maxEntries?: number;
 }
 
 /**
@@ -4994,7 +5010,8 @@ export interface EventBusOptions {
    * Bounded in-memory index size for the subscription audit log
    * (default 1000): the oldest entries are evicted past this size.
    * Applies whether or not `subscriptionAuditDir` persists to disk.
-   * Must be a positive integer.
+   * Must be a positive integer. Retune live with
+   * `setSubscriptionAudit({ maxEntries })` (EB-321).
    */
   subscriptionAuditMaxEntries?: number;
   /**
@@ -17428,11 +17445,8 @@ export class EventBus {
       throw new RangeError('subscriptionAuditDir must be a non-empty string');
     }
     const subscriptionAuditMaxEntries = options?.subscriptionAuditMaxEntries;
-    if (
-      subscriptionAuditMaxEntries !== undefined &&
-      (!Number.isInteger(subscriptionAuditMaxEntries) || subscriptionAuditMaxEntries < 1)
-    ) {
-      throw new RangeError('subscriptionAuditMaxEntries must be a positive integer');
+    if (subscriptionAuditMaxEntries !== undefined) {
+      assertValidSubscriptionAuditMaxEntries(subscriptionAuditMaxEntries);
     }
     this.subAudit = new SubscriptionAuditLog({
       dir: subscriptionAuditDir,
@@ -21601,6 +21615,83 @@ export class EventBus {
       detail: {
         fanOutChunkSize: fanOutChunkSize ?? null,
         oldFanOutChunkSize: currentFanOutChunkSize ?? null,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level subscription audit retention bound live
+   * (EB-321) without restarting the bus: `setSubscriptionAudit({
+   * maxEntries })` retunes how many entries the in-memory index of
+   * the subscription lifecycle audit log retains (see
+   * `EventBusOptions.subscriptionAuditMaxEntries`, EB-78).
+   *
+   * Only the bound moves — the audit chain itself is untouched:
+   * `dir` / `now` and the hash chain head are unchanged, and the
+   * entries already recorded are retained, never cleared or
+   * rewritten. The subscription audit log is always on — the bus
+   * always constructs it — so there is no never-enabled bus to
+   * refuse, unlike the opt-in journals (EB-309 publish audit, EB-315
+   * trace archive).
+   *
+   * Self-append: the revision is itself audited into the same log it
+   * retunes, so the revision event is the first record under the new
+   * bound — a shrink is already reflected in the in-memory index
+   * when the call returns (the revision event evicts the oldest rows
+   * down to the new bound), while a widened bound simply retains
+   * more. Later appends keep evicting to the live bound. Evicted
+   * rows only leave the in-memory view: the on-disk files are never
+   * rewritten, restart recovery still truncates at the live bound,
+   * and the hash chain stays valid — the oldest retained event is
+   * the segment anchor (EB-198).
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live bound and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`assertValidSubscriptionAuditMaxEntries`: a positive integer)
+   * against the merged value, so a value that could not be set at
+   * construction cannot be revised in later either — and a failed
+   * call changes nothing at all. A revision that provides no field,
+   * and a revision identical to the current bound, are both no-ops
+   * with no audit. Audited as `subscription_audit_revised`
+   * (`{ maxEntries, oldMaxEntries }`).
+   *
+   * Orthogonal to EB-309 (that retunes the publish audit journal's
+   * retention — this the subscription audit's retention), to EB-198
+   * (that is the audit chain mechanism itself — this the retention
+   * bound it reads from), and to EB-296 (that retunes tail sampling
+   * — this the subscription audit bound).
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `maxEntries`.
+   */
+  setSubscriptionAudit(opts: SubscriptionAuditRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setSubscriptionAudit: revision must be an object with maxEntries',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    const currentMaxEntries = this.subAudit.current();
+    const maxEntries = opts.maxEntries ?? currentMaxEntries;
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (maxEntries === currentMaxEntries) {
+      return;
+    }
+    assertValidSubscriptionAuditMaxEntries(maxEntries);
+    this.subAudit.retune(maxEntries);
+    this.auditSubscription({
+      action: 'subscription_audit_revised',
+      actor: 'system',
+      detail: {
+        maxEntries,
+        oldMaxEntries: currentMaxEntries,
       },
     });
   }
