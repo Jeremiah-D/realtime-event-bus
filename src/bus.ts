@@ -387,9 +387,11 @@ import {
 import { type ChainVerification } from './auditchain.ts';
 import {
   TraceSpanJournal,
+  assertValidTraceArchiveOptions,
   type TraceArchiveEntry,
   type TraceArchiveOptions,
   type TraceArchiveQuery,
+  type TraceArchiveRevision,
 } from './tracearchive.ts';
 import {
   OtlpSpanExporter,
@@ -20898,6 +20900,88 @@ export class EventBus {
         oldSampleRate: current.sampleRate,
         bufferSize,
         oldBufferSize: current.bufferSize,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level trace span archive journal tuning live
+   * (EB-315) without restarting the bus: `setTraceArchive({
+   * maxEntries?, maxBytes? })` retunes how many sampled spans the
+   * in-memory read view keeps and how large the live journal file may
+   * grow before it rotates (see `EventBusOptions.trace.archive`,
+   * EB-167).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The journal directory and the clock are not revisable here — they
+   * are fixed at construction. The journal object itself is never
+   * replaced: the revision retunes its two bounds in place, and the
+   * record and rotation sites already read those bounds live, so the
+   * new values govern from the next record onward. In-flight entries
+   * are retained, never cleared or rewritten: shrinking `maxEntries`
+   * does not evict immediately — the next record evicts down to the
+   * live bound — and a revised `maxBytes` is honored by the next
+   * record's rotation check, so a tightened budget may rotate the live
+   * file at the next record while a loosened one simply defers the
+   * next rotation.
+   *
+   * Fail-closed: a bus that never enabled `trace.archive`, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. Validation
+   * reuses the construction-time rule (`assertValidTraceArchiveOptions`:
+   * `maxEntries` a positive integer, `maxBytes` a positive finite
+   * number of bytes) against the merged values, so a value that could
+   * not be set at construction cannot be revised in later either — and
+   * a failed call changes nothing at all: when only one field is
+   * provided only that field is validated and moved, and an illegal
+   * value in any field leaves every live value exactly as it was. A
+   * revision that provides neither field, and a revision identical to
+   * the current tuning, are both no-ops with no audit. Audited as
+   * `trace_archive_revised` (`{ maxEntries, oldMaxEntries, maxBytes,
+   * oldMaxBytes }`).
+   *
+   * Orthogonal to EB-311 (that retunes the head-based trace sampling
+   * rate and ring buffer — this the archive journal's retention), and
+   * to EB-167 (that is the trace span archive journal itself — this
+   * the journal's tuning).
+   *
+   * Throws `RangeError` when the trace archive is not enabled, for a
+   * non-object revision, or for an illegal `maxEntries` / `maxBytes`.
+   */
+  setTraceArchive(opts: TraceArchiveRevision): void {
+    const journal = this.traceArchive;
+    if (journal === undefined) {
+      throw new RangeError('setTraceArchive: trace.archive is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setTraceArchive: revision must be an object with maxEntries and/or maxBytes',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = journal.current();
+    const maxEntries = opts.maxEntries ?? current.maxEntries;
+    const maxBytes = opts.maxBytes ?? current.maxBytes;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (maxEntries === current.maxEntries && maxBytes === current.maxBytes) {
+      return;
+    }
+    assertValidTraceArchiveOptions({ maxEntries, maxBytes }, 'setTraceArchive');
+    journal.retune({ maxEntries, maxBytes });
+    this.auditSubscription({
+      action: 'trace_archive_revised',
+      actor: 'system',
+      detail: {
+        maxEntries,
+        oldMaxEntries: current.maxEntries,
+        maxBytes,
+        oldMaxBytes: current.maxBytes,
       },
     });
   }

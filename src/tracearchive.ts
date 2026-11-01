@@ -85,6 +85,25 @@ export interface TraceArchiveOptions {
   now?: () => number;
 }
 
+/**
+ * A partial bus-level revision of the trace-archive tuning, for
+ * `EventBus.setTraceArchive` (EB-315). Only the fields provided move;
+ * the rest keep their live values. The journal directory and the clock
+ * are not revisable here — they are fixed at construction.
+ */
+export interface TraceArchiveRevision {
+  /**
+   * Bounded in-memory read view. Must be a positive integer when
+   * provided — the construction-time rule.
+   */
+  maxEntries?: number;
+  /**
+   * Live-file byte budget. Must be a positive finite number of bytes
+   * when provided — the construction-time rule.
+   */
+  maxBytes?: number;
+}
+
 function utcDay(at: number): string {
   const d = new Date(at);
   const y = d.getUTCFullYear();
@@ -187,8 +206,12 @@ export function parseTraceSpanLine(line: string): TraceArchiveEntry | undefined 
 
 export class TraceSpanJournal {
   private readonly dir: string;
-  private readonly maxEntries: number;
-  private readonly maxBytes: number;
+  // Live-tuned by `retune` (EB-315): `record` and `rotateIfNeeded`
+  // read these bounds on every call, so a revision governs from the
+  // next record without clearing or rewriting anything. `dir` and
+  // `now` stay fixed for the journal's lifetime.
+  private maxEntries: number;
+  private maxBytes: number;
   private readonly now: () => number;
   private readonly entries: TraceArchiveEntry[] = [];
   private diskWriteErrors = 0;
@@ -213,6 +236,34 @@ export class TraceSpanJournal {
     this.maxBytes = maxBytes;
     this.now = now;
     this.recover();
+  }
+
+  /** The two live tuning values, for bus-level revision (EB-315). */
+  current(): { maxEntries: number; maxBytes: number } {
+    return { maxEntries: this.maxEntries, maxBytes: this.maxBytes };
+  }
+
+  /**
+   * Retunes the two numeric bounds live (EB-315). The caller passes the
+   * merged values (current values with the revision applied); this
+   * method re-validates them with the construction-time rule
+   * (`assertValidTraceArchiveOptions`: `maxEntries` a positive integer,
+   * `maxBytes` a positive finite number of bytes) and applies them only
+   * when valid, so a failed call leaves every live value untouched.
+   * In-flight entries are retained, never cleared or rewritten:
+   * shrinking `maxEntries` does not evict immediately — the next
+   * `record()` evicts down to the live bound — and a revised `maxBytes`
+   * is honored by the next `record()`'s rotation check, so a tightened
+   * budget may rotate the live file at the next record while a loosened
+   * one simply defers the next rotation.
+   */
+  retune(next: { maxEntries: number; maxBytes: number }): void {
+    assertValidTraceArchiveOptions(
+      { maxEntries: next.maxEntries, maxBytes: next.maxBytes },
+      'TraceSpanJournal.retune',
+    );
+    this.maxEntries = next.maxEntries;
+    this.maxBytes = next.maxBytes;
   }
 
   /**

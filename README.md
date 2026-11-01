@@ -5870,6 +5870,19 @@ Semantics notes:
   otherwise). Disabled by default; `getTraceArchive()` returns `[]` when
   the journal is off.
 
+Retune live with `bus.setTraceArchive({ maxEntries?, maxBytes? })`
+(EB-315): only the fields provided move; the new values govern from the
+next record onward — a tightened `maxEntries` evicts down to the new
+bound at the next record (in-flight entries are never cleared or
+rewritten), and a revised `maxBytes` is honored by the next record's
+rotation check, so a tightened budget may rotate the live file at the
+next record while a loosened one simply defers the next rotation; only
+a bus that already enabled `trace.archive` can be revised (otherwise
+`RangeError`); illegal values fail closed with the live tuning
+untouched; an identical or empty revision is a no-op with no audit.
+Audited as `trace_archive_revised` (`{ maxEntries, oldMaxEntries,
+maxBytes, oldMaxBytes }`).
+
 ## Pluggable partition assignors (EB-106)
 
 **Opt-in.** Consumer-group partition placement (`partitions` on
