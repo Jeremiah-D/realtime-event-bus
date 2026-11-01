@@ -419,14 +419,19 @@ export interface GatewayOptions {
    * `client_pressure` / `client_pressure_recovered`
    * (`bus.getSubscriptionAudit()`). Default: unset (disabled) — the
    * gateway keeps its historical shed-newest behavior
-   * (`maxPendingBytes`) unchanged.
+   * (`maxPendingBytes`) unchanged. Revisable live with
+   * `setGatewayClientPressure` (EB-326): the new watermarks govern
+   * from the next pressure check on every connection, existing ones
+   * included, and an explicitly `undefined` pressure clears the mode
+   * (releasing any in-flight pressure pause at once).
    */
   clientPressureWatermarkBytes?: number;
   /**
    * Recovery watermark for `clientPressureWatermarkBytes` (EB-161): the
    * queued-bytes level at or below which a pressured connection resumes
    * its paused subscriptions. Must be below the pressure watermark;
-   * defaults to half of it.
+   * defaults to half of it. Revisable live with
+   * `setGatewayClientPressure` (EB-326).
    */
   clientPressureRecoveryWatermarkBytes?: number;
   /**
@@ -478,6 +483,29 @@ export interface GatewayLimitsRevision {
   maxPendingBytes?: number;
   /** Socket-buffer bytes past which a connection pauses pushing frames (positive finite bytes). */
   sendHighWaterMarkBytes?: number;
+}
+
+/**
+ * A `setGatewayClientPressure` revision (EB-326): either client-pressure
+ * watermark. Only the fields provided move — a field left out keeps its
+ * live value, with one asymmetry: an explicitly `undefined` pressure
+ * *clears* the mode (the construction default: disabled), while an
+ * explicitly `undefined` recovery is not a value and keeps the live
+ * recovery. Revising only the pressure keeps the live recovery when it
+ * is still below the new pressure, otherwise it re-derives to half the
+ * new pressure (the construction default).
+ */
+export interface GatewayClientPressureRevision {
+  /**
+   * Queued-bytes watermark that pauses a connection's subscriptions
+   * (positive finite bytes); explicitly `undefined` clears the mode.
+   */
+  clientPressureWatermarkBytes?: number;
+  /**
+   * Queued-bytes level at or below which a pressured connection resumes
+   * (positive finite bytes, strictly below the pressure watermark).
+   */
+  clientPressureRecoveryWatermarkBytes?: number;
 }
 
 export interface GatewayStats {
@@ -611,6 +639,38 @@ function assertValidGatewayLimitBytes(value: number, name: string, caller: strin
   }
 }
 
+/**
+ * Shared client-pressure rule (EB-161 construction, EB-326 revision):
+ * a pressure watermark must be a positive finite number when set, and
+ * its recovery watermark a positive finite number strictly below it.
+ * With the pressure disabled the recovery value is inert and unchecked
+ * — construction stores it as given, and so does a revision.
+ * `caller` prefixes the message (`'invalid gateway options'` at
+ * construction, `'setGatewayClientPressure'` at revision).
+ */
+function assertValidClientPressure(
+  pressure: number | undefined,
+  recovery: number,
+  caller: string,
+): void {
+  if (pressure === undefined) return;
+  if (!Number.isFinite(pressure) || pressure <= 0) {
+    throw new RangeError(
+      `${caller}: clientPressureWatermarkBytes must be a positive finite number`,
+    );
+  }
+  if (!Number.isFinite(recovery) || recovery <= 0) {
+    throw new RangeError(
+      `${caller}: clientPressureRecoveryWatermarkBytes must be a positive finite number`,
+    );
+  }
+  if (recovery >= pressure) {
+    throw new RangeError(
+      `${caller}: clientPressureRecoveryWatermarkBytes must be below clientPressureWatermarkBytes`,
+    );
+  }
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
@@ -626,10 +686,12 @@ export class GatewayServer {
   private sendHighWaterMarkBytes: number;
   private maxPendingBytes: number;
   private maxFrameBytes: number;
-  private readonly clientPressureWatermarkBytes: number | undefined;
+  /** Mutable live via `setGatewayClientPressure` (EB-326) — see that method. */
+  private clientPressureWatermarkBytes: number | undefined;
   /** Opt-in per-connection subscription cap (EB-173); undefined = unlimited. */
   private readonly maxSubscriptionsPerConnection: number | undefined;
-  private readonly clientPressureRecoveryWatermarkBytes: number;
+  /** Mutable live via `setGatewayClientPressure` (EB-326) — see that method. */
+  private clientPressureRecoveryWatermarkBytes: number;
   private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
   /** Resolved permessage-deflate config (EB-206); undefined = disabled. */
   private readonly deflateOpts: ResolvedPerMessageDeflate | undefined;
@@ -670,12 +732,18 @@ export class GatewayServer {
     assertValidGatewayLimitBytes(maxFrameBytes, 'maxFrameBytes', 'invalid gateway options');
     this.maxFrameBytes = maxFrameBytes;
     const clientPressureWatermarkBytes = options.clientPressureWatermarkBytes;
-    if (clientPressureWatermarkBytes !== undefined) {
-      if (!Number.isFinite(clientPressureWatermarkBytes) || clientPressureWatermarkBytes <= 0) {
-        fail('clientPressureWatermarkBytes must be a positive finite number');
-      }
-    }
+    const clientPressureRecoveryWatermarkBytes =
+      options.clientPressureRecoveryWatermarkBytes ??
+      (clientPressureWatermarkBytes === undefined
+        ? 0
+        : Math.floor(clientPressureWatermarkBytes / 2));
+    assertValidClientPressure(
+      clientPressureWatermarkBytes,
+      clientPressureRecoveryWatermarkBytes,
+      'invalid gateway options',
+    );
     this.clientPressureWatermarkBytes = clientPressureWatermarkBytes;
+    this.clientPressureRecoveryWatermarkBytes = clientPressureRecoveryWatermarkBytes;
     // EB-173: opt-in per-connection subscription cap — positive integer
     // or unset (unlimited, the historical behavior). Invalid values fail
     // fast with RangeError at construction, matching every other option.
@@ -686,23 +754,7 @@ export class GatewayServer {
     ) {
       fail('maxSubscriptionsPerConnection must be a positive integer when given');
     }
-    this.maxSubscriptionsPerConnection = maxSubscriptionsPerConnection;  let clientPressureRecoveryWatermarkBytes =
-      options.clientPressureRecoveryWatermarkBytes ??
-      (clientPressureWatermarkBytes === undefined
-        ? 0
-        : Math.floor(clientPressureWatermarkBytes / 2));
-    if (clientPressureWatermarkBytes !== undefined) {
-      if (
-        !Number.isFinite(clientPressureRecoveryWatermarkBytes) ||
-        clientPressureRecoveryWatermarkBytes <= 0
-      ) {
-        fail('clientPressureRecoveryWatermarkBytes must be a positive finite number');
-      }
-      if (clientPressureRecoveryWatermarkBytes >= clientPressureWatermarkBytes) {
-        fail('clientPressureRecoveryWatermarkBytes must be below clientPressureWatermarkBytes');
-      }
-    }
-    this.clientPressureRecoveryWatermarkBytes = clientPressureRecoveryWatermarkBytes;
+    this.maxSubscriptionsPerConnection = maxSubscriptionsPerConnection;
     const onDisconnect = options.onDisconnect;
     if (onDisconnect !== undefined && typeof onDisconnect !== 'function') {
       fail('onDisconnect must be a function');
@@ -839,6 +891,112 @@ export class GatewayServer {
     this.maxFrameBytes = maxFrameBytes;
     this.maxPendingBytes = maxPendingBytes;
     this.sendHighWaterMarkBytes = sendHighWaterMarkBytes;
+  }
+
+  /**
+   * Revises the client-pressure watermarks live (EB-326) without
+   * restarting the server: `setGatewayClientPressure({
+   * clientPressureWatermarkBytes?, clientPressureRecoveryWatermarkBytes?
+   * })` retunes the opt-in pressure mode (see `GatewayOptions` for the
+   * defaults: disabled, recovery half the watermark).
+   *
+   * Only the fields provided move — a partial revision keeps the field
+   * it leaves out, with two exceptions that follow the construction
+   * rules. An explicitly `undefined` pressure *clears* the mode: the
+   * connection falls back to the historical `maxPendingBytes`
+   * shed-newest behavior, exactly as if the watermark had never been
+   * set — and a connection that is pressured when the mode is cleared
+   * has its pressure pause released at once (resuming exactly the
+   * subscriptions the pressure paused, audited as
+   * `client_pressure_recovered` with the recovery watermark that was
+   * in force), because with the mode gone no later pressure check
+   * would ever release it. An explicitly `undefined` recovery is not
+   * a value and keeps the live recovery. A pressure revised without a
+   * recovery keeps the live recovery when it is still below the new
+   * pressure, otherwise it re-derives to half the new pressure (the
+   * construction default).
+   *
+   * The new watermarks govern from the next pressure check on every
+   * connection, existing ones included: `checkClientPressure` reads
+   * the live values whenever a connection's queued bytes change, so
+   * lowering the pressure watermark pauses a connection that is
+   * already over it at the next check, and a revised recovery
+   * watermark re-judges a pressured connection as its queue drains.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with both live watermarks untouched. Validation
+   * reuses the construction-time rule (`assertValidClientPressure`):
+   * a pressure watermark must be a positive finite number and a
+   * recovery watermark a positive finite number strictly below the
+   * pressure watermark — so a value that could not be set at
+   * construction cannot be revised in later either. A revision that
+   * provides no field, and a revision identical to the current
+   * watermarks, are both no-ops.
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `clientPressureWatermarkBytes` or
+   * `clientPressureRecoveryWatermarkBytes`.
+   */
+  setGatewayClientPressure(opts: GatewayClientPressureRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGatewayClientPressure: revision must be an object with clientPressureWatermarkBytes and/or clientPressureRecoveryWatermarkBytes',
+      );
+    }
+    // Unlike `setGatewayLimits`, an explicitly `undefined` pressure is
+    // a value here: it clears the mode (the construction default is
+    // disabled). The `in` check tells an explicit `undefined` apart
+    // from a field left out.
+    const pressureGiven = 'clientPressureWatermarkBytes' in opts;
+    const recoveryGiven =
+      'clientPressureRecoveryWatermarkBytes' in opts &&
+      opts.clientPressureRecoveryWatermarkBytes !== undefined;
+    const pressure = pressureGiven
+      ? opts.clientPressureWatermarkBytes
+      : this.clientPressureWatermarkBytes;
+    let recovery: number;
+    if (recoveryGiven) {
+      recovery = opts.clientPressureRecoveryWatermarkBytes as number;
+    } else if (pressureGiven && pressure !== undefined) {
+      // Revising only the pressure keeps the live recovery when it is
+      // still below the new pressure; otherwise it re-derives to the
+      // construction default, half the new pressure.
+      const liveRecovery = this.clientPressureRecoveryWatermarkBytes;
+      recovery =
+        Number.isFinite(liveRecovery) && liveRecovery > 0 && liveRecovery < pressure
+          ? liveRecovery
+          : Math.floor(pressure / 2);
+    } else if (pressureGiven) {
+      // Clearing the pressure disables the mode; the recovery value is
+      // inert without it, so it resets to the construction default
+      // for disabled pressure.
+      recovery = 0;
+    } else {
+      recovery = this.clientPressureRecoveryWatermarkBytes;
+    }
+    // Re-affirming the current watermarks is a no-op.
+    if (
+      pressure === this.clientPressureWatermarkBytes &&
+      recovery === this.clientPressureRecoveryWatermarkBytes
+    ) {
+      return;
+    }
+    assertValidClientPressure(pressure, recovery, 'setGatewayClientPressure');
+    const recoveryBeforeClear = this.clientPressureRecoveryWatermarkBytes;
+    this.clientPressureWatermarkBytes = pressure;
+    this.clientPressureRecoveryWatermarkBytes = recovery;
+    // Clearing the mode must release the pause it imposed: with the
+    // watermark gone, `checkClientPressure` returns early and no later
+    // check would ever resume these connections.
+    if (pressure === undefined) {
+      for (const conn of this.connections) {
+        this.resumePressurePaused(conn, recoveryBeforeClear);
+      }
+    }
   }
 
   // --- connection lifecycle ------------------------------------------------
@@ -1167,6 +1325,36 @@ export class GatewayServer {
    * audited as `client_pressure` / `client_pressure_recovered`
    * (best-effort: the bus's audit path is infallible).
    */
+  /**
+   * Releases a connection's pressure pause (EB-161, reused by the
+   * EB-326 clear path): resumes exactly the subscriptions the pressure
+   * paused — an operator's manual pause is never cleared here — and
+   * audits the release as `client_pressure_recovered` with the
+   * recovery watermark that was in force. A connection that was never
+   * pressured is untouched.
+   */
+  private resumePressurePaused(conn: Connection, watermarkBytes: number): void {
+    if (!conn.pressured) return;
+    conn.pressured = false;
+    let resumed = 0;
+    for (const subId of conn.pressurePausedSubs) {
+      try {
+        if (this.bus.resumeSubscriber(subId)) resumed += 1;
+      } catch {
+        // Unsubscribed while pressured; the pause died with it.
+      }
+    }
+    conn.pressurePausedSubs.clear();
+    this.bus.noteGatewayClientPressure('recovered', {
+      ...(conn.socket.remoteAddress === undefined
+        ? {}
+        : { remoteAddress: conn.socket.remoteAddress }),
+      queuedBytes: conn.pendingBytes,
+      watermarkBytes,
+      pausedSubscriptions: resumed,
+    });
+  }
+
   private checkClientPressure(conn: Connection): void {
     const watermark = this.clientPressureWatermarkBytes;
     if (watermark === undefined || conn.closed) return;
@@ -1193,22 +1381,7 @@ export class GatewayServer {
       return;
     }
     if (conn.pressured && conn.pendingBytes <= this.clientPressureRecoveryWatermarkBytes) {
-      conn.pressured = false;
-      let resumed = 0;
-      for (const subId of conn.pressurePausedSubs) {
-        try {
-          if (this.bus.resumeSubscriber(subId)) resumed += 1;
-        } catch {
-          // Unsubscribed while pressured; the pause died with it.
-        }
-      }
-      conn.pressurePausedSubs.clear();
-      this.bus.noteGatewayClientPressure('recovered', {
-        ...(remoteAddress === undefined ? {} : { remoteAddress }),
-        queuedBytes: conn.pendingBytes,
-        watermarkBytes: this.clientPressureRecoveryWatermarkBytes,
-        pausedSubscriptions: resumed,
-      });
+      this.resumePressurePaused(conn, this.clientPressureRecoveryWatermarkBytes);
     }
   }
 

@@ -5469,6 +5469,20 @@ Semantics:
   (`bus.getSubscriptionAudit()`), and `gw.getStats()` exposes
   per-connection `queuedBytes` plus the `pausedConnections` count. A
   slow client can no longer OOM the gateway process.
+- **Live client-pressure revision (EB-326).**
+  `gw.setGatewayClientPressure({ clientPressureWatermarkBytes?,
+  clientPressureRecoveryWatermarkBytes? })` retunes the opt-in pressure
+  watermarks without restarting the server: only the fields provided
+  move, an illegal value throws `RangeError` with the live watermarks
+  untouched, and an empty or identical revision is a no-op. An
+  explicitly `undefined` pressure clears the mode — a pressured
+  connection's pause is released at once (audited as
+  `client_pressure_recovered`) and the gateway falls back to the
+  historical `maxPendingBytes` shed-newest behavior. The new watermarks
+  govern from the next pressure check on every connection, existing
+  ones included. Revising only the pressure keeps the live recovery
+  when it is still below the new pressure, otherwise it re-derives to
+  half the new pressure (the construction default).
 - **Subscription cap (EB-173, opt-in).** With
   `maxSubscriptionsPerConnection` set, a connection that already holds
   that many live bus subscriptions gets an error frame with
