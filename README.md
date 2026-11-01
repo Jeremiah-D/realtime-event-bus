@@ -8701,6 +8701,21 @@ Semantics notes:
   topics/outputTopic, non-function `on`, non-positive-finite
   `windowMs`, `how` outside `'inner'|'left'`, non-positive-integer
   `maxBufferedPerKey`, duplicate join ids.
+- Retune live with `bus.setStreamJoinWindow(joinId, windowMs)`
+  (EB-336): only the window moves — the join's topics, key function,
+  flavor, output topic, and `maxBufferedPerKey` are untouched, and the
+  buffered entries stay put. The new value governs only arrivals after
+  the revision: widening expands the pairing range and the lateness
+  horizon, narrowing shrinks both but does not evict buffered entries
+  immediately (the next observation or sweep trims them against the new
+  horizon), and the sweep timer is re-armed at `min(new windowMs,
+  60s)`. A pair already derived is never re-derived or withdrawn. It is
+  fail-closed (an empty or unknown join id, or a non-positive-finite
+  window, throws `RangeError` with the live window and the audit log
+  untouched), and a revision identical to the current window is a no-op
+  with no audit. Audited as `stream_join_window_revised`
+  (`{ joinId: <string>, windowMs: <number>, oldWindowMs: <number> }`).
+  `getStats().joins` reports the live window immediately.
 - `getStats().joins` → per-join `{ joined, joinLate, joinEvicted,
   keyErrors, bufferedLeft, bufferedRight }` (present once a join was
   defined); globals `totalStreamJoinMatches` / `totalStreamJoinLate` /

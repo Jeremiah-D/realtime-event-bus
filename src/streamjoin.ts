@@ -328,6 +328,39 @@ export class StreamJoinEngine {
     return true;
   }
 
+  /** The configured window for a join, or `undefined` when unknown. */
+  getWindowMs(joinId: string): number | undefined {
+    return this.joins.get(joinId)?.windowMs;
+  }
+
+  /**
+   * Retunes a join's sliding window live (EB-336) without redefining
+   * it: `observe` / `arrive` / `sweepJoin` all read `join.windowMs`
+   * live, so the new value governs the next arrival — a pair already
+   * derived is never re-derived or withdrawn, and narrowing the window
+   * does not evict buffered entries immediately (the next observation
+   * or sweep trims them against the new horizon). The sweep timer is
+   * re-armed at `min(new windowMs, 60s)`: the interval was captured
+   * when the join was defined, so a stale timer would keep sweeping
+   * at the old cadence. Throws `RangeError` on an unknown join id or
+   * an illegal window (the same positive-finite rule
+   * `validateStreamJoinOptions` enforces at define time).
+   */
+  retuneWindow(joinId: string, windowMs: number): void {
+    const join = this.joins.get(joinId);
+    if (join === undefined) {
+      throw new RangeError(`unknown join id "${joinId}"`);
+    }
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new RangeError('windowMs must be a positive finite number of milliseconds');
+    }
+    join.windowMs = windowMs;
+    // Re-arm the sweep timer at the new cadence — the interval was
+    // captured in `startSweep` at define time.
+    this.stopSweep(join);
+    this.startSweep(join);
+  }
+
   /** Joins currently defined. */
   get size(): number {
     return this.joins.size;

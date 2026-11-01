@@ -19763,6 +19763,72 @@ export class EventBus {
   }
 
   /**
+   * Revises one stream join's sliding window live (EB-336) without
+   * redefining it: `setStreamJoinWindow(joinId, windowMs)` retunes the
+   * window that correlates left/right arrivals by key (see
+   * `joinTopics`, EB-187).
+   *
+   * Only the window moves: the join's topics, key function, flavor,
+   * output topic, and `maxBufferedPerKey` are untouched, and the
+   * buffered entries stay put — a pair already derived is never
+   * re-derived or withdrawn. `observe` / `arrive` / `sweepJoin` read
+   * the window live, so the new value governs only arrivals after the
+   * revision: widening expands the pairing range (`[ts - windowMs,
+   * ts]`) and the lateness horizon (`now - windowMs`), narrowing
+   * shrinks both — but a narrowing does not evict buffered entries
+   * immediately; the next observation or sweep trims them against the
+   * new horizon. The sweep timer is re-armed at `min(new windowMs,
+   * 60s)`. `getStats().joins` reports the live window immediately.
+   *
+   * Fail-closed: an empty joinId, an unknown join id, and an illegal
+   * window (zero, negative, `NaN`, `Infinity`, a non-number) all throw
+   * `RangeError` with the live window and the audit log untouched —
+   * the new value reuses the define-time validation (a positive
+   * finite number of milliseconds), so a value that could not be set
+   * at define time cannot be revised in later either. A revision
+   * identical to the current window is a no-op with no audit. Audited
+   * as `stream_join_window_revised`
+   * (`{ joinId: <string>, windowMs: <number>, oldWindowMs: <number> }`).
+   *
+   * Orthogonal to EB-187 (that is the join mechanism itself — this
+   * its window revision), to EB-293 (that is the subscriber-side
+   * tumbling aggregation window — this the dual-stream pairing
+   * window), and to EB-59 (that is the event-time watermark lateness
+   * measure — this the pairing predicate's window).
+   *
+   * Throws `RangeError` for an empty / unknown join id or an illegal
+   * window.
+   */
+  setStreamJoinWindow(joinId: string, windowMs: number): void {
+    if (typeof joinId !== 'string' || joinId.length === 0) {
+      throw new RangeError('setStreamJoinWindow: joinId must be a non-empty string');
+    }
+    // Same rule as `validateStreamJoinOptions` (EB-187): a positive
+    // finite number — validated before anything is touched.
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new RangeError('setStreamJoinWindow: windowMs must be a positive finite number of milliseconds');
+    }
+    const engine = this.streamJoins;
+    if (engine === undefined) {
+      throw new RangeError(`setStreamJoinWindow: unknown join id "${joinId}"`);
+    }
+    const oldWindowMs = engine.getWindowMs(joinId);
+    if (oldWindowMs === undefined) {
+      throw new RangeError(`setStreamJoinWindow: unknown join id "${joinId}"`);
+    }
+    // Re-affirming the current window is a no-op: no retune, no audit.
+    if (windowMs === oldWindowMs) {
+      return;
+    }
+    engine.retuneWindow(joinId, windowMs);
+    this.auditSubscription({
+      action: 'stream_join_window_revised',
+      actor: 'system',
+      detail: { joinId, windowMs, oldWindowMs },
+    });
+  }
+
+  /**
    * Emits one derived join output back onto the bus (EB-187): an
    * `outputTopic` publish through the normal pipeline, marked
    * join-derived so it never re-enters join observation.
