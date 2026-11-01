@@ -325,7 +325,9 @@ export interface DurableLogOptions {
    * Maximum retained entries per topic. When a topic's entry count grows
    * past twice this value the file is compacted down to the newest
    * `maxEntriesPerTopic` entries, so a hot topic cannot grow the log
-   * without bound. Must be a positive integer. Default 10000.
+   * without bound. Must be a positive integer. Default 10000. Mutable
+   * at runtime via `setMaxEntriesPerTopic` — the bus exposes it as
+   * `setDurableLogMaxEntriesPerTopic` with a subscription-audit trail.
    */
   maxEntriesPerTopic?: number;
   /**
@@ -1681,9 +1683,30 @@ export interface ForkTopicResult {
   keyedLatest: boolean;
 }
 
+/**
+ * Validates `DurableLogOptions.maxEntriesPerTopic` the way `open()` would
+ * (EB-322): a positive integer. Throws `RangeError` on an illegal value —
+ * before anything is mutated. Shared by `open()`,
+ * `DurableTopicLog.setMaxEntriesPerTopic`, and
+ * `EventBus.setDurableLogMaxEntriesPerTopic`, so a value that could not be
+ * set at construction cannot be revised in later either.
+ */
+export function assertValidDurableLogMaxEntriesPerTopic(value: unknown): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new RangeError('durableLogMaxEntriesPerTopic must be a positive integer');
+  }
+}
+
 export class DurableTopicLog {
   private readonly logDir: string;
-  private readonly maxEntriesPerTopic: number;
+  /**
+   * Per-topic entry budget (`maxEntriesPerTopic`), `10000` when
+   * unconfigured. Mutable at runtime via `setMaxEntriesPerTopic` — the
+   * bus exposes it as `setDurableLogMaxEntriesPerTopic` with a
+   * subscription-audit trail. Every use site reads the live value, so
+   * a revised bound governs from the next append-triggered compact.
+   */
+  private maxEntriesPerTopic: number;
   private readonly keyCompaction: boolean;
   /** Topics known to the log (recovered from disk + appended since open). */
   private readonly topicsSeen = new Set<string>();
@@ -2003,9 +2026,7 @@ export class DurableTopicLog {
       throw new RangeError('durableLogDir must be a non-empty string');
     }
     const maxEntriesPerTopic = options.maxEntriesPerTopic ?? 10000;
-    if (!Number.isInteger(maxEntriesPerTopic) || maxEntriesPerTopic < 1) {
-      throw new RangeError('durableLogMaxEntriesPerTopic must be a positive integer');
-    }
+    assertValidDurableLogMaxEntriesPerTopic(maxEntriesPerTopic);
     const publishDedupMaxEntries = options.publishDedupMaxEntries ?? 10000;
     if (!Number.isInteger(publishDedupMaxEntries) || publishDedupMaxEntries < 1) {
       throw new RangeError('publishDedupMaxEntries must be a positive integer');
@@ -2079,6 +2100,28 @@ export class DurableTopicLog {
     const previous = this.maxAgeMs;
     this.maxAgeMs = maxAgeMs;
     return previous;
+  }
+
+  /**
+   * Changes the per-topic entry budget at runtime (EB-322). Returns the
+   * previous bound. Throws `RangeError` for a non-positive-integer value,
+   * leaving the live bound exactly as it was. The change takes effect on
+   * the next append-triggered compact — already-persisted records are
+   * untouched, a tightened bound does not force an immediate compact,
+   * and a loosened bound simply allows more capacity. The bus wraps
+   * this as `setDurableLogMaxEntriesPerTopic` and records the change in
+   * the subscription audit log (`durable_log_max_entries_revised`).
+   */
+  setMaxEntriesPerTopic(maxEntriesPerTopic: number): number {
+    assertValidDurableLogMaxEntriesPerTopic(maxEntriesPerTopic);
+    const previous = this.maxEntriesPerTopic;
+    this.maxEntriesPerTopic = maxEntriesPerTopic;
+    return previous;
+  }
+
+  /** The current per-topic entry budget — the live value `setMaxEntriesPerTopic` moves. */
+  currentMaxEntriesPerTopic(): number {
+    return this.maxEntriesPerTopic;
   }
 
   /**

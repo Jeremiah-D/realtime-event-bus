@@ -518,7 +518,17 @@ library.
   `getStats().durableLog.retentionEvicted`. Change the bound at runtime
   with `setDurableLogMaxAgeMs(ms, actor?)` (applies to the root log and
   every namespace child log); the change is recorded in the subscription
-  audit log as `retention_updated` with `{ from, to }`. Corrupt log lines
+  audit log as `retention_updated` with `{ from, to }`. Retune the
+  per-topic entry budget live with
+  `setDurableLogMaxEntriesPerTopic(maxEntriesPerTopic, actor?)` (EB-322):
+  only the bound moves, already-persisted records are untouched, and the
+  new bound governs from the next append-triggered compact — tightening
+  does not force an immediate compact, loosening simply allows more
+  capacity. It fans out to the root log and every namespace child log
+  (a namespace registered later opens with the live bound), requires a
+  `durableLogDir` (a bus without one throws `RangeError`), and is
+  audited as `durable_log_max_entries_revised` (old and new bound); an
+  identical revision is a no-op with no audit. Corrupt log lines
   are skipped and counted
   (`getStats().durableLog.corruptLines`), never fatal; payloads
   `JSON.stringify` cannot represent are delivered live but skipped by the

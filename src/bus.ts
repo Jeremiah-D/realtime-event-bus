@@ -5048,7 +5048,8 @@ export interface EventBusOptions {
   /**
    * Maximum retained log entries per topic before the log compacts away the
    * oldest entries (default 10000). Only meaningful with `durableLogDir`.
-   * Must be a positive integer.
+   * Must be a positive integer. Retune live with
+   * `setDurableLogMaxEntriesPerTopic(maxEntriesPerTopic, actor?)` (EB-322).
    */
   durableLogMaxEntriesPerTopic?: number;
   /**
@@ -16597,9 +16598,10 @@ export class EventBus {
   private stateStoreChangelogTopic?: string;
   /**
    * `durableLogMaxEntriesPerTopic` as configured — namespace child logs
-   * (EB-52) open with the same per-topic budget as the root log.
+   * (EB-52) open with the same per-topic budget as the root log; kept
+   * in sync by `setDurableLogMaxEntriesPerTopic`.
    */
-  private readonly durableLogMaxEntriesPerTopic?: number;
+  private durableLogMaxEntriesPerTopic?: number;
   /**
    * `durableLogMaxAgeMs` as configured — namespace child logs (EB-52)
    * open with the same time-based retention bound as the root log; kept
@@ -20867,6 +20869,72 @@ export class EventBus {
       action: 'retention_updated',
       actor,
       detail: { from: previous ?? null, to: maxAgeMs ?? null },
+    });
+  }
+
+  /**
+   * Changes the durable log's per-topic entry budget at runtime (EB-322):
+   * `setDurableLogMaxEntriesPerTopic(maxEntriesPerTopic, actor?)`
+   * retunes how many entries each topic retains before the log compacts
+   * away the oldest (see
+   * `EventBusOptions.durableLogMaxEntriesPerTopic`, default 10000).
+   *
+   * Only the bound moves — the retention mechanism itself is untouched:
+   * the amortized 2x compact trigger, the keyed-compaction rule, and
+   * the offset/dedup journal guards all keep reading the bound live,
+   * and the records already persisted are retained, never cleared or
+   * rewritten. The new bound governs from the next append-triggered
+   * compact of each topic: tightening it does not force an immediate
+   * compact (the next append past twice the new bound rewrites the
+   * file down to the newest entries), while loosening it simply allows
+   * more capacity.
+   *
+   * The change applies to the root log and every namespace child log,
+   * and is recorded in the subscription audit log as
+   * `durable_log_max_entries_revised` (with the previous and new bound
+   * in `detail`), so retention policy changes stay attributable.
+   * A namespace registered after the revision opens its child log with
+   * the live bus bound, like every other durable-log option.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A non-positive-integer bound also throws
+   * `RangeError` with the live bound and the audit log untouched:
+   * validation reuses the construction-time rule
+   * (`assertValidDurableLogMaxEntriesPerTopic`: a positive integer).
+   * A revision identical to the current bound is a no-op with no audit.
+   *
+   * Orthogonal to EB-85 (that retunes the time-based retention bound —
+   * this the per-topic entry count), to EB-119 (that is the byte
+   * retention mechanism — this the entry-count bound), and to EB-296
+   * (that retunes tail sampling — this the durable-log retention).
+   *
+   * Throws `RangeError` for a bad actor, for a non-positive-integer
+   * `maxEntriesPerTopic`, or when the bus has no `durableLogDir`.
+   */
+  setDurableLogMaxEntriesPerTopic(maxEntriesPerTopic: number, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogMaxEntriesPerTopic');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogMaxEntriesPerTopic requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const previous = log.currentMaxEntriesPerTopic();
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (maxEntriesPerTopic === previous) {
+      return;
+    }
+    log.setMaxEntriesPerTopic(maxEntriesPerTopic);
+    for (const child of this.namespaceLogs.values()) {
+      child.setMaxEntriesPerTopic(maxEntriesPerTopic);
+    }
+    this.durableLogMaxEntriesPerTopic = maxEntriesPerTopic;
+    this.auditSubscription({
+      action: 'durable_log_max_entries_revised',
+      actor,
+      detail: { maxEntriesPerTopic, oldMaxEntriesPerTopic: previous },
     });
   }
 
