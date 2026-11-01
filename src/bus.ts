@@ -1460,6 +1460,23 @@ export interface PullBufferRevision {
 }
 
 /**
+ * Revision for the bus-level fan-out chunk size (see
+ * `EventBus.setFanOutChunkSize`, EB-320). Only the field provided
+ * moves; the fan-out itself is never revised by a revision — only how
+ * many subscriber deliveries one synchronous `publish` performs
+ * before yielding to chained microtask chunks.
+ */
+export interface FanOutChunkSizeRevision {
+  /**
+   * Maximum subscriber deliveries one synchronous `publish` performs
+   * before yielding. Must be a positive integer when provided — the
+   * construction-time rule. `Infinity` restores the fully-synchronous
+   * fan-out (the spelled-out default).
+   */
+  fanOutChunkSize?: number;
+}
+
+/**
  * Tuning for opt-in causal (happens-before) delivery (see
  * `SubscribeOptions.causal`).
  */
@@ -5040,6 +5057,8 @@ export interface EventBusOptions {
    * zero added per-subscriber overhead. Must be a positive integer —
    * anything else throws `RangeError` at construction.
    * `getStats().fanOutYields` counts the microtask yields performed.
+   * Retune live with `setFanOutChunkSize({ fanOutChunkSize })`
+   * (EB-320).
    */
   fanOutChunkSize?: number;
   /**
@@ -9248,6 +9267,21 @@ function assertValidIdempotencyOptions(
 function assertValidPullBufferSize(value: unknown): void {
   if (!Number.isInteger(value) || (value as number) < 1) {
     throw new RangeError('pullBufferSize must be a positive integer');
+  }
+}
+
+/**
+ * Validates `EventBusOptions.fanOutChunkSize` the way the constructor
+ * would (EB-320): a positive integer, or `Infinity` / absent for the
+ * fully-synchronous default. Throws `RangeError` on an illegal value
+ * — before anything is mutated. Shared by the constructor and
+ * `EventBus.setFanOutChunkSize`, so a value that could not be set at
+ * construction cannot be revised in later either.
+ */
+function assertValidFanOutChunkSize(value: unknown): void {
+  if (value === undefined || value === Infinity) return;
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new RangeError('fanOutChunkSize must be a positive integer');
   }
 }
 
@@ -16457,9 +16491,11 @@ export class EventBus {
   /**
    * `EventBusOptions.fanOutChunkSize` as configured (EB-150); `undefined`
    * means the default fully-synchronous fan-out. `Infinity` is normalized
-   * to `undefined` at construction.
+   * to `undefined` at construction. Live-revised by `setFanOutChunkSize`
+   * (EB-320): not `readonly`, because every publish reads it live to
+   * size its fan-out chunks.
    */
-  private readonly fanOutChunkSize: number | undefined;
+  private fanOutChunkSize: number | undefined;
   /**
    * Bus-wide fan-out pressure budget (EB-156): the maximum total number
    * of messages that may sit in subscriber backpressure queues across
@@ -17421,12 +17457,8 @@ export class EventBus {
     // other bounded options above. `Infinity` is the spelled-out
     // default — normalized to absent below.
     const fanOutChunkSize = options?.fanOutChunkSize;
-    if (
-      fanOutChunkSize !== undefined &&
-      fanOutChunkSize !== Infinity &&
-      (!Number.isInteger(fanOutChunkSize) || fanOutChunkSize < 1)
-    ) {
-      throw new RangeError('fanOutChunkSize must be a positive integer');
+    if (fanOutChunkSize !== undefined) {
+      assertValidFanOutChunkSize(fanOutChunkSize);
     }
     this.fanOutChunkSize = fanOutChunkSize === Infinity ? undefined : fanOutChunkSize;
     // Bus-wide fan-out pressure budget (EB-156): absent means unlimited
@@ -21482,6 +21514,93 @@ export class EventBus {
       detail: {
         pullBufferSize,
         oldPullBufferSize: currentPullBufferSize,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level fan-out chunk size live (EB-320) without
+   * restarting the bus: `setFanOutChunkSize({ fanOutChunkSize })`
+   * retunes how many subscriber deliveries one synchronous `publish`
+   * performs before yielding to chained `queueMicrotask` steps (see
+   * `EventBusOptions.fanOutChunkSize`, EB-150).
+   *
+   * Only the size moves — the fan-out itself is untouched: matching,
+   * filtering, signing, backpressure, and per-subscriber FIFO are
+   * unchanged, and barrier control messages still bypass chunking
+   * (EB-98). The new size governs from the next publish: the fan-out
+   * captures the live size at publish start, so a chain already in
+   * flight keeps the size it started with and runs its scheduled
+   * microtask chunks to completion at that size — a revision never
+   * re-cuts an in-flight chain mid-flight. Within one publish the
+   * order guarantee is unchanged (scan order, group assignment and
+   * round-robin advance in the same sequence as the synchronous path).
+   *
+   * `Infinity` is the spelled-out default: it restores the
+   * fully-synchronous fan-out (stored as `undefined`, as at
+   * construction). The audit records `null` for the fully-synchronous
+   * state, so `{ fanOutChunkSize: null, oldFanOutChunkSize: 2 }` means
+   * "chunking off, was 2".
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live size and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`assertValidFanOutChunkSize`: a positive integer, or `Infinity`
+   * for the default) against the merged value, so a value that could
+   * not be set at construction cannot be revised in later either —
+   * and a failed call changes nothing at all. A revision that
+   * provides no field, and a revision identical to the current size
+   * (including `Infinity` against the fully-synchronous default),
+   * are both no-ops with no audit. Audited as
+   * `fan_out_chunk_size_revised`
+   * (`{ fanOutChunkSize, oldFanOutChunkSize }`, `null` when
+   * fully-synchronous).
+   *
+   * Orthogonal to EB-150 (that is the chunking mechanism itself —
+   * this the chunk size it reads from), to EB-156 (that retunes the
+   * bus-wide fan-out backpressure budget — this the chunk size), and
+   * to EB-319 (that retunes the pull ring bound — this the fan-out
+   * chunk size).
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `fanOutChunkSize`.
+   */
+  setFanOutChunkSize(opts: FanOutChunkSizeRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setFanOutChunkSize: revision must be an object with fanOutChunkSize',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    // `Infinity` is the spelled-out default: normalize it to
+    // `undefined` (fully-synchronous) before comparing, so
+    // re-affirming the default is a no-op.
+    const currentFanOutChunkSize = this.fanOutChunkSize;
+    const provided = opts.fanOutChunkSize;
+    const fanOutChunkSize =
+      provided === undefined
+        ? currentFanOutChunkSize
+        : provided === Infinity
+          ? undefined
+          : provided;
+    // Re-affirming the current size is a no-op: no retune, no audit.
+    if (fanOutChunkSize === currentFanOutChunkSize) {
+      return;
+    }
+    assertValidFanOutChunkSize(fanOutChunkSize);
+    this.fanOutChunkSize = fanOutChunkSize;
+    this.auditSubscription({
+      action: 'fan_out_chunk_size_revised',
+      actor: 'system',
+      detail: {
+        fanOutChunkSize: fanOutChunkSize ?? null,
+        oldFanOutChunkSize: currentFanOutChunkSize ?? null,
       },
     });
   }

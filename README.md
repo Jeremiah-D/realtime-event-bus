@@ -7906,6 +7906,16 @@ Semantics:
   yields performed by chunked fan-outs (one per scheduled step after the
   synchronous first chunk). It is not exported to Prometheus — it is a
   `getStats()`-only diagnostic.
+- **Retune the chunk size live.** `setFanOutChunkSize({ fanOutChunkSize })`
+  (EB-320) revises the chunk size without restarting the bus: only the
+  size moves, the fan-out itself is untouched, and the new size governs
+  from the next publish — a chain already in flight keeps the size it
+  started with and runs its scheduled microtask chunks to completion at
+  that size. `Infinity` restores the fully-synchronous fan-out (the
+  spelled-out default). Illegal values fail closed with the live size
+  untouched; an identical or empty revision is a no-op with no audit.
+  Audited as `fan_out_chunk_size_revised` (old and new size, `null`
+  when fully-synchronous).
 
 ## Explicit idempotency keys (EB-151)
 

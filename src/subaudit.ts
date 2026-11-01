@@ -176,7 +176,8 @@ export type SubscriptionAuditAction =
   | 'idempotency_revised'
   | 'lineage_revised'
   | 'drop_journal_revised'
-  | 'pull_buffer_revised';
+  | 'pull_buffer_revised'
+  | 'fan_out_chunk_size_revised';
 
 /**
  * One audit entry. `detail` carries action-specific context without
@@ -247,6 +248,7 @@ export type SubscriptionAuditAction =
  * - `lineage_revised`: `{ maxLineageHops, oldMaxLineageHops }` — the bus-level lineage hop cap was revised (EB-317; lineage is always on — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`resolveMaxLineageHops`: a positive integer), so a failed call leaves the live cap untouched; only the cap moves — the lineage records themselves are never rewritten, hop collection is unchanged — and every admission check (the formal check and the `publishAtomic` shadow check) reads the cap live, so a tightened cap rejects a chain that already reached the new bound at the next admission while a widened one admits a chain the old cap would have depth-rejected; messages already admitted keep their lineage — an in-flight message is never re-judged against the new cap, and a message already rejected is never revived; a revision that provides no field, and a revision identical to the current cap, are both no-ops with no audit)
  * - `drop_journal_revised`: `{ maxEntries, oldMaxEntries }` — the bus-level drop journal retention bound was revised (EB-318; the drop journal is always on — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidDropJournalMaxEntries`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the drop determination itself is untouched, drops are still decided by each queue path — and the rows already recorded are retained, never cleared or rewritten: shrinking does not evict immediately (the next record evicts the oldest rows down to the live bound) while a widened bound simply retains more, and lifetime totals (`total` / `byReason`) are unaffected by the revision; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
  * - `pull_buffer_revised`: `{ pullBufferSize, oldPullBufferSize }` — the bus-level pull buffer bound was revised (EB-319; pull is always on — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidPullBufferSize`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the pull mechanism itself is untouched, offsets stay caller-owned, long-poll waiters keep re-reading from their own `fromOffset`, and pull stays independent of push-ACK — and the entries already buffered are retained, never cleared or rewritten: shrinking does not evict immediately (the next publish on a topic truncates that topic's ring down to the live bound) while a widened bound simply retains more; only buses without `durableLogDir` are affected in what `pull()` returns — with a durable log `pull()` reads the log, not the ring; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
+ * - `fan_out_chunk_size_revised`: `{ fanOutChunkSize, oldFanOutChunkSize }` (`null` when fully-synchronous) — the bus-level fan-out chunk size was revised (EB-320; chunking is always available — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidFanOutChunkSize`: a positive integer, or `Infinity` for the fully-synchronous default), so a failed call leaves the live size untouched; only the size moves — the fan-out itself is untouched, matching, filtering, signing, backpressure, and per-subscriber FIFO are unchanged, and barrier control messages still bypass chunking — and the new size governs from the next publish: the fan-out captures the live size at publish start, so a chain already in flight keeps the size it started with and runs its scheduled microtask chunks to completion at that size; a revision that provides no field, and a revision identical to the current size (including `Infinity` against the fully-synchronous default), are both no-ops with no audit)
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -546,6 +548,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'lineage_revised',
   'drop_journal_revised',
   'pull_buffer_revised',
+  'fan_out_chunk_size_revised',
   'dead_letter_replay_requested',
   'dead_letter_replay_approved',
   'dead_letter_replay_rejected',
