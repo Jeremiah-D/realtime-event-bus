@@ -5493,6 +5493,16 @@ Semantics:
   construction; unset means unlimited (the historical behavior).
   `gw.getStats()` exposes the live count per connection in
   `connectionQueues[].subscriptions`.
+- **Live subscription-cap revision (EB-327).**
+  `gw.setGatewayMaxSubscriptionsPerConnection({
+  maxSubscriptionsPerConnection? })` retunes the opt-in cap without
+  restarting the server: an illegal value throws `RangeError` with the
+  live cap untouched, and an empty or identical revision is a no-op.
+  An explicitly `undefined` cap clears it back to unlimited. The new
+  cap governs from the next `subscribe` frame on every connection,
+  existing ones included — tightening denies only new subscribes
+  (existing subscriptions are kept), loosening admits the next
+  subscribe on an over-cap connection at once.
 - **Drain liveness.** The queued backlog is normally drained by the
   socket's `drain` event, which only fires after `write()` returns
   false (past Node's own writable mark). When

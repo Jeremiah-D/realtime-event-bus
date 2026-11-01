@@ -388,7 +388,12 @@ export interface GatewayOptions {
    * frames fail with a `subscribe_denied` error frame — the connection
    * stays open. Defends the gateway against subscription fan-out abuse.
    * Must be a positive integer when given; unset means unlimited
-   * (historical behavior).
+   * (historical behavior). Revisable live with
+   * `setGatewayMaxSubscriptionsPerConnection` (EB-327): the new cap
+   * governs from the next `subscribe` frame on every connection,
+   * existing ones included — tightening denies only new subscribes
+   * (existing subscriptions are kept), and explicitly `undefined`
+   * clears the cap back to unlimited.
    */
   maxSubscriptionsPerConnection?: number;
   /**
@@ -506,6 +511,17 @@ export interface GatewayClientPressureRevision {
    * (positive finite bytes, strictly below the pressure watermark).
    */
   clientPressureRecoveryWatermarkBytes?: number;
+}
+
+/**
+ * A `setGatewayMaxSubscriptionsPerConnection` revision (EB-327): the
+ * per-connection subscription cap. Only the field provided moves — left
+ * out it keeps the live cap, explicitly `undefined` clears it back to
+ * unlimited.
+ */
+export interface GatewaySubscriptionLimitRevision {
+  /** Per-connection subscription cap (positive integer); `undefined` clears it to unlimited. */
+  maxSubscriptionsPerConnection?: number;
 }
 
 export interface GatewayStats {
@@ -671,6 +687,25 @@ function assertValidClientPressure(
   }
 }
 
+/**
+ * Shared per-connection subscription-cap rule (EB-173 construction,
+ * EB-327 revision): a cap must be a positive integer when given;
+ * `undefined` means unlimited. `caller` prefixes the message
+ * (`'invalid gateway options'` at construction,
+ * `'setGatewayMaxSubscriptionsPerConnection'` at revision).
+ */
+function assertValidMaxSubscriptionsPerConnection(
+  value: number | undefined,
+  caller: string,
+): void {
+  if (value === undefined) return;
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new RangeError(
+      `${caller}: maxSubscriptionsPerConnection must be a positive integer`,
+    );
+  }
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
@@ -688,8 +723,8 @@ export class GatewayServer {
   private maxFrameBytes: number;
   /** Mutable live via `setGatewayClientPressure` (EB-326) — see that method. */
   private clientPressureWatermarkBytes: number | undefined;
-  /** Opt-in per-connection subscription cap (EB-173); undefined = unlimited. */
-  private readonly maxSubscriptionsPerConnection: number | undefined;
+  /** Opt-in per-connection subscription cap (EB-173); undefined = unlimited. Mutable live via `setGatewayMaxSubscriptionsPerConnection` (EB-327) — see that method. */
+  private maxSubscriptionsPerConnection: number | undefined;
   /** Mutable live via `setGatewayClientPressure` (EB-326) — see that method. */
   private clientPressureRecoveryWatermarkBytes: number;
   private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
@@ -748,12 +783,10 @@ export class GatewayServer {
     // or unset (unlimited, the historical behavior). Invalid values fail
     // fast with RangeError at construction, matching every other option.
     const maxSubscriptionsPerConnection = options.maxSubscriptionsPerConnection;
-    if (
-      maxSubscriptionsPerConnection !== undefined &&
-      (!Number.isInteger(maxSubscriptionsPerConnection) || maxSubscriptionsPerConnection <= 0)
-    ) {
-      fail('maxSubscriptionsPerConnection must be a positive integer when given');
-    }
+    assertValidMaxSubscriptionsPerConnection(
+      maxSubscriptionsPerConnection,
+      'invalid gateway options',
+    );
     this.maxSubscriptionsPerConnection = maxSubscriptionsPerConnection;
     const onDisconnect = options.onDisconnect;
     if (onDisconnect !== undefined && typeof onDisconnect !== 'function') {
@@ -997,6 +1030,54 @@ export class GatewayServer {
         this.resumePressurePaused(conn, recoveryBeforeClear);
       }
     }
+  }
+
+  /**
+   * Revises the per-connection subscription cap live (EB-327) without
+   * restarting the server: `setGatewayMaxSubscriptionsPerConnection({
+   * maxSubscriptionsPerConnection? })` retunes the opt-in cap (see
+   * `GatewayOptions`: unset means unlimited, the historical behavior).
+   *
+   * An explicitly `undefined` cap clears it back to unlimited; a field
+   * left out keeps the live cap. The new cap governs from the next
+   * `subscribe` frame on every connection, existing ones included:
+   * `handleSubscribe` reads the live value, so tightening the cap
+   * denies only new subscribes — a connection that already holds more
+   * subscriptions than the new cap keeps them, and loosening the cap
+   * admits the next subscribe on an over-cap connection at once.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live cap untouched. Validation reuses the
+   * construction-time rule
+   * (`assertValidMaxSubscriptionsPerConnection`): a cap must be a
+   * positive integer when given — so a value that could not be set at
+   * construction cannot be revised in later either. An empty revision,
+   * and a revision identical to the current cap, are both no-ops.
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `maxSubscriptionsPerConnection`.
+   */
+  setGatewayMaxSubscriptionsPerConnection(opts: GatewaySubscriptionLimitRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGatewayMaxSubscriptionsPerConnection: revision must be an object with maxSubscriptionsPerConnection',
+      );
+    }
+    // An explicitly `undefined` cap is a value here: it clears the cap
+    // back to unlimited. The `in` check tells it apart from a field
+    // left out.
+    const given = 'maxSubscriptionsPerConnection' in opts;
+    const next = given ? opts.maxSubscriptionsPerConnection : this.maxSubscriptionsPerConnection;
+    // Re-affirming the current cap is a no-op.
+    if (next === this.maxSubscriptionsPerConnection) {
+      return;
+    }
+    assertValidMaxSubscriptionsPerConnection(next, 'setGatewayMaxSubscriptionsPerConnection');
+    this.maxSubscriptionsPerConnection = next;
   }
 
   // --- connection lifecycle ------------------------------------------------
