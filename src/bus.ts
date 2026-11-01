@@ -34820,6 +34820,102 @@ export class EventBus {
   }
 
   /**
+   * Revises one consumer group's rebalance-debounce window live
+   * (EB-333) without re-subscribing its members:
+   * `setGroupRebalanceDebounce(groupId, pattern, windowMs |
+   * undefined)` retunes the window that merges a burst of membership
+   * changes into one rebalance event (see
+   * `GroupSubscribeOptions.rebalanceDebounceMs`, EB-169).
+   *
+   * Only the window moves: the roster, the partition assignment, the
+   * assignor, and the member subscriptions are untouched — no member
+   * leaves or rejoins, and no rebalance fires for the revision
+   * itself. A window already armed keeps the timer it was armed with
+   * and flushes at the old value; the new window governs the next
+   * window opened after the revision — a change arriving while a
+   * window is pending is absorbed into that pending window, so the
+   * new value takes effect from the next window, not mid-window.
+   * Passing `undefined` (or `0`, the construction-time "no debounce"
+   * spelling) clears the window back to immediate rebalances. A
+   * group that never debounced can be opted in this way — the first
+   * window opens on its next membership change.
+   *
+   * The revision deliberately does not go through
+   * `checkDebounceConfig`: that is the join-time first-member-fixes
+   * rule, and a live revision must not be refused because the group
+   * already fixed a window. It also does not call
+   * `RebalanceDebouncer.configure` directly: `configure` drops an
+   * armed pending window without flushing (the generation-boundary
+   * rule — a window must never fire into the next generation's
+   * roster), which would contradict the armed-window-flushes-at-the-
+   * old-value rule above. The revision uses
+   * `RebalanceDebouncer.retuneWindow` instead, which moves only the
+   * configured window and leaves a pending window alone.
+   *
+   * Fail-closed: an empty groupId or pattern, an illegal window (a
+   * non-finite number or < 0), and a group the bus does not currently
+   * hold (`groupMembers` has no such key — never joined, or fully
+   * drained; a drained group's retained window configuration is
+   * re-fixed by its next generation's first member, not revised) all
+   * throw `RangeError` with the live window and the audit log
+   * untouched — the window validation reuses the construction-time
+   * rule (a finite number >= 0, `0` meaning no debounce), so a value
+   * that could not be set at join time cannot be revised in later
+   * either. A revision identical to the current window (including
+   * clearing an already-undebounced group) is a no-op with no audit.
+   * Audited as `group_rebalance_debounce_revised` (`{ windowMs:
+   * <number> | null, oldWindowMs: <number> | null }`, `null` when the
+   * group is undebounced; `groupId` / `pattern` ride on the event
+   * itself, like `rebalance`).
+   *
+   * Orthogonal to EB-169 (that is the debounce mechanism itself —
+   * this its window revision), and to `setGroupPartitionCount`
+   * (EB-210, that rescales the competing set — this only retunes
+   * how fast its membership changes are reported).
+   *
+   * Throws `RangeError` for an empty groupId / pattern, an illegal
+   * window, or an unknown consumer group.
+   */
+  setGroupRebalanceDebounce(
+    groupId: string,
+    pattern: string,
+    windowMs: number | undefined,
+  ): void {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('setGroupRebalanceDebounce: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('setGroupRebalanceDebounce: pattern must be a non-empty string');
+    }
+    if (windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs < 0)) {
+      throw new RangeError('setGroupRebalanceDebounce: windowMs must be a finite number of milliseconds >= 0, or undefined to clear it');
+    }
+    const key = EventBus.groupKey(groupId, pattern);
+    if (!this.groupMembers.has(key)) {
+      throw new RangeError(`setGroupRebalanceDebounce: unknown consumer group: ${groupId} / ${pattern}`);
+    }
+    const oldWindowMs = this.rebalancer.getWindowMs(key);
+    // `0` is the construction-time spelling of "no debounce", exactly
+    // like `subscribeToGroup` normalizes it to `undefined`.
+    const next = windowMs === undefined || windowMs === 0 ? undefined : windowMs;
+    // Re-affirming the current window is a no-op: no retune, no audit.
+    if (next === oldWindowMs) {
+      return;
+    }
+    // Only the configured window moves; an armed pending window keeps
+    // its timer and flushes at the old value (see
+    // `RebalanceDebouncer.retuneWindow` — `configure` would drop it).
+    this.rebalancer.retuneWindow(key, next);
+    this.auditSubscription({
+      action: 'group_rebalance_debounce_revised',
+      actor: 'system',
+      groupId,
+      pattern,
+      detail: { windowMs: next ?? null, oldWindowMs: oldWindowMs ?? null },
+    });
+  }
+
+  /**
    * Revises the bus-level consumer-lag SLO tuning live (EB-314) without
    * restarting the bus: `setLagSlo({ maxLagMessages?, maxLagMs?,
    * breachSamples? })` retunes the bounds that decide when a lag row's

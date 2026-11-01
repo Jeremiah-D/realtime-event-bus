@@ -129,6 +129,22 @@ export class RebalanceDebouncer {
   }
 
   /**
+   * Retunes a group's debounce window live (EB-333) without touching a
+   * pending window — unlike `configure`, which drops one. An armed
+   * window keeps the timer it was armed with and flushes at the old
+   * value; the new window governs the next window opened after the
+   * revision (a change arriving while a window is pending is absorbed
+   * into that pending window, never opens a second one). Use this for
+   * a live revision; `configure` stays the generation-boundary path,
+   * where a stale pending window must not fire into the next
+   * generation's roster.
+   */
+  retuneWindow(groupKey: string, windowMs: number | undefined): void {
+    if (windowMs === undefined) this.windows.delete(groupKey);
+    else this.windows.set(groupKey, windowMs);
+  }
+
+  /**
    * Offers a membership change. Returns `true` when the change was
    * absorbed into a debounce window (the caller must not emit now) —
    * either by opening a fresh window or by being counted as suppressed.

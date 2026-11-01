@@ -8488,6 +8488,24 @@ Semantics notes:
   and its subscription is rolled back (members that omit it inherit the
   group's window). A non-finite or negative value throws `RangeError` at
   `subscribeToGroup`, before anything registers.
+- Retune live with `bus.setGroupRebalanceDebounce(groupId, pattern,
+  windowMs | undefined)` (EB-333): only the window moves — the roster,
+  the partition assignment, the assignor, and the member subscriptions
+  are untouched, and no rebalance fires for the revision itself. A
+  window already armed keeps the timer it was armed with and flushes at
+  the old value; the new window governs the next window opened after
+  the revision. Passing `undefined` (or `0`, the construction-time "no
+  debounce" spelling) clears the window back to immediate rebalances,
+  and a group that never debounced can be opted in this way. It is
+  fail-closed (an empty groupId or pattern, a non-finite or negative
+  window, or a group the bus does not currently hold — never joined, or
+  fully drained — throws `RangeError` with the live window and the
+  audit log untouched), and a revision identical to the current window
+  (including clearing an already-undebounced group) is a no-op with no
+  audit. Audited as `group_rebalance_debounce_revised` (`{ windowMs:
+  <number> | null, oldWindowMs: <number> | null }`, `null` when the
+  group is undebounced; `groupId` / `pattern` ride on the event
+  itself, like `rebalance`).
 - If the group fully drains mid-window, the pending window is dropped
   without flushing — a window never fires into the next generation's
   roster. The membership facts remain in the per-change
