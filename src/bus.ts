@@ -35009,6 +35009,79 @@ export class EventBus {
   }
 
   /**
+   * Revises one consumer-group member's handoff-linger window live
+   * (EB-335) without re-subscribing:
+   * `setGroupHandoffLinger(subId, handoffLingerMs)` retunes the window
+   * a leaving member opens over its assigned-but-uncommitted backlog
+   * (see `GroupSubscribeOptions.handoffLingerMs`, EB-32).
+   *
+   * Only the window moves: the member, its group, its assignment, its
+   * committed offsets, and the roster are untouched — no rebalance
+   * fires for the revision itself. `beginLingerHandoff` reads
+   * `subscriber.handoffLingerMs` live at leave time, so the new value
+   * governs only departures after the revision: a window already armed
+   * keeps the `until` it was stamped with, and its covered seqs stay
+   * covered until that stamped expiry — the revision never rewrites a
+   * live window. Passing `0` closes future windows (the member leaves
+   * with no linger, like a member that never opted in), and a member
+   * that never opted in can be opted in this way.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that is not a
+   * consumer-group member (`groupId` unset), and an illegal window (a
+   * non-finite number or < 0) all throw `RangeError` with the live
+   * window and the audit log untouched — the new value reuses the
+   * subscribe-time validation (a finite number >= 0), so a value that
+   * could not be set at join time cannot be revised in later either.
+   * A revision identical to the current window is a no-op with no
+   * audit. Audited as `group_handoff_linger_revised`
+   * (`{ handoffLingerMs: <number>, oldHandoffLingerMs: <number> }`;
+   * `subId` / `groupId` ride on the event itself).
+   *
+   * Orthogonal to EB-32 (that is the linger mechanism itself — this
+   * its window revision), to EB-333 (that retunes the group's
+   * rebalance-debounce window — this retunes one member's handoff
+   * linger), and to EB-169 (that is the debounce mechanism itself).
+   *
+   * Throws `RangeError` for an unknown subscriber, a non-group
+   * subscriber, or an illegal linger window.
+   */
+  setGroupHandoffLinger(subId: string, handoffLingerMs: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setGroupHandoffLinger: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setGroupHandoffLinger: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.groupId === undefined) {
+      throw new RangeError('setGroupHandoffLinger: subscriber is not a consumer-group member');
+    }
+    // Validate before touching anything: the subscribe-time rule is a
+    // finite number >= 0, so the same values subscribe rejects are
+    // rejected here with the live window untouched.
+    if (!Number.isFinite(handoffLingerMs) || handoffLingerMs < 0) {
+      throw new RangeError('setGroupHandoffLinger: handoffLingerMs must be a finite number of milliseconds >= 0');
+    }
+    const oldHandoffLingerMs = subscriber.handoffLingerMs ?? 0;
+    // Re-affirming the current window is a no-op: no retune, no audit.
+    if (handoffLingerMs === oldHandoffLingerMs) {
+      return;
+    }
+    // `beginLingerHandoff` reads this field live at leave time, so the
+    // new value governs only departures after the revision — a window
+    // already armed keeps the `until` it was stamped with.
+    subscriber.handoffLingerMs = handoffLingerMs;
+    this.auditSubscription({
+      action: 'group_handoff_linger_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      groupId: subscriber.groupId,
+      pattern: subscriber.pattern,
+      detail: { handoffLingerMs, oldHandoffLingerMs },
+    });
+  }
+
+  /**
    * Revises the bus-level consumer-lag SLO tuning live (EB-314) without
    * restarting the bus: `setLagSlo({ maxLagMessages?, maxLagMs?,
    * breachSamples? })` retunes the bounds that decide when a lag row's

@@ -584,7 +584,19 @@ library.
   the backlog becomes replayable again (at-least-once). The `leave`
   rebalance event carries `lingerUntil` / `lingering` so operators can see
   the handoff; the operational recipe is `commitOffset` before leaving —
-  the linger only covers what the leaver did not commit. Every resume
+  the linger only covers what the leaver did not commit. Revisable after
+  subscribe (EB-335, via `setGroupHandoffLinger(subId,
+  handoffLingerMs)`): a member's window can be retuned without
+  re-subscribing — the new value governs only departures after the
+  revision (a window already armed keeps the `until` it was stamped
+  with), `0` closes future windows, and a member that never opted in can
+  be opted in this way. It is fail-closed (an unknown subscriber, a
+  subscriber that is not a group member, or a non-finite/negative value
+  throws `RangeError` with the live window and the audit log untouched),
+  and a revision identical to the current window is a no-op with no
+  audit. Every success is audited as `group_handoff_linger_revised`
+  (`{ handoffLingerMs: <number>, oldHandoffLingerMs: <number> }`;
+  `subId` / `groupId` ride on the event itself). Every resume
   replay is observable per subscriber: `getStats().replayProgress` carries
   one row per subscription that replayed — `{ subscriberId, pattern,
   total, replayed, skipped, done, failed, error? }` — counting is
