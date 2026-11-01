@@ -2375,7 +2375,14 @@ library.
   is configurable bus-wide (`EventBusOptions.allowedLatenessMs`, default 0)
   and per topic/pattern (`setTopicAllowedLateness` /
   `clearTopicAllowedLateness`, exact-topic rule wins over patterns, invalid
-  values throw `RangeError`); only admitted publishes move the watermark —
+  values throw `RangeError`); retune the bus-wide default live with
+  `setAllowedLatenessMs(ms, actor?)` (EB-324): only the default moves —
+  per-topic overrides keep winning, the per-topic peak never rolls back,
+  messages already judged late stay late, and the new default governs
+  from the next event-time observation (the next `getStats()` watermark
+  reading reflects it immediately); the change is audited as
+  `allowed_lateness_revised` (`{ from, to }`), and an identical revision
+  is a no-op with no audit. Only admitted publishes move the watermark —
   schema rejections and rate-limit sheds never do. Publishes without an
   event time never participate (the watermark stays unknown), and the event
   time rides the envelope end to end — durable-log record and replay,

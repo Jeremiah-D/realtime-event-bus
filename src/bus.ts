@@ -5623,7 +5623,8 @@ export interface EventBusOptions {
    * `EventBus.setTopicAllowedLateness` win over this default. Must be a
    * non-negative finite number; anything else throws `RangeError` from the
    * constructor. Default 0 — any event time below the observed peak is
-   * late.
+   * late. Retune the default live with
+   * `setAllowedLatenessMs(allowedLatenessMs, actor?)` (EB-324).
    */
   allowedLatenessMs?: number;
   /**
@@ -15423,9 +15424,12 @@ export class EventBus {
    * Bus-wide default allowed lateness in milliseconds for event-time
    * watermark tracking (see `EventBusOptions.allowedLatenessMs`).
    * Per-topic overrides (`setTopicAllowedLateness`) win over this at
-   * observation time.
+   * observation time. Mutable at runtime via `setAllowedLatenessMs` —
+   * `allowedLatenessForTopic` resolves the live default on every
+   * observation, so a revised default governs from the next event-time
+   * observation on any topic without an override.
    */
-  private readonly allowedLatenessMs: number;
+  private allowedLatenessMs: number;
   /**
    * Bus-level late-message hook (see `EventBusOptions.onLate`), fired
    * error-isolated once per late publish.
@@ -19422,6 +19426,73 @@ export class EventBus {
    */
   clearTopicAllowedLateness(topicPattern: string): boolean {
     return this.allowedLatenessRules.delete(topicPattern);
+  }
+
+  /**
+   * Changes the bus-wide default allowed lateness in milliseconds for
+   * event-time watermark tracking at runtime (EB-324):
+   * `setAllowedLatenessMs(allowedLatenessMs, actor?)` retunes how much
+   * business-time lateness a topic tolerates before a message counts as
+   * late (see `EventBusOptions.allowedLatenessMs`, default 0).
+   *
+   * Only the default moves — the watermark mechanism itself is
+   * untouched: per-topic overrides (`setTopicAllowedLateness`, EB-59)
+   * keep winning over the default (exact-topic rule first, then the
+   * earliest-registered matching pattern), the per-topic peak
+   * (`max(eventTime)`) never rolls back, and messages already judged
+   * late stay late — loosening the default never resurrects them.
+   * The new default governs from the next event-time observation on
+   * every topic without an override, and the next `getStats()`
+   * watermark reading reflects it immediately (the watermark is
+   * `maxEventTime - allowedLatenessMs`, resolved per read). Loosening
+   * (a larger grace) admits more on-time arrivals; tightening (a
+   * smaller grace) judges the next observation against a stricter
+   * cutoff right away.
+   *
+   * The change is recorded in the subscription audit log as
+   * `allowed_lateness_revised` (with the previous and new default in
+   * `detail`), so event-time policy changes stay attributable.
+   * Unlike the durable-log revisions there is no `durableLogDir` gate:
+   * watermark tracking is bus-wide and always on.
+   *
+   * Fail-closed: a non-negative-finite value is required — validation
+   * reuses the construction-time rule
+   * (`validateAllowedLatenessMs`). `undefined` is not a new default
+   * (the default is always a number, 0 when unconfigured — there is no
+   * clear semantic here, unlike the durable-log bounds) and throws
+   * `RangeError` with the live default and the audit log untouched. A
+   * revision identical to the current default is a no-op with no audit.
+   *
+   * Orthogonal to EB-59 (that is the per-topic lateness override and
+   * the watermark mechanism — this the bus-level default), to EB-189
+   * (that is idle advancement — this the default lateness value), and
+   * to EB-296 (that retunes tail sampling — this event time).
+   *
+   * Throws `RangeError` for a bad actor or for a non-negative-finite
+   * `allowedLatenessMs` (including `undefined`).
+   */
+  setAllowedLatenessMs(allowedLatenessMs: number, actor = 'system'): void {
+    assertValidActor(actor, 'setAllowedLatenessMs');
+    // The bus default must always be a number (0 when unconfigured):
+    // `undefined` passes `validateAllowedLatenessMs` (it tolerates an
+    // absent constructor option) but is not a legal new default here.
+    if (allowedLatenessMs === undefined) {
+      throw new RangeError(
+        'setAllowedLatenessMs: allowedLatenessMs must be a non-negative finite number of milliseconds',
+      );
+    }
+    validateAllowedLatenessMs(allowedLatenessMs, 'setAllowedLatenessMs');
+    const previous = this.allowedLatenessMs;
+    // Re-affirming the current default is a no-op: no retune, no audit.
+    if (allowedLatenessMs === previous) {
+      return;
+    }
+    this.allowedLatenessMs = allowedLatenessMs;
+    this.auditSubscription({
+      action: 'allowed_lateness_revised',
+      actor,
+      detail: { from: previous, to: allowedLatenessMs },
+    });
   }
 
   /**
