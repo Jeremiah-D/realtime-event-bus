@@ -5458,7 +5458,7 @@ Semantics:
   `gw.getStats()` reports
   `{connections, framesReceived, framesSent, droppedFrames, authFailures,
   protocolErrors, pausedConnections, connectionQueues, compressedFrames,
-  deflatedBytes, savedBytes, limits}`.
+  deflatedBytes, savedBytes, limits, deflate}`.
 - **Live limit revision (EB-325).** `gw.setGatewayLimits({ maxFrameBytes?,
   maxPendingBytes?, sendHighWaterMarkBytes? })` retunes the three bounds
   without restarting the server: only the fields provided move, an
@@ -5516,6 +5516,24 @@ Semantics:
   existing ones included — tightening denies only new subscribes
   (existing subscriptions are kept), loosening admits the next
   subscribe on an over-cap connection at once.
+- **Live permessage-deflate revision (EB-330).**
+  `gw.setGatewayDeflate({ compressThresholdBytes?,
+  serverMaxWindowBits?, clientMaxWindowBits?, maxInflatedBytes? })`
+  retunes the opt-in permessage-deflate tuning without restarting the
+  server: only the fields provided move, an illegal value throws
+  `RangeError` with the live tuning untouched, and an empty or
+  identical revision is a no-op. The threshold and the bomb cap govern
+  from the next message / frame on every connection, existing ones
+  included; the window bits bind only connections established after
+  the revision — a connection that is already open keeps the window
+  bits its handshake negotiated until it reconnects. A gateway that
+  never enabled permessage-deflate refuses the revision with
+  `RangeError`, and the extension can never be cleared or disabled
+  through a revision (an explicitly `undefined` field keeps its live
+  value — clearing it would make already-negotiated connections'
+  inbound compressed frames fail with a 1002 protocol error). There
+  is no audit event for this revision; `gw.getStats().deflate`
+  reports the live tuning (`undefined` when disabled).
 - **Drain liveness.** The queued backlog is normally drained by the
   socket's `drain` event, which only fires after `write()` returns
   false (past Node's own writable mark). When

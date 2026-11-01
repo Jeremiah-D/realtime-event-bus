@@ -465,7 +465,13 @@ export interface GatewayOptions {
    * the original go out plaintext. `serverMaxWindowBits` /
    * `clientMaxWindowBits` (default 15, range 8–15) tune the LZ77
    * windows in each direction. Invalid values throw `RangeError` at
-   * construction, like every other option.
+   * construction, like every other option. Revisable live with
+   * `setGatewayDeflate` (EB-330): the threshold and the bomb cap
+   * govern from the next message / frame on every connection, existing
+   * ones included, while the window bits bind only connections
+   * established after the revision; a gateway that never enabled the
+   * extension refuses the revision, and the extension can never be
+   * cleared or disabled through a revision.
    */
   permessageDeflate?: boolean | PerMessageDeflateOptions;
 }
@@ -524,6 +530,28 @@ export interface GatewaySubscriptionLimitRevision {
   maxSubscriptionsPerConnection?: number;
 }
 
+/**
+ * A `setGatewayDeflate` revision (EB-330): any subset of the four
+ * permessage-deflate tuning fields. Only the fields provided move — a
+ * field left out (or explicitly `undefined`) keeps its live value.
+ * There is deliberately no way to clear or disable the extension
+ * through a revision: clearing it would make already-negotiated
+ * connections' inbound compressed frames fail with a 1002 protocol
+ * error, so a gateway that never enabled permessage-deflate refuses
+ * the revision with `RangeError` instead of switching the extension
+ * on — unlike `setGatewayClientPressure` / `setGatewayMaxSubscriptionsPerConnection`, which have an explicit-`undefined` clear.
+ */
+export interface GatewayDeflateRevision {
+  /** Payloads smaller than this are sent as-is (positive integer). */
+  compressThresholdBytes?: number;
+  /** LZ77 window bits the server uses when compressing to a client (integer 8–15). */
+  serverMaxWindowBits?: number;
+  /** Maximum LZ77 window bits the server lets a client use when compressing to us (integer 8–15). */
+  clientMaxWindowBits?: number;
+  /** Cap on the inflated bytes of one decompressed message (positive integer). */
+  maxInflatedBytes?: number;
+}
+
 export interface GatewayStats {
   connections: number;
   framesReceived: number;
@@ -569,6 +597,14 @@ export interface GatewayStats {
     maxPendingBytes: number;
     sendHighWaterMarkBytes: number;
   };
+  /**
+   * Live permessage-deflate tuning (EB-330): the values
+   * `setGatewayDeflate` last revised, or the construction values —
+   * `undefined` when permessage-deflate is disabled. The window bits
+   * are the live values for *new* connections: a connection that is
+   * already open keeps the window bits its handshake negotiated.
+   */
+  deflate: ResolvedPerMessageDeflate | undefined;
 }
 
 interface ConnectionSubscription {
@@ -728,11 +764,11 @@ export class GatewayServer {
   /** Mutable live via `setGatewayClientPressure` (EB-326) — see that method. */
   private clientPressureRecoveryWatermarkBytes: number;
   private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
-  /** Resolved permessage-deflate config (EB-206); undefined = disabled. */
-  private readonly deflateOpts: ResolvedPerMessageDeflate | undefined;
+  /** Resolved permessage-deflate config (EB-206); undefined = disabled. Mutable live via `setGatewayDeflate` (EB-330) — see that method. */
+  private deflateOpts: ResolvedPerMessageDeflate | undefined;
   private server: TcpServer | null = null;
   private readonly connections = new Set<Connection>();
-  private readonly stats: Omit<GatewayStats, 'pausedConnections' | 'connectionQueues' | 'limits'> = {
+  private readonly stats: Omit<GatewayStats, 'pausedConnections' | 'connectionQueues' | 'limits' | 'deflate'> = {
     connections: 0,
     framesReceived: 0,
     framesSent: 0,
@@ -852,6 +888,7 @@ export class GatewayServer {
         maxPendingBytes: this.maxPendingBytes,
         sendHighWaterMarkBytes: this.sendHighWaterMarkBytes,
       },
+      deflate: this.deflateOpts === undefined ? undefined : { ...this.deflateOpts },
     };
   }
 
@@ -1078,6 +1115,94 @@ export class GatewayServer {
     }
     assertValidMaxSubscriptionsPerConnection(next, 'setGatewayMaxSubscriptionsPerConnection');
     this.maxSubscriptionsPerConnection = next;
+  }
+
+  /**
+   * Revises the permessage-deflate tuning live (EB-330) without
+   * restarting the server: `setGatewayDeflate({
+   * compressThresholdBytes?, serverMaxWindowBits?,
+   * clientMaxWindowBits?, maxInflatedBytes? })` retunes the opt-in
+   * extension (see `GatewayOptions.permessageDeflate` for the
+   * defaults: threshold 1024, both window bits 15, bomb cap 8 MiB).
+   *
+   * Only the fields provided move — a partial revision keeps the
+   * fields it leaves out. The propagation splits by field, following
+   * `setGatewayLimits`' `maxFrameBytes` precedent: `threshold` and
+   * the bomb cap govern from the next message / frame on every
+   * connection, existing ones included — the send path reads
+   * `compressThresholdBytes` live per message (`buildFrame`) and the
+   * inbound path reads `maxInflatedBytes` live per frame
+   * (`processWsMessage`) — while the window bits bind only
+   * connections established after the revision: each connection's
+   * `deflate` captures the negotiated `serverWindowBits` once, at
+   * handshake time, so an already-open connection keeps compressing
+   * with the window it negotiated until it reconnects.
+   *
+   * There is deliberately no way to clear or disable the extension
+   * through a revision (unlike `setGatewayClientPressure`'s clear
+   * mode): an explicitly `undefined` field is not a value and keeps
+   * its live value, and a gateway that never enabled
+   * permessage-deflate refuses the revision outright — clearing the
+   * extension would make already-negotiated connections' inbound
+   * compressed frames fail with a 1002 protocol error.
+   *
+   * There is no audit event for this revision: like `setGatewayLimits`
+   * / `setGatewayClientPressure` /
+   * `setGatewayMaxSubscriptionsPerConnection`, the gateway keeps no
+   * audit log — the live tuning is observable in
+   * `getStats().deflate` instead.
+   *
+   * Fail-closed: a gateway with permessage-deflate disabled, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning untouched. Validation reuses the
+   * construction-time rule (`resolvePerMessageDeflate`): the
+   * threshold and the bomb cap are positive integers, the window
+   * bits integers 8–15 — so a value that could not be set at
+   * construction cannot be revised in later either. An empty
+   * revision, and a revision identical to the current tuning, are
+   * both no-ops.
+   *
+   * Throws `RangeError` when permessage-deflate is not enabled, for a
+   * non-object revision, or for an illegal `compressThresholdBytes`,
+   * `serverMaxWindowBits`, `clientMaxWindowBits`, or
+   * `maxInflatedBytes`.
+   */
+  setGatewayDeflate(opts: GatewayDeflateRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGatewayDeflate: revision must be an object with compressThresholdBytes, serverMaxWindowBits, clientMaxWindowBits and/or maxInflatedBytes',
+      );
+    }
+    const current = this.deflateOpts;
+    if (current === undefined) {
+      throw new RangeError(
+        'setGatewayDeflate: permessage-deflate is not enabled (pass permessageDeflate at construction first)',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    // Reusing the construction-time rule keeps the two in agreement.
+    const merged = resolvePerMessageDeflate({
+      compressThresholdBytes: opts.compressThresholdBytes ?? current.compressThresholdBytes,
+      serverMaxWindowBits: opts.serverMaxWindowBits ?? current.serverMaxWindowBits,
+      clientMaxWindowBits: opts.clientMaxWindowBits ?? current.clientMaxWindowBits,
+      maxInflatedBytes: opts.maxInflatedBytes ?? current.maxInflatedBytes,
+    })!;
+    // Re-affirming the current tuning is a no-op.
+    if (
+      merged.compressThresholdBytes === current.compressThresholdBytes &&
+      merged.serverMaxWindowBits === current.serverMaxWindowBits &&
+      merged.clientMaxWindowBits === current.clientMaxWindowBits &&
+      merged.maxInflatedBytes === current.maxInflatedBytes
+    ) {
+      return;
+    }
+    this.deflateOpts = merged;
   }
 
   // --- connection lifecycle ------------------------------------------------
