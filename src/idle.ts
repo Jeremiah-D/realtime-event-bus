@@ -30,6 +30,12 @@
  *   `false` for an unknown subscription id (including subscriptions that
  *   never opted in). The bus decides which events qualify before calling
  *   it, so the manager never sees non-qualifying traffic.
+ * - `retune` replaces a live window's size (EB-334): the pending timer
+ *   is cancelled and a fresh window of the new size starts from the
+ *   revision moment; later `activity()` calls re-arm with the new size,
+ *   and an expiry after the revision reports the new `maxIdleMs`.
+ *   `current` reads the live size for the revision's no-op comparison
+ *   and its audit entry.
  * - `clear` cancels the timer — called from every unsubscribe path, so
  *   no phantom expiry can fire after the subscriber is gone.
  * - `adoptUnsubscribe` lets the subscribe-family wrappers
@@ -140,6 +146,39 @@ export class IdleReclaimer {
     unrefTimer(timer);
     entry.timer = timer;
     return true;
+  }
+
+  /**
+   * The live idle window for `subId`, in milliseconds, or `undefined`
+   * when it holds no active window (unknown id, a subscription that
+   * never opted in, or one whose window was cleared). A live revision
+   * (`EventBus.setIdleWindow`, EB-334) reads this to compare against
+   * the proposed value and to audit the previous window.
+   */
+  current(subId: string): number | undefined {
+    return this.entries.get(subId)?.maxIdleMs;
+  }
+
+  /**
+   * Retunes a live idle window (EB-334): the pending timer is
+   * cancelled and a fresh window of `maxIdleMs` starts from the
+   * revision moment; later `activity()` calls re-arm with the new
+   * value, and an expiry after the revision reports the new
+   * `maxIdleMs`. Returns the previous window, or `undefined` when
+   * `subId` holds no active window (nothing is armed). The entry's
+   * `pattern`, `idleActivity` and `unsubscribe` are untouched — only
+   * the window size and its timer move.
+   */
+  retune(subId: string, maxIdleMs: number): number | undefined {
+    const entry = this.entries.get(subId);
+    if (entry === undefined) return undefined;
+    const oldMaxIdleMs = entry.maxIdleMs;
+    clearTimeout(entry.timer);
+    const timer = setTimeout(() => this.fire(subId), maxIdleMs);
+    unrefTimer(timer);
+    entry.timer = timer;
+    entry.maxIdleMs = maxIdleMs;
+    return oldMaxIdleMs;
   }
 
   /**

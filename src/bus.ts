@@ -29630,6 +29630,99 @@ export class EventBus {
   }
 
   /**
+   * Revises one idle subscriber's reclamation window live (EB-334)
+   * without re-subscribing: `setIdleWindow(subId, maxIdleMs | null)`
+   * retunes the inactivity bound a subscription expires on (see
+   * `SubscribeOptions.maxIdleMs`, EB-72).
+   *
+   * Only the window moves: a non-null revision clears the pending
+   * timer and re-arms a fresh window of the new size from the revision
+   * moment, so the subscriber expires `maxIdleMs` after its last
+   * qualifying activity measured from the revision — not from the
+   * subscribe moment, and not from the old window's remaining time.
+   * Later activity re-arms with the new value (`IdleReclaimer`
+   * reads the entry live), and an expiry after the revision reports
+   * the new `maxIdleMs` on the `onIdleExpired` event. The
+   * `idleActivity` mode is untouched: which events count as activity
+   * stays exactly as subscribed. The lease, if any, is untouched too
+   * — the two opt-ins stay independent, whichever fires first still
+   * wins. Passing `null` clears the window: the subscriber keeps
+   * running with no idle expiry at all, and a later revision is
+   * refused until the subscriber opts in again at subscribe time
+   * (the EB-267 clear rule). A revision identical to the current
+   * window is a no-op with no audit — and the pending timer is not
+   * re-armed, so a no-op never extends a subscriber's life.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `maxIdleMs` (or whose window was already cleared),
+   * and a non-positive-integer value — `0`, negatives, fractions,
+   * `NaN`, `Infinity`, a non-number, and `undefined` (only an
+   * explicit `null` clears) — all throw `RangeError` with the live
+   * window, its timer, and the audit log untouched. The new value
+   * reuses the subscribe-time validation (a positive integer number
+   * of milliseconds), so a failed call leaves the live window
+   * untouched. Audited as `idle_window_revised`
+   * (`{ maxIdleMs: <number> | null, oldMaxIdleMs: <number> }`,
+   * `null` for a clear) on success.
+   *
+   * Orthogonal to the subscribe-time window of EB-72 (this revises
+   * it, that sets it), to `renewLease` (a fixed lifetime from
+   * subscribe, not an activity-re-armed window), and to `setSlowStart`
+   * (EB-332, a delivery ramp — this only moves the idle bound).
+   *
+   * Throws `RangeError` for an unknown / non-idle subscriber or an
+   * illegal idle window.
+   */
+  setIdleWindow(subId: string, maxIdleMs: number | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setIdleWindow: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setIdleWindow: unknown subscriber: ${subId}`);
+    }
+    const oldMaxIdleMs = this.idleReclaimer.current(subId);
+    if (oldMaxIdleMs === undefined) {
+      throw new RangeError('setIdleWindow: subscriber has no idle window set');
+    }
+    if (maxIdleMs === null) {
+      // Clearing drops the timer with the window: the subscriber
+      // keeps running, and `recordIdleActivity` keeps calling
+      // `activity()` on a missing entry, which no-ops — the mode is
+      // preserved but can never fire again until re-subscribe.
+      this.idleReclaimer.clear(subId);
+      this.auditSubscription({
+        action: 'idle_window_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { maxIdleMs: null, oldMaxIdleMs },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and the subscribe-time rule is
+    // a positive integer, so the same values subscribe rejects are
+    // rejected here with the live window untouched.
+    if (!Number.isInteger(maxIdleMs) || maxIdleMs <= 0) {
+      throw new RangeError('setIdleWindow: maxIdleMs must be a positive integer number of milliseconds, or null to clear it');
+    }
+    // Re-affirming the current window is a no-op: no retune, no
+    // audit, and the pending timer keeps its original fire time.
+    if (maxIdleMs === oldMaxIdleMs) {
+      return;
+    }
+    this.idleReclaimer.retune(subId, maxIdleMs);
+    this.auditSubscription({
+      action: 'idle_window_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { maxIdleMs, oldMaxIdleMs },
+    });
+  }
+
+  /**
    * Revises the health-probe parameters of one probed subscriber
    * (EB-267): a probed subscriber can retune its failure budget without
    * re-subscribing. The revision is partial: a field left out keeps its

@@ -1116,6 +1116,25 @@ library.
   (`subscribeToGroup` passes the option through). Non-positive-integer
   `maxIdleMs` (including `NaN`), an `idleActivity` without `maxIdleMs`,
   or an unknown activity mode throws `RangeError` at subscribe time.
+  Revisable after subscribe (EB-334, via
+  `setIdleWindow(subId, maxIdleMs | null)`): an idle subscriber's window
+  can be retuned without re-subscribing — a non-null revision clears the
+  pending timer and re-arms a fresh window of the new size from the
+  revision moment, later activity re-arms with the new value, and an
+  expiry after the revision reports the new `maxIdleMs` on the
+  `onIdleExpired` event; the `idleActivity` mode and the lease (if any)
+  are untouched. Passing `null` clears the window (the subscriber keeps
+  running with no idle expiry), and a later revision is refused until
+  the subscriber opts in again at subscribe time. It is fail-closed (an
+  unknown subscriber, a subscriber that never opted into `maxIdleMs` —
+  or whose window was already cleared — or a non-positive-integer value
+  throws `RangeError` with the live window, its timer, and the audit log
+  untouched; `undefined` is not a clear, only `null` is), and a revision
+  identical to the current window is a no-op with no audit — the pending
+  timer is not re-armed. Every success is audited as
+  `idle_window_revised` (`{ maxIdleMs: <number> | null, oldMaxIdleMs:
+  <number> }`). (Real-time systems / backend engineering: subscriber
+  lifecycle governance.)
   Disabled by default — fully backward compatible.
 - **Graceful drain-on-unsubscribe** (opt-in via
   `subscription.unsubscribe({ drain: true, drainTimeoutMs })`): instead of
