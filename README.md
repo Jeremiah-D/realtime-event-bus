@@ -1923,6 +1923,31 @@ library.
   backlog when no new publishes arrive. `getStats().rampingSubscribers`
   counts subscriptions still ramping. Invalid options throw `RangeError`
   from `subscribe`; cannot be combined with `shadow`. Disabled by default.
+  Revisable after subscribe (EB-332, via
+  `setSlowStart(subId, opts | null)`): a slow-starting subscriber's ramp
+  can be retuned without re-subscribing — a non-null revision replaces
+  the live gate with a fresh one built from the new options, so the
+  subscriber re-ramps from the revision moment (a gate whose window
+  already elapsed but is still attached re-ramps the same way), with
+  the target read live (the subscriber's `deliveryShaping` cap when
+  configured, full speed otherwise). The revision is a full
+  replacement: a field left out takes the documented default
+  (`initialPerSec` 10, `rampMs` 1000, `strategy` `'linear'`), `true`
+  takes all defaults, and a revision identical to the current gate's
+  parameters is a no-op with no audit. A revision that would build no
+  gate (`initialPerSec` at or above the live target) is a documented
+  no-op that leaves the live gate alone, and `null` clears the gate
+  back to full speed at once. It is fail-closed (an unknown subscriber,
+  a subscriber that never opted into slow-start — or whose completed
+  gate a drain already dropped — a non-object / non-boolean value, or
+  an illegal rate, window, or strategy throws `RangeError` with the
+  live gate, its timer, and the audit log untouched; `undefined` and
+  `false` are not a clear, only `null` is, and a revision after a
+  clear is refused until the subscriber opts in again at subscribe
+  time), and every success is audited as `slow_start_revised`
+  (`{ slowStart: { initialPerSec, rampMs, strategy } | null,
+  oldSlowStart: { initialPerSec, rampMs, strategy } }`). (Real-time
+  systems: delivery governance.)
 - **Per-subscriber sliding-window delivery rate limit** (in
   `src/ratewindow.ts`, opt-in via
   `subscribe(..., { rateLimit: { maxMessages, perWindowMs } })`): a hard

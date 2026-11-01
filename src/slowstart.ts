@@ -156,6 +156,21 @@ export class SlowStartGate {
   }
 
   /**
+   * The resolved options this gate was built from (a defensive copy).
+   * A live revision (`EventBus.setSlowStart`, EB-332) compares a
+   * proposed revision against these field by field, and audits them as
+   * the gate's previous parameters — the gate itself never exposes its
+   * mutable token state.
+   */
+  options(): ResolvedSlowStartOptions {
+    return {
+      initialPerSec: this.initialPerSec,
+      rampMs: this.rampMs,
+      strategy: this.strategy,
+    };
+  }
+
+  /**
    * Consumes one token when available. Returns true when the caller may
    * deliver, false when the ramp currently allows nothing. Never consumes
    * a token on a false return.

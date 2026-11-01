@@ -88,7 +88,8 @@ import type { TailSamplingOptions, TailSamplingRevision } from './tail-sampling.
 import { SlidingWindowLimiter } from './ratewindow.ts';
 import {
   createSlowStartGate,
-  type SlowStartGate,
+  resolveSlowStartOptions,
+  SlowStartGate,
   type SlowStartOptions,
 } from './slowstart.ts';
 import {
@@ -29486,6 +29487,144 @@ export class EventBus {
       detail: { deliveryShaping: { messagesPerSec, burst }, oldDeliveryShaping },
     });
     // A raised rate or burst may have made queued messages
+    // admittable; a lowered one simply admits nothing new.
+    this.scheduleFlush();
+  }
+
+  /**
+   * Revises one slow-starting subscriber's ramp parameters live
+   * (EB-332) without re-subscribing: `setSlowStart(subId, opts |
+   * null)` retunes the ramp a fresh subscription paces itself with
+   * (see `SubscribeOptions.slowStart`, EB-75).
+   *
+   * Only the ramp moves: a non-null revision replaces the live gate
+   * with a fresh one built from the new options, so the subscriber
+   * re-ramps from the revision moment — the new gate starts at the
+   * new `initialPerSec` and climbs over the new `rampMs` toward the
+   * live target. The target is read live at revision time: the
+   * subscriber's `deliveryShaping` cap when shaping is configured,
+   * full speed (`Infinity`) otherwise — exactly the target
+   * `subscribe` would have used. A later shaping revision never
+   * retargets a gate already running (see `setDeliveryShaping`,
+   * EB-266), and a slow-start revision never retunes the shaping
+   * bucket: the two gates stay orthogonal, and the drain keeps
+   * reading `subscriber.slowStart` live, so the new gate paces the
+   * next flush round. The queued messages stay queued in order, the
+   * in-flight count is untouched, and no message is dropped or
+   * reordered by the revision. A gate whose ramp window already
+   * elapsed but is still attached (no drain has dropped it yet) is
+   * revised the same way: the replacement re-ramps from the revision
+   * moment — there is no "already warm" fast path. A revision that
+   * would build no gate is a documented no-op, mirroring
+   * subscribe-time inertness: when `initialPerSec` is already at or
+   * above the live target there is no ramp to run, so the live gate
+   * is left alone and nothing is audited — only an explicit `null`
+   * clears a gate. Passing `null` clears the gate: the subscriber
+   * returns to full speed immediately, a pending re-flush timer is
+   * cancelled (the same cleanup unsubscribe performs), and a later
+   * revision is refused until the subscriber opts in again at
+   * subscribe time.
+   *
+   * The revision is a full replacement, not a partial merge: options
+   * reuse `resolveSlowStartOptions`, so a field left out takes the
+   * documented default (`initialPerSec` 10, `rampMs` 1000,
+   * `strategy` `'linear'`), and `true` takes all defaults. A
+   * revision identical to the current gate's parameters, field by
+   * field, is a no-op with no audit.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `slowStart` (or whose completed gate a drain already
+   * dropped), a non-object / non-boolean value, an illegal
+   * `initialPerSec` (non-finite or <= 0), `rampMs` (non-finite or
+   * <= 0) or `strategy` (not `'linear'` / `'exponential'`), and
+   * `undefined` / `false` — only an explicit `null` clears — all
+   * throw `RangeError` with the live gate, its re-flush timer, and
+   * the audit log untouched. Audited as `slow_start_revised`
+   * (`{ slowStart: { initialPerSec, rampMs, strategy } | null,
+   * oldSlowStart: { initialPerSec, rampMs, strategy } }`, `null`
+   * for a clear) on success. `getStats().rampingSubscribers`
+   * already reads the live gate, so it reflects a revision (and a
+   * re-ramp) with no new field.
+   *
+   * Orthogonal to the subscribe-time ramp of EB-75 (this revises it,
+   * that sets it), to `setDeliveryShaping` (EB-266, that retunes the
+   * shaping cap — this only re-reads it as the ramp target), and to
+   * `setRateLimit` (EB-271, a separate limiter that still bounds
+   * every delivery the retuned ramp admits).
+   *
+   * Throws `RangeError` for an unknown / non-slow-start subscriber
+   * or an illegal slow-start value.
+   */
+  setSlowStart(subId: string, opts: boolean | SlowStartOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setSlowStart: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setSlowStart: unknown subscriber: ${subId}`);
+    }
+    const gate = subscriber.slowStart;
+    if (gate == null) {
+      throw new RangeError('setSlowStart: subscriber has no slowStart set');
+    }
+    const oldSlowStart = gate.options();
+    if (opts === null) {
+      // Drop the armed re-flush timer with the gate: the timer
+      // callback re-reads the live gate and would no-op, but a
+      // cleared subscriber should not keep a wake-up at all.
+      this.clearSlowStartTimer(subscriber);
+      subscriber.slowStart = undefined;
+      this.auditSubscription({
+        action: 'slow_start_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { slowStart: null, oldSlowStart },
+      });
+      // The cleared subscriber is unpaced now: queued messages
+      // become admittable on this flush.
+      this.scheduleFlush();
+      return;
+    }
+    // Validate before touching anything: `undefined` and `false`
+    // are not a clear — only an explicit `null` clears — and the
+    // revision is a full replacement, so resolution happens here,
+    // against the documented defaults, before the gate is replaced.
+    const resolved = resolveSlowStartOptions(opts);
+    if (resolved === undefined) {
+      throw new RangeError('setSlowStart: slowStart must be a boolean or a SlowStartOptions object, or null to clear it');
+    }
+    // Re-affirming the current ramp is a no-op: no retune, no audit.
+    if (
+      resolved.initialPerSec === oldSlowStart.initialPerSec &&
+      resolved.rampMs === oldSlowStart.rampMs &&
+      resolved.strategy === oldSlowStart.strategy
+    ) {
+      return;
+    }
+    // A ramp with no headroom builds no gate (see
+    // `createSlowStartGate`): the option is inert at subscribe time,
+    // and a revision that would build no gate leaves the live gate
+    // alone — only an explicit `null` clears it. The target is read
+    // live: the subscriber's shaping cap when configured, full speed
+    // otherwise.
+    const target = subscriber.deliveryShaping?.messagesPerSec ?? Number.POSITIVE_INFINITY;
+    if (resolved.initialPerSec >= target) {
+      return;
+    }
+    // Only the ramp moves: the old gate's armed re-flush timer is
+    // cancelled with it, the queue and the in-flight count are
+    // untouched, and the drain picks the new gate up live.
+    this.clearSlowStartTimer(subscriber);
+    subscriber.slowStart = new SlowStartGate(resolved, target, this.now);
+    this.auditSubscription({
+      action: 'slow_start_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { slowStart: { ...resolved }, oldSlowStart },
+    });
+    // A raised initial rate may have made queued messages
     // admittable; a lowered one simply admits nothing new.
     this.scheduleFlush();
   }
