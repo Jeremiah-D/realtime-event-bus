@@ -8632,6 +8632,15 @@ Semantics notes:
   changelog consumer's ordering key.
 - `maxKeys` (default 10000) bounds the table: the least-recently-updated
   key is evicted first, counted in `getStats().stateStore.evictedKeys`.
+  Retune the bound live with `setStateStoreMaxKeys(maxKeys, actor?)`
+  (EB-329): only the bound moves — surviving rows keep their content,
+  `version` and `seq`, and the changelog topic is untouched. Tightening
+  evicts the least-recently-updated rows down to the new bound
+  immediately (counted in `evictedKeys`); loosening only raises the
+  ceiling. A bus whose state store is not enabled throws `RangeError`,
+  as does a non-positive-integer bound; an identical revision is a
+  no-op with no audit. Audited as `state_store_max_keys_revised`
+  (`{ maxKeys, oldMaxKeys, evictedKeys }`).
 - `changelogTopic` (opt-in) receives one record per update:
   `{ topic, key, value, oldValue, seq, at, version }`. Changelog records
   are *unkeyed* — they can never feed back into the store (the key rides
@@ -8647,8 +8656,8 @@ Semantics notes:
   the enable itself aborts with zero partial state.
 - Enabling twice throws `RangeError` (fail-fast); invalid options throw
   before anything is enabled.
-- `getStats().stateStore` → `{ keys, evictedKeys }` (present only when
-  enabled).
+- `getStats().stateStore` → `{ keys, evictedKeys, maxKeys }` (present only when
+  enabled; `maxKeys` is the live bound).
 - Prometheus: `eventbus_statestore_keys`,
   `eventbus_statestore_evicted_keys_total` (rendered only when enabled).
 

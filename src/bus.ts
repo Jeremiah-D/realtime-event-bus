@@ -19827,6 +19827,71 @@ export class EventBus {
   }
 
   /**
+   * Changes the materialized state store's `maxKeys` bound at runtime
+   * (EB-329): `setStateStoreMaxKeys(maxKeys, actor?)` retunes how many
+   * keys the table tracks before the least-recently-updated key is
+   * evicted (see `StateStoreOptions.maxKeys`, default 10000).
+   *
+   * Only the bound moves — the store mechanism itself is untouched:
+   * `apply` / `restore` keep reading the bound live, so the next
+   * admitted keyed publish evicts under the new bound, and the rows
+   * already tracked are retained with their content, `version` and
+   * `seq` intact. Tightening evicts the least-recently-updated rows
+   * down to the new bound immediately (counted in
+   * `getStats().stateStore.evictedKeys`, and in the audit detail as
+   * `evictedKeys`), while loosening simply raises the ceiling. The
+   * changelog topic is untouched — updates keep emitting there.
+   *
+   * The change is recorded in the subscription audit log as
+   * `state_store_max_keys_revised` (with the previous and new bound
+   * and the rows evicted by the revision in `detail`), so state-store
+   * capacity governance stays attributable.
+   *
+   * Fail-closed: a bus whose state store is not enabled has no bound
+   * to retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently inert without `enableStateStore`, a
+   * revision explicitly refuses. A non-positive-integer bound also
+   * throws `RangeError` with the live bound and the audit log
+   * untouched: validation reuses the construction-time rule
+   * (`validateStateStoreOptions`: a positive integer). A revision
+   * identical to the current bound is a no-op with no audit.
+   *
+   * Orthogonal to EB-171 (that is the state-store mechanism itself —
+   * this the capacity bound), to `setTopicKeyTtl` (that retunes a
+   * durable-log key TTL — this the in-memory table capacity), and to
+   * EB-322/323 (those retune the durable log's on-disk retention
+   * bounds — this the in-memory table bound).
+   *
+   * Throws `RangeError` for a bad actor, for a non-positive-integer
+   * `maxKeys`, or when the state store is not enabled.
+   */
+  setStateStoreMaxKeys(maxKeys: number, actor = 'system'): void {
+    assertValidActor(actor, 'setStateStoreMaxKeys');
+    const store = this.stateStore;
+    if (store === undefined) {
+      throw new RangeError(
+        'setStateStoreMaxKeys: the state store is not enabled (call enableStateStore first)',
+      );
+    }
+    const previous = store.currentMaxKeys();
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (maxKeys === previous) {
+      return;
+    }
+    const evictedBefore = store.snapshot().evictedKeys;
+    store.setMaxKeys(maxKeys);
+    this.auditSubscription({
+      action: 'state_store_max_keys_revised',
+      actor,
+      detail: {
+        maxKeys,
+        oldMaxKeys: previous,
+        evictedKeys: store.snapshot().evictedKeys - evictedBefore,
+      },
+    });
+  }
+
+  /**
    * Reads the latest materialized value for (topic, key) — `undefined`
    * when the store is disabled or the key was never published. The topic
    * is matched exactly (the alias-resolved concrete topic, as published).

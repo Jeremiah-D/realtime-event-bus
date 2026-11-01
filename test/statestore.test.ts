@@ -186,5 +186,5 @@ test('state store: unit-level apply/scan semantics', () => {
   const e2 = store.apply('t', 'k', 'v2', 2)!;
   assert.equal(e2.version, 2);
   assert.deepEqual(store.scan('t'), [e2]);
-  assert.deepEqual(store.snapshot(), { keys: 1, evictedKeys: 0 });
+  assert.deepEqual(store.snapshot(), { keys: 1, evictedKeys: 0, maxKeys: 10 });
 });

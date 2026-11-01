@@ -17,7 +17,9 @@
  * - `version` is a per-(topic, key) update counter starting at 1 — the
  *   changelog consumer's ordering key.
  * - Memory is bounded by `maxKeys`: the least-recently-updated key is
- *   evicted first (LRU); evictions are counted, never silent.
+ *   evicted first (LRU); evictions are counted, never silent. The bound
+ *   is revisable at runtime via `setMaxKeys` (EB-329): tightening evicts
+ *   down to the new bound immediately, loosening only raises it.
  * - An opt-in `changelogTopic` emits one record per update
  *   (`{ topic, key, value, oldValue, seq, at, version }`). Changelog
  *   records are *unkeyed*, so they can never feed back into the store —
@@ -73,6 +75,11 @@ export interface StateStoreStats {
   keys: number;
   /** Keys evicted by the `maxKeys` bound since the store was created. */
   evictedKeys: number;
+  /**
+   * The live `maxKeys` bound — the value `setMaxKeys` moves (EB-329);
+   * the construction-time bound until the first revision.
+   */
+  maxKeys: number;
 }
 
 const DEFAULT_MAX_KEYS = 10000;
@@ -109,7 +116,8 @@ export function validateStateStoreOptions(opts: StateStoreOptions | undefined): 
 
 export class StateStore {
   private readonly deps: StateStoreDeps;
-  private readonly maxKeys: number;
+  /** Live bound — revisable at runtime via `setMaxKeys` (EB-329). */
+  private maxKeys: number;
   /** Composite key `${topic}\u0000${key}` → row. Map iteration order is the LRU order (oldest first). */
   private readonly rows = new Map<string, StoredRow>();
   private evictedKeys = 0;
@@ -117,6 +125,48 @@ export class StateStore {
   constructor(deps: StateStoreDeps, opts?: StateStoreOptions) {
     this.deps = deps;
     this.maxKeys = opts?.maxKeys ?? DEFAULT_MAX_KEYS;
+  }
+
+  /**
+   * Changes the `maxKeys` bound at runtime (EB-329). Returns the
+   * previous bound. Throws `RangeError` for a non-positive-integer
+   * value, leaving the live bound exactly as it was. Tightening
+   * evicts the least-recently-updated rows down to the new bound
+   * immediately (counted in `evictedKeys`); loosening only raises the
+   * bound. Surviving rows keep their content, `version` and `seq`,
+   * and the changelog topic is untouched — only the bound moves. The
+   * bus wraps this as `setStateStoreMaxKeys` and records the change
+   * in the subscription audit log (`state_store_max_keys_revised`).
+   */
+  setMaxKeys(maxKeys: number): number {
+    if (typeof maxKeys !== 'number' || !Number.isInteger(maxKeys) || maxKeys <= 0) {
+      throw new RangeError('maxKeys must be a positive integer');
+    }
+    const previous = this.maxKeys;
+    this.maxKeys = maxKeys;
+    this.evictExcess();
+    return previous;
+  }
+
+  /** The current `maxKeys` bound — the live value `setMaxKeys` moves. */
+  currentMaxKeys(): number {
+    return this.maxKeys;
+  }
+
+  /**
+   * Evicts least-recently-updated rows until the table fits the live
+   * bound. Returns how many rows were evicted by this call.
+   */
+  private evictExcess(): number {
+    let evicted = 0;
+    while (this.rows.size > this.maxKeys) {
+      const oldest = this.rows.keys().next();
+      if (oldest.done) break;
+      this.rows.delete(oldest.value);
+      this.evictedKeys += 1;
+      evicted += 1;
+    }
+    return evicted;
   }
 
   /**
@@ -145,12 +195,7 @@ export class StateStore {
     if (existing !== undefined) this.rows.delete(composite);
     this.rows.set(composite, { entry });
     // Bound the table: evict the least-recently-updated rows first.
-    while (this.rows.size > this.maxKeys) {
-      const oldest = this.rows.keys().next();
-      if (oldest.done) break;
-      this.rows.delete(oldest.value);
-      this.evictedKeys += 1;
-    }
+    this.evictExcess();
     return entry;
   }
 
@@ -174,12 +219,8 @@ export class StateStore {
     };
     if (existing !== undefined) this.rows.delete(composite);
     this.rows.set(composite, { entry });
-    while (this.rows.size > this.maxKeys) {
-      const oldest = this.rows.keys().next();
-      if (oldest.done) break;
-      this.rows.delete(oldest.value);
-      this.evictedKeys += 1;
-    }
+    // Bound the table: evict the least-recently-updated rows first.
+    this.evictExcess();
   }
 
   /** Reads the latest entry for (topic, key), or `undefined`. */
@@ -204,7 +245,7 @@ export class StateStore {
 
   /** Live counters for `getStats().stateStore`. */
   snapshot(): StateStoreStats {
-    return { keys: this.rows.size, evictedKeys: this.evictedKeys };
+    return { keys: this.rows.size, evictedKeys: this.evictedKeys, maxKeys: this.maxKeys };
   }
 
   /** Clears the table (used by `disableStateStore`); eviction history is kept. */
