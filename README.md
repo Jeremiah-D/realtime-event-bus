@@ -2196,7 +2196,17 @@ library.
   outlet (when configured) and is counted in `getStats().sloMisses` /
   `sloMissesByPhase`. Default off: with the flag off, SLO tracking
   behaves exactly like the bullet above — no phase stamping, no extra
-  clock reads, no ops alert.
+  clock reads, no ops alert. Retune the switch live with
+  `setProcessingLatencySloAlert(enabled)` (EB-331): only subscriptions
+  created after the revision read the live value — a `latencySlo`
+  subscriber created while the switch is on builds a `sloPhase`, one
+  created while it is off builds none — and subscriptions already built
+  are untouched (an armed subscriber keeps attributing after a disable,
+  an unarmed one gains nothing after an enable). A non-boolean value
+  throws `RangeError` with the live switch untouched; an identical
+  revision is a no-op with no audit. Audited as
+  `processing_latency_slo_alert_revised` (`{ enabled, oldEnabled }`).
+  (Real-time systems / backend engineering: latency-SLO observability.)
 - **Per-subscriber lag watermark monitoring** (in `src/lag.ts`, opt-in via
   `subscribe(..., { lagMonitor: true })`): answers the live question — "how
   far behind is this consumer *right now*?" — Kafka-consumer-lag style.

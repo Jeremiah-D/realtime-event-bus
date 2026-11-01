@@ -5335,7 +5335,8 @@ export interface EventBusOptions {
    * alert on the ops outlet (when configured). The in-process callback's
    * legacy fields are unchanged. Default false: with the flag off, SLO
    * tracking behaves exactly like EB-53 alone — no phase stamping, no
-   * extra clock reads, no ops alert.
+   * extra clock reads, no ops alert. Mutable at runtime via
+   * `setProcessingLatencySloAlert` (EB-331).
    */
   processingLatencySloAlert?: boolean;
   /**
@@ -15951,9 +15952,11 @@ export class EventBus {
    * Whether SLO-miss phase attribution is armed bus-wide (EB-133, see
    * `EventBusOptions.processingLatencySloAlert`). When false, no
    * subscriber stamps phases — SLO tracking behaves exactly like EB-53
-   * alone.
+   * alone. Mutable at runtime via `setProcessingLatencySloAlert`
+   * (EB-331): only subscriptions created after the revision read the
+   * live value.
    */
-  private readonly processingLatencySloAlert: boolean;
+  private processingLatencySloAlert: boolean;
   /**
    * Delayed-delivery schedule-skew observability (EB-136, see
    * `EventBusOptions.scheduleSkew`). Absent when the option is not
@@ -29047,6 +29050,65 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { p99ThresholdMs, oldP99ThresholdMs },
+    });
+  }
+
+  /**
+   * Revises the bus-level processing-latency SLO alert switch live
+   * (EB-331) without restarting the bus:
+   * `setProcessingLatencySloAlert(enabled)` arms or disarms SLO-miss
+   * phase attribution (see `EventBusOptions.processingLatencySloAlert`,
+   * EB-133).
+   *
+   * Only the switch moves: `subscribe` reads the live value when a
+   * subscription is created, so the revision governs only
+   * subscriptions created after it — a `latencySlo` subscriber
+   * created while the switch is on builds a `sloPhase` and stamps
+   * phases, one created while it is off builds none. Subscriptions
+   * already built are untouched: an armed subscriber keeps its
+   * `sloPhase` (and keeps attributing misses) after a disable, and
+   * an unarmed subscriber gains none after an enable — there is no
+   * retrofitting, and no re-subscribe is needed for the new value to
+   * take effect on the next subscription. Existing SLO statistics
+   * are untouched: the trackers, their samples, the `alerted`
+   * latches, and the `getStats()` shape are exactly as they were.
+   *
+   * Fail-closed: a non-boolean `enabled` throws `RangeError` with
+   * the live switch and the audit log untouched — the validation
+   * reuses the construction-time rule
+   * (`options?.processingLatencySloAlert === true` arms the switch,
+   * anything else leaves it off), so a value that could not arm the
+   * switch at construction cannot revise it in later either. A
+   * revision identical to the current switch is a no-op with no
+   * audit. Audited as `processing_latency_slo_alert_revised`
+   * (`{ enabled: <boolean>, oldEnabled: <boolean> }`).
+   *
+   * Orthogonal to EB-133 (that is the phase attribution itself —
+   * this the live switch for it), to EB-290
+   * (`setLatencySloThreshold`, that revises one subscriber's p99
+   * threshold — this the bus-wide arming switch), and to EB-53
+   * (that is the latency-SLO tracking itself — this only whether
+   * its misses carry phase attribution).
+   *
+   * Throws `RangeError` for a non-boolean `enabled`.
+   */
+  setProcessingLatencySloAlert(enabled: boolean): void {
+    if (typeof enabled !== 'boolean') {
+      throw new RangeError('setProcessingLatencySloAlert: enabled must be a boolean');
+    }
+    // Re-affirming the current switch is a no-op: no retune, no audit.
+    if (enabled === this.processingLatencySloAlert) {
+      return;
+    }
+    const oldEnabled = this.processingLatencySloAlert;
+    // Only the switch moves; already-built subscribers keep the
+    // `sloPhase` they were created with, and the next `subscribe`
+    // reads the live value.
+    this.processingLatencySloAlert = enabled;
+    this.auditSubscription({
+      action: 'processing_latency_slo_alert_revised',
+      actor: 'system',
+      detail: { enabled, oldEnabled },
     });
   }
 
