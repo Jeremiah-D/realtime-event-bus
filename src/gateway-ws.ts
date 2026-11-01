@@ -370,7 +370,9 @@ export interface GatewayOptions {
   authToken?: string;
   /**
    * Socket-buffer bytes past which a connection pauses pushing frames
-   * and queues them locally instead. Default 256 KiB.
+   * and queues them locally instead. Default 256 KiB. Revisable live
+   * with `setGatewayLimits` (EB-325): the new mark governs from the
+   * next write on every connection, existing ones included.
    *
    * Implementation note: the queued backlog is normally drained by the
    * socket's `drain` event, which only fires after `write()` returns
@@ -391,12 +393,18 @@ export interface GatewayOptions {
   maxSubscriptionsPerConnection?: number;
   /**
    * Cap on the per-connection local queue while paused; past it the
-   * newest frame is dropped and counted. Default 1 MiB.
+   * newest frame is dropped and counted. Default 1 MiB. Revisable live
+   * with `setGatewayLimits` (EB-325): the new bound governs from the
+   * next write on every connection, existing ones included.
    */
   maxPendingBytes?: number;
   /**
    * Largest single inbound frame accepted. Past it the connection is
-   * closed with 1009. Default 1 MiB.
+   * closed with 1009. Default 1 MiB. Revisable live with
+   * `setGatewayLimits` (EB-325) — but only for connections established
+   * after the revision: each connection's `FrameParser` captures the
+   * bound once, at connect time, so an already-open connection keeps
+   * its old bound until it reconnects.
    */
   maxFrameBytes?: number;
   /**
@@ -458,6 +466,20 @@ export interface GatewayDisconnectEvent {
   remoteAddress?: string;
 }
 
+/**
+ * A `setGatewayLimits` revision (EB-325): any subset of the three
+ * frame and queue limits. Only the fields provided move — a field left
+ * out (or explicitly `undefined`) keeps its live value.
+ */
+export interface GatewayLimitsRevision {
+  /** Largest single inbound frame accepted (positive finite bytes). */
+  maxFrameBytes?: number;
+  /** Cap on the per-connection local queue while paused (positive finite bytes). */
+  maxPendingBytes?: number;
+  /** Socket-buffer bytes past which a connection pauses pushing frames (positive finite bytes). */
+  sendHighWaterMarkBytes?: number;
+}
+
 export interface GatewayStats {
   connections: number;
   framesReceived: number;
@@ -492,6 +514,17 @@ export interface GatewayStats {
   deflatedBytes: number;
   /** Sum of `original − compressed` bytes saved by compression. */
   savedBytes: number;
+  /**
+   * Live frame and queue limits (EB-325): the values `setGatewayLimits`
+   * last revised, or the construction defaults. `maxFrameBytes` is the
+   * bound the *next* connection gets — a connection that is already
+   * open keeps the bound its `FrameParser` captured at connect time.
+   */
+  limits: {
+    maxFrameBytes: number;
+    maxPendingBytes: number;
+    sendHighWaterMarkBytes: number;
+  };
 }
 
 interface ConnectionSubscription {
@@ -565,6 +598,19 @@ function fail(msg: string): never {
   throw new RangeError(`invalid gateway options: ${msg}`);
 }
 
+/**
+ * Shared positive-finite-bytes rule for the three gateway limits
+ * (EB-325): construction and `setGatewayLimits` agree — a value that
+ * could not be set at construction cannot be revised in later.
+ * `caller` prefixes the message (`'invalid gateway options'` at
+ * construction, `'setGatewayLimits'` at revision).
+ */
+function assertValidGatewayLimitBytes(value: number, name: string, caller: string): void {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${caller}: ${name} must be a positive finite number`);
+  }
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
@@ -576,9 +622,10 @@ export class GatewayServer {
   private readonly host: string;
   private readonly port: number;
   private readonly authToken: string | undefined;
-  private readonly sendHighWaterMarkBytes: number;
-  private readonly maxPendingBytes: number;
-  private readonly maxFrameBytes: number;
+  /** Mutable live via `setGatewayLimits` (EB-325) — see that method. */
+  private sendHighWaterMarkBytes: number;
+  private maxPendingBytes: number;
+  private maxFrameBytes: number;
   private readonly clientPressureWatermarkBytes: number | undefined;
   /** Opt-in per-connection subscription cap (EB-173); undefined = unlimited. */
   private readonly maxSubscriptionsPerConnection: number | undefined;
@@ -588,7 +635,7 @@ export class GatewayServer {
   private readonly deflateOpts: ResolvedPerMessageDeflate | undefined;
   private server: TcpServer | null = null;
   private readonly connections = new Set<Connection>();
-  private readonly stats: GatewayStats = {
+  private readonly stats: Omit<GatewayStats, 'pausedConnections' | 'connectionQueues' | 'limits'> = {
     connections: 0,
     framesReceived: 0,
     framesSent: 0,
@@ -610,19 +657,17 @@ export class GatewayServer {
     }
     this.authToken = authToken;
     const sendHighWaterMarkBytes = options.sendHighWaterMarkBytes ?? 256 * 1024;
-    if (!Number.isFinite(sendHighWaterMarkBytes) || sendHighWaterMarkBytes <= 0) {
-      fail('sendHighWaterMarkBytes must be a positive finite number');
-    }
+    assertValidGatewayLimitBytes(
+      sendHighWaterMarkBytes,
+      'sendHighWaterMarkBytes',
+      'invalid gateway options',
+    );
     this.sendHighWaterMarkBytes = sendHighWaterMarkBytes;
     const maxPendingBytes = options.maxPendingBytes ?? 1024 * 1024;
-    if (!Number.isFinite(maxPendingBytes) || maxPendingBytes <= 0) {
-      fail('maxPendingBytes must be a positive finite number');
-    }
+    assertValidGatewayLimitBytes(maxPendingBytes, 'maxPendingBytes', 'invalid gateway options');
     this.maxPendingBytes = maxPendingBytes;
     const maxFrameBytes = options.maxFrameBytes ?? 1024 * 1024;
-    if (!Number.isFinite(maxFrameBytes) || maxFrameBytes <= 0) {
-      fail('maxFrameBytes must be a positive finite number');
-    }
+    assertValidGatewayLimitBytes(maxFrameBytes, 'maxFrameBytes', 'invalid gateway options');
     this.maxFrameBytes = maxFrameBytes;
     const clientPressureWatermarkBytes = options.clientPressureWatermarkBytes;
     if (clientPressureWatermarkBytes !== undefined) {
@@ -713,7 +758,87 @@ export class GatewayServer {
         subscriptions: conn.subscriptions.size,
       });
     }
-    return { ...this.stats, pausedConnections, connectionQueues };
+    return {
+      ...this.stats,
+      pausedConnections,
+      connectionQueues,
+      limits: {
+        maxFrameBytes: this.maxFrameBytes,
+        maxPendingBytes: this.maxPendingBytes,
+        sendHighWaterMarkBytes: this.sendHighWaterMarkBytes,
+      },
+    };
+  }
+
+  /**
+   * Revises the gateway's frame and queue limits live (EB-325) without
+   * restarting the server: `setGatewayLimits({ maxFrameBytes?,
+   * maxPendingBytes?, sendHighWaterMarkBytes? })` retunes the three
+   * bounds (see `GatewayOptions` for the defaults: 1 MiB / 1 MiB /
+   * 256 KiB).
+   *
+   * Only the fields provided move — a partial revision keeps the fields
+   * it leaves out. `sendHighWaterMarkBytes` and `maxPendingBytes`
+   * govern from the next write on every connection, existing ones
+   * included: the send path reads the live values on every frame
+   * (`sendRaw`, `scheduleDrainPoll`, `flushPending`), so a lowered
+   * queue bound drops the next overflowing frame on a connection that
+   * was already paused, and a lowered high-water mark queues the next
+   * frame on a connection whose socket buffer is already past it.
+   *
+   * `maxFrameBytes` is different: each connection's `FrameParser`
+   * captures the bound once, at connect time — so a revision binds
+   * only connections established after it. A connection that is
+   * already open keeps its old bound until it reconnects; the live
+   * value in `getStats().limits` is the bound the *next* connection
+   * gets.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with every live limit untouched. Validation reuses the
+   * construction-time rule (`assertValidGatewayLimitBytes`: a positive
+   * finite number) against the merged value, so a value that could not
+   * be set at construction cannot be revised in later either — and a
+   * failed call changes nothing at all. A revision that provides no
+   * field, and a revision identical to the current limits, are both
+   * no-ops.
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `maxFrameBytes`, `maxPendingBytes`, or `sendHighWaterMarkBytes`.
+   */
+  setGatewayLimits(opts: GatewayLimitsRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGatewayLimits: revision must be an object with maxFrameBytes, maxPendingBytes and/or sendHighWaterMarkBytes',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    const maxFrameBytes = opts.maxFrameBytes ?? this.maxFrameBytes;
+    const maxPendingBytes = opts.maxPendingBytes ?? this.maxPendingBytes;
+    const sendHighWaterMarkBytes = opts.sendHighWaterMarkBytes ?? this.sendHighWaterMarkBytes;
+    // Re-affirming the current limits is a no-op.
+    if (
+      maxFrameBytes === this.maxFrameBytes &&
+      maxPendingBytes === this.maxPendingBytes &&
+      sendHighWaterMarkBytes === this.sendHighWaterMarkBytes
+    ) {
+      return;
+    }
+    assertValidGatewayLimitBytes(maxFrameBytes, 'maxFrameBytes', 'setGatewayLimits');
+    assertValidGatewayLimitBytes(maxPendingBytes, 'maxPendingBytes', 'setGatewayLimits');
+    assertValidGatewayLimitBytes(
+      sendHighWaterMarkBytes,
+      'sendHighWaterMarkBytes',
+      'setGatewayLimits',
+    );
+    this.maxFrameBytes = maxFrameBytes;
+    this.maxPendingBytes = maxPendingBytes;
+    this.sendHighWaterMarkBytes = sendHighWaterMarkBytes;
   }
 
   // --- connection lifecycle ------------------------------------------------

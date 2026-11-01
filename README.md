@@ -5445,7 +5445,17 @@ Semantics:
   `gw.getStats()` reports
   `{connections, framesReceived, framesSent, droppedFrames, authFailures,
   protocolErrors, pausedConnections, connectionQueues, compressedFrames,
-  deflatedBytes, savedBytes}`.
+  deflatedBytes, savedBytes, limits}`.
+- **Live limit revision (EB-325).** `gw.setGatewayLimits({ maxFrameBytes?,
+  maxPendingBytes?, sendHighWaterMarkBytes? })` retunes the three bounds
+  without restarting the server: only the fields provided move, an
+  illegal value throws `RangeError` with the live limits untouched, and
+  an empty or identical revision is a no-op. `sendHighWaterMarkBytes`
+  and `maxPendingBytes` govern from the next write on every connection,
+  existing ones included; `maxFrameBytes` binds only connections
+  established after the revision — a connection that is already open
+  keeps the bound its `FrameParser` captured at connect time until it
+  reconnects. `gw.getStats().limits` reports the live values.
 - **Client pressure (EB-161, opt-in).** With
   `clientPressureWatermarkBytes` set, a connection whose queued bytes
   reach the watermark pauses its bus subscriptions (delivery-side hold —
