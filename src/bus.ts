@@ -215,6 +215,7 @@ import {
 } from './subaudit.ts';
 import {
   DropJournal,
+  assertValidDropJournalMaxEntries,
   type DropJournalEntry,
   type DropJournalFilter,
   type DropJournalStats,
@@ -1425,6 +1426,21 @@ export interface LineageRevision {
    * provided — the construction-time rule.
    */
   maxLineageHops?: number;
+}
+
+/**
+ * Revision for the bus-level drop journal retention bound (see
+ * `EventBus.setDropJournal`, EB-318). Only the field provided moves;
+ * the drop determination itself is never revised by a revision — only
+ * how many drop rows the ring retains.
+ */
+export interface DropJournalRevision {
+  /**
+   * Maximum rows retained in the drop journal ring; the oldest rows
+   * are evicted past this bound. Must be a positive integer when
+   * provided — the construction-time rule.
+   */
+  maxEntries?: number;
 }
 
 /**
@@ -4955,7 +4971,8 @@ export interface EventBusOptions {
    * subscriber queues, queried with `getDropJournal` and summarized in
    * `getStats().dropJournal`. The oldest rows are evicted past this
    * size; lifetime totals survive in the stats. Must be a positive
-   * integer.
+   * integer. Retune live with `setDropJournal({ maxEntries })`
+   * (EB-318).
    */
   dropJournalMaxEntries?: number;
   /**
@@ -17357,11 +17374,8 @@ export class EventBus {
     // Subscriber-queue drop journal (EB-225): validated fail-fast like
     // the other bounded options above; the journal itself validates too.
     const dropJournalMaxEntries = options?.dropJournalMaxEntries;
-    if (
-      dropJournalMaxEntries !== undefined &&
-      (!Number.isInteger(dropJournalMaxEntries) || dropJournalMaxEntries < 1)
-    ) {
-      throw new RangeError('dropJournalMaxEntries must be a positive integer');
+    if (dropJournalMaxEntries !== undefined) {
+      assertValidDropJournalMaxEntries(dropJournalMaxEntries);
     }
     this.dropJournal = new DropJournal(dropJournalMaxEntries);
     // Pull-mode ring buffer size (EB-111): validated fail-fast like the
@@ -21297,6 +21311,72 @@ export class EventBus {
       detail: {
         maxLineageHops,
         oldMaxLineageHops: currentMaxLineageHops,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level drop journal retention bound live (EB-318)
+   * without restarting the bus: `setDropJournal({ maxEntries })`
+   * retunes how many per-message drop rows the in-memory ring retains
+   * (see `EventBusOptions.dropJournalMaxEntries`, EB-225).
+   *
+   * Only the bound moves — the drop determination itself is untouched:
+   * drops are still decided by each queue path (backpressure shed,
+   * refusal, drain-time expiry), and the journal only records them.
+   * The rows already recorded are retained, never cleared or
+   * rewritten: shrinking does not evict immediately — the next
+   * `record` evicts the oldest rows down to the live bound — while a
+   * widened bound simply retains more. Lifetime totals
+   * (`getStats().dropJournal.total` / `byReason`) are unaffected by
+   * the revision: a full ring never hides that drops happened, only
+   * which ones, oldest first.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live bound and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`assertValidDropJournalMaxEntries`: a positive integer) against
+   * the merged value, so a value that could not be set at construction
+   * cannot be revised in later either — and a failed call changes
+   * nothing at all. A revision that provides no field, and a revision
+   * identical to the current bound, are both no-ops with no audit.
+   * Audited as `drop_journal_revised`
+   * (`{ maxEntries, oldMaxEntries }`).
+   *
+   * Orthogonal to EB-309 (that retunes the publish audit journal's
+   * retention — this the drop journal's retention), and to EB-296
+   * (that retunes tail sampling — this the drop journal bound).
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `maxEntries`.
+   */
+  setDropJournal(opts: DropJournalRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setDropJournal: revision must be an object with maxEntries',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    const currentMaxEntries = this.dropJournal.current();
+    const maxEntries = opts.maxEntries ?? currentMaxEntries;
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (maxEntries === currentMaxEntries) {
+      return;
+    }
+    assertValidDropJournalMaxEntries(maxEntries);
+    this.dropJournal.retune(maxEntries);
+    this.auditSubscription({
+      action: 'drop_journal_revised',
+      actor: 'system',
+      detail: {
+        maxEntries,
+        oldMaxEntries: currentMaxEntries,
       },
     });
   }

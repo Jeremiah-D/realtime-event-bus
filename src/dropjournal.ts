@@ -93,10 +93,24 @@ export interface DropJournalStats {
 /** Default bound of the in-memory ring (oldest rows evicted first). */
 export const DROP_JOURNAL_DEFAULT_MAX_ENTRIES = 1000;
 
+/**
+ * Validates `EventBusOptions.dropJournalMaxEntries` the way the
+ * constructor would (EB-318): a positive integer. Throws `RangeError`
+ * on an illegal value — before anything is mutated. Shared by the
+ * constructor, `DropJournal.retune`, and `EventBus.setDropJournal`, so
+ * a value that could not be set at construction cannot be revised in
+ * later either.
+ */
+export function assertValidDropJournalMaxEntries(value: unknown): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new RangeError('dropJournalMaxEntries must be a positive integer');
+  }
+}
+
 const DROP_REASONS: readonly DropReason[] = ['evicted', 'refused', 'ttl-expired', 'deadline-expired'];
 
 export class DropJournal {
-  private readonly capacity: number;
+  private capacity: number;
   private readonly entries: DropJournalEntry[] = [];
   private totalRecorded = 0;
   private readonly byReasonCount: Record<DropReason, number> = {
@@ -107,16 +121,39 @@ export class DropJournal {
   };
 
   constructor(maxEntries: number = DROP_JOURNAL_DEFAULT_MAX_ENTRIES) {
-    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
-      throw new RangeError('dropJournalMaxEntries must be a positive integer');
-    }
+    assertValidDropJournalMaxEntries(maxEntries);
     this.capacity = maxEntries;
+  }
+
+  /**
+   * Retunes the ring's retention bound live (EB-318). Only the bound
+   * moves — the drop determination itself is untouched (drops are still
+   * decided by each queue path; the journal only records them), and the
+   * rows already recorded are retained, never cleared or rewritten:
+   * shrinking does not evict immediately — the next `record` evicts the
+   * oldest rows down to the live bound — while lifetime totals (`total`,
+   * `byReason`) are unaffected by the revision. Validates fail-fast
+   * with the construction-time rule, so an illegal value leaves the
+   * live bound exactly as it was.
+   */
+  retune(maxEntries: number): void {
+    assertValidDropJournalMaxEntries(maxEntries);
+    this.capacity = maxEntries;
+  }
+
+  /** The current retention bound — the live value `retune` moves. */
+  current(): number {
+    return this.capacity;
   }
 
   /** Records one drop. Never stores the payload — identity only. */
   record(entry: DropJournalEntry): void {
     this.entries.push({ ...entry });
-    if (this.entries.length > this.capacity) this.entries.shift();
+    // Evict down to the live bound, not just one row: after a retune
+    // shrinks the bound the ring can hold several rows past it, and the
+    // next record must bring it back to the bound in one step. With a
+    // fixed bound this loop sheds exactly one row, as before.
+    while (this.entries.length > this.capacity) this.entries.shift();
     this.totalRecorded += 1;
     this.byReasonCount[entry.reason] += 1;
   }

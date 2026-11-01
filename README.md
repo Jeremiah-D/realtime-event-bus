@@ -4924,6 +4924,15 @@ Details:
   `dropJournalMaxEntries`; lifetime totals survive in
   `getStats().dropJournal`, so a full ring never hides that drops
   happened — only which ones, oldest first.
+- **Retune the bound live.** `setDropJournal({ maxEntries })` (EB-318)
+  revises the retention bound without restarting the bus: only the
+  bound moves, the drop determination itself is untouched, and the rows
+  already recorded are retained — shrinking does not evict immediately
+  (the next record evicts the oldest rows down to the live bound) while
+  a widened bound simply retains more. Lifetime totals are unaffected
+  by the revision. Illegal values fail closed with the live bound
+  untouched; an identical or empty revision is a no-op with no audit.
+  Audited as `drop_journal_revised` (old and new bound).
 - **Orthogonal** — the reliable DLQ (EB-28) keeps payloads and
   replays; the publish audit (EB-138) records admissions, not drops.
   The drop journal is the per-message record of what the queue itself
