@@ -6211,6 +6211,17 @@ Semantics:
   (`EventBusOptions.pullBufferSize`, default 1000); history older than
   the ring is unavailable, and an unknown topic resolves `[]`, never an
   error.
+- **Retune the bound live.** `setPullBuffer({ pullBufferSize })`
+  (EB-319) revises the per-topic ring bound without restarting the bus:
+  only the bound moves, the pull mechanism itself is untouched, and
+  the entries already buffered are retained — shrinking does not evict
+  immediately (the next publish on a topic truncates that topic's ring
+  down to the live bound) while a widened bound simply retains more.
+  Illegal values fail closed with the live bound untouched; an
+  identical or empty revision is a no-op with no audit. Audited as
+  `pull_buffer_revised` (old and new bound). Only buses without
+  `durableLogDir` are affected in what `pull()` returns — with a
+  durable log `pull()` reads the log, not the ring.
 - **Long poll.** When nothing newer than `fromOffset` is available and
   `waitMs > 0`, the call waits up to `waitMs` for the next publish on
   the topic instead of returning `[]` immediately; on expiry it resolves

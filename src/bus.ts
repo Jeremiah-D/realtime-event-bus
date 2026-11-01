@@ -1444,6 +1444,22 @@ export interface DropJournalRevision {
 }
 
 /**
+ * Revision for the bus-level pull buffer bound (see
+ * `EventBus.setPullBuffer`, EB-319). Only the field provided moves;
+ * the pull mechanism itself is never revised by a revision — only how
+ * many of the most recent admitted messages per topic the in-memory
+ * ring retains for `pull()`.
+ */
+export interface PullBufferRevision {
+  /**
+   * Maximum admitted messages retained per topic in the pull ring;
+   * the oldest messages are evicted past this bound. Must be a
+   * positive integer when provided — the construction-time rule.
+   */
+  pullBufferSize?: number;
+}
+
+/**
  * Tuning for opt-in causal (happens-before) delivery (see
  * `SubscribeOptions.causal`).
  */
@@ -5008,6 +5024,7 @@ export interface EventBusOptions {
    * buses without `durableLogDir`; buses with a durable log read from the
    * log instead, but still keep the buffer — it drives long-poll wakeups
    * and keeps the hot path allocation-cheap. Must be a positive integer.
+   * Retune live with `setPullBuffer({ pullBufferSize })` (EB-319).
    */
   pullBufferSize?: number;
   /**
@@ -9218,6 +9235,19 @@ function assertValidIdempotencyOptions(
   }
   if (!Number.isInteger(maxEntries) || maxEntries < 1) {
     throw new RangeError(`${caller}: idempotencyMaxEntries must be a positive integer`);
+  }
+}
+
+/**
+ * Validates `EventBusOptions.pullBufferSize` the way the constructor
+ * would (EB-319): a positive integer. Throws `RangeError` on an
+ * illegal value — before anything is mutated. Shared by the
+ * constructor and `EventBus.setPullBuffer`, so a value that could not
+ * be set at construction cannot be revised in later either.
+ */
+function assertValidPullBufferSize(value: unknown): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new RangeError('pullBufferSize must be a positive integer');
   }
 }
 
@@ -16420,8 +16450,10 @@ export class EventBus {
    */
   private readonly pullRing = new Map<string, PullRingEntry[]>();
   private readonly pullWaiters = new Map<string, Set<PullWaiter>>();
-  /** `EventBusOptions.pullBufferSize` as configured (default 1000). */
-  private readonly pullBufferSize: number;
+  /** `EventBusOptions.pullBufferSize` as configured (default 1000).
+   * Live-revised by `setPullBuffer` (EB-319): not `readonly`, because
+   * every publish reads it live to bound the pull ring. */
+  private pullBufferSize: number;
   /**
    * `EventBusOptions.fanOutChunkSize` as configured (EB-150); `undefined`
    * means the default fully-synchronous fan-out. `Infinity` is normalized
@@ -17381,11 +17413,8 @@ export class EventBus {
     // Pull-mode ring buffer size (EB-111): validated fail-fast like the
     // other bounded options above.
     const pullBufferSize = options?.pullBufferSize;
-    if (
-      pullBufferSize !== undefined &&
-      (!Number.isInteger(pullBufferSize) || pullBufferSize < 1)
-    ) {
-      throw new RangeError('pullBufferSize must be a positive integer');
+    if (pullBufferSize !== undefined) {
+      assertValidPullBufferSize(pullBufferSize);
     }
     this.pullBufferSize = pullBufferSize ?? 1000;
     // Hot-topic fan-out chunking (EB-150): validated fail-fast like the
@@ -21377,6 +21406,82 @@ export class EventBus {
       detail: {
         maxEntries,
         oldMaxEntries: currentMaxEntries,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level pull buffer bound live (EB-319) without
+   * restarting the bus: `setPullBuffer({ pullBufferSize })` retunes how
+   * many of the most recent admitted messages per topic the in-memory
+   * ring retains for `pull()` (see `EventBusOptions.pullBufferSize`,
+   * EB-111).
+   *
+   * Only the bound moves — the pull mechanism itself is untouched:
+   * offsets stay caller-owned, long-poll waiters keep re-reading from
+   * their own `fromOffset`, and pull stays independent of push-ACK.
+   * The entries already buffered are retained, never cleared or
+   * rewritten: shrinking does not evict immediately — the next publish
+   * on a topic truncates that topic's ring down to the live bound (the
+   * truncation in `notePullPublish` already reads the live bound and
+   * splices all excess in one step) — while a widened bound simply
+   * retains more. A pending long-poll waiter is unaffected by the
+   * revision: it re-reads from its own `fromOffset` on the next
+   * publish, whatever the new bound is.
+   *
+   * Scope: only buses without `durableLogDir` are affected in what
+   * `pull()` returns — with a durable log `pull()` reads the log, not
+   * the ring (`readPullAvailable`), so revising the bound changes
+   * nothing the caller sees there (the ring is still kept and still
+   * drives long-poll wakeups). The revision itself is still recorded
+   * on such a bus.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live bound and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`assertValidPullBufferSize`: a positive integer) against the
+   * merged value, so a value that could not be set at construction
+   * cannot be revised in later either — and a failed call changes
+   * nothing at all. A revision that provides no field, and a revision
+   * identical to the current bound, are both no-ops with no audit.
+   * Audited as `pull_buffer_revised`
+   * (`{ pullBufferSize, oldPullBufferSize }`).
+   *
+   * Orthogonal to EB-111 (that is the pull mechanism itself — this the
+   * ring bound it reads from), to EB-150 (that chunks fan-out — this
+   * the pull ring), and to EB-296 (that retunes tail sampling — this
+   * the pull buffer bound).
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `pullBufferSize`.
+   */
+  setPullBuffer(opts: PullBufferRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setPullBuffer: revision must be an object with pullBufferSize',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    const currentPullBufferSize = this.pullBufferSize;
+    const pullBufferSize = opts.pullBufferSize ?? currentPullBufferSize;
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (pullBufferSize === currentPullBufferSize) {
+      return;
+    }
+    assertValidPullBufferSize(pullBufferSize);
+    this.pullBufferSize = pullBufferSize;
+    this.auditSubscription({
+      action: 'pull_buffer_revised',
+      actor: 'system',
+      detail: {
+        pullBufferSize,
+        oldPullBufferSize: currentPullBufferSize,
       },
     });
   }
