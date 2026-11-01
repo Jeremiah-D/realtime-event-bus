@@ -2577,7 +2577,20 @@ library.
   rehydrates the unexpired claims at construction; the journal compacts
   itself to the most recently claimed `idempotencyMaxEntries` identities
   when it grows past twice that many lines. `getStats().durableLog`
-  exposes the journal line count as `publishDedupEntries`.
+  exposes the journal line count as `publishDedupEntries`. Retune live
+  with `setIdempotency({ windowMs?, maxEntries? })` (EB-316): only the
+  fields provided move, the rest keep their live values, and the table
+  itself is never cleared or rewritten — a tightened window expires old
+  entries at the next dedup check, a widened one re-judges them under the
+  new window, and a tightened cap evicts the oldest down to the new bound
+  at the next claim. Content-dedup and explicit-key claims (EB-146/EB-151)
+  keep the window they were claimed under — each claim stores its own
+  `windowMs` at claim time, so a revised bus window governs only claims
+  made after the revision — while their eviction still follows the live
+  cap. The bloom pre-filter is untouched (its sizing is revised by
+  `setDedupBloom`, EB-312). Illegal values fail closed with the live
+  tuning untouched; an identical or empty revision is a no-op with no
+  audit. Audited as `idempotency_revised` (old and new window and cap).
 - **Bloom pre-filter for the publish-side idempotent dedup window**
   (EB-214, opt-in via `EventBusOptions.dedupBloom`, `src/bloom.ts`): a
   space-efficient probabilistic membership test in front of the exact

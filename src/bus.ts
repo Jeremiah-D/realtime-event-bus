@@ -1393,6 +1393,27 @@ export interface DeduplicateMessagesRevision {
 }
 
 /**
+ * Revision for the bus-level idempotency dedup tuning (see
+ * `EventBus.setIdempotency`, EB-316). Only the fields provided move;
+ * the rest keep their live values. The dedup table itself is never
+ * cleared or rewritten by a revision — only its window and bound move.
+ */
+export interface IdempotencyRevision {
+  /**
+   * How long an admitted `(topic, messageId)` claim suppresses its
+   * retry, in milliseconds on the bus clock. Must be a positive finite
+   * number when provided — the construction-time rule.
+   */
+  windowMs?: number;
+  /**
+   * Maximum entries in the dedup table; the oldest entry is evicted
+   * when full. Must be a positive integer when provided — the
+   * construction-time rule.
+   */
+  maxEntries?: number;
+}
+
+/**
  * Tuning for opt-in causal (happens-before) delivery (see
  * `SubscribeOptions.causal`).
  */
@@ -9145,6 +9166,30 @@ function validateIdempotencyKey(idempotencyKey: string | undefined, caller: stri
 }
 
 /**
+ * Validates the bus-level idempotency dedup tuning the way the bus
+ * constructor would (EB-316): `windowMs` a positive finite number of
+ * milliseconds, `maxEntries` a positive integer. Throws `RangeError`
+ * on the first problem — a broken tuning fails before anything is
+ * mutated. Shared by the constructor and `setIdempotency`, so a value
+ * that could not be set at construction cannot be revised in later
+ * either.
+ */
+function assertValidIdempotencyOptions(
+  windowMs: number,
+  maxEntries: number,
+  caller: string,
+): void {
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new RangeError(
+      `${caller}: idempotencyWindowMs must be a positive finite number of milliseconds`,
+    );
+  }
+  if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+    throw new RangeError(`${caller}: idempotencyMaxEntries must be a positive integer`);
+  }
+}
+
+/**
  * Explicit idempotency-key alphabet (EB-151): 1–128 visible ASCII
  * characters (`!` through `~`). The key is embedded verbatim in the
  * publish-dedup journal's reserved `key:` slot and in the in-memory
@@ -15549,15 +15594,17 @@ export class EventBus {
   /**
    * Dedup window in milliseconds (`EventBusOptions.idempotencyWindowMs`):
    * a retry within this long of the admitted publish is a duplicate.
-   * Measured on the injected bus clock.
+   * Measured on the injected bus clock. Live-revised by `setIdempotency`
+   * (EB-316): not `readonly`, because every dedup check reads it live.
    */
-  private readonly idempotencyWindowMs: number;
+  private idempotencyWindowMs: number;
   /**
    * Maximum entries in the dedup table
    * (`EventBusOptions.idempotencyMaxEntries`): the oldest entry is evicted
-   * when the table is full.
+   * when the table is full. Live-revised by `setIdempotency` (EB-316):
+   * not `readonly`, because every claim and trim reads it live.
    */
-  private readonly idempotencyMaxEntries: number;
+  private idempotencyMaxEntries: number;
   /**
    * Bloom pre-filter for the EB-27 dedup table (EB-214, opt-in via
    * `EventBusOptions.dedupBloom`): every admitted claim is added, and
@@ -16781,16 +16828,9 @@ export class EventBus {
         ? undefined
         : new AdmissionLatencyTracker(admissionLatencyOptions);
     const idempotencyWindowMs = options?.idempotencyWindowMs ?? 60_000;
-    if (!Number.isFinite(idempotencyWindowMs) || idempotencyWindowMs <= 0) {
-      throw new RangeError(
-        'idempotencyWindowMs must be a positive finite number of milliseconds',
-      );
-    }
-    this.idempotencyWindowMs = idempotencyWindowMs;
     const idempotencyMaxEntries = options?.idempotencyMaxEntries ?? 10_000;
-    if (!Number.isInteger(idempotencyMaxEntries) || idempotencyMaxEntries < 1) {
-      throw new RangeError('idempotencyMaxEntries must be a positive integer');
-    }
+    assertValidIdempotencyOptions(idempotencyWindowMs, idempotencyMaxEntries, 'EventBus');
+    this.idempotencyWindowMs = idempotencyWindowMs;
     this.idempotencyMaxEntries = idempotencyMaxEntries;
     // Bloom pre-filter for the EB-27 dedup table (EB-214, opt-in):
     // validated fail-fast — a bad sizing must never silently degrade
@@ -21087,6 +21127,93 @@ export class EventBus {
         oldExpectedInsertions: currentExpectedInsertions,
         falsePositiveRate: resolved.falsePositiveRate,
         oldFalsePositiveRate: currentFalsePositiveRate,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level idempotency dedup tuning live (EB-316) without
+   * restarting the bus: `setIdempotency({ windowMs?, maxEntries? })`
+   * retunes how long an admitted `(topic, messageId)` claim suppresses
+   * its retry and how many claims the authoritative dedup table holds
+   * (see `EventBusOptions.idempotencyWindowMs` /
+   * `EventBusOptions.idempotencyMaxEntries`, EB-27).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The dedup table itself is never cleared or rewritten: the table is
+   * the authoritative source, and every lookup and eviction already
+   * reads both values live, so the new values govern from the next
+   * dedup check onward. A tightened `windowMs` expires old EB-27
+   * entries at the next check (and `pruneDedup` drops them from the
+   * head); a widened one re-judges them under the new window. A
+   * tightened `maxEntries` evicts the oldest entries down to the new
+   * cap at the next claim (or trim); a widened one simply admits more.
+   * The bloom pre-filter (EB-214/EB-312) is untouched — its sizing is
+   * revised by `setDedupBloom`, not here.
+   *
+   * Content-dedup and explicit-key claims (EB-146/EB-151) keep the
+   * window they were claimed under: each claim stores its own
+   * `windowMs` at claim time, so a revised bus window governs only
+   * claims made after the revision — an in-flight content or key claim
+   * is still judged against the window it was claimed with, while its
+   * eviction still follows the live `maxEntries` cap.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live tuning and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`assertValidIdempotencyOptions`: `windowMs` a positive finite
+   * number of milliseconds, `maxEntries` a positive integer) against
+   * the merged values, so a value that could not be set at
+   * construction cannot be revised in later either — and a failed
+   * call changes nothing at all: when only one field is provided only
+   * that field is validated and moved, and an illegal value in any
+   * field leaves every live value exactly as it was. A revision that
+   * provides neither field, and a revision identical to the current
+   * tuning, are both no-ops with no audit. Audited as
+   * `idempotency_revised` (`{ windowMs, oldWindowMs, maxEntries,
+   * oldMaxEntries }`).
+   *
+   * Orthogonal to EB-312 (that resizes the bloom pre-filter — this the
+   * authoritative dedup table's retention), to EB-214 (that is the
+   * bloom pre-filter mechanism itself — this the dedup table's
+   * parameters), and to EB-296 (that retunes tail sampling — this the
+   * idempotency window).
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `windowMs` / `maxEntries`.
+   */
+  setIdempotency(opts: IdempotencyRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setIdempotency: revision must be an object with windowMs and/or maxEntries',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const currentWindowMs = this.idempotencyWindowMs;
+    const currentMaxEntries = this.idempotencyMaxEntries;
+    const windowMs = opts.windowMs ?? currentWindowMs;
+    const maxEntries = opts.maxEntries ?? currentMaxEntries;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (windowMs === currentWindowMs && maxEntries === currentMaxEntries) {
+      return;
+    }
+    assertValidIdempotencyOptions(windowMs, maxEntries, 'setIdempotency');
+    this.idempotencyWindowMs = windowMs;
+    this.idempotencyMaxEntries = maxEntries;
+    this.auditSubscription({
+      action: 'idempotency_revised',
+      actor: 'system',
+      detail: {
+        windowMs,
+        oldWindowMs: currentWindowMs,
+        maxEntries,
+        oldMaxEntries: currentMaxEntries,
       },
     });
   }
