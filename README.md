@@ -6281,6 +6281,20 @@ Prometheus exposition carries
 `eventbus_consumer_lag_slo_breach_total`. Clocks are injectable
 (`EventBusOptions.now`), so SLO timing stays deterministic in tests.
 
+Retune live with `bus.setLagSlo({ maxLagMessages?, maxLagMs?,
+breachSamples? })` (EB-314): only the fields provided move; the new
+values govern from the next lag evaluation — a tightened bound may fire
+on the very next sample, a loosened one simply defers it, and a new
+`breachSamples` counts from the next consecutive sample without resetting
+the in-flight consecutive count, latched breach, or episode start;
+`onLagSloBreach` is not revisable. Only a bus that already enabled
+`groupLag.slo` can be revised (otherwise `RangeError`); illegal values
+fail closed with the live tuning untouched; an identical or empty
+revision is a no-op with no audit. Audited as `lag_slo_revised`
+(`{ maxLagMessages?, oldMaxLagMessages?, maxLagMs?, oldMaxLagMs?,
+breachSamples, oldBreachSamples }` — a bound's old value is omitted
+when it was not configured).
+
 ## Ops alert webhook outlet (EB-132)
 
 `EventBusOptions.opsAlert` opts into a signed webhook outlet for the

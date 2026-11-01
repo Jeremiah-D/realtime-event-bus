@@ -165,6 +165,31 @@ export interface ResolvedLagSloOptions {
   onLagSloBreach?: (event: LagSloBreachEvent) => void;
 }
 
+/**
+ * A partial bus-level revision of the consumer-lag SLO tuning, for
+ * `EventBus.setLagSlo` (EB-314). Only the fields provided move; the rest
+ * keep their live values. The `onLagSloBreach` callback is not revisable
+ * here — it is fixed at construction.
+ */
+export interface LagSloRevision {
+  /**
+   * Breach when a lag row's message lag exceeds this. Must be a finite
+   * number `>= 0` when provided — the construction-time rule.
+   */
+  maxLagMessages?: number;
+  /**
+   * Breach when a lag row's continuous above-zero-lag episode lasts at
+   * least this long (bus-clock milliseconds). Must be a finite number
+   * `>= 0` when provided — the construction-time rule.
+   */
+  maxLagMs?: number;
+  /**
+   * Consecutive breach samples required before the callback fires.
+   * Must be an integer `>= 1` when provided — the construction-time rule.
+   */
+  breachSamples?: number;
+}
+
 export const DEFAULT_LAG_SLO_BREACH_SAMPLES = 3;
 
 /**
@@ -226,7 +251,10 @@ export class LagSloMonitor {
   private readonly rows = new Map<string, LagSloRowState>();
   /** Total SLO breach firings (edge-triggered count). */
   private breaches = 0;
-  private readonly slo: ResolvedLagSloOptions | undefined;
+  // Live-tuned by `retune` (EB-314): `check` reads this field on every
+  // call, so a revision governs from the next sample without resetting
+  // any in-flight episode state (`rows` is untouched).
+  private slo: ResolvedLagSloOptions | undefined;
 
   constructor(slo: ResolvedLagSloOptions | undefined) {
     this.slo = slo;
@@ -240,6 +268,29 @@ export class LagSloMonitor {
   /** Total SLO breach episodes fired so far. */
   breachCount(): number {
     return this.breaches;
+  }
+
+  /** The live SLO tuning, for bus-level revision (EB-314). */
+  current(): ResolvedLagSloOptions | undefined {
+    return this.slo === undefined ? undefined : { ...this.slo };
+  }
+
+  /**
+   * Retunes the three numeric SLO bounds live (EB-314). The caller must
+   * have validated `next` through `resolveLagSloOptions` first — this
+   * method applies unconditionally, replacing the bound values while
+   * keeping the `onLagSloBreach` callback (and its identity) untouched.
+   * In-flight episode state is preserved: `consecutive`, `breached`,
+   * and `episodeStartAt` are not reset, so a new bound governs from the
+   * next `check` sample and a new `breachSamples` from the next
+   * consecutive count — a tightened bound may fire on the very next
+   * sample, a loosened one simply defers it.
+   */
+  retune(next: { maxLagMessages?: number; maxLagMs?: number; breachSamples: number }): void {
+    if (this.slo === undefined) {
+      throw new RangeError('LagSloMonitor.retune: no lag SLO is configured');
+    }
+    this.slo = { ...this.slo, ...next };
   }
 
   /**
@@ -385,6 +436,23 @@ export class GroupLagMonitor {
   /** Total consumer-lag SLO breach episodes fired (see `LagSloOptions`). */
   lagSloBreaches(): number {
     return this.sloMonitor.breachCount();
+  }
+
+  /**
+   * The live lag-SLO tuning, for bus-level revision (EB-314):
+   * `undefined` when no SLO is configured under `groupLag.slo`.
+   */
+  lagSloCurrent(): ResolvedLagSloOptions | undefined {
+    return this.sloMonitor.current();
+  }
+
+  /**
+   * Retunes the lag-SLO bounds live (EB-314). Throws `RangeError` when
+   * no SLO is configured — only a bus that enabled `groupLag.slo` can
+   * be revised. The `onLagSloBreach` callback is untouched.
+   */
+  retuneLagSlo(next: { maxLagMessages?: number; maxLagMs?: number; breachSamples: number }): void {
+    this.sloMonitor.retune(next);
   }
 
   /** Effective threshold for a group: its override, else the default. */

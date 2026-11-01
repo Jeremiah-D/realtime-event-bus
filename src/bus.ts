@@ -136,7 +136,9 @@ import {
 import {
   GroupLagMonitor,
   resolveGroupLagOptions,
+  resolveLagSloOptions,
   type GroupLagStat,
+  type LagSloRevision,
 } from './grouplag.ts';
 import {
   InMemoryOffsetStore,
@@ -33550,6 +33552,108 @@ export class EventBus {
     }
     this.groupLagMonitor.clearThreshold(groupId);
     this.checkGroupLagForGroup(groupId);
+  }
+
+  /**
+   * Revises the bus-level consumer-lag SLO tuning live (EB-314) without
+   * restarting the bus: `setLagSlo({ maxLagMessages?, maxLagMs?,
+   * breachSamples? })` retunes the bounds that decide when a lag row's
+   * breach episode pages (see `EventBusOptions.groupLag.slo`, EB-112).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * `onLagSloBreach` is not revisable here — the alert callback (and
+   * its identity, including the ops-alert outlet wrap) is fixed at
+   * construction. In-flight episode state is preserved: a row's
+   * consecutive-breach count, latched breach, and episode start are not
+   * reset, so a new bound governs from the next lag evaluation and a
+   * new `breachSamples` from the next consecutive count — a tightened
+   * bound may fire on the very next sample, a loosened one simply
+   * defers it.
+   *
+   * Fail-closed: a bus that never enabled `groupLag.slo`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the live
+   * tuning and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveLagSloOptions`: each bound a finite
+   * number `>= 0`, at least one bound present, `breachSamples` an
+   * integer `>= 1`) against the merged values, so a value that could
+   * not be set at construction cannot be revised in later either — and
+   * a failed call changes nothing at all: when only one field is
+   * provided only that field is validated and moved, and an illegal
+   * value in any field leaves every live value exactly as it was. A
+   * revision that provides neither field, and a revision identical to
+   * the current tuning, are both no-ops with no audit. Audited as
+   * `lag_slo_revised` (`{ maxLagMessages?, oldMaxLagMessages?,
+   * maxLagMs?, oldMaxLagMs?, breachSamples, oldBreachSamples }` — a
+   * bound's old value is omitted when it was not configured).
+   *
+   * Orthogonal to EB-48 (that is the per-group runtime lag threshold
+   * `setGroupLagThreshold` — this the bus-level SLO breach-detection
+   * parameters), and to EB-296 (that retunes tail sampling — this the
+   * lag SLO).
+   *
+   * Throws `RangeError` when `groupLag.slo` is not enabled, for a
+   * non-object revision, or for an illegal `maxLagMessages` /
+   * `maxLagMs` / `breachSamples`.
+   */
+  setLagSlo(opts: LagSloRevision): void {
+    const current = this.groupLagMonitor.lagSloCurrent();
+    if (current === undefined) {
+      throw new RangeError('setLagSlo: groupLag.slo is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setLagSlo: revision must be an object with maxLagMessages and/or maxLagMs and/or breachSamples',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const maxLagMessages = opts.maxLagMessages ?? current.maxLagMessages;
+    const maxLagMs = opts.maxLagMs ?? current.maxLagMs;
+    const breachSamples = opts.breachSamples ?? current.breachSamples;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    if (
+      maxLagMessages === current.maxLagMessages &&
+      maxLagMs === current.maxLagMs &&
+      breachSamples === current.breachSamples
+    ) {
+      return;
+    }
+    const resolved = resolveLagSloOptions({ maxLagMessages, maxLagMs, breachSamples }, 'setLagSlo');
+    if (resolved === undefined) {
+      throw new RangeError('setLagSlo: groupLag.slo is not enabled on this bus');
+    }
+    this.groupLagMonitor.retuneLagSlo({
+      maxLagMessages: resolved.maxLagMessages,
+      maxLagMs: resolved.maxLagMs,
+      breachSamples: resolved.breachSamples,
+    });
+    this.auditSubscription({
+      action: 'lag_slo_revised',
+      actor: 'system',
+      detail: {
+        ...(maxLagMessages === undefined
+          ? {}
+          : {
+              maxLagMessages,
+              ...(current.maxLagMessages === undefined
+                ? {}
+                : { oldMaxLagMessages: current.maxLagMessages }),
+            }),
+        ...(maxLagMs === undefined
+          ? {}
+          : {
+              maxLagMs,
+              ...(current.maxLagMs === undefined ? {} : { oldMaxLagMs: current.maxLagMs }),
+            }),
+        breachSamples,
+        oldBreachSamples: current.breachSamples,
+      },
+    });
   }
 
   /**
