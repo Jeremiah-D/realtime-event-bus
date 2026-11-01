@@ -437,7 +437,15 @@ library.
   TTL deadline (verbatim; otherwise the peer's own TTL rules apply) ride
   the envelope. Inbound envelopes queue in a bounded ingress buffer
   (`maxInboundQueue`, default 1024) drained on a microtask — a full buffer
-  sheds the newest envelope and counts it. `getStats().bridge` reports
+  sheds the newest envelope and counts it. Retune live with
+  `bus.setBridge({ maxInboundQueue? })` (EB-313): only the bound moves —
+  the transport and the health monitor are untouched — and the new bound
+  governs from the next inbound envelope onward (a tightened bound sheds
+  on the next arrival, a loosened one admits more). Only a bus that
+  enabled `bridge` can be revised (otherwise `RangeError`); illegal
+  values fail closed with the live bound untouched; an identical or empty
+  revision is a no-op with no audit. Audited as `bridge_revised` (old and
+  new bound). `getStats().bridge` reports
   `{ inbound, outbound, dropped, health }`, and the Prometheus exposition carries
   `eventbus_bridge_{outbound,inbound,dropped}_total`. Opt-in transport
   health monitoring (`bridge.health`, EB-168): periodic probes (custom

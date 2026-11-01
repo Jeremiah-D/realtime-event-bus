@@ -212,6 +212,16 @@ export interface ResolvedBridgeOptions {
   health: ResolvedBridgeHealthOptions | undefined;
 }
 
+/**
+ * Partial revision for `EventBus.setBridge` (EB-313). Only the fields
+ * provided move; `transport` is the bridge's identity and is not
+ * revisable here, and `health` is revised by `setBridgeHealth`
+ * (EB-305).
+ */
+export interface BridgeRevision {
+  maxInboundQueue?: number;
+}
+
 const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/;
 const ZERO_TRACE_ID = '0'.repeat(32);
 

@@ -407,6 +407,7 @@ import {
   validateBridgeEnvelope,
   type BridgeEnvelope,
   type BridgeReceiveResult,
+  type BridgeRevision,
   type ResolvedBridgeOptions,
 } from './bridge.ts';
 import {
@@ -16680,9 +16681,11 @@ export class EventBus {
   /**
    * Cross-process bridge config (see `src/bridge.ts`, EB-51), present when
    * `EventBusOptions.bridge` was given. The transport is caller-owned:
-   * the bus never closes it.
+   * the bus never closes it. Not `readonly`: `setBridge` (EB-313)
+   * swaps in a re-resolved config so the next inbound envelope reads
+   * the live `maxInboundQueue`.
    */
-  private readonly bridge: ResolvedBridgeOptions | undefined;
+  private bridge: ResolvedBridgeOptions | undefined;
   /**
    * Bridge transport health monitor (EB-168), present only when
    * `EventBusOptions.bridge.health` was configured. Gates outbound
@@ -21761,6 +21764,84 @@ export class EventBus {
         oldIntervalMs: current.intervalMs,
         failureThreshold,
         oldFailureThreshold: current.failureThreshold,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level bridge inbound queue bound live (EB-313)
+   * without restarting the bus: `setBridge({ maxInboundQueue? })`
+   * retunes how many inbound envelopes the bridge ingress buffer
+   * holds before it sheds the newest (see `EventBusOptions.bridge`,
+   * EB-51).
+   *
+   * Only the field provided moves; the rest keep their live values.
+   * The revision swaps in a re-resolved bridge config, so the new
+   * bound governs from the next inbound envelope onward — the next
+   * `receiveFromBridge` reads the live `maxInboundQueue`. Envelopes
+   * already queued are untouched: tightening below the live queue
+   * depth does not trim the buffer (the queued envelopes still drain),
+   * but the next arrival sheds at once because the queue is already
+   * at or over the new bound, and loosening simply admits more before
+   * the next shed. The bridge identity is untouched: the `transport`
+   * object and the health monitor (EB-168, revised by `setBridgeHealth`,
+   * EB-305) keep their live state — a revision never re-arms a probe
+   * timer, never resets a failure counter, and never pauses or resumes
+   * outbound mirroring.
+   *
+   * Fail-closed: a bus that never enabled `bridge`, a non-object
+   * revision, and an illegal value all throw `RangeError` with the
+   * live config and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveBridgeOptions`: the queue bound a
+   * positive integer) against the merged values — the transport and
+   * the health options are carried over from the live config, so a
+   * value that could not be set at construction cannot be revised in
+   * later either — and a failed call changes nothing at all. A
+   * revision that provides no field, and a revision identical to the
+   * current bound, are both no-ops with no audit. Audited as
+   * `bridge_revised` (`{ maxInboundQueue, oldMaxInboundQueue }`).
+   *
+   * Orthogonal to EB-305 (that retunes the bridge health monitor —
+   * this the ingress buffer bound), and to EB-296 (that retunes tail
+   * sampling — this the bridge).
+   *
+   * Throws `RangeError` when bridge is not enabled, for a non-object
+   * revision, or for an illegal `maxInboundQueue`.
+   */
+  setBridge(opts: BridgeRevision): void {
+    const current = this.bridge;
+    if (current === undefined) {
+      throw new RangeError('setBridge: bridge is not enabled on this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setBridge: revision must be an object with maxInboundQueue');
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const maxInboundQueue = opts.maxInboundQueue ?? current.maxInboundQueue;
+    // Re-affirming the current bound is a no-op: no swap, no audit.
+    if (maxInboundQueue === current.maxInboundQueue) {
+      return;
+    }
+    const resolved = resolveBridgeOptions(
+      { transport: current.transport, maxInboundQueue, health: current.health },
+      'setBridge',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setBridge: bridge is not enabled on this bus');
+    }
+    this.bridge = resolved;
+    this.auditSubscription({
+      action: 'bridge_revised',
+      actor: 'system',
+      detail: {
+        maxInboundQueue,
+        oldMaxInboundQueue: current.maxInboundQueue,
       },
     });
   }
