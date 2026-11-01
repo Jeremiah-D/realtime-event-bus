@@ -1414,6 +1414,20 @@ export interface IdempotencyRevision {
 }
 
 /**
+ * Revision for the bus-level lineage hop cap (see
+ * `EventBus.setLineage`, EB-317). Only the field provided moves; the
+ * lineage records themselves are never rewritten by a revision — only
+ * the cap that admission judges new hops against.
+ */
+export interface LineageRevision {
+  /**
+   * Maximum lineage hops per message. Must be a positive integer when
+   * provided — the construction-time rule.
+   */
+  maxLineageHops?: number;
+}
+
+/**
  * Tuning for opt-in causal (happens-before) delivery (see
  * `SubscribeOptions.causal`).
  */
@@ -4870,7 +4884,8 @@ export interface EventBusOptions {
    * lineage already contains the target topic (a forwarding loop) or
    * already reached this many hops is rejected at admission with zero
    * side effects and counted in `BusStats.lineageCycleRejections`.
-   * Must be a positive integer; defaults to 32.
+   * Must be a positive integer; defaults to 32. Retune live with
+   * `setLineage({ maxLineageHops })` (EB-317).
    */
   maxLineageHops?: number;
   /**
@@ -15803,9 +15818,11 @@ export class EventBus {
    * lineage already contains the target topic (and left it — a
    * forwarding loop) or already reached this many hops is rejected at
    * admission. Validated in the constructor
-   * (`EventBusOptions.maxLineageHops`, default 32).
+   * (`EventBusOptions.maxLineageHops`, default 32). Live-revised by
+   * `setLineage` (EB-317): not `readonly`, because every admission
+   * check reads it live.
    */
-  private readonly maxLineageHops: number;
+  private maxLineageHops: number;
   /**
    * Publishes rejected by the lineage cycle check (EB-184): the target
    * topic already appeared in the message's hops and was left (a
@@ -21214,6 +21231,72 @@ export class EventBus {
         oldWindowMs: currentWindowMs,
         maxEntries,
         oldMaxEntries: currentMaxEntries,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level lineage hop cap live (EB-317) without
+   * restarting the bus: `setLineage({ maxLineageHops })` retunes how
+   * many hops a message's forwarding chain may carry before admission
+   * rejects it as a runaway chain (see
+   * `EventBusOptions.maxLineageHops`, EB-184).
+   *
+   * Only the cap moves — the lineage records themselves are never
+   * rewritten: hop collection is unchanged, and every admission check
+   * (the formal check and the `publishAtomic` shadow check) already
+   * reads the cap live, so the new value governs from the next
+   * admission check onward. A tightened cap rejects a chain that
+   * already reached the new bound at the next admission; a widened
+   * one admits a chain the old cap would have depth-rejected.
+   * Messages already admitted keep their lineage — an in-flight
+   * message is never re-judged against the new cap, and a message
+   * already rejected is never revived.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live cap and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`resolveMaxLineageHops`: a positive integer) against the merged
+   * value, so a value that could not be set at construction cannot be
+   * revised in later either — and a failed call changes nothing at
+   * all. A revision that provides no field, and a revision identical
+   * to the current cap, are both no-ops with no audit. Audited as
+   * `lineage_revised` (`{ maxLineageHops, oldMaxLineageHops }`).
+   *
+   * Orthogonal to EB-150 (that chunks fan-out — this the lineage hop
+   * cap), and to EB-296 (that retunes tail sampling — this the
+   * lineage cap).
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `maxLineageHops`.
+   */
+  setLineage(opts: LineageRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setLineage: revision must be an object with maxLineageHops',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    const currentMaxLineageHops = this.maxLineageHops;
+    const maxLineageHops = opts.maxLineageHops ?? currentMaxLineageHops;
+    // Re-affirming the current cap is a no-op: no retune, no audit.
+    if (maxLineageHops === currentMaxLineageHops) {
+      return;
+    }
+    resolveMaxLineageHops(maxLineageHops);
+    this.maxLineageHops = maxLineageHops;
+    this.auditSubscription({
+      action: 'lineage_revised',
+      actor: 'system',
+      detail: {
+        maxLineageHops,
+        oldMaxLineageHops: currentMaxLineageHops,
       },
     });
   }

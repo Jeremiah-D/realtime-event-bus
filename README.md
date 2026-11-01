@@ -9175,6 +9175,17 @@ Semantics:
   (default 32, must be a positive integer) is rejected too — the
   backstop for runaway chains, including same-topic republish loops the
   cycle rule deliberately permits.
+- **Retune the cap live.** `setLineage({ maxLineageHops })` (EB-317)
+  revises the hop cap without restarting the bus: only the cap moves,
+  the lineage records themselves are never rewritten, and every
+  admission check reads the cap live, so a tightened cap rejects a
+  chain that already reached the new bound at the next admission and a
+  widened one admits a chain the old cap would have depth-rejected.
+  Messages already admitted keep their lineage — an in-flight message
+  is never re-judged, and a rejected one is never revived. Illegal
+  values fail closed with the live cap untouched; an identical or empty
+  revision is a no-op with no audit. Audited as `lineage_revised` (old
+  and new cap).
 - **Zero-side-effect rejection.** Both rejections consume no sequence
   number (subscribers see no gap), write nothing to the durable log,
   burn no rate-limit budget, and surface on `onAdmissionRejected` with
