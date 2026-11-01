@@ -378,10 +378,12 @@ export interface DurableLogOptions {
   /**
    * Bound for the publish-dedup journal (`__publish_dedup.jsonl`, EB-66):
    * the journal compacts itself to the latest claim per (topic, messageId)
-   * when it grows past twice this value. The bus passes its own
-   * `idempotencyMaxEntries` here so the journal's size guard tracks the
-   * publish-side dedup window it persists. Must be a positive integer.
-   * Default 10000.
+   * when it grows past twice this value. The bus passes its live
+   * `durableLogPublishDedupMaxEntries` here (initially its
+   * `idempotencyMaxEntries`, revisable at runtime via
+   * `setDurableLogPublishDedupMaxEntries`, EB-328) so the journal's size
+   * guard tracks the publish-side dedup window it persists. Must be a
+   * positive integer. Default 10000.
    */
   publishDedupMaxEntries?: number;
   /**
@@ -1716,6 +1718,20 @@ export function assertValidDurableLogMaxBytesPerTopic(value: number | undefined)
   }
 }
 
+/**
+ * Validates `DurableLogOptions.publishDedupMaxEntries` the way `open()`
+ * would (EB-328): a positive integer. Throws `RangeError` on an illegal
+ * value — before anything is mutated. Shared by `open()`,
+ * `DurableTopicLog.setPublishDedupMaxEntries`, and
+ * `EventBus.setDurableLogPublishDedupMaxEntries`, so a value that could
+ * not be set at construction cannot be revised in later either.
+ */
+export function assertValidDurableLogPublishDedupMaxEntries(value: unknown): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new RangeError('publishDedupMaxEntries must be a positive integer');
+  }
+}
+
 export class DurableTopicLog {
   private readonly logDir: string;
   /**
@@ -1838,9 +1854,13 @@ export class DurableTopicLog {
    * Publish-dedup window bound (see `DurableLogOptions.publishDedupMaxEntries`):
    * the journal compacts itself to the latest claim per (topic, messageId)
    * when it grows past twice this value, so an idempotent-heavy producer
-   * cannot grow the journal without bound.
+   * cannot grow the journal without bound. Mutable at runtime via
+   * `setPublishDedupMaxEntries` — the bus exposes it as
+   * `setDurableLogPublishDedupMaxEntries` with a subscription-audit
+   * trail. Every use site reads the live value, so a revised bound
+   * governs from the next append-triggered compact.
    */
-  private readonly publishDedupMaxEntries: number;
+  private publishDedupMaxEntries: number;
   /**
    * Opt-in segment rotation triggers, `undefined` when rotation is
    * disabled (the default — one live file per topic, as before).
@@ -2051,9 +2071,7 @@ export class DurableTopicLog {
     const maxEntriesPerTopic = options.maxEntriesPerTopic ?? 10000;
     assertValidDurableLogMaxEntriesPerTopic(maxEntriesPerTopic);
     const publishDedupMaxEntries = options.publishDedupMaxEntries ?? 10000;
-    if (!Number.isInteger(publishDedupMaxEntries) || publishDedupMaxEntries < 1) {
-      throw new RangeError('publishDedupMaxEntries must be a positive integer');
-    }
+    assertValidDurableLogPublishDedupMaxEntries(publishDedupMaxEntries);
     const maxAgeMs = options.maxAgeMs;
     if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
       throw new RangeError('durableLogMaxAgeMs must be a positive finite number of milliseconds');
@@ -2167,6 +2185,31 @@ export class DurableTopicLog {
   /** The current per-topic byte budget — the live value `setMaxBytesPerTopic` moves. */
   currentMaxBytesPerTopic(): number | undefined {
     return this.maxBytesPerTopic;
+  }
+
+  /**
+   * Changes the publish-dedup journal bound at runtime (EB-328). Returns
+   * the previous bound. Throws `RangeError` for a non-positive-integer
+   * value, leaving the live bound exactly as it was. The change takes
+   * effect on the next append-triggered compact — already-persisted
+   * claims are untouched, a tightened bound does not force an immediate
+   * journal rewrite (the next claim past twice the new bound compacts
+   * the journal down to the newest claims), and a loosened bound simply
+   * allows more capacity. The bus wraps this as
+   * `setDurableLogPublishDedupMaxEntries` and records the change in
+   * the subscription audit log
+   * (`durable_log_publish_dedup_max_entries_revised`).
+   */
+  setPublishDedupMaxEntries(maxEntries: number): number {
+    assertValidDurableLogPublishDedupMaxEntries(maxEntries);
+    const previous = this.publishDedupMaxEntries;
+    this.publishDedupMaxEntries = maxEntries;
+    return previous;
+  }
+
+  /** The current publish-dedup journal bound — the live value `setPublishDedupMaxEntries` moves. */
+  currentPublishDedupMaxEntries(): number {
+    return this.publishDedupMaxEntries;
   }
 
   /**

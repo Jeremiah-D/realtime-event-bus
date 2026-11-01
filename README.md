@@ -539,6 +539,19 @@ library.
   every namespace child log (a namespace registered later opens with the
   live bound), requires a `durableLogDir`, and is audited as
   `durable_log_max_bytes_revised` (`{ from, to }`, `null` when unset);
+  an identical revision is a no-op with no audit. Retune the
+  publish-dedup journal bound live with
+  `setDurableLogPublishDedupMaxEntries(maxEntries, actor?)` (EB-328):
+  the bound starts at the construction-time `idempotencyMaxEntries`
+  (the journal persists the publish-side dedup window) and evolves
+  independently of it afterwards — `setIdempotency` never moves it.
+  Only the bound moves, already-persisted claims are untouched, and
+  the new bound governs from the next claim-triggered compact
+  (tightening does not force an immediate journal rewrite, loosening
+  simply allows more capacity). It fans out to the root log and every
+  namespace child log (a namespace registered later opens with the
+  live bound), requires a `durableLogDir`, and is audited as
+  `durable_log_publish_dedup_max_entries_revised` (old and new bound);
   an identical revision is a no-op with no audit. Corrupt log lines
   are skipped and counted
   (`getStats().durableLog.corruptLines`), never fatal; payloads

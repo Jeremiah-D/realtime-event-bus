@@ -16621,6 +16621,15 @@ export class EventBus {
    */
   private durableLogMaxBytesPerTopic?: number;
   /**
+   * Publish-dedup journal bound for the durable log (EB-328): the root
+   * log and every namespace child log open with this bound, and it is
+   * kept in sync by `setDurableLogPublishDedupMaxEntries`. Starts at the
+   * construction-time `idempotencyMaxEntries` — the journal persists
+   * the publish-side dedup window — but evolves independently of it
+   * afterwards: `setIdempotency` never moves this field.
+   */
+  private durableLogPublishDedupMaxEntries: number;
+  /**
    * `durableLogKeyCompaction` as configured — namespace child logs
    * (EB-52) open with the same compaction mode as the root log.
    */
@@ -16960,6 +16969,11 @@ export class EventBus {
     assertValidIdempotencyOptions(idempotencyWindowMs, idempotencyMaxEntries, 'EventBus');
     this.idempotencyWindowMs = idempotencyWindowMs;
     this.idempotencyMaxEntries = idempotencyMaxEntries;
+    // EB-328: the publish-dedup journal bound starts at the
+    // construction-time idempotency window it persists, then evolves
+    // independently via `setDurableLogPublishDedupMaxEntries` —
+    // `setIdempotency` never moves it.
+    this.durableLogPublishDedupMaxEntries = idempotencyMaxEntries;
     // Bloom pre-filter for the EB-27 dedup table (EB-214, opt-in):
     // validated fail-fast — a bad sizing must never silently degrade
     // into an unbounded filter. `true` sizes for `idempotencyMaxEntries`
@@ -17242,8 +17256,10 @@ export class EventBus {
         segmentRotation: options.durableLogSegmentRotation,
         encryptor: options.durableLogEncryptor,
         // The publish-dedup journal's size guard tracks the publish-side
-        // idempotency window it persists (EB-66).
-        publishDedupMaxEntries: this.idempotencyMaxEntries,
+        // idempotency window it persists (EB-66); the live bound is
+        // revisable at runtime via `setDurableLogPublishDedupMaxEntries`
+        // (EB-328) and starts at the construction-time window.
+        publishDedupMaxEntries: this.durableLogPublishDedupMaxEntries,
         // EB-94: a checksum-failed archived segment is isolated by the
         // log and reported here — one audit event per segment, so an
         // operator can see exactly which history was quarantined.
@@ -21084,6 +21100,80 @@ export class EventBus {
       action: 'durable_log_max_bytes_revised',
       actor,
       detail: { from: previous ?? null, to: maxBytesPerTopic ?? null },
+    });
+  }
+
+  /**
+   * Changes the durable log's publish-dedup journal bound at runtime
+   * (EB-328): `setDurableLogPublishDedupMaxEntries(maxEntries, actor?)`
+   * retunes how many publish-side idempotent-dedup claims the
+   * `__publish_dedup.jsonl` journal retains before it compacts down to
+   * the newest claims (see
+   * `DurableLogOptions.publishDedupMaxEntries`, default 10000 — the bus
+   * starts the bound at its construction-time `idempotencyMaxEntries`,
+   * since the journal persists the publish-side dedup window).
+   *
+   * Only the bound moves — the dedup mechanism itself is untouched:
+   * the amortized 2x compact trigger keeps reading the bound live,
+   * claim identities and their suppression semantics are unchanged, and
+   * the claims already persisted are retained, never cleared or
+   * rewritten. The new bound governs from the next append-triggered
+   * compact: tightening it does not force an immediate journal rewrite
+   * (the next claim past twice the new bound compacts the journal down
+   * to the newest claims), while loosening it simply allows more
+   * capacity.
+   *
+   * The change applies to the root log and every namespace child log,
+   * and is recorded in the subscription audit log as
+   * `durable_log_publish_dedup_max_entries_revised` (with the previous
+   * and new bound in `detail`), so publish-side idempotency governance
+   * stays attributable. A namespace registered after the revision opens
+   * its child log with the live bus bound, like every other
+   * durable-log option.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A non-positive-integer bound also throws
+   * `RangeError` with the live bound and the audit log untouched:
+   * validation reuses the construction-time rule
+   * (`assertValidDurableLogPublishDedupMaxEntries`: a positive
+   * integer). A revision identical to the current bound is a no-op
+   * with no audit.
+   *
+   * Orthogonal to EB-66 (that is the journal mechanism itself — this
+   * the journal bound), to EB-146/151 (those are the dedup
+   * determinations — this the journal bound), to `setIdempotency`
+   * (that retunes the in-memory dedup window — this the on-disk
+   * journal bound, and the two evolve independently after
+   * construction), and to EB-322/323 (those retune the per-topic
+   * entry/byte retention bounds — this the dedup journal bound).
+   *
+   * Throws `RangeError` for a bad actor, for a non-positive-integer
+   * `maxEntries`, or when the bus has no `durableLogDir`.
+   */
+  setDurableLogPublishDedupMaxEntries(maxEntries: number, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogPublishDedupMaxEntries');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogPublishDedupMaxEntries requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const previous = log.currentPublishDedupMaxEntries();
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (maxEntries === previous) {
+      return;
+    }
+    log.setPublishDedupMaxEntries(maxEntries);
+    for (const child of this.namespaceLogs.values()) {
+      child.setPublishDedupMaxEntries(maxEntries);
+    }
+    this.durableLogPublishDedupMaxEntries = maxEntries;
+    this.auditSubscription({
+      action: 'durable_log_publish_dedup_max_entries_revised',
+      actor,
+      detail: { publishDedupMaxEntries: maxEntries, oldPublishDedupMaxEntries: previous },
     });
   }
 
@@ -25711,6 +25801,9 @@ export class EventBus {
         maxAgeMs: this.durableLogMaxAgeMs,
         // EB-119: namespace child logs share the root log's byte budget.
         maxBytesPerTopic: this.durableLogMaxBytesPerTopic,
+        // EB-328: namespace child logs share the root log's live
+        // publish-dedup journal bound.
+        publishDedupMaxEntries: this.durableLogPublishDedupMaxEntries,
         now: this.now,
         keyCompaction: this.durableLogKeyCompaction,
         segmentRotation: this.durableLogSegmentRotation,
