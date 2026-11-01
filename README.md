@@ -528,7 +528,18 @@ library.
   (a namespace registered later opens with the live bound), requires a
   `durableLogDir` (a bus without one throws `RangeError`), and is
   audited as `durable_log_max_entries_revised` (old and new bound); an
-  identical revision is a no-op with no audit. Corrupt log lines
+  identical revision is a no-op with no audit. Retune the per-topic byte
+  budget live with `setDurableLogMaxBytesPerTopic(maxBytesPerTopic,
+  actor?)` (EB-323): pass `undefined` to clear the byte bound and return
+  to count-only retention; only the bound moves, already-persisted
+  records are untouched, and the new bound governs from the next append
+  (rotation off: the next append past twice the new bound compacts down
+  to the newest records that fit; rotation on: crossing the bound
+  archives the live segment instead). It fans out to the root log and
+  every namespace child log (a namespace registered later opens with the
+  live bound), requires a `durableLogDir`, and is audited as
+  `durable_log_max_bytes_revised` (`{ from, to }`, `null` when unset);
+  an identical revision is a no-op with no audit. Corrupt log lines
   are skipped and counted
   (`getStats().durableLog.corruptLines`), never fatal; payloads
   `JSON.stringify` cannot represent are delivered live but skipped by the

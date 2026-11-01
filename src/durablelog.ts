@@ -364,6 +364,8 @@ export interface DurableLogOptions {
    * and under keyed compaction the latest record per key is exempt too
    * (the key space itself bounds retention, Kafka-style). Must be a
    * positive finite number of bytes. Absent by default (no byte bound).
+   * Mutable at runtime via `setMaxBytesPerTopic` — the bus exposes it as
+   * `setDurableLogMaxBytesPerTopic` with a subscription-audit trail.
    */
   maxBytesPerTopic?: number;
   /**
@@ -1697,6 +1699,23 @@ export function assertValidDurableLogMaxEntriesPerTopic(value: unknown): void {
   }
 }
 
+/**
+ * Validates `DurableLogOptions.maxBytesPerTopic` the way `open()` would
+ * (EB-323): `undefined` (no byte bound) or a positive finite number of
+ * bytes. Throws `RangeError` on an illegal value — before anything is
+ * mutated. Shared by `open()`, `DurableTopicLog.setMaxBytesPerTopic`,
+ * and `EventBus.setDurableLogMaxBytesPerTopic`, so a value that could
+ * not be set at construction cannot be revised in later either.
+ */
+export function assertValidDurableLogMaxBytesPerTopic(value: number | undefined): void {
+  if (
+    value !== undefined &&
+    (!Number.isFinite(value) || value <= 0)
+  ) {
+    throw new RangeError('durableLogMaxBytesPerTopic must be a positive finite number of bytes');
+  }
+}
+
 export class DurableTopicLog {
   private readonly logDir: string;
   /**
@@ -1887,9 +1906,13 @@ export class DurableTopicLog {
   /**
    * EB-119: per-topic live-byte budget (`maxBytesPerTopic`), `undefined`
    * when no byte bound is configured (the default — count/age retention
-   * behave exactly as before).
+   * behave exactly as before). Mutable at runtime via
+   * `setMaxBytesPerTopic` — the bus exposes it as
+   * `setDurableLogMaxBytesPerTopic` with a subscription-audit trail.
+   * Every use site reads the live value, so a revised bound governs
+   * from the next append (rotation archives, compaction evicts).
    */
-  private readonly maxBytesPerTopic: number | undefined;
+  private maxBytesPerTopic: number | undefined;
   /** Set while a background archive pass is scheduled. */
   private archiveScheduled = false;
   /**
@@ -2036,12 +2059,7 @@ export class DurableTopicLog {
       throw new RangeError('durableLogMaxAgeMs must be a positive finite number of milliseconds');
     }
     const maxBytesPerTopic = options.maxBytesPerTopic;
-    if (
-      maxBytesPerTopic !== undefined &&
-      (!Number.isFinite(maxBytesPerTopic) || maxBytesPerTopic <= 0)
-    ) {
-      throw new RangeError('durableLogMaxBytesPerTopic must be a positive finite number of bytes');
-    }
+    assertValidDurableLogMaxBytesPerTopic(maxBytesPerTopic);
     const now = options.now ?? Date.now;
     if (typeof now !== 'function') {
       throw new RangeError('durableLog now must be a function');
@@ -2122,6 +2140,33 @@ export class DurableTopicLog {
   /** The current per-topic entry budget — the live value `setMaxEntriesPerTopic` moves. */
   currentMaxEntriesPerTopic(): number {
     return this.maxEntriesPerTopic;
+  }
+
+  /**
+   * Changes the per-topic byte budget at runtime (EB-323). Pass
+   * `undefined` to clear the byte bound and return to count-only
+   * retention, the same clear semantic as `setMaxAgeMs`. Returns the
+   * previous bound. Throws `RangeError` for a non-positive-finite
+   * value, leaving the live bound exactly as it was. The change takes
+   * effect from the next append — already-persisted records are
+   * untouched, a tightened bound does not force an immediate compact
+   * (with rotation off the next append past twice the new bound
+   * compacts down to the newest records that fit; with rotation on,
+   * crossing the bound archives the live segment instead), and a
+   * loosened bound simply allows more capacity. The bus wraps this as
+   * `setDurableLogMaxBytesPerTopic` and records the change in the
+   * subscription audit log (`durable_log_max_bytes_revised`).
+   */
+  setMaxBytesPerTopic(maxBytesPerTopic: number | undefined): number | undefined {
+    assertValidDurableLogMaxBytesPerTopic(maxBytesPerTopic);
+    const previous = this.maxBytesPerTopic;
+    this.maxBytesPerTopic = maxBytesPerTopic;
+    return previous;
+  }
+
+  /** The current per-topic byte budget — the live value `setMaxBytesPerTopic` moves. */
+  currentMaxBytesPerTopic(): number | undefined {
+    return this.maxBytesPerTopic;
   }
 
   /**

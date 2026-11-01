@@ -5152,7 +5152,9 @@ export interface EventBusOptions {
    * Compressed records count their compressed wire bytes. Evictions are
    * visible in `getStats().durableLog.bytes` / `bytesLimit`. Only
    * meaningful with `durableLogDir`. Must be a positive finite number of
-   * bytes.
+   * bytes. Retune live with
+   * `setDurableLogMaxBytesPerTopic(maxBytesPerTopic, actor?)` (EB-323);
+   * pass `undefined` to clear the byte bound.
    */
   durableLogMaxBytesPerTopic?: number;
   /**
@@ -16610,9 +16612,10 @@ export class EventBus {
   private durableLogMaxAgeMs?: number;
   /**
    * `durableLogMaxBytesPerTopic` as configured — namespace child logs
-   * (EB-52) open with the same per-topic byte budget as the root log.
+   * (EB-52) open with the same per-topic byte budget as the root log;
+   * kept in sync by `setDurableLogMaxBytesPerTopic`.
    */
-  private readonly durableLogMaxBytesPerTopic?: number;
+  private durableLogMaxBytesPerTopic?: number;
   /**
    * `durableLogKeyCompaction` as configured — namespace child logs
    * (EB-52) open with the same compaction mode as the root log.
@@ -20935,6 +20938,81 @@ export class EventBus {
       action: 'durable_log_max_entries_revised',
       actor,
       detail: { maxEntriesPerTopic, oldMaxEntriesPerTopic: previous },
+    });
+  }
+
+  /**
+   * Changes the durable log's per-topic byte budget at runtime (EB-323):
+   * `setDurableLogMaxBytesPerTopic(maxBytesPerTopic, actor?)` retunes
+   * how many live bytes each topic retains before the log compacts
+   * away the oldest (see
+   * `EventBusOptions.durableLogMaxBytesPerTopic`, EB-119). Pass
+   * `undefined` to clear the byte bound and return to count-only
+   * retention, the same clear semantic as `setDurableLogMaxAgeMs`.
+   *
+   * Only the bound moves — the retention mechanism itself is untouched:
+   * the amortized 2x compact trigger, the rotation trigger, and the
+   * newest-first byte-budget fill all keep reading the bound live, and
+   * the records already persisted are retained, never cleared or
+   * rewritten. The new bound governs from the next append of each
+   * topic: tightening it does not force an immediate compact (with
+   * rotation off, the next append past twice the new bound rewrites
+   * the file down to the newest records whose bytes fit; with rotation
+   * on, crossing the bound archives the live segment instead, still
+   * replayable with `{ includeArchived: true }`), while loosening it
+   * simply allows more capacity.
+   *
+   * The change applies to the root log and every namespace child log,
+   * and is recorded in the subscription audit log as
+   * `durable_log_max_bytes_revised` (with the previous and new bound
+   * in `detail`, `null` when unset), so retention policy changes stay
+   * attributable. A namespace registered after the revision opens its
+   * child log with the live bus bound, like every other durable-log
+   * option.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A non-positive-finite bound also throws
+   * `RangeError` with the live bound and the audit log untouched:
+   * validation reuses the construction-time rule
+   * (`assertValidDurableLogMaxBytesPerTopic`: `undefined` or a
+   * positive finite number of bytes). A revision identical to the
+   * current bound (including clearing an already-unset bound) is a
+   * no-op with no audit.
+   *
+   * Orthogonal to EB-85 (that retunes the time-based retention bound —
+   * this the per-topic byte budget), to EB-119 (that is the byte
+   * retention mechanism — this the byte bound's revision), and to
+   * EB-322 (that retunes the per-topic entry count — this the byte
+   * budget, and unlike the entry bound this one can be cleared with
+   * `undefined`).
+   *
+   * Throws `RangeError` for a bad actor, for a non-positive-finite
+   * `maxBytesPerTopic`, or when the bus has no `durableLogDir`.
+   */
+  setDurableLogMaxBytesPerTopic(maxBytesPerTopic: number | undefined, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogMaxBytesPerTopic');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogMaxBytesPerTopic requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const previous = log.currentMaxBytesPerTopic();
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (maxBytesPerTopic === previous) {
+      return;
+    }
+    log.setMaxBytesPerTopic(maxBytesPerTopic);
+    for (const child of this.namespaceLogs.values()) {
+      child.setMaxBytesPerTopic(maxBytesPerTopic);
+    }
+    this.durableLogMaxBytesPerTopic = maxBytesPerTopic;
+    this.auditSubscription({
+      action: 'durable_log_max_bytes_revised',
+      actor,
+      detail: { from: previous ?? null, to: maxBytesPerTopic ?? null },
     });
   }
 
