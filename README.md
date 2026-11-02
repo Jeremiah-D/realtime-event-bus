@@ -4204,6 +4204,23 @@ Semantics:
   transforms throw `RangeError` from `setSchemaMigration`;
   `clearSchemaMigration(pattern?)` removes registrations (returns whether
   anything was removed).
+- **Live revision of the expected version** (EB-342, via
+  `setSubscriberSchemaVersion(subId, schemaVersion | null, actor?)`) —
+  a subscriber's expected version can be retuned without
+  re-subscribing: raise it, lower it, or pass `null` to clear it back
+  to undeclared, pass-through delivery. There is no opt-in gate — a
+  subscriber that declared no version can gain one. The fan-out gate
+  and the delivery migration both read the live field on every
+  message, so the new version governs from the next fan-out, and a
+  message already queued when the revision lands is migrated — or
+  fail-closed dropped — under the new version at delivery time.
+  Fail-closed (an unknown subscriber or a non-null value that is not
+  a non-negative integer throws `RangeError` with the live version
+  untouched), and a revision identical to the current version is a
+  no-op with no audit. Every success is audited as
+  `subscriber_schema_version_revised` (`{ schemaVersion: <number> |
+  null, oldSchemaVersion: <number> | null }`). (Real-time systems /
+  backend engineering: schema evolution governance.)
 
 ## Message signing (HMAC)
 

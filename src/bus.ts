@@ -30146,6 +30146,90 @@ export class EventBus {
   }
 
   /**
+   * Revises one subscriber's expected schema version live (EB-342)
+   * without re-subscribing: `setSubscriberSchemaVersion(subId, schemaVersion | null, actor?)`
+   * retunes which version (`SubscribeOptions.schemaVersion`, EB-186)
+   * delivered messages are migrated to. A subscriber that declared no
+   * version can gain one — there is no opt-in gate, because declaring
+   * a version only narrows what that subscriber receives — and a
+   * declared version can be raised, lowered, or cleared.
+   *
+   * Only the subscriber field moves: `checkSchemaMigrationGate`
+   * (fan-out) and `applySchemaMigration` (delivery) both read the live
+   * `subscriber.schemaVersion` on every message, so the new version
+   * governs from the next fan-out, and a message already queued when
+   * the revision lands is migrated — or fail-closed dropped — under
+   * the new version at delivery time. The durable log is untouched:
+   * it keeps storing the write-version payload, so replay re-migrates
+   * from the original bytes under whatever version is live then.
+   * Already-delivered messages are untouched, and a message dropped
+   * fail-closed under the old version is never resurrected.
+   *
+   * Fail-closed: an unknown subscriber id and an illegal value — a
+   * non-null value that is not a non-negative integer — both throw
+   * `RangeError` with the live version and the audit log untouched.
+   * The new value reuses the subscribe-time validation
+   * (`validateSchemaVersion`), so a failed call leaves the live
+   * version untouched. Passing `null` clears the expected version:
+   * the subscriber falls back to undeclared, pass-through delivery.
+   * A revision identical to the current version — including `null`
+   * on a subscriber that declared no version — is a no-op with no
+   * audit. Audited as `subscriber_schema_version_revised`
+   * (`{ schemaVersion: <number> | null, oldSchemaVersion: <number>
+   * | null }`, `null` meaning undeclared) on success.
+   *
+   * Orthogonal to the migration-gate mechanism itself (EB-186, this
+   * revises the version it judges against), to `setTopicSchemaVersion`
+   * (EB-86, the topic-level validator registry — this revises the
+   * subscriber's expected version, not the registry), and to
+   * `setSchemaMigration` (the migration-path registration — this
+   * revises the destination version, not the hops).
+   *
+   * Throws `RangeError` for an unknown subscriber, an illegal actor,
+   * or an illegal schema version.
+   */
+  setSubscriberSchemaVersion(subId: string, schemaVersion: number | null, actor = 'system'): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setSubscriberSchemaVersion: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setSubscriberSchemaVersion: unknown subscriber: ${subId}`);
+    }
+    assertValidActor(actor, 'setSubscriberSchemaVersion');
+    // Validate before touching anything: the subscribe-time rule is
+    // exactly the non-negative-integer contract, so the same values
+    // subscribe rejects are rejected here with the live version
+    // untouched. Only an explicit `null` clears — `undefined` is not
+    // a clear and throws like any other non-integer.
+    if (
+      schemaVersion !== null &&
+      (typeof schemaVersion !== 'number' || !Number.isInteger(schemaVersion) || schemaVersion < 0)
+    ) {
+      throw new RangeError(
+        'setSubscriberSchemaVersion: schemaVersion must be a non-negative integer, or null to clear it',
+      );
+    }
+    const oldSchemaVersion = subscriber.schemaVersion;
+    const newSchemaVersion = schemaVersion === null ? undefined : schemaVersion;
+    // Re-affirming the current version is a no-op: no revision, no
+    // audit — including `null` on a subscriber that declared none.
+    if (newSchemaVersion === oldSchemaVersion) {
+      return;
+    }
+    // Only the field moves; the fan-out gate and the delivery
+    // migration both re-read it live on every message (see above).
+    subscriber.schemaVersion = newSchemaVersion;
+    this.auditSubscription({
+      action: 'subscriber_schema_version_revised',
+      actor,
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { schemaVersion: newSchemaVersion ?? null, oldSchemaVersion: oldSchemaVersion ?? null },
+    });
+  }
+
+  /**
    * Revises the health-probe parameters of one probed subscriber
    * (EB-267): a probed subscriber can retune its failure budget without
    * re-subscribing. The revision is partial: a field left out keeps its
