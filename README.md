@@ -274,7 +274,24 @@ library.
   through `onRebalance`/`rebalanceListener`, and the change is audited
   with `partitionsBefore`/`partitionsAfter`. A custom assignor that moves
   an old partition gets the normal cooperative handoff, selected with the
-  pre-expansion routing so it stays exact. **Topic partition scaling**
+  pre-expansion routing so it stays exact. **Assignor live switch** (EB-346):
+  `setGroupAssignor(groupId, assignor | 'rendezvous' | 'sticky' | null, actor = 'system')` switches a
+  partitioned group's partition assignor at runtime without re-subscribing its members — the hot-skew
+  escape hatch: when one member lags under a rendezvous placement, the operator switches the group to a
+  lag-aware (or zone-aware / weighted) assignor and the partitions migrate without tearing the group down.
+  Only the assignor moves — the roster, the partition count, the committed offsets, the assignment watermarks,
+  and the rebalance-debounce window are untouched — and the switch reuses the existing rebalance path: the
+  cached assignment is invalidated, the new assignor recomputes with the pre-switch assignment as its
+  `previous` input, each migrated partition's new owner replays its uncommitted backlog from the durable log,
+  and an operator rebalance fires (`trigger: 'assignor'`, `memberId: ''`; the rebalance debounce is bypassed)
+  so `partitionRebalance.strategy` reports the new name. A custom assignor is trial-run against the live roster
+  before anything moves (a throwing or invalid assignor aborts with the old assignor in place); the built-ins
+  skip the trial. Zone-aware, lag-aware, and weighted assignors arrive as factory-built `PartitionAssignor`
+  objects; the string form only names `'rendezvous'` and `'sticky'`, and `null` restores the default rendezvous.
+  An unknown groupId, a group that never opted into partitions, or an ambiguous groupId throws `RangeError`;
+  switching to the running assignor is a no-op with no audit. Audited as `group_assignor_revised`
+  (`{ assignor, oldAssignor }`). A fully drained group records the switch by the audit entry alone, and the
+  next generation's first member re-fixes the assignor under the first-member-fixes rule. **Topic partition scaling**
   (EB-216): `scalePartitions(topic, newCount)` is the Kafka
   `kafka-topics --alter --partitions` analogue applied end to end on one
   topic — real-time systems' elastic scale-out. Growth only (a

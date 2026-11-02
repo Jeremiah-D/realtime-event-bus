@@ -4409,15 +4409,16 @@ export interface GroupRebalanceEvent {
    */
   members: string[];
   /**
-   * What triggered the rebalance: a member joining, a member leaving, or
-   * an operator-initiated partition-count expansion
-   * (`EventBus.setGroupPartitionCount`, EB-210).
+   * What triggered the rebalance: a member joining, a member leaving, an
+   * operator-initiated partition-count expansion
+   * (`EventBus.setGroupPartitionCount`, EB-210), or an operator-initiated
+   * partition-assignor switch (`EventBus.setGroupAssignor`, EB-346).
    */
-  trigger: 'join' | 'leave' | 'expand' | 'remediate';
+  trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor';
   /**
    * The roster key of the member that joined or left. Empty for
-   * `trigger: 'expand'` / `'remediate'` — those are operator-initiated
-   * and name no single member.
+   * `trigger: 'expand'` / `'remediate'` / `'assignor'` — those are
+   * operator-initiated and name no single member.
    */
   memberId: string;
   /**
@@ -34359,7 +34360,7 @@ export class EventBus {
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave' | 'expand' | 'remediate',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor',
     memberId: string,
     linger?: { until: number; windows: LingerWindow[] },
     partitionRebalance?: PartitionRebalanceInfo,
@@ -34391,7 +34392,7 @@ export class EventBus {
    */
   private fireRebalanceListener(
     groupId: string,
-    trigger: 'join' | 'leave' | 'expand' | 'remediate',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor',
     memberId: string,
     rosterKey: string,
     subscriber: Subscriber,
@@ -34456,7 +34457,8 @@ export class EventBus {
    * the audit entry are byte-identical to before EB-169.
    *
    * `bypassDebounce` is for operator-initiated rebalances (EB-210
-   * expansion, EB-211 remediation): they apply immediately instead of
+   * expansion, EB-211 remediation, EB-346 assignor switch): they apply
+   * immediately instead of
    * merging into a membership-change window, and the debounce baseline
    * is refreshed from the post-change assignment so a later window
    * never diffs across the operator's change. `expansion` carries the
@@ -34466,7 +34468,7 @@ export class EventBus {
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave' | 'expand' | 'remediate',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor',
     memberId: string,
     linger: { until: number; windows: LingerWindow[] } | undefined,
     partitionRebalance: PartitionRebalanceInfo | undefined,
@@ -36651,6 +36653,179 @@ export class EventBus {
       throw new RangeError('getGroupAutoCommit: groupId must be a non-empty string');
     }
     return this.groupAutoCommitIntervals.get(groupId);
+  }
+
+  /**
+   * Switches one partitioned consumer group's partition assignor live
+   * (EB-346) without re-subscribing its members:
+   * `setGroupAssignor(groupId, assignor | 'rendezvous' | 'sticky' | null, actor = 'system')`
+   * retunes how the group's partitions are placed across its roster
+   * (see `GroupSubscribeOptions.assignor` / `assignment`, EB-106) —
+   * the hot-skew escape hatch: when one member lags under a rendezvous
+   * placement, the operator switches the group to a lag-aware (or
+   * zone-aware / weighted) assignor and the partitions migrate without
+   * tearing the group down.
+   *
+   * Only the assignor moves: the roster, the partition count, the
+   * committed offsets, the assignment watermarks, and the rebalance-
+   * debounce window are untouched. The switch reuses the existing
+   * rebalance path: the cached assignment is invalidated, the new
+   * assignor recomputes with the pre-switch assignment as its
+   * `previous` input (so a sticky-style assignor migrates only what
+   * the balance requires), each migrated partition's new owner replays
+   * its uncommitted backlog `(committed, watermark]` from the durable
+   * log, and an operator rebalance fires (`trigger: 'assignor'`,
+   * `memberId: ''`; the rebalance debounce is bypassed) so members
+   * observe the migration through `onRebalance`/`rebalanceListener`
+   * and `PartitionRebalanceInfo.strategy` reports the new name. A
+   * fully drained group has no members to notify and no assignment to
+   * migrate: the switch is recorded by the audit entry alone — and the
+   * next generation's first member re-fixes the assignor under the
+   * EB-106 first-member-fixes rule, so a drained switch records the
+   * operator's intent but does not bind the next generation.
+   *
+   * The new assignor is trial-validated before anything moves (the
+   * EB-106 fail-fast): a custom assignor is trial-run against the live
+   * roster and its result passes `assertValidPartitionAssignment` — a
+   * throwing or invalid assignor aborts with `RangeError` and the old
+   * assignor stays in place, unaudited. The built-ins are infallible
+   * by construction and skip the trial. Zone-aware, lag-aware, and
+   * weighted assignors need their options, so they arrive as
+   * factory-built `PartitionAssignor` objects (see
+   * `createZoneAwarePartitionAssignor` / `createLagAwarePartitionAssignor`
+   * / `createWeightedPartitionAssignor`); the string form only names
+   * the two option-free built-ins, `'rendezvous'` and `'sticky'`.
+   * Passing `null` restores the default rendezvous built-in.
+   *
+   * Fail-closed: an empty groupId, an illegal actor, an unknown group
+   * or a group that never opted into partitions (no `groupPartitions`
+   * entry — a round-robin group has no placement to switch), a string
+   * assignor other than `'rendezvous'` / `'sticky'`, and a custom
+   * assignor without a non-empty string `name` or a function `assign`
+   * all throw `RangeError` with the live assignor and the audit log
+   * untouched. A switch to the assignor the group already runs is a
+   * no-op with no audit. Audited as `group_assignor_revised`
+   * (`{ assignor: <string>, oldAssignor: <string> }`; `groupId` and
+   * `pattern` ride on the event itself).
+   *
+   * Orthogonal to EB-106 (that is the assignor mechanism itself —
+   * this its live switch), to EB-54 (that is the sticky assignor —
+   * this the switch entry point), to EB-223 (that is the zone-aware
+   * assignor — this the switch entry point), to EB-333 (that retunes
+   * the group's rebalance-debounce window — this retunes its placement
+   * strategy), and to EB-344 (that revises the group's auto-commit
+   * interval — this revises its assignor).
+   *
+   * Throws `RangeError` for an empty groupId, an illegal actor or
+   * assignor, or an unknown or unpartitioned group.
+   */
+  setGroupAssignor(
+    groupId: string,
+    assignor: PartitionAssignor | 'rendezvous' | 'sticky' | null,
+    actor = 'system',
+  ): void {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('setGroupAssignor: groupId must be a non-empty string');
+    }
+    assertValidActor(actor, 'setGroupAssignor');
+    if (typeof assignor === 'string' && assignor !== 'rendezvous' && assignor !== 'sticky') {
+      throw new RangeError(
+        `setGroupAssignor: unknown built-in assignor '${assignor}' — only 'rendezvous' / 'sticky' take the string form; pass zone-aware, lag-aware, or weighted as a factory-built PartitionAssignor object`,
+      );
+    }
+    if (assignor !== null && typeof assignor !== 'string') {
+      assertValidPartitionAssignor(assignor, 'setGroupAssignor');
+    }
+    // Exactly one partitioned competing set per groupId (the same
+    // fail-closed resolution `commitOffset` uses): an unknown groupId
+    // or a group that never opted into partitions has no placement to
+    // switch, and an ambiguous groupId refuses rather than guessing.
+    const key = this.partitionGroupKey(groupId);
+    const sep = key.indexOf('\0');
+    const pattern = key.slice(sep + 1);
+    const name =
+      assignor === null
+        ? 'rendezvous'
+        : typeof assignor === 'string'
+          ? assignor
+          : assignor.name;
+    const impl =
+      assignor === null
+        ? rendezvousPartitionAssignor
+        : typeof assignor === 'string'
+          ? resolveBuiltinPartitionAssignor(assignor)
+          : assignor;
+    const oldAssignor = this.groupAssignorName(key);
+    // Re-affirming the current assignor is a no-op: no recompute, no
+    // rebalance, no audit. Compared by name: a custom assignor that
+    // shares the running assignor's name is the same strategy.
+    if (name === oldAssignor) {
+      return;
+    }
+    const partitions = this.groupPartitions.get(key) ?? 0;
+    const members = this.groupMembers.get(key) ?? [];
+    // Pluggable assignor fail-fast (EB-106): trial the switch against
+    // the live roster before touching any state, mirroring
+    // validateJoinAssignment — a throwing or invalid custom assignor
+    // aborts here with the old assignor untouched. The built-ins are
+    // infallible by construction and skip the trial. A fully drained
+    // group has no roster to trial against — and the assignor is never
+    // invoked for an empty roster — so the trial is skipped there and
+    // the next join's validateJoinAssignment trials it instead.
+    if (
+      impl !== rendezvousPartitionAssignor &&
+      impl !== stickyPartitionAssignor &&
+      members.length > 0
+    ) {
+      const trial = impl.assign(partitions, members, this.previousPartitionAssignment.get(key));
+      assertValidPartitionAssignment(trial, partitions, members, name);
+    }
+    // The switch itself: snapshot the live assignment, swap the entry,
+    // drop the cached assignment, and recompute through the normal path
+    // — the new assignor sees the pre-switch assignment as its
+    // `previous` input and snapshots the new generation for the next
+    // recomputation.
+    const beforeAssignment = new Map(this.partitionAssignment(key));
+    this.groupAssignors.set(key, { name, assignor: impl });
+    this.invalidatePartitionAssignment(key);
+    const after = this.partitionAssignment(key);
+    const migrated = this.diffPartitionAssignment(key, beforeAssignment, after);
+    let partitionRebalance: PartitionRebalanceInfo | undefined;
+    if (members.length > 0) {
+      partitionRebalance = {
+        assignment: Object.fromEntries(after),
+        migrated,
+        strategy: this.groupAssignorName(key),
+      };
+      // Cooperative handoff for partitions the new assignor moved: the
+      // new owner replays the partition's uncommitted backlog
+      // `(committed, watermark]` from the durable log, exactly like the
+      // join/leave path. Migration targets are roster keys — resolve
+      // static ones to their live subscription before replaying.
+      const staticSubs = this.groupStaticSubs.get(key);
+      for (const m of migrated) {
+        if (m.from === null) continue;
+        const owner = this.subscribers.get(staticSubs?.get(m.to) ?? m.to);
+        if (owner !== undefined) this.replayPartitionBacklog(owner, key, m.partition);
+      }
+    }
+    // The revision itself is audited before the rebalance fires, so the
+    // `group_assignor_revised` entry precedes the `rebalance` entry the
+    // rebalance records — the same ordering the join path uses.
+    this.auditSubscription({
+      action: 'group_assignor_revised',
+      actor,
+      groupId,
+      pattern,
+      detail: { assignor: name, oldAssignor },
+    });
+    if (members.length > 0) {
+      // Operator-initiated: bypass the membership-change debounce, audit
+      // on its own. emitRebalance flushes pending auto-commits, notifies
+      // members (onRebalance + rebalance listeners for the migrated
+      // partitions), audits the rebalance, and re-checks group lag.
+      this.emitRebalance(groupId, pattern, key, 'assignor', '', undefined, partitionRebalance, 0, true);
+    }
   }
 
   /**
