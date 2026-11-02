@@ -9688,6 +9688,14 @@ const report = await bus.replayRange('market.ticks', { from: 1, to: 10_000, spee
 // { requested: 10000, delivered: 10000, handlerErrors: 0, durationMs: 842, … }
 ```
 
+- **Key filter (EB-343).** Pass `key` to replay only one entity's
+  history — a single-entity projection rebuild: `replayRange('orders',
+  { key: 'order-42' })` delivers just that key's records; non-keyed
+  records and other keys never match. It composes with `from`/`to`/
+  `speed`, `subscribers`, and `namespace`, and pacing uses the matched
+  messages' original gaps only, so a sparse key converges fast. The
+  report adds `matched` (records actually replayed); `requested` still
+  counts every record scanned in the range.
 - **Accelerated pacing.** The original inter-message gaps are compressed
   by `speed` — a history spaced 1 second apart replays with 20ms
   between messages at `speed: 50`.

@@ -718,6 +718,15 @@ export interface ReplayRangeOptions {
   to?: number;
   /** Acceleration multiplier over the original inter-message gaps (default 10). */
   speed?: number;
+  /**
+   * Only replay history records whose key equals this value (EB-343):
+   * a single-entity projection rebuild. Non-keyed records and records
+   * with any other key never match. Composes orthogonally with
+   * `from`/`to`/`speed` and with the call options' `subscribers`/
+   * `namespace`. Pacing uses the matched messages' original gaps only,
+   * so a sparse key converges fast.
+   */
+  key?: string;
 }
 
 /** Targeting options for `EventBus.replayRange` (EB-203). */
@@ -737,6 +746,12 @@ export interface ReplayRangeReport {
   speed: number;
   /** History records in the requested range. */
   requested: number;
+  /**
+   * History records in the requested range whose key matched the
+   * `key` filter (EB-343) — the records actually replayed. Equals
+   * `requested` when no key filter was given.
+   */
+  matched: number;
   /** Subscribers the replay targeted. */
   subscriberCount: number;
   /** Handler invocations performed. */
@@ -3154,6 +3169,14 @@ export interface PulledMessage {
   messageId?: string;
   /** Publisher identity, when the publish carried one. */
   publisherId?: string;
+  /**
+   * Partition key, when the publish carried one (EB-343): rides the
+   * pull ring and the durable-log record so a key-filtered
+   * `replayRange` can filter the in-memory history exactly like the
+   * durable one — a pulled message names its key, just like a live
+   * delivery does.
+   */
+  key?: string;
 }
 
 /**
@@ -24287,6 +24310,7 @@ export class EventBus {
           payload: entry.payload,
           seq: entry.seq,
           replayed: true,
+          ...(entry.key === undefined ? {} : { key: entry.key }),
           ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
           ...(entry.publisherId === undefined ? {} : { publisherId: entry.publisherId }),
         },
@@ -24340,7 +24364,14 @@ export class EventBus {
    *
    * Target subscribers default to every live subscription whose
    * pattern matches the topic; pass `subscribers` to replay to a
-   * specific set of subscription ids. Subscribers that opted in via
+   * specific set of subscription ids. Pass `range.key` (EB-343) to
+   * replay only the history records whose key equals it — a
+   * single-entity projection rebuild: non-keyed records and records
+   * with any other key never match, and pacing uses the matched
+   * messages' original gaps only, so a sparse key converges fast.
+   * The report's `requested` still counts every record in the range;
+   * `matched` counts the key-matching ones actually replayed.
+   * Subscribers that opted in via
    * `SubscribeOptions.catchUpOnReplay` pause their live drain for the
    * replay's duration — the live backlog stays queued and drains when
    * the replay finishes, so catch-up is lossless and seamless.
@@ -24363,6 +24394,7 @@ export class EventBus {
     const from = range?.from ?? 1;
     const to = range?.to ?? Number.MAX_SAFE_INTEGER;
     const speed = range?.speed ?? 10;
+    const key = range?.key;
     if (!Number.isInteger(from) || from < 1) {
       throw new RangeError('replayRange: from must be a positive integer sequence number');
     }
@@ -24371,6 +24403,9 @@ export class EventBus {
     }
     if (typeof speed !== 'number' || !Number.isFinite(speed) || speed <= 0) {
       throw new RangeError('replayRange: speed must be a positive finite multiplier');
+    }
+    if (key !== undefined && (typeof key !== 'string' || key.length === 0)) {
+      throw new RangeError('replayRange: key must be a non-empty string');
     }
     let subscriberIds: string[] | undefined;
     if (opts?.subscribers !== undefined) {
@@ -24388,6 +24423,12 @@ export class EventBus {
       throw new RangeError(`replayRange: a replay is already in progress for topic "${topic}"`);
     }
     const history = this.readReplayHistory(concrete, from, to);
+    // EB-343: a key filter narrows the replay to one entity's records.
+    // `requested` still counts the whole range scan; only the matched
+    // records are delivered, and pacing runs on their original gaps —
+    // the unmatched records in between cost no time.
+    const matchedHistory =
+      key === undefined ? history : history.filter((entry) => entry.message.key === key);
     const targets: Subscriber[] = [];
     if (subscriberIds !== undefined) {
       for (const id of subscriberIds) {
@@ -24408,12 +24449,13 @@ export class EventBus {
       to,
       speed,
       requested: history.length,
+      matched: matchedHistory.length,
       subscriberCount: targets.length,
       delivered: 0,
       handlerErrors: 0,
       durationMs: 0,
     };
-    if (history.length === 0 || targets.length === 0) return report;
+    if (matchedHistory.length === 0 || targets.length === 0) return report;
     this.activeReplays.add(concrete);
     const paused: Subscriber[] = [];
     const startedAtMs = this.now();
@@ -24425,7 +24467,7 @@ export class EventBus {
         }
       }
       let previousAt: number | undefined;
-      for (const entry of history) {
+      for (const entry of matchedHistory) {
         if (previousAt !== undefined) {
           const delayMs = (entry.at - previousAt) / speed;
           if (delayMs > 0) await sleep(delayMs);
@@ -38844,6 +38886,7 @@ export class EventBus {
       seq: rec.seq,
       payload,
       at: rec.at,
+      ...(rec.key === undefined ? {} : { key: rec.key }),
       ...(rec.messageId === undefined ? {} : { messageId: rec.messageId }),
       ...(rec.publisherId === undefined ? {} : { publisherId: rec.publisherId }),
     };
@@ -38865,6 +38908,7 @@ export class EventBus {
     expiresAt: number | undefined,
     messageId: string | undefined,
     publisherId: string | undefined,
+    key: string | undefined,
   ): void {
     const cap = this.pullBufferSize;
     let ring = this.pullRing.get(topic);
@@ -38880,6 +38924,7 @@ export class EventBus {
       ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(messageId === undefined ? {} : { messageId }),
       ...(publisherId === undefined ? {} : { publisherId }),
+      ...(key === undefined ? {} : { key }),
     });
     if (ring.length > cap) ring.splice(0, ring.length - cap);
     this.wakePullWaiters(topic);
@@ -50774,7 +50819,7 @@ export class EventBus {
     // gate and was stamped and logged — feed the per-topic pull ring
     // buffer and wake long-poll waiters. The application payload (not the
     // wire form) is what pull returns, matching push delivery.
-    this.notePullPublish(topic, msg.seq, payload, nowMs, expiresAt, cleanMessageId, publisherId);
+    this.notePullPublish(topic, msg.seq, payload, nowMs, expiresAt, cleanMessageId, publisherId, keyed?.key);
     // Cluster federation (EB-37): when the hub link is up and the cached
     // route table shows subscribers for this topic on OTHER members, the
     // admitted message is additionally forwarded to the hub. The hub
