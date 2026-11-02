@@ -149,6 +149,13 @@ interface StoredDek {
   retiredAtMs?: number;
 }
 
+/** Shared grace-window validation for the constructor and `setGraceMs` (EB-354). */
+function assertValidGraceMs(graceMs: unknown): asserts graceMs is number {
+  if (typeof graceMs !== 'number' || !Number.isFinite(graceMs) || graceMs < 0) {
+    throw new RangeError('graceMs must be a non-negative finite number of milliseconds');
+  }
+}
+
 /**
  * A key-id-versioned ring of AES-256-GCM data-encryption keys (DEKs).
  *
@@ -159,7 +166,8 @@ interface StoredDek {
  * inclusive), so messages sealed just before rotation still open.
  * `decrypt` selects the key by the envelope's `keyId` and fails loudly
  * on an unknown key id, a keyless envelope, or a key whose grace
- * window fully elapsed — never returning garbage or guessing.
+ * window fully elapsed — never returning garbage or guessing. The
+ * window itself is revisable live via `setGraceMs` (EB-354).
  *
  * Implements `PayloadEncryptor` with `Date.now()` as the default clock;
  * pass `nowMs` explicitly for deterministic tests. Zero new
@@ -168,7 +176,7 @@ interface StoredDek {
 export class RotatingDekEncryptor implements PayloadEncryptor {
   readonly name = 'aes-256-gcm';
   private readonly keys: StoredDek[] = [];
-  private readonly graceMs: number;
+  private graceMsValue: number;
 
   /**
    * `keys[0]` is the live DEK; every later key starts retired as of
@@ -181,9 +189,7 @@ export class RotatingDekEncryptor implements PayloadEncryptor {
       throw new RangeError('RotatingDekEncryptor needs at least one DEK');
     }
     const graceMs = opts?.graceMs ?? 0;
-    if (!Number.isFinite(graceMs) || graceMs < 0) {
-      throw new RangeError('graceMs must be a non-negative finite number of milliseconds');
-    }
+    assertValidGraceMs(graceMs);
     const nowMs = opts?.nowMs ?? Date.now();
     const seen = new Set<string>();
     keys.forEach((input, index) => {
@@ -198,12 +204,55 @@ export class RotatingDekEncryptor implements PayloadEncryptor {
         ...(index === 0 ? {} : { retiredAtMs: nowMs }),
       });
     });
-    this.graceMs = graceMs;
+    this.graceMsValue = graceMs;
   }
 
   /** The key id `encrypt` currently seals with. */
   get liveKeyId(): string {
     return this.keys[0].keyId;
+  }
+
+  /** The live grace window — how long a retired key keeps decrypting. */
+  get graceMs(): number {
+    return this.graceMsValue;
+  }
+
+  /**
+   * Revises the grace window at runtime (EB-354): retired keys keep
+   * decrypting for `graceMs` from their retirement, so in-flight
+   * messages sealed just before rotation still open.
+   *
+   * Only the window moves — the key ring and every retirement stamp
+   * are untouched: widening does not resurrect a key `rekey` /
+   * `pruneRetiredKeys` already dropped (it is gone), and narrowing
+   * only changes the next `decrypt` decision (a retired key past the
+   * new window is refused on its next decrypt, not actively pruned).
+   * A key retired after the revision is measured against the new
+   * window. The new window governs from the next `decrypt` / `rekey` /
+   * `pruneRetiredKeys` call.
+   *
+   * Fail-closed: validation reuses the construction-time rule (a
+   * non-negative finite number of milliseconds) — an illegal value
+   * throws `RangeError` with the live window untouched. Revising to
+   * the current window is a no-op.
+   *
+   * Do NOT call this on a ring owned by `EventBus.setTopicEncryptionKey`:
+   * the bus keeps its own `graceMs` copy for registration-time pruning
+   * and stats export, so a direct revision would leave the bus copy
+   * stale — re-setting the rule's `graceMs` goes through
+   * `setTopicEncryptionKey`, which updates both. This method is for
+   * rings held directly: a standalone ring, or the durable-log
+   * encryptor passed as `EventBusOptions.durableLogEncryptor` (the bus
+   * only ever calls its `encrypt` / `decrypt` — it holds no grace copy
+   * for it, so the ring is the single source of truth there).
+   */
+  setGraceMs(graceMs: number): void {
+    assertValidGraceMs(graceMs);
+    // Re-affirming the current window is a no-op.
+    if (graceMs === this.graceMsValue) {
+      return;
+    }
+    this.graceMsValue = graceMs;
   }
 
   /** Key ids currently held, live first. */
@@ -231,7 +280,7 @@ export class RotatingDekEncryptor implements PayloadEncryptor {
     if (stored === undefined) {
       throw new Error(`RotatingDekEncryptor.decrypt failed: unknown key id "${keyId}"`);
     }
-    if (stored.retiredAtMs !== undefined && nowMs - stored.retiredAtMs > this.graceMs) {
+    if (stored.retiredAtMs !== undefined && nowMs - stored.retiredAtMs > this.graceMsValue) {
       throw new Error(
         `RotatingDekEncryptor.decrypt failed: key id "${keyId}" is retired (grace window elapsed)`,
       );
@@ -317,7 +366,7 @@ export class RotatingDekEncryptor implements PayloadEncryptor {
     }
     this.keys.length = 0;
     for (const k of next) {
-      if (k.retiredAtMs === undefined || nowMs - k.retiredAtMs <= this.graceMs) {
+      if (k.retiredAtMs === undefined || nowMs - k.retiredAtMs <= this.graceMsValue) {
         this.keys.push(k);
       }
     }
@@ -335,7 +384,7 @@ export class RotatingDekEncryptor implements PayloadEncryptor {
     let pruned = 0;
     for (let i = this.keys.length - 1; i >= 1; i -= 1) {
       const k = this.keys[i];
-      if (k.retiredAtMs !== undefined && nowMs - k.retiredAtMs > this.graceMs) {
+      if (k.retiredAtMs !== undefined && nowMs - k.retiredAtMs > this.graceMsValue) {
         this.keys.splice(i, 1);
         pruned += 1;
       }

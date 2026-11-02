@@ -9464,7 +9464,15 @@ Semantics:
   audit event `{ oldKeyId, newKeyId, rotatedAtMs }`; re-setting a rule
   follows the `signing.ts` rotation-stamping convention (dropped keys
   retire as of now, already-retired keys keep their stamp — rotation
-  never extends a grace window).
+  never extends a grace window). The window itself is revisable live
+  on a directly-held ring via `RotatingDekEncryptor.setGraceMs(graceMs)`
+  (EB-354; the `graceMs` getter reads the live value): widening does
+  not resurrect a key already pruned, narrowing refuses on the next
+  decrypt, illegal values throw `RangeError`, and re-affirming the
+  current window is a no-op. A bus-hosted rule's window is revised by
+  re-setting the rule with `setTopicEncryptionKey`, never by calling
+  `setGraceMs` on the rule's ring directly (the bus keeps its own
+  `graceMs` copy for registration-time pruning and stats export).
 - **Fail-closed delivery.** A message that cannot be decrypted (unknown
   key id, retired past grace, no rule, tampered envelope) is dropped —
   never delivered as ciphertext, never as garbage — counted in
