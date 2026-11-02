@@ -158,6 +158,7 @@ export type SubscriptionAuditAction =
   | 'bridge_unhealthy'
   | 'bridge_recovered'
   | 'mirror_throttled'
+  | 'mirror_throttle_revised'
   | 'topic_key_rotated'
   | 'decrypt_failed'
   | 'auto_remediate_resume'
@@ -404,6 +405,7 @@ export type SubscriptionAuditAction =
  * - `mirror_throttled`: `{ srcPattern, dstTemplate, messagesPerSec }` —
  *   a mirror frame shed by its rule's traffic throttle (EB-172) before
  *   reaching admission; the `pattern` field carries the source pattern
+ * - `mirror_throttle_revised`: `{ srcPattern, throttle: { messagesPerSec, burst } | null, oldThrottle: { messagesPerSec, burst } | null }` — one live mirror rule's traffic throttle was revised (EB-337; `null` means the throttle was cleared back to unlimited; the new value reuses the construction-time validation (`validateMirrorThrottle`: the rate and the burst positive finite numbers, the burst defaulting to one second of budget), so a failed call leaves the live throttle untouched; a rule that already had a throttle is retuned in place (`TokenBucket.retune`: the stored budget is refilled at the old rate up to now and then capped at the new burst, never topped up), a rule that had none starts from a full bucket, and clearing drops the bucket so frames pass through; a revision identical to the current throttle is a no-op with no audit; every live rule sharing the source pattern is revised, each audited once; the `pattern` field carries the source pattern)
  */
 export interface SubscriptionAuditEvent {
   v: 1;
@@ -553,6 +555,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'bridge_unhealthy',
   'bridge_recovered',
   'mirror_throttled',
+  'mirror_throttle_revised',
   'topic_key_rotated',
   'decrypt_failed',
   'auto_remediate_resume',

@@ -252,10 +252,12 @@ import {
 } from './partitionhealth.ts';
 import {
   resolveMirrorRules,
+  validateMirrorThrottle,
   type MirrorHandle,
   type MirrorProvenance,
   type MirrorRule,
   type MirrorRuleInfo,
+  type MirrorThrottleOptions,
   type ResolvedMirrorRule,
 } from './mirror.ts';
 import {
@@ -15882,6 +15884,13 @@ export class EventBus {
       info: MirrorRuleInfo;
       sub: Subscription;
       apply: (topic: string) => string | null;
+      /**
+       * Live per-rule throttle state (EB-337): the token bucket the
+       * mirror callback gates on. `setMirrorThrottle` retunes,
+       * replaces, or drops it in place; `bucket` is `undefined` while
+       * the rule is unthrottled, so frames pass straight through.
+       */
+      throttle: { bucket?: TokenBucket };
     }>;
   }> = [];
   /**
@@ -20519,14 +20528,23 @@ export class EventBus {
         mirrored: 0,
         loopsPrevented: 0,
         mirroredThrottled: 0,
+        // The key is present only while the rule is throttled, so an
+        // unthrottled row keeps its historical shape.
+        ...(rule.throttle === undefined ? {} : { throttle: { ...rule.throttle } }),
       };
       // EB-172: per-rule mirror throttle. The token bucket rides the
       // destination bus's injected clock, so mirror throttle timing is
       // deterministic in tests like every other bus clock consumer.
-      const throttleBucket =
-        rule.throttle === undefined
-          ? undefined
-          : new TokenBucket(rule.throttle.burst, rule.throttle.messagesPerSec, () => this.now());
+      // EB-337: the bucket lives in a mutable holder on the
+      // registration entry, so `setMirrorThrottle` can retune, replace,
+      // or drop it live — the subscription callback reads the holder,
+      // never a captured bucket.
+      const throttle: { bucket?: TokenBucket } = {
+        bucket:
+          rule.throttle === undefined
+            ? undefined
+            : new TokenBucket(rule.throttle.burst, rule.throttle.messagesPerSec, () => this.now()),
+      };
       const sub = source.subscribe(rule.srcPattern, (msg: BusMessage) => {
         // EB-131: merge the source write's HLC into this bus's clock
         // first — a local write made after seeing this message must
@@ -20565,7 +20583,7 @@ export class EventBus {
         // reach admission (loops, stale writes) neither consume throttle
         // budget nor count as mirrored — only frames that would otherwise
         // be handed to admission can be shed here.
-        if (throttleBucket !== undefined && !throttleBucket.take()) {
+        if (throttle.bucket !== undefined && !throttle.bucket.take()) {
           info.mirroredThrottled += 1;
           this.auditMirrorThrottled(rule, msg.topic);
           return;
@@ -20609,7 +20627,7 @@ export class EventBus {
                 },
         });
       });
-      return { info, sub, apply: rule.apply };
+      return { info, sub, apply: rule.apply, throttle };
     });
     const registration = { source, rules: entries };
     this.mirrorRegistrations.push(registration);
@@ -20618,7 +20636,13 @@ export class EventBus {
       get closed() {
         return closed;
       },
-      rules: () => entries.map(({ info }) => ({ ...info })),
+      // The throttle object is copied fresh per snapshot, so mutating a
+      // returned row can never move the live throttle.
+      rules: () =>
+        entries.map(({ info }) => ({
+          ...info,
+          ...(info.throttle === undefined ? {} : { throttle: { ...info.throttle } }),
+        })),
       close: () => {
         if (closed) return;
         closed = true;
@@ -20627,6 +20651,108 @@ export class EventBus {
         if (i >= 0) this.mirrorRegistrations.splice(i, 1);
       },
     };
+  }
+
+  /**
+   * Revises the traffic throttle of every live mirror rule for one
+   * source pattern (EB-337) without re-registering the mirror:
+   * `setMirrorThrottle(srcPattern, throttle | null)` retunes the
+   * per-rule token bucket the mirror callback gates on (see `mirror`,
+   * EB-37 / EB-172).
+   *
+   * Only the throttle moves: the rule's rename template, its
+   * subscription, and its counters are untouched, and no message is
+   * dropped or reordered by the revision. The new value reuses the
+   * construction-time validation (`validateMirrorThrottle`): the rate
+   * and the burst must be positive finite numbers, the burst defaulting
+   * to one second of budget — a value that could not be set at
+   * `mirror()` time cannot be revised in later either.
+   *
+   * A rule that already had a throttle is retuned in place
+   * (`TokenBucket.retune`): tokens banked so far are first refilled at
+   * the old rate up to now, then capped at the new burst — a lowered
+   * burst never banks more than the new burst, and a raised burst does
+   * not refill the bucket to full: the stored budget survives the
+   * change and the new rate applies from the next lazy refill. A rule
+   * that had no throttle starts from a full bucket at the new budget.
+   * Passing `null` clears the throttle: the bucket is dropped and
+   * frames pass straight through, as if the rule had never been
+   * throttled.
+   *
+   * Fail-closed: an empty `srcPattern`, an unknown `srcPattern` (no
+   * live rule carries it — a closed mirror's rules are gone), an
+   * illegal throttle value, and `undefined` — only an explicit `null`
+   * clears — all throw `RangeError` with every live throttle and the
+   * audit log untouched. A revision identical to a rule's current
+   * throttle (comparing the resolved values, so a bare
+   * `{ messagesPerSec }` matches a rule built with the same rate and
+   * the defaulted burst) is a no-op for that rule: no retune, no
+   * audit. When several live rules share the pattern, all of them are
+   * revised and each records its own audit event. Audited as
+   * `mirror_throttle_revised`
+   * (`{ srcPattern, throttle: { messagesPerSec, burst } | null,
+   * oldThrottle: { messagesPerSec, burst } | null }`) per revised rule.
+   * `getStats().mirrors` and the handle's `rules()` report the live
+   * throttle immediately.
+   *
+   * Orthogonal to EB-172 (that is the throttle mechanism itself —
+   * this revises it live), to EB-266 / `setDeliveryShaping` (that
+   * retunes a subscriber's delivery-shaping bucket — this a mirror
+   * rule's bucket, same `retune` primitive, different owner), and to
+   * `setBridge` (that bounds a bridge's ingress queue — this throttles
+   * the mirror's outbound frames).
+   *
+   * Throws `RangeError` for an empty / unknown `srcPattern` or an
+   * illegal throttle value.
+   */
+  setMirrorThrottle(srcPattern: string, throttle: MirrorThrottleOptions | null): void {
+    if (typeof srcPattern !== 'string' || srcPattern.length === 0) {
+      throw new RangeError('setMirrorThrottle: srcPattern must be a non-empty string');
+    }
+    // Same rule as `validateMirrorThrottle` (EB-172): a positive finite
+    // rate and burst, the burst defaulting to one second of budget —
+    // validated before anything is touched.
+    const resolved =
+      throttle === null ? null : validateMirrorThrottle(throttle, 'setMirrorThrottle');
+    const matches = this.mirrorRegistrations.flatMap((registration) =>
+      registration.rules.filter((entry) => entry.info.srcPattern === srcPattern),
+    );
+    if (matches.length === 0) {
+      throw new RangeError(`setMirrorThrottle: unknown srcPattern: ${srcPattern}`);
+    }
+    for (const entry of matches) {
+      const oldThrottle =
+        entry.info.throttle === undefined ? null : { ...entry.info.throttle };
+      // Re-affirming the current throttle is a no-op for this rule:
+      // no retune, no audit.
+      const same =
+        (resolved === null && oldThrottle === null) ||
+        (resolved !== null &&
+          oldThrottle !== null &&
+          resolved.messagesPerSec === oldThrottle.messagesPerSec &&
+          resolved.burst === oldThrottle.burst);
+      if (same) continue;
+      if (resolved === null) {
+        // Drop the bucket with the throttle: frames pass through from
+        // the next arrival, and the row reads unthrottled again.
+        entry.throttle.bucket = undefined;
+        delete entry.info.throttle;
+      } else if (entry.throttle.bucket !== undefined) {
+        // Retune in place: the stored budget is refilled at the old
+        // rate up to now and capped at the new burst, never topped up.
+        entry.throttle.bucket.retune(resolved.burst, resolved.messagesPerSec);
+        entry.info.throttle = { ...resolved };
+      } else {
+        // A rule that never had a throttle starts from a full bucket.
+        entry.throttle.bucket = new TokenBucket(
+          resolved.burst,
+          resolved.messagesPerSec,
+          () => this.now(),
+        );
+        entry.info.throttle = { ...resolved };
+      }
+      this.auditMirrorThrottleRevised(srcPattern, resolved, oldThrottle);
+    }
   }
 
   /**
@@ -44705,6 +44831,26 @@ export class EventBus {
   }
 
   /**
+   * Records one `mirror_throttle_revised` audit event (EB-337): a live
+   * mirror rule's traffic throttle was revised (`setMirrorThrottle`) —
+   * retuned, newly set, or cleared back to unlimited. Fully
+   * error-isolated like all audit emission: a revision must never throw
+   * for observability.
+   */
+  private auditMirrorThrottleRevised(
+    srcPattern: string,
+    throttle: { messagesPerSec: number; burst: number } | null,
+    oldThrottle: { messagesPerSec: number; burst: number } | null,
+  ): void {
+    this.auditSubscription({
+      action: 'mirror_throttle_revised',
+      actor: 'system',
+      pattern: srcPattern,
+      detail: { srcPattern, throttle, oldThrottle },
+    });
+  }
+
+  /**
    * Records one bridge health transition audit event (EB-168):
    * `bridge_unhealthy` when consecutive mirror/probe failures reach the
    * threshold and outbound mirroring pauses, `bridge_recovered` when a
@@ -51688,7 +51834,12 @@ export class EventBus {
       ),
       mirroredMessages: this.mirrorIngressCount,
       mirrors: this.mirrorRegistrations.flatMap((registration) =>
-        registration.rules.map(({ info }) => ({ ...info })),
+        registration.rules.map(({ info }) => ({
+          ...info,
+          // The throttle object is copied fresh per snapshot, so
+          // mutating a returned row can never move the live throttle.
+          ...(info.throttle === undefined ? {} : { throttle: { ...info.throttle } }),
+        })),
       ),
       mirrorConflicts: this.totalMirrorConflicts,
       mirrorConflictsByTopic: [...this.mirrorConflictTopics.entries()].map(([topic, conflicts]) => ({

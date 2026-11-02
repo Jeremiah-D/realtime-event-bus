@@ -6747,6 +6747,34 @@ invalid throttle fails fast with `RangeError` at `mirror()` time.
 Prometheus exposition carries the activity-gated per-rule series
 `eventbus_mirror_throttled_total{src_pattern,dst_template}`.
 
+## Live mirror throttle revision (EB-337)
+
+A live rule's throttle can be revised without re-registering the
+mirror: `dst.setMirrorThrottle(srcPattern, throttle | null)` revises
+every live rule carrying that source pattern (each records its own
+`mirror_throttle_revised` audit event,
+`{ srcPattern, throttle: { messagesPerSec, burst } | null,
+oldThrottle: { messagesPerSec, burst } | null }`).
+`getStats().mirrors` and the handle's `rules()` report each rule's
+current throttle (`throttle` is absent while a rule is unthrottled).
+The new value reuses the construction-time validation
+(`messagesPerSec` and `burst` positive finite numbers, `burst`
+defaulting to one second of budget). A rule that already had a
+throttle is retuned in place (`TokenBucket.retune`): tokens banked so
+far are refilled at the old rate up to now and then capped at the new
+burst — a lowered burst never banks more than the new burst, and a
+raised burst does not refill the bucket to full. A rule that had no
+throttle starts from a full bucket at the new budget. Passing `null`
+clears the throttle: the bucket is dropped and frames pass straight
+through. An unknown `srcPattern`, an illegal throttle value, and
+`undefined` (only an explicit `null` clears) all throw `RangeError`
+with every live throttle untouched, and a revision identical to a
+rule's current throttle is a no-op with no audit. This is the mirror
+side's counterpart to `setDeliveryShaping` (EB-266, which retunes a
+subscriber's delivery-shaping bucket — same `retune` primitive, a
+different owner): mirror-rule buckets govern the cross-instance
+receive path, shaping buckets govern local delivery.
+
 ## Publish circuit breaker (EB-116)
 
 `bus.setPublishCircuitBreaker(topic, opts?)` arms an opt-in publish-side

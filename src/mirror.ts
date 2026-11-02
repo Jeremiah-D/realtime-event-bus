@@ -125,6 +125,13 @@ export interface MirrorRuleInfo {
    * `MirrorRule.throttle`.
    */
   mirroredThrottled: number;
+  /**
+   * Live per-rule throttle (EB-337): the rule's current throttle config
+   * (`burst` fully resolved), or absent when the rule is unthrottled.
+   * `EventBus.setMirrorThrottle` revises it live; `getStats().mirrors`
+   * and the handle's `rules()` report the current value.
+   */
+  throttle?: { messagesPerSec: number; burst: number };
 }
 
 /**
