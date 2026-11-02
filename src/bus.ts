@@ -33856,7 +33856,17 @@ export class EventBus {
         throw new RangeError('instanceId must not collide with generated subscription ids (sub-<n>)');
       }
     }
-    const sessionTimeoutMs = opts?.sessionTimeoutMs ?? DEFAULT_STATIC_SESSION_TIMEOUT_MS;
+    // A rejoin that does not pass its own sessionTimeoutMs keeps the
+    // member's stored timeout (EB-347: a live-revised timeout survives
+    // a rejoin); an explicit value still wins, and a first join falls
+    // back to the default. The stored value was validated when set, so
+    // the gate below still holds for every resolved value.
+    const sessionTimeoutMs =
+      opts?.sessionTimeoutMs ??
+      (instanceId !== undefined
+        ? this.groupStaticTimeouts.get(EventBus.groupKey(groupId, topicPattern))?.get(instanceId)
+        : undefined) ??
+      DEFAULT_STATIC_SESSION_TIMEOUT_MS;
     if (!Number.isFinite(sessionTimeoutMs) || sessionTimeoutMs <= 0) {
       throw new RangeError('sessionTimeoutMs must be a finite number of milliseconds > 0');
     }
@@ -36826,6 +36836,133 @@ export class EventBus {
       // partitions), audits the rebalance, and re-checks group lag.
       this.emitRebalance(groupId, pattern, key, 'assignor', '', undefined, partitionRebalance, 0, true);
     }
+  }
+
+  /**
+   * Revises one static consumer-group member's session timeout live
+   * (EB-347) without re-subscribing it:
+   * `setGroupSessionTimeout(groupId, pattern, instanceId, timeoutMs, actor = 'system')`
+   * retunes how long the member's roster slot is held after it leaves
+   * (see `GroupSubscribeOptions.sessionTimeoutMs`, EB-104).
+   *
+   * Only the timeout moves: the roster, the partition assignment, the
+   * assignor, and the member subscriptions are untouched — no member
+   * leaves or rejoins, and no rebalance fires for the revision itself.
+   * An active member's new timeout takes effect from its next leave
+   * (`enterStaticLimbo` reads the stored value when it arms the expiry
+   * timer). A member already in limbo — a live expiry timer in
+   * `groupStaticSessions` — is re-armed from the revision moment at
+   * the new timeout (the `renewLease` from-now semantics, EB-69), so
+   * tightening the timeout expires the slot sooner and loosening it
+   * holds the slot longer, with the frozen assignment untouched either
+   * way. The revised timeout is remembered per member, so a rejoin
+   * that does not pass its own `sessionTimeoutMs` keeps it (a rejoin
+   * that does pass one still wins — the subscribe-time value is
+   * authoritative when given).
+   *
+   * Fail-closed: an empty groupId, pattern, or instanceId, an illegal
+   * actor, an illegal timeout (anything but a finite number > 0 — the
+   * subscribe-time validation, so a value that could not be set at join
+   * time cannot be revised in later either), and an unknown
+   * group/pattern/instance (no stored timeout for that member — a
+   * dynamic member, a member whose session already expired, or a group
+   * that never had static members) all throw `RangeError` with the
+   * live timeout and the audit log untouched. A revision identical to
+   * the current timeout is a no-op with no audit. Audited as
+   * `group_session_timeout_revised`
+   * (`{ instanceId, previous_timeout_ms, timeout_ms }`; `groupId` and
+   * `pattern` ride on the event itself).
+   *
+   * Orthogonal to EB-104 (that is the static-membership session
+   * mechanism itself — this its timeout revision), to EB-333 (that
+   * retunes the group's rebalance-debounce window — this retunes its
+   * session timeout), to EB-335 (that retunes the handoff-linger
+   * window — this retunes the session timeout), to EB-344 (that
+   * revises the group's auto-commit interval — this revises a member's
+   * session timeout), and to EB-346 (that switches the group's
+   * partition assignor — this revises a member's session timeout).
+   *
+   * Throws `RangeError` for an empty groupId, pattern, or instanceId,
+   * an illegal actor or timeout, or an unknown group/pattern/instance.
+   */
+  setGroupSessionTimeout(
+    groupId: string,
+    pattern: string,
+    instanceId: string,
+    timeoutMs: number,
+    actor = 'system',
+  ): void {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('setGroupSessionTimeout: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('setGroupSessionTimeout: pattern must be a non-empty string');
+    }
+    if (typeof instanceId !== 'string' || instanceId.length === 0) {
+      throw new RangeError('setGroupSessionTimeout: instanceId must be a non-empty string');
+    }
+    assertValidActor(actor, 'setGroupSessionTimeout');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError(
+        'setGroupSessionTimeout: timeoutMs must be a finite number of milliseconds > 0',
+      );
+    }
+    const key = EventBus.groupKey(groupId, pattern);
+    const timeouts = this.groupStaticTimeouts.get(key);
+    const previousTimeoutMs = timeouts?.get(instanceId);
+    if (previousTimeoutMs === undefined) {
+      throw new RangeError(
+        `setGroupSessionTimeout: unknown static member "${instanceId}" in group "${groupId}" on pattern "${pattern}"`,
+      );
+    }
+    // Re-affirming the current timeout is a no-op: no re-arm, no audit.
+    if (timeoutMs === previousTimeoutMs) {
+      return;
+    }
+    timeouts!.set(instanceId, timeoutMs);
+    const sessions = this.groupStaticSessions.get(key);
+    const session = sessions?.get(instanceId);
+    if (session !== undefined) {
+      // Lingering session: re-arm from the revision moment at the new
+      // timeout (the renewLease from-now semantics) — the old timer is
+      // dropped, never left to fire at the old deadline.
+      clearTimeout(session.timer);
+      const cappedMs = Math.min(timeoutMs, 2_147_483_647);
+      const expiresAt = Date.now() + cappedMs;
+      const timer = setTimeout(() => {
+        this.expireStaticSession(key, groupId, pattern, instanceId);
+      }, cappedMs);
+      unrefTimer(timer);
+      sessions!.set(instanceId, { timer, expiresAt });
+    }
+    this.auditSubscription({
+      action: 'group_session_timeout_revised',
+      actor,
+      groupId,
+      pattern,
+      detail: { instanceId, previous_timeout_ms: previousTimeoutMs, timeout_ms: timeoutMs },
+    });
+  }
+
+  /**
+   * Returns the live session timeout for one static consumer-group
+   * member (EB-347) — the value its slot is held for after its next
+   * leave — or `undefined` when the group/pattern/instance holds no
+   * static member (a dynamic member, a member whose session already
+   * expired, or a group that never had static members). Throws
+   * `RangeError` for an empty groupId, pattern, or instanceId.
+   */
+  getGroupSessionTimeout(groupId: string, pattern: string, instanceId: string): number | undefined {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('getGroupSessionTimeout: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('getGroupSessionTimeout: pattern must be a non-empty string');
+    }
+    if (typeof instanceId !== 'string' || instanceId.length === 0) {
+      throw new RangeError('getGroupSessionTimeout: instanceId must be a non-empty string');
+    }
+    return this.groupStaticTimeouts.get(EventBus.groupKey(groupId, pattern))?.get(instanceId);
   }
 
   /**

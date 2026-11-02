@@ -6021,6 +6021,23 @@ Details worth knowing:
   exit. A static member in limbo is reported by `getGroupMembers` with
   its `instanceId`; `subscription.instanceId` is readable from the
   returned `Subscription`.
+- **Session-timeout live revision** (EB-347):
+  `setGroupSessionTimeout(groupId, pattern, instanceId, timeoutMs, actor = 'system')`
+  retunes one static member's hold window at runtime — an active member
+  takes the new timeout from its next leave, and a member already in
+  limbo is re-armed from the revision moment at the new timeout (the
+  `renewLease` from-now semantics), so tightening expires the slot
+  sooner and loosening holds it longer. A rejoin that does not pass its
+  own `sessionTimeoutMs` keeps the revised value (an explicit value at
+  rejoin still wins). The timeout must be a finite number of
+  milliseconds > 0; an unknown group/pattern/instance and an illegal
+  value throw `RangeError` with the live timeout untouched, and
+  re-affirming the current timeout is a no-op with no audit. No
+  rebalance fires for the revision itself. Audited as
+  `group_session_timeout_revised`
+  (`{ instanceId, previous_timeout_ms, timeout_ms }`);
+  `getGroupSessionTimeout(groupId, pattern, instanceId)` reports the
+  live timeout, or `undefined` when the member holds no stored timeout.
 
 ## Consumer-group assignment snapshot (EB-256)
 
