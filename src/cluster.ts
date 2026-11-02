@@ -710,7 +710,7 @@ export class ClusterLink {
   private readonly nodeId: string;
   private readonly url: URL;
   private readonly tls: ClusterConnectOptions['tls'];
-  private readonly heartbeatMs: number;
+  private heartbeatMs: number;
   private readonly onMessage: (msg: ClusterMessage) => boolean;
   private readonly getPatterns: () => string[];
   private readonly onStatusChange?: (status: ClusterLinkStatus) => void;
@@ -1160,6 +1160,43 @@ export class ClusterLink {
       socket.destroy();
     }
     this.emitStatus();
+  }
+
+  /**
+   * The live heartbeat send interval, ms (EB-339). Retuned by
+   * `retuneHeartbeat`; `getHeartbeatMs` reads it back.
+   */
+  getHeartbeatMs(): number {
+    return this.heartbeatMs;
+  }
+
+  /**
+   * Retunes the heartbeat send interval (EB-339) without reconnecting,
+   * re-syncing routes, or changing the connection state: when the
+   * heartbeat timer is armed (connected), it is re-armed at the new
+   * interval — the next heartbeat goes out on the new cadence; when
+   * the link is backing off or otherwise has no armed timer, the
+   * value is stored and the next `startHeartbeat` picks it up.
+   * Reuses the connect-time validation (a positive finite number);
+   * an illegal value throws `RangeError` with the live interval
+   * untouched.
+   *
+   * The hub side is untouched: the hub still drops silent members
+   * after its own `heartbeatTimeoutMs`, so a retuned interval must
+   * stay well below the hub's timeout — this method neither knows
+   * nor changes that timeout.
+   */
+  retuneHeartbeat(heartbeatMs: number): void {
+    if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0) {
+      throw new RangeError('heartbeatMs must be a positive finite number');
+    }
+    this.heartbeatMs = heartbeatMs;
+    // Re-arm the armed timer at the new interval. A link in backoff
+    // has no armed timer and just keeps the stored value until the
+    // next startHeartbeat.
+    if (this.heartbeatTimer != null) {
+      this.startHeartbeat();
+    }
   }
 
   private startHeartbeat(): void {

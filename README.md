@@ -412,7 +412,20 @@ library.
   `getStats().cluster` report `degraded`) and reconnects with backoff
   (see `src/reconnect.ts`; `reconnect: false` disables it). Hub-side
   heartbeat management sweeps members that stop heartbeating
-  (`heartbeatIntervalMs` / `heartbeatTimeoutMs`). Payloads must be
+  (`heartbeatIntervalMs` / `heartbeatTimeoutMs`). The node-side heartbeat
+  send interval is revisable without reconnecting (EB-339, via
+  `bus.setClusterLinkHeartbeat(heartbeatMs)`): the armed timer is re-armed
+  at the new interval when connected — no reconnect, no route re-sync, no
+  connection-state change — and a revision made while backing off is stored
+  for the next `startHeartbeat`. Only the send interval moves; the cached
+  route table, the hub epoch, and the reconnect policy are untouched, and
+  the hub-side `heartbeatTimeoutMs` is untouched and unvalidated, so the
+  interval must stay well below the hub's silence bound. A bus with no
+  cluster link, and any interval that fails the connect-time rule (a
+  positive finite number), both throw `RangeError`; re-affirming the current
+  interval is a no-op with no audit. Every success is audited as
+  `cluster_link_heartbeat_revised`
+  (`{ heartbeatMs: <number>, oldHeartbeatMs: <number> }`). Payloads must be
   JSON-serializable for the wire (`Buffer` payloads travel as base64);
   compressed payloads are forwarded as envelopes and inflated on receipt
   (preset-dictionary bytes must be registered identically on every node).
@@ -3327,6 +3340,16 @@ npm test
   payloads surfacing as forward errors, option validation, double-connect
   rejection, `getStats().cluster`, compressed forward + inflate + raw-payload
   filtering.
+- `test/cluster-link-heartbeat.test.ts` — cluster link heartbeat interval
+  revision (EB-339): `setClusterLinkHeartbeat` fail-closed preconditions
+  (no link before connect and after disconnect, illegal intervals) with the
+  live interval and the audit log untouched, re-affirming the current interval
+  as a no-op with no audit, a connected retune audited with the timer
+  re-armed and the link still connected on the same route version,
+  `ClusterLink.retuneHeartbeat`/`getHeartbeatMs` validating and reading back
+  without a connection, a connected retune taking effect on the wire (the hub
+  keeps the retuned member and sweeps the unretuned one), and a retune during
+  backoff applying on the next connect.
 - `test/bridge.test.ts` — cross-process fan-out bridge: two-node mirror via
   an in-memory transport, loop-free inbound (no re-mirror), key/keySeq/
   messageId/traceId passthrough with trace continuation on the peer,

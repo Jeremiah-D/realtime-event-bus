@@ -36280,6 +36280,74 @@ export class EventBus {
   }
 
   /**
+   * Revises the cluster link's heartbeat send interval (EB-339)
+   * without reconnecting: `setClusterLinkHeartbeat(heartbeatMs)`
+   * retunes how often this node heartbeats to the hub (see
+   * `ClusterConnectOptions.heartbeatMs`, EB-37).
+   *
+   * Only the send interval moves: the link's heartbeat timer is
+   * re-armed at the new interval when connected — the next heartbeat
+   * goes out on the new cadence, with no reconnect, no route
+   * re-sync, and no connection-state change — and when the link is
+   * backing off after a transport drop the value is stored and the
+   * next `startHeartbeat` picks it up, so a revision made while
+   * disconnected governs the reconnected link. The cached route
+   * table, the hub epoch, and the reconnect policy are untouched.
+   *
+   * Hub-side coupling, documented not validated: the hub drops
+   * members silent for longer than its `heartbeatTimeoutMs`
+   * (default 15000ms), so the node-side send interval must stay well
+   * below the hub's timeout — this revision only changes the node's
+   * send interval and neither knows nor changes the hub timeout, so
+   * raising the interval past the hub's timeout can still get the
+   * node swept (and the reconnect policy will bring it back).
+   *
+   * Fail-closed: a bus with no cluster link (never connected, or
+   * already disconnected via `disconnectCluster()`) and an illegal
+   * interval (non-positive, non-finite, or `NaN`) both throw
+   * `RangeError` with the live interval and the audit log untouched
+   * — the interval validation reuses the connect-time rule
+   * (`ClusterLink` constructor: a positive finite number), so an
+   * interval that could not be set at connect time cannot be revised
+   * in later either. A revision identical to the current interval is
+   * a no-op with no audit. Audited as
+   * `cluster_link_heartbeat_revised`
+   * (`{ heartbeatMs: <number>, oldHeartbeatMs: <number> }`).
+   *
+   * Orthogonal to `connectToHub` (that builds the link, this retunes
+   * it afterwards), to the hub-side `heartbeatTimeoutMs` (that is
+   * the hub's member-sweep silence bound, this the node's send
+   * interval), and to `setBridgeHealth` (that retunes the bridge
+   * probe interval, this the cluster link heartbeat).
+   *
+   * Throws `RangeError` for a missing cluster link or an illegal
+   * interval.
+   */
+  setClusterLinkHeartbeat(heartbeatMs: number): void {
+    const link = this.clusterLink;
+    if (link == null) {
+      throw new RangeError('setClusterLinkHeartbeat: no cluster link — call connectToHub() first');
+    }
+    // Validate before touching anything, reusing the connect-time
+    // rule: a positive finite number, or the live interval and the
+    // audit log stay exactly as they were.
+    if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0) {
+      throw new RangeError('setClusterLinkHeartbeat: heartbeatMs must be a positive finite number');
+    }
+    const oldHeartbeatMs = link.getHeartbeatMs();
+    // Re-affirming the current interval is a no-op: no re-arm, no audit.
+    if (heartbeatMs === oldHeartbeatMs) {
+      return;
+    }
+    link.retuneHeartbeat(heartbeatMs);
+    this.auditSubscription({
+      action: 'cluster_link_heartbeat_revised',
+      actor: 'system',
+      detail: { heartbeatMs, oldHeartbeatMs },
+    });
+  }
+
+  /**
    * Delivers one hub-forwarded message to this node's matching
    * subscribers. Runs the same matching/filter/backpressure/group path
    * as local publishes (`deliverMatched`); the message keeps the hub's
