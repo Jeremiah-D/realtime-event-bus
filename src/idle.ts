@@ -36,6 +36,10 @@
  *   and an expiry after the revision reports the new `maxIdleMs`.
  *   `current` reads the live size for the revision's no-op comparison
  *   and its audit entry.
+ * - `retuneActivity` replaces a live window's activity mode (EB-341):
+ *   only the stored mode moves — the pending timer keeps its fire time,
+ *   so an armed window's remaining time is untouched, and an expiry
+ *   after the revision reports the new mode.
  * - `clear` cancels the timer — called from every unsubscribe path, so
  *   no phantom expiry can fire after the subscriber is gone.
  * - `adoptUnsubscribe` lets the subscribe-family wrappers
@@ -189,6 +193,23 @@ export class IdleReclaimer {
   adoptUnsubscribe(subId: string, unsubscribe: () => void): void {
     const entry = this.entries.get(subId);
     if (entry !== undefined) entry.unsubscribe = unsubscribe;
+  }
+
+  /**
+   * Retunes a live idle window's activity mode (EB-341): only the
+   * stored `idleActivity` moves — the pending timer keeps its fire
+   * time, so an armed window's remaining time is untouched, and an
+   * expiry after the revision reports the new mode. Returns the
+   * previous mode, or `undefined` when `subId` holds no active window
+   * (nothing is armed). The entry's `maxIdleMs`, `pattern` and
+   * `unsubscribe` are untouched — only the mode moves.
+   */
+  retuneActivity(subId: string, idleActivity: IdleActivityMode): IdleActivityMode | undefined {
+    const entry = this.entries.get(subId);
+    if (entry === undefined) return undefined;
+    const oldIdleActivity = entry.idleActivity;
+    entry.idleActivity = idleActivity;
+    return oldIdleActivity;
   }
 
   /**

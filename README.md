@@ -1179,7 +1179,19 @@ library.
   identical to the current window is a no-op with no audit — the pending
   timer is not re-armed. Every success is audited as
   `idle_window_revised` (`{ maxIdleMs: <number> | null, oldMaxIdleMs:
-  <number> }`). (Real-time systems / backend engineering: subscriber
+  <number> }`). Also revisable live (EB-341, via
+  `setIdleActivity(subId, idleActivity, actor?)`): an idle subscriber's
+  activity mode can be retuned without re-subscribing — the subscriber
+  record and the `IdleReclaimer` entry move together, so the next event
+  is gated by the new mode and an expiry after the revision reports the
+  new mode on the `onIdleExpired` event; the pending timer is untouched,
+  so an armed window keeps its remaining time. It is fail-closed (an
+  unknown subscriber, a subscriber that never opted into `maxIdleMs` —
+  or whose window was already cleared — or an illegal mode throws
+  `RangeError` with the live mode untouched), and a revision identical
+  to the current mode is a no-op with no audit. Every success is
+  audited as `idle_activity_revised` (`{ idleActivity: <mode>,
+  oldIdleActivity: <mode> }`). (Real-time systems / backend engineering: subscriber
   lifecycle governance.)
   Disabled by default — fully backward compatible.
 - **Graceful drain-on-unsubscribe** (opt-in via

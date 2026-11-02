@@ -1747,7 +1747,9 @@ export interface SubscribeOptions {
    * `'ack'` = `ack()` settled a live delivery (reliable subscriptions
    * only — `nack()`, ack timeouts and no-op acks do not count);
    * `'any'` = either (the default). Requires `maxIdleMs`; anything else
-   * throws `RangeError` at subscribe time.
+   * throws `RangeError` at subscribe time. Revisable live via
+   * `setIdleActivity` (EB-341) — the mode moves without re-subscribing,
+   * and an expiry after the revision reports the new mode.
    */
   idleActivity?: IdleActivityMode;
   /**
@@ -30059,6 +30061,87 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { maxIdleMs, oldMaxIdleMs },
+    });
+  }
+
+  /**
+   * Revises one idle subscriber's activity mode live (EB-341) without
+   * re-subscribing: `setIdleActivity(subId, idleActivity, actor?)`
+   * retunes which events count as activity for the subscription's idle
+   * window (see `SubscribeOptions.idleActivity`, EB-72) — `'deliver'`
+   * (the handler returned without throwing), `'ack'` (`ack()` settled
+   * a live delivery), or `'any'` (either).
+   *
+   * Both stores move together: the subscriber record (which
+   * `recordIdleActivity` reads live on every event, so the new mode
+   * gates re-arming from the next event on) and the `IdleReclaimer`
+   * entry (which the expiry event reports, so an expiry after the
+   * revision names the new mode). The pending timer is untouched: an
+   * armed window keeps the remaining time it was armed with — the mode
+   * only decides which event kinds re-arm it, it never recomputes the
+   * window. The window size, the lease (if any), and the queue are
+   * untouched too. A revision identical to the current mode is a no-op
+   * with no audit — and the pending timer is not re-armed, so a no-op
+   * never extends a subscriber's life.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `maxIdleMs` (or whose window was already cleared), and
+   * an illegal mode value — anything but `'deliver'`, `'ack'` or
+   * `'any'` — all throw `RangeError` with the live mode, its timer,
+   * and the audit log untouched. The new value reuses the
+   * subscribe-time validation, so a failed call leaves the live mode
+   * untouched. Audited as `idle_activity_revised`
+   * (`{ idleActivity: <mode>, oldIdleActivity: <mode> }`) on success.
+   *
+   * Orthogonal to the idle reclamation mechanism itself (EB-72, this
+   * revises which events re-arm it), to `setIdleWindow` (EB-334, the
+   * window duration — this only moves the mode), and to `renewLease`
+   * (a fixed lifetime from subscribe, not an activity-re-armed
+   * window).
+   *
+   * Throws `RangeError` for an unknown / non-idle subscriber, an
+   * illegal actor, or an illegal activity mode.
+   */
+  setIdleActivity(subId: string, idleActivity: IdleActivityMode, actor = 'system'): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setIdleActivity: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setIdleActivity: unknown subscriber: ${subId}`);
+    }
+    assertValidActor(actor, 'setIdleActivity');
+    // The live window gates the revision: a subscriber that never
+    // opted into `maxIdleMs` — or whose window was already cleared —
+    // holds no entry, so there is no mode to revise (the EB-267 clear
+    // rule, same as `setIdleWindow`).
+    if (this.idleReclaimer.current(subId) === undefined) {
+      throw new RangeError('setIdleActivity: subscriber has no idle window set');
+    }
+    // Validate before touching anything: the subscribe-time rule is
+    // exactly the three modes, so the same values subscribe rejects
+    // are rejected here with the live mode untouched.
+    if (idleActivity !== 'deliver' && idleActivity !== 'ack' && idleActivity !== 'any') {
+      throw new RangeError("setIdleActivity: idleActivity must be 'deliver', 'ack' or 'any'");
+    }
+    const oldIdleActivity = subscriber.idleActivity;
+    // Re-affirming the current mode is a no-op: no revision, no
+    // audit, and the pending timer keeps its original fire time.
+    if (idleActivity === oldIdleActivity) {
+      return;
+    }
+    // Both stores move together: `recordIdleActivity` reads the live
+    // subscriber record on every event, and the expiry event reports
+    // the entry's stored mode — revising only one would leave the
+    // other reporting the stale mode.
+    subscriber.idleActivity = idleActivity;
+    this.idleReclaimer.retuneActivity(subId, idleActivity);
+    this.auditSubscription({
+      action: 'idle_activity_revised',
+      actor,
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { idleActivity, oldIdleActivity },
     });
   }
 
