@@ -715,7 +715,11 @@ export interface GraphqlGatewayOptions {
   /**
    * Opt-in bearer auth: when set, `connection_init`'s payload must
    * carry `authorization: "Bearer <token>"` (constant-time compare),
-   * otherwise the connection closes with 4401.
+   * otherwise the connection closes with 4401. Revisable live with
+   * `setAuthToken` (EB-350): a non-empty string rotates the token,
+   * `null` clears it back to no auth — the new value governs from the
+   * next `connection_init`, and a connection that already initialized
+   * is never re-authenticated or disconnected.
    */
   authToken?: string;
   /**
@@ -746,6 +750,12 @@ export interface GraphqlGatewayStats {
   messagesSent: number;
   protocolErrors: number;
   authFailures: number;
+  /**
+   * Whether bearer auth is currently armed (EB-350): true while a live
+   * `authToken` is set — the token value itself is never exposed here.
+   * `setAuthToken` flips this without restarting the server.
+   */
+  authEnabled: boolean;
   /**
    * Live connection limits (EB-349): the values
    * `setGraphqlGatewayLimits` last revised, or the construction
@@ -794,7 +804,8 @@ export class GraphqlGateway {
   private readonly bus: EventBus;
   private readonly host: string;
   private readonly port: number;
-  private readonly authToken: string | undefined;
+  /** Mutable live via `setAuthToken` (EB-350) — see that method. */
+  private authToken: string | undefined;
   /** Mutable live via `setGraphqlGatewayLimits` (EB-349) — see that method. */
   private maxConnections: number | undefined;
   private connectionInitTimeoutMs: number;
@@ -872,6 +883,7 @@ export class GraphqlGateway {
     for (const conn of this.connections) subscriptions += conn.subscriptions.size;
     return {
       ...this.stats,
+      authEnabled: this.authToken !== undefined,
       subscriptions,
       limits: {
         maxConnections: this.maxConnections,
@@ -960,6 +972,49 @@ export class GraphqlGateway {
     }
     this.maxConnections = maxConnections;
     this.connectionInitTimeoutMs = connectionInitTimeoutMs;
+  }
+
+  /**
+   * Rotates or clears the gateway's bearer token live (EB-350) without
+   * restarting the server: `setAuthToken(token)` replaces the token the
+   * next `connection_init` must present (`authorization: "Bearer
+   * <token>"`, constant-time compare), and `setAuthToken(null)` clears
+   * it — `connection_init` stops requiring auth at once. Clearing
+   * disables auth; that is the point of the call, and it is recorded
+   * in the audit event — the token value itself never is.
+   *
+   * Rotation governs only handshakes after the call:
+   * `handleConnectionInit` reads the live value per connection, so a
+   * connection that already initialized keeps running — it is never
+   * re-authenticated or disconnected — while the next `connection_init`
+   * is judged against the new token (the old token closes with 4401
+   * from then on).
+   *
+   * The rotation is audited as `auth_token_revised`
+   * (`bus.getSubscriptionAudit()`) with `{ gateway: 'graphql',
+   * changed: 'rotated' | 'cleared' }`. A revision identical to the
+   * current token — including clearing a gateway that never armed auth
+   * — is a no-op with no audit.
+   *
+   * Fail-closed: an invalid value throws `RangeError` with the live
+   * token untouched. Validation reuses the construction-time rule: a
+   * non-empty string, or `null` to clear — so a value that could not
+   * be set at construction cannot be revised in later either.
+   *
+   * Throws `RangeError` for a non-string token, or for an empty
+   * string.
+   */
+  setAuthToken(token: string | null): void {
+    if (token !== null && (typeof token !== 'string' || token.length === 0)) {
+      throw new RangeError('setAuthToken: token must be a non-empty string or null');
+    }
+    const next = token === null ? undefined : token;
+    // Re-affirming the current token is a no-op — no audit.
+    if (next === this.authToken) {
+      return;
+    }
+    this.authToken = next;
+    this.bus.noteGatewayAuthTokenRevised('graphql', token === null ? 'cleared' : 'rotated');
   }
 
   // --- connection lifecycle --------------------------------------------------

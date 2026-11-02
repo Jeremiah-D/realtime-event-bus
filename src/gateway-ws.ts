@@ -365,7 +365,11 @@ export interface GatewayOptions {
   /**
    * Opt-in connection-level bearer auth. When set, the handshake must
    * carry `Authorization: Bearer <token>`; otherwise the server answers
-   * 401 and drops the connection.
+   * 401 and drops the connection. Revisable live with `setAuthToken`
+   * (EB-350): a non-empty string rotates the token, `null` clears it
+   * back to no auth — the new value governs from the next handshake,
+   * and a connection that already handshook is never re-authenticated
+   * or disconnected.
    */
   authToken?: string;
   /**
@@ -559,6 +563,12 @@ export interface GatewayStats {
   /** Frames dropped (newest-first) while a connection's queue overflowed. */
   droppedFrames: number;
   authFailures: number;
+  /**
+   * Whether bearer auth is currently armed (EB-350): true while a live
+   * `authToken` is set — the token value itself is never exposed here.
+   * `setAuthToken` flips this without restarting the server.
+   */
+  authEnabled: boolean;
   protocolErrors: number;
   /**
    * Connections currently under client pressure (EB-161): their send
@@ -752,7 +762,8 @@ export class GatewayServer {
   private readonly bus: EventBus;
   private readonly host: string;
   private readonly port: number;
-  private readonly authToken: string | undefined;
+  /** Mutable live via `setAuthToken` (EB-350) — see that method. */
+  private authToken: string | undefined;
   /** Mutable live via `setGatewayLimits` (EB-325) — see that method. */
   private sendHighWaterMarkBytes: number;
   private maxPendingBytes: number;
@@ -881,6 +892,7 @@ export class GatewayServer {
     }
     return {
       ...this.stats,
+      authEnabled: this.authToken !== undefined,
       pausedConnections,
       connectionQueues,
       limits: {
@@ -1115,6 +1127,48 @@ export class GatewayServer {
     }
     assertValidMaxSubscriptionsPerConnection(next, 'setGatewayMaxSubscriptionsPerConnection');
     this.maxSubscriptionsPerConnection = next;
+  }
+
+  /**
+   * Rotates or clears the gateway's bearer token live (EB-350) without
+   * restarting the server: `setAuthToken(token)` replaces the token the
+   * next handshake must present (`Authorization: Bearer <token>`,
+   * constant-time compare), and `setAuthToken(null)` clears it — the
+   * handshake stops requiring auth at once. Clearing disables auth;
+   * that is the point of the call, and it is recorded in the audit
+   * event — the token value itself never is.
+   *
+   * Rotation governs only handshakes after the call: `handleHandshake`
+   * reads the live value per connection, so a connection that already
+   * handshook keeps running — it is never re-authenticated or
+   * disconnected — while the next handshake is judged against the new
+   * token (the old token answers 401 from then on).
+   *
+   * The rotation is audited as `auth_token_revised`
+   * (`bus.getSubscriptionAudit()`) with `{ gateway: 'ws', changed:
+   * 'rotated' | 'cleared' }`. A revision identical to the current
+   * token — including clearing a gateway that never armed auth — is a
+   * no-op with no audit.
+   *
+   * Fail-closed: an invalid value throws `RangeError` with the live
+   * token untouched. Validation reuses the construction-time rule: a
+   * non-empty string, or `null` to clear — so a value that could not
+   * be set at construction cannot be revised in later either.
+   *
+   * Throws `RangeError` for a non-string token, or for an empty
+   * string.
+   */
+  setAuthToken(token: string | null): void {
+    if (token !== null && (typeof token !== 'string' || token.length === 0)) {
+      throw new RangeError('setAuthToken: token must be a non-empty string or null');
+    }
+    const next = token === null ? undefined : token;
+    // Re-affirming the current token is a no-op — no audit.
+    if (next === this.authToken) {
+      return;
+    }
+    this.authToken = next;
+    this.bus.noteGatewayAuthTokenRevised('ws', token === null ? 'cleared' : 'rotated');
   }
 
   /**

@@ -20938,6 +20938,28 @@ export class EventBus {
   }
 
   /**
+   * Records one gateway bearer-token rotation in the subscription
+   * audit log (EB-350): a `GatewayServer` or `GraphqlGateway` had its
+   * live `authToken` rotated (`'rotated'`) or cleared (`'cleared'`) by
+   * `setAuthToken`. Audited as `auth_token_revised` with `{ gateway:
+   * 'ws' | 'graphql', changed: 'rotated' | 'cleared' }` — the token
+   * value itself is never recorded, only whether it changed or was
+   * cleared (clearing disables auth, so the event is the record that
+   * auth went off). Fully error-isolated like every audit site: a
+   * broken audit log can never disturb the rotation.
+   */
+  noteGatewayAuthTokenRevised(
+    gateway: 'ws' | 'graphql',
+    changed: 'rotated' | 'cleared',
+  ): void {
+    this.auditSubscription({
+      action: 'auth_token_revised',
+      actor: 'system',
+      detail: { gateway, changed },
+    });
+  }
+
+  /**
    * Receives one forwarded message from another bus's forward rule
    * (EB-56) — the destination-side half of `forward()`. INTERNAL USE
    * ONLY: only forward and mirror registrations call this; producers

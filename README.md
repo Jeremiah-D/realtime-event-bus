@@ -5669,7 +5669,13 @@ Semantics:
   sees snapshot messages before the `subscribed` ack, then live messages.
 - **Auth (opt-in).** With `authToken` set, the handshake must carry
   `Authorization: Bearer <token>` (constant-time compare); otherwise the
-  server answers 401 and drops the connection.
+  server answers 401 and drops the connection. Both gateways rotate it
+  live with `setAuthToken(token)` (EB-350) — a non-empty string rotates,
+  `null` clears back to no auth; only later handshakes are judged
+  against the new value, established connections are untouched, and
+  every rotation is audited as `auth_token_revised` (the token value
+  itself is never logged). `gw.getStats().authEnabled` reports whether
+  auth is currently armed.
 - **Backpressure.** While a connection's socket buffer is past
   `sendHighWaterMarkBytes` (default 256 KiB) the gateway pauses pushing
   frames and queues them locally, bounded by `maxPendingBytes` (default
@@ -5677,7 +5683,7 @@ Semantics:
   `droppedFrames` — the gateway sheds load instead of growing memory.
   `gw.getStats()` reports
   `{connections, framesReceived, framesSent, droppedFrames, authFailures,
-  protocolErrors, pausedConnections, connectionQueues, compressedFrames,
+  authEnabled, protocolErrors, pausedConnections, connectionQueues, compressedFrames,
   deflatedBytes, savedBytes, limits, deflate}`.
 - **Live limit revision (EB-325).** `gw.setGatewayLimits({ maxFrameBytes?,
   maxPendingBytes?, sendHighWaterMarkBytes? })` retunes the three bounds
@@ -9710,10 +9716,11 @@ Semantics:
   teardown unsubscribe.
 - **Auth.** Opt-in: with `authToken` set, `connection_init`'s payload
   must carry `authorization: "Bearer <token>"` (constant-time compare);
-  otherwise the connection closes with 4401.
+  otherwise the connection closes with 4401. It rotates live with
+  `setAuthToken(token)` (EB-350) — see the WS gateway's Auth bullet.
 - **Observability.** `GraphqlGateway.getStats()` reports
   `{ connections, subscriptions, messagesSent, protocolErrors,
-  authFailures, limits }`, where `limits` snapshots the live
+  authFailures, authEnabled, limits }`, where `limits` snapshots the live
   connection limits (`{ maxConnections, connectionInitTimeoutMs }`).
 - **Live limit revision (EB-349).** `setGraphqlGatewayLimits({
   maxConnections?, connectionInitTimeoutMs? })` retunes the two
