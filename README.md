@@ -8873,6 +8873,27 @@ Semantics notes:
   with no audit. Audited as `stream_join_window_revised`
   (`{ joinId: <string>, windowMs: <number>, oldWindowMs: <number> }`).
   `getStats().joins` reports the live window immediately.
+- Retune the memory bound live with
+  `bus.setStreamJoinMaxBufferedPerKey(joinId, maxBufferedPerKey)`
+  (EB-345): only the cap moves — the join's topics, key function,
+  flavor, output topic, and `windowMs` are untouched, and the buffered
+  entries stay put. The new value governs only arrivals after the
+  revision: tightening does not evict immediately (the capacity loop
+  trims the key's list down to the new bound, oldest first, only on
+  that key's next arrival), while loosening expands the capacity at
+  once — so an operator can shed memory pressure on a hot
+  order/payment reconciliation key without dropping in-flight
+  correlation state, then raise the bound again when the burst passes.
+  The sweep timer is untouched (its interval depends only on
+  `windowMs`). A pair already derived is never re-derived or
+  withdrawn. It is fail-closed (an empty or unknown join id, or a
+  non-positive-integer bound, throws `RangeError` with the live bound
+  and the audit log untouched), and a revision identical to the current
+  bound is a no-op with no audit. Audited as
+  `stream_join_max_buffered_per_key_revised`
+  (`{ joinId: <string>, maxBufferedPerKey: <number>,
+  oldMaxBufferedPerKey: <number> }`).
+  `getStats().joins` reports the live bound immediately.
 - `getStats().joins` → per-join `{ joined, joinLate, joinEvicted,
   keyErrors, bufferedLeft, bufferedRight }` (present once a join was
   defined); globals `totalStreamJoinMatches` / `totalStreamJoinLate` /

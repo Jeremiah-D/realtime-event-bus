@@ -19875,6 +19875,71 @@ export class EventBus {
   }
 
   /**
+   * Revises one stream join's per-key buffer bound live (EB-345)
+   * without redefining it: `setStreamJoinMaxBufferedPerKey(joinId,
+   * maxBufferedPerKey)` retunes the cap on buffered entries per key
+   * per side (see `joinTopics`, EB-187).
+   *
+   * Only the cap moves: the join's topics, key function, flavor,
+   * output topic, and `windowMs` are untouched, and the buffered
+   * entries stay put — a pair already derived is never re-derived or
+   * withdrawn. `arrive` reads the bound live, so the new value
+   * governs only arrivals after the revision: tightening does not
+   * evict immediately — the capacity loop trims the key's list down
+   * to the new bound (oldest first, counted in `joinEvicted`) only on
+   * that key's next arrival — while loosening expands the capacity at
+   * once. The sweep timer is untouched: its interval depends only on
+   * `windowMs`. `getStats().joins` reports the live bound
+   * immediately.
+   *
+   * Fail-closed: an empty joinId, an unknown join id, and an illegal
+   * bound (zero, negative, non-integer, `NaN`, `Infinity`, a
+   * non-number) all throw `RangeError` with the live bound and the
+   * audit log untouched — the new value reuses the define-time
+   * validation (a positive integer), so a value that could not be set
+   * at define time cannot be revised in later either. A revision
+   * identical to the current bound is a no-op with no audit. Audited
+   * as `stream_join_max_buffered_per_key_revised`
+   * (`{ joinId: <string>, maxBufferedPerKey: <number>,
+   * oldMaxBufferedPerKey: <number> }`).
+   *
+   * Orthogonal to EB-336 (that is the join window revision — this
+   * its per-key buffer bound), and to EB-187 (that is the join
+   * mechanism itself).
+   *
+   * Throws `RangeError` for an empty / unknown join id or an illegal
+   * bound.
+   */
+  setStreamJoinMaxBufferedPerKey(joinId: string, maxBufferedPerKey: number): void {
+    if (typeof joinId !== 'string' || joinId.length === 0) {
+      throw new RangeError('setStreamJoinMaxBufferedPerKey: joinId must be a non-empty string');
+    }
+    // Same rule as `validateStreamJoinOptions` (EB-187): a positive
+    // integer — validated before anything is touched.
+    if (!Number.isInteger(maxBufferedPerKey) || maxBufferedPerKey <= 0) {
+      throw new RangeError('setStreamJoinMaxBufferedPerKey: maxBufferedPerKey must be a positive integer');
+    }
+    const engine = this.streamJoins;
+    if (engine === undefined) {
+      throw new RangeError(`setStreamJoinMaxBufferedPerKey: unknown join id "${joinId}"`);
+    }
+    const oldMaxBufferedPerKey = engine.getMaxBufferedPerKey(joinId);
+    if (oldMaxBufferedPerKey === undefined) {
+      throw new RangeError(`setStreamJoinMaxBufferedPerKey: unknown join id "${joinId}"`);
+    }
+    // Re-affirming the current bound is a no-op: no retune, no audit.
+    if (maxBufferedPerKey === oldMaxBufferedPerKey) {
+      return;
+    }
+    engine.retuneMaxBufferedPerKey(joinId, maxBufferedPerKey);
+    this.auditSubscription({
+      action: 'stream_join_max_buffered_per_key_revised',
+      actor: 'system',
+      detail: { joinId, maxBufferedPerKey, oldMaxBufferedPerKey },
+    });
+  }
+
+  /**
    * Emits one derived join output back onto the bus (EB-187): an
    * `outputTopic` publish through the normal pipeline, marked
    * join-derived so it never re-enters join observation.

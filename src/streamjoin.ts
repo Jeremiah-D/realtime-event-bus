@@ -155,6 +155,8 @@ export interface StreamJoinStats {
   outputTopic: string;
   how: StreamJoinHow;
   windowMs: number;
+  /** Bound on buffered entries per key per side (live-revisable, EB-345). */
+  maxBufferedPerKey: number;
   /** Combined messages derived. */
   joined: number;
   /** Arrivals dropped as too late to ever match. */
@@ -361,6 +363,36 @@ export class StreamJoinEngine {
     this.startSweep(join);
   }
 
+  /** The configured per-key buffer bound for a join, or `undefined` when unknown. */
+  getMaxBufferedPerKey(joinId: string): number | undefined {
+    return this.joins.get(joinId)?.maxBufferedPerKey;
+  }
+
+  /**
+   * Retunes a join's per-key buffer bound live (EB-345) without
+   * redefining it: `observe` / `arrive` read `join.maxBufferedPerKey`
+   * live, so the new value governs the next arrival — a pair already
+   * derived is never re-derived or withdrawn, and already-buffered
+   * entries stay put. Tightening does not evict immediately: the
+   * capacity loop in `arrive` trims the key's list down to the new
+   * bound only on that key's next arrival (evicting the oldest first,
+   * counted in `joinEvicted`). Loosening expands the capacity at
+   * once. The sweep timer is untouched — its interval depends only on
+   * `windowMs`. Throws `RangeError` on an unknown join id or an
+   * illegal bound (the same positive-integer rule
+   * `validateStreamJoinOptions` enforces at define time).
+   */
+  retuneMaxBufferedPerKey(joinId: string, maxBufferedPerKey: number): void {
+    const join = this.joins.get(joinId);
+    if (join === undefined) {
+      throw new RangeError(`unknown join id "${joinId}"`);
+    }
+    if (!Number.isInteger(maxBufferedPerKey) || maxBufferedPerKey <= 0) {
+      throw new RangeError('maxBufferedPerKey must be a positive integer');
+    }
+    join.maxBufferedPerKey = maxBufferedPerKey;
+  }
+
   /** Joins currently defined. */
   get size(): number {
     return this.joins.size;
@@ -550,6 +582,7 @@ export class StreamJoinEngine {
       outputTopic: join.outputTopic,
       how: join.how,
       windowMs: join.windowMs,
+      maxBufferedPerKey: join.maxBufferedPerKey,
       joined: join.joined,
       joinLate: join.late,
       joinEvicted: join.evicted,
