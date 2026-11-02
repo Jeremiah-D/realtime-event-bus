@@ -359,7 +359,10 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
   });
 
   it('a retune during backoff applies on the next connect', async () => {
-    const { hub: fastHub, port } = await makeHub({ heartbeatIntervalMs: 100, heartbeatTimeoutMs: 250 });
+    // Generous silence bound: the node heartbeats every 5000ms, so a
+    // 250ms hub sweep would destroy its socket mid-test and flap the
+    // final connected check. The retune under test does not touch it.
+    const { hub: fastHub, port } = await makeHub({ heartbeatIntervalMs: 100, heartbeatTimeoutMs: 10000 });
     const fx2: Fixture = { hub: fastHub, port, buses: [], links: [] };
     try {
       const { bus, link } = await makeNode(fx2, {
@@ -387,7 +390,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
         oldMaxAttempts: 100,
       });
       // Bring a NEW hub up on the same port (new epoch).
-      const hub2 = new ClusterHub({ host: '127.0.0.1', port, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 250 });
+      const hub2 = new ClusterHub({ host: '127.0.0.1', port, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 10000 });
       await hub2.listen();
       fx2.hub = hub2;
       await waitFor(() => link.getStats().connected, 8000, 'reconnect');
