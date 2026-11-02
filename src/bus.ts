@@ -5236,7 +5236,10 @@ export interface EventBusOptions {
    * `DurableTopicLog.readSince` / `readSinceTime` with
    * `{ includeArchived: true }`. Only meaningful with `durableLogDir`.
    * Default: absent (no rotation — one live file per topic, as before).
-   * Invalid triggers throw `RangeError` at construction.
+   * Invalid triggers throw `RangeError` at construction. Retune live
+   * with `setDurableLogSegmentRotation(patch, actor?)` (EB-355); only
+   * a bus constructed with rotation can be revised — rotation cannot
+   * be enabled after the fact.
    */
   durableLogSegmentRotation?: SegmentRotationOptions;
   /**
@@ -16715,9 +16718,10 @@ export class EventBus {
   private readonly durableLogKeyCompaction: boolean = false;
   /**
    * `durableLogSegmentRotation` as configured — namespace child logs
-   * (EB-52) open with the same rotation triggers as the root log.
+   * (EB-52) open with the same rotation triggers as the root log; kept
+   * in sync by `setDurableLogSegmentRotation`.
    */
-  private readonly durableLogSegmentRotation?: SegmentRotationOptions;
+  private durableLogSegmentRotation?: SegmentRotationOptions;
   /**
    * `durableLogEncryptor` as configured — namespace child logs (EB-52)
    * seal with the same encryptor as the root log.
@@ -21588,6 +21592,107 @@ export class EventBus {
       action: 'durable_log_publish_dedup_max_entries_revised',
       actor,
       detail: { publishDedupMaxEntries: maxEntries, oldPublishDedupMaxEntries: previous },
+    });
+  }
+
+  /**
+   * Changes the durable log's segment-rotation triggers at runtime
+   * (EB-355): `setDurableLogSegmentRotation(patch, actor?)` retunes
+   * when a topic's live segment closes and archives (see
+   * `EventBusOptions.durableLogSegmentRotation`).
+   *
+   * A partial revision: only the fields `patch` provides move, the
+   * rest keep their live values. Passing a field as `undefined` clears
+   * that trigger — the merged triggers must still hold at least one,
+   * else `RangeError`. Only the triggers move — the segment-archiving
+   * and offload configuration is untouched, and the in-flight live
+   * segment keeps its original start time and counted entries (no
+   * recount, no immediate rotation). The new triggers govern from the
+   * next append of each topic: tightening `maxEntriesPerSegment`
+   * below the current segment's entry count rotates on that next
+   * append, and `maxSegmentAgeMs` is judged on record timestamps
+   * (the bus clock).
+   *
+   * The change applies to the root log and every namespace child log,
+   * and is recorded in the subscription audit log as
+   * `durable_log_segment_rotation_revised` (with the previous and new
+   * triggers in `detail`, `null` when unset), so rotation-policy
+   * changes stay attributable. A namespace registered after the
+   * revision opens its child log with the live bus triggers, like
+   * every other durable-log option.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A bus constructed without
+   * `durableLogSegmentRotation` also throws `RangeError`: rotation
+   * cannot be enabled after the fact, because the live segment's
+   * identity (its entry count and first record's seq / timestamp) is
+   * only tracked while rotation is on — a late-enabled rotation
+   * would count the segment from 0 and misalign it with the live
+   * file's actual first record. An illegal value throws `RangeError`
+   * with the live triggers and the audit log untouched: validation
+   * reuses the construction-time rule
+   * (`resolveSegmentRotationOptions`: at least one trigger, a
+   * positive-integer entry budget, a positive-finite age budget).
+   * A revision identical to the current triggers — or a patch with
+   * neither field — is a no-op with no audit.
+   *
+   * Orthogonal to EB-322 (that retunes the per-topic entry retention
+   * bound — this the segment-rotation triggers), to EB-323 (that
+   * retunes the per-topic byte retention bound — this the rotation
+   * triggers), and to `setDurableLogMaxAgeMs` (that retunes time-based
+   * retention — this the segment age that closes a segment).
+   *
+   * Throws `RangeError` for a bad actor, for an illegal trigger, when
+   * the bus has no `durableLogDir`, or when the bus was constructed
+   * without `durableLogSegmentRotation`.
+   */
+  setDurableLogSegmentRotation(patch: SegmentRotationOptions, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogSegmentRotation');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogSegmentRotation requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const current = this.durableLogSegmentRotation;
+    if (current === undefined) {
+      throw new RangeError(
+        'setDurableLogSegmentRotation requires EventBusOptions.durableLogSegmentRotation to be set: rotation cannot be enabled after the fact',
+      );
+    }
+    // Nothing to revise: no-op, no audit. An explicitly `undefined`
+    // field is a clear, not an absence (hence the `in` checks).
+    if (!('maxEntriesPerSegment' in patch) && !('maxSegmentAgeMs' in patch)) {
+      return;
+    }
+    const merged: SegmentRotationOptions = { ...current, ...patch };
+    if (merged.maxEntriesPerSegment === undefined && merged.maxSegmentAgeMs === undefined) {
+      throw new RangeError(
+        'setDurableLogSegmentRotation needs at least one of maxEntriesPerSegment / maxSegmentAgeMs',
+      );
+    }
+    // Re-affirming the current triggers is a no-op: no retune, no audit.
+    if (
+      merged.maxEntriesPerSegment === current.maxEntriesPerSegment &&
+      merged.maxSegmentAgeMs === current.maxSegmentAgeMs
+    ) {
+      return;
+    }
+    log.setSegmentRotation(patch);
+    for (const child of this.namespaceLogs.values()) {
+      child.setSegmentRotation(patch);
+    }
+    this.durableLogSegmentRotation = merged;
+    const triggers = (t: SegmentRotationOptions) => ({
+      maxEntriesPerSegment: t.maxEntriesPerSegment ?? null,
+      maxSegmentAgeMs: t.maxSegmentAgeMs ?? null,
+    });
+    this.auditSubscription({
+      action: 'durable_log_segment_rotation_revised',
+      actor,
+      detail: { from: triggers(current), to: triggers(merged) },
     });
   }
 

@@ -654,8 +654,22 @@ library.
   namespace child log (a namespace registered later opens with the
   live bound), requires a `durableLogDir`, and is audited as
   `durable_log_publish_dedup_max_entries_revised` (old and new bound);
-  an identical revision is a no-op with no audit. Corrupt log lines
-  are skipped and counted
+  an identical revision is a no-op with no audit. Retune the
+  segment-rotation triggers live with
+  `setDurableLogSegmentRotation(patch, actor?)` (EB-355): a partial
+  revision — only the fields provided move (passing a field as
+  `undefined` clears that trigger, as long as at least one remains);
+  only the triggers move, the in-flight live segment keeps its start
+  time and counted entries, and the new triggers govern from the next
+  append (a tightened entry budget rotates on that next append, the age
+  budget is judged on record timestamps). It fans out to the root log
+  and every namespace child log (a namespace registered later opens
+  with the live triggers), requires a `durableLogDir` and a bus
+  constructed with rotation (rotation cannot be enabled after the
+  fact), and is audited as `durable_log_segment_rotation_revised`
+  (`{ from, to }`, `null` when a trigger is unset); an identical
+  revision, or a patch with neither field, is a no-op with no audit.
+  Corrupt log lines are skipped and counted
   (`getStats().durableLog.corruptLines`), never fatal; payloads
   `JSON.stringify` cannot represent are delivered live but skipped by the
   log. Opt-in Kafka-style keyed compaction (`durableLogKeyCompaction`):

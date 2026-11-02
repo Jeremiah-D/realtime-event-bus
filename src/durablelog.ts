@@ -1864,8 +1864,9 @@ export class DurableTopicLog {
   /**
    * Opt-in segment rotation triggers, `undefined` when rotation is
    * disabled (the default — one live file per topic, as before).
+   * Mutable at runtime via `setSegmentRotation` (EB-355).
    */
-  private readonly segmentRotation?: SegmentRotationOptions;
+  private segmentRotation?: SegmentRotationOptions;
   /**
    * Entries appended to the current live segment per topic. Reset on
    * every rotation; seeded from the live file on recovery.
@@ -2210,6 +2211,59 @@ export class DurableTopicLog {
   /** The current publish-dedup journal bound — the live value `setPublishDedupMaxEntries` moves. */
   currentPublishDedupMaxEntries(): number {
     return this.publishDedupMaxEntries;
+  }
+
+  /**
+   * Changes the segment-rotation triggers at runtime (EB-355), as a
+   * partial revision: only the fields `patch` provides move, the rest
+   * keep their live values. Passing a field as `undefined` clears that
+   * trigger — the merged triggers must still hold at least one, else
+   * `RangeError`. Returns the previous triggers. Throws `RangeError`
+   * for an illegal value (reusing the construction-time validation
+   * `resolveSegmentRotationOptions`), leaving the live triggers
+   * exactly as they were. A patch with neither field is a no-op
+   * returning the current triggers.
+   *
+   * Fail-closed: a log constructed without `segmentRotation` refuses
+   * outright — rotation cannot be enabled after the fact, because the
+   * live segment's identity (`segmentEntries` / `segmentStartSeq` /
+   * `segmentStartAt`) is only tracked while rotation is on, so a
+   * late-enabled rotation would count the segment from 0 and misalign
+   * it with the live file's actual first record. The bus enforces the
+   * same gate as `setDurableLogSegmentRotation` and records the change
+   * in the subscription audit log
+   * (`durable_log_segment_rotation_revised`).
+   *
+   * Only the triggers move: the in-flight live segment keeps its
+   * original start time and counted entries (no recount, no immediate
+   * rotation), and the new triggers govern from the next append — a
+   * `maxEntriesPerSegment` tightened below the current segment's
+   * entry count rotates on that next append. Segment archiving /
+   * offload configuration is untouched.
+   */
+  setSegmentRotation(patch: SegmentRotationOptions): SegmentRotationOptions | undefined {
+    // Neither field given at all is a no-op; an explicitly `undefined`
+    // field is a clear, not an absence (hence the `in` checks).
+    if (!('maxEntriesPerSegment' in patch) && !('maxSegmentAgeMs' in patch)) {
+      return this.currentSegmentRotation();
+    }
+    if (this.segmentRotation === undefined) {
+      throw new RangeError(
+        'DurableTopicLog.setSegmentRotation requires segmentRotation to be configured at construction: rotation cannot be enabled after the fact',
+      );
+    }
+    const merged = resolveSegmentRotationOptions({
+      ...this.segmentRotation,
+      ...patch,
+    }) as SegmentRotationOptions;
+    const previous = this.currentSegmentRotation();
+    this.segmentRotation = merged;
+    return previous;
+  }
+
+  /** The current segment-rotation triggers — the live value `setSegmentRotation` moves. */
+  currentSegmentRotation(): SegmentRotationOptions | undefined {
+    return this.segmentRotation === undefined ? undefined : { ...this.segmentRotation };
   }
 
   /**
