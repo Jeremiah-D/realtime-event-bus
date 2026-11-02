@@ -4380,6 +4380,32 @@ export interface GroupPartitionExpansion {
 }
 
 /**
+ * The result of `EventBus.triggerGroupRebalance` (EB-351): a manual,
+ * operator-initiated rebalance of one consumer group.
+ */
+export interface GroupRebalanceTrigger {
+  /** The rebalanced group. */
+  groupId: string;
+  /** The competing set's topic pattern. */
+  pattern: string;
+  /** Members notified (0 when the group was empty/drained). */
+  members: number;
+  /**
+   * False when the group was empty/drained: the trigger was audited but
+   * no rebalance fired — there was nobody to notify and no assignment
+   * to move.
+   */
+  triggered: boolean;
+  /**
+   * Present for partitioned groups that fired: the post-trigger
+   * partition assignment plus the net migration since the last emitted
+   * rebalance (empty in the steady state — members with no changed
+   * partitions are not called, per the EB-209 rule).
+   */
+  partitionRebalance?: PartitionRebalanceInfo;
+}
+
+/**
  * Result of `EventBus.scalePartitions` (EB-216): the topic-scale
  * operation's publish-side counts plus one per-group expansion for
  * every partitioned competing set whose pattern is exactly the scaled
@@ -4412,13 +4438,15 @@ export interface GroupRebalanceEvent {
    * What triggered the rebalance: a member joining, a member leaving, an
    * operator-initiated partition-count expansion
    * (`EventBus.setGroupPartitionCount`, EB-210), or an operator-initiated
-   * partition-assignor switch (`EventBus.setGroupAssignor`, EB-346).
+   * partition-assignor switch (`EventBus.setGroupAssignor`, EB-346), or
+   * an operator-initiated manual trigger
+   * (`EventBus.triggerGroupRebalance`, EB-351).
    */
-  trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor';
+  trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor' | 'operator';
   /**
    * The roster key of the member that joined or left. Empty for
-   * `trigger: 'expand'` / `'remediate'` / `'assignor'` — those are
-   * operator-initiated and name no single member.
+   * `trigger: 'expand'` / `'remediate'` / `'assignor'` / `'operator'` —
+   * those are operator-initiated and name no single member.
    */
   memberId: string;
   /**
@@ -34479,7 +34507,7 @@ export class EventBus {
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor' | 'operator',
     memberId: string,
     linger?: { until: number; windows: LingerWindow[] },
     partitionRebalance?: PartitionRebalanceInfo,
@@ -34511,7 +34539,7 @@ export class EventBus {
    */
   private fireRebalanceListener(
     groupId: string,
-    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor' | 'operator',
     memberId: string,
     rosterKey: string,
     subscriber: Subscriber,
@@ -34576,8 +34604,8 @@ export class EventBus {
    * the audit entry are byte-identical to before EB-169.
    *
    * `bypassDebounce` is for operator-initiated rebalances (EB-210
-   * expansion, EB-211 remediation, EB-346 assignor switch): they apply
-   * immediately instead of
+   * expansion, EB-211 remediation, EB-346 assignor switch, EB-351
+   * manual trigger): they apply immediately instead of
    * merging into a membership-change window, and the debounce baseline
    * is refreshed from the post-change assignment so a later window
    * never diffs across the operator's change. `expansion` carries the
@@ -34587,7 +34615,7 @@ export class EventBus {
     groupId: string,
     pattern: string,
     key: string,
-    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor',
+    trigger: 'join' | 'leave' | 'expand' | 'remediate' | 'assignor' | 'operator',
     memberId: string,
     linger: { until: number; windows: LingerWindow[] } | undefined,
     partitionRebalance: PartitionRebalanceInfo | undefined,
@@ -34599,9 +34627,10 @@ export class EventBus {
     if (members == null) return;
     // The group opted into rebalance debounce (EB-169): the event
     // carries how many membership changes were absorbed into the window.
-    // Operator-initiated rebalances (EB-210 expansion, EB-211 remediation)
-    // bypass the debouncer — they apply immediately and are audited on
-    // their own — so they never report a membership-change count.
+    // Operator-initiated rebalances (EB-210 expansion, EB-211 remediation,
+    // EB-346 assignor switch, EB-351 manual trigger) bypass the debouncer
+    // — they apply immediately and are audited on their own — so they
+    // never report a membership-change count.
     const debounced = !bypassDebounce && this.rebalancer.getWindowMs(key) !== undefined;
     // Offset auto-commit (EB-127): every rebalance — join or leave —
     // checkpoints the group's pending offsets first, before ownership
@@ -36945,6 +36974,151 @@ export class EventBus {
       // partitions), audits the rebalance, and re-checks group lag.
       this.emitRebalance(groupId, pattern, key, 'assignor', '', undefined, partitionRebalance, 0, true);
     }
+  }
+
+  /**
+   * Manually triggers a consumer-group rebalance (EB-351, real-time
+   * systems): the operator's "rebalance now" button — for a group whose
+   * membership changed behind the rebalance-debounce window, or whose
+   * assignment an operator wants re-observed without touching the
+   * roster, the partition count, or the assignor. Nothing about the
+   * group moves: the roster, the partition count, the assignor, the
+   * committed offsets, and the assignment watermarks are untouched — the
+   * trigger only re-emits the rebalance for the live roster.
+   *
+   * The trigger fires immediately: the rebalance debounce (EB-169) is
+   * bypassed, following the EB-210 expansion path — a debounced group's
+   * pending window is not waited on (and not cancelled; it still flushes
+   * its merged membership event at window end, diffed against the
+   * baseline this trigger refreshed). Partitioned groups report the net
+   * migration since the last emitted rebalance (the debounced flush's
+   * baseline): a membership change absorbed into a pending window already
+   * moved the live assignment eagerly, so the trigger surfaces that
+   * pending migration to the listeners now. With no baseline the live
+   * assignment is the baseline — a steady-state trigger migrates nothing,
+   * and members with no changed partitions are not called, per the
+   * EB-209 rule. No backlog is replayed: the trigger moves no partition
+   * itself, so there is no handoff to hand over.
+   *
+   * Resolution is exactly-one (the `getGroupAssignment` shape): a
+   * `pattern` selects its competing set directly; without one, the
+   * groupId must own exactly one competing set. A fully drained group
+   * is a no-op that still audits: the trigger is recorded but no
+   * rebalance fires — there is nobody to notify and no assignment to
+   * move. A drained partitioned group is still known (its count and
+   * strategy are retained), while a fully drained round-robin group
+   * leaves no trace and reads as unknown.
+   *
+   * Audited as `group_rebalance_triggered` (`{ trigger: 'operator',
+   * members }`; `groupId` / `pattern` / `actor` ride on the event
+   * itself), recorded before the rebalance fires — so the operator
+   * action is on the record even for a drained group. The rebalance
+   * itself is audited as `rebalance` with `trigger: 'operator'` inside
+   * `emitRebalance`, like any other rebalance.
+   *
+   * Orthogonal to EB-346 (that switches the assignor and migrates
+   * partitions — this moves nothing), to EB-333 (that retunes the
+   * debounce window — this bypasses it), and to EB-344 (that revises
+   * the auto-commit interval — this fires a rebalance).
+   *
+   * Throws `RangeError` for an empty groupId, an empty pattern when
+   * given, an illegal actor, or a groupId that does not resolve to
+   * exactly one competing set (unknown, or ambiguous without a pattern).
+   */
+  triggerGroupRebalance(
+    groupId: string,
+    pattern?: string,
+    actor = 'system',
+  ): GroupRebalanceTrigger {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('triggerGroupRebalance: groupId must be a non-empty string');
+    }
+    if (pattern !== undefined && (typeof pattern !== 'string' || pattern.length === 0)) {
+      throw new RangeError(
+        'triggerGroupRebalance: pattern must be a non-empty string when given',
+      );
+    }
+    assertValidActor(actor, 'triggerGroupRebalance');
+    let key: string;
+    let resolvedPattern: string;
+    if (pattern !== undefined) {
+      key = EventBus.groupKey(groupId, pattern);
+      if (!this.groupMembers.has(key) && !this.groupPartitions.has(key)) {
+        throw new RangeError(
+          `triggerGroupRebalance: unknown consumer group "${groupId}" on pattern "${pattern}"`,
+        );
+      }
+      resolvedPattern = pattern;
+    } else {
+      const prefix = `${groupId}\0`;
+      const keys = new Set<string>();
+      for (const k of [...this.groupMembers.keys(), ...this.groupPartitions.keys()]) {
+        if (k.startsWith(prefix)) keys.add(k);
+      }
+      if (keys.size === 0) {
+        throw new RangeError(`triggerGroupRebalance: unknown consumer group "${groupId}"`);
+      }
+      if (keys.size > 1) {
+        throw new RangeError(
+          `triggerGroupRebalance: consumer group "${groupId}" has ${keys.size} competing sets — pass the pattern to select one`,
+        );
+      }
+      key = [...keys][0] as string;
+      resolvedPattern = key.slice(prefix.length);
+    }
+    const members = this.groupMembers.get(key) ?? [];
+    // The trigger itself is audited first, so the operator action is on
+    // the record even when the group is drained and nothing fires — the
+    // same ordering the assignor switch uses.
+    this.auditSubscription({
+      action: 'group_rebalance_triggered',
+      actor,
+      groupId,
+      pattern: resolvedPattern,
+      detail: { trigger: 'operator', members: members.length },
+    });
+    if (members.length === 0) {
+      // Fully drained group: only the retained state is left — nobody to
+      // notify, no assignment to move. No rebalance fires.
+      return { groupId, pattern: resolvedPattern, members: 0, triggered: false };
+    }
+    // Partitioned groups report the net migration since the last emitted
+    // rebalance (the debounced flush's baseline, EB-169). With no
+    // baseline the live assignment is the baseline, so a steady-state
+    // trigger migrates nothing. No backlog replay: the trigger moves no
+    // partition itself.
+    let partitionRebalance: PartitionRebalanceInfo | undefined;
+    if (this.groupPartitions.get(key) !== undefined) {
+      const before = this.rebounceBaselines.get(key) ?? new Map(this.partitionAssignment(key));
+      const after = this.partitionAssignment(key);
+      partitionRebalance = {
+        assignment: Object.fromEntries(after),
+        migrated: this.diffPartitionAssignment(key, before, after),
+        strategy: this.groupAssignorName(key),
+      };
+    }
+    // Operator-initiated: bypass the membership-change debounce, audit
+    // on its own. emitRebalance flushes pending auto-commits, notifies
+    // members (onRebalance + rebalance listeners for the migrated
+    // partitions), audits the rebalance, and re-checks group lag.
+    this.emitRebalance(
+      groupId,
+      resolvedPattern,
+      key,
+      'operator',
+      '',
+      undefined,
+      partitionRebalance,
+      0,
+      true,
+    );
+    return {
+      groupId,
+      pattern: resolvedPattern,
+      members: members.length,
+      triggered: true,
+      ...(partitionRebalance === undefined ? {} : { partitionRebalance }),
+    };
   }
 
   /**

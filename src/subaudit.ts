@@ -201,13 +201,14 @@ export type SubscriptionAuditAction =
   | 'stream_join_window_revised'
   | 'stream_join_max_buffered_per_key_revised'
   | 'allowed_lateness_revised'
-  | 'auth_token_revised';
+  | 'auth_token_revised'
+  | 'group_rebalance_triggered';
 
 /**
  * One audit entry. `detail` carries action-specific context without
  * bloating the flat schema:
  * - `update_pattern`: `{ from: <old pattern> }`
- * - `rebalance`: `{ trigger: 'join'|'leave', memberId, members: <count> }`
+ * - `rebalance`: `{ trigger: 'join'|'leave'|'expand'|'remediate'|'assignor'|'operator', memberId, members: <count> }`
  * - `group_session_expired`: `{ instanceId }` (static membership, EB-104:
  *   the held roster slot was released after the session window)
  * - `topic_register`: `{ owner?, description?, schemaVersion?, tags?, updated: <bool> }`
@@ -292,6 +293,7 @@ export type SubscriptionAuditAction =
  * - `stream_join_max_buffered_per_key_revised`: `{ joinId: <string>, maxBufferedPerKey: <number>, oldMaxBufferedPerKey: <number> }` — one stream join's per-key buffer bound was revised (EB-345; only a join the bus currently holds can be revised — a never-defined or removed join refuses with `RangeError`; the new value reuses the define-time validation (a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the join's topics, key function, flavor, output topic, and `windowMs` are untouched, and the buffered entries stay put — and the new value governs only arrivals after the revision (`arrive` reads the bound live), so a pair already derived is never re-derived or withdrawn, tightening does not evict buffered entries immediately (the capacity loop trims the key's list down to the new bound, oldest first, only on that key's next arrival) while loosening expands the capacity at once, the sweep timer is untouched (its interval depends only on `windowMs`), and `getStats().joins` reports the live bound immediately; a revision identical to the current bound is a no-op with no audit)
  * - `allowed_lateness_revised`: `{ from: <previous allowedLatenessMs>, to: <new allowedLatenessMs> }` — the bus-wide default allowed lateness for event-time watermark tracking was revised (EB-324; watermark tracking is bus-wide and always on, so there is no never-enabled bus to refuse and no `durableLogDir` gate; the new value reuses the construction-time validation (`validateAllowedLatenessMs`: a non-negative finite number of milliseconds), so a failed call leaves the live default untouched; `undefined` is not a new default — the default is always a number, 0 when unconfigured — and throws `RangeError`; only the default moves — the watermark mechanism itself is untouched (per-topic overrides from `setTopicAllowedLateness` keep winning, exact-topic rule first then the earliest-registered matching pattern, the per-topic peak never rolls back, and messages already judged late stay late) — and the new default governs from the next event-time observation on every topic without an override, with the next `getStats()` watermark reading reflecting it immediately; a revision identical to the current default is a no-op with no audit)
  * - `auth_token_revised`: `{ gateway: 'ws' | 'graphql', changed: 'rotated' | 'cleared' }` — one gateway's bearer token was rotated or cleared live (EB-350; a non-empty string rotates, `null` clears — clearing disables auth, so a gateway that never armed auth records nothing for it; the token value itself is never recorded — only whether it changed or was cleared — and the new value governs only handshakes after the revision, so a connection that already handshook is never re-authenticated or disconnected and the old token stops working at the next handshake; the new value reuses the construction-time validation (a non-empty string, or `null` to clear), so a failed call leaves the live token untouched; a revision identical to the current token, including clearing an already-unauthenticated gateway, is a no-op with no audit)
+ * - `group_rebalance_triggered`: `{ trigger: 'operator', members: <number> }` — an operator manually triggered a consumer-group rebalance (EB-351; `groupId` / `pattern` / `actor` ride on the event itself, like `rebalance`; only a group the bus currently holds can be triggered — an unknown groupId, or an ambiguous groupId without a pattern, refuses with `RangeError`; the trigger bypasses the rebalance debounce and fires immediately, so members observe it through `onRebalance`/`rebalanceListener` with `trigger: 'operator'` and the rebalance itself is audited as `rebalance`; only the trigger is recorded for a fully drained group — no rebalance fires, nobody is notified — and the `members` count is 0 there)
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -621,6 +623,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'stream_join_max_buffered_per_key_revised',
   'allowed_lateness_revised',
   'auth_token_revised',
+  'group_rebalance_triggered',
   'dead_letter_replay_requested',
   'dead_letter_replay_approved',
   'dead_letter_replay_rejected',

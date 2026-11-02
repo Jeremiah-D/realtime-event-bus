@@ -291,7 +291,18 @@ library.
   An unknown groupId, a group that never opted into partitions, or an ambiguous groupId throws `RangeError`;
   switching to the running assignor is a no-op with no audit. Audited as `group_assignor_revised`
   (`{ assignor, oldAssignor }`). A fully drained group records the switch by the audit entry alone, and the
-  next generation's first member re-fixes the assignor under the first-member-fixes rule. **Topic partition scaling**
+  next generation's first member re-fixes the assignor under the first-member-fixes rule. **Manual rebalance
+  trigger** (EB-351): `triggerGroupRebalance(groupId, pattern?, actor = 'system')` fires a consumer-group
+  rebalance on demand — the operator's "rebalance now" — without touching the roster, the partition count, or
+  the assignor. The rebalance debounce is bypassed, so the event fires immediately (`trigger: 'operator'`,
+  `memberId: ''`); partitioned groups report the net migration since the last emitted rebalance, so a membership
+  change absorbed into a pending debounce window surfaces to `onRebalance`/`rebalanceListener` (revoke/assign in
+  the expand-path shape) now instead of at window end, while a steady-state trigger migrates nothing and the
+  listeners stay silent. A `pattern` selects one competing set directly; without one, the groupId must own
+  exactly one. Audited as `group_rebalance_triggered` (`{ trigger: 'operator', members }`), recorded before the
+  rebalance itself (audited as `rebalance` with `trigger: 'operator'`). A fully drained group is an audited
+  no-op — the trigger is recorded but no rebalance fires; a drained partitioned group is still known, while a
+  fully drained round-robin group reads as unknown. **Topic partition scaling**
   (EB-216): `scalePartitions(topic, newCount)` is the Kafka
   `kafka-topics --alter --partitions` analogue applied end to end on one
   topic — real-time systems' elastic scale-out. Growth only (a
