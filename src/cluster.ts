@@ -143,6 +143,8 @@ export interface ClusterHubStats {
   routeSyncRequests: number;
   /** Configured diff retention window. */
   routeDiffRetention: number;
+  /** Silence after which the hub drops a member, ms — the live value (revisable via `setHeartbeatTimeout`, EB-352). */
+  heartbeatTimeoutMs: number;
 }
 
 interface HubMember {
@@ -357,7 +359,7 @@ export class ClusterHub {
   private forwardedMessages = 0;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private readonly heartbeatIntervalMs: number;
-  private readonly heartbeatTimeoutMs: number;
+  private heartbeatTimeoutMs: number;
   private readonly tls: ClusterHubOptions['tls'];
   private readonly host: string;
   private readonly port: number;
@@ -438,7 +440,55 @@ export class ClusterHub {
       routeSnapshotsSent: this.routeSnapshotsSent,
       routeSyncRequests: this.routeSyncRequests,
       routeDiffRetention: this.routeDiffRetention,
+      heartbeatTimeoutMs: this.heartbeatTimeoutMs,
     };
+  }
+
+  /**
+   * Revises the hub-side silent-member sweep timeout live (EB-352,
+   * real-time systems): how long a member may go without a heartbeat
+   * before the hub drops it (`sweepSilentMembers`).
+   *
+   * Only the timeout moves: the sweep timer is not rebuilt — it keeps
+   * its `heartbeatIntervalMs` cadence and reads the live value each
+   * round — and the members, the route table, the hub epoch, and the
+   * connections are untouched. The new value governs from the next
+   * sweep: tightening drops a member that is already silent past the
+   * new bound, loosening spares one that would have been swept under
+   * the old bound. This closes the EB-340 gap on the hub side: a
+   * retuned link backoff that waits longer than the hub's silence
+   * bound can now be accommodated by raising the bound to match,
+   * instead of the node being swept on the next drop.
+   *
+   * Fail-closed: anything but a positive finite number of
+   * milliseconds, and any value at or below the live heartbeat
+   * interval — a member would be swept inside a normal heartbeat
+   * interval — both throw `RangeError` with the live timeout
+   * untouched. Re-affirming the current timeout is a no-op (checked
+   * before the interval guard, so a hub built with a timeout at or
+   * below its interval keeps running it). The hub has no bus audit
+   * channel — the live value is observed via `getStats()`.
+   *
+   * Throws `RangeError` for an illegal timeout.
+   */
+  setHeartbeatTimeout(timeoutMs: number): void {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError(
+        'setHeartbeatTimeout: timeoutMs must be a finite number of milliseconds > 0',
+      );
+    }
+    // Re-affirming the current timeout is a no-op: no timer touch, no
+    // observable change — even when the hub was built with a timeout at
+    // or below its interval (the constructor never enforced the guard).
+    if (timeoutMs === this.heartbeatTimeoutMs) {
+      return;
+    }
+    if (timeoutMs <= this.heartbeatIntervalMs) {
+      throw new RangeError(
+        `setHeartbeatTimeout: timeoutMs (${timeoutMs}ms) must be greater than the heartbeat interval (${this.heartbeatIntervalMs}ms) — otherwise a member is swept inside a normal heartbeat interval`,
+      );
+    }
+    this.heartbeatTimeoutMs = timeoutMs;
   }
 
   /**

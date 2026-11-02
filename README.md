@@ -487,7 +487,19 @@ library.
   maxAttempts, oldBaseDelayMs, oldMaxDelayMs, oldMaxAttempts }`). The hub's
   `heartbeatTimeoutMs` is untouched and unvalidated, so a retuned backoff
   that waits longer than the hub's silence bound can still get the node
-  swept on the next drop. Payloads must be
+  swept on the next drop. The hub-side silence bound itself is revisable
+  live (EB-352, via `ClusterHub.setHeartbeatTimeout(timeoutMs)`): the sweep
+  timer keeps its `heartbeatIntervalMs` cadence and reads the live value
+  each round — it is never rebuilt — so a tightened bound drops an
+  already-silent member at the next sweep and a loosened bound spares one
+  that would have been swept under the old bound, which is the answer to a
+  retuned backoff that waits longer than the old bound. The new value must
+  stay above the live heartbeat interval (a member would otherwise be swept
+  inside a normal heartbeat interval); anything but a positive finite number
+  above the interval throws `RangeError` with the live timeout untouched,
+  and re-affirming the current timeout is a no-op. The hub has no audit
+  channel — the live value is observed via
+  `ClusterHub.getStats().heartbeatTimeoutMs`. Payloads must be
   JSON-serializable for the wire (`Buffer` payloads travel as base64);
   compressed payloads are forwarded as envelopes and inflated on receipt
   (preset-dictionary bytes must be registered identically on every node).
