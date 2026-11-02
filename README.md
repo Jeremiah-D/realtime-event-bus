@@ -2359,6 +2359,23 @@ library.
   no-op with no audit. Every success is audited as
   `key_hotspot_recover_depth_revised`
   (`{ recoverDepth: <number>, oldRecoverDepth: <number> }`).
+  The auto-mitigation switch itself is revisable the same way (EB-338, via
+  `setKeyHotspotAutoMitigate(subId, autoMitigate | null)`): `true` enables
+  with the defaults (`recoverDepth` taken from the live threshold, no
+  callback), an object tunes `recoverDepth` (a non-negative integer at most
+  the live threshold) and `onHotKeyMitigated`, and `false` / `null` disables
+  — a detection-only subscription can opt in this way, unlike the EB-294
+  depth revision which refuses it. Only the switch moves: the threshold and
+  the `onKeyHotspot` callback are untouched, enabling never touches the alert
+  latch (a key that already alerted stays alerted; mitigation engages on the
+  next keyed-delivery evaluation at or above the threshold), and disabling
+  also clears the `mitigatedKeys` latch, releasing engaged streams
+  immediately so the next out-of-order arrival buffers instead of being shed
+  and `getStats().hotKeys` never reports a stale `mitigated` flag. A
+  homomorphic revision is a no-op with no audit. Every success is audited as
+  `key_hotspot_auto_mitigate_revised`
+  (`{ enabled: <boolean>, recoverDepth: <number> | null,
+  oldEnabled: <boolean>, oldRecoverDepth: <number> | null }`).
   (Real-time systems: key-hotspot governance.) Disabled by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
   `new EventBus({ trace: true })`): one trace per sampled publish, threading
@@ -3666,6 +3683,15 @@ npm test
   depth audited and carried by the next engagement, repairing an EB-289 inverted hysteresis band,
   lowering the depth keeping an engaged mitigation engaged until a partial drain, raising it
   releasing sooner, and `recoverDepth` 0 meaning no automatic release.
+- `test/keyhotspot-auto-mitigate.test.ts` — key-hotspot auto-mitigation switch revision
+  (EB-338): `setKeyHotspotAutoMitigate` fail-closed preconditions (unknown / empty / unmonitored
+  subscriber, illegal `recoverDepth` / callback / value shape) with the live switch and the audit
+  log untouched, closing a detection-only subscription as a no-op with no audit, `true` and an
+  object without `recoverDepth` both defaulting the depth to the live threshold, an object tuning
+  the depth and the callback with the engagement carrying the new values, homomorphic revisions
+  as no-ops with no audit, disabling an engaged mitigation clearing the latch and releasing at
+  once with stats never stale, disabling keeping the threshold and the alert callback, and
+  enabling never touching the alert latch.
 - `test/deduplicate-messages-revision.test.ts` — subscriber dedup window revision (EB-295):
   `setDeduplicateMessages` fail-closed preconditions (unknown / empty / non-dedup subscriber,
   non-object revision, invalid `windowMs` / `maxEntries`, one illegal field vetoing the whole

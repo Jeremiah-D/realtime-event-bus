@@ -130,6 +130,7 @@ import {
 import {
   HOT_KEYS_LIMIT,
   resolveKeyHotspotOptions,
+  type HotKeyMitigateOptions,
   type HotKeyStat,
   type KeyHotspotOptions,
   type SubscriberKeyHotspotState,
@@ -29163,6 +29164,152 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { recoverDepth, oldRecoverDepth },
+    });
+  }
+
+  /**
+   * Revises one key-hotspot-monitored subscriber's auto-mitigation
+   * switch (EB-338) without re-subscribing:
+   * `setKeyHotspotAutoMitigate(subId, autoMitigate | null)` enables,
+   * retunes, or disables per-key auto-mitigation at runtime (see
+   * `SubscribeOptions.keyHotspot`, EB-47 / EB-115).
+   *
+   * `true` enables mitigation with the defaults — `recoverDepth`
+   * taken from the LIVE `thresholdDepth` (not the subscribe-time
+   * snapshot, so an EB-289 threshold revision is honored) and no
+   * callback; an object tunes `recoverDepth` (a non-negative integer
+   * at most the live threshold, reusing the subscribe-time rule) and
+   * `onHotKeyMitigated`. `false` or `null` disables mitigation. A
+   * detection-only subscription can opt in this way — enabling does
+   * not require mitigation to have been armed at subscribe time.
+   *
+   * Only the mitigation switch moves: `checkKeyHotspot` reads the
+   * live `keyHotspot.mitigate` on every keyed-delivery evaluation
+   * (`deliverKeyed` growth and `cascadeKeyExpected` shrink), so the
+   * new switch governs from the next evaluation — enabling engages
+   * mitigation the next time a stream's buffer depth reaches the
+   * threshold, disabling stops shedding at once. The `thresholdDepth`
+   * and the `onKeyHotspot` callback are untouched, and enabling never
+   * touches the alert latch: a key that already alerted stays
+   * alerted, and mitigation engages on the next evaluation whose
+   * depth is at or above the threshold. Disabling also clears the
+   * `mitigatedKeys` latch: the discard check requires `mitigate` to
+   * be set, so a stale latch could never shed again, but
+   * `getStats().hotKeys` reads the latch — leaving it set would
+   * report a stream as mitigated that no longer is. Clearing it
+   * releases engaged streams immediately: the next out-of-order
+   * arrival buffers instead of being shed, and already-buffered
+   * messages drain normally. The `alertedKeys` latch is untouched by
+   * either direction, so a disabled-then-re-enabled subscription
+   * re-engages only on a fresh excursion.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `keyHotspot` monitoring, and an illegal revision (a
+   * `recoverDepth` that is negative, non-integer, `NaN`, non-finite,
+   * or above the live threshold; a non-function
+   * `onHotKeyMitigated`; any other value shape) all throw
+   * `RangeError` / `TypeError` with the live mitigation config, the
+   * threshold, the callbacks, the latches, and the audit log
+   * untouched — the revision reuses the subscribe-time validation
+   * (`resolveKeyHotspotOptions`), so a value that could not be set
+   * at subscribe time cannot be revised in later either. A revision
+   * homomorphic to the current switch — both disabled, or both
+   * enabled with the same `recoverDepth` and the same callback
+   * reference — is a no-op with no audit. Audited as
+   * `key_hotspot_auto_mitigate_revised`
+   * (`{ enabled: <boolean>, recoverDepth: <number> | null,
+   * oldEnabled: <boolean>, oldRecoverDepth: <number> | null }`).
+   *
+   * Orthogonal to EB-115 (that is the mitigation mechanism itself —
+   * this its runtime switch), to EB-289 (that retunes the alert
+   * threshold, this the mitigation on/off), and to EB-294 (that
+   * retunes the release depth of an already-enabled mitigation,
+   * this whether mitigation is armed at all — a detection-only
+   * subscription refuses an EB-294 revision but accepts this one).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, or an illegal `recoverDepth`; `TypeError` for a
+   * malformed `autoMitigate` value.
+   */
+  setKeyHotspotAutoMitigate(subId: string, autoMitigate: boolean | HotKeyMitigateOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setKeyHotspotAutoMitigate: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setKeyHotspotAutoMitigate: unknown subscriber: ${subId}`);
+    }
+    const keyHotspot = subscriber.keyHotspot;
+    if (keyHotspot === undefined) {
+      throw new RangeError('setKeyHotspotAutoMitigate: subscriber has no keyHotspot monitoring set');
+    }
+    const oldMitigate = keyHotspot.mitigate;
+    const oldEnabled = oldMitigate !== undefined;
+    const oldRecoverDepth = oldMitigate?.recoverDepth ?? null;
+    // Validate before touching anything, reusing the subscribe-time
+    // rule against the LIVE threshold: `true` enables with defaults
+    // (recoverDepth = live thresholdDepth, no callback), an object
+    // tunes recoverDepth (non-negative integer at most the live
+    // threshold) and onHotKeyMitigated (function), `false`/`null`
+    // disables. Anything else is a malformed revision.
+    let next: SubscriberKeyHotspotState['mitigate'];
+    if (autoMitigate === false || autoMitigate === null) {
+      next = undefined;
+    } else {
+      if (autoMitigate !== true && (typeof autoMitigate !== 'object' || autoMitigate === null)) {
+        throw new TypeError(
+          'setKeyHotspotAutoMitigate: autoMitigate must be true, false, null, or a HotKeyMitigateOptions object',
+        );
+      }
+      const m: HotKeyMitigateOptions = autoMitigate === true ? {} : autoMitigate;
+      const recoverDepth = m.recoverDepth ?? keyHotspot.thresholdDepth;
+      if (!Number.isInteger(recoverDepth) || recoverDepth < 0) {
+        throw new RangeError(
+          'setKeyHotspotAutoMitigate: recoverDepth must be a non-negative integer',
+        );
+      }
+      if (recoverDepth > keyHotspot.thresholdDepth) {
+        throw new RangeError(
+          'setKeyHotspotAutoMitigate: recoverDepth must not exceed the live thresholdDepth',
+        );
+      }
+      const onHotKeyMitigated = m.onHotKeyMitigated;
+      if (onHotKeyMitigated !== undefined && typeof onHotKeyMitigated !== 'function') {
+        throw new TypeError('setKeyHotspotAutoMitigate: onHotKeyMitigated must be a function');
+      }
+      next = { recoverDepth, onHotKeyMitigated };
+    }
+    // A revision homomorphic to the current switch is a no-op: no
+    // swap, no latch clear, no audit.
+    const nextEnabled = next !== undefined;
+    const isNoOp =
+      (next === undefined && oldMitigate === undefined) ||
+      (next !== undefined &&
+        oldMitigate !== undefined &&
+        next.recoverDepth === oldMitigate.recoverDepth &&
+        next.onHotKeyMitigated === oldMitigate.onHotKeyMitigated);
+    if (isNoOp) {
+      return;
+    }
+    // Only the switch moves; disabling also clears the engaged
+    // mitigation latch so `getStats().hotKeys` never reports a
+    // mitigated stream that can no longer shed, and the next
+    // out-of-order arrival buffers instead of being shed.
+    keyHotspot.mitigate = next;
+    if (next === undefined) {
+      keyHotspot.mitigatedKeys.clear();
+    }
+    this.auditSubscription({
+      action: 'key_hotspot_auto_mitigate_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        enabled: nextEnabled,
+        recoverDepth: next?.recoverDepth ?? null,
+        oldEnabled,
+        oldRecoverDepth,
+      },
     });
   }
 
