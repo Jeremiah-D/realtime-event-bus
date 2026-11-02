@@ -499,7 +499,22 @@ library.
   above the interval throws `RangeError` with the live timeout untouched,
   and re-affirming the current timeout is a no-op. The hub has no audit
   channel — the live value is observed via
-  `ClusterHub.getStats().heartbeatTimeoutMs`. Payloads must be
+  `ClusterHub.getStats().heartbeatTimeoutMs`. The route-diff retention is
+  likewise revisable live (EB-353, via
+  `ClusterHub.setRouteDiffRetention(retention)`): only the bound moves —
+  the route table, the route version, the hub epoch, and the member
+  connections are untouched — and a shrink trims the retained ring eagerly
+  inside the setter, so over-limit diffs do not linger until the next
+  broadcast. Setting `0` switches incremental diffs off (the next change
+  broadcasts the full snapshot; members that missed diffs pull the snapshot
+  via `routes-sync`, unchanged) and raising it back above `0` switches diffs
+  back on from the next change. Anything but a non-negative integer throws
+  `RangeError` with the live retention untouched, and re-affirming the
+  current retention is a no-op. Honest note: only the latest diff is
+  consumed today, so retained older entries have no replay consumer yet —
+  the live effect is the 0/non-0 switch and the memory bound, not a replay
+  gain. The live value is observed via
+  `ClusterHub.getStats().routeDiffRetention`. Payloads must be
   JSON-serializable for the wire (`Buffer` payloads travel as base64);
   compressed payloads are forwarded as envelopes and inflated on receipt
   (preset-dictionary bytes must be registered identically on every node).

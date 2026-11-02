@@ -363,7 +363,7 @@ export class ClusterHub {
   private readonly tls: ClusterHubOptions['tls'];
   private readonly host: string;
   private readonly port: number;
-  private readonly routeDiffRetention: number;
+  private routeDiffRetention: number;
   /** Snapshot behind the latest route version; the diff baseline. */
   private lastSnapshot: RouteEntry[] = [];
   /** Bounded history of recent diffs, oldest first. */
@@ -489,6 +489,49 @@ export class ClusterHub {
       );
     }
     this.heartbeatTimeoutMs = timeoutMs;
+  }
+
+  /**
+   * Revises the route-diff retention live (EB-353, real-time systems):
+   * how many recent incremental diffs the hub keeps in its bounded
+   * ring (`routeDiffs`).
+   *
+   * Only the bound moves: the route table, the route version, the hub
+   * epoch, and the member connections are untouched. Each `bumpRoutes`
+   * already reads the live value, so the new bound governs from the
+   * next route change; shrinking also trims eagerly inside the setter,
+   * so over-limit diffs do not linger in the ring until the next
+   * broadcast truncates them. Setting `0` switches incremental diffs
+   * off — the next change broadcasts the full snapshot instead
+   * (members that missed diffs pull the snapshot via `routes-sync`,
+   * unchanged) — and raising it back above `0` switches diffs back on
+   * from the next change.
+   *
+   * Honest note: only the latest diff is consumed today
+   * (`broadcastRouteChange` sends the newest one), so retained older
+   * entries have no replay consumer yet — the live effect of this
+   * revision is the 0/non-0 switch and the memory bound, not a replay
+   * gain.
+   *
+   * Fail-closed: anything but a non-negative integer throws
+   * `RangeError` with the live retention untouched (the constructor
+   * rule, reused). Re-affirming the current retention is a no-op. The
+   * hub has no bus audit channel — the live value is observed via
+   * `getStats().routeDiffRetention`.
+   *
+   * Throws `RangeError` for an illegal retention.
+   */
+  setRouteDiffRetention(retention: number): void {
+    if (!Number.isInteger(retention) || retention < 0) {
+      throw new RangeError('setRouteDiffRetention: retention must be a non-negative integer');
+    }
+    if (retention === this.routeDiffRetention) {
+      return;
+    }
+    this.routeDiffRetention = retention;
+    // Eager trim: a shrink must not leave over-limit diffs lingering
+    // in the ring until the next broadcast truncates them.
+    while (this.routeDiffs.length > this.routeDiffRetention) this.routeDiffs.shift();
   }
 
   /**
