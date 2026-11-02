@@ -51,7 +51,7 @@ import { createServer as createTcpServer, connect as tcpConnect, type Server as 
 import { createServer as createTlsServer, connect as tlsConnect, type Server as TlsServer, type TLSSocket } from 'node:tls';
 import { randomBytes } from 'node:crypto';
 import { compilePattern } from './bus.ts';
-import { ReconnectController } from './reconnect.ts';
+import { ReconnectController, type ReconnectBackoffRevision } from './reconnect.ts';
 
 export interface ClusterHubOptions {
   /** Interface to bind (default 127.0.0.1). */
@@ -96,6 +96,13 @@ export interface ClusterConnectOptions {
   /** Fired on connect / disconnect / route-table updates (best effort). */
   onStatusChange?: (status: ClusterLinkStatus) => void;
 }
+
+/**
+ * Live revision of a cluster link's reconnect backoff policy (EB-340):
+ * any field may be omitted to keep its live value. See
+ * `EventBus.setClusterLinkReconnectBackoff`.
+ */
+export type ClusterLinkReconnectBackoffRevision = ReconnectBackoffRevision;
 
 export interface ClusterLinkStatus {
   connected: boolean;
@@ -1197,6 +1204,51 @@ export class ClusterLink {
     if (this.heartbeatTimer != null) {
       this.startHeartbeat();
     }
+  }
+
+  /**
+   * The live reconnect backoff policy (EB-340): `{ baseDelayMs,
+   * maxDelayMs, maxAttempts }` — the connect-time policy, or the
+   * revised one after `retuneReconnectBackoff`. Throws `RangeError`
+   * on a link built with `reconnect: false`, which has no controller
+   * and therefore no policy to read.
+   */
+  getReconnectBackoff(): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number } {
+    const controller = this.reconnectController;
+    if (controller == null) {
+      throw new RangeError('getReconnectBackoff: no reconnect policy — the link was built with reconnect: false');
+    }
+    return controller.getReconnectBackoff();
+  }
+
+  /**
+   * Retunes the reconnect backoff policy live (EB-340) without
+   * reconnecting, re-syncing routes, or changing the connection state:
+   * a field left out keeps its live value. The attempt counter is
+   * untouched, `onGiveUp` is untouched, and a backoff timer already
+   * armed keeps running at the delay it was armed with — the new
+   * policy governs from the next backoff, which reads the live
+   * strategy, and the next failure reads the live `maxAttempts`.
+   *
+   * Reuses the documented connect-time rule (`baseDelayMs` /
+   * `maxDelayMs` positive finite numbers, `maxAttempts` a positive
+   * integer); an illegal value throws `RangeError` with the live
+   * policy untouched. Note the constructor never validated these
+   * numbers, so this rule is the revision-time contract — see
+   * `ReconnectController.retuneBackoff`. Throws `RangeError` on a link
+   * built with `reconnect: false`, which has no controller to retune.
+   * A revision that moves `baseDelayMs` or `maxDelayMs` rebuilds the
+   * strategy as a fresh `ExponentialBackoff` (default 250ms jitter);
+   * a `maxAttempts`-only revision leaves the strategy object alone.
+   * The hub side is untouched: the hub's `heartbeatTimeoutMs` and
+   * the cached route table never move.
+   */
+  retuneReconnectBackoff(revision: ClusterLinkReconnectBackoffRevision): void {
+    const controller = this.reconnectController;
+    if (controller == null) {
+      throw new RangeError('retuneReconnectBackoff: no reconnect policy — the link was built with reconnect: false');
+    }
+    controller.retuneBackoff(revision);
   }
 
   private startHeartbeat(): void {

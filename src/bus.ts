@@ -409,6 +409,7 @@ import {
 import type {
   ClusterConnectOptions,
   ClusterLink,
+  ClusterLinkReconnectBackoffRevision,
   ClusterLinkStatus,
   ClusterMessage,
 } from './cluster.ts';
@@ -36344,6 +36345,108 @@ export class EventBus {
       action: 'cluster_link_heartbeat_revised',
       actor: 'system',
       detail: { heartbeatMs, oldHeartbeatMs },
+    });
+  }
+
+  /**
+   * Revises the cluster link's reconnect backoff policy live (EB-340)
+   * without reconnecting: `setClusterLinkReconnectBackoff(opts, actor?)`
+   * retunes how the link waits between reconnect attempts (see
+   * `ClusterConnectOptions.reconnect`, EB-37).
+   *
+   * Only the policy moves: a field left out of `opts` keeps its live
+   * value, the attempt counter is untouched, `onGiveUp` is untouched,
+   * and a backoff timer already armed keeps running at the delay it
+   * was armed with — the new policy governs from the next backoff,
+   * which reads the live strategy, and the next failure reads the
+   * live `maxAttempts` (so lowering the budget below the current
+   * attempt count gives up on the next failure, while raising it
+   * extends the runway mid-flight). The cached route table, the hub
+   * epoch, and the heartbeat interval are untouched, and the link
+   * stays connected — or keeps backing off — through the revision.
+   *
+   * Validation: `opts` must be an object; `baseDelayMs` / `maxDelayMs`
+   * must be positive finite numbers and `maxAttempts` a positive
+   * integer. The rule is checked before anything mutates, so one
+   * illegal field vetoes the whole revision and leaves every live
+   * value exactly as it was. Note the constructor never validated
+   * these numbers, so this is the revision-time contract, not a
+   * restatement of a connect-time check — a link built with values
+   * outside it keeps its old unchecked behavior until first revised.
+   *
+   * Fail-closed: a bus with no cluster link (never connected, or
+   * already disconnected via `disconnectCluster()`) and a link built
+   * with `reconnect: false` (no controller, no policy to revise) both
+   * throw `RangeError` with the live policy and the audit log
+   * untouched. A revision that provides no field, and a revision
+   * identical to the current policy field for field, are both no-ops
+   * with no audit. Audited as
+   * `cluster_link_reconnect_backoff_revised`
+   * (`{ baseDelayMs, maxDelayMs, maxAttempts, oldBaseDelayMs,
+   * oldMaxDelayMs, oldMaxAttempts }`).
+   *
+   * Hub-side coupling, documented not validated: the hub drops
+   * members silent for longer than its `heartbeatTimeoutMs`, so a
+   * retuned backoff that waits longer than the hub's silence bound
+   * can still get the node swept on the next drop — this revision
+   * only changes the node's wait between attempts and neither knows
+   * nor changes the hub timeout.
+   *
+   * Orthogonal to `connectToHub` (that builds the link and its
+   * initial policy, this retunes it afterwards), to the hub-side
+   * `heartbeatTimeoutMs` (that is the hub's member-sweep silence
+   * bound, this the node's wait between reconnect attempts), and to
+   * `setClusterLinkHeartbeat` (that retunes the heartbeat send
+   * interval, this the reconnect backoff).
+   *
+   * Throws `RangeError` for a missing cluster link, a link with no
+   * reconnect policy, a non-object revision, or an illegal value.
+   */
+  setClusterLinkReconnectBackoff(opts: ClusterLinkReconnectBackoffRevision, actor = 'system'): void {
+    const link = this.clusterLink;
+    if (link == null) {
+      throw new RangeError('setClusterLinkReconnectBackoff: no cluster link — call connectToHub() first');
+    }
+    assertValidActor(actor, 'setClusterLinkReconnectBackoff');
+    // Validate before touching anything: a non-object revision, or
+    // one illegal field, leaves the live policy and the audit log
+    // exactly as they were.
+    if (opts == null || typeof opts !== 'object') {
+      throw new RangeError('setClusterLinkReconnectBackoff: opts must be an object');
+    }
+    const current = link.getReconnectBackoff();
+    const baseDelayMs = opts.baseDelayMs ?? current.baseDelayMs;
+    const maxDelayMs = opts.maxDelayMs ?? current.maxDelayMs;
+    const maxAttempts = opts.maxAttempts ?? current.maxAttempts;
+    if (!Number.isFinite(baseDelayMs) || baseDelayMs <= 0) {
+      throw new RangeError('setClusterLinkReconnectBackoff: baseDelayMs must be a positive finite number');
+    }
+    if (!Number.isFinite(maxDelayMs) || maxDelayMs <= 0) {
+      throw new RangeError('setClusterLinkReconnectBackoff: maxDelayMs must be a positive finite number');
+    }
+    if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
+      throw new RangeError('setClusterLinkReconnectBackoff: maxAttempts must be a positive integer');
+    }
+    // Re-affirming the current policy is a no-op: no retune, no audit.
+    if (
+      baseDelayMs === current.baseDelayMs &&
+      maxDelayMs === current.maxDelayMs &&
+      maxAttempts === current.maxAttempts
+    ) {
+      return;
+    }
+    link.retuneReconnectBackoff({ baseDelayMs, maxDelayMs, maxAttempts });
+    this.auditSubscription({
+      action: 'cluster_link_reconnect_backoff_revised',
+      actor,
+      detail: {
+        baseDelayMs,
+        maxDelayMs,
+        maxAttempts,
+        oldBaseDelayMs: current.baseDelayMs,
+        oldMaxDelayMs: current.maxDelayMs,
+        oldMaxAttempts: current.maxAttempts,
+      },
     });
   }
 

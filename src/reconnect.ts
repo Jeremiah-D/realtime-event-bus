@@ -47,6 +47,16 @@ export class ExponentialBackoff implements BackoffStrategy {
   }
 }
 
+/** Live revision of the exponential backoff policy (EB-340): any field may be omitted to keep its live value. */
+export interface ReconnectBackoffRevision {
+  /** Base backoff delay in ms; attempt n waits baseDelay * 2^(n-1) plus jitter. */
+  baseDelayMs?: number;
+  /** Hard cap for the backoff delay in ms. */
+  maxDelayMs?: number;
+  /** Connection attempts before giving up and returning to idle. */
+  maxAttempts?: number;
+}
+
 export interface ReconnectOptions {
   /** Async connection attempt; injected so tests can fake success/failure. */
   connectFn: () => Promise<void>;
@@ -78,17 +88,28 @@ export class ReconnectController {
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly connectFn: () => Promise<void>;
-  private readonly strategy: BackoffStrategy;
-  private readonly maxAttempts: number;
+  private strategy: BackoffStrategy;
+  private maxAttempts: number;
   private readonly onGiveUp?: (attempts: number) => void;
+  /**
+   * Live numeric backoff parameters (EB-340). These describe the
+   * default exponential strategy: when the controller was built with a
+   * custom `strategy` they are the constructor-provided numbers (which
+   * that strategy ignores) until a retune replaces the strategy — see
+   * `retuneBackoff`.
+   */
+  private backoffBaseDelayMs: number;
+  private backoffMaxDelayMs: number;
 
   constructor(options: ReconnectOptions) {
     this.connectFn = options.connectFn;
+    this.backoffBaseDelayMs = options.baseDelayMs ?? 1000;
+    this.backoffMaxDelayMs = options.maxDelayMs ?? 30000;
     this.strategy =
       options.strategy ??
       new ExponentialBackoff({
-        baseDelayMs: options.baseDelayMs,
-        maxDelayMs: options.maxDelayMs,
+        baseDelayMs: this.backoffBaseDelayMs,
+        maxDelayMs: this.backoffMaxDelayMs,
         jitterMs: options.jitterMs,
       });
     this.maxAttempts = options.maxAttempts ?? 10;
@@ -107,6 +128,67 @@ export class ReconnectController {
   /** Delay in ms before attempt `attempt` (1-based); exposed for testability. */
   computeDelayMs(attempt: number): number {
     return this.strategy.delayMs(attempt);
+  }
+
+  /**
+   * The live reconnect backoff policy (EB-340): `{ baseDelayMs,
+   * maxDelayMs, maxAttempts }`. Reads the tracked numeric parameters
+   * and the live attempt budget — after a retune this is the revised
+   * policy, before one it is the connect-time policy.
+   */
+  getReconnectBackoff(): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number } {
+    return {
+      baseDelayMs: this.backoffBaseDelayMs,
+      maxDelayMs: this.backoffMaxDelayMs,
+      maxAttempts: this.maxAttempts,
+    };
+  }
+
+  /**
+   * Retunes the reconnect backoff policy live (EB-340) without
+   * resetting the attempt counter, touching an armed backoff timer,
+   * or changing `onGiveUp`: a field left out keeps its live value.
+   *
+   * Validation reuses the documented connect-time rule — `baseDelayMs`
+   * / `maxDelayMs` positive finite numbers, `maxAttempts` a positive
+   * integer — and is checked before anything mutates, so an illegal
+   * revision throws `RangeError` with the live policy untouched. (The
+   * constructor itself never validated these numbers, so this rule is
+   * the revision-time contract; connect-time values outside it keep
+   * their old unchecked behavior until first revised.)
+   *
+   * Effect: when `baseDelayMs` or `maxDelayMs` moves, the strategy is
+   * rebuilt as a fresh `ExponentialBackoff` at the merged values —
+   * which replaces a custom strategy, if one was installed, and resets
+   * the jitter to the default 250ms with `Math.random` (jitter is not
+   * part of the revision surface). A revision that only moves
+   * `maxAttempts` leaves the strategy object — custom or default —
+   * exactly as it is. A backoff timer already armed keeps running at
+   * the delay it was armed with; the new policy governs from the next
+   * `enterBackoff`, which reads the live strategy, and the next
+   * failure reads the live `maxAttempts` — so lowering the budget
+   * below the current attempt count gives up on the next failure,
+   * while raising it extends the runway mid-flight.
+   */
+  retuneBackoff(revision: ReconnectBackoffRevision): void {
+    const baseDelayMs = revision.baseDelayMs ?? this.backoffBaseDelayMs;
+    const maxDelayMs = revision.maxDelayMs ?? this.backoffMaxDelayMs;
+    const maxAttempts = revision.maxAttempts ?? this.maxAttempts;
+    if (!Number.isFinite(baseDelayMs) || baseDelayMs <= 0) {
+      throw new RangeError('retuneBackoff: baseDelayMs must be a positive finite number');
+    }
+    if (!Number.isFinite(maxDelayMs) || maxDelayMs <= 0) {
+      throw new RangeError('retuneBackoff: maxDelayMs must be a positive finite number');
+    }
+    if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
+      throw new RangeError('retuneBackoff: maxAttempts must be a positive integer');
+    }
+    if (baseDelayMs !== this.backoffBaseDelayMs || maxDelayMs !== this.backoffMaxDelayMs) {
+      this.backoffBaseDelayMs = baseDelayMs;
+      this.backoffMaxDelayMs = maxDelayMs;
+      this.strategy = new ExponentialBackoff({ baseDelayMs, maxDelayMs });
+    }
+    this.maxAttempts = maxAttempts;
   }
 
   start(): void {

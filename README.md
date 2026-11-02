@@ -425,7 +425,28 @@ library.
   positive finite number), both throw `RangeError`; re-affirming the current
   interval is a no-op with no audit. Every success is audited as
   `cluster_link_heartbeat_revised`
-  (`{ heartbeatMs: <number>, oldHeartbeatMs: <number> }`). Payloads must be
+  (`{ heartbeatMs: <number>, oldHeartbeatMs: <number> }`). The reconnect
+  backoff policy is likewise revisable without reconnecting (EB-340, via
+  `bus.setClusterLinkReconnectBackoff({ baseDelayMs?, maxDelayMs?,
+  maxAttempts? }, actor?)`): a field left out keeps its live value, the
+  attempt counter and `onGiveUp` are untouched, and a backoff timer already
+  armed keeps running at the delay it was armed with, so the new policy
+  governs from the next backoff and the next failure reads the live
+  `maxAttempts`. Only the policy moves — the cached route table, the hub
+  epoch, and the heartbeat interval are untouched. The validation
+  (`baseDelayMs` / `maxDelayMs` positive finite numbers, `maxAttempts` a
+  positive integer) is the revision-time contract: the constructor never
+  validated these numbers, so a link built with values outside it keeps its
+  old unchecked behavior until first revised. A bus with no cluster link,
+  and a link built with `reconnect: false`, both throw `RangeError`, as does
+  any illegal value (one illegal field vetoes the whole revision); a
+  revision that provides no field, and one identical to the current policy,
+  are both no-ops with no audit. Every success is audited as
+  `cluster_link_reconnect_backoff_revised` (`{ baseDelayMs, maxDelayMs,
+  maxAttempts, oldBaseDelayMs, oldMaxDelayMs, oldMaxAttempts }`). The hub's
+  `heartbeatTimeoutMs` is untouched and unvalidated, so a retuned backoff
+  that waits longer than the hub's silence bound can still get the node
+  swept on the next drop. Payloads must be
   JSON-serializable for the wire (`Buffer` payloads travel as base64);
   compressed payloads are forwarded as envelopes and inflated on receipt
   (preset-dictionary bytes must be registered identically on every node).
@@ -3350,6 +3371,23 @@ npm test
   without a connection, a connected retune taking effect on the wire (the hub
   keeps the retuned member and sweeps the unretuned one), and a retune during
   backoff applying on the next connect.
+- `test/cluster-link-reconnect-backoff-revision.test.ts` — cluster link
+  reconnect backoff policy revision (EB-340):
+  `setClusterLinkReconnectBackoff` fail-closed preconditions (no link before
+  connect and after disconnect, a `reconnect: false` link with no policy,
+  illegal values with one illegal field vetoing the whole revision, an
+  illegal actor) with the live policy and the audit log untouched, a partial
+  revision keeping the unprovided fields and auditing old and new values
+  with the actor recorded, re-affirming the current policy and an empty
+  revision as no-ops with no audit, connect-time defaults reading back as
+  200/5000/10, `ClusterLink.retuneReconnectBackoff`/`getReconnectBackoff`
+  validating and reading back without a connection, a controller retune
+  changing the live delay without touching the attempt count (the armed
+  timer finishing at the old delay, the next backoff stalling under the new
+  base), the live `maxAttempts` read on every failure (lowering below the
+  current attempt giving up on the next failure, raising extending the
+  runway), and a retune during backoff applying on the next connect with
+  exactly one reconnect and the heartbeat interval untouched.
 - `test/bridge.test.ts` — cross-process fan-out bridge: two-node mirror via
   an in-memory transport, loop-free inbound (no re-mirror), key/keySeq/
   messageId/traceId passthrough with trace continuation on the peer,
