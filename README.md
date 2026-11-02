@@ -201,7 +201,20 @@ library.
   wall-clock interval — it never keeps the process alive. Default off:
   absent means no timer, no tracking, zero behavior change.
   `getStats().autoCommittedOffsets` counts the auto-committed checkpoints
-  (`eventbus_autocommitted_offsets_total` in `src/metrics.ts`). Opt-in `partitions` on `subscribeToGroup` switches a
+  (`eventbus_autocommitted_offsets_total` in `src/metrics.ts`). The
+  interval is fixed by the group's first opt-in member — a later member
+  that opts in with a different interval fails to join with `RangeError`
+  — and can be revised live via `setGroupAutoCommit(groupId, intervalMs |
+  null, actor = 'system')` (EB-344): every armed member's timer is
+  re-armed in place at the new interval (pending checkpoints untouched,
+  flushing on the next tick at the new cadence), and `null` flushes the
+  pending checkpoints once first and then stops every timer, clearing
+  the group's interval until a member opts in again. A group that never
+  opted in refuses with `RangeError`; re-affirming the current interval
+  is a no-op with no audit. Audited as `group_auto_commit_revised`
+  (`{ intervalMs, oldIntervalMs }`); `getGroupAutoCommit(groupId)`
+  reports the live interval, or `undefined` when the group never opted
+  in. Opt-in `partitions` on `subscribeToGroup` switches a
   competing set from per-message round-robin to Kafka-style partition
   assignment: the key space is divided into N logical partitions, each owned
   exclusively by one member. A keyed message's partition is

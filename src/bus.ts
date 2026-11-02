@@ -16397,6 +16397,16 @@ export class EventBus {
    */
   private autoCommitGroups = new Map<string, number>();
   /**
+   * Consumer-group auto-commit intervals (EB-344): groupId -> the live
+   * `intervalMs` every armed member of the group commits on. Fixed by
+   * the group's first opt-in member (`checkAutoCommitConfig`, the
+   * EB-196 first-member-fixes rule) and revised live by
+   * `setGroupAutoCommit`; a later member that opts in with a different
+   * interval fails to join with `RangeError`. Dropped when the last
+   * armed member disarms, so a new generation re-fixes its interval.
+   */
+  private groupAutoCommitIntervals = new Map<string, number>();
+  /**
    * Pending auto-commit checkpoints (EB-127): groupId -> concrete topic
    * -> highest per-topic `seq` handed to any member since the last flush.
    * Flushed by the member timers, every rebalance, and every
@@ -33846,6 +33856,11 @@ export class EventBus {
       // rejected.
       this.checkGroupMemberLimit(key, maxMembers);
       this.checkGroupMemberLimitJoin(key, instanceId);
+      // Offset auto-commit interval (EB-344): the first opt-in member
+      // fixes the group's interval and a later member that opts in with
+      // a different one fails here, rolling back the just-registered
+      // subscriber; a member that does not opt in joins freely.
+      this.checkAutoCommitConfig(groupId, autoCommitIntervalMs);
     } catch (err) {
       sub.unsubscribe();
       throw err;
@@ -34997,6 +35012,38 @@ export class EventBus {
   }
 
   /**
+   * Validates a joining member's `autoCommit.intervalMs` against the
+   * group's fixed auto-commit interval (EB-344, see
+   * `checkGroupMemberLimit`). The group's interval is fixed by its
+   * first opt-in member: a new group (or a new generation after the
+   * last armed member left) records the choice; a later member that
+   * opts in with a different interval throws `RangeError`. A member
+   * that does not opt in joins freely — it simply runs no commit
+   * timer — and never disturbs the group's interval. Called before
+   * the member joins the competing set, so the caller can roll back
+   * the subscription. Scoped by groupId, like the pending-checkpoint
+   * and refcount maps (`autoCommitPending` / `autoCommitGroups`),
+   * not by (groupId, pattern): every armed member of the group
+   * commits on the one group interval.
+   */
+  private checkAutoCommitConfig(groupId: string, intervalMs: number | undefined): void {
+    const configured = this.groupAutoCommitIntervals.get(groupId);
+    if (configured === undefined || !this.autoCommitGroups.has(groupId)) {
+      // New group, or a new generation after the last armed member left:
+      // the first opt-in member fixes the interval; a stale interval
+      // from a dead generation is dropped.
+      if (intervalMs !== undefined) this.groupAutoCommitIntervals.set(groupId, intervalMs);
+      else this.groupAutoCommitIntervals.delete(groupId);
+      return;
+    }
+    if (intervalMs !== undefined && intervalMs !== configured) {
+      throw new RangeError(
+        `auto-commit interval mismatch: group uses ${configured}ms, got ${intervalMs}ms`,
+      );
+    }
+  }
+
+  /**
    * Enforces the consumer-group member cap (EB-196) at join time: a join
    * that would add a roster entry past the group's limit throws
    * `RangeError`. Static rejoins reclaim their existing roster slot (no
@@ -35335,6 +35382,10 @@ export class EventBus {
     if (remaining <= 0) {
       this.autoCommitGroups.delete(armed.groupId);
       this.autoCommitPending.delete(armed.groupId);
+      // Last armed member gone: the group's interval is dropped with it
+      // (EB-344), so a new generation re-fixes its interval on first
+      // opt-in instead of inheriting a dead generation's value.
+      this.groupAutoCommitIntervals.delete(armed.groupId);
     } else {
       this.autoCommitGroups.set(armed.groupId, remaining);
     }
@@ -36425,6 +36476,116 @@ export class EventBus {
       );
     }
     this.groupMemberLimits.set(key, n);
+  }
+
+  /**
+   * Revises one consumer group's offset auto-commit interval live
+   * (EB-344) without re-subscribing its members:
+   * `setGroupAutoCommit(groupId, intervalMs | null, actor = 'system')`
+   * retunes how often each armed member's commit timer checkpoints
+   * the group's pending offsets (see `GroupSubscribeOptions.autoCommit`,
+   * EB-127).
+   *
+   * Only the interval moves: the roster, the partition assignment, the
+   * assignor, and the member subscriptions are untouched — no member
+   * leaves or rejoins, and no rebalance fires for the revision
+   * itself. A new interval re-arms every armed member's timer in
+   * place (`armAutoCommitTimer` replaces the timer and leaves the
+   * refcount untouched); the pending checkpoints are untouched and
+   * flush on the next tick at the new cadence, so tightening the
+   * interval commits sooner and loosening it commits later, with no
+   * checkpoint lost or duplicated. Passing `null` disables
+   * auto-commit for the group: the pending checkpoints are flushed
+   * once at the old cadence first, so no handed seq is left
+   * uncommitted, and then every armed member's timer is stopped.
+   * After a clear the group holds no interval — a later revision is
+   * refused until a member opts in again at subscribe time (the
+   * EB-283 clear rule), and the next opt-in member re-fixes the
+   * interval.
+   *
+   * The revised interval is remembered per groupId, so a member that
+   * joins later and opts in must use the revised value — a different
+   * one fails to join with `RangeError` (the EB-196 first-member-
+   * fixes rule, enforced by `checkAutoCommitConfig`); a member that
+   * does not opt in joins freely and runs no timer.
+   *
+   * Fail-closed: an empty groupId, an illegal interval (anything but
+   * `null` or a finite number > 0 — the subscribe-time validation,
+   * so a value that could not be set at join time cannot be revised
+   * in later either), an illegal actor, and a group that never opted
+   * into auto-commit (or whose last armed member already left) all
+   * throw `RangeError` with the live interval and the audit log
+   * untouched. A revision identical to the current interval is a
+   * no-op with no audit. Audited as `group_auto_commit_revised`
+   * (`{ intervalMs: <number> | null, oldIntervalMs: <number> }`;
+   * `groupId` rides on the event itself).
+   *
+   * Orthogonal to EB-127 (that is the auto-commit mechanism itself —
+   * this its interval revision), to EB-196 (that caps the roster —
+   * this retunes the commit cadence), and to EB-333 (that retunes the
+   * group's rebalance-debounce window — this retunes its commit
+   * interval).
+   *
+   * Throws `RangeError` for an empty groupId, an illegal interval or
+   * actor, or a group that never opted into auto-commit.
+   */
+  setGroupAutoCommit(groupId: string, intervalMs: number | null, actor = 'system'): void {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('setGroupAutoCommit: groupId must be a non-empty string');
+    }
+    assertValidActor(actor, 'setGroupAutoCommit');
+    if (intervalMs !== null && (!Number.isFinite(intervalMs) || intervalMs <= 0)) {
+      throw new RangeError(
+        'setGroupAutoCommit: intervalMs must be a finite number of milliseconds > 0, or null to disable auto-commit',
+      );
+    }
+    const oldIntervalMs = this.groupAutoCommitIntervals.get(groupId);
+    if (oldIntervalMs === undefined || !this.autoCommitGroups.has(groupId)) {
+      throw new RangeError(
+        `setGroupAutoCommit: unknown consumer group or group never opted into auto-commit: ${groupId}`,
+      );
+    }
+    // Re-affirming the current interval is a no-op: no re-arm, no audit.
+    if (intervalMs === oldIntervalMs) {
+      return;
+    }
+    if (intervalMs === null) {
+      // Flush once at the old cadence, then stop every armed member's
+      // timer — no handed seq is left uncommitted. Disarming the last
+      // member also drops the group's remembered interval, so the next
+      // opt-in member re-fixes it.
+      this.flushAutoCommits(groupId);
+      for (const [rosterKey, armed] of [...this.autoCommitTimers.entries()]) {
+        if (armed.groupId === groupId) this.disarmAutoCommitTimer(rosterKey);
+      }
+    } else {
+      // Re-arm every armed member's timer at the new interval; the
+      // refcount is untouched and the pending checkpoints stay put.
+      for (const [rosterKey, armed] of [...this.autoCommitTimers.entries()]) {
+        if (armed.groupId === groupId) this.armAutoCommitTimer(rosterKey, groupId, intervalMs);
+      }
+      this.groupAutoCommitIntervals.set(groupId, intervalMs);
+    }
+    this.auditSubscription({
+      action: 'group_auto_commit_revised',
+      actor,
+      groupId,
+      detail: { intervalMs, oldIntervalMs },
+    });
+  }
+
+  /**
+   * Returns the live offset auto-commit interval for one consumer
+   * group (EB-344) — the value every armed member currently commits
+   * on — or `undefined` when the group never opted into auto-commit
+   * (or auto-commit was cleared via `setGroupAutoCommit(groupId,
+   * null)`). Throws `RangeError` for an empty groupId.
+   */
+  getGroupAutoCommit(groupId: string): number | undefined {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('getGroupAutoCommit: groupId must be a non-empty string');
+    }
+    return this.groupAutoCommitIntervals.get(groupId);
   }
 
   /**
@@ -51706,6 +51867,7 @@ export class EventBus {
     for (const { timer } of this.autoCommitTimers.values()) clearInterval(timer);
     this.autoCommitTimers.clear();
     this.autoCommitGroups.clear();
+    this.groupAutoCommitIntervals.clear();
     for (const sessions of this.groupStaticSessions.values()) {
       for (const session of sessions.values()) clearTimeout(session.timer);
     }
