@@ -9713,7 +9713,17 @@ Semantics:
   otherwise the connection closes with 4401.
 - **Observability.** `GraphqlGateway.getStats()` reports
   `{ connections, subscriptions, messagesSent, protocolErrors,
-  authFailures }`.
+  authFailures, limits }`, where `limits` snapshots the live
+  connection limits (`{ maxConnections, connectionInitTimeoutMs }`).
+- **Live limit revision (EB-349).** `setGraphqlGatewayLimits({
+  maxConnections?, connectionInitTimeoutMs? })` retunes the two
+  connection limits without restarting the server: only the fields
+  provided move, an explicitly `undefined` cap clears it back to
+  unlimited, and illegal values throw `RangeError` with the live
+  limits untouched. The new cap governs from the next connection
+  (already-open connections are never dropped); the new init timeout
+  arms only handshakes that start after the revision. No audit event
+  — the live tuning is observable in `getStats().limits`.
 - **Orthogonality.** `gateway-ws.ts` speaks the bus's own framing; this
   speaks the graphql-ws wire protocol. A text-frame-only WebSocket
   client is all a subscriber needs.

@@ -67,7 +67,9 @@
  * messagesSent, protocolErrors, authFailures}`: `connections` is the
  * cumulative count of accepted sockets, `subscriptions` the live
  * subscription count, `messagesSent` the cumulative `next` frames
- * delivered.
+ * delivered; `limits` snapshots the live connection limits, revisable
+ * with `setGraphqlGatewayLimits` (EB-349) without restarting the
+ * server.
  */
 import {
   createServer as createTcpServer,
@@ -718,12 +720,19 @@ export interface GraphqlGatewayOptions {
   authToken?: string;
   /**
    * Cap on concurrent connections; past it new sockets are refused
-   * with 503 before the handshake. Unset means unlimited.
+   * with 503 before the handshake. Unset means unlimited. Revisable
+   * live with `setGraphqlGatewayLimits` (EB-349): the new cap governs
+   * from the next connection — already-open connections are never
+   * dropped, and an explicitly `undefined` revision clears the cap
+   * back to unlimited.
    */
   maxConnections?: number;
   /**
    * Milliseconds a fresh connection may take to send `connection_init`
-   * before it is closed with 4429. Default 5000.
+   * before it is closed with 4429. Default 5000. Revisable live with
+   * `setGraphqlGatewayLimits` (EB-349): the new timeout arms only
+   * handshakes that start after the revision — a connection whose init
+   * timer is already armed keeps the timeout it started with.
    */
   connectionInitTimeoutMs?: number;
 }
@@ -737,6 +746,36 @@ export interface GraphqlGatewayStats {
   messagesSent: number;
   protocolErrors: number;
   authFailures: number;
+  /**
+   * Live connection limits (EB-349): the values
+   * `setGraphqlGatewayLimits` last revised, or the construction
+   * values. `maxConnections` is the cap the *next* connection is
+   * judged against (`undefined` means unlimited); already-open
+   * connections are never dropped by a revision.
+   * `connectionInitTimeoutMs` is the timeout the *next* handshake
+   * arms — a connection whose init timer is already armed keeps the
+   * timeout it started with.
+   */
+  limits: {
+    maxConnections: number | undefined;
+    connectionInitTimeoutMs: number;
+  };
+}
+
+/**
+ * A `setGraphqlGatewayLimits` revision (EB-349): any subset of the two
+ * connection limits. Only the fields provided move — a field left out
+ * (or explicitly `undefined`, for `connectionInitTimeoutMs`) keeps its
+ * live value. An explicitly `undefined` `maxConnections` *clears* the
+ * cap back to unlimited (the `setGatewayMaxSubscriptionsPerConnection`
+ * precedent, EB-327); `connectionInitTimeoutMs` always has a value
+ * (default 5000), so there is nothing to clear it to.
+ */
+export interface GraphqlGatewayLimitsRevision {
+  /** Cap on concurrent connections (positive integer); `undefined` clears it to unlimited. */
+  maxConnections?: number;
+  /** Milliseconds a fresh connection may take to send `connection_init` (positive integer). */
+  connectionInitTimeoutMs?: number;
 }
 
 interface GqlConnection {
@@ -756,8 +795,9 @@ export class GraphqlGateway {
   private readonly host: string;
   private readonly port: number;
   private readonly authToken: string | undefined;
-  private readonly maxConnections: number | undefined;
-  private readonly connectionInitTimeoutMs: number;
+  /** Mutable live via `setGraphqlGatewayLimits` (EB-349) — see that method. */
+  private maxConnections: number | undefined;
+  private connectionInitTimeoutMs: number;
   private server: TcpServer | null = null;
   private boundPort = 0;
   private readonly connections = new Set<GqlConnection>();
@@ -830,7 +870,96 @@ export class GraphqlGateway {
   getStats(): GraphqlGatewayStats {
     let subscriptions = 0;
     for (const conn of this.connections) subscriptions += conn.subscriptions.size;
-    return { ...this.stats, subscriptions };
+    return {
+      ...this.stats,
+      subscriptions,
+      limits: {
+        maxConnections: this.maxConnections,
+        connectionInitTimeoutMs: this.connectionInitTimeoutMs,
+      },
+    };
+  }
+
+  /**
+   * Revises the gateway's connection limits live (EB-349) without
+   * restarting the server: `setGraphqlGatewayLimits({ maxConnections?,
+   * connectionInitTimeoutMs? })` retunes the two bounds (see
+   * `GraphqlGatewayOptions` for the defaults: unlimited / 5000ms).
+   *
+   * Only the fields provided move — a partial revision keeps the fields
+   * it leaves out, with one asymmetry that follows the WS gateway's
+   * `setGatewayMaxSubscriptionsPerConnection` (EB-327): an explicitly
+   * `undefined` `maxConnections` *clears* the cap back to unlimited,
+   * while an explicitly `undefined` `connectionInitTimeoutMs` is not a
+   * value and keeps the live timeout (it always has a value — the
+   * default 5000 — so there is nothing to clear it to).
+   *
+   * The new cap governs from the next connection: `handleConnection`
+   * reads the live value on every accept, so tightening the cap refuses
+   * the next socket past it with 503, and loosening or clearing it
+   * admits the next socket at once — a connection that is already open
+   * is never dropped by a revision. The new init timeout governs from
+   * the next handshake: `handleHandshake` arms `conn.initTimer` from
+   * the live value, so a connection whose timer is already armed keeps
+   * the timeout it started with until it reconnects.
+   *
+   * There is no audit event for this revision: like the WS gateway's
+   * `setGatewayLimits` / `setGatewayClientPressure` /
+   * `setGatewayMaxSubscriptionsPerConnection`, the gateway keeps no
+   * audit log — the live tuning is observable in
+   * `getStats().limits` instead.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with every live limit untouched. Validation reuses the
+   * construction-time rule for the cap (a positive integer when given)
+   * and requires a positive integer for the timeout, so a value that
+   * could not be set at construction cannot be revised in later
+   * either. An empty revision, and a revision identical to the current
+   * limits, are both no-ops.
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `maxConnections` or `connectionInitTimeoutMs`.
+   */
+  setGraphqlGatewayLimits(opts: GraphqlGatewayLimitsRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGraphqlGatewayLimits: revision must be an object with maxConnections and/or connectionInitTimeoutMs',
+      );
+    }
+    // An explicitly `undefined` cap is a value here: it clears the cap
+    // back to unlimited. The `in` check tells it apart from a field
+    // left out. The timeout has no clear: `undefined` keeps the live
+    // value (the EB-325 convention).
+    const givenMax = 'maxConnections' in opts;
+    const maxConnections = givenMax ? opts.maxConnections : this.maxConnections;
+    const connectionInitTimeoutMs =
+      opts.connectionInitTimeoutMs ?? this.connectionInitTimeoutMs;
+    // Re-affirming the current limits is a no-op.
+    if (
+      maxConnections === this.maxConnections &&
+      connectionInitTimeoutMs === this.connectionInitTimeoutMs
+    ) {
+      return;
+    }
+    if (
+      maxConnections !== undefined &&
+      (!Number.isInteger(maxConnections) || maxConnections <= 0)
+    ) {
+      throw new RangeError(
+        'setGraphqlGatewayLimits: maxConnections must be a positive integer',
+      );
+    }
+    if (!Number.isInteger(connectionInitTimeoutMs) || connectionInitTimeoutMs <= 0) {
+      throw new RangeError(
+        'setGraphqlGatewayLimits: connectionInitTimeoutMs must be a positive integer number of milliseconds',
+      );
+    }
+    this.maxConnections = maxConnections;
+    this.connectionInitTimeoutMs = connectionInitTimeoutMs;
   }
 
   // --- connection lifecycle --------------------------------------------------
