@@ -23,6 +23,9 @@
  *   (`subscribeReliable`, `subscribeToGroup`) replace the stored
  *   unsubscribe closure with their outermost one, so expiry runs the
  *   full teardown (group leave, ack-tracker clear) exactly once.
+ * - `current` reports the configured duration of the active lease,
+ *   so a live revision (`setSubscriptionLease`, EB-348) can audit
+ *   what it replaced.
  *
  * Expiry fires exactly once per armed lease: the entry is disarmed
  * before the bus-level expiry handler runs, and a stale timer fire
@@ -127,6 +130,17 @@ export class LeaseManager {
   relabelPattern(subId: string, pattern: string): void {
     const entry = this.entries.get(subId);
     if (entry !== undefined) entry.pattern = pattern;
+  }
+
+  /**
+   * Configured lease duration in milliseconds for `subId`, or
+   * `undefined` when `subId` holds no active lease (unknown id, or a
+   * subscription that never opted into a lease). Backs
+   * `setSubscriptionLease`'s audit detail (`previous_lease_ms`) and
+   * its no-op clear. Mirrors `IdleReclaimer.current` (EB-72).
+   */
+  current(subId: string): number | undefined {
+    return this.entries.get(subId)?.leaseMs;
   }
 
   /** Cancels the lease timer for `subId`, if any. Idempotent. */

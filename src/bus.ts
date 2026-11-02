@@ -27607,6 +27607,93 @@ export class EventBus {
   }
 
   /**
+   * Arms, retunes, or clears a subscription lease live (EB-348)
+   * without re-subscribing: `setSubscriptionLease(subId, ms | null,
+   * actor = 'system')`.
+   *
+   * - A positive-integer `ms` arms a lease on a subscription that has
+   *   none — expiry then unsubscribes through the subscription's
+   *   outermost teardown (`subscriber.teardown`, so a consumer-group
+   *   member leaves the group and a reliable subscription clears its
+   *   ack tracker, exactly as a subscribe-time lease would) — or
+   *   re-arms an existing lease from the revision moment, the
+   *   `renewLease` from-now semantics: re-affirming the current
+   *   duration still re-arms the timer and is audited.
+   * - `null` clears the lease: the subscription keeps running with no
+   *   lease expiry. Clearing a subscription that holds no lease is a
+   *   no-op with no audit.
+   *
+   * Returns `true` when the subscription exists (including a no-op
+   * clear), `false` for an unknown subscription id — the `renewLease`
+   * convention: nothing to update is not an error. An illegal `ms`
+   * (anything but a positive integer or `null`) or an illegal actor
+   * throws `RangeError` before anything is touched, even for an
+   * unknown id, and leaves the live lease untouched. Every applied
+   * change is recorded in the subscription audit log as
+   * `subscription_lease_revised` with `{ previous_lease_ms, lease_ms
+   * }` (either side `null` when that side holds no lease); the
+   * expiry itself is unchanged (`onLeaseExpired` +
+   * `getStats().expiredLeases`, EB-69).
+   *
+   * Orthogonal to EB-69 (that is the lease mechanism itself — this
+   * its live arm/retune/clear), to EB-72 (that is idle auto-reclamation
+   * — this is the fixed-duration lease), to EB-82 (that migrates a
+   * subscription's remaining lease — this arms one in place), and to
+   * EB-335 (that retunes the group handoff linger — this retunes a
+   * subscription lease).
+   *
+   * Throws `RangeError` for an illegal `ms` or actor.
+   */
+  setSubscriptionLease(subId: string, ms: number | null, actor = 'system'): boolean {
+    if (ms !== null && (!Number.isInteger(ms) || ms <= 0)) {
+      throw new RangeError(
+        'setSubscriptionLease: ms must be a positive integer number of milliseconds, or null to clear the lease',
+      );
+    }
+    assertValidActor(actor, 'setSubscriptionLease');
+    const subscriber = this.subscribers.get(subId);
+    // Parallels `renewLease`: an unknown id is not an error — there is
+    // simply nothing to update.
+    if (subscriber === undefined) return false;
+    const previous = this.leases.current(subId);
+    if (ms === null) {
+      // Clearing a lease-less subscription is a no-op: the requested
+      // end state (no lease) already holds, and nothing is audited.
+      if (previous === undefined) return true;
+      this.leases.clear(subId);
+      this.auditSubscription({
+        action: 'subscription_lease_revised',
+        actor,
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { previous_lease_ms: previous, lease_ms: null },
+      });
+      return true;
+    }
+    if (previous !== undefined) {
+      // Re-arm from the revision moment — the renewLease semantics.
+      this.leases.renew(subId, ms);
+    } else {
+      // Arm a lease on a subscription that never opted in, through its
+      // outermost teardown (group leave / ack-tracker clear included);
+      // `teardown` is recorded for every live subscriber at subscribe
+      // time, so a missing one can only mean an internal invariant
+      // break — fail closed rather than arming a half lease.
+      const teardown = subscriber.teardown;
+      if (teardown === undefined) return false;
+      this.leases.arm(subId, ms, subscriber.pattern, teardown);
+    }
+    this.auditSubscription({
+      action: 'subscription_lease_revised',
+      actor,
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { previous_lease_ms: previous ?? null, lease_ms: ms },
+    });
+    return true;
+  }
+
+  /**
    * Hot-updates a subscriber's delivery-sampling rate (see
    * `SubscribeOptions.deliverySampleRate`, EB-152): the new divisor
    * applies to the very next fanned-out message — no drain, no

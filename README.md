@@ -1154,7 +1154,15 @@ library.
   are discarded with the queue, per the subscriber's own `dropPolicy`
   semantics — no new drop semantic is invented). `renewLease(subId, ms)`
   restarts the timer from the renewal moment and returns `false` for an
-  unknown id or a lease-less subscription; `unsubscribe()` clears the
+  unknown id or a lease-less subscription; `setSubscriptionLease(subId,
+  ms | null)` (EB-348) arms a lease on a subscription that never opted
+  in, retunes an existing one from the revision moment, or clears it
+  with `null` — all without re-subscribing, expiry still running the
+  outermost teardown (group leave / ack-tracker clear included);
+  unknown ids return `false`, illegal values throw `RangeError` with
+  the live lease untouched, and every applied change is audited as
+  `subscription_lease_revised` with `{ previous_lease_ms, lease_ms }`.
+  `unsubscribe()` clears the
   timer, so no phantom expiry can fire afterwards. The expiry timer is
   `unref()`'d, so a pending lease never keeps the process alive.
   `EventBusOptions.onLeaseExpired` fires once per expiry (error-isolated —
