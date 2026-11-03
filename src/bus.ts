@@ -7904,6 +7904,13 @@ export interface BusStats {
      * `readbackCacheMaxSegments`.
      */
     readbackCacheMaxBytes?: number;
+    /**
+     * Durable-log S3 offload local retention (EB-362): the live number
+     * of newest archived segments kept locally per topic, as revised by
+     * `setDurableLogRetainLocalSegments` (`Infinity` keeps every local
+     * copy). Absent when offload is disabled.
+     */
+    retainLocalSegments?: number;
   };
   /**
    * In-memory lookback buffers (EB-176, see `setTopicLookback`): the
@@ -21841,6 +21848,99 @@ export class EventBus {
         oldReadbackCacheMaxSegments: current.readbackCacheMaxSegments,
         readbackCacheMaxBytes: merged.readbackCacheMaxBytes,
         oldReadbackCacheMaxBytes: current.readbackCacheMaxBytes,
+      },
+    });
+  }
+
+  /**
+   * (EB-362): `setDurableLogRetainLocalSegments(retainLocalSegments, actor?)`
+   * retunes the durable log's S3 offload local-retain segment count
+   * live — how many newest archived segments per topic stay local
+   * after upload (see `EventBusOptions.durableLogSegmentOffload`,
+   * EB-163; default `Infinity` — the remote is a pure replica).
+   *
+   * Only the retain count moves — the S3 client, key prefix, namespace,
+   * readback-cache bounds, and segment rotation are untouched.
+   * Tightening takes effect at once: local segments beyond the new
+   * bound are deleted now (least-recently-used first, only segments
+   * the remote manifest confirms as uploaded), so a tightened log
+   * never keeps local copies over the new bound waiting for the next
+   * offload pass; loosening simply allows more local copies and
+   * governs from the next `offloadNow` pass. A count of 0 keeps
+   * nothing local (archived segments are deleted locally once the
+   * manifest confirms them remote — reads fall back to remote
+   * readback); `Infinity` restores full retention.
+   *
+   * The change applies to the root log; namespace child logs do not
+   * offload, so the revision skips them (a namespace registered later
+   * likewise opens without offload). It is recorded in the
+   * subscription audit log as
+   * `durable_log_retain_local_segments_revised` (with the previous and
+   * new counts in `detail`; `Infinity` is recorded as `null`, since
+   * JSON has no `Infinity`). The live count is visible in
+   * `getStats().durableLog.retainLocalSegments`.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A bus constructed without
+   * `durableLogSegmentOffload` also throws `RangeError`: offload
+   * cannot be enabled after the fact, because there is no S3 client
+   * or remote manifest for the retention to serve. An illegal value
+   * throws `RangeError` with the live count and the audit log
+   * untouched: validation reuses the construction-time rule
+   * (`assertValidRetainLocalSegments`: a non-negative integer or
+   * `Infinity`). A revision identical to the current count is a no-op
+   * with no audit. When the remote manifest cannot be read, the value
+   * still moves and the trim is deferred to the next automatic
+   * offload pass (counted in `getStats().durableLog.offloadFailed`); a
+   * dry-run S3 client never trims.
+   *
+   * Orthogonal to EB-163 (that is S3 offload itself — this its local
+   * retain count), to EB-361 (that retunes the readback-cache bounds —
+   * this the local retain count, a different field of the same offload
+   * object), to EB-355 (that retunes the segment-rotation triggers —
+   * this the post-archive local retention), and to EB-322/EB-323
+   * (those retune the per-topic entry/byte retention bounds — this the
+   * archived segments' local retention).
+   *
+   * Throws `RangeError` for a bad actor, for an illegal count, when
+   * the bus has no `durableLogDir`, or when the bus was constructed
+   * without `durableLogSegmentOffload`.
+   */
+  setDurableLogRetainLocalSegments(retainLocalSegments: number, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogRetainLocalSegments');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogRetainLocalSegments requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const current = log.currentRetainLocalSegments();
+    if (current === undefined) {
+      throw new RangeError(
+        'setDurableLogRetainLocalSegments requires EventBusOptions.durableLogSegmentOffload to be set: offload cannot be enabled after the fact',
+      );
+    }
+    // Re-affirming the current count is a no-op: no retune, no audit.
+    if (retainLocalSegments === current) {
+      return;
+    }
+    // `retuneRetainLocalSegments` validates before moving anything, so
+    // an illegal value leaves the live count untouched.
+    log.retuneRetainLocalSegments(retainLocalSegments);
+    for (const child of this.namespaceLogs.values()) {
+      // Namespace child logs do not offload — skip them.
+      if (child.currentRetainLocalSegments() !== undefined) {
+        child.retuneRetainLocalSegments(retainLocalSegments);
+      }
+    }
+    this.auditSubscription({
+      action: 'durable_log_retain_local_segments_revised',
+      actor,
+      detail: {
+        retainLocalSegments: retainLocalSegments === Infinity ? null : retainLocalSegments,
+        oldRetainLocalSegments: current === Infinity ? null : current,
       },
     });
   }

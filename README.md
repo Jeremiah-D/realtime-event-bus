@@ -883,7 +883,14 @@ library.
   enabled after the fact), skips namespace child logs (they do not offload), and is audited
   as `durable_log_readback_cache_revised` (old and new bounds); an identical revision is a
   no-op with no audit, and the live bounds are visible in
-  `getStats().durableLog.readbackCacheMaxSegments` / `readbackCacheMaxBytes`. Readback volume is observable
+  `getStats().durableLog.readbackCacheMaxSegments` / `readbackCacheMaxBytes`. Retune the local
+  retain count live with `setDurableLogRetainLocalSegments(n, actor?)` (EB-362): tightening
+  deletes local copies beyond the new bound at once (least-recently-used first, only segments
+  the manifest confirms as remote), loosening governs from the next offload pass; `0` keeps
+  nothing local and `Infinity` restores full retention; same gates (requires a `durableLogDir`
+  and a bus constructed with `durableLogSegmentOffload`, skips namespace child logs) and the
+  same no-op rule, audited as `durable_log_retain_local_segments_revised` (`Infinity` recorded
+  as `null`), live value in `getStats().durableLog.retainLocalSegments`. Readback volume is observable
   in `getStats().durableLog` (`s3Readbacks` pulls, `s3ReadbackBytes` downloaded bytes,
   `s3ReadbackCacheHits` cache hits) and renders as the `durablelog_s3_readbacks_total`,
   `durablelog_s3_readback_bytes_total`, and `durablelog_s3_readback_cache_hits_total`

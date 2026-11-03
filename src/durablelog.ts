@@ -613,6 +613,18 @@ export interface ReadbackCacheLimits {
 }
 
 /**
+ * EB-362: the construction-time rule for the local-retain segment
+ * count, shared by `resolveSegmentOffloadOptions` and
+ * `retuneRetainLocalSegments`: a non-negative integer or `Infinity`,
+ * else `RangeError`.
+ */
+function assertValidRetainLocalSegments(value: unknown): void {
+  if (!(value === Infinity || (Number.isInteger(value) && (value as number) >= 0))) {
+    throw new RangeError('segmentOffload.retainLocalSegments must be a non-negative integer or Infinity');
+  }
+}
+
+/**
  * EB-361: the construction-time rule for the readback-cache bounds,
  * shared by `resolveSegmentOffloadOptions` and `retuneReadbackCache`:
  * both bounds must be non-negative integers, else `RangeError`.
@@ -669,9 +681,7 @@ function resolveSegmentOffloadOptions(
     throw new RangeError('segmentOffload.namespace must be a string');
   }
   const retain = retainLocalSegments ?? Infinity;
-  if (!(retain === Infinity || (Number.isInteger(retain) && retain >= 0))) {
-    throw new RangeError('segmentOffload.retainLocalSegments must be a non-negative integer or Infinity');
-  }
+  assertValidRetainLocalSegments(retain);
   const readbackCacheMaxSegments = options.readbackCacheMaxSegments ?? 16;
   const readbackCacheMaxBytes = options.readbackCacheMaxBytes ?? 64 * 1024 * 1024;
   assertValidReadbackCacheLimits(readbackCacheMaxSegments, readbackCacheMaxBytes);
@@ -2354,6 +2364,85 @@ export class DurableTopicLog {
     // EB-361: tightening applies at once — prune to the new bounds now.
     this.pruneReadbackCache();
     return current;
+  }
+
+  /**
+   * The current local-retain segment count — the live value
+   * `retuneRetainLocalSegments` moves. `undefined` when S3 offload is
+   * not enabled on this log (there is nothing retained to count).
+   */
+  currentRetainLocalSegments(): number | undefined {
+    return this.offload === undefined ? undefined : this.offload.retainLocalSegments;
+  }
+
+  /**
+   * Changes the S3 offload local-retain segment count at runtime
+   * (EB-362): how many newest archived segments per topic stay local
+   * after upload (see `EventBusOptions.durableLogSegmentOffload`,
+   * EB-163). Returns the previous count. Throws `RangeError` for an
+   * illegal value (reusing the construction-time rule
+   * `assertValidRetainLocalSegments`: a non-negative integer or
+   * `Infinity`), leaving the live count and the local segments exactly
+   * as they were.
+   *
+   * Fail-closed: a log constructed without `segmentOffload` refuses
+   * outright — the retain count cannot be enabled after the fact,
+   * because there is no offload (no S3 client, no remote manifest)
+   * for the retention to serve. The bus enforces the same gate as
+   * `setDurableLogRetainLocalSegments` and records the change in the
+   * subscription audit log (`durable_log_retain_local_segments_revised`).
+   *
+   * Only the retain count moves: the S3 client, key prefix, namespace,
+   * readback-cache bounds, and segment rotation are untouched.
+   * Tightening takes effect at once — the local segments are trimmed
+   * to the new bound here (least-recently-used first, only segments
+   * the remote manifest confirms as uploaded), so a tightened log
+   * never keeps local copies over the new bound waiting for the next
+   * offload pass; loosening simply allows more local copies and
+   * governs from the next `offloadNow` pass. A count of 0 keeps
+   * nothing local (archived segments are deleted locally once the
+   * manifest confirms them remote, and reads fall back to remote
+   * readback); `Infinity` restores full retention (the construction
+   * default). A revision identical to the current count is a no-op
+   * returning the current count.
+   *
+   * Trimming is fail-soft, along `offloadNow`: when the remote
+   * manifest cannot be read (transport failure, or a corrupt manifest
+   * the pass must not overwrite), the value still moves and the trim
+   * is deferred to the next automatic `offloadNow` pass, counted in
+   * `stats().offloadFailed`. A dry-run S3 client never trims (along
+   * `offloadNow`, which never trims for a rehearsal either).
+   */
+  retuneRetainLocalSegments(retain: number): number {
+    if (this.offload === undefined) {
+      throw new RangeError(
+        'DurableTopicLog.retuneRetainLocalSegments requires segmentOffload to be enabled at construction: the local retain count cannot be enabled after the fact',
+      );
+    }
+    assertValidRetainLocalSegments(retain);
+    const old = this.offload.retainLocalSegments;
+    if (retain === old) return old;
+    const offload = this.offload as ResolvedSegmentOffload;
+    offload.retainLocalSegments = retain;
+    // EB-362: tightening applies at once — trim to the new bound now.
+    // A dry-run client never trims (along `offloadNow`).
+    if (offload.s3.isDryRun === true) return old;
+    let manifest: Map<string, RemoteOffloadManifestEntry>;
+    try {
+      const loaded = this.loadRemoteManifest();
+      if (loaded.corrupt) {
+        // Fail closed on the manifest, fail-soft on the revision: the
+        // value already moved; the trim is deferred to the next pass.
+        this.offloadFailed += 1;
+        return old;
+      }
+      manifest = loaded.entries;
+    } catch {
+      this.offloadFailed += 1;
+      return old;
+    }
+    this.trimLocalSegments(manifest);
+    return old;
   }
 
   /**
@@ -5411,6 +5500,7 @@ export class DurableTopicLog {
         : {
             readbackCacheMaxSegments: this.offload.readbackCacheMaxSegments,
             readbackCacheMaxBytes: this.offload.readbackCacheMaxBytes,
+            retainLocalSegments: this.offload.retainLocalSegments,
           }),
       ...(this.maxBytesPerTopic === undefined ? {} : { bytesLimit: this.maxBytesPerTopic }),
     };
