@@ -739,6 +739,17 @@ export interface GraphqlGatewayOptions {
    * timer is already armed keeps the timeout it started with.
    */
   connectionInitTimeoutMs?: number;
+  /**
+   * Largest single inbound WebSocket frame accepted, in bytes. Past
+   * it the connection is closed with 4400 (`CLOSE_BAD_REQUEST`,
+   * 'frame too large'). Default 1 MiB. Revisable live with
+   * `setGraphqlGatewayLimits` (EB-358): the new bound governs only
+   * connections established after the revision — each connection's
+   * `FrameParser` captures the bound once, at connect time (the WS
+   * gateway's EB-325 precedent), so an already-open connection keeps
+   * its old bound until it reconnects.
+   */
+  maxFrameBytes?: number;
 }
 
 export interface GraphqlGatewayStats {
@@ -757,35 +768,42 @@ export interface GraphqlGatewayStats {
    */
   authEnabled: boolean;
   /**
-   * Live connection limits (EB-349): the values
-   * `setGraphqlGatewayLimits` last revised, or the construction
+   * Live connection limits (EB-349; EB-358 adds `maxFrameBytes`): the
+   * values `setGraphqlGatewayLimits` last revised, or the construction
    * values. `maxConnections` is the cap the *next* connection is
    * judged against (`undefined` means unlimited); already-open
    * connections are never dropped by a revision.
    * `connectionInitTimeoutMs` is the timeout the *next* handshake
    * arms — a connection whose init timer is already armed keeps the
-   * timeout it started with.
+   * timeout it started with. `maxFrameBytes` is the frame bound the
+   * *next* connection's `FrameParser` is built with — a connection
+   * that is already open keeps the bound it started with.
    */
   limits: {
     maxConnections: number | undefined;
     connectionInitTimeoutMs: number;
+    maxFrameBytes: number;
   };
 }
 
 /**
- * A `setGraphqlGatewayLimits` revision (EB-349): any subset of the two
- * connection limits. Only the fields provided move — a field left out
- * (or explicitly `undefined`, for `connectionInitTimeoutMs`) keeps its
- * live value. An explicitly `undefined` `maxConnections` *clears* the
- * cap back to unlimited (the `setGatewayMaxSubscriptionsPerConnection`
- * precedent, EB-327); `connectionInitTimeoutMs` always has a value
- * (default 5000), so there is nothing to clear it to.
+ * A `setGraphqlGatewayLimits` revision (EB-349; EB-358 adds
+ * `maxFrameBytes`): any subset of the three connection limits. Only
+ * the fields provided move — a field left out (or explicitly
+ * `undefined`, for `connectionInitTimeoutMs` and `maxFrameBytes`)
+ * keeps its live value. An explicitly `undefined` `maxConnections`
+ * *clears* the cap back to unlimited (the
+ * `setGatewayMaxSubscriptionsPerConnection` precedent, EB-327);
+ * `connectionInitTimeoutMs` and `maxFrameBytes` always have a value
+ * (defaults 5000 / 1 MiB), so there is nothing to clear them to.
  */
 export interface GraphqlGatewayLimitsRevision {
   /** Cap on concurrent connections (positive integer); `undefined` clears it to unlimited. */
   maxConnections?: number;
   /** Milliseconds a fresh connection may take to send `connection_init` (positive integer). */
   connectionInitTimeoutMs?: number;
+  /** Largest single inbound WebSocket frame accepted (positive integer bytes). */
+  maxFrameBytes?: number;
 }
 
 interface GqlConnection {
@@ -809,6 +827,8 @@ export class GraphqlGateway {
   /** Mutable live via `setGraphqlGatewayLimits` (EB-349) — see that method. */
   private maxConnections: number | undefined;
   private connectionInitTimeoutMs: number;
+  /** Mutable live via `setGraphqlGatewayLimits` (EB-358) — see that method. */
+  private maxFrameBytes: number;
   private server: TcpServer | null = null;
   private boundPort = 0;
   private readonly connections = new Set<GqlConnection>();
@@ -845,6 +865,11 @@ export class GraphqlGateway {
       fail('connectionInitTimeoutMs must be a positive finite number');
     }
     this.connectionInitTimeoutMs = connectionInitTimeoutMs;
+    const maxFrameBytes = options.maxFrameBytes ?? MAX_FRAME_BYTES;
+    if (!Number.isInteger(maxFrameBytes) || maxFrameBytes <= 0) {
+      fail('maxFrameBytes must be a positive integer');
+    }
+    this.maxFrameBytes = maxFrameBytes;
   }
 
   /** Starts listening; resolves once bound. */
@@ -888,23 +913,27 @@ export class GraphqlGateway {
       limits: {
         maxConnections: this.maxConnections,
         connectionInitTimeoutMs: this.connectionInitTimeoutMs,
+        maxFrameBytes: this.maxFrameBytes,
       },
     };
   }
 
   /**
-   * Revises the gateway's connection limits live (EB-349) without
-   * restarting the server: `setGraphqlGatewayLimits({ maxConnections?,
-   * connectionInitTimeoutMs? })` retunes the two bounds (see
-   * `GraphqlGatewayOptions` for the defaults: unlimited / 5000ms).
+   * Revises the gateway's connection limits live (EB-349; EB-358 adds
+   * `maxFrameBytes`) without restarting the server:
+   * `setGraphqlGatewayLimits({ maxConnections?,
+   * connectionInitTimeoutMs?, maxFrameBytes? })` retunes the three
+   * bounds (see `GraphqlGatewayOptions` for the defaults: unlimited /
+   * 5000ms / 1 MiB).
    *
    * Only the fields provided move — a partial revision keeps the fields
    * it leaves out, with one asymmetry that follows the WS gateway's
    * `setGatewayMaxSubscriptionsPerConnection` (EB-327): an explicitly
    * `undefined` `maxConnections` *clears* the cap back to unlimited,
-   * while an explicitly `undefined` `connectionInitTimeoutMs` is not a
-   * value and keeps the live timeout (it always has a value — the
-   * default 5000 — so there is nothing to clear it to).
+   * while an explicitly `undefined` `connectionInitTimeoutMs` or
+   * `maxFrameBytes` is not a value and keeps the live value (each
+   * always has a value — the defaults 5000 / 1 MiB — so there is
+   * nothing to clear them to).
    *
    * The new cap governs from the next connection: `handleConnection`
    * reads the live value on every accept, so tightening the cap refuses
@@ -913,7 +942,11 @@ export class GraphqlGateway {
    * is never dropped by a revision. The new init timeout governs from
    * the next handshake: `handleHandshake` arms `conn.initTimer` from
    * the live value, so a connection whose timer is already armed keeps
-   * the timeout it started with until it reconnects.
+   * the timeout it started with until it reconnects. The new frame
+   * bound governs from the next connection: `handleConnection` builds
+   * each connection's `FrameParser` from the live value, so a
+   * connection that is already open keeps the bound it started with
+   * until it reconnects.
    *
    * There is no audit event for this revision: like the WS gateway's
    * `setGatewayLimits` / `setGatewayClientPressure` /
@@ -924,13 +957,13 @@ export class GraphqlGateway {
    * Fail-closed: a non-object revision and an illegal value both throw
    * `RangeError` with every live limit untouched. Validation reuses the
    * construction-time rule for the cap (a positive integer when given)
-   * and requires a positive integer for the timeout, so a value that
-   * could not be set at construction cannot be revised in later
-   * either. An empty revision, and a revision identical to the current
-   * limits, are both no-ops.
+   * and requires a positive integer for the timeout and the frame
+   * bound, so a value that could not be set at construction cannot be
+   * revised in later either. An empty revision, and a revision
+   * identical to the current limits, are both no-ops.
    *
    * Throws `RangeError` for a non-object revision, or for an illegal
-   * `maxConnections` or `connectionInitTimeoutMs`.
+   * `maxConnections`, `connectionInitTimeoutMs`, or `maxFrameBytes`.
    */
   setGraphqlGatewayLimits(opts: GraphqlGatewayLimitsRevision): void {
     // An absent revision asks nothing to move.
@@ -939,21 +972,23 @@ export class GraphqlGateway {
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {
       throw new RangeError(
-        'setGraphqlGatewayLimits: revision must be an object with maxConnections and/or connectionInitTimeoutMs',
+        'setGraphqlGatewayLimits: revision must be an object with maxConnections and/or connectionInitTimeoutMs and/or maxFrameBytes',
       );
     }
     // An explicitly `undefined` cap is a value here: it clears the cap
     // back to unlimited. The `in` check tells it apart from a field
-    // left out. The timeout has no clear: `undefined` keeps the live
-    // value (the EB-325 convention).
+    // left out. The timeout and the frame bound have no clear:
+    // `undefined` keeps the live value (the EB-325 convention).
     const givenMax = 'maxConnections' in opts;
     const maxConnections = givenMax ? opts.maxConnections : this.maxConnections;
     const connectionInitTimeoutMs =
       opts.connectionInitTimeoutMs ?? this.connectionInitTimeoutMs;
+    const maxFrameBytes = opts.maxFrameBytes ?? this.maxFrameBytes;
     // Re-affirming the current limits is a no-op.
     if (
       maxConnections === this.maxConnections &&
-      connectionInitTimeoutMs === this.connectionInitTimeoutMs
+      connectionInitTimeoutMs === this.connectionInitTimeoutMs &&
+      maxFrameBytes === this.maxFrameBytes
     ) {
       return;
     }
@@ -970,8 +1005,14 @@ export class GraphqlGateway {
         'setGraphqlGatewayLimits: connectionInitTimeoutMs must be a positive integer number of milliseconds',
       );
     }
+    if (!Number.isInteger(maxFrameBytes) || maxFrameBytes <= 0) {
+      throw new RangeError(
+        'setGraphqlGatewayLimits: maxFrameBytes must be a positive integer number of bytes',
+      );
+    }
     this.maxConnections = maxConnections;
     this.connectionInitTimeoutMs = connectionInitTimeoutMs;
+    this.maxFrameBytes = maxFrameBytes;
   }
 
   /**
@@ -1037,7 +1078,7 @@ export class GraphqlGateway {
     }
     const conn: GqlConnection = {
       socket,
-      parser: new FrameParser(MAX_FRAME_BYTES),
+      parser: new FrameParser(this.maxFrameBytes),
       handshook: false,
       closed: false,
       initialized: false,

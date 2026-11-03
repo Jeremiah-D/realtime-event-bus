@@ -1,15 +1,19 @@
 /**
- * GraphQL gateway connection-limit live revision (EB-349).
+ * GraphQL gateway connection-limit live revision (EB-349; EB-358 adds
+ * `maxFrameBytes`).
  *
- * `setGraphqlGatewayLimits` retunes `maxConnections` and
- * `connectionInitTimeoutMs` live — without restarting the server. Only
- * the fields provided move; an explicitly `undefined` cap clears it
- * back to unlimited. The new cap governs from the next connection
- * (already-open connections are never dropped); the new init timeout
- * arms only handshakes that start after the revision. An illegal value
- * fails closed with `RangeError` and the live limits untouched; an
- * empty or identical revision is a no-op. The live tuning is
- * observable in `getStats().limits`.
+ * `setGraphqlGatewayLimits` retunes `maxConnections`,
+ * `connectionInitTimeoutMs`, and `maxFrameBytes` live — without
+ * restarting the server. Only the fields provided move; an explicitly
+ * `undefined` cap clears it back to unlimited. The new cap governs
+ * from the next connection (already-open connections are never
+ * dropped); the new init timeout arms only handshakes that start after
+ * the revision; the new frame bound governs only connections
+ * established after the revision (each connection's `FrameParser`
+ * captures the bound once, at connect time). An illegal value fails
+ * closed with `RangeError` and the live limits untouched; an empty or
+ * identical revision is a no-op. The live tuning is observable in
+ * `getStats().limits`.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -250,6 +254,7 @@ test('tightening maxConnections refuses new sockets with 503; the open one is un
       assert.deepEqual(gw.getStats().limits, {
         maxConnections: 1,
         connectionInitTimeoutMs: 5000,
+        maxFrameBytes: 1024 * 1024,
       });
       const third = await rawGqlConnect(port, { protocol: 'graphql-ws' });
       assert.match(third.statusLine, /^HTTP\/1\.1 503/);
@@ -333,7 +338,7 @@ test('the new init timeout arms only new handshakes; an armed timer keeps the ol
 test('illegal values throw RangeError and leave the live limits untouched', async () => {
   const bus = new EventBus();
   await withGqlGateway(bus, { port: 0, maxConnections: 2 }, async (gw) => {
-    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000 };
+    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000, maxFrameBytes: 1024 * 1024 };
     assert.deepEqual(gw.getStats().limits, live);
     for (const bad of [0, -1, 1.5, NaN, Infinity, '2' as never]) {
       assert.throws(
@@ -351,6 +356,14 @@ test('illegal values throw RangeError and leave the live limits untouched', asyn
       );
       assert.deepEqual(gw.getStats().limits, live);
     }
+    for (const bad of [0, -1, 1.5, NaN, Infinity, '128' as never]) {
+      assert.throws(
+        () => gw.setGraphqlGatewayLimits({ maxFrameBytes: bad as never }),
+        RangeError,
+        `maxFrameBytes=${bad}`,
+      );
+      assert.deepEqual(gw.getStats().limits, live);
+    }
     // A non-object revision and an array revision both throw.
     assert.throws(() => gw.setGraphqlGatewayLimits('x' as never), RangeError);
     assert.throws(() => gw.setGraphqlGatewayLimits([1] as never), RangeError);
@@ -361,12 +374,14 @@ test('illegal values throw RangeError and leave the live limits untouched', asyn
 test('an empty revision, an identical revision, and an absent one are no-ops', async () => {
   const bus = new EventBus();
   await withGqlGateway(bus, { port: 0, maxConnections: 2 }, async (gw) => {
-    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000 };
+    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000, maxFrameBytes: 1024 * 1024 };
     gw.setGraphqlGatewayLimits({});
     assert.deepEqual(gw.getStats().limits, live);
     gw.setGraphqlGatewayLimits({ maxConnections: 2 });
     assert.deepEqual(gw.getStats().limits, live);
     gw.setGraphqlGatewayLimits({ connectionInitTimeoutMs: 5000 });
+    assert.deepEqual(gw.getStats().limits, live);
+    gw.setGraphqlGatewayLimits({ maxFrameBytes: 1024 * 1024 });
     assert.deepEqual(gw.getStats().limits, live);
     gw.setGraphqlGatewayLimits(null as never);
     gw.setGraphqlGatewayLimits(undefined as never);
@@ -380,18 +395,138 @@ test('getStats reflects the live limits, including a cleared cap', async () => {
     assert.deepEqual(gw.getStats().limits, {
       maxConnections: undefined,
       connectionInitTimeoutMs: 5000,
+      maxFrameBytes: 1024 * 1024,
     });
     gw.setGraphqlGatewayLimits({ maxConnections: 3, connectionInitTimeoutMs: 2500 });
     assert.deepEqual(gw.getStats().limits, {
       maxConnections: 3,
       connectionInitTimeoutMs: 2500,
+      maxFrameBytes: 1024 * 1024,
     });
     // Clearing only the cap keeps the revised timeout.
     gw.setGraphqlGatewayLimits({ maxConnections: undefined });
     assert.deepEqual(gw.getStats().limits, {
       maxConnections: undefined,
       connectionInitTimeoutMs: 2500,
+      maxFrameBytes: 1024 * 1024,
     });
+    // Revising only the frame bound keeps the other two limits.
+    gw.setGraphqlGatewayLimits({ maxFrameBytes: 4096 });
+    assert.deepEqual(gw.getStats().limits, {
+      maxConnections: undefined,
+      connectionInitTimeoutMs: 2500,
+      maxFrameBytes: 4096,
+    });
+  });
+});
+
+const SUB = (topicArg: string, fields = 'topic payload seq') =>
+  `subscription { events(${topicArg}) { ${fields} } }`;
+
+/**
+ * Waits until the bus reports at least `n` subscribers. A `subscribe`
+ * frame is processed asynchronously on the server (TCP roundtrip), so
+ * tests must not `bus.publish` until the subscription is registered.
+ */
+async function waitForSubscribers(bus: EventBus, n: number, what: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    if (bus.getStats().totalSubscribers >= n) return;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await sleep(10);
+  }
+}
+
+/**
+ * A subscribe frame whose payload is ~300 bytes — past a 128-byte
+ * bound, far under the 1 MiB default. The long id keeps the query
+ * itself small and valid, so the frame is a legal subscribe once it
+ * fits the bound.
+ */
+function oversizedSubscribe(client: GqlClient): void {
+  client.send({
+    type: 'subscribe',
+    id: 'x'.repeat(150),
+    payload: { query: SUB('topic: "news.*"') },
+  });
+}
+
+test('a frame past the construction maxFrameBytes closes with 4400', async () => {
+  const bus = new EventBus();
+  await withGqlGateway(bus, { port: 0, maxFrameBytes: 128 }, async (gw, port) => {
+    assert.equal(gw.getStats().limits.maxFrameBytes, 128);
+    const client = await connectGql(port);
+    try {
+      await initAck(client);
+      oversizedSubscribe(client);
+      await withTimeout(client.waitClosed(), 3000, 'oversized frame close');
+      assert.equal(client.closeCode, 4400);
+      assert.equal(gw.getStats().protocolErrors, 1);
+    } finally {
+      client.destroy();
+    }
+  });
+});
+
+test('tightening maxFrameBytes closes only connections established after the revision', async () => {
+  const bus = new EventBus();
+  await withGqlGateway(bus, { port: 0 }, async (gw, port) => {
+    const oldConn = await connectGql(port);
+    try {
+      await initAck(oldConn);
+      gw.setGraphqlGatewayLimits({ maxFrameBytes: 128 });
+      assert.equal(gw.getStats().limits.maxFrameBytes, 128);
+      // A connection established after the revision is bound by 128.
+      const fresh = await connectGql(port);
+      try {
+        await initAck(fresh);
+        oversizedSubscribe(fresh);
+        await withTimeout(fresh.waitClosed(), 3000, 'oversized frame close');
+        assert.equal(fresh.closeCode, 4400);
+      } finally {
+        fresh.destroy();
+      }
+      // The pre-revision connection keeps its 1 MiB bound: the same
+      // frame registers a subscription instead of closing it.
+      oversizedSubscribe(oldConn);
+      await waitForSubscribers(bus, 1, 'oversized subscribe on old connection');
+      bus.publish('news.tech', { headline: 'hello' });
+      const next = await withTimeout(oldConn.next(), 3000, 'next');
+      assert.equal(next.type, 'next');
+      assert.equal(next.id, 'x'.repeat(150));
+      // Only the fresh connection's close counted a protocol error.
+      assert.equal(gw.getStats().protocolErrors, 1);
+    } finally {
+      oldConn.destroy();
+    }
+  });
+});
+
+test('loosening maxFrameBytes admits large frames on new connections again', async () => {
+  const bus = new EventBus();
+  await withGqlGateway(bus, { port: 0, maxFrameBytes: 128 }, async (gw, port) => {
+    const tight = await connectGql(port);
+    try {
+      await initAck(tight);
+      oversizedSubscribe(tight);
+      await withTimeout(tight.waitClosed(), 3000, 'oversized frame close');
+      assert.equal(tight.closeCode, 4400);
+    } finally {
+      tight.destroy();
+    }
+    gw.setGraphqlGatewayLimits({ maxFrameBytes: 1024 * 1024 });
+    const loose = await connectGql(port);
+    try {
+      await initAck(loose);
+      oversizedSubscribe(loose);
+      await waitForSubscribers(bus, 1, 'oversized subscribe after loosening');
+      bus.publish('news.tech', { headline: 'hello' });
+      const next = await withTimeout(loose.next(), 3000, 'next');
+      assert.equal(next.type, 'next');
+      assert.equal(gw.getStats().protocolErrors, 1);
+    } finally {
+      loose.destroy();
+    }
   });
 });
 
