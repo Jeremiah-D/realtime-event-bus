@@ -13657,6 +13657,35 @@ export interface CompressionAutoTrainOptions {
 }
 
 /**
+ * Live revision of a rule's auto-train parameters (EB-369): the patch for
+ * `EventBus.setCompressionAutoTrain`. Only the fields provided move; the
+ * rest keep their live values. A trigger field given as `null` clears
+ * that trigger (`undefined` / omitted leaves it alone); `onTrained` can
+ * only be replaced, never cleared. See `setCompressionAutoTrain` for the
+ * trigger interplay and the fail-closed gates.
+ */
+export interface CompressionAutoTrainRevision {
+  /** New sample-window capacity (positive integer). */
+  sampleCount?: number;
+  /** New sample-window byte cap (positive finite number of bytes). */
+  sampleMaxBytes?: number;
+  /**
+   * New message-count retrain trigger (positive integer), or `null` to
+   * clear it. Setting it without `retrainEveryMs` clears the cadence;
+   * clearing it without `retrainEveryMs` falls back to the 60_000 ms
+   * default cadence.
+   */
+  retrainEveryMessages?: number | null;
+  /**
+   * New retrain cadence in milliseconds (positive finite number), or
+   * `null` to clear it.
+   */
+  retrainEveryMs?: number | null;
+  /** Replacement `onTrained` callback. */
+  onTrained?: (event: CompressionAutoTrainedEvent) => void;
+}
+
+/**
  * Delivered to `CompressionAutoTrainOptions.onTrained` after a training
  * pass completes and the new dictionary is live on the rule.
  */
@@ -13777,6 +13806,31 @@ function resolveAutoTrainOptions(autoTrain: CompressionAutoTrainOptions, where: 
 }
 
 /**
+ * Audit-safe form of resolved auto-train parameters (EB-369): the
+ * `onTrained` callback is recorded only as `'set'` (present/absent),
+ * never serialized — a function has no JSON form and must never leak
+ * into the audit log. Unset triggers are omitted, like the lag-SLO
+ * audit (`lag_slo_revised`).
+ */
+function serializeAutoTrainOptions(resolved: ResolvedAutoTrainOptions): {
+  sampleCount: number;
+  sampleMaxBytes: number;
+  retrainEveryMessages?: number;
+  retrainEveryMs?: number;
+  onTrained?: 'set';
+} {
+  return {
+    sampleCount: resolved.sampleCount,
+    sampleMaxBytes: resolved.sampleMaxBytes,
+    ...(resolved.retrainEveryMessages === undefined
+      ? {}
+      : { retrainEveryMessages: resolved.retrainEveryMessages }),
+    ...(resolved.retrainEveryMs === undefined ? {} : { retrainEveryMs: resolved.retrainEveryMs }),
+    ...(resolved.onTrained === undefined ? {} : { onTrained: 'set' as const }),
+  };
+}
+
+/**
  * Marks a timer as not keeping the process alive, tolerating timer-like
  * objects without `unref` (the same defensive shape used by the delayed
  * delivery and rate-window timers).
@@ -13818,7 +13872,7 @@ const retryLadderTimers: RetryLadderTimerFactory = {
  */
 class CompressionAutoTrainer {
   private readonly pattern: string;
-  private readonly config: ResolvedAutoTrainOptions;
+  private config: ResolvedAutoTrainOptions;
   private readonly hooks: {
     now: () => number;
     registerDictionary: (id: string, dictionary: Buffer) => void;
@@ -13878,9 +13932,19 @@ class CompressionAutoTrainer {
     this.sampleBytes += bytes;
     this.sampledMessagesTotal += 1;
     this.sinceLastTrain += 1;
-    // Dual-bounded window: evict oldest first, but always retain the
-    // newest sample — a single payload larger than `sampleMaxBytes` still
-    // trains, it just trains alone.
+    this.pruneWindow();
+    const every = this.config.retrainEveryMessages;
+    if (every !== undefined && this.sinceLastTrain >= every) this.requestTraining();
+  }
+
+  /**
+   * Evicts the oldest samples until both window bounds hold — the same
+   * loop `sample()` runs per publish, factored out so a live revision
+   * (EB-369) can prune at once instead of waiting for the next publish.
+   * The newest sample is always kept, even when it alone exceeds the
+   * byte cap.
+   */
+  private pruneWindow(): void {
     while (
       this.samples.length > 1 &&
       (this.samples.length > this.config.sampleCount || this.sampleBytes > this.config.sampleMaxBytes)
@@ -13888,8 +13952,36 @@ class CompressionAutoTrainer {
       const evicted = this.samples.shift();
       if (evicted !== undefined) this.sampleBytes -= Buffer.byteLength(evicted, 'utf8');
     }
-    const every = this.config.retrainEveryMessages;
-    if (every !== undefined && this.sinceLastTrain >= every) this.requestTraining();
+  }
+
+  /** Live resolved parameters (a copy) — the revision path merges over these. */
+  currentOptions(): ResolvedAutoTrainOptions {
+    return { ...this.config };
+  }
+
+  /**
+   * Applies already-validated parameters in place (EB-369): the trainer
+   * instance, sample window, counters, version, dictionary, and any
+   * queued training survive — only the five parameters move.
+   * Tightening the window bounds prunes at once (oldest first, newest
+   * sample always kept); loosening governs from the next sample. The
+   * cadence timer is re-armed from now only when `retrainEveryMs`
+   * actually changed — an unchanged cadence keeps the timer it was
+   * armed with, so a revision never silently resets the cadence.
+   * `sinceLastTrain` is untouched, so lowering `retrainEveryMessages`
+   * to at or below the current count trains on the next sample.
+   */
+  retune(resolved: ResolvedAutoTrainOptions): void {
+    const oldRetrainEveryMs = this.config.retrainEveryMs;
+    this.config = resolved;
+    this.pruneWindow();
+    if (resolved.retrainEveryMs !== oldRetrainEveryMs) {
+      if (this.cadenceTimer !== undefined) {
+        clearTimeout(this.cadenceTimer);
+        this.cadenceTimer = undefined;
+      }
+      this.armCadenceTimer();
+    }
   }
 
   /** Retires the trainer: drops a queued training and clears the cadence timer. */
@@ -26480,6 +26572,163 @@ export class EventBus {
       this.compressionAutoTrainers.delete(topicPattern);
     }
     return this.compressionRules.delete(topicPattern);
+  }
+
+  /**
+   * Revises a compression rule's auto-train parameters live (EB-369)
+   * without replacing the rule — the state-preserving counterpart to
+   * `setTopicCompression`, which retires the trainer and drops every
+   * accumulated sample. `setCompressionAutoTrain(pattern, patch)` retunes
+   * the trainer `setTopicCompression` built for `pattern` in place: the
+   * trainer instance, its sample window, `sampledMessagesTotal`,
+   * `sinceLastTrain`, `version`, `dictionaryId`, `lastTrainedAt`, and the
+   * compression rule's own fields (`thresholdBytes` / `codec` / `level` /
+   * `dictionary`) all survive the revision — only the five auto-train
+   * parameters move.
+   *
+   * A partial revision: only the fields `patch` provides move, the rest
+   * keep their live values. A trigger field given as `null` clears that
+   * trigger (`undefined` / omitted leaves it alone). Trigger interplay
+   * follows the construction-time default rule (`resolveAutoTrainOptions`):
+   * setting `retrainEveryMessages` without `retrainEveryMs` clears the
+   * cadence (the message trigger is exclusive — no cadence); clearing
+   * `retrainEveryMessages` without `retrainEveryMs` falls the cadence
+   * back to the 60_000 ms default; leaving both triggers untouched keeps
+   * both live values. `onTrained` can only be replaced, never cleared
+   * (a `null` there keeps the live callback).
+   *
+   * Tightening `sampleCount` / `sampleMaxBytes` prunes the window at
+   * once (oldest first, the newest sample always kept), so a tightened
+   * bound is already reflected in `getStats()` when the call returns;
+   * loosening governs from the next sample. `sinceLastTrain` is not
+   * reset, so lowering `retrainEveryMessages` to at or below the current
+   * count trains on the next sample, and raising it defers training. A
+   * queued training is unaffected by a revision. `retrainEveryMs`
+   * re-arms the cadence timer from the revision moment only when its
+   * resolved value actually changed — an unchanged cadence keeps the
+   * timer it was armed with.
+   *
+   * An explicit `null` patch retires the trainer entirely (the
+   * `setSlowStart` / `setThrottle` / `setRetryLadder` null-clear
+   * convention): its timers are cleared, its map entry is removed, and
+   * the rule's `autoTrainState` is cleared, so `getStats()` no longer
+   * shows an `autoTrain` row for the topic. A later revision is refused
+   * until `setTopicCompression` opts the rule back into auto-training.
+   *
+   * Fail-closed: an empty `topicPattern`, a pattern with no compression
+   * rule, a rule without `autoTrain`, and a retired trainer all throw
+   * `RangeError` — only a live trainer can be revised. Validation reuses
+   * the construction-time rule (`resolveAutoTrainOptions`, run against
+   * the patch merged over the live resolved values), so an illegal value
+   * leaves the live parameters, samples, timers, and audit untouched.
+   * A revision identical to the current five parameters — or a patch
+   * with no fields — is a no-op with no audit. Otherwise the change is
+   * recorded in the subscription audit log as
+   * `compression_auto_train_revised`
+   * (`{ topicPattern, autoTrain, oldAutoTrain }` — `autoTrain` is `null`
+   * when the trainer was retired, and the `onTrained` callback is
+   * recorded only as `'set'`, never serialized), via the bus-level
+   * `auditSubscription` form with no `subId` (like `setLagSlo` and
+   * `setDurableLogMaxAgeMs`). The live parameters are not otherwise
+   * exposed: `getStats()` shows the trainer's `snapshot()` — the
+   * pruned `sampledBytes` reflects a tightening at once, while
+   * `version` / `lastTrainedAt` never move for a revision alone
+   * (a revision itself never trains).
+   *
+   * Orthogonal to EB-60 (that is the auto-training mechanism itself —
+   * this its parameters' live revision), to EB-194 (the codec registry —
+   * auto-train still only derives deflate dictionaries, and
+   * `brotli` + `autoTrain` still throws at construction), to EB-22
+   * (deflate semantics — this the training triggers), to EB-30 (the
+   * dictionary registry — a revision never touches it, and old
+   * dictionaries stay registered for replay), to `setTopicCompression`
+   * (whole-rule replacement that retires the trainer — this retunes it
+   * in place), and to EB-355 / EB-361 (durable-log revisions — this
+   * compression training, the same audit shape).
+   *
+   * Throws `RangeError` for an empty `topicPattern`, for a pattern with
+   * no rule / no auto-trainer / a retired trainer, for a non-object
+   * patch, or for an illegal parameter value.
+   */
+  setCompressionAutoTrain(topicPattern: string, patch: CompressionAutoTrainRevision | null): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('setCompressionAutoTrain: topicPattern must be a non-empty string');
+    }
+    const rule = this.compressionRules.get(topicPattern);
+    const trainer = this.compressionAutoTrainers.get(topicPattern);
+    if (rule === undefined || rule.autoTrainState === undefined || trainer === undefined) {
+      throw new RangeError(
+        `setCompressionAutoTrain: no auto-trainer for topic pattern "${topicPattern}" ` +
+          '(no compression rule, no autoTrain, or the trainer was retired)',
+      );
+    }
+    const old = trainer.currentOptions();
+    // An explicit null retires the trainer entirely: its timers are
+    // cleared, its map entry removed, and the rule's autoTrainState
+    // cleared — otherwise getStats() would keep showing a zombie
+    // snapshot and applyTrainedDictionary's map guard would go stale.
+    // A later revision is refused until setTopicCompression re-opts in.
+    if (patch === null) {
+      trainer.clear();
+      this.compressionAutoTrainers.delete(topicPattern);
+      this.compressionRules.set(topicPattern, { ...rule, autoTrainState: undefined });
+      this.auditSubscription({
+        action: 'compression_auto_train_revised',
+        actor: 'system',
+        detail: { topicPattern, autoTrain: null, oldAutoTrain: serializeAutoTrainOptions(old) },
+      });
+      return;
+    }
+    if (typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError('setCompressionAutoTrain: patch must be an object or null');
+    }
+    const setsMessages = patch.retrainEveryMessages !== undefined;
+    const setsMs = patch.retrainEveryMs !== undefined;
+    // Trigger interplay, re-applying the construction-time default rule
+    // to the merged pair: an explicit message trigger without a cadence
+    // clears the cadence; clearing the message trigger without a cadence
+    // falls back to the 60_000 ms default; both untouched keeps both
+    // live values.
+    const mergedMessages = setsMessages ? (patch.retrainEveryMessages ?? undefined) : old.retrainEveryMessages;
+    let mergedMs: number | undefined;
+    if (setsMs) {
+      mergedMs = patch.retrainEveryMs ?? undefined;
+    } else if (setsMessages) {
+      mergedMs = mergedMessages === undefined ? DEFAULT_AUTO_TRAIN_RETRAIN_MS : undefined;
+    } else {
+      mergedMs = old.retrainEveryMs;
+    }
+    const merged: CompressionAutoTrainOptions = {
+      sampleCount: patch.sampleCount ?? old.sampleCount,
+      sampleMaxBytes: patch.sampleMaxBytes ?? old.sampleMaxBytes,
+      retrainEveryMessages: mergedMessages,
+      retrainEveryMs: mergedMs,
+      onTrained: patch.onTrained ?? old.onTrained,
+    };
+    // Validate before touching anything: an illegal value leaves the
+    // live parameters, samples, timers, and audit exactly as they were.
+    const resolved = resolveAutoTrainOptions(merged, `setCompressionAutoTrain("${topicPattern}")`);
+    // Re-affirming the current five parameters is a no-op: no retune,
+    // no prune, no timer re-arm, no audit.
+    if (
+      resolved.sampleCount === old.sampleCount &&
+      resolved.sampleMaxBytes === old.sampleMaxBytes &&
+      resolved.retrainEveryMessages === old.retrainEveryMessages &&
+      resolved.retrainEveryMs === old.retrainEveryMs &&
+      resolved.onTrained === old.onTrained
+    ) {
+      return;
+    }
+    trainer.retune(resolved);
+    this.auditSubscription({
+      action: 'compression_auto_train_revised',
+      actor: 'system',
+      detail: {
+        topicPattern,
+        autoTrain: serializeAutoTrainOptions(resolved),
+        oldAutoTrain: serializeAutoTrainOptions(old),
+      },
+    });
   }
 
   /**

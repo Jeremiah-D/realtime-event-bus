@@ -2032,7 +2032,29 @@ library.
     (`version`, `dictionaryId`, `lastTrainedAt`, `sampledMessages`,
     `sampledBytes`). `clearTopicCompression` (or replacing the rule)
     retires the trainer — queued trainings are dropped and timers
-    cleared. Invalid options throw `RangeError`; an `onTrained` callback
+    cleared. Retuning a live trainer without losing its samples is a
+    separate call, `setCompressionAutoTrain(pattern, patch)`: it revises
+    the five auto-train parameters in place (`sampleCount`,
+    `sampleMaxBytes`, `retrainEveryMessages`, `retrainEveryMs`,
+    `onTrained` — only the fields provided move, a trigger given as
+    `null` clears that trigger, `onTrained` can only be replaced, never
+    cleared), while the trainer instance, sample window, counters,
+    `version`, `dictionaryId`, `lastTrainedAt`, and the compression rule
+    itself all survive. Tightening the window bounds prunes at once
+    (oldest first, newest sample always kept); lowering
+    `retrainEveryMessages` trains on the next sample once the count is
+    reached; `retrainEveryMs` re-arms the cadence timer only when its
+    value actually changed. A `null` patch retires the trainer entirely
+    (revising again is refused until `setTopicCompression` opts the rule
+    back in). An identical revision is a no-op; an illegal value throws
+    `RangeError` with everything untouched. Every revision is audited
+    as `compression_auto_train_revised` (`{ topicPattern, autoTrain,
+    oldAutoTrain }` — `autoTrain` is `null` on retirement, the callback
+    recorded only as `'set'`). In short: `setTopicCompression` replaces
+    the rule and retires its trainer (samples dropped, training restarts
+    from an empty corpus); `setCompressionAutoTrain` retunes the live
+    trainer and keeps everything it has learned. Invalid options throw
+    `RangeError`; an `onTrained` callback
     fires after each completed training (a throwing callback is
     swallowed). Disabled by default. Measured on
     `bench/dict-train.bench.ts` (2,000 market-tick messages, mean 142
