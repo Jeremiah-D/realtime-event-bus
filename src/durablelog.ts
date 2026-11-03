@@ -1777,7 +1777,16 @@ export class DurableTopicLog {
    * a revised bound governs from the next append-triggered compact.
    */
   private maxEntriesPerTopic: number;
-  private readonly keyCompaction: boolean;
+  /**
+   * Keyed compaction (`keyCompaction`), `false` when unconfigured.
+   * Mutable at runtime via `setKeyCompaction` (EB-364) — the bus
+   * exposes it as `setDurableLogKeyCompaction` with a
+   * subscription-audit trail. Every use site reads the live value, so
+   * a revised flag flips the read view at once and governs the next
+   * append-triggered compact; enabling also rebuilds the key index
+   * and superseded counts from the records already on disk.
+   */
+  private keyCompaction: boolean;
   /** Topics known to the log (recovered from disk + appended since open). */
   private readonly topicsSeen = new Set<string>();
   /** Entry counts per topic, used for compaction and stats. */
@@ -2194,6 +2203,40 @@ export class DurableTopicLog {
   /** The current per-topic entry budget — the live value `setMaxEntriesPerTopic` moves. */
   currentMaxEntriesPerTopic(): number {
     return this.maxEntriesPerTopic;
+  }
+
+  /**
+   * Flips keyed compaction at runtime (EB-364). Returns the previous
+   * flag. Enabling takes effect at once: the read view switches to
+   * latest-per-key immediately — superseded records stop replaying
+   * even before the file is rewritten — and the key index and
+   * superseded counts are rebuilt from the records already on disk
+   * (`readLiveRecords` + `rebuildKeyIndex` per known topic), so the
+   * next append counts the dead weight that predates the flip and
+   * the amortized compact trigger stays honest. Disabling is a view
+   * switch, not an un-delete: the read view returns to full history
+   * at once (superseded records reappear in replay until a rewrite),
+   * appends stop maintaining the key index, and the superseded
+   * counts freeze until the flag is flipped back on. The bus wraps
+   * this as `setDurableLogKeyCompaction` and records the change in
+   * the subscription audit log
+   * (`durable_log_key_compaction_revised`).
+   */
+  setKeyCompaction(enabled: boolean): boolean {
+    const previous = this.keyCompaction;
+    if (enabled === previous) return previous;
+    this.keyCompaction = enabled;
+    if (enabled) {
+      for (const topic of this.topicsSeen) {
+        this.rebuildKeyIndex(topic, this.readLiveRecords(topic));
+      }
+    }
+    return previous;
+  }
+
+  /** Whether keyed compaction is on — the live value `setKeyCompaction` moves. */
+  currentKeyCompaction(): boolean {
+    return this.keyCompaction;
   }
 
   /**

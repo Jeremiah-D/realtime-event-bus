@@ -892,7 +892,18 @@ library.
   nothing local and `Infinity` restores full retention; same gates (requires a `durableLogDir`
   and a bus constructed with `durableLogSegmentOffload`, skips namespace child logs) and the
   same no-op rule, audited as `durable_log_retain_local_segments_revised` (`Infinity` recorded
-  as `null`), live value in `getStats().durableLog.retainLocalSegments`. Readback volume is observable
+  as `null`), live value in `getStats().durableLog.retainLocalSegments`. Flip keyed compaction live
+  with `setDurableLogKeyCompaction(enabled, actor?)` (EB-364): enabling switches the read view to
+  latest-per-key at once (superseded records stop replaying even before the file is rewritten) and
+  rebuilds each log's key index and superseded counts from disk, so the next append counts the dead
+  weight that predates the flip; disabling is a view switch, not an un-delete — the read view returns
+  to full history at once, appends stop maintaining the key index, and the superseded counts freeze.
+  The per-key TTL gate (`setTopicKeyTtl`) follows the live flag, stored TTL rules only sleep while
+  disabled. A bus constructed without keyed compaction can still enable it; it fans out to the root
+  log and every namespace child log (a namespace registered later opens with the live flag), requires
+  a `durableLogDir`, and is audited as `durable_log_key_compaction_revised` (`{ enabled, oldEnabled }`);
+  an identical revision is a no-op with no audit, and the live flag is visible in
+  `getStats().durableLog.keyCompaction`. Readback volume is observable
   in `getStats().durableLog` (`s3Readbacks` pulls, `s3ReadbackBytes` downloaded bytes,
   `s3ReadbackCacheHits` cache hits) and renders as the `durablelog_s3_readbacks_total`,
   `durablelog_s3_readback_bytes_total`, and `durablelog_s3_readback_cache_hits_total`

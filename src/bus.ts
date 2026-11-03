@@ -16777,9 +16777,10 @@ export class EventBus {
   private durableLogPublishDedupMaxEntries: number;
   /**
    * `durableLogKeyCompaction` as configured — namespace child logs
-   * (EB-52) open with the same compaction mode as the root log.
+   * (EB-52) open with the same compaction mode as the root log; kept
+   * in sync by `setDurableLogKeyCompaction` (EB-364).
    */
-  private readonly durableLogKeyCompaction: boolean = false;
+  private durableLogKeyCompaction: boolean = false;
   /**
    * `durableLogSegmentRotation` as configured — namespace child logs
    * (EB-52) open with the same rotation triggers as the root log; kept
@@ -21960,6 +21961,94 @@ export class EventBus {
         retainLocalSegments: retainLocalSegments === Infinity ? null : retainLocalSegments,
         oldRetainLocalSegments: current === Infinity ? null : current,
       },
+    });
+  }
+
+  /**
+   * Flips the durable log's keyed compaction live (EB-364):
+   * `setDurableLogKeyCompaction(enabled, actor?)` switches the log
+   * between Kafka-style latest-per-key retention and full-history
+   * retention without restarting the bus (see
+   * `EventBusOptions.durableLogKeyCompaction`, EB-26).
+   *
+   * Only the flag moves — the compaction mechanism itself is
+   * untouched: the read paths keep re-deriving latest-per-key from
+   * the record set on every read (`readSince` / `readSinceTime` /
+   * `applyKeyTtl` all gate on the live flag), the amortized compact
+   * trigger keeps reading it live, and the fork's `keyedLatest`
+   * filter is explicit and independent of this flag. Enabling takes
+   * effect at once: the read view switches to latest-per-key
+   * immediately — superseded records stop replaying even before the
+   * file is rewritten — and each log rebuilds its key index and
+   * superseded counts from the records already on disk, so the next
+   * append counts the dead weight that predates the flip and the
+   * compact trigger stays honest. Disabling is a view switch, not an
+   * un-delete: the read view returns to full history at once
+   * (superseded records reappear in replay until a rewrite), appends
+   * stop maintaining the key index, and the superseded counts freeze
+   * until the flag is flipped back on. The per-key TTL gate
+   * (`setTopicKeyTtl`) follows the live flag too: enabling re-opens
+   * it, disabling closes it again, and already-stored TTL rules only
+   * sleep while disabled — they are never deleted, and re-enabling
+   * restores them.
+   *
+   * The change applies to the root log and every namespace child log,
+   * and is recorded in the subscription audit log as
+   * `durable_log_key_compaction_revised` (with the previous and new
+   * flag in `detail`), so compaction-policy changes stay attributable.
+   * A namespace registered after the revision opens its child log
+   * with the live bus flag, like every other durable-log option. The
+   * live flag is visible in `getStats().durableLog.keyCompaction`.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. There is no "only if already set" gate: a bus
+   * constructed without keyed compaction can still enable it — the
+   * flip only changes the read view and rebuilds the in-memory index
+   * from disk, and needs no construction-time structure (unlike
+   * offload or rotation, which cannot be enabled after the fact). A
+   * non-boolean flag also throws `RangeError` with the live flag and
+   * the audit log untouched. A revision identical to the current flag
+   * is a no-op with no audit.
+   *
+   * Orthogonal to EB-26 (that is the compaction mechanism itself —
+   * this its live switch), to EB-221 / `setTopicKeyTtl` (that is the
+   * per-key TTL — this the master switch that gates it), to EB-322 /
+   * EB-323 (those retune the entry/byte retention bounds — this the
+   * keyed view switch), to EB-355 (that retunes the segment-rotation
+   * triggers — this the compaction switch), and to EB-119 (that is
+   * the byte-retention / compact-trigger mechanism — this the trigger
+   * condition's switch).
+   *
+   * Throws `RangeError` for a bad actor, for a non-boolean `enabled`,
+   * or when the bus has no `durableLogDir`.
+   */
+  setDurableLogKeyCompaction(enabled: boolean, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogKeyCompaction');
+    if (typeof enabled !== 'boolean') {
+      throw new RangeError('setDurableLogKeyCompaction: enabled must be a boolean');
+    }
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogKeyCompaction requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const previous = this.durableLogKeyCompaction;
+    // Re-affirming the current flag is a no-op: no retune, no audit.
+    if (enabled === previous) {
+      return;
+    }
+    log.setKeyCompaction(enabled);
+    for (const child of this.namespaceLogs.values()) {
+      child.setKeyCompaction(enabled);
+    }
+    this.durableLogKeyCompaction = enabled;
+    this.auditSubscription({
+      action: 'durable_log_key_compaction_revised',
+      actor,
+      detail: { enabled, oldEnabled: previous },
     });
   }
 
