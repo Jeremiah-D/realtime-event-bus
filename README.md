@@ -7294,6 +7294,28 @@ Semantics:
   "delivered"), and `src/metrics.ts` renders them as
   `eventbus_fair_scheduled_messages_total{topic}` — only for topics with
   at least one scheduled message.
+- **Revisable after subscribe (EB-359, via
+  `setTopicFairness(subId, opts | null)`).** Only a subscriber that
+  already opted into `topicFairness` can be revised — there is no
+  "revise a plain subscriber" path. The revision is a full replacement
+  of the weights mapping: `true` takes all weights 1, an object takes
+  its `weights` mapping (a topic absent from it still drains at weight
+  1), and a field left out is unweighted, not carried over from the
+  live mapping. The drain reads the new weights live, so the new ratio
+  governs the very next flush round, while the per-topic deficit
+  carryover and the scheduled counters are untouched — a weight change
+  earns no historical credit and forfeits none already banked. `null`
+  clears fairness back to plain FIFO order, discarding the deficits
+  and counters with the state, and a later revision is refused until
+  the subscriber opts in again at subscribe time. A revision with the
+  same effective mapping (`true` equivalent to an all-1 mapping) is a
+  no-op with no audit. It is fail-closed (an unknown subscriber, a
+  subscriber that never opted in, a non-object / non-boolean value, an
+  illegal weight, or `undefined` / `false` throws `RangeError` with the
+  live weights, deficits, counters, and audit log untouched), and every
+  success is audited as `topic_fairness_revised`
+  (`{ topicFairness: { weights } | null, oldTopicFairness: { weights } }`,
+  `null` for a clear). (Real-time systems: delivery governance.)
 
 ## Subscriber drain priority (EB-166)
 

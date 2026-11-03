@@ -31262,6 +31262,135 @@ export class EventBus {
   }
 
   /**
+   * Revises one fair-scheduled subscriber's topic weights live
+   * (EB-359) without re-subscribing: `setTopicFairness(subId, opts |
+   * null)` retunes the deficit round-robin weights the drain serves
+   * that subscriber's queued topics with (see
+   * `SubscribeOptions.topicFairness`, EB-135).
+   *
+   * Only the weights move, as a full replacement: a non-null revision
+   * swaps in the newly resolved options, so the drain reads the new
+   * weights from the very next flush round — the new ratio governs
+   * the next round's interleave, with no re-queueing, no dropped or
+   * reordered message, and no drain-budget change. The per-topic
+   * deficit carryover and the scheduled counters are untouched: the
+   * deficits are debited per scheduled message, so a weight change
+   * earns no historical credit and forfeits none already banked — a
+   * raised weight does not backfill the rounds it missed, and a
+   * lowered weight does not confiscate what the old weight already
+   * earned. `true` takes all weights 1, an object takes its
+   * `weights` mapping (a topic absent from the mapping still drains
+   * at weight 1), and a field left out is simply unweighted, not
+   * carried over from the live mapping — the revision replaces the
+   * whole mapping. Passing `null` clears fairness back to plain FIFO
+   * order: the deficits and counters are discarded with the state,
+   * and a later revision is refused until the subscriber opts in
+   * again at subscribe time (the EB-267 clear rule).
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into `topicFairness` (or whose fairness was already
+   * cleared), a non-object / non-boolean value, an illegal weight
+   * (a non-positive-integer weight, an empty topic name), and
+   * `undefined` / `false` — only an explicit `null` clears — all
+   * throw `RangeError` with the live weights, the deficits, the
+   * counters, and the audit log untouched. The new weights reuse the
+   * subscribe-time validation (`resolveTopicFairnessOptions`), so a
+   * failed call leaves the live weights untouched. Audited as
+   * `topic_fairness_revised` (`{ topicFairness: { weights } | null,
+   * oldTopicFairness: { weights } }`, `null` for a clear) on success.
+   * `getStats().topicFairness` keeps aggregating the live counters
+   * and deficits, so it reflects a revision with no new field.
+   *
+   * Orthogonal to the subscribe-time fairness of EB-135 (this
+   * revises it, that sets it), to `setDeliveryPriority` (EB-272,
+   * that weights subscribers against each other in the drain — this
+   * weights topics within one subscriber), and to `setDeliveryShaping`
+   * (EB-266, that caps how much a visit drains — this only picks
+   * which queued topics the budget covers).
+   *
+   * Throws `RangeError` for an unknown / non-fair subscriber or an
+   * illegal fairness value.
+   */
+  setTopicFairness(subId: string, opts: boolean | TopicFairnessOptions | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setTopicFairness: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setTopicFairness: unknown subscriber: ${subId}`);
+    }
+    const fair = subscriber.topicFairness;
+    if (fair == null) {
+      throw new RangeError('setTopicFairness: subscriber has no topicFairness set');
+    }
+    const oldWeights = Object.fromEntries(fair.options.weights);
+    if (opts === null) {
+      // Discard the deficits and counters with the state: the
+      // cleared subscriber drains plain FIFO, and a later revision
+      // is refused until it opts in again at subscribe time.
+      subscriber.topicFairness = undefined;
+      this.auditSubscription({
+        action: 'topic_fairness_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { topicFairness: null, oldTopicFairness: { weights: oldWeights } },
+      });
+      // The cleared subscriber drains in plain FIFO order now: the
+      // queued backlog is re-ordered at the next flush round.
+      this.scheduleFlush();
+      return;
+    }
+    // Validate before touching anything: `undefined` and `false`
+    // are not a clear — only an explicit `null` clears — and the
+    // revision is a full replacement, so resolution happens here,
+    // against the documented defaults, before the live options move.
+    const resolved = resolveTopicFairnessOptions(opts, 'setTopicFairness');
+    if (resolved === undefined) {
+      throw new RangeError('setTopicFairness: topicFairness must be true or an options object, or null to clear it');
+    }
+    // Re-affirming the current weights is a no-op: no retune, no
+    // audit. Equality is on the effective mapping — a topic absent
+    // from the mapping drains at weight 1 — so `true` and an
+    // all-1 mapping are the same revision.
+    const sameWeights = (a: ReadonlyMap<string, number>, b: ReadonlyMap<string, number>): boolean => {
+      if (a.size !== b.size) {
+        // Sizes may differ only by explicit weight-1 entries.
+        for (const [topic, weight] of a) {
+          if ((b.get(topic) ?? 1) !== weight) return false;
+        }
+        for (const [topic, weight] of b) {
+          if ((a.get(topic) ?? 1) !== weight) return false;
+        }
+        return true;
+      }
+      for (const [topic, weight] of a) {
+        if (b.get(topic) !== weight) return false;
+      }
+      return true;
+    };
+    if (sameWeights(resolved.weights, fair.options.weights)) {
+      return;
+    }
+    // Only the options move: the deficit carryover and the
+    // scheduled counters survive the revision, and the drain reads
+    // the new weights live from the next flush round.
+    fair.options = resolved;
+    this.auditSubscription({
+      action: 'topic_fairness_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        topicFairness: { weights: Object.fromEntries(resolved.weights) },
+        oldTopicFairness: { weights: oldWeights },
+      },
+    });
+    // A re-weighted backlog is re-served at the next flush round.
+    this.scheduleFlush();
+  }
+
+  /**
    * Revises the lag watermark monitoring of one subscriber (EB-273):
    * a subscriber that opted into `lagMonitor` can retune its window,
    * threshold, and alert callback without re-subscribing. The
