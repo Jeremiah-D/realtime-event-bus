@@ -114,7 +114,20 @@ library.
   replays. Unsubscribing cancels pending replays; a manual
   `replayDeadLetter` supersedes the scheduled one. `getStats()` exposes
   `autoReplayed` / `autoReplayExhausted` / `poisoned`. Disabled by
-  default. High-throughput in-order consumers can call
+  default. The backoff and replay budget are live-revisable per
+  subscriber without re-subscribing — `setDeadLetterAutoReplay(subId,
+  patch)` (EB-367) moves only the fields present (`initialDelayMs` /
+  `maxDelayMs` / `backoffMultiplier` / `maxAutoReplayAttempts`); passing
+  `null` clears auto-replay outright, and a revision after a clear is
+  refused until the subscriber opts in again at subscribe time. Raising
+  `maxAutoReplayAttempts` rescues a message at the poison edge, lowering
+  it (including to `0`) poisons on the next dead-lettering once the
+  carried attempt count reaches the new max, and the delay fields only
+  shape the next arming — an already-armed timer keeps the delay it was
+  armed with and still fires once after a clear. Revisions are audited
+  as `dead_letter_auto_replay_revised` (actor `system`, new value `null`
+  on a clear); passing the current values is a no-op with no audit.
+  High-throughput in-order consumers can call
   `ackUpTo(subId, seq)` (EB-76) to cumulatively acknowledge every
   outstanding delivery with `seq <= seq` in one call instead of acking
   each `Delivery` handle: it returns the number actually acked, skips
