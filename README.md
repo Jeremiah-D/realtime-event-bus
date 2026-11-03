@@ -844,8 +844,11 @@ library.
   for real. Remote segment offload (EB-163): opt-in S3 upload of sealed
   (archived) segments via `segmentOffload: { s3, keyPrefix?,
   namespace?, retainLocalSegments? }` on `DurableTopicLog.open` (the log
-  layer; no new `EventBus` option — namespace child logs pass their
-  prefix as `namespace` explicitly). Every archived segment is uploaded
+  layer) or `durableLogSegmentOffload` on `new EventBus({ durableLogDir,
+  durableLogSegmentRotation, durableLogSegmentOffload })` (EB-361, the
+  bus level — the root log offloads; namespace child logs do not offload
+  and pass their prefix as `namespace` explicitly when opened directly).
+  Every archived segment is uploaded
   under a deterministic key
   `<keyPrefix>/[<namespace>/]<urlencoded-topic>.seg-<seqStart>-<seqEnd>.jsonl.gz`
   (default prefix `durable-log-offload`), and a remote manifest
@@ -872,7 +875,15 @@ library.
   — e.g. several subscribers resuming from old offsets — do not re-download; bounds via
   `readbackCacheMaxSegments` (default 16) and `readbackCacheMaxBytes` (default 64 MiB,
   accounted against downloaded bytes), either 0 to disable. A failed pull is never
-  cached, and `purgeTopic` evicts the topic from the cache. Readback volume is observable
+  cached, and `purgeTopic` evicts the topic from the cache. Retune the cache bounds live
+  with `setDurableLogReadbackCache(patch, actor?)` (EB-361): a partial revision — only the
+  fields provided move; tightening prunes the cache to the new bounds at once
+  (least-recently-used first), loosening governs from the next insert; it requires a
+  `durableLogDir` and a bus constructed with `durableLogSegmentOffload` (offload cannot be
+  enabled after the fact), skips namespace child logs (they do not offload), and is audited
+  as `durable_log_readback_cache_revised` (old and new bounds); an identical revision is a
+  no-op with no audit, and the live bounds are visible in
+  `getStats().durableLog.readbackCacheMaxSegments` / `readbackCacheMaxBytes`. Readback volume is observable
   in `getStats().durableLog` (`s3Readbacks` pulls, `s3ReadbackBytes` downloaded bytes,
   `s3ReadbackCacheHits` cache hits) and renders as the `durablelog_s3_readbacks_total`,
   `durablelog_s3_readback_bytes_total`, and `durablelog_s3_readback_cache_hits_total`

@@ -600,6 +600,36 @@ interface ResolvedSegmentOffload {
 }
 
 /**
+ * EB-361: the live bounds of the S3 readback cache (`SegmentOffloadOptions`
+ * `readbackCacheMaxSegments` / `readbackCacheMaxBytes`). The bus revises
+ * them at runtime via `DurableTopicLog.retuneReadbackCache` /
+ * `EventBus.setDurableLogReadbackCache`; only these two bounds move.
+ */
+export interface ReadbackCacheLimits {
+  /** Max cached segments (default 16). 0 disables the cache entirely. */
+  readbackCacheMaxSegments: number;
+  /** Max downloaded bytes held (default 64 MiB). 0 disables the cache entirely. */
+  readbackCacheMaxBytes: number;
+}
+
+/**
+ * EB-361: the construction-time rule for the readback-cache bounds,
+ * shared by `resolveSegmentOffloadOptions` and `retuneReadbackCache`:
+ * both bounds must be non-negative integers, else `RangeError`.
+ */
+function assertValidReadbackCacheLimits(
+  readbackCacheMaxSegments: unknown,
+  readbackCacheMaxBytes: unknown,
+): void {
+  if (!Number.isInteger(readbackCacheMaxSegments) || (readbackCacheMaxSegments as number) < 0) {
+    throw new RangeError('segmentOffload.readbackCacheMaxSegments must be a non-negative integer');
+  }
+  if (!Number.isInteger(readbackCacheMaxBytes) || (readbackCacheMaxBytes as number) < 0) {
+    throw new RangeError('segmentOffload.readbackCacheMaxBytes must be a non-negative integer');
+  }
+}
+
+/**
  * Validates `SegmentOffloadOptions`, returning the resolved
  * configuration. `undefined` stays `undefined` (offload disabled —
  * fully backward compatible). Anything else must carry a usable S3
@@ -643,13 +673,8 @@ function resolveSegmentOffloadOptions(
     throw new RangeError('segmentOffload.retainLocalSegments must be a non-negative integer or Infinity');
   }
   const readbackCacheMaxSegments = options.readbackCacheMaxSegments ?? 16;
-  if (!Number.isInteger(readbackCacheMaxSegments) || readbackCacheMaxSegments < 0) {
-    throw new RangeError('segmentOffload.readbackCacheMaxSegments must be a non-negative integer');
-  }
   const readbackCacheMaxBytes = options.readbackCacheMaxBytes ?? 64 * 1024 * 1024;
-  if (!Number.isInteger(readbackCacheMaxBytes) || readbackCacheMaxBytes < 0) {
-    throw new RangeError('segmentOffload.readbackCacheMaxBytes must be a non-negative integer');
-  }
+  assertValidReadbackCacheLimits(readbackCacheMaxSegments, readbackCacheMaxBytes);
   return {
     s3,
     keyPrefix: resolvedPrefix,
@@ -2264,6 +2289,96 @@ export class DurableTopicLog {
   /** The current segment-rotation triggers — the live value `setSegmentRotation` moves. */
   currentSegmentRotation(): SegmentRotationOptions | undefined {
     return this.segmentRotation === undefined ? undefined : { ...this.segmentRotation };
+  }
+
+  /**
+   * The current readback-cache bounds — the live values
+   * `retuneReadbackCache` moves. `undefined` when S3 offload is not
+   * enabled on this log (there is no cache to bound).
+   */
+  currentReadbackCacheLimits(): ReadbackCacheLimits | undefined {
+    return this.offload === undefined
+      ? undefined
+      : {
+          readbackCacheMaxSegments: this.offload.readbackCacheMaxSegments,
+          readbackCacheMaxBytes: this.offload.readbackCacheMaxBytes,
+        };
+  }
+
+  /**
+   * Changes the S3 readback-cache bounds at runtime (EB-361), as a
+   * partial revision: only the fields `patch` provides move, the rest
+   * keep their live values. Returns the previous bounds. Throws
+   * `RangeError` for an illegal value (reusing the construction-time
+   * rule `assertValidReadbackCacheLimits`: both bounds non-negative
+   * integers), leaving the live bounds and the cached entries exactly
+   * as they were. A patch with neither field is a no-op returning the
+   * current bounds.
+   *
+   * Fail-closed: a log constructed without `segmentOffload` refuses
+   * outright — the cache bounds cannot be enabled after the fact,
+   * because there is no offload (no S3 client, no remote key space)
+   * for the cache to serve. The bus enforces the same gate as
+   * `setDurableLogReadbackCache` and records the change in the
+   * subscription audit log (`durable_log_readback_cache_revised`).
+   *
+   * Only the two bounds move: the S3 client, key prefix, namespace,
+   * `retainLocalSegments`, and segment rotation are untouched.
+   * Tightening takes effect at once — the cache is pruned to the new
+   * bounds here (least-recently-used first, until both bounds hold),
+   * so a tightened cache never keeps entries over the new bound
+   * waiting for the next insert; loosening simply allows more capacity
+   * and governs from the next insert. A bound of 0 disables the cache
+   * entirely (the prune empties it, and `cacheReadbackSegment` refuses
+   * every later insert while either bound is 0); a single segment
+   * larger than the byte bound is never cached.
+   */
+  retuneReadbackCache(patch: Partial<ReadbackCacheLimits>): ReadbackCacheLimits | undefined {
+    if (this.offload === undefined) {
+      throw new RangeError(
+        'DurableTopicLog.retuneReadbackCache requires segmentOffload to be enabled at construction: the readback cache cannot be enabled after the fact',
+      );
+    }
+    const current = this.currentReadbackCacheLimits() as ReadbackCacheLimits;
+    if (!('readbackCacheMaxSegments' in patch) && !('readbackCacheMaxBytes' in patch)) {
+      return current;
+    }
+    const merged: ReadbackCacheLimits = {
+      readbackCacheMaxSegments: patch.readbackCacheMaxSegments ?? current.readbackCacheMaxSegments,
+      readbackCacheMaxBytes: patch.readbackCacheMaxBytes ?? current.readbackCacheMaxBytes,
+    };
+    assertValidReadbackCacheLimits(merged.readbackCacheMaxSegments, merged.readbackCacheMaxBytes);
+    const offload = this.offload as ResolvedSegmentOffload;
+    offload.readbackCacheMaxSegments = merged.readbackCacheMaxSegments;
+    offload.readbackCacheMaxBytes = merged.readbackCacheMaxBytes;
+    // EB-361: tightening applies at once — prune to the new bounds now.
+    this.pruneReadbackCache();
+    return current;
+  }
+
+  /**
+   * EB-361: evicts least-recently-used cached segments until both live
+   * bounds hold (a bound of 0 empties the cache; a lone segment over
+   * the byte bound is evicted too). No-op when offload is disabled.
+   * Shared by `retuneReadbackCache`; the insert path keeps its own
+   * pre-insert eviction loop (`cacheReadbackSegment`), which must
+   * account for the incoming segment's bytes before inserting.
+   */
+  private pruneReadbackCache(): void {
+    const offload = this.offload;
+    if (offload === undefined) return;
+    const maxSegments = offload.readbackCacheMaxSegments;
+    const maxBytes = offload.readbackCacheMaxBytes;
+    while (
+      this.readbackCache.size > 0 &&
+      (this.readbackCache.size > maxSegments || this.readbackCacheBytes > maxBytes)
+    ) {
+      const oldest = this.readbackCache.keys().next();
+      if (oldest.done) break;
+      const evicted = this.readbackCache.get(oldest.value);
+      this.readbackCache.delete(oldest.value);
+      if (evicted !== undefined) this.readbackCacheBytes -= evicted.bytes;
+    }
   }
 
   /**
@@ -5239,6 +5354,17 @@ export class DurableTopicLog {
      * no S3 request. 0 when offload is disabled.
      */
     s3ReadbackCacheHits: number;
+    /**
+     * EB-361: the live readback-cache bounds
+     * (`retuneReadbackCache` / `setDurableLogReadbackCache`). Absent
+     * when offload is disabled.
+     */
+    readbackCacheMaxSegments?: number;
+    /**
+     * EB-361: the live readback-cache byte budget. See
+     * `readbackCacheMaxSegments`.
+     */
+    readbackCacheMaxBytes?: number;
   } {
     let entries = 0;
     for (const count of this.entryCounts.values()) entries += count;
@@ -5280,6 +5406,12 @@ export class DurableTopicLog {
       s3Readbacks: this.s3Readbacks,
       s3ReadbackBytes: this.s3ReadbackBytes,
       s3ReadbackCacheHits: this.s3ReadbackCacheHits,
+      ...(this.offload === undefined
+        ? {}
+        : {
+            readbackCacheMaxSegments: this.offload.readbackCacheMaxSegments,
+            readbackCacheMaxBytes: this.offload.readbackCacheMaxBytes,
+          }),
       ...(this.maxBytesPerTopic === undefined ? {} : { bytesLimit: this.maxBytesPerTopic }),
     };
   }

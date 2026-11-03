@@ -166,7 +166,7 @@ import {
   type RemediationActionResult,
   type RemediationReport,
 } from './remediate.ts';
-import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
+import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type ReadbackCacheLimits, type SegmentOffloadOptions, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
 import { exportTopicData as exportTopicDataFromLog, importTopicData as importTopicDataIntoLog, type ImportTopicDataResult } from './topic-data-export.ts';
 import {
   OutboxRelay,
@@ -5245,6 +5245,24 @@ export interface EventBusOptions {
    */
   durableLogSegmentRotation?: SegmentRotationOptions;
   /**
+   * Opt-in S3 offload of sealed (archived) durable-log segments (EB-361;
+   * see `SegmentOffloadOptions` in `src/durablelog.ts`): closed segments
+   * are uploaded to an S3-compatible object store once archived, and
+   * locally-trimmed segments are pulled back on demand during replay
+   * (`readSince` / `readSinceTime` with `{ includeArchived: true }`),
+   * hash-verified against the remote manifest and held in a local LRU
+   * readback cache (`readbackCacheMaxSegments` default 16,
+   * `readbackCacheMaxBytes` default 64 MiB; either bound 0 disables the
+   * cache). Only meaningful with `durableLogDir` and
+   * `durableLogSegmentRotation` (only sealed segments are offloaded).
+   * Retune the cache bounds live with
+   * `setDurableLogReadbackCache(patch, actor?)` (EB-361); only a bus
+   * constructed with offload can be revised — offload cannot be enabled
+   * after the fact. Namespace child logs do not offload: their archived
+   * segments stay local, so the revision skips them.
+   */
+  durableLogSegmentOffload?: SegmentOffloadOptions;
+  /**
    * Opt-in at-rest encryption for the durable log (EB-80): when set,
    * every per-topic JSONL data line, every archived segment's record
    * payload, and the publish-dedup journal are sealed with this
@@ -7874,6 +7892,18 @@ export interface BusStats {
      * disabled.
      */
     s3ReadbackCacheHits?: number;
+    /**
+     * Durable-log S3 readback-cache bounds (EB-361): the live segment
+     * budget of the local readback cache, as revised by
+     * `setDurableLogReadbackCache`. Absent when offload is disabled.
+     */
+    readbackCacheMaxSegments?: number;
+    /**
+     * Durable-log S3 readback-cache bounds (EB-361): the live
+     * downloaded-byte budget of the local readback cache. See
+     * `readbackCacheMaxSegments`.
+     */
+    readbackCacheMaxBytes?: number;
   };
   /**
    * In-memory lookback buffers (EB-176, see `setTopicLookback`): the
@@ -17323,6 +17353,9 @@ export class EventBus {
     if (options?.durableLogDir == null && options?.durableLogStorageBackend !== undefined) {
       throw new RangeError('durableLogStorageBackend requires EventBusOptions.durableLogDir to be set');
     }
+    if (options?.durableLogDir == null && options?.durableLogSegmentOffload !== undefined) {
+      throw new RangeError('durableLogSegmentOffload requires EventBusOptions.durableLogDir to be set');
+    }
     if (
       options?.durableLogDir == null &&
       options?.publishAudit !== undefined &&
@@ -17346,6 +17379,10 @@ export class EventBus {
         now: this.now,
         keyCompaction: options.durableLogKeyCompaction,
         segmentRotation: options.durableLogSegmentRotation,
+        // EB-361: S3 offload of sealed segments (requires
+        // `durableLogSegmentRotation` — enforced by
+        // `DurableTopicLog.open`); namespace child logs do not offload.
+        segmentOffload: options.durableLogSegmentOffload,
         encryptor: options.durableLogEncryptor,
         // The publish-dedup journal's size guard tracks the publish-side
         // idempotency window it persists (EB-66); the live bound is
@@ -21702,6 +21739,109 @@ export class EventBus {
       action: 'durable_log_segment_rotation_revised',
       actor,
       detail: { from: triggers(current), to: triggers(merged) },
+    });
+  }
+
+  /**
+   * (EB-361): `setDurableLogReadbackCache(patch, actor?)` retunes the
+   * S3 readback-cache bounds of the durable log live — how many
+   * remotely-pulled segments (`readbackCacheMaxSegments`, default 16)
+   * and how many downloaded bytes (`readbackCacheMaxBytes`, default
+   * 64 MiB) the local LRU cache may hold (see
+   * `EventBusOptions.durableLogSegmentOffload`, EB-218).
+   *
+   * A partial revision: only the fields `patch` provides move, the
+   * rest keep their live values. Only the two bounds move — the S3
+   * client, key prefix, namespace, `retainLocalSegments`, and segment
+   * rotation are untouched. Tightening takes effect at once: the cache
+   * is pruned to the new bounds on revision (least-recently-used
+   * first, until both bounds hold), so a tightened cache never keeps
+   * entries over the new bound waiting for the next insert; loosening
+   * simply allows more capacity and governs from the next insert. A
+   * bound of 0 disables the cache entirely (the prune empties it, and
+   * later readbacks download from the remote every time); a single
+   * segment larger than the byte bound is never cached.
+   *
+   * The change applies to the root log; namespace child logs do not
+   * offload, so the revision skips them (a namespace registered later
+   * likewise opens without offload). It is recorded in the
+   * subscription audit log as `durable_log_readback_cache_revised`
+   * (with the previous and new bounds in `detail`), so cache-policy
+   * changes stay attributable. The live bounds are visible in
+   * `getStats().durableLog.readbackCacheMaxSegments` /
+   * `readbackCacheMaxBytes`.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A bus constructed without
+   * `durableLogSegmentOffload` also throws `RangeError`: offload
+   * cannot be enabled after the fact, because there is no S3 client
+   * or remote key space for the cache to serve. An illegal value
+   * throws `RangeError` with the live bounds and the audit log
+   * untouched: validation reuses the construction-time rule
+   * (`assertValidReadbackCacheLimits`: both bounds non-negative
+   * integers). A revision identical to the current bounds — or a
+   * patch with neither field — is a no-op with no audit.
+   *
+   * Orthogonal to EB-218 (that is the readback cache mechanism
+   * itself — this its bounds' revision), to EB-322/EB-323 (those
+   * retune the per-topic entry/byte retention bounds — this the
+   * readback cache), to EB-355 (that retunes the segment-rotation
+   * triggers — this the readback cache), and to EB-163 (that is S3
+   * offload itself — this its local cache bounds).
+   *
+   * Throws `RangeError` for a bad actor, for an illegal bound, when
+   * the bus has no `durableLogDir`, or when the bus was constructed
+   * without `durableLogSegmentOffload`.
+   */
+  setDurableLogReadbackCache(patch: Partial<ReadbackCacheLimits>, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogReadbackCache');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogReadbackCache requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const current = log.currentReadbackCacheLimits();
+    if (current === undefined) {
+      throw new RangeError(
+        'setDurableLogReadbackCache requires EventBusOptions.durableLogSegmentOffload to be set: offload cannot be enabled after the fact',
+      );
+    }
+    // Nothing to revise: no-op, no audit.
+    if (!('readbackCacheMaxSegments' in patch) && !('readbackCacheMaxBytes' in patch)) {
+      return;
+    }
+    const merged: ReadbackCacheLimits = {
+      readbackCacheMaxSegments: patch.readbackCacheMaxSegments ?? current.readbackCacheMaxSegments,
+      readbackCacheMaxBytes: patch.readbackCacheMaxBytes ?? current.readbackCacheMaxBytes,
+    };
+    // Re-affirming the current bounds is a no-op: no retune, no audit.
+    if (
+      merged.readbackCacheMaxSegments === current.readbackCacheMaxSegments &&
+      merged.readbackCacheMaxBytes === current.readbackCacheMaxBytes
+    ) {
+      return;
+    }
+    // `retuneReadbackCache` validates the merged bounds before moving
+    // anything, so an illegal value leaves every live bound untouched.
+    log.retuneReadbackCache(patch);
+    for (const child of this.namespaceLogs.values()) {
+      // Namespace child logs do not offload — skip them.
+      if (child.currentReadbackCacheLimits() !== undefined) {
+        child.retuneReadbackCache(patch);
+      }
+    }
+    this.auditSubscription({
+      action: 'durable_log_readback_cache_revised',
+      actor,
+      detail: {
+        readbackCacheMaxSegments: merged.readbackCacheMaxSegments,
+        oldReadbackCacheMaxSegments: current.readbackCacheMaxSegments,
+        readbackCacheMaxBytes: merged.readbackCacheMaxBytes,
+        oldReadbackCacheMaxBytes: current.readbackCacheMaxBytes,
+      },
     });
   }
 
