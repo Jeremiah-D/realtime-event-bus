@@ -7796,6 +7796,15 @@ export interface BusStats {
    */
   groupLag: GroupLagStat[];
   /**
+   * Effective lag-alert threshold for a group (EB-363): its per-group
+   * override via `setGroupLagThreshold`, else the live default revised
+   * by `setGroupLagDefaultThreshold` (construction default 100). Reads
+   * the live `GroupLagMonitor.thresholdFor`, so it always reflects the
+   * current revision. Present alongside `groupLag` so operators can
+   * tell at a glance whether a row is over its threshold.
+   */
+  groupLagThresholdFor: (groupId: string) => number;
+  /**
    * Total consumer-lag SLO breach episodes fired (EB-112, see
    * `EventBusOptions.groupLag.slo`): each edge-triggered
    * `onLagSloBreach` firing moves this by one. 0 when SLO alerting is
@@ -16432,6 +16441,15 @@ export class EventBus {
    * fires when `EventBusOptions.groupLag.onGroupLag` is configured.
    */
   private readonly groupLagMonitor: GroupLagMonitor;
+  /**
+   * Stable accessor for the live per-group lag threshold (EB-363): one
+   * shared function reference, so `getStats()` snapshots stay
+   * `deepEqual` across calls (a fresh arrow per snapshot would break
+   * read-only snapshot assertions). Reads the live monitor on each
+   * call, so it always reflects the current revision.
+   */
+  private readonly groupLagThresholdForFn = (groupId: string): number =>
+    this.groupLagMonitor.thresholdFor(groupId);
   /**
    * Effective autoscale signal thresholds (EB-192): resolved from
    * `EventBusOptions.autoscale` at construction, adjustable at runtime
@@ -36262,6 +36280,70 @@ export class EventBus {
   }
 
   /**
+   * Revises the consumer-group lag alert default threshold live
+   * (EB-363) without restarting the bus:
+   * `setGroupLagDefaultThreshold(thresholdMessages)` retunes the
+   * default `onGroupLag` fires above (see `EventBusOptions.groupLag`,
+   * EB-48; construction default 100) — the threshold every group
+   * without a per-group override falls back to.
+   *
+   * Only the default moves — per-group overrides set via
+   * `setGroupLagThreshold` keep winning (and `clearGroupLagThreshold`
+   * falls back to the revised default), the SLO (`setLagSlo`) is
+   * untouched, and in-flight episodes/latches change only through the
+   * re-evaluation below. The revision re-evaluates every group at
+   * once, so a lowered threshold alerts on already-lagging groups
+   * without waiting for new publishes, and a raised threshold clears
+   * already-triggered latches the same way. A revision identical to
+   * the current default is a no-op. There is no audit event for this
+   * family (along EB-48: per-group threshold revisions are likewise
+   * unaudited); observe the live default via
+   * `getStats().groupLagThresholdFor(groupId)`.
+   *
+   * Fail-closed: a bus with no `groupLag` configured, or with
+   * `groupLag` but no `onGroupLag` callback, throws `RangeError` —
+   * only a bus that enabled alerting can be revised, since a default
+   * that can never fire has no behaviour to revise. An illegal value
+   * throws `RangeError` with the live default untouched: validation
+   * reuses the construction-time gate (`assertValidThreshold`: a
+   * finite number `>= 0`).
+   *
+   * Orthogonal to EB-48 (that is the per-group runtime override
+   * `setGroupLagThreshold` — this the default it falls back to), to
+   * EB-314/`setLagSlo` (that retunes the SLO breach-detection
+   * parameters — this the `onGroupLag` default threshold), to EB-112
+   * (that is the SLO mechanism itself — this the default threshold),
+   * and to `clearGroupLagThreshold` (that drops an override back to
+   * the default — this the default itself).
+   *
+   * Throws `RangeError` when `groupLag` or `onGroupLag` is not
+   * configured, or for a non-finite threshold `< 0`.
+   */
+  setGroupLagDefaultThreshold(thresholdMessages: number): void {
+    const current = this.groupLagMonitor.defaultThresholdValue();
+    if (current === undefined) {
+      throw new RangeError(
+        'setGroupLagDefaultThreshold requires EventBusOptions.groupLag with onGroupLag to be set',
+      );
+    }
+    // Re-affirming the current default is a no-op: no retune, no
+    // re-evaluation.
+    if (thresholdMessages === current) {
+      return;
+    }
+    // `setDefaultThreshold` validates before moving anything, so an
+    // illegal value leaves the live default untouched.
+    this.groupLagMonitor.setDefaultThreshold(thresholdMessages);
+    // Re-evaluate every group at once (along `setGroupLagThreshold`'s
+    // immediate re-evaluation, but bus-wide): a lowered default alerts
+    // already-lagging groups now; a raised default clears
+    // already-triggered latches now.
+    if (this.groupLagMonitor.enabled()) {
+      this.groupLagMonitor.check(this.groupLagRowsFor(undefined), this.now());
+    }
+  }
+
+  /**
    * Revises one consumer group's rebalance-debounce window live
    * (EB-333) without re-subscribing its members:
    * `setGroupRebalanceDebounce(groupId, pattern, windowMs |
@@ -53921,6 +54003,7 @@ export class EventBus {
       }),
       pausedGroups: [...this.pausedGroups].sort(),
       groupLag: this.groupLagRowsFor(undefined),
+      groupLagThresholdFor: this.groupLagThresholdForFn,
       lagSloBreaches: this.groupLagMonitor.lagSloBreaches(),
       replayProgress,
       // MQTT-style retained messages (EB-87): one row per concrete
@@ -54212,7 +54295,7 @@ export class EventBus {
       lagThresholdMs,
       dlqBacklog,
       groupLag: stats.groupLag,
-      groupLagThresholdFor: (groupId: string) => this.groupLagMonitor.thresholdFor(groupId),
+      groupLagThresholdFor: this.groupLagThresholdForFn,
       consumerGroups: stats.consumerGroups,
       namespaces: stats.namespaces,
       durableLog: stats.durableLog,

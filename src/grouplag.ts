@@ -460,6 +460,38 @@ export class GroupLagMonitor {
     return this.resolved?.thresholds.get(groupId) ?? this.resolved?.defaultThreshold ?? DEFAULT_GROUP_LAG_THRESHOLD;
   }
 
+  /**
+   * The live default lag threshold, for bus-level revision (EB-363):
+   * `undefined` when no `groupLag` is resolved or no `onGroupLag` is
+   * configured — the default can never fire an alert then, so there is
+   * nothing to revise.
+   */
+  defaultThresholdValue(): number | undefined {
+    return this.resolved?.onGroupLag === undefined ? undefined : this.resolved.defaultThreshold;
+  }
+
+  /**
+   * Retunes the default lag threshold live (EB-363). Only the default
+   * moves — the per-group `thresholds` map is untouched, so overrides
+   * keep winning and `clearThreshold` falls back to the revised
+   * default. Throws `RangeError` for an illegal value (reusing the
+   * construction-time gate `assertValidThreshold`: a finite number
+   * `>= 0`), leaving the live default untouched, and when no `groupLag`
+   * with `onGroupLag` is configured — only a bus that enabled alerting
+   * can be revised. The bus re-evaluates every group right after the
+   * revision, so a lowered default alerts already-lagging groups at
+   * once and a raised default clears already-triggered latches.
+   */
+  setDefaultThreshold(value: number): void {
+    const validated = assertValidThreshold(value, 'thresholdMessages', 'setGroupLagDefaultThreshold');
+    if (this.resolved === undefined || this.resolved.onGroupLag === undefined) {
+      throw new RangeError(
+        'setGroupLagDefaultThreshold requires groupLag with onGroupLag to be set',
+      );
+    }
+    this.resolved.defaultThreshold = validated;
+  }
+
   /** Runtime per-group threshold override (see `EventBus.setGroupLagThreshold`). */
   setThreshold(groupId: string, thresholdMessages: number): void {
     if (groupId.length === 0) throw new RangeError('groupId must be a non-empty string');

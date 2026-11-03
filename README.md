@@ -365,7 +365,9 @@ library.
   `thresholdMessages` sets the default (100; `0` alerts on any lag),
   `thresholds` overrides per groupId, and
   `setGroupLagThreshold`/`clearGroupLagThreshold` adjust at runtime with an
-  immediate re-evaluation — lag is re-checked on every assignment, commit,
+  immediate re-evaluation, and `setGroupLagDefaultThreshold` (EB-363) retunes
+  the default every group without an override falls back to, re-evaluating
+  every group at once — lag is re-checked on every assignment, commit,
   and rebalance, so a lag spike during a rebalance alerts promptly. Lag rows
   are exposed as `eventbus_group_lag_messages{group,topic}` and
   `eventbus_group_partition_lag_messages{group,topic,partition}` gauges in
@@ -6787,6 +6789,18 @@ revision is a no-op with no audit. Audited as `lag_slo_revised`
 (`{ maxLagMessages?, oldMaxLagMessages?, maxLagMs?, oldMaxLagMs?,
 breachSamples, oldBreachSamples }` — a bound's old value is omitted
 when it was not configured).
+
+Retune the alert default live with
+`bus.setGroupLagDefaultThreshold(thresholdMessages)` (EB-363): only the
+default moves — per-group overrides still win and
+`clearGroupLagThreshold` falls back to the revised default — and every
+group is re-evaluated at once, so a lowered default alerts
+already-lagging groups immediately and a raised default clears
+already-triggered latches. Only a bus with `groupLag` and `onGroupLag`
+configured can be revised (otherwise `RangeError`); illegal values fail
+closed with the live default untouched; an identical revision is a
+no-op. There is no audit event for this family; observe the live default
+via `getStats().groupLagThresholdFor(groupId)`.
 
 ## Ops alert webhook outlet (EB-132)
 
