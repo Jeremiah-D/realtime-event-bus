@@ -1,17 +1,19 @@
 /**
- * Bus-level OTLP export revision (EB-299).
+ * Bus-level OTLP export revision (EB-299; EB-357 adds the flush
+ * interval).
  *
  * `setOtlp` retunes the exporter live — the export-side sample rate,
- * the batch size, the per-request timeout, and the buffer bound —
- * without restarting the bus. Only a bus that enabled `otlp` can be
- * revised; illegal values fail closed with the live tuning and the
- * audit log untouched; an identical (or empty) revision is a no-op
- * with no audit. In-flight buffered spans are untouched: a revised
- * sample rate governs from the next span admission, a revised batch
- * size from the next flush, a revised buffer bound from the next
- * admission's drop-oldest check, and a revised timeout from the next
- * export POST. `endpoint`, `headers`, `serviceName`, and
- * `flushIntervalMs` are not revisable here.
+ * the batch size, the flush interval, the per-request timeout, and
+ * the buffer bound — without restarting the bus. Only a bus that
+ * enabled `otlp` can be revised; illegal values fail closed with the
+ * live tuning and the audit log untouched; an identical (or empty)
+ * revision is a no-op with no audit. In-flight buffered spans are
+ * untouched: a revised sample rate governs from the next span
+ * admission, a revised batch size from the next flush, a revised
+ * buffer bound from the next admission's drop-oldest check, a revised
+ * timeout from the next export POST, and a revised flush interval
+ * rebuilds the flush timer at the new cadence from the next tick.
+ * `endpoint`, `headers`, and `serviceName` are not revisable here.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -116,6 +118,10 @@ describe('OTLP export revision (EB-299)', () => {
         { batchSize: 0 },
         { batchSize: -1 },
         { batchSize: 1.5 },
+        { flushIntervalMs: 0 },
+        { flushIntervalMs: -1 },
+        { flushIntervalMs: Number.NaN },
+        { flushIntervalMs: Infinity },
         { timeoutMs: 0 },
         { timeoutMs: -1 },
         { timeoutMs: Number.NaN },
@@ -153,6 +159,7 @@ describe('OTLP export revision (EB-299)', () => {
       bus.subscribe('t', () => {});
       bus.setOtlp({ sampleRate: 0 });
       bus.setOtlp({ batchSize: 512 });
+      bus.setOtlp({ flushIntervalMs: 60_000 });
       bus.setOtlp({ timeoutMs: 5000 });
       bus.setOtlp({ maxBuffered: 10000 });
       bus.setOtlp({});
@@ -200,6 +207,8 @@ describe('OTLP export revision (EB-299)', () => {
         oldSampleRate: 1,
         batchSize: 512,
         oldBatchSize: 512,
+        flushIntervalMs: 60_000,
+        oldFlushIntervalMs: 60_000,
         timeoutMs: 5000,
         oldTimeoutMs: 5000,
         maxBuffered: 10000,
@@ -226,6 +235,8 @@ describe('OTLP export revision (EB-299)', () => {
         oldSampleRate: 1,
         batchSize: 512,
         oldBatchSize: 512,
+        flushIntervalMs: 60_000,
+        oldFlushIntervalMs: 60_000,
         timeoutMs: 2500,
         oldTimeoutMs: 5000,
         maxBuffered: 10000,
@@ -312,6 +323,106 @@ describe('OTLP export revision (EB-299)', () => {
       assert.equal(exporter.current().batchSize, 100);
       exporter.exportSpan(makeSpan());
       assert.equal(exporter.getStats().bufferedSpans, 1);
+    } finally {
+      await exporter.shutdown();
+      await collector.close();
+    }
+  });
+
+  it('flushIntervalMs revision rebuilds the timer: buffered spans flush at the new cadence, none lost', async () => {
+    const collector = startCollector();
+    const endpoint = await collector.endpoint;
+    const bus = new EventBus({
+      trace: { sampleRate: 1 },
+      otlp: { endpoint, flushIntervalMs: 60_000 },
+    });
+    try {
+      bus.subscribe('t', () => {});
+      bus.publish('t', 'a');
+      await flush();
+      const buffered = bus.getStats().otlp?.bufferedSpans ?? 0;
+      assert.ok(buffered > 0, 'expected spans buffered before the revision');
+      // Nothing flushes on its own at the 60s cadence.
+      await sleep(150);
+      assert.equal(collector.requests.length, 0);
+      // Tighten the interval: the retune itself keeps the buffer, the
+      // new timer drains it within a few ticks — nothing is lost or
+      // re-sent, the batch is exported exactly once.
+      bus.setOtlp({ flushIntervalMs: 50 });
+      assert.equal(bus.getStats().otlp?.bufferedSpans, buffered);
+      await waitFor(() => (bus.getStats().otlp?.exportedSpans ?? 0) >= buffered);
+      assert.equal(bus.getStats().otlp?.bufferedSpans, 0);
+      assert.ok(collector.requests.length > 0);
+      const audit = bus.getSubscriptionAudit({ action: 'otlp_revised' });
+      assert.equal(audit.length, 1);
+      assert.deepEqual(audit[0].detail, {
+        sampleRate: 1,
+        oldSampleRate: 1,
+        batchSize: 512,
+        oldBatchSize: 512,
+        flushIntervalMs: 50,
+        oldFlushIntervalMs: 60_000,
+        timeoutMs: 5000,
+        oldTimeoutMs: 5000,
+        maxBuffered: 10000,
+        oldMaxBuffered: 10000,
+      });
+    } finally {
+      await collector.close();
+    }
+  });
+
+  it('widening flushIntervalMs delays the timer flush; a later tightening re-arms it', async () => {
+    const collector = startCollector();
+    const endpoint = await collector.endpoint;
+    const bus = new EventBus({
+      trace: { sampleRate: 1 },
+      otlp: { endpoint, flushIntervalMs: 50 },
+    });
+    try {
+      bus.subscribe('t', () => {});
+      bus.publish('t', 'a');
+      await flush();
+      assert.ok((bus.getStats().otlp?.bufferedSpans ?? 0) > 0);
+      // Widen to 60s: the 50ms timer is gone, so no flush fires now.
+      bus.setOtlp({ flushIntervalMs: 60_000 });
+      await sleep(200);
+      assert.equal(collector.requests.length, 0);
+      assert.ok((bus.getStats().otlp?.bufferedSpans ?? 0) > 0);
+      // Tighten again: the rebuilt timer drains the retained buffer.
+      bus.setOtlp({ flushIntervalMs: 50 });
+      await waitFor(() => (bus.getStats().otlp?.exportedSpans ?? 0) > 0);
+      assert.equal(bus.getStats().otlp?.bufferedSpans, 0);
+    } finally {
+      await collector.close();
+    }
+  });
+
+  it('exporter retune moves flushIntervalMs; current() reports it, and a retune after shutdown does not re-arm the timer', async () => {
+    const collector = startCollector();
+    const endpoint = await collector.endpoint;
+    const exporter = new OtlpSpanExporter(
+      resolveOtlpOptions({ endpoint, flushIntervalMs: 60_000 })!,
+    );
+    try {
+      assert.equal(exporter.current().flushIntervalMs, 60_000);
+      exporter.retune(
+        resolveOtlpOptions({ endpoint, flushIntervalMs: 25 })!,
+      );
+      assert.equal(exporter.current().flushIntervalMs, 25);
+      exporter.exportSpan(makeSpan());
+      await waitFor(() => exporter.getStats().exportedSpans > 0);
+      // A stopped exporter stays stopped: retuning the interval after
+      // shutdown moves the value but arms no timer.
+      await exporter.shutdown();
+      exporter.retune(
+        resolveOtlpOptions({ endpoint, flushIntervalMs: 50 })!,
+      );
+      assert.equal(exporter.current().flushIntervalMs, 50);
+      exporter.exportSpan(makeSpan());
+      await sleep(150);
+      assert.equal(exporter.getStats().bufferedSpans, 1);
+      assert.equal(exporter.getStats().exportedSpans, 1);
     } finally {
       await exporter.shutdown();
       await collector.close();

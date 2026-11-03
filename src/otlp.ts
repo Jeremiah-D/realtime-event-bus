@@ -96,12 +96,10 @@ export interface ResolvedOtlpSpanExporterOptions {
 
 /**
  * Revision for the bus-level OTLP export tuning (see
- * `EventBus.setOtlp`, EB-299). Only the fields provided move; the rest
- * keep their live values. `endpoint`, `headers`, and `serviceName` are
- * not revisable here — they are the export destination and identity
- * fixed at construction — and neither is `flushIntervalMs`: the flush
- * timer is armed once at construction, so changing the interval means
- * rebuilding the exporter (and the bus).
+ * `EventBus.setOtlp`, EB-299; EB-357 adds `flushIntervalMs`). Only the
+ * fields provided move; the rest keep their live values. `endpoint`,
+ * `headers`, and `serviceName` are not revisable here — they are the
+ * export destination and identity fixed at construction.
  */
 export interface OtlpRevision {
   /**
@@ -114,6 +112,14 @@ export interface OtlpRevision {
    * the construction-time rule.
    */
   batchSize?: number;
+  /**
+   * Periodic flush interval in milliseconds. Must be a finite number >
+   * 0 when provided — the construction-time rule. Revising it (EB-357)
+   * rebuilds the flush timer at the new interval without rebuilding
+   * the exporter: buffered spans stay buffered, nothing is lost or
+   * re-sent, and the new cadence governs from the next tick.
+   */
+  flushIntervalMs?: number;
   /**
    * Per-request timeout in milliseconds. Must be a finite number > 0
    * when provided — the construction-time rule.
@@ -282,23 +288,25 @@ function encodeBatch(serviceName: string, batch: TraceSpan[]): string {
  */
 export class OtlpSpanExporter {
   private readonly endpoint: URL;
-  // Live-tuned by `retune` (EB-299): every use point reads these fields
-  // on each call — `exportSpan` samples at the live `sampleRate` and
-  // drops the oldest past the live `maxBuffered`, flushes at the live
-  // `batchSize`, `flushInner` slices at the live `batchSize`, and
-  // `postBatch` times out at the live `timeoutMs` — so a revision
-  // governs from the next admission/flush/POST without draining or
-  // rebuilding the exporter. `endpoint`, `headers`, and `serviceName`
-  // stay fixed for the exporter's lifetime.
+  // Live-tuned by `retune` (EB-299; EB-357 adds the flush interval):
+  // every use point reads these fields on each call — `exportSpan`
+  // samples at the live `sampleRate` and drops the oldest past the
+  // live `maxBuffered`, flushes at the live `batchSize`, `flushInner`
+  // slices at the live `batchSize`, and `postBatch` times out at the
+  // live `timeoutMs` — so a revision governs from the next
+  // admission/flush/POST without draining or rebuilding the exporter.
+  // `endpoint`, `headers`, and `serviceName` stay fixed for the
+  // exporter's lifetime.
   private sampleRate: number;
   private batchSize: number;
-  private readonly flushIntervalMs: number;
+  private flushIntervalMs: number;
   private timeoutMs: number;
   private readonly headers: Record<string, string>;
   private readonly serviceName: string;
   private maxBuffered: number;
   private readonly buffer: TraceSpan[] = [];
-  private readonly timer: ReturnType<typeof setInterval>;
+  private timer: ReturnType<typeof setInterval>;
+  private stopped = false;
   private flushPromise: Promise<void> | undefined;
   private exportedSpans = 0;
   private failedSpans = 0;
@@ -313,11 +321,21 @@ export class OtlpSpanExporter {
     this.headers = resolved.headers;
     this.serviceName = resolved.serviceName;
     this.maxBuffered = resolved.maxBuffered;
-    // Unref'd: export must never hold the process open on its own.
-    this.timer = setInterval(() => {
+    this.timer = this.armFlushTimer(resolved.flushIntervalMs);
+  }
+
+  /**
+   * Arms the periodic flush timer at `intervalMs`. Unref'd: export
+   * must never hold the process open on its own. Every arm goes
+   * through here so a retune (EB-357) rebuilds the same timer the
+   * constructor armed.
+   */
+  private armFlushTimer(intervalMs: number): ReturnType<typeof setInterval> {
+    const timer = setInterval(() => {
       void this.flush();
-    }, resolved.flushIntervalMs);
-    if (typeof this.timer.unref === 'function') this.timer.unref();
+    }, intervalMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    return timer;
   }
 
   /** The live export tuning, for bus-level revision (EB-299). */
@@ -335,22 +353,34 @@ export class OtlpSpanExporter {
   }
 
   /**
-   * Retunes the four numeric export bounds live (EB-299). The caller
-   * must have validated `next` through `resolveOtlpOptions` first —
-   * this method applies unconditionally. In-flight buffered spans are
-   * untouched: already-buffered spans stay buffered, and the new values
-   * govern from the next decision onward — the next span admission
-   * samples at the live `sampleRate` and drops the oldest past the live
-   * `maxBuffered`, the next flush triggers and slices at the live
-   * `batchSize`, and the next export POST times out at the live
-   * `timeoutMs`. `endpoint`, `headers`, `serviceName`, and
-   * `flushIntervalMs` are never moved here.
+   * Retunes the five numeric export bounds live (EB-299; EB-357 adds
+   * the flush interval). The caller must have validated `next` through
+   * `resolveOtlpOptions` first — this method applies unconditionally.
+   * In-flight buffered spans are untouched: already-buffered spans
+   * stay buffered, and the new values govern from the next decision
+   * onward — the next span admission samples at the live `sampleRate`
+   * and drops the oldest past the live `maxBuffered`, the next flush
+   * triggers and slices at the live `batchSize`, and the next export
+   * POST times out at the live `timeoutMs`. A revised
+   * `flushIntervalMs` rebuilds the flush timer at the new interval
+   * (the old timer is cleared first, so a tick never fires twice and
+   * no tick is lost — the new cadence governs from the next tick).
+   * `endpoint`, `headers`, and `serviceName` are never moved here. A
+   * retune after `shutdown()` moves the values but does not re-arm the
+   * timer — a stopped exporter stays stopped.
    */
   retune(next: ResolvedOtlpSpanExporterOptions): void {
     this.sampleRate = next.sampleRate;
     this.batchSize = next.batchSize;
     this.timeoutMs = next.timeoutMs;
     this.maxBuffered = next.maxBuffered;
+    if (next.flushIntervalMs !== this.flushIntervalMs) {
+      this.flushIntervalMs = next.flushIntervalMs;
+      if (!this.stopped) {
+        clearInterval(this.timer);
+        this.timer = this.armFlushTimer(next.flushIntervalMs);
+      }
+    }
   }
 
   /**
@@ -407,6 +437,7 @@ export class OtlpSpanExporter {
 
   /** Stops the flush timer and drains the buffer one last time. */
   shutdown(): Promise<void> {
+    this.stopped = true;
     clearInterval(this.timer);
     return this.flush();
   }
