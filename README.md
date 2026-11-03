@@ -499,7 +499,22 @@ library.
   above the interval throws `RangeError` with the live timeout untouched,
   and re-affirming the current timeout is a no-op. The hub has no audit
   channel — the live value is observed via
-  `ClusterHub.getStats().heartbeatTimeoutMs`. The route-diff retention is
+  `ClusterHub.getStats().heartbeatTimeoutMs`. The hub-side sweep
+  cadence itself is likewise revisable live (EB-356, via
+  `ClusterHub.setHeartbeatInterval(intervalMs)`): when the sweep timer
+  is armed it is rebuilt at the new interval — cleared and re-armed,
+  still unref'd — so the next sweep lands on the new cadence, and a
+  revision made before `listen()` is stored and arms the timer at
+  that interval. Tightening the cadence drops an already-silent member
+  at the next sweep (the answer to a tightened timeout bound that a
+  5000ms cadence would not notice for seconds); loosening it gives a
+  member more grace between sweeps. The new interval must stay below
+  the live heartbeat timeout (a member would otherwise be swept
+  inside a normal heartbeat interval); anything but a positive finite
+  number below the timeout throws `RangeError` with the live interval
+  untouched, and re-affirming the current interval is a no-op. The
+  live value is observed via
+  `ClusterHub.getStats().heartbeatIntervalMs`. The route-diff retention is
   likewise revisable live (EB-353, via
   `ClusterHub.setRouteDiffRetention(retention)`): only the bound moves —
   the route table, the route version, the hub epoch, and the member

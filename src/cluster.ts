@@ -145,6 +145,8 @@ export interface ClusterHubStats {
   routeDiffRetention: number;
   /** Silence after which the hub drops a member, ms — the live value (revisable via `setHeartbeatTimeout`, EB-352). */
   heartbeatTimeoutMs: number;
+  /** How often the hub sweeps silent members, ms — the live value (revisable via `setHeartbeatInterval`, EB-356). */
+  heartbeatIntervalMs: number;
 }
 
 interface HubMember {
@@ -358,7 +360,7 @@ export class ClusterHub {
   private readonly keySeqs = new Map<string, number>();
   private forwardedMessages = 0;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly heartbeatIntervalMs: number;
+  private heartbeatIntervalMs: number;
   private heartbeatTimeoutMs: number;
   private readonly tls: ClusterHubOptions['tls'];
   private readonly host: string;
@@ -406,10 +408,7 @@ export class ClusterHub {
         this.server?.off('error', reject);
         const addr = this.server?.address();
         const boundPort = typeof addr === 'object' && addr != null ? addr.port : this.port;
-        this.sweepTimer = setInterval(() => this.sweepSilentMembers(), this.heartbeatIntervalMs);
-        if (typeof this.sweepTimer === 'object' && this.sweepTimer !== null && 'unref' in this.sweepTimer) {
-          (this.sweepTimer as { unref(): void }).unref();
-        }
+        this.armSweepTimer();
         resolve(boundPort);
       });
     });
@@ -441,7 +440,20 @@ export class ClusterHub {
       routeSyncRequests: this.routeSyncRequests,
       routeDiffRetention: this.routeDiffRetention,
       heartbeatTimeoutMs: this.heartbeatTimeoutMs,
+      heartbeatIntervalMs: this.heartbeatIntervalMs,
     };
+  }
+
+  /** (Re-)arms the silent-member sweep timer at the live interval. */
+  private armSweepTimer(): void {
+    if (this.sweepTimer != null) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    this.sweepTimer = setInterval(() => this.sweepSilentMembers(), this.heartbeatIntervalMs);
+    if (typeof this.sweepTimer === 'object' && this.sweepTimer !== null && 'unref' in this.sweepTimer) {
+      (this.sweepTimer as { unref(): void }).unref();
+    }
   }
 
   /**
@@ -489,6 +501,64 @@ export class ClusterHub {
       );
     }
     this.heartbeatTimeoutMs = timeoutMs;
+  }
+
+  /**
+   * Revises the hub-side heartbeat sweep interval live (EB-356,
+   * real-time systems): how often the hub sweeps silent members
+   * (`sweepSilentMembers`).
+   *
+   * Only the cadence moves: when the sweep timer is armed
+   * (listening) it is rebuilt at the new interval — cleared and
+   * re-armed, still unref'd — so the next sweep lands on the new
+   * cadence; a hub that has not started yet just stores the value
+   * and `listen()` arms the timer at it. The timeout bound, the
+   * members, the route table, the hub epoch, and the connections
+   * are untouched. Tightening the cadence drops an already-silent
+   * member at the next sweep; loosening it gives a member more
+   * grace between sweeps. This closes the EB-352 gap on the hub
+   * side: the timeout could be retuned but the sweep cadence was a
+   * construction-time constant, so a hub sweeping every 5000ms
+   * could not notice a tightened bound any sooner without a
+   * restart.
+   *
+   * Fail-closed: anything but a positive finite number of
+   * milliseconds, and any value at or above the live heartbeat
+   * timeout — a member would be swept inside a normal heartbeat
+   * interval — both throw `RangeError` with the live interval
+   * untouched. Re-affirming the current interval is a no-op
+   * (checked before the timeout guard, so a hub built with an
+   * interval at or above its timeout keeps running it). The hub
+   * has no bus audit channel — the live value is observed via
+   * `getStats()`.
+   *
+   * Throws `RangeError` for an illegal interval.
+   */
+  setHeartbeatInterval(intervalMs: number): void {
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new RangeError(
+        'setHeartbeatInterval: intervalMs must be a finite number of milliseconds > 0',
+      );
+    }
+    // Re-affirming the current interval is a no-op: no timer touch,
+    // no observable change — even when the hub was built with an
+    // interval at or above its timeout (the constructor never
+    // enforced the guard).
+    if (intervalMs === this.heartbeatIntervalMs) {
+      return;
+    }
+    if (intervalMs >= this.heartbeatTimeoutMs) {
+      throw new RangeError(
+        `setHeartbeatInterval: intervalMs (${intervalMs}ms) must be less than the heartbeat timeout (${this.heartbeatTimeoutMs}ms) — otherwise a member is swept inside a normal heartbeat interval`,
+      );
+    }
+    this.heartbeatIntervalMs = intervalMs;
+    // Rebuild the armed timer at the new cadence. A hub that has
+    // not started yet has no armed timer and just keeps the stored
+    // value until listen().
+    if (this.sweepTimer != null) {
+      this.armSweepTimer();
+    }
   }
 
   /**
