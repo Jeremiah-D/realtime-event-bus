@@ -4208,6 +4208,22 @@ export interface DeadLetterReplayRateLimitOptions {
   burst: number;
 }
 
+/**
+ * Partial revision for `EventBus.setDeadLetterBudget` (EB-365): only the
+ * fields present move — the rest keep their live values. `maxAgeMs` may
+ * be an explicit `null` to clear the per-entry TTL; `undefined` (or
+ * absent) leaves it alone. `maxRedeliveries` / `maxEntries` have no
+ * clear semantics and only take numbers.
+ */
+export interface DeadLetterBudgetRevision {
+  /** New redelivery budget before a message dead-letters (non-negative integer). */
+  maxRedeliveries?: number;
+  /** New DLQ capacity in entries (positive integer). */
+  maxEntries?: number;
+  /** New per-entry TTL in milliseconds (positive finite number), or `null` to clear it. */
+  maxAgeMs?: number | null;
+}
+
 /** Snapshot delivered to `DeadLetterOptions.onDeadLetter`. */
 export interface DeadLetterEvent {
   /** The reliable subscription whose DLQ took the message. */
@@ -31439,6 +31455,139 @@ export class EventBus {
   }
 
   /**
+   * Revises the dead-letter budget of one reliable subscriber (EB-365):
+   * the redelivery budget (`maxRedeliveries`), the DLQ capacity
+   * (`maxEntries`), and the per-entry TTL (`maxAgeMs`) — without
+   * re-subscribing. Only the fields present in `patch` move; the rest
+   * keep their live values. An explicit `maxAgeMs: null` clears the
+   * TTL (an absent `maxAgeMs` leaves it alone, like
+   * `setSlowStart` / `setThrottle`); `maxRedeliveries` /
+   * `maxEntries` have no clear semantics and only take numbers.
+   *
+   * The three values are read live at every decision point, so the
+   * revision takes effect immediately with no message, timer, or
+   * counter touched:
+   * - Raising `maxRedeliveries` rescues a message still in the
+   *   immediate redelivery loop — its next failure requeues under the
+   *   new budget instead of dead-lettering — while lowering it
+   *   dead-letters on the next failure. The count is per message
+   *   (`reliable.redeliveries`), so a message that already spent its
+   *   budget under the old value is judged by the new one on its
+   *   next failure.
+   * - A message already on the retry ladder is unaffected: once
+   *   `enterRetryLadderOrDeadLetter` arms a rung it walks the ladder
+   *   to the end without re-checking the budget, so raising the
+   *   budget does not rescue it and lowering it does not pull down
+   *   an already-armed rung (the EB-270 in-flight rung semantics).
+   *   The redelivery hook detects a laddered message by its
+   *   surviving `pendingLadders` entry and routes its failures
+   *   straight back to the ladder, bypassing the live budget check
+   *   — without that bypass a raised budget would yank a rung
+   *   failure back into the immediate loop. Replayed messages take
+   *   a fresh budget and are judged by the live values.
+   * - Tightening `maxEntries` does not immediately trim the DLQ:
+   *   the next dead-letter enqueue sweeps expired entries first
+   *   (expire-first, EB-145) and then evicts the oldest entry to
+   *   make room under the new bound; loosening simply holds more.
+   * - Setting `maxAgeMs` applies on the next lazy sweep (query /
+   *   replay / dead-letter enqueue), so an entry already older than
+   *   the new TTL expires at once; clearing it stops expiry —
+   *   entries no longer age out.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable
+   * subscriber, a reliable subscriber with no `deadLetter`
+   * configured, and an illegal value — `maxRedeliveries` must be a
+   * non-negative integer, `maxEntries` a positive integer,
+   * `maxAgeMs` a positive finite number or `null`, reusing the
+   * construction-time `normalizeDeadLetterOptions` rules — all throw
+   * `RangeError` with the live budget and the audit log untouched.
+   * Passing the current values for all three fields is a no-op
+   * with no audit. Audited as `dead_letter_budget_revised`
+   * (`{ maxRedeliveries, oldMaxRedeliveries, maxEntries,
+   * oldMaxEntries, maxAgeMs, oldMaxAgeMs }`, `null` on either side
+   * of the TTL meaning "no TTL") on success.
+   *
+   * Orthogonal to EB-28 (the DLQ mechanism itself — this revises
+   * its budget / capacity / TTL), to EB-270 (the retry ladder's
+   * rung delays — this is the budget that arms the ladder), to
+   * `setRedeliveryBackoff` (EB-261, the spacing between
+   * redeliveries — this is how many there are), to
+   * `setDeadLetterReplayRateLimit` (EB-238, the replay rate — this
+   * is what lands in the DLQ), and to EB-145 (the `maxAgeMs`
+   * mechanism itself — this revises it live).
+   *
+   * Throws `RangeError` for an unknown / non-reliable / DLQ-less
+   * subscriber or an illegal budget value.
+   */
+  setDeadLetterBudget(subId: string, patch: DeadLetterBudgetRevision): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeadLetterBudget: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeadLetterBudget: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.reliable == null) {
+      throw new RangeError('setDeadLetterBudget: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) {
+      throw new RangeError('setDeadLetterBudget: subscriber has no deadLetter configured');
+    }
+    // Validate before touching anything: the construction-time rules
+    // from `normalizeDeadLetterOptions`, reused rather than restated.
+    if (patch === null || typeof patch !== 'object') {
+      throw new RangeError('setDeadLetterBudget: patch must be a DeadLetterBudgetRevision object');
+    }
+    const { maxRedeliveries, maxEntries, maxAgeMs } = patch;
+    if (maxRedeliveries !== undefined && (!Number.isInteger(maxRedeliveries) || maxRedeliveries < 0)) {
+      throw new RangeError('setDeadLetterBudget: maxRedeliveries must be a non-negative integer');
+    }
+    if (maxEntries !== undefined && (!Number.isInteger(maxEntries) || maxEntries <= 0)) {
+      throw new RangeError('setDeadLetterBudget: maxEntries must be a positive integer');
+    }
+    if (
+      maxAgeMs !== undefined &&
+      maxAgeMs !== null &&
+      (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)
+    ) {
+      throw new RangeError(
+        'setDeadLetterBudget: maxAgeMs must be a positive finite number of milliseconds, or null to clear it',
+      );
+    }
+    const oldMaxRedeliveries = dlq.maxRedeliveries;
+    const oldMaxEntries = dlq.maxEntries;
+    const oldMaxAgeMs = dlq.maxAgeMs ?? null;
+    const newMaxRedeliveries = maxRedeliveries ?? oldMaxRedeliveries;
+    const newMaxEntries = maxEntries ?? oldMaxEntries;
+    const newMaxAgeMs = maxAgeMs === undefined ? dlq.maxAgeMs : (maxAgeMs ?? undefined);
+    if (
+      newMaxRedeliveries === oldMaxRedeliveries &&
+      newMaxEntries === oldMaxEntries &&
+      newMaxAgeMs === dlq.maxAgeMs
+    ) {
+      return;
+    }
+    dlq.maxRedeliveries = newMaxRedeliveries;
+    dlq.maxEntries = newMaxEntries;
+    dlq.maxAgeMs = newMaxAgeMs;
+    this.auditSubscription({
+      action: 'dead_letter_budget_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        maxRedeliveries: newMaxRedeliveries,
+        oldMaxRedeliveries,
+        maxEntries: newMaxEntries,
+        oldMaxEntries,
+        maxAgeMs: newMaxAgeMs ?? null,
+        oldMaxAgeMs,
+      },
+    });
+  }
+
+  /**
    * Revises the sliding-window delivery rate limit of one
    * rate-limited subscriber (EB-271): a subscriber that opted into
    * `rateLimit` can retune its hard ceiling without re-subscribing.
@@ -34110,6 +34259,25 @@ export class EventBus {
         // `bus.enqueue` span in the same trace, and the redelivery opens
         // a new ack span when it is handed to the handler.
         this.trace?.abandonAckSpan(msg);
+        // EB-365: the redelivery budget is read live from the
+        // subscriber record, not from the subscribe-time `dlq`
+        // snapshot captured by this closure — `setDeadLetterBudget`
+        // revises the record, and a raise must rescue a message
+        // still in the immediate redelivery loop (or a lowering
+        // dead-letter it) on its next failure. The record is
+        // assigned synchronously inside `subscribeReliable`, before
+        // any delivery can run, so it is set whenever this hook fires.
+        const liveDlq = subscriber.deadLetter;
+        // EB-365: a message already on the retry ladder walks the
+        // ladder to the end without re-checking the budget — raising
+        // the budget must not rescue it out of the ladder, and
+        // lowering it must not pull down an already-armed rung. The
+        // pending entry survives the rung delivery (its timer is
+        // disarmed while the rung is outstanding), so its presence
+        // is exactly the "on the ladder" signal. Without this, a
+        // raised budget would yank a rung failure back into the
+        // immediate loop.
+        const onLadder = liveDlq?.pendingLadders.has(msg) ?? false;
         // Tail-based sampling (EB-181): the terminal outcome must be
         // known BEFORE the leg closes, because the keep decision runs on
         // leg close. A redelivery that exhausts its budget dead-letters
@@ -34119,7 +34287,8 @@ export class EventBus {
         const tail = this.tailSampler;
         if (tail !== undefined && tail.hasTrace(msg)) {
           const nextCount = (redeliveries.get(msg) ?? 0) + 1;
-          const exhaustsBudget = dlq != null && nextCount > dlq.maxRedeliveries;
+          const exhaustsBudget =
+            liveDlq != null && (onLadder || nextCount > liveDlq.maxRedeliveries);
           tail.abandonAckSpan(
             msg,
             exhaustsBudget
@@ -34169,8 +34338,11 @@ export class EventBus {
         // The redelivery budget is exhausted: the message is poison
         // (repeated nacks, ack timeouts, or a handler that keeps throwing
         // and never settles). Dead-letter it instead of requeueing
-        // forever.
-        if (dlq != null && count > dlq.maxRedeliveries) {
+        // forever. EB-365: the budget is the live record value (it may
+        // have been revised since subscribe time) — except a message
+        // already on the retry ladder bypasses the budget entirely and
+        // walks the ladder to the end (see `onLadder` above).
+        if (liveDlq != null && (onLadder || count > liveDlq.maxRedeliveries)) {
           // EB-155: with a retry ladder configured the message walks the
           // ladder's delayed rungs before it may dead-letter; without one
           // it dead-letters immediately, the pre-EB-155 behavior.

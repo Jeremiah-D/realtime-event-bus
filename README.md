@@ -87,7 +87,17 @@ library.
   DLQ is bounded (`maxEntries`, default 1000, oldest evicted first) and a
   synchronously throwing handler counts as an immediate redelivery attempt
   rather than crashing the flush. `getStats().deadLetteredMessages` counts
-  every dead-lettering. Opt-in `deadLetter.diagnosticTopic` fans each
+  every dead-lettering. The budget, capacity, and per-entry TTL are live-revisable
+  per subscriber without re-subscribing — `setDeadLetterBudget(subId, patch)`
+  (EB-365) moves only the fields present (`maxRedeliveries` / `maxEntries` /
+  `maxAgeMs`, an explicit `maxAgeMs: null` clears the TTL): raising the budget
+  rescues a message still in the immediate redelivery loop, lowering it
+  dead-letters on the next failure, messages already on the retry ladder walk
+  the ladder to the end unaffected, tightening `maxEntries` evicts the oldest
+  only on the next dead-letter enqueue (after an expire-first sweep), and a
+  newly set `maxAgeMs` expires old entries on the next lazy sweep. Revisions
+  are audited as `dead_letter_budget_revised` (actor `system`); passing the
+  current values is a no-op with no audit. Opt-in `deadLetter.diagnosticTopic` fans each
   dead-lettering out as one diagnostic event on the configured topic — the
   original payload plus `{ subscriberId, pattern, seq, lastError,
   redeliveries, traceId, deadLetteredAt }` metadata — so operators consume
