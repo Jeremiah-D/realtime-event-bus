@@ -107,11 +107,14 @@ export interface AutoRemediateScheduleOptions extends AutoRemediateOptions {
 }
 
 /**
- * A live revision of the auto-remediation schedule (EB-306): the
+ * A live revision of the auto-remediation schedule (EB-306, EB-360): the
  * partial update `EventBus.setAutoRemediate()` applies to a bus that
  * already enabled the `EventBusOptions.autoRemediate` opt-in. Only the
  * fields present move; the rest keep their live values. The `doctor`
- * tuning is not revisable here — it was fixed at construction.
+ * tuning is revisable here (EB-360): a partial `doctor` object moves
+ * only the thresholds it names, each resolved against the live parsed
+ * values, so a field left out keeps the live threshold (the doctor
+ * default when never configured).
  */
 export interface AutoRemediateRevision {
   /** Positive finite milliseconds between remediation runs. */
@@ -120,6 +123,9 @@ export interface AutoRemediateRevision {
   maxActions?: number;
   /** Preview only: plan without applying. */
   dryRun?: boolean;
+  /** Doctor diagnosis tuning (EB-360): the slow-subscriber p99 and
+   * lag-watermark thresholds the scheduled run diagnoses with. */
+  doctor?: DoctorOptions;
 }
 
 /** Default per-run action cap for `autoRemediate()`. */

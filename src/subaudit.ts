@@ -245,24 +245,28 @@ export type SubscriptionAuditAction =
  *   capped, maxActions }` — one `autoRemediate()` run's summary,
  *   including dry-run previews
  * - `auto_remediate_revised`: `{ intervalMs, oldIntervalMs, maxActions,
- *   oldMaxActions, dryRun, oldDryRun }` — the bus-level doctor
- *   auto-remediation schedule was revised (EB-306; only a bus that
+ *   oldMaxActions, dryRun, oldDryRun, doctor, oldDoctor }` — the bus-level doctor
+ *   auto-remediation schedule was revised (EB-306, doctor tuning EB-360; only a bus that
  *   already enabled `autoRemediate` can be revised — a never-enabled
  *   bus refuses until the opt-in is set at construction, since it holds
  *   no schedule at all; the new values reuse the construction-time
  *   validation (`assertValidRemediateSchedule`: the interval a positive
  *   finite number, maxActions a non-negative integer), plus a boolean
- *   check on `dryRun`, so a failed call leaves the live schedule
+ *   check on `dryRun` and a positive-finite check on each provided
+ *   doctor threshold, so a failed call leaves the live schedule
  *   untouched, and only the fields provided move — a partial revision
  *   keeps the fields it leaves out, and an illegal value in any field
- *   leaves every live value exactly as it was; only the three schedule
- *   values move — the construction-time `doctor` tuning is untouched —
- *   and a moved interval clears and re-arms the timer at the new
- *   interval with no extra run fired, while a maxActions/dryRun-only
- *   revision leaves the pending run's countdown untouched and takes
- *   effect on the next run; a revision that provides neither field, and
- *   a revision identical to the current schedule, are both no-ops with
- *   no audit)
+ *   leaves every live value exactly as it was; the `doctor` pair
+ *   carries the parsed thresholds (the doctor defaults when never
+ *   configured), and only the scheduled run reads the stored tuning —
+ *   a manual `autoRemediate(options)` still diagnoses with its own
+ *   per-call `options?.doctor`, and `exportBusHealth(options?)` with
+ *   its own per-call options — and a moved interval clears and re-arms
+ *   the timer at the new interval with no extra run fired, while a
+ *   maxActions/dryRun/doctor-only revision leaves the pending run's
+ *   countdown untouched and takes effect on the next run; a revision
+ *   that provides neither field, and a revision identical to the
+ *   current schedule, are both no-ops with no audit)
  * - `ops_alert_revised`: `{ dedupWindowMs, oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs, oldRetryBaseMs, gatewayDisconnectThreshold, oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs, oldGatewayDisconnectWindowMs }` — the bus-level ops-alert tuning was revised (EB-307; only a bus that already enabled `opsAlert` can be revised — a never-enabled bus refuses until the outlet is opted into at construction, since it holds no alerter at all; the new values reuse the construction-time validation (`resolveOpsAlerterOptions`: the windows and the backoff base positive finite numbers, the attempts and the threshold positive integers), so a failed call leaves the live tuning untouched, and only the fields provided move — a partial revision keeps the fields it leaves out, and an illegal value in any field leaves every live value exactly as it was; only the five numeric bounds move — the `sink` / `secret` / `keyId` / `busId` are untouched, and neither is the `now` clock — and in-flight state is untouched, so the new values govern from the next note onward — the next dedup check reads the live window, the next disconnect note truncates at the live storm window and trips at the live threshold, and the next delivery attempt budgets at the live maxAttempts and backs off at the live retryBaseMs (a backoff timer already armed keeps the delay it was armed with); a revision that provides neither field, and a revision identical to the current tuning, are both no-ops with no audit)
  * - `admission_webhook_revised`: `{ timeoutMs, oldTimeoutMs, failureMode, oldFailureMode, headersChanged }` — the bus-level external admission webhook tuning was revised (EB-308; only a bus that already enabled `admissionWebhook` can be revised — a never-enabled bus refuses until the hook is opted into at construction, since it holds no endpoint at all; the new values reuse the construction-time validation (`validateAdmissionWebhookOptions`: the timeout a positive finite number, the failure mode `'fail-open'`/`'fail-closed'`, the headers a string-to-string map), so a failed call leaves the live tuning untouched, and only the fields provided move — a partial revision keeps the fields it leaves out, and an illegal value in any field leaves every live value exactly as it was; only `timeoutMs` / `failureMode` / `headers` move — the `url` is untouched — and a revision swaps in a fresh merged options object, so the new timeout governs from the next `decideAdmission` call, the new failure mode from the next timeout or transport failure, and the new headers from the next decision request, while a publish already blocked in its webhook call keeps the timeout it was called with; header values are never written to the audit log (they may carry bearer tokens) — only whether the header set moved is recorded; a revision that provides neither field, and a revision identical to the current tuning, are both no-ops with no audit)
  * - `publish_audit_revised`: `{ maxEntries, oldMaxEntries, maxBytes, oldMaxBytes }` — the bus-level publish audit journal tuning was revised (EB-309; only a bus that already enabled `publishAudit` can be revised — a never-enabled bus refuses until the journal is opted into at construction, since it holds no log at all; the new values reuse the construction-time validation (the in-memory bound a positive integer, the live-file byte budget a positive finite number of bytes), so a failed call leaves the live tuning untouched, and only the fields provided move — a partial revision keeps the fields it leaves out, and an illegal value in any field leaves every live value exactly as it was; only `maxEntries` / `maxBytes` move — the journal directory and the clock are untouched — and in-flight entries are retained, never cleared or rewritten: shrinking `maxEntries` does not evict immediately (the next record evicts down to the live bound) and a revised `maxBytes` is honored by the next record's rotation check, so a tightened budget may rotate the live file at the next record while a loosened one simply defers the next rotation; a revision that provides neither field, and a revision identical to the current tuning, are both no-ops with no audit)

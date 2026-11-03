@@ -5969,19 +5969,29 @@ run on an unref'd periodic timer: `new EventBus({ autoRemediate:
 { intervalMs: 60_000, maxActions: 10 } })`. Absent the opt-in nothing is
 scheduled and the bus behaves exactly as before EB-211; the timer is
 cleared on `close()`. The live schedule is observable via
-`getStats().autoRemediate` (`{ intervalMs, maxActions, dryRun }`).
+`getStats().autoRemediate` (`{ intervalMs, maxActions, dryRun, doctor }`,
+the `doctor` pair carrying the parsed thresholds — the doctor defaults
+when never configured).
 
-`bus.setAutoRemediate({ intervalMs?, maxActions?, dryRun? })` (EB-306)
-retunes that schedule live without restarting the bus — only a bus that
-already enabled the opt-in can be revised, and only the fields provided
-move (the construction-time `doctor` tuning is not revisable). A moved
-interval re-arms the timer at the new interval with no extra run fired;
-a `maxActions`/`dryRun`-only revision leaves the pending run's countdown
-untouched and takes effect on the next run. Illegal values throw
-`RangeError` with the live schedule untouched, and an identical (or
-empty) revision is a no-op with no audit. Audited as
-`auto_remediate_revised` (`{ intervalMs, oldIntervalMs, maxActions,
-oldMaxActions, dryRun, oldDryRun }`).
+`bus.setAutoRemediate({ intervalMs?, maxActions?, dryRun?, doctor? })`
+(EB-306, doctor tuning EB-360) retunes that schedule live without
+restarting the bus — only a bus that already enabled the opt-in can be
+revised, and only the fields provided move; a partial `doctor` object
+moves only the thresholds it names, each resolved against the live
+parsed values, so a field left out keeps its live threshold. The new
+thresholds govern the scheduled run's diagnosis from the next run on
+(the tick reads the live schedule), while a manual `autoRemediate(options)`
+still diagnoses with its own per-call `options?.doctor` and
+`exportBusHealth(options?)` with its own per-call `options` — neither
+reads the stored tuning. A moved interval re-arms the timer at the new
+interval with no extra run fired; a `maxActions`/`dryRun`/`doctor`-only
+revision leaves the pending run's countdown untouched and takes effect
+on the next run. Illegal values (including a non-positive or
+non-finite doctor threshold) throw `RangeError` with the live schedule
+untouched, and an identical (or empty) revision is a no-op with no
+audit. Audited as `auto_remediate_revised` (`{ intervalMs,
+oldIntervalMs, maxActions, oldMaxActions, dryRun, oldDryRun, doctor,
+oldDoctor }`).
 
 ## Transactional outbox relay (EB-102)
 

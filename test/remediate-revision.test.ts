@@ -62,6 +62,7 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       intervalMs: 100,
       maxActions: 1,
       dryRun: false,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     const bad: Array<unknown> = [
       { intervalMs: 0 },
@@ -91,6 +92,7 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       intervalMs: 100,
       maxActions: 1,
       dryRun: false,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     assert.equal(bus.getSubscriptionAudit({ action: 'auto_remediate_revised' }).length, 0);
     // The untouched schedule still fires with the live cap of 1: two
@@ -127,6 +129,7 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       intervalMs: 5_000,
       maxActions: 3,
       dryRun: true,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     assert.equal(bus.getSubscriptionAudit({ action: 'auto_remediate_revised' }).length, 0);
     await bus.close();
@@ -139,6 +142,7 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       intervalMs: 30_000,
       maxActions: 5,
       dryRun: false,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     const revised = bus.getSubscriptionAudit({ action: 'auto_remediate_revised' });
     assert.equal(revised.length, 1);
@@ -149,6 +153,8 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       oldMaxActions: 1,
       dryRun: false,
       oldDryRun: false,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
+      oldDoctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     await bus.close();
   });
@@ -168,6 +174,7 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       intervalMs: 20,
       maxActions: 10,
       dryRun: false,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     const revised = bus.getSubscriptionAudit({ action: 'auto_remediate_revised' });
     assert.equal(revised.length, 1);
@@ -178,6 +185,8 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       oldMaxActions: 10,
       dryRun: false,
       oldDryRun: false,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
+      oldDoctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     // The re-armed timer fires at the new interval and resumes it.
     await sleep(300);
@@ -195,6 +204,7 @@ describe('auto-remediation schedule revision (EB-306)', () => {
       intervalMs: 20,
       maxActions: 10,
       dryRun: true,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
     });
     // Runs fire, but only preview: the subscriber stays degraded.
     await sleep(300);

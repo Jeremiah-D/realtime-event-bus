@@ -148,6 +148,8 @@ import {
   type OffsetStore,
 } from './offsetstore.ts';
 import {
+  DEFAULT_LAG_WATERMARK_MS,
+  DEFAULT_SLOW_SUBSCRIBER_P99_MS,
   diagnoseBusHealth,
   type BusHealthReport,
   type DoctorInput,
@@ -7694,12 +7696,19 @@ export interface BusStats {
   bridge: BridgeStats;
   /**
    * Live doctor auto-remediation schedule (EB-211, revised live by
-   * EB-306 `setAutoRemediate`): the interval between periodic
-   * `autoRemediate()` runs, the per-run action cap, and whether runs
-   * only preview. Absent when the `autoRemediate` opt-in was never
+   * EB-306 `setAutoRemediate`, doctor tuning by EB-360): the interval
+   * between periodic `autoRemediate()` runs, the per-run action cap,
+   * whether runs only preview, and the parsed doctor thresholds the
+   * scheduled run diagnoses with (the doctor defaults when never
+   * configured). Absent when the `autoRemediate` opt-in was never
    * configured, so snapshots from a bus without it are unchanged.
    */
-  autoRemediate?: { intervalMs: number; maxActions: number; dryRun: boolean };
+  autoRemediate?: {
+    intervalMs: number;
+    maxActions: number;
+    dryRun: boolean;
+    doctor: { slowSubscriberP99Ms: number; lagWatermarkDefaultMs: number };
+  };
   /**
    * Stats for every concrete topic that has seen at least one publish or
    * schema rejection, in order of first publish.
@@ -23404,20 +23413,26 @@ export class EventBus {
 
   /**
    * Revises the bus-level doctor auto-remediation schedule live
-   * (EB-306) without restarting the bus: `setAutoRemediate({
-   * intervalMs?, maxActions?, dryRun? })` retunes how often the
-   * periodic `autoRemediate()` run fires, how many actions each run
-   * may apply, and whether runs only preview (see
-   * `EventBusOptions.autoRemediate`, EB-211).
+   * (EB-306, EB-360) without restarting the bus: `setAutoRemediate({
+   * intervalMs?, maxActions?, dryRun?, doctor? })` retunes how often
+   * the periodic `autoRemediate()` run fires, how many actions each run
+   * may apply, whether runs only preview, and the doctor thresholds the
+   * scheduled run diagnoses with (see `EventBusOptions.autoRemediate`,
+   * EB-211).
    *
    * Only the fields provided move; the rest keep their live values,
-   * and the construction-time `doctor` tuning is untouched — it is not
-   * revisable here. A moved interval clears and re-arms the timer at
-   * the new interval — the old timer is cleared and a new one armed,
-   * with no extra run fired; a maxActions/dryRun-only revision leaves
-   * the pending run's countdown untouched and takes effect on the next
-   * run (the tick reads the live schedule). A remediation run is
-   * synchronous, so there is no in-flight run to wait out.
+   * and a partial `doctor` object moves only the thresholds it names
+   * — a field left out keeps its live threshold (the doctor default
+   * when never configured). A moved interval clears and re-arms the
+   * timer at the new interval — the old timer is cleared and a new one
+   * armed, with no extra run fired; a maxActions/dryRun/doctor-only
+   * revision leaves the pending run's countdown untouched and takes
+   * effect on the next run (the tick reads the live schedule). A
+   * remediation run is synchronous, so there is no in-flight run to
+   * wait out. The doctor thresholds govern only the scheduled run:
+   * a manual `autoRemediate(options)` still diagnoses with its own
+   * per-call `options?.doctor`, and `exportBusHealth(options?)` with
+   * its own per-call `options` — neither reads the stored tuning.
    *
    * Fail-closed: a bus that never enabled `autoRemediate`, a bus that
    * is already closed, a non-object revision, and an illegal value all
@@ -23425,7 +23440,8 @@ export class EventBus {
    * untouched. Validation reuses the construction-time rule
    * (`assertValidRemediateSchedule`: the interval a positive finite
    * number, maxActions a non-negative integer) against the merged
-   * values, plus a boolean check on `dryRun`, so a value that could
+   * values, plus a boolean check on `dryRun` and a positive-finite
+   * check on each provided doctor threshold, so a value that could
    * not be set at construction cannot be revised in later either —
    * and a failed call changes nothing at all: when only one field is
    * provided only that field is validated and moved, and an illegal
@@ -23433,7 +23449,10 @@ export class EventBus {
    * revision that provides neither field, and a revision identical to
    * the current schedule, are both no-ops with no audit. Audited as
    * `auto_remediate_revised` (`{ intervalMs, oldIntervalMs,
-   * maxActions, oldMaxActions, dryRun, oldDryRun }`).
+   * maxActions, oldMaxActions, dryRun, oldDryRun, doctor,
+   * oldDoctor }`, the doctor pair carrying the parsed thresholds).
+   * `getStats().autoRemediate` exposes the live schedule including
+   * the parsed doctor thresholds.
    *
    * Orthogonal to EB-211 (that is the remediation run itself — this
    * the run's schedule), and to EB-305 (that retunes bridge-health
@@ -23441,7 +23460,7 @@ export class EventBus {
    *
    * Throws `RangeError` when auto-remediation is not enabled, when the
    * bus is closed, for a non-object revision, or for an illegal
-   * `intervalMs` / `maxActions` / `dryRun`.
+   * `intervalMs` / `maxActions` / `dryRun` / `doctor` value.
    */
   setAutoRemediate(opts: AutoRemediateRevision): void {
     const current = this.remediateSchedule;
@@ -23454,7 +23473,7 @@ export class EventBus {
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {
       throw new RangeError(
-        'setAutoRemediate: revision must be an object with intervalMs and/or maxActions and/or dryRun',
+        'setAutoRemediate: revision must be an object with intervalMs and/or maxActions and/or dryRun and/or doctor',
       );
     }
     // Validate before touching anything: `undefined` is not a value — a
@@ -23466,13 +23485,43 @@ export class EventBus {
     if (opts.dryRun !== undefined && typeof opts.dryRun !== 'boolean') {
       throw new RangeError('setAutoRemediate: dryRun must be a boolean');
     }
+    // Doctor tuning (EB-360): the parsed live thresholds are the merge
+    // base — the doctor defaults when the schedule never configured a
+    // threshold — and only the fields the revision names move. A
+    // provided threshold must be a positive finite number; the
+    // construction-time schedule never validated doctor values, so the
+    // revision contract is new here and an illegal value fails the
+    // whole call with every live value untouched.
+    const currentDoctor = {
+      slowSubscriberP99Ms:
+        current.doctor?.slowSubscriberP99Ms ?? DEFAULT_SLOW_SUBSCRIBER_P99_MS,
+      lagWatermarkDefaultMs:
+        current.doctor?.lagWatermarkDefaultMs ?? DEFAULT_LAG_WATERMARK_MS,
+    };
+    if (opts.doctor !== undefined && (typeof opts.doctor !== 'object' || opts.doctor === null || Array.isArray(opts.doctor))) {
+      throw new RangeError(
+        'setAutoRemediate: doctor must be an object with slowSubscriberP99Ms and/or lagWatermarkDefaultMs',
+      );
+    }
+    for (const field of ['slowSubscriberP99Ms', 'lagWatermarkDefaultMs'] as const) {
+      const value = opts.doctor?.[field];
+      if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+        throw new RangeError(`setAutoRemediate: doctor.${field} must be a positive finite number of milliseconds`);
+      }
+    }
+    const doctor = {
+      slowSubscriberP99Ms: opts.doctor?.slowSubscriberP99Ms ?? currentDoctor.slowSubscriberP99Ms,
+      lagWatermarkDefaultMs: opts.doctor?.lagWatermarkDefaultMs ?? currentDoctor.lagWatermarkDefaultMs,
+    };
     // Re-affirming the current schedule is a no-op: no re-arm, no audit.
     const currentMaxActions = current.maxActions ?? DEFAULT_REMEDIATE_MAX_ACTIONS;
     const currentDryRun = current.dryRun ?? false;
     if (
       intervalMs === current.intervalMs &&
       maxActions === currentMaxActions &&
-      dryRun === currentDryRun
+      dryRun === currentDryRun &&
+      doctor.slowSubscriberP99Ms === currentDoctor.slowSubscriberP99Ms &&
+      doctor.lagWatermarkDefaultMs === currentDoctor.lagWatermarkDefaultMs
     ) {
       return;
     }
@@ -23483,11 +23532,13 @@ export class EventBus {
     const oldIntervalMs = current.intervalMs;
     const oldMaxActions = currentMaxActions;
     const oldDryRun = currentDryRun;
-    // Keep the construction-time `doctor` tuning: spread first, then
-    // overwrite only the revisable fields.
-    this.remediateSchedule = { ...current, intervalMs, maxActions, dryRun };
-    // Only a moved interval re-arms the timer; a maxActions/dryRun-only
-    // revision leaves the pending run's countdown untouched.
+    const oldDoctor = currentDoctor;
+    // Keep the construction-time values for fields the revision leaves
+    // out: spread first, then overwrite with the merged values — the
+    // doctor object stored is the parsed pair, never a partial.
+    this.remediateSchedule = { ...current, intervalMs, maxActions, dryRun, doctor };
+    // Only a moved interval re-arms the timer; a maxActions/dryRun/
+    // doctor-only revision leaves the pending run's countdown untouched.
     if (intervalMs !== oldIntervalMs) {
       this.armRemediateTimer();
     }
@@ -23501,6 +23552,8 @@ export class EventBus {
         oldMaxActions,
         dryRun,
         oldDryRun,
+        doctor,
+        oldDoctor,
       },
     });
   }
@@ -53404,6 +53457,14 @@ export class EventBus {
               maxActions:
                 this.remediateSchedule.maxActions ?? DEFAULT_REMEDIATE_MAX_ACTIONS,
               dryRun: this.remediateSchedule.dryRun === true,
+              doctor: {
+                slowSubscriberP99Ms:
+                  this.remediateSchedule.doctor?.slowSubscriberP99Ms ??
+                  DEFAULT_SLOW_SUBSCRIBER_P99_MS,
+                lagWatermarkDefaultMs:
+                  this.remediateSchedule.doctor?.lagWatermarkDefaultMs ??
+                  DEFAULT_LAG_WATERMARK_MS,
+              },
             },
           }),
       aliases: [...this.topicAliases.entries()].map(([oldTopic, entry]) => ({
