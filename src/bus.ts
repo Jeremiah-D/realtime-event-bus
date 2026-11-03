@@ -7418,9 +7418,10 @@ export interface BusStats {
    * tracking enabled, in subscription order. Each entry carries the
    * windowed nearest-rank p99 of handler processing time (delivery→
    * handler-return for plain subscriptions, delivery→`ack()` completion
-   * for reliable ones), the sample count, the configured threshold, and
-   * whether the p99 is currently above the threshold (`breaching`, i.e.
-   * the alert latch is set). Empty when no subscriber opts in.
+   * for reliable ones), the sample count, the configured threshold, the
+   * live window bound (EB-368, revisable via `setLatencySloWindowSize`),
+   * and whether the p99 is currently above the threshold (`breaching`,
+   * i.e. the alert latch is set). Empty when no subscriber opts in.
    */
   subscriberLatencyP99: Array<{
     subscriberId: string;
@@ -7431,6 +7432,8 @@ export interface BusStats {
     samples: number;
     /** The configured `p99ThresholdMs`. */
     thresholdMs: number;
+    /** The live sample-window bound (`latencySlo.windowSize`, EB-368). */
+    windowSize: number;
     /** Whether the windowed p99 is currently above the threshold. */
     breaching: boolean;
   }>;
@@ -30196,6 +30199,102 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { p99ThresholdMs, oldP99ThresholdMs },
+    });
+  }
+
+  /**
+   * Revises one latency-SLO-tracked subscriber's sample-window size
+   * (EB-368) without re-subscribing: `setLatencySloWindowSize(subId,
+   * windowSize)` retunes the rolling window that the processing-latency
+   * p99 SLO is evaluated against (see `SubscribeOptions.latencySlo`,
+   * EB-53) — the last remaining `latencySlo` field `setLatencySloThreshold`
+   * (EB-290) left untouched: that one moves only the threshold, this one
+   * only the window.
+   *
+   * Only the window moves: the SLO tracker is resized in place
+   * (`DeliveryLatencyTracker.resize`, EB-276) — shrinking evicts the
+   * oldest samples past the new bound at once, so `getStats().
+   * subscriberLatencyP99` reflects the new window's p99 and sample
+   * count immediately, while widening keeps every sample and only
+   * raises the bound for the next samples. The threshold, the
+   * `onLatencySloMiss` callback, and the `alerted` latch are untouched:
+   * shrinking the slow tail out of the window so the p99 drops back
+   * below the threshold does *not* clear an already-triggered latch —
+   * the latch re-arms only when a later sample evaluation sees the
+   * p99 at or below the (live) threshold, along the existing check
+   * logic (`checkProcessingLatencySlo`). When phase attribution is
+   * armed for the subscriber (EB-133), its three phase trackers
+   * (`queueWait` / `backpressureWait` / `redeliveryWait`) are resized
+   * to the same bound, so the attribution keeps covering exactly the
+   * history the miss was evaluated against — the phase windows mirror
+   * the SLO window size, and a revision that moved only the SLO
+   * tracker would let the two histories diverge.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `latencySlo` monitoring, and an illegal window (not a
+   * positive integer) all throw `RangeError` with the live window, the
+   * samples, the threshold, the callback, the latch, and the audit log
+   * untouched — the window validation reuses the subscribe-time rule
+   * (`resolveLatencySloOptions`: a positive integer), so a window that
+   * could not be set at subscribe time cannot be revised in later
+   * either. A revision identical to the current window is a no-op with
+   * no audit. Audited as `latency_slo_window_size_revised`
+   * (`{ windowSize: <number>, oldWindowSize: <number> }`).
+   *
+   * Orthogonal to EB-53 (that is the SLO mechanism itself, this its
+   * sample-window revision), to EB-290 (`setLatencySloThreshold`, that
+   * revises the p99 threshold — this the window, a different field of
+   * the same state), to EB-133 (that is the phase attribution itself —
+   * this only keeps its four windows in lockstep), to EB-331 (that is
+   * the bus-level attribution arming switch — this a per-subscriber
+   * window), to EB-276 (that revises the delivery-latency sampler's
+   * window — this the processing-latency SLO window, an independent
+   * tracker instance), and to EB-279 (that revises the ack-latency
+   * sampler as a whole — this a single `latencySlo` window).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, or an illegal window size.
+   */
+  setLatencySloWindowSize(subId: string, windowSize: number): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setLatencySloWindowSize: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setLatencySloWindowSize: unknown subscriber: ${subId}`);
+    }
+    const latencySlo = subscriber.latencySlo;
+    if (latencySlo === undefined) {
+      throw new RangeError('setLatencySloWindowSize: subscriber has no latencySlo monitoring set');
+    }
+    // Validate before touching anything, reusing the subscribe-time
+    // rule: a positive integer window. The resolved state is
+    // discarded — only its validation is reused, with the live
+    // threshold carried so the threshold itself is never questioned.
+    resolveLatencySloOptions({ windowSize, p99ThresholdMs: latencySlo.thresholdMs });
+    // Re-affirming the current window is a no-op: no resize, no audit.
+    const oldWindowSize = latencySlo.tracker.windowSizeLimit();
+    if (windowSize === oldWindowSize) {
+      return;
+    }
+    // Only the window moves: resize the SLO tracker in place — the
+    // tracker object, its surviving samples, the threshold, the
+    // callback, and the alert latch are untouched. The phase trackers
+    // resize with it when attribution is armed, keeping the mirror
+    // invariant (EB-133) intact.
+    latencySlo.tracker.resize(windowSize);
+    const phase = subscriber.sloPhase;
+    if (phase !== undefined) {
+      phase.queueWait.resize(windowSize);
+      phase.backpressureWait.resize(windowSize);
+      phase.redeliveryWait.resize(windowSize);
+    }
+    this.auditSubscription({
+      action: 'latency_slo_window_size_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { windowSize, oldWindowSize },
     });
   }
 
@@ -53881,6 +53980,9 @@ export class EventBus {
           p99Ms: p99.p99Ms,
           samples: p99.samples,
           thresholdMs: slo.thresholdMs,
+          // EB-368: the live window bound, so a window revision is
+          // observable from the next snapshot.
+          windowSize: slo.tracker.windowSizeLimit(),
           breaching: slo.alerted,
         });
         // EB-133: per-subscriber SLO-miss phase attribution. The handler

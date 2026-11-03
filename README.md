@@ -2440,7 +2440,16 @@ library.
   the live threshold) while raising it never clears an already-triggered latch, which re-arms only when
   the p99 drops back to or below the new threshold. A revision identical to the current threshold is a
   no-op with no audit. Every success is audited as `latency_slo_threshold_revised`
-  (`{ p99ThresholdMs: <number>, oldP99ThresholdMs: <number> }`). (Real-time systems: latency SLO
+  (`{ p99ThresholdMs: <number>, oldP99ThresholdMs: <number> }`). The sample window itself is likewise
+  revisable without re-subscribing (EB-368, via `setLatencySloWindowSize(subId, windowSize)`): only the
+  window moves — shrinking evicts the oldest samples past the new bound at once, so `getStats().
+  subscriberLatencyP99` reflects the new window's p99, sample count, and live `windowSize` immediately,
+  while widening keeps every sample; the threshold, the `onLatencySloMiss` callback, and the `alerted`
+  latch are untouched, so shrinking the slow tail out of the window never clears a triggered latch
+  (it re-arms only on the next sample evaluation), and when phase attribution is armed the three phase
+  trackers resize to the same bound. A revision identical to the current window is a no-op with no
+  audit. Every success is audited as `latency_slo_window_size_revised`
+  (`{ windowSize: <number>, oldWindowSize: <number> }`). (Real-time systems: latency SLO
   governance.) Disabled by default.
 - **SLO-miss phase attribution** (in `src/bus.ts`, opt-in via
   `new EventBus({ processingLatencySloAlert: true })`): when a
