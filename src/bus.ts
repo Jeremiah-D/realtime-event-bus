@@ -3811,6 +3811,41 @@ export interface SubscriberBreakerTrippedEvent {
   pendingMessages: number;
 }
 
+/**
+ * Patch for a live revision of the subscriber-side auto circuit
+ * breaker (`EventBus.reviseSubscriberBreaker`, EB-373). Both fields
+ * are optional — an omitted field keeps its live value. Pass
+ * `onTripped: null` to clear the callback; any other non-function
+ * value throws `RangeError`.
+ */
+export interface SubscriberBreakerRevision {
+  /** New trip threshold: consecutive handler failures that trip the breaker. Must be a positive integer. */
+  maxConsecutiveFailures?: number;
+  /**
+   * New trip callback, or `null` to clear it. `undefined` (omitted)
+   * keeps the live callback.
+   */
+  onTripped?: ((event: SubscriberBreakerTrippedEvent) => void) | null;
+}
+
+/**
+ * Live snapshot of the subscriber-side auto circuit breaker (see
+ * `getSubscriberBreaker`, EB-373): the live threshold plus the
+ * subscribers currently holding a breaker-tripped pause, in the same
+ * shape as `getStats().subscriberBreaker.tripped`.
+ */
+export interface SubscriberBreakerSnapshot {
+  /** Consecutive handler failures that trip the breaker. */
+  maxConsecutiveFailures: number;
+  /** Subscribers currently holding a breaker-tripped pause. */
+  tripped: Array<{
+    subscriberId: string;
+    pattern: string;
+    consecutiveFailures: number;
+    pendingMessages: number;
+  }>;
+}
+
 /** Snapshot delivered to `SlowHandlerOptions.onSlowHandler` per slow invocation. */
 export interface SlowHandlerEvent {
   /** The subscriber whose handler ran slow. */
@@ -19723,6 +19758,115 @@ export class EventBus {
     if (this.subscriberBreaker === undefined) return false;
     this.subscriberBreaker = undefined;
     return true;
+  }
+
+  /**
+   * Retunes the armed subscriber-side auto circuit breaker in place
+   * (`reviseSubscriberBreaker`, EB-373) — the live alternative to
+   * `setSubscriberBreaker`'s whole-rule replacement. Both patch fields
+   * are optional: an omitted field keeps its live value, and
+   * `onTripped: null` clears the callback. Merged against the live
+   * values and validated with the setter's exact rules, so an illegal
+   * merged value throws `RangeError` and the live rule — and every
+   * subscriber's streak — is fully untouched.
+   *
+   * The revision moves only the rule, in place on the live record:
+   * every subscriber's `breakerConsecutiveFailures` streak and
+   * `breakerTripped` flag are preserved verbatim — an already-tripped
+   * subscriber stays tripped (only a manual `resumeSubscriber`
+   * recovers it), and a streak keeps accumulating toward the new
+   * threshold. The new threshold applies to subsequent failure
+   * counting at once: the trip check in `noteBreakerOutcome` reads
+   * `maxConsecutiveFailures` live, and the trip report reads
+   * `onTripped` live, so tightening below a live streak trips on the
+   * next failure and a swapped callback fires on the next trip.
+   *
+   * A revision identical to the live rule is a no-op with no audit.
+   * Otherwise the change is recorded in the subscription audit log as
+   * `subscriber_breaker_revised` (`{ previous, current }`, each
+   * holding `maxConsecutiveFailures` and whether an `onTripped`
+   * callback is set). Returns the live snapshot after the revision. A
+   * closed bus refuses the revision with `BusClosedError` (EB-154).
+   *
+   * Orthogonal to EB-215 (that is the breaker mechanism itself — this
+   * its thresholds' live revision), to EB-372 (that is the publish
+   * side — this the subscriber side), and to `setSubscriberBreaker`
+   * (whole-rule replacement that resets every streak — this retunes
+   * them in place).
+   *
+   * Throws `RangeError` for a non-object patch, for a bus with no
+   * armed rule, or for an illegal merged value.
+   */
+  reviseSubscriberBreaker(patch: SubscriberBreakerRevision): SubscriberBreakerSnapshot {
+    // EB-154: a closed bus never takes new configuration — refusing the
+    // revision fail-fast keeps the shutdown terminal.
+    this.assertNotClosed('subscribe', 'subscriber-breaker');
+    if (patch == null || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError('reviseSubscriberBreaker: patch must be an object');
+    }
+    const live = this.subscriberBreaker;
+    if (live === undefined) {
+      throw new RangeError(
+        'reviseSubscriberBreaker: no subscriber breaker armed ' +
+          '(install one with setSubscriberBreaker first)',
+      );
+    }
+    // Merge over the live values, then validate with the setter's exact
+    // rules — before touching anything, so an illegal value leaves the
+    // live rule, every streak, and the audit exactly as they were.
+    const maxConsecutiveFailures = patch.maxConsecutiveFailures ?? live.maxConsecutiveFailures;
+    if (!Number.isInteger(maxConsecutiveFailures) || maxConsecutiveFailures < 1) {
+      throw new RangeError('maxConsecutiveFailures must be a positive integer');
+    }
+    const onTripped =
+      patch.onTripped === null ? undefined : (patch.onTripped ?? live.onTripped);
+    if (onTripped !== undefined && typeof onTripped !== 'function') {
+      throw new RangeError('onTripped must be a function');
+    }
+    const previous = {
+      maxConsecutiveFailures: live.maxConsecutiveFailures,
+      onTripped: live.onTripped !== undefined,
+    };
+    // Re-affirming the live rule is a no-op: no retune, no audit.
+    if (maxConsecutiveFailures === previous.maxConsecutiveFailures && onTripped === live.onTripped) {
+      return this.getSubscriberBreaker() as SubscriberBreakerSnapshot;
+    }
+    const current = { maxConsecutiveFailures, onTripped: onTripped !== undefined };
+    live.maxConsecutiveFailures = maxConsecutiveFailures;
+    live.onTripped = onTripped;
+    this.auditSubscription({
+      action: 'subscriber_breaker_revised',
+      actor: 'system',
+      detail: { previous, current },
+    });
+    return this.getSubscriberBreaker() as SubscriberBreakerSnapshot;
+  }
+
+  /**
+   * Returns a live snapshot of the subscriber-side auto circuit
+   * breaker — the live threshold plus the subscribers currently
+   * holding a breaker-tripped pause — or `undefined` when no rule is
+   * armed. `getStats().subscriberBreaker` carries the same tripped
+   * rows; this getter is the direct read of the live rule (EB-373).
+   *
+   * Named `getSubscriberBreaker` rather than `subscriberBreaker`:
+   * the private rule field already holds that name.
+   */
+  getSubscriberBreaker(): SubscriberBreakerSnapshot | undefined {
+    const live = this.subscriberBreaker;
+    if (live === undefined) return undefined;
+    const tripped: SubscriberBreakerSnapshot['tripped'] = [];
+    for (const subscriber of this.subscribers.values()) {
+      if (subscriber.breakerTripped === true) {
+        tripped.push({
+          subscriberId: subscriber.id,
+          pattern: subscriber.pattern,
+          consecutiveFailures: subscriber.breakerConsecutiveFailures ?? 0,
+          pendingMessages: subscriber.queue.size,
+        });
+      }
+    }
+    return { maxConsecutiveFailures: live.maxConsecutiveFailures, tripped };
   }
 
   /**

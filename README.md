@@ -7312,6 +7312,25 @@ Semantics:
   pauses stay paused — recovery is still a manual `resumeSubscriber`).
   Invalid options throw `RangeError` from `setSubscriberBreaker`;
   re-setting replaces the rule and resets every streak.
+- **Live revision (EB-373).** `bus.reviseSubscriberBreaker(patch)`
+  retunes the armed rule in place without resetting anything:
+  `maxConsecutiveFailures` and `onTripped` are both optional (an
+  omitted field keeps its live value; `onTripped: null` clears the
+  callback), the merged rule is validated with the setter's exact
+  rules (an illegal value throws `RangeError` and leaves the live
+  rule, every streak, and the audit untouched), and a revision
+  identical to the live rule is a no-op with no audit. Streaks and
+  tripped flags are preserved verbatim — tightening below a live
+  streak trips on the next failure, loosening never un-trips a
+  subscriber, and a swapped callback fires on the next trip.
+  Applied revisions are audited as `subscriber_breaker_revised`
+  (`{ previous, current }`, each holding `maxConsecutiveFailures`
+  and whether an `onTripped` callback is set); revising an unarmed
+  bus throws `RangeError`, and a closed bus refuses the revision
+  with `BusClosedError`. `bus.getSubscriberBreaker()` returns the
+  live snapshot `{ maxConsecutiveFailures, tripped: [...] }` (same
+  tripped shape as `getStats().subscriberBreaker`), or `undefined`
+  when no rule is armed.
 
 Orthogonal to `pauseSubscriber`/`resumeSubscriber` (EB-113, the manual
 hold this drives automatically), to the publish circuit breaker
