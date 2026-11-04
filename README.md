@@ -4659,13 +4659,34 @@ How it works:
 - **TTL** — a retained message keeps the TTL deadline stamped at publish
   time: past its deadline it is pruned and never snapshotted (nor shown
   in stats) — the snapshot never resurrects an expired message.
+  `setTopicRetainedTtl(topicPattern, ttlMs)` / `clearTopicRetainedTtl`
+  / `getTopicRetainedTtl` (EB-378) adds a second, independent knob for
+  snapshot freshness — a sensor's last-known value, say, should stop
+  being served as current long before the message queue would have
+  dropped it. A snapshot's effective expiry is the earlier of the
+  message TTL deadline stamped at publish time and
+  `publishTime + ttlMs`: the retained TTL only shortens, never extends
+  (a longer retained TTL loses to a shorter message TTL, and vice
+  versa). The bound is stamped at store time and survives restarts via
+  the seq-0 log record; a live rule change is re-checked at serve time,
+  so tightening stops serving stale snapshots immediately while
+  loosening never revives one whose stamped deadline already passed.
+  Clearing a rule only stops future stamping — already-stored snapshots
+  keep their stamped deadline. `ttlMs = 0` stores-then-immediately-
+  expires. Match resolution mirrors `setTopicTtl` (exact wins,
+  earliest-registered pattern wins); empty patterns and negative or
+  non-finite values throw `RangeError`.
 - **Observability** — `getStats().retainedTopics` lists
   `{ topic, seq, at }` per topic holding a retained message (sorted by
-  topic; TTL-expired entries filtered out); Prometheus:
+  topic; TTL-expired entries filtered out); `getStats().retainedExpiredMessages`
+  (global) and each topic's `retainedExpiredMessages` count pruned
+  snapshots, once per entry. Prometheus:
   `eventbus_retained_topics` (gauge). Rule changes and publish-driven
   clears are recorded in the subscription audit log as
   `retained_rule_set` (`{ enabled }`), `retained_rule_cleared`, and
-  `retained_cleared` (`{ via: 'publish' }`).
+  `retained_cleared` (`{ via: 'publish' }`); retained-TTL rule changes
+  as `retained_ttl_rule_set` / `retained_ttl_rule_cleared`
+  (both `{ ttlMs }`).
 - **Scope notes** — retained state is node-local: bridge/cluster hops
   re-admit as ordinary publishes and do not propagate the retain flag.
   Only `publish` carries `retain`; batch/atomic/delayed publishes do

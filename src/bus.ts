@@ -6034,6 +6034,14 @@ export interface TopicStats {
    */
   expiredMessages: number;
   /**
+   * Retained snapshots on this topic pruned because they expired (EB-378):
+   * either the TTL deadline stamped at publish time passed, or the live
+   * retained-TTL rule (`setTopicRetainedTtl`) expired the snapshot at
+   * serve time. Counts each pruned snapshot once — a snapshot is gone
+   * after one prune, so no layer can count it twice.
+   */
+  retainedExpiredMessages: number;
+  /**
    * Messages on this topic handed to a handler at or past their EDF
    * scheduling deadline (see `PublishOptions.deadlineMs`, EB-204).
    * Unlike `expiredMessages`, these were delivered — stamped
@@ -6618,6 +6626,12 @@ export interface BusStats {
    * discarded queue entry once — see `TopicStats.expiredMessages`).
    */
   expiredMessages: number;
+  /**
+   * Total retained snapshots pruned because they expired (sum of the
+   * per-topic `retainedExpiredMessages` counters, counting each pruned
+   * snapshot once — see `TopicStats.retainedExpiredMessages`).
+   */
+  retainedExpiredMessages: number;
   /**
    * Total EDF hand-offs that missed their scheduling deadline (sum of
    * the per-topic `missedDeadlineMessages` counters — see
@@ -9463,6 +9477,7 @@ function zeroedTopicStats(): {
   subscriberCount: number;
   publishedMessages: number;
   expiredMessages: number;
+  retainedExpiredMessages: number;
   missedDeadlineMessages: number;
   lastSeq: number;
   sequenceGaps: number;
@@ -9510,6 +9525,7 @@ function zeroedTopicStats(): {
     subscriberCount: 0,
     publishedMessages: 0,
     expiredMessages: 0,
+    retainedExpiredMessages: 0,
     missedDeadlineMessages: 0,
     lastSeq: 0,
     sequenceGaps: 0,
@@ -15190,6 +15206,8 @@ export class EventBus {
       subscriberCount: number;
       publishedMessages: number;
       expiredMessages: number;
+      /** Retained snapshots pruned for expiry on this topic (EB-378). */
+      retainedExpiredMessages: number;
       lastSeq: number;
       sequenceGaps: number;
       rateLimitedMessages: number;
@@ -15238,6 +15256,14 @@ export class EventBus {
    */
   private readonly publisherCounts = new Map<string, number>();
   private totalExpired = 0;
+  /**
+   * Retained snapshots pruned for expiry (EB-378): a snapshot whose
+   * stamped deadline passed, or whose live retained-TTL rule expired it
+   * at serve time — counted once per pruned entry, in both prune layers.
+   * Surfaced as `getStats().retainedExpiredMessages` (global) and
+   * `TopicStats.retainedExpiredMessages` (per topic).
+   */
+  private totalRetainedExpired = 0;
   /**
    * EDF missed-deadline hand-offs (EB-204): messages carrying an EDF
    * scheduling deadline (`PublishOptions.deadlineMs` without
@@ -15593,6 +15619,24 @@ export class EventBus {
    * retained configuration never inflates `patternCacheSize`.
    */
   private retainedMatcherCache = new Map<string, RegExp>();
+  /**
+   * Per-topic retained-snapshot TTLs in milliseconds (EB-378), keyed by
+   * the exact string passed to `setTopicRetainedTtl` — either a concrete
+   * topic name or a wildcard pattern. A retained snapshot's effective
+   * expiry is the earlier of the message TTL deadline (when one was
+   * stamped) and `at + retainedTtlMs`: the retained TTL only shortens,
+   * never extends. Match resolution mirrors `setTopicTtl`: an
+   * exact-topic rule wins over any pattern; between patterns the
+   * earliest-registered rule wins.
+   */
+  private retainedTtlRules = new Map<string, number>();
+  /**
+   * Compiled matchers for the wildcard entries in `retainedTtlRules`,
+   * kept apart from the subscriber pattern cache and the other rule
+   * caches so retained-TTL configuration never inflates
+   * `patternCacheSize`.
+   */
+  private retainedTtlMatcherCache = new Map<string, RegExp>();
   /**
    * Publish-side partition counts (EB-90), keyed by the exact string
    * passed to `setTopicPartitions` — either a concrete topic name or a
@@ -19000,6 +19044,107 @@ export class EventBus {
         this.retainedMatcherCache.set(pattern, matcher);
       }
       if (matcher.test(topic)) return enabled;
+    }
+    return undefined;
+  }
+
+  /**
+   * Bounds how long a retained snapshot stays fresh, in milliseconds,
+   * for one topic or topic pattern (EB-378 — real-time systems: a
+   * sensor's last-known value must not be served as current hours after
+   * it stopped updating). Independent from the message-queue TTL
+   * (`setTopicTtl`): the queue lifetime governs delivery, this rule
+   * governs only the snapshot a late subscriber receives.
+   *
+   * A retained entry's effective expiry is the earlier of the message
+   * TTL deadline stamped at publish time (when a message TTL rule
+   * matched) and `publishTime + ttlMs` — the retained TTL only
+   * shortens, never extends. The bound is stamped at store time and
+   * survives restarts via the seq-0 log record; a live rule change
+   * re-checks already-stored entries at serve time (tightening stops
+   * serving stale snapshots immediately, loosening never revives an
+   * entry whose stamped deadline already passed).
+   *
+   * `topicPattern` accepts the same wildcard syntax as `subscribe` (or
+   * an exact topic name); the rule key is the exact string passed here.
+   * Match resolution mirrors `setTopicTtl`: an exact-topic rule wins
+   * over any pattern; between patterns the earliest-registered rule
+   * wins (independent matcher cache — never inflates
+   * `patternCacheSize`). With no matching rule a retained snapshot
+   * lives until its message TTL deadline, or forever when no message
+   * TTL matched either. Re-setting a rule replaces it. `ttlMs = 0`
+   * stores-then-immediately-expires (the snapshot is never served).
+   *
+   * Removing a rule (`clearTopicRetainedTtl`) only stops future
+   * stamping — already-stored entries keep their stamped deadline.
+   * Throws `RangeError` when `topicPattern` is empty or `ttlMs` is
+   * negative or not finite. Audited as `retained_ttl_rule_set`.
+   */
+  setTopicRetainedTtl(topicPattern: string, ttlMs: number): void {
+    if (topicPattern.length === 0) {
+      throw new RangeError('topicPattern must be a non-empty string');
+    }
+    if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+      throw new RangeError('ttlMs must be a non-negative finite number of milliseconds');
+    }
+    this.retainedTtlRules.set(topicPattern, ttlMs);
+    this.auditSubscription({
+      action: 'retained_ttl_rule_set',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: { ttlMs },
+    });
+  }
+
+  /**
+   * Removes the retained-snapshot TTL rule previously registered for
+   * `topicPattern`. Returns true when a rule existed and was removed.
+   * Already-stored retained entries are left untouched — only future
+   * retained publishes stop being stamped with this bound. Audited as
+   * `retained_ttl_rule_cleared` (carrying the removed rule's `ttlMs`)
+   * when a rule existed; clearing a nonexistent rule returns false and
+   * audits nothing.
+   */
+  clearTopicRetainedTtl(topicPattern: string): boolean {
+    const previous = this.retainedTtlRules.get(topicPattern);
+    const removed = this.retainedTtlRules.delete(topicPattern);
+    if (removed) {
+      this.auditSubscription({
+        action: 'retained_ttl_rule_cleared',
+        actor: 'system',
+        pattern: topicPattern,
+        detail: { ttlMs: previous },
+      });
+    }
+    return removed;
+  }
+
+  /**
+   * Returns the retained-snapshot TTL that applies to `topicPattern`,
+   * or `undefined` when no rule matches. Match resolution mirrors
+   * `setTopicTtl`: an exact-topic rule wins over patterns; between
+   * patterns the earliest-registered matching rule wins.
+   */
+  getTopicRetainedTtl(topicPattern: string): number | undefined {
+    return this.retainedTtlForTopic(topicPattern);
+  }
+
+  /**
+   * Returns the retained-snapshot TTL rule that applies to `topic`, or
+   * `undefined` when no rule matches. An exact-topic rule wins over
+   * patterns; between patterns the earliest-registered matching rule
+   * wins.
+   */
+  private retainedTtlForTopic(topic: string): number | undefined {
+    const exact = this.retainedTtlRules.get(topic);
+    if (exact !== undefined) return exact;
+    for (const [pattern, ttlMs] of this.retainedTtlRules) {
+      let matcher = this.retainedTtlMatcherCache.get(pattern);
+      if (matcher == null) {
+        matcher = compilePattern(pattern);
+        this.retainedTtlMatcherCache.set(pattern, matcher);
+      }
+      if (matcher.test(topic)) return ttlMs;
     }
     return undefined;
   }
@@ -27887,6 +28032,7 @@ export class EventBus {
         // yet, so it must not count as published.
         publishedMessages: log.messageCount(topic),
         expiredMessages: 0,
+        retainedExpiredMessages: 0,
         missedDeadlineMessages: 0,
         lastSeq,
         sequenceGaps: 0,
@@ -47128,6 +47274,20 @@ export class EventBus {
       this.clearRetained(topic, nowMs);
       return;
     }
+    // Retained-snapshot TTL (EB-378): the snapshot's own freshness
+    // bound — the earlier of the message TTL deadline stamped at publish
+    // time and `at + retainedTtlMs`. The retained TTL only shortens,
+    // never extends: with no message deadline the retained TTL alone
+    // bounds the snapshot; with no retained rule the message deadline
+    // stands alone. The stamped deadline rides the seq-0 log record
+    // verbatim, so restart recovery honors it with no change there.
+    const retainedTtlMs = this.retainedTtlForTopic(topic);
+    const effectiveExpiresAt =
+      retainedTtlMs === undefined
+        ? expiresAt
+        : expiresAt === undefined
+          ? nowMs + retainedTtlMs
+          : Math.min(expiresAt, nowMs + retainedTtlMs);
     const signature =
       msg.signature === undefined
         ? undefined
@@ -47147,7 +47307,7 @@ export class EventBus {
       // partition for gap detection.
       ...(msg.partition === undefined ? {} : { partition: msg.partition }),
       at: nowMs,
-      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(effectiveExpiresAt === undefined ? {} : { expiresAt: effectiveExpiresAt }),
       ...(dictId === undefined ? {} : { dictId }),
       ...(signature === undefined ? {} : { signature }),
       ...(publisherSignature === undefined ? {} : { publisherSignature }),
@@ -47178,7 +47338,7 @@ export class EventBus {
       // so restart recovery rebuilds the table with the message's
       // partition identity intact.
       ...(msg.partition === undefined ? {} : { partition: msg.partition }),
-      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(effectiveExpiresAt === undefined ? {} : { expiresAt: effectiveExpiresAt }),
       ...(dictId === undefined ? {} : { dictId }),
       ...(signature === undefined ? {} : { signature }),
       ...(publisherSignature === undefined ? {} : { publisherSignature }),
@@ -47268,10 +47428,19 @@ export class EventBus {
     const nowMs = this.now();
     // Lazy TTL prune: a retained message past its deadline is gone — the
     // live drain would drop it as expired, so the snapshot never
-    // resurrects it. Restart recovery applies the same rule.
+    // resurrects it. Restart recovery applies the same rule. The live
+    // retained-TTL rule (EB-378) is re-checked here too: tightening a
+    // rule prunes an already-stored snapshot at once, even when its
+    // stamped deadline is later — the stamp is an upper bound, the live
+    // rule is the current freshness contract. Loosening never revives
+    // anything: an entry whose stamped deadline passed is already gone.
+    // Each pruned entry counts once in `retainedExpiredMessages`.
     for (const [topic, entry] of this.retainedMessages) {
-      if (entry.expiresAt !== undefined && entry.expiresAt <= nowMs) {
+      const liveTtlMs = this.retainedTtlForTopic(topic);
+      const liveExpired = liveTtlMs !== undefined && entry.at + liveTtlMs <= nowMs;
+      if ((entry.expiresAt !== undefined && entry.expiresAt <= nowMs) || liveExpired) {
         this.retainedMessages.delete(topic);
+        this.recordRetainedExpired(topic);
       }
     }
     const matched: RetainedEntry[] = [];
@@ -48935,6 +49104,7 @@ export class EventBus {
     const ruleMaps: Array<Map<string, unknown>> = [
       this.ttlRules,
       this.retainedRules,
+      this.retainedTtlRules,
       this.partitionRules,
       this.rateLimitRules,
       this.subscriberLimitRules,
@@ -49053,6 +49223,7 @@ export class EventBus {
     const ruleMaps: Array<Map<string, unknown>> = [
       this.ttlRules,
       this.retainedRules,
+      this.retainedTtlRules,
       this.partitionRules,
       this.rateLimitRules,
       this.subscriberLimitRules,
@@ -49251,6 +49422,7 @@ export class EventBus {
       const ruleMaps: Array<Map<string, unknown>> = [
         this.ttlRules,
         this.retainedRules,
+        this.retainedTtlRules,
         this.partitionRules,
         this.rateLimitRules,
         this.subscriberLimitRules,
@@ -49264,6 +49436,7 @@ export class EventBus {
       const matcherCaches: Array<Map<string, RegExp>> = [
         this.ttlMatcherCache,
         this.retainedMatcherCache,
+        this.retainedTtlMatcherCache,
         this.partitionMatcherCache,
         this.rateLimitMatcherCache,
         this.subscriberLimitMatcherCache,
@@ -49511,6 +49684,7 @@ export class EventBus {
       subscriberCount: 0,
       publishedMessages: log.messageCount(targetTopic),
       expiredMessages: 0,
+      retainedExpiredMessages: 0,
       missedDeadlineMessages: 0,
       lastSeq: result.targetLastSeq,
       sequenceGaps: 0,
@@ -49659,6 +49833,7 @@ export class EventBus {
       subscriberCount: 0,
       publishedMessages: log.messageCount(targetTopic),
       expiredMessages: 0,
+      retainedExpiredMessages: 0,
       missedDeadlineMessages: 0,
       lastSeq: result.targetLastSeq,
       sequenceGaps: 0,
@@ -49830,6 +50005,7 @@ export class EventBus {
         subscriberCount: 0,
         publishedMessages: log.messageCount(targetTopic),
         expiredMessages: 0,
+        retainedExpiredMessages: 0,
         missedDeadlineMessages: 0,
         lastSeq: targetLastSeq,
         sequenceGaps: 0,
@@ -49985,6 +50161,7 @@ export class EventBus {
       subscriberCount: 0,
       publishedMessages: log.messageCount(targetTopic),
       expiredMessages: 0,
+      retainedExpiredMessages: 0,
       missedDeadlineMessages: 0,
       lastSeq: result.targetLastSeq,
       sequenceGaps: 0,
@@ -55348,6 +55525,7 @@ export class EventBus {
       },
       throttledMessages: this.totalThrottled,
       expiredMessages: this.totalExpired,
+      retainedExpiredMessages: this.totalRetainedExpired,
       missedDeadlineMessages: this.totalMissedDeadline,
       expiredLeases: this.totalExpiredLeases,
       idleExpired: this.totalIdleExpired,
@@ -55768,6 +55946,7 @@ export class EventBus {
         subscriberCount: stats.subscriberCount,
         publishedMessages: stats.publishedMessages,
         expiredMessages: stats.expiredMessages,
+        retainedExpiredMessages: stats.retainedExpiredMessages,
         missedDeadlineMessages: stats.missedDeadlineMessages,
         lastSeq: stats.lastSeq,
         sequenceGaps: stats.sequenceGaps,
@@ -60732,6 +60911,20 @@ export class EventBus {
     // paths pass it); delayed schedules and pause-buffered messages expire
     // before ever queueing, so they move no lane counter.
     if (lane !== undefined) this.countLaneUnqueued(topic, lane);
+  }
+
+  /**
+   * Counts one retained snapshot pruned for expiry against its concrete
+   * topic and the global total (EB-378). Each pruned snapshot counts
+   * once — the entry is deleted as it is counted, so neither prune
+   * layer (stamped deadline or live retained-TTL rule) can count it
+   * twice. Mirrors `recordExpired`, minus the lane bookkeeping: a
+   * snapshot never sat in a subscriber queue.
+   */
+  private recordRetainedExpired(topic: string): void {
+    this.totalRetainedExpired += 1;
+    const stats = this.topicStats.get(topic);
+    if (stats != null) stats.retainedExpiredMessages += 1;
   }
 
   /**

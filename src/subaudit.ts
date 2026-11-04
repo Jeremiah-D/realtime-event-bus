@@ -7,7 +7,8 @@
  * `signature_verification_failed`) / durable-log retention policy changes
  * (EB-85, `retention_updated`) / retained-message rule and state changes
  * (EB-87, `retained_rule_set` / `retained_rule_cleared` /
- * `retained_cleared`) / topic pause/resume (EB-88, `topic_paused` /
+ * `retained_cleared`) / retained-snapshot TTL rule changes (EB-378,
+ * `retained_ttl_rule_set` / `retained_ttl_rule_cleared`) / topic pause/resume (EB-88, `topic_paused` /
  * `topic_resumed`) / bulk delayed-delivery cancellation (EB-89,
  * `delayed_cancelled`) / publish-side partition-count rule changes (EB-90,
  * `partition_rule_set` / `partition_rule_cleared`) / out-of-order barrier
@@ -74,6 +75,8 @@ export type SubscriptionAuditAction =
   | 'retention_updated'
   | 'retained_rule_set'
   | 'retained_rule_cleared'
+  | 'retained_ttl_rule_set'
+  | 'retained_ttl_rule_cleared'
   | 'retained_cleared'
   | 'topic_paused'
   | 'topic_resumed'
@@ -324,6 +327,8 @@ export type SubscriptionAuditAction =
  * - `retention_updated`: `{ from: <previous maxAgeMs, null when unset>, to: <new maxAgeMs, null when cleared> }`
  * - `retained_rule_set`: `{ enabled: <boolean> }` (the `pattern` field carries the rule key)
  * - `retained_rule_cleared`: no detail (the `pattern` field carries the rule key)
+ * - `retained_ttl_rule_set`: `{ ttlMs: <number> }` (EB-378; the `pattern` field carries the rule key)
+ * - `retained_ttl_rule_cleared`: `{ ttlMs: <number> }` (EB-378; the `pattern` field carries the rule key, the removed rule's value)
  * - `retained_cleared`: `{ via: 'publish' }` (the `topic` field carries the concrete topic)
  * - `partition_rule_set`: `{ partitions: <count> }` (the `pattern` field carries the rule key)
  * - `partition_rule_cleared`: no detail (the `pattern` field carries the rule key)
@@ -539,6 +544,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'retention_updated',
   'retained_rule_set',
   'retained_rule_cleared',
+  'retained_ttl_rule_set',
+  'retained_ttl_rule_cleared',
   'retained_cleared',
   'topic_paused',
   'topic_resumed',
