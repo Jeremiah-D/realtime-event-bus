@@ -408,6 +408,12 @@ import {
   type OtlpSpanExporterOptions,
   type OtlpSpanExportStats,
 } from './otlp.ts';
+import {
+  OtlpMetricsExporter,
+  resolveOtlpMetricsOptions,
+  type OtlpMetricsExporterOptions,
+  type OtlpMetricsExportStats,
+} from './otlp-metrics.ts';
 import type {
   ClusterConnectOptions,
   ClusterLink,
@@ -5715,6 +5721,26 @@ export interface EventBusOptions {
    */
   otlp?: OtlpSpanExporterOptions | false;
   /**
+   * OTLP/HTTP metrics export (see `src/otlp-metrics.ts`, EB-370):
+   * pushes bus-level `BusStats` snapshots to an OpenTelemetry
+   * collector as OTLP/HTTP JSON (`POST <endpoint>`, `/v1/metrics`),
+   * hand-encoded with zero new dependencies. The push complement to
+   * the pull-mode Prometheus exposition (`renderPrometheus`) and to
+   * the span exporter (`otlp`) — a collector-only deployment gets
+   * counters, gauges, latency distributions, and per-topic payload
+   * histograms without scraping. Independent of `otlp`: metrics need
+   * no tracing, so this option does not require `trace`.
+   *
+   * Best-effort by design: a snapshot exports on an unref'd timer
+   * (never holds the process open); a failed export POST drops that
+   * snapshot and counts it in `getStats().otlpMetrics.failedExports`
+   * instead of disturbing delivery. Metrics are snapshots, not an
+   * event stream, so nothing buffers — each tick exports only the
+   * newest snapshot. Disabled by default; an invalid config throws
+   * `RangeError` from the constructor.
+   */
+  otlpMetrics?: OtlpMetricsExporterOptions | false;
+  /**
    * Cross-process fan-out bridge (see `src/bridge.ts`, EB-51): a pluggable
    * `BridgeTransport` that mirrors every admitted local publish to an
    * external broker (Redis Streams, NATS, … — the adapter is implemented
@@ -7718,6 +7744,16 @@ export interface BusStats {
    * (drop-oldest). A snapshot — mutating it does not affect the bus.
    */
   otlp?: OtlpSpanExportStats;
+  /**
+   * OTLP metrics export state (see `EventBusOptions.otlpMetrics` and
+   * `src/otlp-metrics.ts`, EB-370). Present only when metrics export
+   * is configured: `exportedMetrics` data points successfully POSTed,
+   * `failedExports` export POSTs dropped because the collector was
+   * unreachable (best-effort, never retried), `lastExportAtMs` the
+   * epoch milliseconds of the last successful export (0 when never
+   * exported). A snapshot — mutating it does not affect the bus.
+   */
+  otlpMetrics?: OtlpMetricsExportStats;
   /**
    * The hottest topics by 1m publish rate (see `src/rates.ts`), hottest
    * first — at most `HOT_TOPICS_LIMIT` (10) entries; topics with no
@@ -16062,6 +16098,13 @@ export class EventBus {
    */
   private readonly otlpExporter: OtlpSpanExporter | undefined;
   /**
+   * OTLP metrics exporter (`EventBusOptions.otlpMetrics`), or
+   * `undefined` when export is not configured (EB-370). Fed by a
+   * snapshot supplier (`() => this.getStats()`), so each tick exports
+   * the latest snapshot; independent of the span exporter above.
+   */
+  private readonly otlpMetricsExporter: OtlpMetricsExporter | undefined;
+  /**
    * Compiled broker-level ACL rules in evaluation order
    * (`EventBusOptions.acl` / `setAclRules`). Empty means no ACL — every
    * verdict falls through to `aclDefault`.
@@ -17375,6 +17418,16 @@ export class EventBus {
     } else {
       this.otlpExporter = undefined;
     }
+    // OTLP metrics export (EB-370): snapshot-based, no trace
+    // dependency — metrics exist whether or not tracing samples
+    // anything. The exporter collects via `() => this.getStats()`,
+    // next to the span exporter above; a failed export never throws
+    // into construction (the resolver already validated the config).
+    const resolvedOtlpMetrics = resolveOtlpMetricsOptions(options?.otlpMetrics, 'EventBus');
+    this.otlpMetricsExporter =
+      resolvedOtlpMetrics === undefined
+        ? undefined
+        : new OtlpMetricsExporter(resolvedOtlpMetrics, () => this.getStats());
     // Trace span archive journal (EB-167): the journal rides the trace
     // pipeline's span fan-out behind the OTLP exporter (if any) — one
     // more composition point, still no changes to TraceRecorder. Every
@@ -53591,6 +53644,17 @@ export class EventBus {
   }
 
   /**
+   * Exports the latest metrics snapshot to the configured OTLP
+   * collector now instead of waiting for the export timer (EB-370) —
+   * the deterministic hook for tests and graceful shutdown. No-op
+   * when metrics export is not configured (or after `close()` stopped
+   * the exporter); never throws (best-effort export).
+   */
+  flushOtlpMetrics(): Promise<void> {
+    return this.otlpMetricsExporter?.flush() ?? Promise.resolve();
+  }
+
+  /**
    * Registers a WebSocket gateway for orderly shutdown (EB-154): the
    * gateway is closed after the subscriber drains complete, so every
    * connection's bus subscription delivers its pending backlog before
@@ -53926,6 +53990,12 @@ export class EventBus {
       // storage backend, so the records are handed to the OS regardless.
     }
     await this.flushOtlp();
+    // OTLP metrics export (EB-370): the final snapshot goes out
+    // after the span drain above, then the exporter's timer stops —
+    // a closed bus exports nothing more. A second `close()` reuses
+    // the first call's promise, so this final export fires once.
+    await this.flushOtlpMetrics();
+    this.otlpMetricsExporter?.shutdown();
     for (const gateway of [...this.gateways]) {
       try {
         await gateway.close();
@@ -54737,6 +54807,12 @@ export class EventBus {
       ...(this.otlpExporter == null
         ? {}
         : { otlp: this.otlpExporter.getStats() }),
+      // OTLP metrics export (EB-370): present only when configured —
+      // the field stays absent otherwise so unconfigured buses keep
+      // byte-identical stats.
+      ...(this.otlpMetricsExporter == null
+        ? {}
+        : { otlpMetrics: this.otlpMetricsExporter.getStats() }),
       hotTopics: this.publishRates.hotTopics(ratesNow),
       ...(this.clusterLink == null
         ? {}

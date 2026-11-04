@@ -6362,6 +6362,77 @@ Semantics notes:
   are not revisable here — they are the export destination and identity
   fixed at construction.
 
+## OTLP metrics export (EB-370)
+
+**Opt-in.** Pushes bus-level `BusStats` snapshots to an OpenTelemetry
+collector over OTLP/HTTP as hand-encoded JSON — zero new dependencies,
+no OTel SDK — the push complement to the pull-mode Prometheus
+exposition (`renderPrometheus`) and to the span exporter above (which
+only ships traces). A deployment that runs an OTLP collector and never
+scrapes Prometheus gets the bus's counters, gauges, latency
+distributions, and per-topic payload histograms from here:
+
+```ts
+const bus = new EventBus({
+  otlpMetrics: {
+    endpoint: 'http://collector:4318/v1/metrics',
+    serviceName: 'checkout-bus', // default 'realtime-event-bus'
+    flushIntervalMs: 5000, // export cadence (default 5000)
+    timeoutMs: 5000, // per-request timeout (default 5000)
+    headers: { Authorization: 'Bearer …' }, // extra POST headers
+    perTopic: { maxTopics: 20 }, // hottest topics only (default 20); false disables per-topic series
+  },
+});
+```
+
+Mapping table (metric names reuse the Prometheus names, only the type
+changes, so a collector can align push and scrape series directly):
+
+| `BusStats` source | OTLP metric | OTLP type |
+|---|---|---|
+| Counters (`totalPublished`, `deliveredMessages`, `droppedMessages`, `deadLetteredMessages`, `expiredMessages`, `rejectedMessages`, `filteredMessages`, `sampledMessages`, `duplicateMessages`, `dedupDropped`, `gapRepaired`, … — every `*_total` counter `renderPrometheus` emits) | `eventbus_*_total` | Sum (Cumulative, Monotonic) |
+| Water levels (`totalSubscribers`, `degradedSubscribers`, `circuitBreakers` open, `creditExhaustedSubscribers`, `causalBuffer.depth`, `queueBytes`, …) | `eventbus_subscribers`, `eventbus_degraded_subscribers`, `eventbus_circuit_breakers_open`, … | Gauge |
+| Latency distributions (`deliveryLatency`, `publishLatency`, `ackLatency` p50/p95/p99, ms) | `eventbus_delivery_latency_ms`, `eventbus_publish_admission_latency_ms`, `eventbus_ack_latency_ms` (one data point per quantile) | Gauge |
+| Latency sample counts | `eventbus_*_latency_samples` | Sum |
+| Per-topic payload histograms (EB-143) | `eventbus_payload_bytes` (`explicit_bounds` = configured bounds + `+Inf`, `bucket_counts` differential) | Histogram |
+
+Semantics notes:
+
+- `otlpMetrics` needs no tracing — metrics exist whether or not
+  `trace` samples anything — and is independent of `otlp`: the two
+  exporters share the transport skeleton but carry different signals
+  to the same collector.
+- Best-effort, never in the delivery path: a snapshot exports on an
+  unref'd timer (never holds the process open); a failed export POST
+  drops that snapshot and counts it in
+  `getStats().otlpMetrics.failedExports` — the exporter does not
+  retry. Metrics are snapshots, not an event stream, so nothing
+  buffers: each tick exports only the newest snapshot (no `batchSize`,
+  no `maxBuffered`, no `sampleRate`).
+- Cardinality bound: per-topic series (`eventbus_published_messages_total`
+  with a `topic` attribute, per-topic payload histograms) cover only
+  the hottest topics by 1m publish rate (`getStats().hotTopics`), at
+  most `maxTopics` (default 20; `getStats().hotTopics` itself caps at
+  10, so the effective ceiling is `min(maxTopics, 10)` today);
+  `perTopic: false` emits bus-level aggregates only. Per-topic
+  delivered/dropped counts are not exported: `TopicStats` carries no
+  per-topic delivered/dropped counters (bus-level only), so the
+  exporter reports only what `BusStats` actually measures.
+- Sum `startTimeUnixNano` is the exporter construction time — an
+  approximation of the bus start, since `getStats()` counters
+  accumulate over the process lifetime. Resource attributes carry only
+  `service.name`, matching the span exporter.
+- `getStats().otlpMetrics` (`{ endpoint, exportedMetrics,
+  failedExports, lastExportAtMs }`) is present only when export is
+  configured; without it the stats shape is byte-identical to before.
+- `bus.flushOtlpMetrics()` exports the latest snapshot
+  deterministically — the hook for tests and graceful shutdown.
+  `close()` awaits it for one final export, then stops the exporter's
+  timer; a second `close()` does not re-export. There is no
+  `setOtlpMetrics` live-revision entry — tuning revisions are a
+  separate item. Invalid options throw `RangeError` from the
+  constructor.
+
 ## Trace span archive journal (EB-167)
 
 **Opt-in.** The trace pipeline's in-memory ring (`getStats().traceSpans`)
