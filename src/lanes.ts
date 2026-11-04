@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { BoundedQueue, type DropPolicy } from './backpressure.ts';
+import { BoundedQueue, assertValidDropPolicy, type DropPolicy } from './backpressure.ts';
 
 /**
  * Per-topic priority lanes (EB-122): `urgent` / `normal` / `bulk`.
@@ -207,7 +207,11 @@ export interface LaneQueueOptions<T> {
 export class LaneQueue<T> {
   private readonly lanes: Record<MessageLane, BoundedQueue<T>>;
   private capacity: number;
-  private readonly policy: DropPolicy;
+  // Mutable since EB-375 (`setPolicy`): `push` reads the policy live on
+  // every admission, so a revision governs from the next push with no
+  // queue rebuild — the only writer is `setPolicy`, which fans out to
+  // the three lane queues (the `setCapacity` pattern).
+  private policy: DropPolicy;
   // Live-tuned by `retune` (EB-310): the drain sites read these fields
   // on every call, so a revision governs from the next drain round
   // without draining or rebuilding the queue. They are not `readonly`
@@ -284,6 +288,11 @@ export class LaneQueue<T> {
   /** Queued entries in one lane. */
   laneSize(lane: MessageLane): number {
     return this.lanes[lane].size;
+  }
+
+  /** The live shed policy, as last set by the constructor or `setPolicy`. */
+  get dropPolicy(): DropPolicy {
+    return this.policy;
   }
 
   /** Aggregate buffered bytes across lanes (0 when no byte budget is configured). */
@@ -368,6 +377,20 @@ export class LaneQueue<T> {
       this.highWaterMarkReached = true;
     }
     this.maybeFireDrained();
+  }
+
+  /**
+   * Revises the shed policy at runtime (EB-375, via
+   * `EventBus.setDropPolicy`): fans out to the three lane queues, so
+   * the aggregate and every lane shed per the new policy from the next
+   * `push`. Queued entries are untouched; the `'block'` latch is
+   * untouched. Validated before anything moves, so an illegal value
+   * leaves every lane's policy exactly as it was.
+   */
+  setPolicy(policy: DropPolicy): void {
+    assertValidDropPolicy(policy, 'setPolicy');
+    this.policy = policy;
+    for (const lane of MESSAGE_LANES) this.lanes[lane].setPolicy(policy);
   }
 
   /**

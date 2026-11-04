@@ -1,5 +1,6 @@
 import {
   assertValidBackpressurePolicy,
+  assertValidDropPolicy,
   type BackpressurePolicy,
   type DropPolicy,
 } from './backpressure.ts';
@@ -34406,6 +34407,90 @@ export class EventBus {
       detail: {
         backpressure: tier,
         oldBackpressure,
+      },
+    });
+  }
+
+  /**
+   * Revises a subscription's queue shed policy (EB-375) without
+   * re-subscribing: `setDropPolicy(subId, policy)` retunes which message
+   * is dropped when the subscriber's bounded queue is full at enqueue
+   * time (see `SubscribeOptions.dropPolicy`, EB-83).
+   *
+   * There is no opt-in gate: every subscription always carries an
+   * already-resolved policy — `resolveBackpressurePolicy` settled it at
+   * subscribe time, defaulting to `'drop-oldest'` — so there is no
+   * "unset" state and no revision is ever refused for lacking one. The
+   * policy is validated with its own two-value gate
+   * (`assertValidDropPolicy`): `'block'` is a backpressure tier, not a
+   * shed policy, so it throws `RangeError` here even though the
+   * subscribe-time tier validation (`assertValidBackpressurePolicy`)
+   * admits it — and a non-string value throws likewise, with the live
+   * policy and the audit log untouched.
+   *
+   * Only the policy moves: `queueSize`, `queueMaxBytes`,
+   * `highWaterMarkRatio`, the backpressure tier, the `'block'` latch,
+   * already-queued messages, and the `onEvicted` drop accounting never
+   * move. The queue object is mutated in place (`LaneQueue.setPolicy`
+   * fans out to the three lane queues), so the new policy governs from
+   * the next `push` — the count-saturation shed (drop tiers), the
+   * byte-budget shed (all tiers), and the `'block'` tier's
+   * first-saturation admit-with-shed all pick their victim by the new
+   * policy, while already-queued messages are never re-shed. The
+   * revision itself neither arms nor clears the `'block'` latch: a
+   * blocked subscriber still refuses arrivals until the queue recedes
+   * below the high-water mark, when the usual `onDrained` path clears
+   * it. A shadow subscription's queue is revised through its own
+   * subscription id exactly the same way — the shadow mirror pushes
+   * through the same queue object, so the revision applies to the
+   * mirror with no separate entry point. A revision identical to the
+   * current policy is a no-op with no audit.
+   *
+   * Orthogonal to `setBackpressureTier` (EB-285, that revises the tier
+   * — block-vs-drop when full — this revises which message is dropped),
+   * to `setQueueSize` (EB-281, capacity), and to `setQueueMaxBytes`
+   * (EB-282, the byte budget the new policy sheds within). Audited as
+   * `drop_policy_revised` (`{ dropPolicy: <policy>,
+   * oldDropPolicy: <policy> }`); no `getStats` field is added — the
+   * audit detail plus the live policy already carried by every
+   * `backpressure_dropped` audit detail are the observability channel.
+   *
+   * Throws `RangeError` for an unknown subscriber or an illegal policy,
+   * and `BusClosedError` when the bus is already closed (EB-154).
+   */
+  setDropPolicy(subId: string, policy: DropPolicy): void {
+    // EB-154: a closed bus never takes new configuration — refusing the
+    // revision fail-fast keeps the shutdown terminal.
+    this.assertNotClosed('subscribe', subId);
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDropPolicy: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDropPolicy: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: the two-value gate refuses
+    // 'block' and non-strings alike, so an illegal policy never moves
+    // the live policy.
+    assertValidDropPolicy(policy, 'setDropPolicy');
+    const oldDropPolicy = subscriber.queue.dropPolicy;
+    // Identical policy: a no-op — no audit, and no queue state moves
+    // (in particular the 'block' latch is neither armed nor cleared).
+    if (policy === oldDropPolicy) {
+      return;
+    }
+    // Only the policy moves; every admission decision re-reads the live
+    // policy from the queue (see `LaneQueue.push` / `BoundedQueue.push`),
+    // and the blocked latch is untouched.
+    subscriber.queue.setPolicy(policy);
+    this.auditSubscription({
+      action: 'drop_policy_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        dropPolicy: policy,
+        oldDropPolicy,
       },
     });
   }

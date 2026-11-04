@@ -1016,6 +1016,34 @@ library.
   Orthogonal to the capacity (EB-281, that revises `queueSize`,
   this revises the full-queue behavior). (Real-time systems:
   delivery governance.)
+  Revisable after subscribe (EB-375, via
+  `setDropPolicy(subId, policy)`): a subscription's queue shed
+  policy can be retuned without re-subscribing — and there is no
+  opt-in gate, because every subscription always carries an
+  already-resolved policy (default `'drop-oldest'`). Only the
+  policy moves: `queueSize`, `queueMaxBytes`,
+  `highWaterMarkRatio`, the backpressure tier, the `'block'`
+  latch, already-queued messages, and the drop accounting are
+  untouched, and the new policy governs from the next push — the
+  count-saturation shed, the byte-budget shed, and the `'block'`
+  tier's first-saturation admit-with-shed all pick their victim
+  by the new policy. The revision itself neither arms nor clears
+  the `'block'` latch, and a shadow subscription's queue is
+  revised through its own subscription id, the mirror shedding
+  per the new policy with no separate entry point. A revision
+  identical to the current policy is a no-op with no audit. It
+  is fail-closed (an unknown subscriber or a policy outside
+  `'drop-oldest' | 'drop-newest'` throws `RangeError` with the
+  live policy and the audit log untouched — `'block'` is a tier,
+  not a policy — and a closed bus refuses with
+  `BusClosedError`), and every success is audited as
+  `drop_policy_revised` (`{ dropPolicy: <policy>,
+  oldDropPolicy: <policy> }`); no `getStats` field is added, the
+  audit detail plus the live policy already carried by every
+  `backpressure_dropped` detail are the observability channel.
+  Orthogonal to the tier (EB-285, that revises block-vs-drop
+  when full, this revises which message is dropped). (Real-time
+  systems: backpressure governance.)
   Revisable after subscribe (EB-281, via
   `setQueueSize(subId, size | null)`): a subscriber's queue count
   capacity can be retuned without re-subscribing — every subscription

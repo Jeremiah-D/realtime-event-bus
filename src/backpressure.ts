@@ -30,6 +30,23 @@ export function assertValidBackpressurePolicy(
 }
 
 /**
+ * Validates a queue shed policy (EB-375): only the two `DropPolicy`
+ * values — `'block'` is a backpressure tier, not a shed policy, so it is
+ * refused here even though `assertValidBackpressurePolicy` admits it.
+ * Throws `RangeError` on illegal values.
+ */
+export function assertValidDropPolicy(
+  value: unknown,
+  where: string,
+): asserts value is DropPolicy {
+  if (value !== 'drop-oldest' && value !== 'drop-newest') {
+    throw new RangeError(
+      `${where}: dropPolicy must be 'drop-oldest' or 'drop-newest'`,
+    );
+  }
+}
+
+/**
  * Message priority for shed decisions. Higher values are shed later:
  * when the queue is full under `drop-oldest`, the oldest entry with the
  * lowest priority is dropped first. The default priority is 0.
@@ -98,7 +115,10 @@ function defaultByteSize(item: unknown): number {
 export class BoundedQueue<T> {
   private entries: QueueEntry<T>[] = [];
   private capacity: number;
-  private readonly policy: DropPolicy;
+  // Mutable since EB-375 (`setPolicy`): `push` reads the policy live on
+  // every admission, so a revision governs from the next push with no
+  // queue rebuild — the only writer is `setPolicy`.
+  private policy: DropPolicy;
   private readonly onHighWaterMark?: (size: number) => void;
   private readonly onDrained?: (size: number) => void;
   private highWaterMarkFraction: number;
@@ -166,6 +186,11 @@ export class BoundedQueue<T> {
     return this.droppedByPriorityCount;
   }
 
+  /** The live shed policy, as last set by the constructor or `setPolicy`. */
+  get dropPolicy(): DropPolicy {
+    return this.policy;
+  }
+
   /** High-water mark as a fraction of capacity, in (0, 1]. */
   get highWaterMarkRatio(): number {
     return this.highWaterMarkFraction;
@@ -205,6 +230,19 @@ export class BoundedQueue<T> {
     }
     this.capacity = capacity;
     this.maybeFireDrained();
+  }
+
+  /**
+   * Revises the shed policy at runtime (EB-375, via
+   * `EventBus.setDropPolicy`). Queued entries are untouched — the new
+   * policy governs only future `push` calls, which shed or refuse per
+   * it on both the count and the byte dimension. Throws `RangeError`
+   * for a value outside `'drop-oldest' | 'drop-newest'` (`'block'` is a
+   * backpressure tier, not a shed policy).
+   */
+  setPolicy(policy: DropPolicy): void {
+    assertValidDropPolicy(policy, 'setPolicy');
+    this.policy = policy;
   }
 
   /**
