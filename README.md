@@ -7245,6 +7245,28 @@ Semantics:
   `eventbus_circuit_breaker_trips_total`,
   `eventbus_circuit_breakers_open`, and per-topic
   `eventbus_topic_circuit_broken_messages_total{topic}`.
+- **Live threshold revision (EB-372).**
+  `bus.revisePublishCircuitBreaker(topic, patch)` retunes an armed
+  breaker's thresholds in place, without rebuilding it:
+  `consecutiveShedPublishes` and/or `halfOpenProbeIntervalMs` move,
+  fields left out keep their live values. Unlike re-arming with
+  `setPublishCircuitBreaker` — which resets the breaker to `'closed'`
+  and zeroes the streak and refusal count — a revision preserves the
+  live state and counters verbatim: an open breaker stays open, is not
+  re-timed, and no counter is zeroed, so shortening
+  `halfOpenProbeIntervalMs` makes the next probe earlier against the
+  original open time. The new thresholds apply to subsequent publish
+  evaluation at once. Only an already-armed topic can be revised (an
+  unarmed topic throws `RangeError`); an illegal merged value throws
+  `RangeError` and leaves the live record untouched; a revision
+  identical to the live thresholds is a no-op with no audit. Applied
+  revisions are recorded in the subscription audit log as
+  `publish_circuit_breaker_revised` (`{ topic, previous, current }`,
+  each holding both thresholds), and a closed bus refuses the revision
+  with `BusClosedError`. `bus.publishCircuitBreaker(topic)` returns the
+  live snapshot — both thresholds plus `state`, `consecutiveBlocked`,
+  and `rejectedMessages` — or `undefined` when no rule is armed
+  (`getStats().circuitBreakers` rows carry no thresholds).
 
 ## Subscriber auto circuit breaker (EB-215)
 

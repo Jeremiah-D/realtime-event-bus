@@ -3969,6 +3969,56 @@ export interface CircuitBreakerStat {
 }
 
 /**
+ * Live revision of a topic's publish circuit breaker thresholds (EB-372):
+ * the patch for `revisePublishCircuitBreaker`. Only the fields provided
+ * move; the rest keep their live values. Absent fields leave the live
+ * value untouched. Merged against the live values and validated with the
+ * setter's exact rules (`setPublishCircuitBreaker`, EB-116), so an
+ * illegal merged value throws `RangeError` and the live record is fully
+ * untouched. The breaker's state and counters are never moved by a
+ * revision — an open breaker stays open, is not re-timed, and no counter
+ * is zeroed.
+ */
+export interface PublishCircuitBreakerRevision {
+  /**
+   * New trip threshold: consecutive all-degraded/shedding publishes
+   * before the breaker opens. Must be a positive integer.
+   */
+  consecutiveShedPublishes?: number;
+  /**
+   * New half-open probe interval in milliseconds, measured on the bus
+   * clock. Must be a positive finite number.
+   */
+  halfOpenProbeIntervalMs?: number;
+}
+
+/**
+ * Live snapshot of a topic's publish circuit breaker (see
+ * `publishCircuitBreaker`, EB-372): both thresholds plus the live gate
+ * state and counters. `getStats().circuitBreakers` rows
+ * (`CircuitBreakerStat`) carry no thresholds — this snapshot fills that
+ * gap.
+ */
+export interface PublishCircuitBreakerSnapshot {
+  /** The concrete topic the breaker guards. */
+  topic: string;
+  /** Publishes-in-a-row with every subscriber degraded/shedding that trip the breaker. */
+  consecutiveShedPublishes: number;
+  /** Milliseconds an open breaker waits before admitting a half-open probe. */
+  halfOpenProbeIntervalMs: number;
+  /** `'closed'` (normal), `'open'` (fast-failing), or `'half-open'` (probing). */
+  state: PublishCircuitBreakerState;
+  /**
+   * Consecutive publishes that found every production subscriber of the
+   * topic degraded or shedding. Reset by any publish that finds a
+   * healthy subscriber.
+   */
+  consecutiveBlocked: number;
+  /** Publishes refused while the breaker was open (fast-fail). */
+  rejectedMessages: number;
+}
+
+/**
  * Tuning for a reliable subscriber's dead-letter queue (see
  * `ReliableSubscribeOptions.deadLetter`).
  */
@@ -19497,6 +19547,112 @@ export class EventBus {
    */
   circuitBreakerState(topic: string): PublishCircuitBreakerState | undefined {
     return this.publishCircuitBreakers.get(topic)?.state;
+  }
+
+  /**
+   * Revises a topic's publish circuit breaker thresholds live (EB-372)
+   * — without rebuilding the breaker. Only a topic with an already-armed
+   * rule can be revised: an unarmed topic throws `RangeError` (install a
+   * new rule with `setPublishCircuitBreaker`, which rebuilds the record
+   * from scratch). The patch merges over the live thresholds and is
+   * validated with the setter's exact rules, so an illegal merged value
+   * throws `RangeError` and the live record is fully untouched.
+   *
+   * The revision moves only the two thresholds, in place on the live
+   * record: `state`, `consecutiveBlocked`, `openedAtMs`, and
+   * `rejectedMessages` are preserved verbatim — an open breaker stays
+   * open, is not re-timed, and no counter is zeroed. The new thresholds
+   * apply to subsequent publish evaluation at once: the trip check in
+   * `updatePublishCircuitBreaker` reads `consecutiveShedPublishes` live,
+   * and the probe gate in `checkPublishCircuitBreaker` reads
+   * `halfOpenProbeIntervalMs` live against the original `openedAtMs`,
+   * so shortening the interval makes the next probe earlier without
+   * re-opening.
+   *
+   * A revision identical to the live thresholds is a no-op with no
+   * audit. Otherwise the change is recorded in the subscription audit
+   * log as `publish_circuit_breaker_revised` (`{ topic, previous,
+   * current }`, each holding both thresholds). Returns the live
+   * snapshot after the revision. A closed bus refuses the revision
+   * with `BusClosedError` (EB-154).
+   *
+   * Orthogonal to EB-116 (that is the breaker mechanism itself — this
+   * its thresholds' live revision), to EB-215 (that is the subscriber
+   * side — this the publish side), and to `setPublishCircuitBreaker`
+   * (whole-rule replacement that resets state and counters — this
+   * retunes them in place).
+   *
+   * Throws `RangeError` for a non-object patch, for a topic with no
+   * armed rule, or for an illegal merged threshold value.
+   */
+  revisePublishCircuitBreaker(
+    topic: string,
+    patch: PublishCircuitBreakerRevision,
+  ): PublishCircuitBreakerSnapshot {
+    // EB-154: a closed bus never takes new configuration — refusing the
+    // revision fail-fast keeps the shutdown terminal.
+    this.assertNotClosed('publish', topic);
+    if (patch == null || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError('revisePublishCircuitBreaker: patch must be an object');
+    }
+    const breaker = this.publishCircuitBreakers.get(topic);
+    if (breaker === undefined) {
+      throw new RangeError(
+        `revisePublishCircuitBreaker: no publish circuit breaker armed for topic "${topic}" ` +
+          '(install one with setPublishCircuitBreaker first)',
+      );
+    }
+    // Merge over the live values, then validate with the setter's exact
+    // rules — before touching anything, so an illegal value leaves the
+    // live record and the audit exactly as they were.
+    const consecutiveShedPublishes = patch.consecutiveShedPublishes ?? breaker.consecutiveShedPublishes;
+    if (!Number.isInteger(consecutiveShedPublishes) || consecutiveShedPublishes < 1) {
+      throw new RangeError('consecutiveShedPublishes must be a positive integer');
+    }
+    const halfOpenProbeIntervalMs = patch.halfOpenProbeIntervalMs ?? breaker.halfOpenProbeIntervalMs;
+    if (!Number.isFinite(halfOpenProbeIntervalMs) || halfOpenProbeIntervalMs <= 0) {
+      throw new RangeError('halfOpenProbeIntervalMs must be a positive finite number of milliseconds');
+    }
+    const previous = {
+      consecutiveShedPublishes: breaker.consecutiveShedPublishes,
+      halfOpenProbeIntervalMs: breaker.halfOpenProbeIntervalMs,
+    };
+    // Re-affirming the live thresholds is a no-op: no retune, no audit.
+    if (
+      consecutiveShedPublishes === previous.consecutiveShedPublishes &&
+      halfOpenProbeIntervalMs === previous.halfOpenProbeIntervalMs
+    ) {
+      return this.publishCircuitBreaker(topic) as PublishCircuitBreakerSnapshot;
+    }
+    const current = { consecutiveShedPublishes, halfOpenProbeIntervalMs };
+    breaker.consecutiveShedPublishes = consecutiveShedPublishes;
+    breaker.halfOpenProbeIntervalMs = halfOpenProbeIntervalMs;
+    this.auditSubscription({
+      action: 'publish_circuit_breaker_revised',
+      actor: 'system',
+      detail: { topic, previous, current },
+    });
+    return this.publishCircuitBreaker(topic) as PublishCircuitBreakerSnapshot;
+  }
+
+  /**
+   * Returns a live snapshot of the publish circuit breaker armed for
+   * `topic` — both thresholds plus the live gate state and counters —
+   * or `undefined` when no rule is configured. `getStats().circuitBreakers`
+   * rows (`CircuitBreakerStat`) carry no thresholds; this getter fills
+   * that gap (EB-372).
+   */
+  publishCircuitBreaker(topic: string): PublishCircuitBreakerSnapshot | undefined {
+    const breaker = this.publishCircuitBreakers.get(topic);
+    if (breaker === undefined) return undefined;
+    return {
+      topic: breaker.topic,
+      consecutiveShedPublishes: breaker.consecutiveShedPublishes,
+      halfOpenProbeIntervalMs: breaker.halfOpenProbeIntervalMs,
+      state: breaker.state,
+      consecutiveBlocked: breaker.consecutiveBlocked,
+      rejectedMessages: breaker.rejectedMessages,
+    };
   }
 
   /**

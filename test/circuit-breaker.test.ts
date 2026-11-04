@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EventBus,
+  BusClosedError,
   CircuitBreakerOpenError,
   type AdmissionRejectionEvent,
 } from '../src/bus.ts';
@@ -234,4 +235,221 @@ test('Prometheus exposition carries the breaker series', async () => {
   assert.match(exposition, /^eventbus_circuit_breaker_trips_total 1$/m);
   assert.match(exposition, /^eventbus_circuit_breakers_open 1$/m);
   assert.match(exposition, /^eventbus_topic_circuit_broken_messages_total\{topic="t"\} 1$/m);
+});
+
+// --- Live threshold revision (EB-372) ---
+
+const revisedAudit = (bus: EventBus) =>
+  bus.getSubscriptionAudit({ action: 'publish_circuit_breaker_revised' });
+
+test('revising thresholds while closed trips at the new threshold', async () => {
+  const bus = new EventBus();
+  await degradeSubscriber(bus, 't');
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 5 });
+  bus.publish('t', 'a'); // streak 1
+  bus.publish('t', 'b'); // streak 2
+  // Tighten the threshold below the live streak: the next publish trips.
+  const snapshot = bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 3 });
+  assert.deepEqual(snapshot, {
+    topic: 't',
+    consecutiveShedPublishes: 3,
+    halfOpenProbeIntervalMs: 1000,
+    state: 'closed',
+    consecutiveBlocked: 2,
+    rejectedMessages: 0,
+  });
+  bus.publish('t', 'c'); // streak 3 → trips at the new threshold
+  assert.equal(bus.circuitBreakerState('t'), 'open');
+  assert.equal(bus.getStats().circuitBreakerTrips, 1);
+});
+
+test('revising while open keeps it open with openedAtMs and rejectedMessages unchanged', async () => {
+  const clock = controllableClock();
+  const bus = new EventBus({ now: clock.now });
+  await degradeSubscriber(bus, 't');
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 1, halfOpenProbeIntervalMs: 1000 });
+  bus.publish('t', 'd'); // trips open at clock 1000
+  assert.equal(bus.circuitBreakerState('t'), 'open');
+  assertCircuitOpenError(() => bus.publish('t', 'nope'), 't'); // rejectedMessages 1
+  clock.nowMs += 500; // revision happens at 1500, not at the trip time
+  const snapshot = bus.revisePublishCircuitBreaker('t', { halfOpenProbeIntervalMs: 5000 });
+  assert.equal(snapshot.state, 'open');
+  assert.equal(snapshot.rejectedMessages, 1);
+  // openedAtMs is still the trip time (1000), not the revision time
+  // (1500): the probe is due at 1000 + 5000 = 6000. At 5500 the gate
+  // still fast-fails; at 6000 the probe is admitted.
+  clock.nowMs += 4000; // 5500
+  assertCircuitOpenError(() => bus.publish('t', 'still-early'), 't');
+  assert.equal(bus.publishCircuitBreaker('t')?.rejectedMessages, 2);
+  clock.nowMs += 500; // 6000: probe admitted, still degraded → re-opens
+  assert.equal(bus.publish('t', 'probe'), 1);
+  assert.equal(bus.circuitBreakerState('t'), 'open');
+});
+
+test('consecutiveBlocked is not zeroed by a revision', async () => {
+  const bus = new EventBus();
+  await degradeSubscriber(bus, 't');
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 5 });
+  bus.publish('t', 'a'); // streak 1
+  bus.publish('t', 'b'); // streak 2
+  bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 4 });
+  bus.publish('t', 'c'); // streak 3 — still closed
+  assert.equal(bus.circuitBreakerState('t'), 'closed');
+  bus.publish('t', 'd'); // streak 4 → trips; a zeroed streak would need 4 more
+  assert.equal(bus.circuitBreakerState('t'), 'open');
+  assert.equal(bus.publishCircuitBreaker('t')?.consecutiveBlocked, 4);
+});
+
+test('illegal merge throws RangeError and the live record is fully untouched', async () => {
+  const bus = new EventBus();
+  await degradeSubscriber(bus, 't');
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 2, halfOpenProbeIntervalMs: 1000 });
+  bus.publish('t', 'a'); // streak 1
+  const before = bus.publishCircuitBreaker('t');
+  const bad: Array<unknown> = [
+    { consecutiveShedPublishes: 0 },
+    { consecutiveShedPublishes: -2 },
+    { consecutiveShedPublishes: 1.5 },
+    { consecutiveShedPublishes: Number.NaN },
+    { halfOpenProbeIntervalMs: 0 },
+    { halfOpenProbeIntervalMs: -1 },
+    { halfOpenProbeIntervalMs: Number.NaN },
+    { halfOpenProbeIntervalMs: Number.POSITIVE_INFINITY },
+    // One good field does not save a bad sibling.
+    { consecutiveShedPublishes: 3, halfOpenProbeIntervalMs: -1 },
+    // A non-object patch asks nothing valid to move.
+    null,
+    42,
+    'nope',
+    [],
+  ];
+  for (const patch of bad) {
+    assert.throws(
+      () => bus.revisePublishCircuitBreaker('t', patch as never),
+      RangeError,
+      `expected RangeError for ${JSON.stringify(patch)}`,
+    );
+  }
+  assert.deepEqual(bus.publishCircuitBreaker('t'), before);
+  assert.equal(revisedAudit(bus).length, 0);
+  // The live breaker is intact: one more all-degraded publish trips it
+  // at the unchanged threshold of 2.
+  bus.publish('t', 'b');
+  assert.equal(bus.circuitBreakerState('t'), 'open');
+});
+
+test('revising an unarmed topic throws RangeError', () => {
+  const bus = new EventBus();
+  assert.throws(() => bus.revisePublishCircuitBreaker('ghost', { consecutiveShedPublishes: 2 }), RangeError);
+  assert.equal(revisedAudit(bus).length, 0);
+  // Clearing the rule un-arms it again: a later revision is refused.
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 2 });
+  assert.equal(bus.clearPublishCircuitBreaker('t'), true);
+  assert.throws(() => bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 2 }), RangeError);
+});
+
+test('same-value revision is a no-op: no audit', () => {
+  const bus = new EventBus();
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 2, halfOpenProbeIntervalMs: 1000 });
+  assert.deepEqual(bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 2 }), {
+    topic: 't',
+    consecutiveShedPublishes: 2,
+    halfOpenProbeIntervalMs: 1000,
+    state: 'closed',
+    consecutiveBlocked: 0,
+    rejectedMessages: 0,
+  });
+  bus.revisePublishCircuitBreaker('t', { halfOpenProbeIntervalMs: 1000 });
+  bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 2, halfOpenProbeIntervalMs: 1000 });
+  bus.revisePublishCircuitBreaker('t', {});
+  assert.equal(revisedAudit(bus).length, 0);
+});
+
+test('audit records previous and current thresholds', () => {
+  const bus = new EventBus();
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 5, halfOpenProbeIntervalMs: 1000 });
+  bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 2 });
+  assert.deepEqual(revisedAudit(bus)[0].detail, {
+    topic: 't',
+    previous: { consecutiveShedPublishes: 5, halfOpenProbeIntervalMs: 1000 },
+    current: { consecutiveShedPublishes: 2, halfOpenProbeIntervalMs: 1000 },
+  });
+  bus.revisePublishCircuitBreaker('t', { halfOpenProbeIntervalMs: 250 });
+  assert.deepEqual(revisedAudit(bus)[1].detail, {
+    topic: 't',
+    previous: { consecutiveShedPublishes: 2, halfOpenProbeIntervalMs: 1000 },
+    current: { consecutiveShedPublishes: 2, halfOpenProbeIntervalMs: 250 },
+  });
+  assert.equal(revisedAudit(bus).length, 2);
+});
+
+test('publishCircuitBreaker returns live thresholds, or undefined when unarmed', async () => {
+  const bus = new EventBus();
+  assert.equal(bus.publishCircuitBreaker('t'), undefined);
+  await degradeSubscriber(bus, 't');
+  bus.setPublishCircuitBreaker('t', {});
+  // Defaults surface: 5 publishes, 1000 ms probe interval.
+  assert.deepEqual(bus.publishCircuitBreaker('t'), {
+    topic: 't',
+    consecutiveShedPublishes: 5,
+    halfOpenProbeIntervalMs: 1000,
+    state: 'closed',
+    consecutiveBlocked: 0,
+    rejectedMessages: 0,
+  });
+  bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 1, halfOpenProbeIntervalMs: 500 });
+  assert.deepEqual(bus.publishCircuitBreaker('t'), {
+    topic: 't',
+    consecutiveShedPublishes: 1,
+    halfOpenProbeIntervalMs: 500,
+    state: 'closed',
+    consecutiveBlocked: 0,
+    rejectedMessages: 0,
+  });
+  // Live state follows the breaker, not the getter: after a trip and a
+  // fast-fail the snapshot shows the open state and the refusal count.
+  bus.publish('t', 'd'); // trips open at threshold 1
+  assertCircuitOpenError(() => bus.publish('t', 'nope'), 't');
+  assert.deepEqual(bus.publishCircuitBreaker('t'), {
+    topic: 't',
+    consecutiveShedPublishes: 1,
+    halfOpenProbeIntervalMs: 500,
+    state: 'open',
+    consecutiveBlocked: 1,
+    rejectedMessages: 1,
+  });
+  assert.equal(bus.clearPublishCircuitBreaker('t'), true);
+  assert.equal(bus.publishCircuitBreaker('t'), undefined);
+});
+
+test('shortening halfOpenProbeIntervalMs makes the next probe earlier', async () => {
+  const clock = controllableClock();
+  const bus = new EventBus({ now: clock.now });
+  await degradeSubscriber(bus, 't');
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 1, halfOpenProbeIntervalMs: 10_000 });
+  bus.publish('t', 'd'); // trips open at clock 1000
+  clock.nowMs += 1000; // 2000: far short of the 10s interval
+  assertCircuitOpenError(() => bus.publish('t', 'too-early'), 't');
+  // Shorten the interval below the time already elapsed since the trip:
+  // the very next publish is admitted as the probe.
+  bus.revisePublishCircuitBreaker('t', { halfOpenProbeIntervalMs: 500 });
+  assert.equal(bus.publish('t', 'probe'), 1);
+  assert.equal(bus.circuitBreakerState('t'), 'open'); // still degraded: re-opened
+});
+
+test('revision after close is rejected with BusClosedError', async () => {
+  const bus = new EventBus();
+  bus.setPublishCircuitBreaker('t', { consecutiveShedPublishes: 2 });
+  await bus.close();
+  assert.throws(
+    () => bus.revisePublishCircuitBreaker('t', { consecutiveShedPublishes: 3 }),
+    (err: unknown) => {
+      assert.ok(err instanceof BusClosedError, `expected BusClosedError, got ${String(err)}`);
+      assert.equal((err as Error).name, 'BusClosedError');
+      assert.equal((err as BusClosedError).code, 'BUS_CLOSED');
+      assert.equal((err as BusClosedError).action, 'publish');
+      return true;
+    },
+  );
+  assert.equal(revisedAudit(bus).length, 0);
 });
