@@ -4353,6 +4353,20 @@ export interface DeadLetterBudgetRevision {
 }
 
 /**
+ * Partial revision for `EventBus.setDeadLetterApproval` (EB-377): only the
+ * fields present move — the rest keep their live values. `requireApproval`
+ * / `maxPending` carry the construction-time `DeadLetterOptions` meanings
+ * and bounds (`requireApproval` a boolean, `maxPending` a positive
+ * integer).
+ */
+export interface DeadLetterApprovalRevision {
+  /** Whether operator replays need approval (boolean). */
+  requireApproval?: boolean;
+  /** New bound for the pending-approval queue (positive integer). */
+  maxPending?: number;
+}
+
+/**
  * Partial revision for `EventBus.setDeadLetterAutoReplay` (EB-367): only
  * the fields present move — the rest keep their live values. The four
  * fields carry the construction-time `AutoReplayOptions` meanings and
@@ -32531,6 +32545,106 @@ export class EventBus {
         oldMaxEntries,
         maxAgeMs: newMaxAgeMs ?? null,
         oldMaxAgeMs,
+      },
+    });
+  }
+
+  /**
+   * Revises the dead-letter replay approval gate of one reliable
+   * subscriber (EB-377): whether operator replays need approval
+   * (`requireApproval`) and the bound on the pending-approval queue
+   * (`maxPending`) — without re-subscribing. Only the fields present
+   * in `patch` move; the rest keep their live values.
+   *
+   * Both values are read live at every `replayDeadLetter`, so the
+   * revision takes effect on the next replay request with no message,
+   * timer, or counter touched:
+   * - Flipping `requireApproval` ON parks the next replay request
+   *   (the entry leaves the DLQ into `pendingApprovals` and returns
+   *   `true` meaning "request accepted"); entries already in the DLQ
+   *   are untouched and the pending queue starts empty.
+   * - Flipping it OFF does not auto-release already-parked requests:
+   *   they still need `approveDeadLetterReplay` to requeue or
+   *   `rejectDeadLetterReplay` to return to the DLQ; only new
+   *   requests go straight through.
+   * - Tightening `maxPending` keeps already-parked requests beyond
+   *   the new bound — nothing is evicted — and only new requests are
+   *   gated (a full queue refuses the request, entry stays in the
+   *   DLQ, `dead_letter_replay_rejected` with reason
+   *   `'approval_queue_full'`); loosening only adds capacity.
+   * - A retarget replay (EB-240) composes: flipping approval ON
+   *   parks the request with its target attached, and only approval
+   *   publishes it to the repair topic.
+   * - `getDeadLetterStats` reads the live values, so the gate shows
+   *   there immediately.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable
+   * subscriber, a reliable subscriber with no `deadLetter`
+   * configured, and an illegal value — `requireApproval` must be a
+   * boolean (`TypeError`, reusing the construction-time
+   * `normalizeDeadLetterOptions` rule), `maxPending` a positive
+   * integer — all throw with the live gate and the audit log
+   * untouched. Passing the current values (or an empty patch) is a
+   * no-op with no audit. Audited as `dead_letter_approval_revised`
+   * (`{ requireApproval, oldRequireApproval, maxPending,
+   * oldMaxPending }`) on success.
+   *
+   * Orthogonal to EB-233 (the approval gate itself — this revises
+   * it live), to EB-365 (`setDeadLetterBudget`, the DLQ budget —
+   * this is the replay gate), to EB-367 (the auto-replay parameters
+   * — system auto-replay bypasses approval), and to EB-238 (the
+   * replay rate limit — this is whether a replay parks at all).
+   *
+   * Throws `TypeError` for a non-boolean `requireApproval` and
+   * `RangeError` for an unknown / non-reliable / DLQ-less
+   * subscriber, a non-object patch, or an illegal `maxPending`.
+   */
+  setDeadLetterApproval(subId: string, patch: DeadLetterApprovalRevision): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeadLetterApproval: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeadLetterApproval: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.reliable == null) {
+      throw new RangeError('setDeadLetterApproval: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) {
+      throw new RangeError('setDeadLetterApproval: subscriber has no deadLetter configured');
+    }
+    // Validate before touching anything: the construction-time rules
+    // from `normalizeDeadLetterOptions`, reused rather than restated.
+    if (patch === null || typeof patch !== 'object') {
+      throw new RangeError('setDeadLetterApproval: patch must be a DeadLetterApprovalRevision object');
+    }
+    const { requireApproval, maxPending } = patch;
+    if (requireApproval !== undefined && typeof requireApproval !== 'boolean') {
+      throw new TypeError('setDeadLetterApproval: requireApproval must be a boolean');
+    }
+    if (maxPending !== undefined && (!Number.isInteger(maxPending) || maxPending <= 0)) {
+      throw new RangeError('setDeadLetterApproval: maxPending must be a positive integer');
+    }
+    const oldRequireApproval = dlq.requireApproval;
+    const oldMaxPending = dlq.maxPending;
+    const newRequireApproval = requireApproval ?? oldRequireApproval;
+    const newMaxPending = maxPending ?? oldMaxPending;
+    if (newRequireApproval === oldRequireApproval && newMaxPending === oldMaxPending) {
+      return;
+    }
+    dlq.requireApproval = newRequireApproval;
+    dlq.maxPending = newMaxPending;
+    this.auditSubscription({
+      action: 'dead_letter_approval_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        requireApproval: newRequireApproval,
+        oldRequireApproval,
+        maxPending: newMaxPending,
+        oldMaxPending,
       },
     });
   }

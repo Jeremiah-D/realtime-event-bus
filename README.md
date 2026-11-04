@@ -8512,6 +8512,29 @@ All three transitions audit (`dead_letter_replay_requested`
   operator replay. (Backend engineering: dead-letter
   governance.)
 
+`setDeadLetterApproval(subId, { requireApproval, maxPending })`
+(EB-377) revises the gate live, without re-subscribing: only
+the fields present move. Flipping `requireApproval` on parks
+the next replay request (entries already in the DLQ are
+untouched, the pending queue starts empty); flipping it off
+does not auto-release already-parked requests — they still
+need `approveDeadLetterReplay` / `rejectDeadLetterReplay` —
+only new requests go straight through. Tightening
+`maxPending` keeps already-parked requests beyond the new
+bound and gates only new requests; loosening only adds
+capacity. A retarget replay (EB-240) composes: flipping
+approval on parks the request with its target attached, and
+only approval publishes it. Invalid values throw
+(`TypeError` for a non-boolean `requireApproval`,
+`RangeError` for an illegal `maxPending`) with the live
+gate untouched, and a revision identical to the current gate
+is a no-op with no audit. Revisions audit as
+`dead_letter_approval_revised` (`{ requireApproval,
+oldRequireApproval, maxPending, oldMaxPending }`), and
+`getDeadLetterStats` reads the live values. (Real-time
+systems / backend engineering: dead-letter replay
+governance.)
+
 ## Dead-letter replay rate limit (EB-238)
 
 `setDeadLetterReplayRateLimit(subId, { messagesPerSec, burst })`
