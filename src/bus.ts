@@ -20485,9 +20485,12 @@ export class EventBus {
    * the previous step matched; a matching arrival kills the partial. A
    * satisfied absence records `{ stepIndex, topic, windowMs }` and the
    * derived match carries `absences` (absent for purely positive
-   * matches). The deadline timer is unref'd and re-checks the pattern
-   * window on fire, so an idle bus never derives a stale absence. The
-   * first step can never be an absence step.
+   * matches). The deadline timer is unref'd and guarded by its armed
+   * window against the live window (EB-379): a timer that fires late
+   * still derives when the armed window fits the live `withinMs` — the
+   * event-free window really elapsed, only delivery was late — and a
+   * partial drops only when its armed window exceeds the live window.
+   * The first step can never be an absence step.
    *
    * Throws `RangeError` before anything is registered on invalid options
    * or a duplicate id. `getStats().cep` exposes the live counters
@@ -20530,9 +20533,11 @@ export class EventBus {
    * their life, and tightening `maxPartialMatches` evicts the oldest
    * partials on the next new partial. An absence step without an
    * explicit `absenceMs` follows the live `withinMs` from the next
-   * arming, and an armed deadline re-checks the live window on fire —
-   * so a partial that outlived a shrunken window while the bus was idle
-   * is dropped instead of deriving a stale absence.
+   * arming, and an already-armed deadline is guarded by its armed
+   * window against the live window on fire (EB-379) — so a partial
+   * whose armed window still fits derives even when the timer fires
+   * late, and only a partial whose armed window exceeds the shrunken
+   * live window is dropped instead of deriving.
    *
    * Fail-closed: a bus with no patterns defined, an unknown pattern id,
    * a non-object revision, and an illegal value all throw `RangeError`

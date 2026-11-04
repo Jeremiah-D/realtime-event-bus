@@ -9272,9 +9272,15 @@ Semantics notes:
   match carries `absences` (absent for purely positive matches).
   Absence steps compose with positive steps mid-pattern (`A, NOT B, C`)
   and chain (`A, NOT B, NOT C`); per-key state machines keep keys
-  isolated. The timer re-checks the pattern window on fire, so a partial
-  that outlived `withinMs` while the bus was idle is dropped instead of
-  deriving a stale absence. The first step can never be an absence step
+  isolated. The deadline guard compares the ARMED window against the
+  LIVE `withinMs` (EB-379), not the fire time: when the bus was idle and
+  the timer fires late (millisecond rounding / event-loop jitter), the
+  absence still derives — the event-free window really elapsed, only
+  delivery was late — and `durationMs` records the actual late-fire
+  time. A partial drops only when its armed window exceeds the live
+  window (an explicit `absenceMs` wider than `withinMs`, or a live
+  shrink under EB-297); `absences[].windowMs` records the armed value.
+  The first step can never be an absence step
   (`RangeError` — there is no anchor to start the window from), and a
   non-positive `absenceMs` throws `RangeError`.
 - `defineSequence` validates eagerly: fewer than two steps, a non-positive
@@ -9289,7 +9295,11 @@ Semantics notes:
   partials on the next observation's lazy sweep, widening it extends
   their life, and tightening `maxPartialMatches` evicts the oldest
   partials on the next new partial. An absence step without an explicit
-  `absenceMs` follows the live `withinMs` from the next arming. Unknown
+  `absenceMs` follows the live `withinMs` from the next arming; an
+  already-armed deadline is guarded by its armed window against the
+  live window on fire (EB-379) — it derives when the armed window still
+  fits, even if the timer fires late, and drops only when the live
+  window shrank below it. Unknown
   ids and illegal values throw `RangeError` with the live values
   untouched; an identical or empty revision is a no-op with no audit.
   Audited as `cep_sequence_pattern_revised` (the `pattern` field carries

@@ -31,10 +31,15 @@
  * topic arrives for the key first, the partial is killed — the absence can
  * never fire. If the deadline passes event-free, the absence is recorded
  * and the partial advances (completing the pattern when the absence step
- * was last). The timer re-checks the pattern window on fire, so a partial
- * that outlived `withinMs` while the bus was idle is dropped instead of
- * deriving a stale absence. `getStats().cep` exposes `absencePatterns`
- * and `absenceMatches`.
+ * was last). The guard at fire time compares the ARMED window against
+ * the LIVE pattern window (EB-379), not the fire time: a timer that
+ * fires late (millisecond rounding / event-loop jitter) still derives
+ * when the armed window fits the live window — the event-free window
+ * really elapsed, only delivery was late — and a partial is dropped
+ * only when its armed window exceeds the live `withinMs` (an explicit
+ * `absenceMs > withinMs`, or a live shrink under EB-297). `durationMs`
+ * records the actual late-fire time. `getStats().cep` exposes
+ * `absencePatterns` and `absenceMatches`.
  *
  * The class is pure in-memory state: the bus owns topic matching
  * (`compilePattern` is injected — this module must not import
@@ -202,6 +207,14 @@ interface PartialMatch {
    * clear — a dead partial never fires.
    */
   absenceTimer: unknown;
+  /**
+   * The absence window captured when the deadline was armed (EB-379):
+   * `step.absenceMs ?? pattern.withinMs` at arm time. The fire-time
+   * guard compares this armed value against the live `withinMs`, so a
+   * late-firing timer still derives when the armed window fits; cleared
+   * together with the timer on kill, sweep, eviction and clear.
+   */
+  absenceWindowMs?: number;
   /**
    * Set when the partial is dead (killed, swept, evicted, cleared,
    * completed). The timer callback checks it: a stale timer is a no-op.
@@ -372,11 +385,14 @@ export class CepEngine {
    * window expires in-flight partials on the next observation, widening
    * it extends their life), `startPartial` evicts against the live
    * `maxPartialMatches` (tightening it evicts the oldest partials on
-   * the next new partial), and an armed absence deadline re-checks the
-   * live `withinMs` on fire — an absence step without an explicit
-   * `absenceMs` follows the live window from the next arming. In-flight
-   * partials are untouched by the revision itself: already-recorded
-   * events, timers, and absence records stay as they are.
+   * the next new partial), and an armed absence deadline is guarded by
+   * its armed window against the live `withinMs` on fire (EB-379) — an
+   * absence step without an explicit `absenceMs` follows the live window
+   * from the next arming, while an already-armed deadline derives when
+   * its armed window still fits the live window and drops only when the
+   * live window shrank below it. In-flight partials are untouched by the
+   * revision itself: already-recorded events, timers, and absence
+   * records stay as they are.
    *
    * Returns whether anything moved, with the old and new values for the
    * audit record. A patch that provides neither field, and a patch
@@ -545,13 +561,15 @@ export class CepEngine {
   /**
    * Arms the absence deadline for a partial waiting at an absence step
    * (EB-174). The window runs `absenceMs` (default: the pattern's
-   * `withinMs`) from now, on the bus clock. The timer re-checks the
-   * pattern window on fire, so a partial that outlived `withinMs` while
-   * the bus was idle is dropped instead of deriving a stale absence.
+   * `withinMs`) from now, on the bus clock, and the armed value is
+   * captured on the partial (EB-379): the fire-time guard compares the
+   * armed window against the live `withinMs`, not the fire time, so a
+   * timer that fires late still derives when the armed window fits.
    */
   private armAbsence(pattern: CompiledPattern, partial: PartialMatch): void {
     const step = pattern.steps[partial.stepIndex];
     const windowMs = step.absenceMs ?? pattern.withinMs;
+    partial.absenceWindowMs = windowMs;
     partial.absenceTimer = this.setTimer(() => this.onAbsenceDeadline(pattern, partial), windowMs);
   }
 
@@ -561,19 +579,32 @@ export class CepEngine {
    * partial — completing the pattern when the absence step was last.
    * A consecutive absence step arms immediately, so `[A, NOT B, NOT C]`
    * chains without another anchor event.
+   *
+   * Guard (EB-379): the armed window is compared against the LIVE
+   * `withinMs` — drop only when the armed window exceeds it (an
+   * explicit `absenceMs > withinMs`, or a live shrink under EB-297).
+   * The fire time is never re-checked: when the bus was idle and the
+   * timer fires late, the event-free window really elapsed and the
+   * absence still derives, with `durationMs` recording the actual
+   * late-fire time.
    */
   private onAbsenceDeadline(pattern: CompiledPattern, partial: PartialMatch): void {
     if (partial.resolved) return;
     partial.absenceTimer = undefined;
     const now = this.deps.now();
-    if (now - partial.startedAt > pattern.withinMs) {
-      // The lazy sweep never ran while the bus was idle: the partial is
-      // older than the pattern window, so it dies deriving nothing.
+    const armedWindowMs = partial.absenceWindowMs;
+    partial.absenceWindowMs = undefined;
+    if (armedWindowMs !== undefined && armedWindowMs > pattern.withinMs) {
+      // The armed window no longer fits the live window: the partial
+      // dies deriving nothing (EB-297 shrink, or an explicit absenceMs
+      // wider than withinMs).
       this.dropPartial(pattern, partial);
       return;
     }
     const step = pattern.steps[partial.stepIndex];
-    const windowMs = step.absenceMs ?? pattern.withinMs;
+    // The recorded window is the armed value — a live revision after
+    // arming never rewrites what the deadline waited out.
+    const windowMs = armedWindowMs ?? step.absenceMs ?? pattern.withinMs;
     partial.absences.push({ stepIndex: partial.stepIndex, topic: step.topic, windowMs });
     this.totalAbsenceMatches += 1;
     if (partial.stepIndex === pattern.steps.length - 1) {
@@ -589,7 +620,8 @@ export class CepEngine {
 
   /**
    * Kills a partial: disarms its absence deadline (if any) and marks it
-   * resolved so a stale timer is a no-op. The caller removes it from the
+   * resolved so a stale timer is a no-op. The armed window is cleared
+   * together with the timer (EB-379). The caller removes it from the
    * pattern index (observe's survivor list, clear's map drop).
    */
   private killPartial(pattern: CompiledPattern, partial: PartialMatch): void {
@@ -597,6 +629,7 @@ export class CepEngine {
       this.clearTimer(partial.absenceTimer);
       partial.absenceTimer = undefined;
     }
+    partial.absenceWindowMs = undefined;
     partial.resolved = true;
   }
 

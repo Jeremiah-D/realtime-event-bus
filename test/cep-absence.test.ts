@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventBus, type BusMessage } from '../src/bus.ts';
-import { CepEngine } from '../src/cep.ts';
+import { CepEngine, type SequenceMatchEvent } from '../src/cep.ts';
 import { renderPrometheus } from '../src/metrics.ts';
 
 /** Yields until the bus's async flush has delivered. */
@@ -340,4 +340,280 @@ test('CEP absence: metrics render the new series', () => {
   const out = renderPrometheus(bus.getStats());
   assert.ok(out.includes('eventbus_cep_absence_patterns 1'), 'absence patterns gauge');
   assert.ok(out.includes('eventbus_cep_absence_matches_total 0'), 'absence matches counter');
+});
+
+/**
+ * Deterministic engine harness for the EB-379 boundary tests: injected
+ * fake timers (same precedent as the test above) plus a controllable bus
+ * clock, so a late-firing deadline is exact instead of timing luck.
+ */
+function fakeEngine() {
+  let now = 1_000;
+  const timers: Array<() => void> = [];
+  const matches: SequenceMatchEvent[] = [];
+  const engine = new CepEngine({
+    now: () => now,
+    compile: (p: string) => new RegExp(`^${p.replace(/\./g, '\\.')}$`),
+    emitMatch: (_id, match) => {
+      matches.push(match);
+    },
+    setTimer: (fn) => {
+      timers.push(fn);
+      return timers.length;
+    },
+    clearTimer: () => {},
+  });
+  return {
+    engine,
+    matches,
+    timers,
+    advance: (ms: number) => {
+      now += ms;
+    },
+    observe: (topic: string, key = 'k') =>
+      engine.observe({ topic, seq: 1, key, payload: 1 } as never),
+  };
+}
+
+test('CEP absence (EB-379): default window, timer fires 5ms late, still derives', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'late5',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true }],
+    withinMs: 80,
+  });
+  observe('a');
+  assert.equal(engine.snapshot().partialMatches, 1);
+  // The timer was armed for 80ms but the bus was idle and delivery ran
+  // 5ms late: the event-free window really elapsed, so it still derives.
+  advance(85);
+  timers[0]();
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].durationMs, 85);
+  assert.deepEqual(matches[0].absences, [{ stepIndex: 1, topic: 'b', windowMs: 80 }]);
+  const snap = engine.snapshot();
+  assert.equal(snap.absenceMatches, 1);
+  assert.equal(snap.matches, 1);
+  assert.equal(snap.partialMatches, 0);
+});
+
+test('CEP absence (EB-379): default window, timer fires 500ms late, still derives', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'late500',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true }],
+    withinMs: 80,
+  });
+  observe('a');
+  advance(580);
+  timers[0]();
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].durationMs, 580);
+  assert.equal(matches[0].absences![0].windowMs, 80);
+  assert.equal(engine.snapshot().absenceMatches, 1);
+});
+
+test('CEP absence (EB-379): explicit absenceMs wider than withinMs, late fire still drops', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'wide',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true, absenceMs: 200 }],
+    withinMs: 60,
+  });
+  observe('a');
+  advance(205);
+  timers[0]();
+  assert.equal(matches.length, 0);
+  const snap = engine.snapshot();
+  assert.equal(snap.absenceMatches, 0);
+  assert.equal(snap.matches, 0);
+  assert.equal(snap.partialMatches, 0);
+});
+
+test('CEP absence (EB-379): EB-297 shrink below the armed window drops on fire', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'shrink',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true }],
+    withinMs: 80,
+  });
+  observe('a');
+  // Live window shrinks under the armed 80ms before the timer fires.
+  assert.equal(engine.update('shrink', { withinMs: 50 }).changed, true);
+  advance(85);
+  timers[0]();
+  assert.equal(matches.length, 0);
+  const snap = engine.snapshot();
+  assert.equal(snap.absenceMatches, 0);
+  assert.equal(snap.matches, 0);
+  assert.equal(snap.partialMatches, 0);
+});
+
+test('CEP absence (EB-379): EB-297 widen above the armed window still derives', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'widen',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true }],
+    withinMs: 80,
+  });
+  observe('a');
+  assert.equal(engine.update('widen', { withinMs: 10_000 }).changed, true);
+  advance(85);
+  timers[0]();
+  assert.equal(matches.length, 1);
+  // The recorded window is the armed 80ms, not the widened live window.
+  assert.equal(matches[0].absences![0].windowMs, 80);
+  assert.equal(engine.snapshot().absenceMatches, 1);
+});
+
+test('CEP absence (EB-379): explicit small window, very late fire derives', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'small',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true, absenceMs: 50 }],
+    withinMs: 10_000,
+  });
+  observe('a');
+  advance(550);
+  timers[0]();
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].durationMs, 550);
+  assert.equal(matches[0].absences![0].windowMs, 50);
+  assert.equal(engine.snapshot().absenceMatches, 1);
+});
+
+test('CEP absence (EB-379): chained [A, NOT B, NOT C] completes on late fires', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'chain-late',
+    steps: [
+      { topic: 'a' },
+      { topic: 'b', absence: true, absenceMs: 60 },
+      { topic: 'c', absence: true, absenceMs: 60 },
+    ],
+    withinMs: 10_000,
+  });
+  observe('a');
+  advance(65);
+  timers[0](); // NOT b fires 5ms late, arms NOT c immediately
+  assert.equal(timers.length, 2);
+  assert.equal(engine.snapshot().absenceMatches, 1);
+  assert.equal(engine.snapshot().matches, 0);
+  advance(65);
+  timers[1](); // NOT c fires 5ms late, completes the pattern
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].absences!.length, 2);
+  assert.deepEqual(
+    matches[0].absences!.map((a) => a.stepIndex),
+    [1, 2],
+  );
+  assert.deepEqual(
+    matches[0].absences!.map((a) => a.windowMs),
+    [60, 60],
+  );
+  const snap = engine.snapshot();
+  assert.equal(snap.absenceMatches, 2);
+  assert.equal(snap.matches, 1);
+  assert.equal(snap.partialMatches, 0);
+});
+
+test('CEP absence (EB-379): absences windowMs records the armed value, unaffected by revise', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'armed-value',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true, absenceMs: 50 }],
+    withinMs: 1000,
+  });
+  observe('a');
+  // Widen the live window after arming: the recorded window stays 50.
+  assert.equal(engine.update('armed-value', { withinMs: 2000 }).changed, true);
+  advance(55);
+  timers[0]();
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].absences![0].windowMs, 50);
+  assert.equal(matches[0].durationMs, 55);
+});
+
+test('CEP absence (EB-379): B arriving before the deadline still kills', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'kill',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true, absenceMs: 50 }],
+    withinMs: 10_000,
+  });
+  observe('a');
+  observe('b'); // arrives inside the window — the absence can never fire
+  const snap = engine.snapshot();
+  assert.equal(snap.partialMatches, 0);
+  assert.equal(snap.matches, 0);
+  assert.equal(snap.absenceMatches, 0);
+  // The stale timer is a no-op once the partial is resolved.
+  advance(60);
+  timers[0]();
+  assert.equal(matches.length, 0);
+  assert.equal(engine.snapshot().absenceMatches, 0);
+});
+
+test('CEP absence (EB-379): counters track the late-fire lifecycle', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'counts',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true }],
+    withinMs: 80,
+  });
+  observe('a');
+  let snap = engine.snapshot();
+  assert.equal(snap.partialMatches, 1);
+  assert.equal(snap.matches, 0);
+  assert.equal(snap.absenceMatches, 0);
+  advance(85);
+  timers[0]();
+  assert.equal(matches.length, 1);
+  snap = engine.snapshot();
+  assert.equal(snap.partialMatches, 0);
+  assert.equal(snap.matches, 1);
+  assert.equal(snap.absenceMatches, 1);
+});
+
+test('CEP absence (EB-379): shrink below an explicit absenceMs drops on fire', () => {
+  const { engine, matches, timers, advance, observe } = fakeEngine();
+  engine.define({
+    id: 'shrink-explicit',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true, absenceMs: 200 }],
+    withinMs: 1000,
+  });
+  observe('a');
+  assert.equal(engine.update('shrink-explicit', { withinMs: 100 }).changed, true);
+  advance(205);
+  timers[0]();
+  assert.equal(matches.length, 0);
+  const snap = engine.snapshot();
+  assert.equal(snap.absenceMatches, 0);
+  assert.equal(snap.matches, 0);
+  assert.equal(snap.partialMatches, 0);
+});
+
+test('CEP absence (EB-379): real timer, default window derives despite fire jitter', async () => {
+  const bus = new EventBus();
+  const seen = collect(bus, 'cep.jitter');
+  bus.defineSequence({
+    id: 'jitter',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true }],
+    withinMs: 40,
+  });
+  bus.publish('a', 1, { key: 'k' });
+  // A 40ms timer almost always fires at 41ms+ on a real event loop; the
+  // old fire-time re-check (`now - startedAt > withinMs`) dropped this
+  // deterministically. The armed-window guard derives it every time.
+  await sleep(200);
+  await flush();
+  assert.equal(seen.length, 1);
+  const payload = seen[0].payload as Record<string, unknown>;
+  const absences = payload.absences as Array<{ windowMs: number }>;
+  assert.equal(absences[0].windowMs, 40);
+  assert.equal((payload.durationMs as number) >= 40, true);
+  const stats = bus.getStats().cep!;
+  assert.equal(stats.absenceMatches, 1);
+  assert.equal(stats.matches, 1);
+  assert.equal(stats.partialMatches, 0);
 });
