@@ -80,6 +80,8 @@ export type SubscriptionAuditAction =
   | 'delayed_cancelled'
   | 'delayed_rescheduled'
   | 'delayed_ttl_extended'
+  | 'recurring_job_cancelled'
+  | 'recurring_job_revised'
   | 'ack_deadline_extended'
   | 'ack_timeout_revised'
   | 'redelivery_backoff_revised'
@@ -325,6 +327,8 @@ export type SubscriptionAuditAction =
  * - `topic_paused`: `{ mode: 'shed'|'queue' }` (the `pattern` field carries the rule key)
  * - `topic_resumed`: `{ mode: 'shed'|'queue', drainedMessages: <count> }` (the `pattern` field carries the rule key)
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
+ * - `recurring_job_cancelled`: `{ id, topic, cron }` — one live cron recurring job was cancelled by id (EB-371; the `topic` field carries the job's topic)
+ * - `recurring_job_revised`: `{ id, previous_cron, cron, payloadFactoryReplaced }` — one live cron recurring job's schedule and/or payload factory was revised by id (EB-371; the `topic` field carries the job's topic)
  * - `delayed_topic_held`: `{ topicPattern: <string> }` — the delayed-delivery sweep was held for the pattern (EB-250; the `pattern` field carries the rule key)
  * - `ack_deadline_extended`: `{ seq, extensionMs, deadlineMs }` — one outstanding reliable delivery's ack timeout was reset (EB-255; `subId` carries the subscriber, `deadlineMs` is the new bus-clock deadline)
  * - `ack_timeout_revised`: `{ ackTimeoutMs, oldAckTimeoutMs }` — a reliable subscriber's ack-timeout default for future deliveries was revised (EB-259; already-armed timers are untouched)
@@ -529,6 +533,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_cancelled',
   'delayed_rescheduled',
   'delayed_ttl_extended',
+  'recurring_job_cancelled',
+  'recurring_job_revised',
   'ack_deadline_extended',
   'ack_timeout_revised',
   'redelivery_backoff_revised',

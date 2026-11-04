@@ -7808,6 +7808,28 @@ due sweeps also run at the start of every flush, so advancing an injected
 clock past a trigger time and then publishing anything fires
 deterministically in tests.
 
+By-id operations (EB-371) for callers that hold only the id, not the
+handle — ops tooling, embedded hosts:
+
+- `bus.cancelRecurringJob(id)` cancels a live job by id and returns
+  `true`; an unknown, already-cancelled, or dormant id returns `false`
+  and never throws. A successful cancel stops the timer, writes the
+  seq-0 tombstone, and audits `recurring_job_cancelled` (`{ id, topic,
+  cron }`).
+- `bus.reviseRecurringJob(id, patch)` revises a live job in place and
+  returns its current `RecurringJobInfo`: `patch.cronExpr` is re-parsed
+  fail-fast (an illegal expression throws `RangeError` and leaves the
+  job untouched), the next trigger is recomputed from the revision
+  moment, the job is re-ordered in the trigger heap and the timer
+  re-armed; `patch.payloadFactory` replaces the factory for later
+  triggers. The id, topic, `triggerCount`/`errorCount` history, and
+  static publish attributes are unchanged. A revision identical to the
+  live job is a no-op with no audit; an applied revision writes a fresh
+  seq-0 schedule record (no tombstone — a revision is not a cancel) and
+  audits `recurring_job_revised` (`{ id, previous_cron, cron }`). Only
+  live jobs can be revised: an unknown id or a dormant entry throws
+  `RangeError`, and a closed bus refuses with `BusClosedError`.
+
 ## Topic lifecycle management (EB-126)
 
 `bus.createTopic(name, opts)` provisions a topic — one call that registers

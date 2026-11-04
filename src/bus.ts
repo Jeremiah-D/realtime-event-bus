@@ -853,6 +853,19 @@ class RecurringJobHeap {
     return top.job;
   }
 
+  /**
+   * Restores heap order after a job's `nextTriggerMs` was changed
+   * in place (see `EventBus.reviseRecurringJob`, EB-371): a bottom-up
+   * heapify over the live nodes — lazily-cancelled nodes stay in place
+   * and are still discarded when they surface. Insertion `order` values
+   * are untouched, so same-instant ties keep schedule order.
+   */
+  reheapify(): void {
+    for (let i = (this.nodes.length >> 1) - 1; i >= 0; i--) {
+      this.siftDown(i);
+    }
+  }
+
   private less(a: RecurringHeapNode, b: RecurringHeapNode): boolean {
     if (a.job.nextTriggerMs !== b.job.nextTriggerMs) {
       return a.job.nextTriggerMs < b.job.nextTriggerMs;
@@ -922,6 +935,28 @@ export interface RecurringJobHandle {
    * a no-op, never a throw, and writes a single tombstone.
    */
   cancel(): void;
+}
+
+/**
+ * Patch for `EventBus.reviseRecurringJob` (EB-371): every field is
+ * optional — only the fields present are revised, the rest keep their
+ * live values. An empty patch is a no-op: the current info is returned
+ * with nothing audited and nothing re-recorded.
+ */
+export interface RecurringJobRevision {
+  /**
+   * Replacement cron expression, parsed with the same fail-fast
+   * `parseCronExpression` as `scheduleRecurring` — an illegal value
+   * throws `RangeError` and leaves the live job untouched. The next
+   * trigger is recomputed from the revision moment.
+   */
+  cronExpr?: string;
+  /**
+   * Replacement payload factory, called fresh on every trigger from
+   * the revision on; triggers already fired keep the payload they
+   * published.
+   */
+  payloadFactory?: () => unknown;
 }
 
 /**
@@ -45372,6 +45407,161 @@ export class EventBus {
   }
 
   /**
+   * Cancels a live cron recurring job by its id (EB-371) — the id shown
+   * in `getStats().recurringJobs` — for callers that hold only the id,
+   * not the handle `scheduleRecurring` returned (ops tooling, embedded
+   * hosts). Unknown, already-cancelled, or dormant ids return `false`,
+   * never throw (the `renewLease` convention). A successful cancel
+   * follows the handle `cancel()` semantics — the timer stops, a seq-0
+   * tombstone is written to the durable log (when enabled) so a restart
+   * never revives the job — and is recorded in the subscription audit
+   * log as `recurring_job_cancelled` (with `id`/`topic`/`cron` in
+   * `detail`). Dormant post-restart entries are not cancelled: they
+   * hold no timer to stop, and tombstoning one would erase the record
+   * a restart rebuilds — re-register with `scheduleRecurring` to
+   * supersede one, or hold its (nonexistent) handle.
+   */
+  cancelRecurringJob(id: string): boolean {
+    const job = this.recurringById.get(id);
+    if (job == null || job.cancelled || job.dormant) return false;
+    const { topic, cronExpr: cron } = job;
+    // `cancelRecurring` stops the timer (lazy heap deletion + re-arm),
+    // drops the job from `recurringById`, and writes the tombstone.
+    if (!this.cancelRecurring(id)) return false;
+    this.auditSubscription({
+      action: 'recurring_job_cancelled',
+      actor: 'system',
+      topic,
+      detail: { id, topic, cron },
+    });
+    return true;
+  }
+
+  /**
+   * Revises a live cron recurring job by its id (EB-371) — the id shown
+   * in `getStats().recurringJobs` — without cancelling and
+   * re-registering it: the job keeps its id, its topic, its
+   * `triggerCount`/`errorCount` history, and its static per-trigger
+   * publish attributes (`publisherId`, `traceparent`, `priority`).
+   * Returns the job's current `RecurringJobInfo` after the revision.
+   *
+   * - `cronExpr` is re-parsed with the same fail-fast
+   *   `parseCronExpression` as `scheduleRecurring`: an illegal value
+   *   throws `RangeError` and the live job is untouched (same cron,
+   *   same next trigger, same factory). A new cron recomputes
+   *   `nextTriggerMs` from the revision moment, re-orders the job in
+   *   the trigger heap, and re-arms the shared timer.
+   * - `payloadFactory` replaces the factory for all later triggers;
+   *   triggers already fired keep the payload they published.
+   * - A revision identical to the live job (same cron, no factory) is
+   *   a no-op with no audit and no re-record.
+   * - A revision writes a fresh seq-0 schedule record to the durable
+   *   log (EB-24 convention) so the new cron is on the trail — but no
+   *   tombstone: a revision is not a cancel. Every applied revision is
+   *   recorded in the subscription audit log as
+   *   `recurring_job_revised` (with `id`/`previous_cron`/`cron` in
+   *   `detail`).
+   *
+   * Only live jobs can be revised: an unknown id throws `RangeError`,
+   * and a dormant post-restart entry (no live timer, no factory to
+   * restore) throws `RangeError` — re-register with
+   * `scheduleRecurring` to reactivate one. A non-function
+   * `payloadFactory` throws `TypeError`. A closed bus refuses the
+   * revision with `BusClosedError` (EB-154).
+   *
+   * Orthogonal to EB-124 (that is the schedule mechanism itself — this
+   * its by-id ops entry point), to EB-154 (that is the close fail-fast
+   * — this the revision that must respect it), and to dormant restart
+   * recovery (this never touches the recovery semantics).
+   */
+  reviseRecurringJob(id: string, patch: RecurringJobRevision): RecurringJobInfo {
+    // EB-154: a closed bus never arms a new timer — refusing the
+    // revision fail-fast keeps the shutdown terminal. (Close cancels
+    // every job first, so without this the id would read as unknown.)
+    this.assertNotClosed('schedule', id);
+    // Fail-fast validation, before any lookup or mutation: a throw
+    // leaves the live job — and the audit log — untouched.
+    if (patch == null || typeof patch !== 'object') {
+      throw new TypeError('reviseRecurringJob: patch must be an object');
+    }
+    const newSchedule =
+      patch.cronExpr === undefined ? undefined : parseCronExpression(patch.cronExpr);
+    if (patch.payloadFactory !== undefined && typeof patch.payloadFactory !== 'function') {
+      throw new TypeError('reviseRecurringJob: payloadFactory must be a function');
+    }
+    const job = this.recurringById.get(id);
+    if (job == null || job.cancelled) {
+      throw new RangeError(`reviseRecurringJob: unknown recurring job id ${JSON.stringify(id)}`);
+    }
+    // Dormant post-restart entries hold no live timer and no factory to
+    // restore: there is nothing to revise in place. Re-register with
+    // `scheduleRecurring` to reactivate one.
+    if (job.dormant) {
+      throw new RangeError(
+        `reviseRecurringJob: recurring job ${id} is dormant (restart recovery has no live timer or payload factory)`,
+      );
+    }
+    const previousCron = job.cronExpr;
+    const cronChanged = newSchedule !== undefined && newSchedule.source !== previousCron;
+    const factoryChanged = patch.payloadFactory !== undefined;
+    // Re-affirming the current cron with no factory change is a no-op:
+    // no retune, no schedule record, no audit.
+    if (!cronChanged && !factoryChanged) {
+      return this.recurringJobInfo(job);
+    }
+    const nowMs = this.now();
+    if (cronChanged) {
+      job.schedule = newSchedule!;
+      job.cronExpr = newSchedule!.source;
+      // Recomputed from the revision moment, never from the missed
+      // cadence — the next trigger is strictly after now.
+      job.nextTriggerMs = nextCronOccurrence(newSchedule!, nowMs);
+    }
+    if (factoryChanged) {
+      job.payloadFactory = patch.payloadFactory!;
+    }
+    // A revised cron re-orders the job in the heap and the shared timer
+    // is re-armed for the new earliest trigger; a factory-only revision
+    // leaves the heap order untouched but re-arms anyway so the timer
+    // never goes stale.
+    this.recurringHeap.reheapify();
+    this.armRecurringTimer();
+    // A revision writes a fresh seq-0 schedule record (EB-24
+    // convention) so the new cron is on the durable trail — but no
+    // tombstone: a revision is not a cancel.
+    this.appendRecurringScheduleRecord(job, nowMs);
+    this.auditSubscription({
+      action: 'recurring_job_revised',
+      actor: 'system',
+      topic: job.topic,
+      detail: {
+        id,
+        previous_cron: previousCron,
+        cron: job.cronExpr,
+        payloadFactoryReplaced: factoryChanged,
+      },
+    });
+    return this.recurringJobInfo(job);
+  }
+
+  /**
+   * One `getStats().recurringJobs` row for a job: the same shape
+   * `reviseRecurringJob` returns, so a revision's result reads exactly
+   * like the stats row.
+   */
+  private recurringJobInfo(job: RecurringJob): RecurringJobInfo {
+    return {
+      id: job.id,
+      topic: job.topic,
+      cron: job.cronExpr,
+      nextTriggerMs: job.nextTriggerMs,
+      triggerCount: job.triggerCount,
+      errorCount: job.errorCount,
+      ...(job.dormant ? { dormant: true as const } : {}),
+    };
+  }
+
+  /**
    * Cancels a recurring job: no further triggers. Returns `true` when a
    * live or dormant job was cancelled. Idempotent — unknown or
    * already-cancelled ids return `false`, never throw — and writes a
@@ -54739,15 +54929,7 @@ export class EventBus {
       delayedScheduleSkew: this.scheduleSkew?.tracker.summary() ?? emptyScheduleSkewSummary(),
       recurringJobs: {
         active: [...this.recurringById.values()].filter((j) => !j.dormant).length,
-        jobs: [...this.recurringById.values()].map((j) => ({
-          id: j.id,
-          topic: j.topic,
-          cron: j.cronExpr,
-          nextTriggerMs: j.nextTriggerMs,
-          triggerCount: j.triggerCount,
-          errorCount: j.errorCount,
-          ...(j.dormant ? { dormant: true as const } : {}),
-        })),
+        jobs: [...this.recurringById.values()].map((j) => this.recurringJobInfo(j)),
       },
       deliveryLatency,
       ackLatency,
