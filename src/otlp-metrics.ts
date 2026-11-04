@@ -136,6 +136,46 @@ export interface OtlpMetricsExportStats {
   failedExports: number;
   /** Epoch milliseconds of the last successful export; 0 when never exported. */
   lastExportAtMs: number;
+  /** Live export cadence in milliseconds (revisable via `setOtlpMetrics`, EB-374). */
+  flushIntervalMs: number;
+  /** Live per-request timeout in milliseconds (revisable via `setOtlpMetrics`, EB-374). */
+  timeoutMs: number;
+  /** Live per-topic series tuning (revisable via `setOtlpMetrics`, EB-374). */
+  perTopic: { enabled: boolean; maxTopics: number };
+}
+
+/**
+ * Revision for the bus-level OTLP metrics export tuning (see
+ * `EventBus.setOtlpMetrics`, EB-374). Only the fields provided move;
+ * the rest keep their live values. `endpoint`, `headers`, and
+ * `serviceName` are not revisable here — they are the export
+ * destination and identity fixed at construction. `perTopic: false`
+ * disables every per-topic series (bus aggregates only); `true`
+ * re-enables them at the live `maxTopics`; `{ maxTopics }` keeps
+ * per-topic series enabled and moves the cap.
+ */
+export interface OtlpMetricsRevision {
+  /**
+   * Periodic export interval in milliseconds. Must be a finite number
+   * > 0 when provided — the construction-time rule. Revising it
+   * rebuilds the flush timer at the new interval without rebuilding
+   * the exporter: counters and the Sum start time are retained, and
+   * the new cadence governs from the next tick.
+   */
+  flushIntervalMs?: number;
+  /**
+   * Per-request timeout in milliseconds. Must be a finite number > 0
+   * when provided — the construction-time rule. The next export POST
+   * times out at the live value.
+   */
+  timeoutMs?: number;
+  /**
+   * Per-topic series: `false` disables them, `true` (re-)enables
+   * them at the live `maxTopics`, `{ maxTopics }` moves the cap
+   * (a positive integer — the construction-time rule). The next
+   * export covers the hottest topics under the live cap.
+   */
+  perTopic?: boolean | { maxTopics?: number };
 }
 
 const DEFAULT_SERVICE_NAME = 'realtime-event-bus';
@@ -532,10 +572,10 @@ function histogramPoint(
 export class OtlpMetricsExporter {
   private readonly endpoint: URL;
   private readonly serviceName: string;
-  private readonly flushIntervalMs: number;
-  private readonly timeoutMs: number;
+  private flushIntervalMs: number;
+  private timeoutMs: number;
   private readonly headers: Record<string, string>;
-  private readonly perTopic: { enabled: boolean; maxTopics: number };
+  private perTopic: { enabled: boolean; maxTopics: number };
   private readonly collect: () => BusStats;
   private readonly startTimeUnixNano: string;
   private timer: ReturnType<typeof setInterval>;
@@ -561,7 +601,9 @@ export class OtlpMetricsExporter {
 
   /**
    * Arms the periodic export timer at `intervalMs`. Unref'd: export
-   * must never hold the process open on its own.
+   * must never hold the process open on its own. Every arm goes
+   * through here so a retune (EB-374) rebuilds the same timer the
+   * constructor armed.
    */
   private armFlushTimer(intervalMs: number): ReturnType<typeof setInterval> {
     const timer = setInterval(() => {
@@ -569,6 +611,47 @@ export class OtlpMetricsExporter {
     }, intervalMs);
     if (typeof timer.unref === 'function') timer.unref();
     return timer;
+  }
+
+  /** The live export tuning, for bus-level revision (EB-374). */
+  current(): ResolvedOtlpMetricsExporterOptions {
+    return {
+      endpoint: this.endpoint,
+      serviceName: this.serviceName,
+      flushIntervalMs: this.flushIntervalMs,
+      timeoutMs: this.timeoutMs,
+      headers: { ...this.headers },
+      perTopic: { ...this.perTopic },
+    };
+  }
+
+  /**
+   * Retunes the three live export bounds (EB-374). The caller must
+   * have validated `next` through `resolveOtlpMetricsOptions` first —
+   * this method applies unconditionally. The counters
+   * (`exportedMetrics`/`failedExports`/`lastExportAtMs`) and the Sum
+   * `startTimeUnixNano` are retained — a retune never restarts the
+   * cumulative series, so the collector-side rate computation is
+   * uninterrupted — and an in-flight flush is untouched: the next
+   * export POST times out at the live `timeoutMs`, the next export
+   * covers the hottest topics under the live `perTopic` cap, and a
+   * revised `flushIntervalMs` rebuilds the flush timer at the new
+   * interval (the old timer is cleared first, so a tick never fires
+   * twice and no tick is lost — the new cadence governs from the
+   * next tick). `endpoint`, `headers`, and `serviceName` are never
+   * moved here. A retune after `shutdown()` moves the values but
+   * does not re-arm the timer — a stopped exporter stays stopped.
+   */
+  retune(next: ResolvedOtlpMetricsExporterOptions): void {
+    this.timeoutMs = next.timeoutMs;
+    this.perTopic = { ...next.perTopic };
+    if (next.flushIntervalMs !== this.flushIntervalMs) {
+      this.flushIntervalMs = next.flushIntervalMs;
+      if (!this.stopped) {
+        clearInterval(this.timer);
+        this.timer = this.armFlushTimer(next.flushIntervalMs);
+      }
+    }
   }
 
   /**
@@ -638,6 +721,9 @@ export class OtlpMetricsExporter {
       exportedMetrics: this.exportedMetrics,
       failedExports: this.failedExports,
       lastExportAtMs: this.lastExportAtMs,
+      flushIntervalMs: this.flushIntervalMs,
+      timeoutMs: this.timeoutMs,
+      perTopic: { ...this.perTopic },
     };
   }
 

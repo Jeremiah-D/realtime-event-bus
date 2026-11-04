@@ -6423,15 +6423,35 @@ Semantics notes:
   accumulate over the process lifetime. Resource attributes carry only
   `service.name`, matching the span exporter.
 - `getStats().otlpMetrics` (`{ endpoint, exportedMetrics,
-  failedExports, lastExportAtMs }`) is present only when export is
-  configured; without it the stats shape is byte-identical to before.
+  failedExports, lastExportAtMs, flushIntervalMs, timeoutMs,
+  perTopic }`) is present only when export is configured; without it
+  the stats shape is byte-identical to before. The trailing three
+  fields report the live tuning (EB-374, below).
 - `bus.flushOtlpMetrics()` exports the latest snapshot
   deterministically — the hook for tests and graceful shutdown.
   `close()` awaits it for one final export, then stops the exporter's
-  timer; a second `close()` does not re-export. There is no
-  `setOtlpMetrics` live-revision entry — tuning revisions are a
-  separate item. Invalid options throw `RangeError` from the
-  constructor.
+  timer; a second `close()` does not re-export. Invalid options throw
+  `RangeError` from the constructor.
+
+**Revising the metrics export live (EB-374).**
+`bus.setOtlpMetrics({ flushIntervalMs?, timeoutMs?, perTopic? })`
+retunes the export cadence, the per-request timeout, and the
+per-topic series cap without restarting the bus — only a bus that
+already enabled `otlpMetrics` can be revised, and a closed bus
+refuses. Only the fields provided move; the counters and the Sum
+`startTimeUnixNano` are retained, so a retune never restarts the
+cumulative series, and an in-flight flush is untouched. A revised
+`flushIntervalMs` rebuilds the flush timer at the new cadence from
+the next tick; a revised `timeoutMs` governs the next POST; a
+revised `perTopic` (`false` disables every per-topic series, `true`
+re-enables them at the live cap, `{ maxTopics }` moves the cap)
+governs the next export. `endpoint`, `headers`, and `serviceName`
+stay fixed at construction. Illegal values fail closed with
+`RangeError` and leave the live tuning untouched; an identical (or
+empty) revision is a no-op with no audit. Audited as
+`otlp_metrics_revised` (`{ flushIntervalMs, oldFlushIntervalMs,
+timeoutMs, oldTimeoutMs, perTopicEnabled, oldPerTopicEnabled,
+perTopicMaxTopics, oldPerTopicMaxTopics }`).
 
 ## Trace span archive journal (EB-167)
 

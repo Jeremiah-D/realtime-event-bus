@@ -413,6 +413,7 @@ import {
   resolveOtlpMetricsOptions,
   type OtlpMetricsExporterOptions,
   type OtlpMetricsExportStats,
+  type OtlpMetricsRevision,
 } from './otlp-metrics.ts';
 import type {
   ClusterConnectOptions,
@@ -7871,7 +7872,9 @@ export interface BusStats {
    * `failedExports` export POSTs dropped because the collector was
    * unreachable (best-effort, never retried), `lastExportAtMs` the
    * epoch milliseconds of the last successful export (0 when never
-   * exported). A snapshot — mutating it does not affect the bus.
+   * exported), plus the live tuning `flushIntervalMs` / `timeoutMs` /
+   * `perTopic` (revisable via `setOtlpMetrics`, EB-374). A snapshot —
+   * mutating it does not affect the bus.
    */
   otlpMetrics?: OtlpMetricsExportStats;
   /**
@@ -23609,6 +23612,152 @@ export class EventBus {
         oldTimeoutMs: current.timeoutMs,
         maxBuffered,
         oldMaxBuffered: current.maxBuffered,
+      },
+    });
+  }
+
+  /**
+   * Revises the bus-level OTLP metrics export tuning live (EB-374)
+   * without restarting the bus:
+   * `setOtlpMetrics({ flushIntervalMs?, timeoutMs?, perTopic? })`
+   * retunes how often snapshots are pushed, how long a POST may
+   * take, and how many hottest topics get per-topic series (see
+   * `EventBusOptions.otlpMetrics`, EB-370).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The counters (`exportedMetrics`/`failedExports`/`lastExportAtMs`)
+   * and the Sum `startTimeUnixNano` are retained — a retune never
+   * restarts the cumulative series, so the collector-side rate
+   * computation is uninterrupted — and an in-flight flush is
+   * untouched: the next export POST times out at the live `timeoutMs`,
+   * the next export covers the hottest topics under the live
+   * `perTopic` cap, and a revised `flushIntervalMs` rebuilds the
+   * flush timer at the new interval without rebuilding the exporter,
+   * so the new cadence governs from the next tick. `endpoint`,
+   * `headers`, and `serviceName` are not revisable here — they are
+   * the export destination and identity fixed at construction.
+   * `perTopic: false` disables every per-topic series (bus aggregates
+   * only); `true` re-enables them at the live `maxTopics`; an object
+   * moves the cap and keeps per-topic series enabled. Disabling
+   * resolves through the construction-time canonical form, so the
+   * live `maxTopics` reports the resolver default (20) while
+   * disabled — re-enabling with `true` restores the cap from the
+   * live value, which is that default unless a `{ maxTopics }`
+   * revision moved it while enabled.
+   *
+   * Fail-closed: a bus that never enabled `otlpMetrics`, a closed
+   * bus, a non-object revision, and an illegal value all throw
+   * `RangeError` with the live tuning and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`resolveOtlpMetricsOptions`: `flushIntervalMs`/`timeoutMs`
+   * positive finite numbers, `perTopic.maxTopics` a positive
+   * integer) against the merged values, so a value that could not
+   * be set at construction cannot be revised in later either — and
+   * a failed call changes nothing at all: when only one field is
+   * provided only that field is validated and moved, and an illegal
+   * value in either field leaves every live value exactly as it
+   * was. A revision that provides neither field, and a revision
+   * identical to the current tuning, are both no-ops with no audit.
+   * Audited as `otlp_metrics_revised` (`{ flushIntervalMs,
+   * oldFlushIntervalMs, timeoutMs, oldTimeoutMs, perTopicEnabled,
+   * oldPerTopicEnabled, perTopicMaxTopics, oldPerTopicMaxTopics }`).
+   *
+   * Orthogonal to EB-370 (that is the metrics export mechanism
+   * itself — this the export tuning), and to `setOtlp` (that retunes
+   * the span exporter — this the metrics exporter).
+   *
+   * Throws `RangeError` when OTLP metrics export is not enabled,
+   * when the bus is closed, for a non-object revision, or for an
+   * illegal `flushIntervalMs` / `timeoutMs` / `perTopic`.
+   */
+  setOtlpMetrics(patch: OtlpMetricsRevision, actor = 'system'): void {
+    assertValidActor(actor, 'setOtlpMetrics');
+    const exporter = this.otlpMetricsExporter;
+    if (exporter === undefined) {
+      throw new RangeError('setOtlpMetrics: otlpMetrics is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154): close() already flushed
+    // once and stopped the exporter — there is no live tuning left
+    // to revise.
+    if (this.closed) {
+      throw new RangeError('setOtlpMetrics: bus is closed');
+    }
+    // An absent revision asks nothing to move.
+    if (patch == null) {
+      return;
+    }
+    if (typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError(
+        'setOtlpMetrics: revision must be an object with flushIntervalMs and/or timeoutMs and/or perTopic',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value —
+    // a partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = exporter.current();
+    const flushIntervalMs = patch.flushIntervalMs ?? current.flushIntervalMs;
+    const timeoutMs = patch.timeoutMs ?? current.timeoutMs;
+    // Merge `perTopic` onto the live resolved form: `false` disables
+    // (the resolver canonicalizes the cap to its default while
+    // disabled), `true` re-enables at the live cap, an object moves
+    // the cap and keeps per-topic series enabled.
+    const rawPerTopic = patch.perTopic;
+    let mergedPerTopic: boolean | { maxTopics: number };
+    if (rawPerTopic === undefined) {
+      mergedPerTopic = current.perTopic.enabled
+        ? { maxTopics: current.perTopic.maxTopics }
+        : false;
+    } else if (typeof rawPerTopic === 'boolean') {
+      mergedPerTopic = rawPerTopic ? { maxTopics: current.perTopic.maxTopics } : false;
+    } else if (
+      typeof rawPerTopic === 'object' &&
+      rawPerTopic !== null &&
+      !Array.isArray(rawPerTopic)
+    ) {
+      mergedPerTopic = { maxTopics: rawPerTopic.maxTopics ?? current.perTopic.maxTopics };
+    } else {
+      throw new RangeError('setOtlpMetrics: perTopic must be a boolean or { maxTopics }');
+    }
+    const perTopicEnabled = mergedPerTopic !== false;
+    const perTopicMaxTopics = perTopicEnabled ? mergedPerTopic.maxTopics : 20;
+    // Re-affirming the current tuning is a no-op: no retune, no audit.
+    // The canonical cap while disabled is the resolver default (20),
+    // so a `false` re-affirmation compares equal once disabled.
+    if (
+      flushIntervalMs === current.flushIntervalMs &&
+      timeoutMs === current.timeoutMs &&
+      perTopicEnabled === current.perTopic.enabled &&
+      perTopicMaxTopics === current.perTopic.maxTopics
+    ) {
+      return;
+    }
+    const resolved = resolveOtlpMetricsOptions(
+      {
+        endpoint: current.endpoint.toString(),
+        serviceName: current.serviceName,
+        flushIntervalMs,
+        timeoutMs,
+        headers: { ...current.headers },
+        perTopic: mergedPerTopic,
+      },
+      'setOtlpMetrics',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setOtlpMetrics: otlpMetrics is not enabled on this bus');
+    }
+    exporter.retune(resolved);
+    this.auditSubscription({
+      action: 'otlp_metrics_revised',
+      actor,
+      detail: {
+        flushIntervalMs,
+        oldFlushIntervalMs: current.flushIntervalMs,
+        timeoutMs,
+        oldTimeoutMs: current.timeoutMs,
+        perTopicEnabled,
+        oldPerTopicEnabled: current.perTopic.enabled,
+        perTopicMaxTopics,
+        oldPerTopicMaxTopics: current.perTopic.maxTopics,
       },
     });
   }
