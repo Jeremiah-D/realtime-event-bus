@@ -375,7 +375,25 @@ library.
   `resumeFromTime` always wins over the policy, and a static rejoin inside
   its session window never resets. Partitioned groups decide per
   partition. Any other value throws `RangeError` before anything
-  registers. **Consumer-group lag monitoring**
+  registers. **Consumer-group offset seek** (EB-376):
+  `seekGroupOffsets(groupId, pattern, targets, { actor = 'system' })` is the Kafka-style operator seek —
+  it repositions a group's committed offsets at runtime and replays the live members from the new positions,
+  without re-subscribing anyone: `targets` maps each concrete topic to `'earliest'` (replay from the log's
+  start), `'latest'` (fast-forward to the live head, no replay), or an explicit `seq` (replay everything past
+  it). The checkpoint moves first through the `commitOffset` path — durable-log offset journal append,
+  `OffsetStore` mirror, lag re-evaluation — then every live member of the `(groupId, pattern)` competing set
+  replays its topics from the new position through the same durable-log replay as the subscribe-time resume
+  (a partitioned group replays only each member's assigned partitions; a round-robin group replays the full
+  range into every member). A rewind is at-least-once by design: replayed messages may reach a consumer that
+  already processed them, so consumers dedupe by `messageId` when that matters. Already-queued backlog and
+  in-flight reliable deliveries are untouched — the replay is additive — and a seek never counts as a sequence
+  gap. Fail-closed: an unknown group (no live members and no committed offsets), an illegal target, or a rewind
+  without a durable log throws `RangeError` before anything moves; a fast-forward only moves the checkpoint and
+  is always allowed; empty targets is a no-op. A rewind's lower seq is appended to the offset journal, but the
+  journal's recovery is highest-wins, so a restart before the next forward commit reseeds the pre-seek
+  checkpoint while the live process replays from the new position. Audited as `group_offsets_seeked`
+  (`{ groupId, pattern, targets, previous }`). Only the group level moves — per-partition checkpoints are
+  untouched. **Consumer-group lag monitoring**
   (`src/grouplag.ts`): `getStats().groupLag` reports one row per
   (group, topic) — per (group, partition, topic) for partitioned groups —
   with `assignedSeq` (highest seq handed to the group), `committedSeq`
@@ -3574,6 +3592,17 @@ npm test
   skipping in-flight seqs during the window, live traffic unaffected,
   backlog replayable after expiry, no window when fully committed, inert
   without a durable log, option validation.
+- `test/seek-group-offsets.test.ts` — consumer-group offset seek (EB-376):
+  rewind replays from the durable log and moves the checkpoint, fast-forward
+  and `'latest'` move only the checkpoint, `'earliest'` replays from the log
+  start and clears the checkpoint, unknown group / illegal seq / rewind
+  without a log refuse with `RangeError`, checkpoint + journal + offset-store
+  mirror follow the move (journal highest-wins keeps the pre-seek high-water
+  across a restart after a rewind), lag re-evaluated from the new checkpoint,
+  queued backlog and in-flight deliveries untouched, at-least-once redelivery
+  with no phantom gap, every live member replays the full range, per-topic
+  targets move independently, checkpoint-only seek with no live members,
+  empty targets no-op, partitioned group replays only its own partitions.
 - `test/offsetstore.test.ts` — pluggable `OffsetStore` (EB-114):
   group-level commits mirrored to an injected store, per-partition and
   per-instance checkpoints staying in memory, default in-memory zero

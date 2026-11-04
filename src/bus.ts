@@ -14844,6 +14844,48 @@ export interface SubscriberSeekResult {
   invalidatedInflight: number;
 }
 
+/** Per-topic seek target for `EventBus.seekGroupOffsets` (EB-376). */
+export type GroupSeekOffsetTarget = 'earliest' | 'latest' | number;
+
+/** Options for `EventBus.seekGroupOffsets` (EB-376). */
+export interface GroupSeekOffsetsOptions {
+  /**
+   * Who performed the seek, recorded in the subscription audit log.
+   * Defaults to `'system'`; must be a non-empty string when given.
+   */
+  actor?: string;
+}
+
+/** Per-topic outcome of `EventBus.seekGroupOffsets` (EB-376). */
+export interface GroupSeekOffsetsTopicResult {
+  /** Concrete topic the checkpoint was moved on. */
+  topic: string;
+  /** Committed offset before the seek (`0` when nothing was committed). */
+  from: number;
+  /** Requested position, resolved from the seek target. */
+  requested: number;
+  /**
+   * Effective position after the seek: the checkpoint the group now
+   * holds. Equals `requested`, except a `'latest'` seek never regresses
+   * a checkpoint an operator already committed past the live head.
+   */
+  position: number;
+  /** Messages replayed from the durable log for this topic, summed over live members. */
+  replayed: number;
+}
+
+/** Result of `EventBus.seekGroupOffsets` (EB-376). */
+export interface GroupSeekOffsetsResult {
+  /** The seeked consumer group. */
+  groupId: string;
+  /** The competing set's pattern. */
+  pattern: string;
+  /** One outcome per targeted concrete topic (empty on a no-op seek). */
+  topics: GroupSeekOffsetsTopicResult[];
+  /** Live members the seek replayed into. */
+  members: number;
+}
+
 /** `EventBus.seek` target after validation (EB-130). */
 type ParsedSeekTarget =
   | { mode: 'earliest' | 'latest'; topic?: string }
@@ -57546,6 +57588,271 @@ export class EventBus {
     if (records.length === 0) return 0;
     // Deterministic order, mirroring `replayLog`'s cross-topic sort
     // (single topic here, so effectively at-then-seq).
+    records.sort(
+      (a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0),
+    );
+    this.admitReplayRecords(subscriber, records, { trackProgress: true });
+    this.scheduleFlush();
+    return subscriber.replayProgress?.replayed ?? 0;
+  }
+
+  /**
+   * Repositions one consumer group's committed offsets and replays the
+   * live members from the new positions (EB-376, real-time systems):
+   * the Kafka-style group seek — the operator counterpart to the
+   * subscribe-time `autoOffsetReset` (EB-207) and the per-subscriber
+   * `seek` (EB-130). Where `commitOffset` only writes a checkpoint and
+   * never moves a live member, this moves the checkpoint *and* triggers
+   * the replay: an operator rewinds a stuck group to reprocess, or
+   * fast-forwards it past poisoned history, without re-subscribing
+   * anyone.
+   *
+   * `targets` maps each concrete topic to its new position:
+   * `'earliest'` replays from the log's start (`resumeFromSeq` 0),
+   * `'latest'` fast-forwards to the live head (the same head
+   * `resolveSeekPosition` reports for `seek` — the highest published
+   `seq`, corroborated against the log) with no replay, and an explicit
+   * `seq` replays everything past it. The position is exclusive, like
+   * `seek`: messages with a higher `seq` are (re)delivered.
+   *
+   * The checkpoint moves first, through the `commitOffset` path where
+   * the position allows it — the same validation, durable-log offset
+   * journal append, `OffsetStore` mirror (EB-114), and
+   * `checkGroupLagForGroup` re-evaluation — so group lag
+   * (`getStats().groupLag`) reflects the new position immediately.
+   * `'earliest'` resets the checkpoint to 0, which `commitOffset`
+   * cannot express (it requires a positive integer): the in-memory
+   * entry is deleted and the reset is mirrored as a 0 record into the
+   * journal and the store. A rewind's lower seq is appended and mirrored
+   * the same way — but the offset journal's recovery is highest-wins by
+   * design, so a rewind never erases the earlier high-water there: a
+   * restart before the group commits forward again reseeds the pre-seek
+   * checkpoint from the journal, while the live process replays from the
+   * new position regardless and the store mirror itself (last-wins) does
+   * follow the move.
+   *
+   * The replay then runs per live member of the `(groupId, pattern)`
+   * competing set, through the same `readSince` +
+   * `admitReplayRecords` path the subscribe-time resume uses — so
+   * filters, TTL expiry, keyed ordering and signature verification
+   * behave identically — with one replay per member per topic, so a
+   * per-topic target replays exactly its own topic. A partitioned group
+   * replays through the partitioned variant, so each member replays
+   * only its assigned partitions. In a round-robin group every live
+   * member replays the full range for its topics: a rewind is
+   * at-least-once by design, and a replayed message may reach a
+   * consumer that already processed it — the consumer must dedupe by
+   * `messageId` / idempotency key when that matters. Already-queued
+   * backlog and in-flight reliable deliveries are untouched (unlike
+   * `seek`, which drops the queue and invalidates in-flight): the
+   * replay is additive, queued messages still deliver in queue order,
+   * and a seek never fabricates a sequence gap — each member's gap
+   * baselines are repositioned to the new position and their epoch
+   * entries cleared, so the next live delivery re-establishes the
+   * baseline instead of counting the jump.
+   *
+   * Fail-closed: an empty groupId/pattern, an illegal actor, a
+   * non-object `targets`, an empty target topic, or a non-positive /
+   * non-integer explicit seq throws `RangeError` before anything
+   * moves. An unknown group — no live members *and* no committed
+   * offsets for the groupId — throws `RangeError`; a group with
+   * committed offsets but no live members is known, and the seek moves
+   * its checkpoints with no replay. A rewind (a target below the
+   * group's committed offset for the topic, including `'earliest'`)
+   * without a durable log throws `RangeError` — there is no history to
+   * replay from — while a fast-forward only moves the checkpoint and is
+   * always allowed. An empty `targets` is a no-op with no audit. Only
+   * the group level moves: per-partition checkpoints
+   * (`partitionCommittedOffsets`) are untouched — a per-partition seek
+   * is a later item.
+   *
+   * Audited as `group_offsets_seeked`
+   * (`{ groupId, pattern, targets, previous }`; `previous` is the
+   * pre-seek committed offset per targeted topic, `0` when nothing was
+   * committed).
+   *
+   * Orthogonal to EB-16 (that is the group mechanism itself — this
+   * repositions its offsets), to EB-32 (that is the `commitOffset`
+   * checkpoint — this moves it and replays the live members), to
+   * EB-207 (that is the join-time `auto.offset.reset` — this is the
+   * run-time operator seek), to EB-17 (that is the subscribe-time
+   * `resumeFromSeq` replay — this is the group-level seek), to EB-114
+   * (that is the offset store — this mirrors through it), and to
+   * EB-127 (that is offset auto-commit — this is the manual seek).
+   */
+  seekGroupOffsets(
+    groupId: string,
+    pattern: string,
+    targets: Record<string, GroupSeekOffsetTarget>,
+    opts?: GroupSeekOffsetsOptions,
+  ): GroupSeekOffsetsResult {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('seekGroupOffsets: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('seekGroupOffsets: pattern must be a non-empty string');
+    }
+    const actor = opts?.actor ?? 'system';
+    assertValidActor(actor, 'seekGroupOffsets');
+    if (typeof targets !== 'object' || targets === null || Array.isArray(targets)) {
+      throw new RangeError('seekGroupOffsets: targets must be an object mapping topic to target');
+    }
+    const topics = Object.keys(targets).sort();
+    for (const topic of topics) {
+      if (topic.length === 0) {
+        throw new RangeError('seekGroupOffsets: target topic must be a non-empty string');
+      }
+      const target = targets[topic];
+      if (target !== 'earliest' && target !== 'latest') {
+        if (!Number.isInteger(target) || (target as number) < 1) {
+          throw new RangeError(
+            `seekGroupOffsets: seq for ${JSON.stringify(topic)} must be a positive integer`,
+          );
+        }
+      }
+    }
+    const key = EventBus.groupKey(groupId, pattern);
+    const members = this.liveGroupMembers(key);
+    const committed = this.committedOffsets.get(groupId);
+    if (members.length === 0 && (committed?.size ?? 0) === 0) {
+      throw new RangeError(
+        `seekGroupOffsets: unknown consumer group "${groupId}" (pattern "${pattern}")`,
+      );
+    }
+    const log = this.durableLog;
+    // Phase 1 — pure planning. Every RangeError below throws before
+    // anything mutates, so a rejected seek leaves the group exactly as
+    // it was.
+    const previous: Record<string, number> = {};
+    const plans = topics.map((topic) => {
+      const from = committed?.get(topic) ?? 0;
+      previous[topic] = from;
+      const target = targets[topic];
+      let requested: number;
+      if (target === 'earliest') requested = 0;
+      else if (target === 'latest') {
+        // Fast-forward never regresses a checkpoint an operator already
+        // committed past the live head (a manual over-commit).
+        requested = Math.max(this.resolveSeekPosition(topic, { mode: 'latest' }, log), from);
+      } else requested = target;
+      if (log === undefined && requested < from) {
+        throw new RangeError(
+          `seekGroupOffsets: cannot rewind ${topic} from ${from} to ${requested} without durableLogDir history to replay`,
+        );
+      }
+      return { topic, from, requested };
+    });
+    if (plans.length === 0) {
+      return { groupId, pattern, topics: [], members: members.length };
+    }
+    // Phase 2 — mutate. The checkpoint moves first, through the
+    // `commitOffset` path where the position allows it, then the live
+    // members replay from the new position.
+    const partitioned = this.groupPartitions.get(key) !== undefined;
+    const results: GroupSeekOffsetsTopicResult[] = [];
+    for (const plan of plans) {
+      const { topic, from } = plan;
+      const position = plan.requested;
+      if (position >= 1) {
+        this.commitOffset(groupId, topic, position);
+      } else if (from > 0) {
+        // 'earliest' (or a 'latest' on a never-published topic): the
+        // checkpoint resets to 0, which `commitOffset` cannot express.
+        // The in-memory entry is deleted; the reset is mirrored as a 0
+        // record into the journal and the store — the journal keeps its
+        // high-water (see the method doc).
+        const byTopic = this.committedOffsets.get(groupId);
+        byTopic?.delete(topic);
+        if (byTopic !== undefined && byTopic.size === 0) this.committedOffsets.delete(groupId);
+        this.durableLog?.appendOffset(groupId, topic, 0, this.now());
+        this.mirrorOffsetToStore(groupId, topic, 0);
+        this.checkGroupLagForGroup(groupId);
+      }
+      let replayed = 0;
+      for (const member of members) {
+        // Reposition the gap baselines before the replay: a seek never
+        // counts as a sequence gap. The epoch entries are cleared too,
+        // so the next live delivery re-establishes the baseline — unlike
+        // `seek`, which leaves a stale epoch behind and can count a
+        // phantom gap when the member already delivered past the new
+        // position. Replayed messages never move the baseline themselves
+        // (`detectGap` skips `replayed`).
+        for (const part of this.seekTopicPartitions(member, topic)) {
+          const gapKey = EventBus.gapKey(topic, part);
+          member.lastDeliveredSeq.set(gapKey, position);
+          member.lastEpoch.delete(gapKey);
+        }
+        const memberLog = member.durableLog ?? this.durableLog;
+        if (memberLog === undefined) continue;
+        replayed += partitioned
+          ? this.replaySeekTopicForPartitionedMember(member, key, topic, position, memberLog)
+          : this.replaySeekTopic(member, topic, { mode: 'seq', seq: position }, position, memberLog);
+      }
+      results.push({ topic, from, requested: plan.requested, position, replayed });
+    }
+    this.auditSubscription({
+      action: 'group_offsets_seeked',
+      actor,
+      groupId,
+      pattern,
+      detail: { groupId, pattern, targets: { ...targets }, previous },
+    });
+    this.scheduleFlush();
+    return { groupId, pattern, topics: results, members: members.length };
+  }
+
+  /**
+   * Live subscribers of one competing set, in roster order — the
+   * `Subscriber` behind each roster key (static members resolve through
+   * `groupStaticSubs`, EB-104). A static member inside its session
+   * window still holds its roster slot but has no live subscription, so
+   * it is skipped: only members that can actually receive a replay are
+   * returned.
+   */
+  private liveGroupMembers(groupKey: string): Subscriber[] {
+    const staticSubs = this.groupStaticSubs.get(groupKey);
+    const out: Subscriber[] = [];
+    for (const rosterKey of this.groupMembers.get(groupKey) ?? []) {
+      const sub = this.subscribers.get(staticSubs?.get(rosterKey) ?? rosterKey);
+      if (sub !== undefined) out.push(sub);
+    }
+    return out;
+  }
+
+  /**
+   * Replays one seek topic from the durable log for a member of a
+   * partitioned group (EB-376): the `replaySeekTopic` pass filtered to
+   * the partitions currently assigned to the member — a resume must not
+   * deliver another member's partitions. The roster key is the
+   * member's `instanceId` for static members (EB-104), the
+   * subscription id otherwise; `replayLogForPartitionedMember` compares
+   * against the subscription id alone, which silently replays nothing
+   * for a static member.
+   */
+  private replaySeekTopicForPartitionedMember(
+    subscriber: Subscriber,
+    groupKey: string,
+    topic: string,
+    position: number,
+    log: DurableTopicLog,
+  ): number {
+    const n = this.groupPartitions.get(groupKey);
+    if (n === undefined) {
+      return this.replaySeekTopic(subscriber, topic, { mode: 'seq', seq: position }, position, log);
+    }
+    const assignment = this.partitionAssignment(groupKey);
+    const mine = new Set<number>();
+    const rosterKey = subscriber.instanceId ?? subscriber.id;
+    for (const [p, memberId] of assignment) {
+      if (memberId === rosterKey) mine.add(p);
+    }
+    const records: ReplayRecord[] = [];
+    for (const rec of log.readSince(topic, position)) {
+      if (mine.has(this.alignedGroupPartition(n, rec.topic, rec.seq, rec.partition, rec.key))) {
+        records.push(rec);
+      }
+    }
+    if (records.length === 0) return 0;
     records.sort(
       (a, b) => a.at - b.at || a.seq - b.seq || (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0),
     );
