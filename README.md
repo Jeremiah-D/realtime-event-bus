@@ -2448,6 +2448,18 @@ library.
   p50 0.05%, p95 0.17%, p99 0.27% relative error at 485 centroids (pinned
   <1% in tests); 200k samples stay under 800 centroids. Invalid `q`,
   non-finite values, and non-positive weights throw `RangeError`.
+  Both knobs are live-tunable (EB-392): `td.retune({ compression?,
+  bufferSize? })` moves only the fields provided — a compression-only
+  revision keeps the live `bufferSize` (it is *not* recomputed from the
+  new compression's construction default) — and `td.current()` reads the
+  live values. Validation reuses the construction-time rule, so an
+  illegal value throws `RangeError` with the live tuning untouched, and
+  a same-value (or empty) patch is a silent no-op. The new `bufferSize`
+  governs from the next `add()`, the new `compression` from the next
+  compression pass; the centroids already held are never split apart or
+  rebuilt by the retune itself, and no sample is dropped. There is no
+  bus-level wiring: `TDigest` is a standalone class, so retune is a
+  class-level API with no `setX` method or audit event on the bus.
 - **Per-subscriber end-to-end ack-latency SLO tracking** (in
   `src/acklatency.ts`, opt-in via
   `subscribeReliable(..., { ackLatency: true })`): measures each reliably

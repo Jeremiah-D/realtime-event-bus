@@ -146,3 +146,125 @@ test('heavy-tail spike stays visible at extreme quantiles', () => {
   assert.ok(td.quantile(0.5) < 60, `median=${td.quantile(0.5)} pulled by spike`);
   assert.ok(td.quantile(0.999) > 50000, `q0.999=${td.quantile(0.999)} missed the spike`);
 });
+
+test('retune: current() follows construction; partial revision keeps the other field', () => {
+  const td = new TDigest();
+  assert.deepEqual(td.current(), { compression: 100, bufferSize: 800 });
+  td.retune({ compression: 50 });
+  // A compression-only revision keeps the live bufferSize — it is NOT
+  // recomputed from the new compression's construction default (80).
+  assert.deepEqual(td.current(), { compression: 50, bufferSize: 800 });
+  td.retune({ bufferSize: 64 });
+  assert.deepEqual(td.current(), { compression: 50, bufferSize: 64 });
+  td.retune({ compression: 200, bufferSize: 4096 });
+  assert.deepEqual(td.current(), { compression: 200, bufferSize: 4096 });
+});
+
+test('retune: illegal compression throws RangeError and leaves live tuning untouched', () => {
+  const td = new TDigest({ compression: 100, bufferSize: 64 });
+  for (const compression of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, 'x']) {
+    assert.throws(
+      () => td.retune({ compression: compression as unknown as number }),
+      RangeError,
+    );
+    assert.deepEqual(td.current(), { compression: 100, bufferSize: 64 });
+  }
+});
+
+test('retune: illegal bufferSize throws RangeError and leaves live tuning untouched', () => {
+  const td = new TDigest({ compression: 100, bufferSize: 64 });
+  for (const bufferSize of [0, -2, 1.5, Number.NaN, 'x']) {
+    assert.throws(
+      () => td.retune({ bufferSize: bufferSize as unknown as number }),
+      RangeError,
+    );
+    assert.deepEqual(td.current(), { compression: 100, bufferSize: 64 });
+  }
+});
+
+test('retune: non-object patch throws; empty and same-value patches are silent no-ops', () => {
+  const td = new TDigest({ compression: 100, bufferSize: 64 });
+  for (let i = 0; i < 10; i++) td.add(i);
+  const before = td.getCentroids();
+  assert.throws(() => td.retune(null as unknown as { compression: number }), RangeError);
+  assert.throws(() => td.retune('nope' as unknown as { compression: number }), RangeError);
+  assert.throws(() => td.retune([] as unknown as { compression: number }), RangeError);
+  td.retune({});
+  td.retune({ compression: 100 });
+  td.retune({ bufferSize: 64 });
+  td.retune({ compression: 100, bufferSize: 64 });
+  assert.deepEqual(td.current(), { compression: 100, bufferSize: 64 });
+  // The no-op retunes never touched the digest itself.
+  assert.equal(td.count, 10);
+  assert.deepEqual(td.getCentroids(), before);
+});
+
+test('retune: tightening compression refines the next merges — more centroids, tighter p99', () => {
+  const r = rng32(42);
+  const td = new TDigest({ compression: 10 });
+  const exact: number[] = [];
+  for (let i = 0; i < 2000; i++) {
+    const v = Math.exp(r() * 6) * 5;
+    td.add(v);
+    exact.push(v);
+  }
+  const coarseCount = td.centroidCount;
+  const sorted = [...exact].sort((a, b) => a - b);
+  const coarseErr = Math.abs(td.quantile(0.99) - exactRank(sorted, 0.99)) / exactRank(sorted, 0.99);
+  td.retune({ compression: 1000 });
+  for (let i = 0; i < 2000; i++) {
+    const v = Math.exp(r() * 6) * 5;
+    td.add(v);
+    exact.push(v);
+  }
+  const fineCount = td.centroidCount;
+  const sorted2 = [...exact].sort((a, b) => a - b);
+  const fineErr = Math.abs(td.quantile(0.99) - exactRank(sorted2, 0.99)) / exactRank(sorted2, 0.99);
+  // Measured on Node v24: 47 -> 1257 centroids, p99 error 0.23% -> 0.04%.
+  assert.ok(fineCount > coarseCount * 10, `centroids ${coarseCount} -> ${fineCount}`);
+  assert.ok(fineErr < coarseErr, `p99 err ${(coarseErr * 100).toFixed(2)}% -> ${(fineErr * 100).toFixed(2)}%`);
+});
+
+test('retune: loosening compression lets the next pass merge far more aggressively', () => {
+  const r = rng32(42);
+  const td = new TDigest({ compression: 1000 });
+  for (let i = 0; i < 2000; i++) td.add(Math.exp(r() * 6) * 5);
+  const fineCount = td.centroidCount;
+  td.retune({ compression: 10 });
+  for (let i = 0; i < 2000; i++) td.add(Math.exp(r() * 6) * 5);
+  const coarseCount = td.centroidCount;
+  // Measured on Node v24: 1999 -> 45 centroids.
+  assert.ok(coarseCount < fineCount / 10, `centroids ${fineCount} -> ${coarseCount}`);
+});
+
+test('retune: bufferSize governs from the next add()', () => {
+  const td = new TDigest({ bufferSize: 3 });
+  const buffered = () => (td as unknown as { buffer: unknown[] }).buffer.length;
+  td.add(1);
+  td.add(2);
+  assert.equal(buffered(), 2);
+  td.add(3);
+  assert.equal(buffered(), 0, 'third add filled the buffer and compressed');
+  td.retune({ bufferSize: 10 });
+  for (let i = 0; i < 5; i++) td.add(i + 10);
+  assert.equal(buffered(), 5, 'loosened buffer holds five points without compressing');
+  td.retune({ bufferSize: 2 });
+  td.add(99);
+  assert.equal(buffered(), 0, 'tightened buffer compresses on the very next add');
+  td.add(100);
+  assert.equal(buffered(), 1);
+});
+
+test('retune: buffered samples and count survive the retune itself', () => {
+  const td = new TDigest({ compression: 100, bufferSize: 1024 });
+  for (let i = 0; i < 100; i++) td.add(i);
+  const buffered = () => (td as unknown as { buffer: unknown[] }).buffer.length;
+  assert.equal(buffered(), 100);
+  assert.equal(td.count, 100);
+  td.retune({ compression: 10, bufferSize: 8 });
+  // The retune moved the tuning and nothing else: no compression pass
+  // ran, no buffered point was dropped or rewritten.
+  assert.equal(buffered(), 100);
+  assert.equal(td.count, 100);
+  assert.deepEqual(td.current(), { compression: 10, bufferSize: 8 });
+});

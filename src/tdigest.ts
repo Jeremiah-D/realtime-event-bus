@@ -56,14 +56,36 @@ interface MutableCentroid {
 }
 
 /**
+ * Partial revision of a {@link TDigest}'s tuning (EB-392), for
+ * `TDigest.retune`. Only the fields provided move; the rest keep their
+ * live values. `compression` is the K_1 delta (a positive finite
+ * number); `bufferSize` is how many points to buffer before a
+ * compression pass (a positive integer). A partial revision that only
+ * moves `compression` keeps the live `bufferSize` — it is *not*
+ * recomputed from the new compression's default
+ * (`max(64, 8 * compression)`), which applies at construction only.
+ */
+export interface TDigestRevision {
+  /** Compression parameter delta. Must be a positive finite number. */
+  compression?: number;
+  /** How many points to buffer before a compression pass. Must be a positive integer. */
+  bufferSize?: number;
+}
+
+/**
  * Streaming quantile sketch with bounded memory. Add millisecond deltas
  * with {@link add}; estimate quantiles with {@link quantile}. The digest
  * is deterministic: the same insert sequence always yields the same
  * centroids.
  */
 export class TDigest {
-  private readonly compression: number;
-  private readonly bufferSize: number;
+  // Live-tuned by `retune` (EB-392): `add` reads `bufferSize` on every
+  // call and `compress` reads `compression` on every pass, so a revision
+  // governs from the next add / next compression without rebuilding
+  // anything — the centroids already held keep the shape they were
+  // merged under and are never split apart.
+  private compression: number;
+  private bufferSize: number;
   private centroids: MutableCentroid[] = [];
   private buffer: MutableCentroid[] = [];
   private total = 0;
@@ -76,6 +98,56 @@ export class TDigest {
     const bufferSize = options.bufferSize ?? Math.max(64, 8 * Math.ceil(compression));
     if (!Number.isInteger(bufferSize) || bufferSize <= 0) {
       throw new RangeError("TDigest: `bufferSize` must be a positive integer");
+    }
+    this.compression = compression;
+    this.bufferSize = bufferSize;
+  }
+
+  /** The two live tuning values (EB-392). */
+  current(): { compression: number; bufferSize: number } {
+    return { compression: this.compression, bufferSize: this.bufferSize };
+  }
+
+  /**
+   * Retunes the compression and buffer size live (EB-392). The caller
+   * passes a partial revision: only the fields provided move, the rest
+   * keep their live values. Validation reuses the construction-time
+   * rule (`compression` a positive finite number, `bufferSize` a
+   * positive integer) against the merged values, so a value that could
+   * not be set at construction cannot be revised in later either — and
+   * a failed call changes nothing at all: an illegal value in either
+   * field leaves every live value exactly as it was. A revision
+   * identical to the current tuning (including an empty patch) is a
+   * silent no-op.
+   *
+   * The new `bufferSize` governs from the next `add()` (a tightened
+   * buffer compresses more often, a loosened one lets more points
+   * accumulate before the next pass) and the new `compression` from the
+   * next `compress()` — the centroids already held are untouched: a
+   * compression pass re-merges them as units under the new limit but
+   * never splits one apart, so tightening refines what arrives next
+   * while loosening lets the next pass merge more aggressively. The
+   * samples themselves (`count`, buffered points) are never dropped or
+   * rewritten by a retune.
+   */
+  retune(patch: TDigestRevision): void {
+    if (patch == null || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError('TDigest.retune: patch must be an object with compression and/or bufferSize');
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial patch keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const compression = patch.compression ?? this.compression;
+    const bufferSize = patch.bufferSize ?? this.bufferSize;
+    // Re-affirming the current tuning is a no-op.
+    if (compression === this.compression && bufferSize === this.bufferSize) {
+      return;
+    }
+    if (!Number.isFinite(compression) || compression <= 0) {
+      throw new RangeError('TDigest.retune: `compression` must be a positive finite number');
+    }
+    if (!Number.isInteger(bufferSize) || bufferSize <= 0) {
+      throw new RangeError('TDigest.retune: `bufferSize` must be a positive integer');
     }
     this.compression = compression;
     this.bufferSize = bufferSize;
