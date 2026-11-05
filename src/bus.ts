@@ -5345,6 +5345,28 @@ export interface EventBusOptions {
    */
   maxPendingMessages?: number;
   /**
+   * Bus-wide delayed-delivery capacity budget (EB-384, real-time
+   * systems / backend engineering): the maximum number of
+   * `publishDelayed` schedules that may sit pending across the whole
+   * bus. A schedule attempted while the pending set is already at the
+   * budget is refused fail-fast — it returns `undefined`, is counted in
+   * the topic's `rejectedMessages` and `delayedCapacityRejected`, and
+   * fires `onAdmissionRejected` with reason `'delayed-capacity'` — and
+   * otherwise leaves zero side effects: no publisher or key rate-limit
+   * token burned, no key sequence consumed, no id minted, nothing in
+   * the heap, nothing on disk. Tightening the budget at runtime (see
+   * `setDelayedCapacity`) never evicts schedules already pending; they
+   * drain naturally, and new schedules are admitted again once the
+   * pending count drops below the new budget. Absent (the default)
+   * means unlimited — fully backward compatible. Must be a
+   * non-negative integer when given (`0` refuses every new schedule),
+   * otherwise `RangeError` at construction. Restart recovery
+   * (`recoverDelayed`) rebuilds persisted schedules without consulting
+   * the budget — the budget constrains only schedules created after
+   * the restart.
+   */
+  maxDelayedEntries?: number;
+  /**
    * Bus-level global publish rate limit (EB-180, real-time systems /
    * backend engineering): one token bucket shared by every publish on
    * the bus — the backstop under the per-topic (EB-19) and per-publisher
@@ -6085,6 +6107,17 @@ export interface TopicStats {
    */
   publisherRateLimited: number;
   /**
+   * Delayed schedules on this topic refused by the bus-wide delayed
+   * capacity budget (see `setDelayedCapacity`, EB-384): the pending
+   * delayed queue was already at `EventBusOptions.maxDelayedEntries`
+   * when the schedule was attempted, so it was never queued, never
+   * persisted, and burned no publisher or key rate-limit token. The
+   * shed consumes no sequence number (delayed schedules never consume
+   * one before fan-out) and is invisible to gap detection. Surfaced on
+   * `onAdmissionRejected` with reason `'delayed-capacity'`.
+   */
+  delayedCapacityRejected: number;
+  /**
    * Messages on this topic shed by per-key publish-side rate limiting
    * (see `setKeyRateLimit`, EB-234): the per-(topic, key) token bucket
    * was empty when the keyed message was published, so it was never
@@ -6758,6 +6791,12 @@ export interface BusStats {
    * `TopicStats.publisherRateLimited` for the exact counting rules.
    */
   publisherRateLimited: number;
+  /**
+   * Total delayed schedules refused by the bus-wide delayed capacity
+   * budget — the sum of every topic's `delayedCapacityRejected`. See
+   * `TopicStats.delayedCapacityRejected` for the exact counting rules.
+   */
+  delayedCapacityRejected: number;
   /**
    * Total messages shed by per-key publish-side rate limiting — the sum
    * of every topic's `keyRateLimited`. See `TopicStats.keyRateLimited`
@@ -9483,6 +9522,7 @@ function zeroedTopicStats(): {
   sequenceGaps: number;
   rateLimitedMessages: number;
   publisherRateLimited: number;
+  delayedCapacityRejected: number;
   keyRateLimited: number;
   sampledMessages: number;
   pausedMessages: number;
@@ -9531,6 +9571,7 @@ function zeroedTopicStats(): {
     sequenceGaps: 0,
     rateLimitedMessages: 0,
     publisherRateLimited: 0,
+    delayedCapacityRejected: 0,
     keyRateLimited: 0,
     sampledMessages: 0,
     pausedMessages: 0,
@@ -12040,6 +12081,12 @@ interface PauseBufferEntry {
  *   EB-234; shed in the admission phase — no sequence number consumed,
  *   so like a `'publisher-rate-limit'` shed it is invisible to gap
  *   detection, and it burns no per-topic rate-limit token)
+ * - `'delayed-capacity'` → `TopicStats.delayedCapacityRejected` /
+ *   `BusStats.delayedCapacityRejected` (the pending delayed schedule
+ *   set was already at the bus-wide capacity budget, EB-384; refused
+ *   at schedule time — no id minted, nothing in the heap, nothing on
+ *   disk, no publisher or key token burned — and also counted in
+ *   `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
  * - `'cas-mismatch'` → `TopicStats.casMismatches` /
@@ -12130,6 +12177,7 @@ export type AdmissionRejectReason =
   | 'backpressure'
   | 'tenant-quota'
   | 'global-rate-limit'
+  | 'delayed-capacity'
   | 'webhook-deny'
   | 'maintenance'
   | 'lineage-cycle'
@@ -15212,6 +15260,7 @@ export class EventBus {
       sequenceGaps: number;
       rateLimitedMessages: number;
       publisherRateLimited: number;
+      delayedCapacityRejected: number;
       keyRateLimited: number;
       pausedMessages: number;
       circuitBrokenMessages: number;
@@ -15864,6 +15913,13 @@ export class EventBus {
    * sequence number and subscribers see no gap.
    */
   private totalPublisherRateLimited = 0;
+  /**
+   * Total delayed schedules refused by the bus-wide delayed capacity
+   * budget (EB-384, see `EventBusOptions.maxDelayedEntries`). Counts
+   * each refused schedule once, at the schedule-time refusal. Surfaced
+   * as `BusStats.delayedCapacityRejected`.
+   */
+  private totalDelayedCapacityRejected = 0;
   /**
    * Per-key publish rate limits (EB-234), keyed by the exact string
    * passed to `setKeyRateLimit` — either a concrete topic name or a
@@ -17073,6 +17129,14 @@ export class EventBus {
    */
   private maxPendingMessages: number | undefined;
   /**
+   * Bus-wide delayed-delivery capacity budget (EB-384): the maximum
+   * number of pending `publishDelayed` schedules across the whole bus.
+   * `undefined` (the default) means unlimited. Tunable at runtime via
+   * `setDelayedCapacity` — lowering it never evicts pending schedules,
+   * it drains naturally.
+   */
+  private maxDelayedEntries: number | undefined;
+  /**
    * Bus-level global publish rate limiter (EB-180, see
    * `EventBusOptions.globalPublishRateLimit`). `undefined` when
    * unconfigured — the publish path then pays a single `undefined`
@@ -18074,6 +18138,19 @@ export class EventBus {
       throw new RangeError('maxPendingMessages must be a non-negative integer');
     }
     this.maxPendingMessages = maxPendingMessages;
+    // Bus-wide delayed-delivery capacity budget (EB-384): absent means
+    // unlimited (backward compatible); a configured budget is enforced
+    // in `publishDelayed`'s schedule-time admission phase, after alias
+    // resolution and the topic-pause gate and before any rate-limit
+    // token is taken.
+    const maxDelayedEntries = options?.maxDelayedEntries;
+    if (
+      maxDelayedEntries !== undefined &&
+      (!Number.isInteger(maxDelayedEntries) || maxDelayedEntries < 0)
+    ) {
+      throw new RangeError('maxDelayedEntries must be a non-negative integer');
+    }
+    this.maxDelayedEntries = maxDelayedEntries;
     // Bus-level global publish rate limit (EB-180): absent means
     // unlimited (backward compatible); a configured limit is enforced in
     // the fan-out admission phase, after every per-topic gate.
@@ -18103,6 +18180,66 @@ export class EventBus {
       throw new RangeError('maxPendingMessages must be a non-negative integer');
     }
     this.maxPendingMessages = maxPendingMessages;
+  }
+
+  /**
+   * Retunes the bus-wide delayed-delivery capacity budget at runtime
+   * (EB-384, see `EventBusOptions.maxDelayedEntries`).
+   * `setDelayedCapacity(maxEntries, actor?)` replaces the live budget:
+   * `undefined` clears it back to unlimited, `0` refuses every new
+   * schedule. Tightening the budget never evicts schedules already
+   * pending — they drain naturally, and new schedules are admitted
+   * again once the pending count drops below the new budget — while
+   * loosening it takes effect for the very next schedule attempt.
+   *
+   * The change is recorded in the subscription audit log as
+   * `delayed_capacity_revised` (with the previous and new bound in
+   * `detail`; `null` stands for unlimited, since JSON has no
+   * `undefined`), so capacity policy changes stay attributable. The
+   * revision itself is live-only: a restart restores the
+   * construction-time option value, and restart recovery rebuilds
+   * persisted schedules without consulting the budget either way.
+   *
+   * Fail-closed: a non-negative-integer violation throws `RangeError`
+   * with the live budget and the audit log untouched. A revision
+   * identical to the current budget (including clearing an already
+   * unlimited budget) is a no-op with no audit.
+   *
+   * Throws `RangeError` for a bad actor or for a negative or
+   * non-integer `maxEntries`.
+   */
+  setDelayedCapacity(maxEntries: number | undefined, actor = 'system'): void {
+    assertValidActor(actor, 'setDelayedCapacity');
+    if (
+      maxEntries !== undefined &&
+      (!Number.isInteger(maxEntries) || maxEntries < 0)
+    ) {
+      throw new RangeError('maxDelayedEntries must be a non-negative integer');
+    }
+    const previous = this.maxDelayedEntries;
+    // Re-affirming the current budget is a no-op: no retune, no audit.
+    if (maxEntries === previous) {
+      return;
+    }
+    this.maxDelayedEntries = maxEntries;
+    this.auditSubscription({
+      action: 'delayed_capacity_revised',
+      actor,
+      detail: {
+        maxEntries: maxEntries === undefined ? null : maxEntries,
+        oldMaxEntries: previous === undefined ? null : previous,
+      },
+    });
+  }
+
+  /**
+   * Returns the live delayed-delivery capacity budget (EB-384):
+   * `undefined` means unlimited. Mirrors the value `setDelayedCapacity`
+   * last installed, or the construction-time
+   * `EventBusOptions.maxDelayedEntries` before any revision.
+   */
+  getDelayedCapacity(): number | undefined {
+    return this.maxDelayedEntries;
   }
 
   /**
@@ -28280,6 +28417,7 @@ export class EventBus {
         sequenceGaps: 0,
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
+        delayedCapacityRejected: 0,
         keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
@@ -44256,6 +44394,24 @@ export class EventBus {
       this.countTopicPaused(topic, payload, publisherId);
       return undefined;
     }
+    // Fail fast on the bus-wide delayed capacity budget (EB-384): the
+    // gate sits after alias resolution and the topic-pause gate — so
+    // the refusal is counted against the resolved concrete topic, like
+    // every other schedule-time gate — and before any rate-limit token
+    // is taken, so a refused schedule burns no publisher or key budget,
+    // consumes no key sequence, mints no id, enters no heap, and writes
+    // nothing to disk. The check and the insert below run in the same
+    // synchronous call with no await between them, so the
+    // check-then-insert cannot race. A refused schedule returns
+    // `undefined` like every other fail-fast shed, which also rolls
+    // back a `publishDelayedBatch` containing it.
+    if (
+      this.maxDelayedEntries !== undefined &&
+      this.delayedById.size >= this.maxDelayedEntries
+    ) {
+      this.countDelayedCapacityRejected(topic, payload, publisherId);
+      return undefined;
+    }
     // Fail fast on the per-publisher rate limit (EB-79): an over-budget
     // publisher never becomes a scheduled delivery — no id, nothing in
     // the heap, nothing on disk. The token is spent at schedule time, so
@@ -48422,6 +48578,25 @@ export class EventBus {
   }
 
   /**
+   * Counts one delayed schedule refused by the bus-wide delayed
+   * capacity budget (EB-384) against the topic and the global total,
+   * then fires the admission-rejection hook with reason
+   * `'delayed-capacity'`. The refusal happens before admission: the
+   * schedule never becomes a pending delivery — no id is minted,
+   * nothing enters the heap, nothing is persisted, and no publisher
+   * or key rate-limit token is burned. The per-topic stats entry is
+   * created here when the topic has never published anything yet (see
+   * `countSchemaRejection`).
+   */
+  private countDelayedCapacityRejected(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).delayedCapacityRejected += 1;
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalDelayedCapacityRejected += 1;
+    this.totalRejected += 1;
+    this.emitAdmissionRejected(topic, 'delayed-capacity', payload, publisherId);
+  }
+
+  /**
    * Takes one token from the (topic, key) rate-limit bucket (EB-234),
    * creating the bucket lazily from the configured rule on first use —
    * refilled from the injected clock (`EventBusOptions.now`), so the
@@ -49932,6 +50107,7 @@ export class EventBus {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
+      delayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -50081,6 +50257,7 @@ export class EventBus {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
+      delayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -50253,6 +50430,7 @@ export class EventBus {
         sequenceGaps: 0,
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
+        delayedCapacityRejected: 0,
         keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
@@ -50409,6 +50587,7 @@ export class EventBus {
       sequenceGaps: 0,
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
+      delayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -55786,6 +55965,7 @@ export class EventBus {
       sequenceGaps: this.totalSequenceGaps,
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
+      delayedCapacityRejected: this.totalDelayedCapacityRejected,
       keyRateLimited: this.totalKeyRateLimited,
       sampledMessages: this.totalSampled,
       pausedMessages: this.totalPaused,
@@ -56194,6 +56374,7 @@ export class EventBus {
         sequenceGaps: stats.sequenceGaps,
         rateLimitedMessages: stats.rateLimitedMessages,
         publisherRateLimited: stats.publisherRateLimited,
+        delayedCapacityRejected: stats.delayedCapacityRejected,
         keyRateLimited: stats.keyRateLimited,
         sampledMessages: stats.sampledMessages,
         pausedMessages: stats.pausedMessages,

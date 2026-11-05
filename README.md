@@ -3193,7 +3193,31 @@ library.
   the message consumes no sequence number, writes no durable-log message
   record, and burns no rate-limit budget until it actually fans out — at
   which point it goes through the full publish pipeline exactly as if
-  published at that moment. TTL is stamped at schedule time: a message whose
+  published at that moment. Bus-wide delayed capacity budget (EB-384, via
+  `EventBusOptions.maxDelayedEntries`, retuned live with
+  `bus.setDelayedCapacity(maxEntries, actor?)` / read with
+  `bus.getDelayedCapacity()`): at most that many schedules may sit
+  pending across the whole bus. A schedule attempted at the budget is
+  refused fail-fast — it returns `undefined`, counts in the topic's
+  `rejectedMessages` and `delayedCapacityRejected` (plus the bus-wide
+  totals), and fires `onAdmissionRejected` with reason
+  `'delayed-capacity'` — with zero other side effects: no publisher or
+  key rate-limit token burned, no key sequence consumed, no id minted,
+  nothing in the heap, nothing on disk. The gate runs after alias
+  resolution and the topic-pause gate and before any token is taken, so
+  the refusal is attributed to the resolved concrete topic. Tightening
+  the budget never evicts schedules already pending — they drain
+  naturally and admission resumes once the count drops below the new
+  budget — while loosening takes effect for the very next attempt; `0`
+  refuses every new schedule and `undefined` restores unlimited.
+  `publishDelayedBatch` inherits the gate entry by entry, so one refused
+  entry rolls the whole batch back. Restart recovery rebuilds persisted
+  schedules without consulting the budget, and the revision itself is
+  live-only (a restart restores the construction-time option). Revisions
+  are audited as `delayed_capacity_revised` (`null` stands for
+  unlimited); an identical revision is a no-op with no audit, and an
+  illegal value throws `RangeError` with the live budget untouched.
+  TTL is stamped at schedule time: a message whose
   deadline passes before its due time is dropped as expired, never
   delivered. With `durableLogDir`, the schedule is persisted before
   `publishDelayed` returns (a seq-0 record carrying `deliverAt`), so a
