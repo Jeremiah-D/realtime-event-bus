@@ -28351,6 +28351,89 @@ export class EventBus {
   }
 
   /**
+   * Revises one namespace's admission flags live (EB-386) without
+   * deleting and re-creating it: `setNamespaceOptions(prefix, opts,
+   * actor?)` retunes `allowPublish` / `allowSubscribe` for a
+   * registered namespace. The revision is partial — only the flags
+   * `opts` provides move; a flag left out keeps its live value.
+   *
+   * The admission gates (`resolveNamespaceForPublish` /
+   * `resolveNamespaceForSubscribe`) read the stored flags on every
+   * call, so the new flags govern from the very next publish or
+   * subscribe admission, while in-flight deliveries and
+   * already-established subscriptions are unaffected: denying
+   * subscribe blocks only new subscriptions — it never evicts an
+   * existing subscriber — and denying publish rejects only new
+   * publishes. Only the flags move, in place on the stored flags
+   * object: the namespace registration, its child durable log, its
+   * subscribers, and its quota rules (`setNamespaceQuota`, EB-162)
+   * are untouched. `getNamespaces()` already reports the live flags,
+   * so no new getter is needed.
+   *
+   * This is the only targeted live path for namespace flags:
+   * `deleteNamespace` still refuses a namespace with live subscribers
+   * or retained durable-log entries, and `applyConfig` still cannot
+   * change a live namespace's flags (its delete-then-create modify
+   * fails and rolls back). The revision itself is live-only — it is
+   * never written into snapshots, so a restart restores the
+   * `createNamespace` construction values.
+   *
+   * The change is recorded in the subscription audit log as
+   * `namespace_options_revised` (with the prefix and the previous
+   * and new flags in `detail`), so flag policy changes stay
+   * attributable.
+   *
+   * Fail-closed: a non-object `opts`, a non-boolean flag, or an
+   * unknown prefix throws `RangeError` with the live flags and the
+   * audit log untouched. A revision identical to the live flags is a
+   * no-op with no audit.
+   *
+   * Throws `RangeError` for a bad actor, a non-object `opts`, a
+   * non-boolean flag, or an unknown prefix.
+   */
+  setNamespaceOptions(prefix: string, opts: NamespaceOptions, actor = 'system'): void {
+    assertValidActor(actor, 'setNamespaceOptions');
+    if (typeof opts !== 'object' || opts === null || Array.isArray(opts)) {
+      throw new RangeError('setNamespaceOptions: options must be an object');
+    }
+    if (opts.allowPublish !== undefined && typeof opts.allowPublish !== 'boolean') {
+      throw new RangeError('namespace allowPublish must be a boolean');
+    }
+    if (opts.allowSubscribe !== undefined && typeof opts.allowSubscribe !== 'boolean') {
+      throw new RangeError('namespace allowSubscribe must be a boolean');
+    }
+    const entry = this.namespaces.get(prefix);
+    if (entry === undefined) {
+      throw new RangeError(`unknown namespace "${prefix}"`);
+    }
+    const oldAllowPublish = entry.allowPublish;
+    const oldAllowSubscribe = entry.allowSubscribe;
+    const allowPublish = opts.allowPublish ?? oldAllowPublish;
+    const allowSubscribe = opts.allowSubscribe ?? oldAllowSubscribe;
+    // Re-affirming the live flags is a no-op: no retune, no audit.
+    if (allowPublish === oldAllowPublish && allowSubscribe === oldAllowSubscribe) {
+      return;
+    }
+    // In place on the stored flags object: the admission gates read
+    // these fields live, so the next publish/subscribe already sees
+    // the new flags — nothing is re-registered, and no subscriber,
+    // durable-log entry, or quota rule moves.
+    entry.allowPublish = allowPublish;
+    entry.allowSubscribe = allowSubscribe;
+    this.auditSubscription({
+      action: 'namespace_options_revised',
+      actor,
+      detail: {
+        prefix,
+        allowPublish,
+        oldAllowPublish,
+        allowSubscribe,
+        oldAllowSubscribe,
+      },
+    });
+  }
+
+  /**
    * Snapshot of the registered namespaces, in registration order: the
    * prefix, its effective flags, and the current live subscriber count.
    */

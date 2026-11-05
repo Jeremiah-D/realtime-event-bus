@@ -3460,6 +3460,21 @@ Semantics:
 - **Flags.** `createNamespace(prefix, { allowPublish: false })` makes a
   read-only scope (publishes → `NamespaceDeniedError`);
   `allowSubscribe: false` makes a write-only scope.
+  `bus.setNamespaceOptions(prefix, { allowPublish?, allowSubscribe? })`
+  (EB-386) revises the flags live, partially — only the flags provided
+  move — without deleting and re-creating the namespace: the next
+  publish/subscribe admission already reads the new flags, while
+  in-flight deliveries and existing subscriptions are unaffected
+  (denying subscribe blocks only new subscriptions). The change is
+  audited as `namespace_options_revised` (prefix plus previous and new
+  flags); a re-affirmation is a no-op. Unlike `deleteNamespace`
+  (which still refuses a namespace with live subscribers or retained
+  durable-log entries) and `applyConfig` (whose delete-then-create
+  modify still fails on a live namespace), this is the targeted live
+  path — and unlike `setNamespaceQuota` (EB-162, publish budgets) it
+  moves only admission flags, never quotas, durable-log entries, or
+  subscribers. The revision is live-only: a restart restores the
+  `createNamespace` values.
 - **Lifecycle.** `getNamespaces()` snapshots prefix, flags, and live
   subscriber counts. `deleteNamespace(prefix)` throws
   `NamespaceNotEmptyError` while live subscribers or retained
