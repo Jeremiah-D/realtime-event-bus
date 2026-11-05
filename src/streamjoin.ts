@@ -153,6 +153,7 @@ export interface StreamJoinStats {
   left: string;
   right: string;
   outputTopic: string;
+  /** Join flavor (live-revisable, EB-383). */
   how: StreamJoinHow;
   windowMs: number;
   /** Bound on buffered entries per key per side (live-revisable, EB-345). */
@@ -391,6 +392,36 @@ export class StreamJoinEngine {
       throw new RangeError('maxBufferedPerKey must be a positive integer');
     }
     join.maxBufferedPerKey = maxBufferedPerKey;
+  }
+
+  /** The configured join flavor for a join, or `undefined` when unknown. */
+  getHow(joinId: string): StreamJoinHow | undefined {
+    return this.joins.get(joinId)?.how;
+  }
+
+  /**
+   * Retunes a join's inner/left-outer flavor live (EB-383) without
+   * redefining it: `arrive` reads `join.how` live, so the new value
+   * governs only arrivals after the revision — a left arrival with no
+   * in-window right peer derives a `right: null` row only while the
+   * flavor is `'left'`, and a left arrival under `'inner'` only
+   * buffers. A pair already derived is never re-derived or withdrawn,
+   * and a buffered left entry is never backfilled when the flavor
+   * flips to `'left'` (a left-outer row is derived only at arrival
+   * time). The sweep timer is untouched — its interval depends only
+   * on `windowMs`. Throws `RangeError` on an unknown join id or an
+   * illegal flavor (the same `'inner' | 'left'` rule
+   * `validateStreamJoinOptions` enforces at define time).
+   */
+  retuneHow(joinId: string, how: StreamJoinHow): void {
+    const join = this.joins.get(joinId);
+    if (join === undefined) {
+      throw new RangeError(`unknown join id "${joinId}"`);
+    }
+    if (how !== 'inner' && how !== 'left') {
+      throw new RangeError("how must be 'inner' or 'left'");
+    }
+    join.how = how;
   }
 
   /** Joins currently defined. */

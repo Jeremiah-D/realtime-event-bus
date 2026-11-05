@@ -9461,6 +9461,28 @@ Semantics notes:
   (`{ joinId: <string>, maxBufferedPerKey: <number>,
   oldMaxBufferedPerKey: <number> }`).
   `getStats().joins` reports the live bound immediately.
+- Retune the join flavor live with
+  `bus.setStreamJoinHow(joinId, how)` (EB-383): only the flavor
+  moves — the join's topics, key function, output topic, `windowMs`,
+  and `maxBufferedPerKey` are untouched, and the buffered entries
+  stay put. The new value governs only arrivals after the revision:
+  flipping inner→left makes the next unmatched left arrival derive a
+  `right: null` row (a buffered left entry is never backfilled — a
+  left-outer row is derived only at arrival time), while flipping
+  left→inner makes the next unmatched left arrival only buffer, so an
+  operator can open the tap on unmatched orders while the payments
+  stream stalls and close it again when the flood of null rows is no
+  longer wanted. A right arrival never derives a null row on either
+  side of a flip. A pair already derived is never re-derived or
+  withdrawn, and pairing itself is unaffected — a buffered left entry
+  still pairs with its later right arrival under either flavor. The
+  sweep timer is untouched (its interval depends only on `windowMs`).
+  It is fail-closed (an empty or unknown join id, or a flavor outside
+  `'inner'`/`'left'`, throws `RangeError` with the live flavor and the
+  audit log untouched), and a revision identical to the current flavor
+  is a no-op with no audit. Audited as `stream_join_how_revised`
+  (`{ joinId: <string>, how: <string>, oldHow: <string> }`).
+  `getStats().joins` reports the live flavor immediately.
 - `getStats().joins` → per-join `{ joined, joinLate, joinEvicted,
   keyErrors, bufferedLeft, bufferedRight }` (present once a join was
   defined); globals `totalStreamJoinMatches` / `totalStreamJoinLate` /

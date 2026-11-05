@@ -20942,6 +20942,75 @@ export class EventBus {
   }
 
   /**
+   * Revises one stream join's inner/left-outer flavor live (EB-383)
+   * without redefining it: `setStreamJoinHow(joinId, how)` switches
+   * the join between `'inner'` (emit only on a hit) and `'left'`
+   * (also emit left arrivals with no in-window right peer, with
+   * `right: null` / `rightSeq: null`) — see `joinTopics`, EB-187.
+   *
+   * Only the flavor moves: the join's topics, key function, output
+   * topic, `windowMs`, and `maxBufferedPerKey` are untouched, and the
+   * buffered entries stay put — a pair already derived is never
+   * re-derived or withdrawn. `arrive` reads the flavor live, so the
+   * new value governs only arrivals after the revision: flipping
+   * inner→left makes the next unmatched left arrival derive a
+   * `right: null` row (a buffered left entry is never backfilled —
+   * a left-outer row is derived only at arrival time), while flipping
+   * left→inner makes the next unmatched left arrival only buffer.
+   * A right arrival never derives a null row on either side of a
+   * flip: the left-outer rule applies to left arrivals only. The
+   * sweep timer is untouched: its interval depends only on
+   * `windowMs`. `getStats().joins` reports the live flavor
+   * immediately.
+   *
+   * Fail-closed: an empty joinId, an unknown join id, and an illegal
+   * flavor (anything but `'inner'` / `'left'`, e.g. `'outer'`,
+   * `'INNER'`, a non-string) all throw `RangeError` with the live
+   * flavor and the audit log untouched — the new value reuses the
+   * define-time validation, so a value that could not be set at
+   * define time cannot be revised in later either. A revision
+   * identical to the current flavor is a no-op with no audit. Audited
+   * as `stream_join_how_revised`
+   * (`{ joinId: <string>, how: <string>, oldHow: <string> }`).
+   *
+   * Orthogonal to EB-187 (that is the join mechanism itself — this
+   * its flavor revision), to EB-336 (that is the join window
+   * revision — this the flavor), and to EB-345 (that is the per-key
+   * buffer bound revision — this the flavor).
+   *
+   * Throws `RangeError` for an empty / unknown join id or an illegal
+   * flavor.
+   */
+  setStreamJoinHow(joinId: string, how: StreamJoinHow): void {
+    if (typeof joinId !== 'string' || joinId.length === 0) {
+      throw new RangeError('setStreamJoinHow: joinId must be a non-empty string');
+    }
+    // Same rule as `validateStreamJoinOptions` (EB-187): 'inner' or
+    // 'left' — validated before anything is touched.
+    if (how !== 'inner' && how !== 'left') {
+      throw new RangeError("setStreamJoinHow: how must be 'inner' or 'left'");
+    }
+    const engine = this.streamJoins;
+    if (engine === undefined) {
+      throw new RangeError(`setStreamJoinHow: unknown join id "${joinId}"`);
+    }
+    const oldHow = engine.getHow(joinId);
+    if (oldHow === undefined) {
+      throw new RangeError(`setStreamJoinHow: unknown join id "${joinId}"`);
+    }
+    // Re-affirming the current flavor is a no-op: no retune, no audit.
+    if (how === oldHow) {
+      return;
+    }
+    engine.retuneHow(joinId, how);
+    this.auditSubscription({
+      action: 'stream_join_how_revised',
+      actor: 'system',
+      detail: { joinId, how, oldHow },
+    });
+  }
+
+  /**
    * Emits one derived join output back onto the bus (EB-187): an
    * `outputTopic` publish through the normal pipeline, marked
    * join-derived so it never re-enters join observation.
