@@ -20490,6 +20490,10 @@ export class EventBus {
    * still derives when the armed window fits the live `withinMs` — the
    * event-free window really elapsed, only delivery was late — and a
    * partial drops only when its armed window exceeds the live window.
+   * The same deadline is evaluated on every observation (EB-380): a
+   * message arriving after the armed deadline but before the late timer
+   * fired settles the absence first, then is matched against the
+   * advanced step — only an arrival before the deadline kills.
    * The first step can never be an absence step.
    *
    * Throws `RangeError` before anything is registered on invalid options

@@ -9277,7 +9277,13 @@ Semantics notes:
   the timer fires late (millisecond rounding / event-loop jitter), the
   absence still derives — the event-free window really elapsed, only
   delivery was late — and `durationMs` records the actual late-fire
-  time. A partial drops only when its armed window exceeds the live
+  time. The same deadline is evaluated on every observation (EB-380):
+  a message arriving after the armed deadline but before the late timer
+  fired settles the absence first (disarming the timer, so a stale fire
+  records nothing twice), then is matched against the advanced step —
+  only an arrival before the deadline kills. A message arriving after
+  both the deadline and the live `withinMs` is swept first and derives
+  nothing. A partial drops only when its armed window exceeds the live
   window (an explicit `absenceMs` wider than `withinMs`, or a live
   shrink under EB-297); `absences[].windowMs` records the armed value.
   The first step can never be an absence step
@@ -9299,7 +9305,10 @@ Semantics notes:
   already-armed deadline is guarded by its armed window against the
   live window on fire (EB-379) — it derives when the armed window still
   fits, even if the timer fires late, and drops only when the live
-  window shrank below it. Unknown
+  window shrank below it — and the same deadline is evaluated on
+  observation (EB-380): a message arriving after the armed deadline but
+  before the late timer fired settles first, then is matched against the
+  advanced step. Unknown
   ids and illegal values throw `RangeError` with the live values
   untouched; an identical or empty revision is a no-op with no audit.
   Audited as `cep_sequence_pattern_revised` (the `pattern` field carries

@@ -41,6 +41,15 @@
  * records the actual late-fire time. `getStats().cep` exposes
  * `absencePatterns` and `absenceMatches`.
  *
+ * The deadline is also evaluated on `observe` (EB-380), before topic
+ * matching: a message arriving after the armed deadline — `now >=
+ * absenceArmedAt + absenceWindowMs` — but before the late timer fired
+ * settles the absence first (same path as the timer fire), then the
+ * message is matched against the advanced step. A message arriving
+ * before the deadline still kills the partial as before; the guard is
+ * the same armed-window-vs-live-window rule (EB-379), so a shrink
+ * under EB-297 still drops instead of deriving.
+ *
  * The class is pure in-memory state: the bus owns topic matching
  * (`compilePattern` is injected — this module must not import
  * `bus.ts` at runtime, or it closes an import cycle), the clock
@@ -215,6 +224,15 @@ interface PartialMatch {
    * together with the timer on kill, sweep, eviction and clear.
    */
   absenceWindowMs?: number;
+  /**
+   * Bus-clock time the absence deadline was armed (EB-380): `observe`
+   * evaluates the deadline against this — `now >= absenceArmedAt +
+   * absenceWindowMs` — before topic matching, so a message arriving
+   * after the deadline but before the late timer fires settles the
+   * absence first instead of killing the partial. Cleared together
+   * with the timer on kill, sweep, eviction and clear.
+   */
+  absenceArmedAt?: number;
   /**
    * Set when the partial is dead (killed, swept, evicted, cleared,
    * completed). The timer callback checks it: a stale timer is a no-op.
@@ -497,34 +515,63 @@ export class CepEngine {
       if (existing !== undefined) {
         const survivors: PartialMatch[] = [];
         for (const partial of existing) {
-          const step = steps[partial.stepIndex];
-          if (step === undefined) {
-            survivors.push(partial);
-            continue;
-          }
-          if (step.absence) {
-            // Negation (EB-174): the awaited event arrived — the absence
-            // can never fire. Kill the partial and disarm its deadline.
+          // A message arriving after an armed absence deadline settles
+          // the absence first (EB-380): the deadline is evaluated on
+          // observe, before topic matching, so a B that lands in the
+          // gap between the deadline passing and the late timer firing
+          // no longer kills the partial — the absence settles, then B
+          // is matched against the advanced step. The loop re-evaluates
+          // after a settle: a freshly re-armed chained absence step is
+          // still inside its new window, so B kills it as before.
+          let current: PartialMatch | undefined = partial;
+          while (current !== undefined) {
+            const step = steps[current.stepIndex];
+            if (step === undefined) {
+              survivors.push(current);
+              break;
+            }
+            if (step.absence) {
+              const armedAt = current.absenceArmedAt;
+              const armedWindowMs = current.absenceWindowMs;
+              if (
+                armedAt !== undefined &&
+                armedWindowMs !== undefined &&
+                now >= armedAt + armedWindowMs
+              ) {
+                const outcome = this.settleAbsence(pattern, current, now);
+                if (outcome === 'completed' || outcome === 'dropped') {
+                  // Completed (match emitted) or guard-dropped: the
+                  // partial leaves the index — not a survivor.
+                  break;
+                }
+                // Advanced past the absence step: B is now matched
+                // against the new step.
+                continue;
+              }
+              // Negation (EB-174): the awaited event arrived — the absence
+              // can never fire. Kill the partial and disarm its deadline.
+              if (step.matcher.test(msg.topic)) {
+                this.killPartial(pattern, current);
+              } else {
+                survivors.push(current);
+              }
+              break;
+            }
             if (step.matcher.test(msg.topic)) {
-              this.killPartial(pattern, partial);
+              const events = [...current.events, this.matchedEvent(msg, now)];
+              if (current.stepIndex === steps.length - 1) {
+                this.complete(pattern, current, events, key, now);
+              } else {
+                const advanced: PartialMatch = { ...current, stepIndex: current.stepIndex + 1, events };
+                // The next step may be an absence step — arm its deadline.
+                const next = steps[advanced.stepIndex];
+                if (next !== undefined && next.absence) this.armAbsence(pattern, advanced);
+                survivors.push(advanced);
+              }
             } else {
-              survivors.push(partial);
+              survivors.push(current);
             }
-            continue;
-          }
-          if (step.matcher.test(msg.topic)) {
-            const events = [...partial.events, this.matchedEvent(msg, now)];
-            if (partial.stepIndex === steps.length - 1) {
-              this.complete(pattern, partial, events, key, now);
-            } else {
-              const advanced: PartialMatch = { ...partial, stepIndex: partial.stepIndex + 1, events };
-              // The next step may be an absence step — arm its deadline.
-              const next = steps[advanced.stepIndex];
-              if (next !== undefined && next.absence) this.armAbsence(pattern, advanced);
-              survivors.push(advanced);
-            }
-          } else {
-            survivors.push(partial);
+            break;
           }
         }
         if (survivors.length === 0) {
@@ -565,12 +612,73 @@ export class CepEngine {
    * captured on the partial (EB-379): the fire-time guard compares the
    * armed window against the live `withinMs`, not the fire time, so a
    * timer that fires late still derives when the armed window fits.
+   * The arm moment is captured too (EB-380), so `observe` can evaluate
+   * the same deadline when a message arrives before the timer fires.
    */
   private armAbsence(pattern: CompiledPattern, partial: PartialMatch): void {
     const step = pattern.steps[partial.stepIndex];
     const windowMs = step.absenceMs ?? pattern.withinMs;
     partial.absenceWindowMs = windowMs;
+    // The arm moment on the bus clock (EB-380): `observe` evaluates the
+    // deadline against this, so a message arriving after the deadline
+    // but before the late timer fires settles first.
+    partial.absenceArmedAt = this.deps.now();
     partial.absenceTimer = this.setTimer(() => this.onAbsenceDeadline(pattern, partial), windowMs);
+  }
+
+  /**
+   * Settles one armed absence deadline (EB-174/EB-379/EB-380) — the
+   * shared path of the timer fire (`onAbsenceDeadline`) and the
+   * observe-side evaluation (`observe`). Disarms the pending timer
+   * first, so a stale timer firing later is a no-op and can never
+   * record the same absence twice; then the EB-379 guard: drop (derive
+   * nothing) when the armed window exceeds the live `withinMs`.
+   * Otherwise records the absence (windowMs is the armed value),
+   * counts it, and advances the partial — completing the pattern when
+   * the absence step was last, or re-arming immediately when the next
+   * step is also an absence step. `durationMs` records the settle time
+   * `now` (the late-fire / late-arrival time, as it happened).
+   *
+   * Index ownership stays with the caller: on `'completed'` or
+   * `'dropped'` the partial is resolved but still in the pattern
+   * index — the timer path removes it via `dropPartial`, the observe
+   * path by leaving it out of the survivor list. On `'advanced'` the
+   * partial stays live at its new step.
+   */
+  private settleAbsence(
+    pattern: CompiledPattern,
+    partial: PartialMatch,
+    now: number,
+  ): 'completed' | 'advanced' | 'dropped' {
+    if (partial.absenceTimer !== undefined) {
+      this.clearTimer(partial.absenceTimer);
+      partial.absenceTimer = undefined;
+    }
+    const armedWindowMs = partial.absenceWindowMs;
+    partial.absenceWindowMs = undefined;
+    partial.absenceArmedAt = undefined;
+    if (armedWindowMs !== undefined && armedWindowMs > pattern.withinMs) {
+      // The armed window no longer fits the live window: the partial
+      // dies deriving nothing (EB-297 shrink, or an explicit absenceMs
+      // wider than withinMs).
+      partial.resolved = true;
+      return 'dropped';
+    }
+    const step = pattern.steps[partial.stepIndex];
+    // The recorded window is the armed value — a live revision after
+    // arming never rewrites what the deadline waited out.
+    const windowMs = armedWindowMs ?? step.absenceMs ?? pattern.withinMs;
+    partial.absences.push({ stepIndex: partial.stepIndex, topic: step.topic, windowMs });
+    this.totalAbsenceMatches += 1;
+    if (partial.stepIndex === pattern.steps.length - 1) {
+      partial.resolved = true;
+      this.complete(pattern, partial, partial.events, partial.key, now);
+      return 'completed';
+    }
+    partial.stepIndex += 1;
+    const next = pattern.steps[partial.stepIndex];
+    if (next !== undefined && next.absence) this.armAbsence(pattern, partial);
+    return 'advanced';
   }
 
   /**
@@ -590,32 +698,12 @@ export class CepEngine {
    */
   private onAbsenceDeadline(pattern: CompiledPattern, partial: PartialMatch): void {
     if (partial.resolved) return;
+    // Already fired: nothing to disarm — settleAbsence clears the
+    // handle only when one is still pending (the observe path).
     partial.absenceTimer = undefined;
     const now = this.deps.now();
-    const armedWindowMs = partial.absenceWindowMs;
-    partial.absenceWindowMs = undefined;
-    if (armedWindowMs !== undefined && armedWindowMs > pattern.withinMs) {
-      // The armed window no longer fits the live window: the partial
-      // dies deriving nothing (EB-297 shrink, or an explicit absenceMs
-      // wider than withinMs).
-      this.dropPartial(pattern, partial);
-      return;
-    }
-    const step = pattern.steps[partial.stepIndex];
-    // The recorded window is the armed value — a live revision after
-    // arming never rewrites what the deadline waited out.
-    const windowMs = armedWindowMs ?? step.absenceMs ?? pattern.withinMs;
-    partial.absences.push({ stepIndex: partial.stepIndex, topic: step.topic, windowMs });
-    this.totalAbsenceMatches += 1;
-    if (partial.stepIndex === pattern.steps.length - 1) {
-      partial.resolved = true;
-      this.complete(pattern, partial, partial.events, partial.key, now);
-      this.dropPartial(pattern, partial);
-    } else {
-      partial.stepIndex += 1;
-      const next = pattern.steps[partial.stepIndex];
-      if (next !== undefined && next.absence) this.armAbsence(pattern, partial);
-    }
+    const outcome = this.settleAbsence(pattern, partial, now);
+    if (outcome === 'completed' || outcome === 'dropped') this.dropPartial(pattern, partial);
   }
 
   /**
@@ -630,6 +718,7 @@ export class CepEngine {
       partial.absenceTimer = undefined;
     }
     partial.absenceWindowMs = undefined;
+    partial.absenceArmedAt = undefined;
     partial.resolved = true;
   }
 
