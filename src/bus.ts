@@ -6130,6 +6130,18 @@ export interface TopicStats {
    */
   topicDelayedCapacityRejected: number;
   /**
+   * Delayed schedules on this topic refused by the per-key delayed
+   * capacity budget (see `setKeyDelayedCapacity`, EB-389): the pending
+   * delayed queue for this concrete (topic, key) pair was already at
+   * its per-key budget when the schedule was attempted, so it was
+   * never queued, never persisted, and burned no publisher or key
+   * rate-limit token. The shed consumes no sequence number (delayed
+   * schedules never consume one before fan-out) and is invisible to
+   * gap detection. Surfaced on `onAdmissionRejected` with reason
+   * `'key-delayed-capacity'`.
+   */
+  keyDelayedCapacityRejected: number;
+  /**
    * Messages on this topic shed by per-key publish-side rate limiting
    * (see `setKeyRateLimit`, EB-234): the per-(topic, key) token bucket
    * was empty when the keyed message was published, so it was never
@@ -6816,6 +6828,13 @@ export interface BusStats {
    * rules.
    */
   topicDelayedCapacityRejected: number;
+  /**
+   * Total delayed schedules refused by per-key delayed capacity
+   * budgets — the sum of every topic's `keyDelayedCapacityRejected`.
+   * See `TopicStats.keyDelayedCapacityRejected` for the exact counting
+   * rules.
+   */
+  keyDelayedCapacityRejected: number;
   /**
    * Total messages shed by per-key publish-side rate limiting — the sum
    * of every topic's `keyRateLimited`. See `TopicStats.keyRateLimited`
@@ -9552,6 +9571,7 @@ function zeroedTopicStats(): {
   publisherRateLimited: number;
   delayedCapacityRejected: number;
   topicDelayedCapacityRejected: number;
+  keyDelayedCapacityRejected: number;
   keyRateLimited: number;
   sampledMessages: number;
   pausedMessages: number;
@@ -9602,6 +9622,7 @@ function zeroedTopicStats(): {
     publisherRateLimited: 0,
     delayedCapacityRejected: 0,
     topicDelayedCapacityRejected: 0,
+    keyDelayedCapacityRejected: 0,
     keyRateLimited: 0,
     sampledMessages: 0,
     pausedMessages: 0,
@@ -12123,6 +12144,13 @@ interface PauseBufferEntry {
  *   budget, EB-385; refused at schedule time — the same zero-side-effect
  *   semantics as `'delayed-capacity'` — and also counted in
  *   `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`)
+ * - `'key-delayed-capacity'` → `TopicStats.keyDelayedCapacityRejected` /
+ *   `BusStats.keyDelayedCapacityRejected` (the pending delayed schedule
+ *   set for one concrete (topic, key) pair was already at its per-key
+ *   capacity budget, EB-389; refused at schedule time — the same
+ *   zero-side-effect semantics as `'delayed-capacity'` — and also
+ *   counted in `TopicStats.rejectedMessages` /
+ *   `BusStats.rejectedMessages`)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
  * - `'cas-mismatch'` → `TopicStats.casMismatches` /
@@ -12215,6 +12243,7 @@ export type AdmissionRejectReason =
   | 'global-rate-limit'
   | 'delayed-capacity'
   | 'topic-delayed-capacity'
+  | 'key-delayed-capacity'
   | 'webhook-deny'
   | 'maintenance'
   | 'lineage-cycle'
@@ -15299,6 +15328,7 @@ export class EventBus {
       publisherRateLimited: number;
       delayedCapacityRejected: number;
       topicDelayedCapacityRejected: number;
+      keyDelayedCapacityRejected: number;
       keyRateLimited: number;
       pausedMessages: number;
       circuitBrokenMessages: number;
@@ -15965,6 +15995,13 @@ export class EventBus {
    * `BusStats.topicDelayedCapacityRejected`.
    */
   private totalTopicDelayedCapacityRejected = 0;
+  /**
+   * Total delayed schedules refused by per-key delayed capacity
+   * budgets (EB-389). Counts each refused schedule once, at the
+   * schedule-time refusal. Surfaced as
+   * `BusStats.keyDelayedCapacityRejected`.
+   */
+  private totalKeyDelayedCapacityRejected = 0;
   /**
    * Per-key publish rate limits (EB-234), keyed by the exact string
    * passed to `setKeyRateLimit` — either a concrete topic name or a
@@ -17193,6 +17230,17 @@ export class EventBus {
    */
   private topicDelayedCapacities = new Map<string, number>();
   /**
+   * Per-(topic, key) delayed-delivery capacity budgets (EB-389): maps a
+   * concrete topic name to a map from message key to the maximum number
+   * of pending `publishDelayed` schedules that (topic, key) pair may
+   * hold. A (topic, key) pair absent from the map is unlimited.
+   * Live-only — a restart clears every per-key budget (like the
+   * per-topic budgets, EB-385). Tunable at runtime via
+   * `setKeyDelayedCapacity` — lowering a budget never evicts pending
+   * schedules, they drain naturally.
+   */
+  private keyDelayedCapacities = new Map<string, Map<string, number>>();
+  /**
    * Per-topic durable-log age-retention overrides (EB-388): maps a
    * concrete topic name to its own `maxAgeMs` bound. A topic present
    * here compacts under its override and no longer follows later
@@ -18402,6 +18450,120 @@ export class EventBus {
       topic,
       maxEntries,
     }));
+  }
+
+  /**
+   * Retunes the per-key delayed-delivery capacity budget for one
+   * concrete (topic, key) pair at runtime (EB-389).
+   * `setKeyDelayedCapacity(topic, key, maxEntries, actor?)` installs
+   * the maximum number of pending `publishDelayed` schedules that
+   * (topic, key) pair may hold: `undefined` clears the pair's budget
+   * back to unlimited, `0` refuses every new schedule for that pair.
+   * Pairs without a budget stay unlimited, and unkeyed schedules are
+   * never subject to this gate (they carry no key to cap) — they stay
+   * under the bus-wide and per-topic budgets.
+   * Tightening a budget never evicts schedules already pending for
+   * that pair — they drain naturally, and new schedules are admitted
+   * again once the pair's pending count drops below the new budget —
+   * while loosening it takes effect for the very next schedule attempt.
+   *
+   * The gate runs after the per-topic gate (`setTopicDelayedCapacity`,
+   * EB-385): when several budgets are exhausted the refusal is
+   * attributed to the earliest gate (bus-wide, then per-topic, then
+   * per-key). A schedule refused by the per-key gate is counted in
+   * the topic's `rejectedMessages` and `keyDelayedCapacityRejected`
+   * and fires `onAdmissionRejected` with reason
+   * `'key-delayed-capacity'`.
+   *
+   * The change is recorded in the subscription audit log as
+   * `key_delayed_capacity_revised` (with the topic, the key, and the
+   * previous and new bound in `detail`; `null` stands for unlimited,
+   * since JSON has no `undefined`), so capacity policy changes stay
+   * attributable. The revision itself is live-only: a restart clears
+   * every per-key budget (like the per-topic budgets), and restart
+   * recovery rebuilds persisted schedules without consulting any
+   * budget either way.
+   *
+   * Fail-closed: a bad topic, a bad key, or a non-negative-integer
+   * violation throws `RangeError` with the live budgets and the audit
+   * log untouched. A revision identical to the current budget for the
+   * pair (including clearing an already-unlimited pair) is a no-op
+   * with no audit.
+   *
+   * Throws `RangeError` for a bad actor, for an empty topic, for an
+   * empty key, or for a negative or non-integer `maxEntries`.
+   */
+  setKeyDelayedCapacity(topic: string, key: string, maxEntries: number | undefined, actor = 'system'): void {
+    assertValidActor(actor, 'setKeyDelayedCapacity');
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    if (key === undefined) {
+      throw new RangeError('setKeyDelayedCapacity: key must be a non-empty string');
+    }
+    validateMessageKey(key, 'setKeyDelayedCapacity');
+    if (
+      maxEntries !== undefined &&
+      (!Number.isInteger(maxEntries) || maxEntries < 0)
+    ) {
+      throw new RangeError('maxEntries must be a non-negative integer');
+    }
+    const byKey = this.keyDelayedCapacities.get(topic);
+    const previous = byKey === undefined ? undefined : byKey.get(key);
+    // Re-affirming the current budget is a no-op: no retune, no audit.
+    if (maxEntries === previous) {
+      return;
+    }
+    if (maxEntries === undefined) {
+      if (byKey !== undefined) {
+        byKey.delete(key);
+        if (byKey.size === 0) {
+          this.keyDelayedCapacities.delete(topic);
+        }
+      }
+    } else if (byKey === undefined) {
+      this.keyDelayedCapacities.set(topic, new Map([[key, maxEntries]]));
+    } else {
+      byKey.set(key, maxEntries);
+    }
+    this.auditSubscription({
+      action: 'key_delayed_capacity_revised',
+      actor,
+      detail: {
+        topic,
+        key,
+        maxEntries: maxEntries === undefined ? null : maxEntries,
+        oldMaxEntries: previous === undefined ? null : previous,
+      },
+    });
+  }
+
+  /**
+   * Returns the live per-key delayed-delivery capacity budget for one
+   * concrete (topic, key) pair (EB-389): `undefined` means unlimited
+   * (no budget installed for the pair). Mirrors the value
+   * `setKeyDelayedCapacity` last installed for the pair.
+   */
+  getKeyDelayedCapacity(topic: string, key: string): number | undefined {
+    return this.keyDelayedCapacities.get(topic)?.get(key);
+  }
+
+  /**
+   * Lists every per-key delayed-delivery capacity budget currently
+   * installed (EB-389), in installation order — one row per concrete
+   * (topic, key) pair with a budget, topics in installation order and
+   * keys in installation order within each topic. Pairs without a
+   * budget (unlimited) are not listed. The returned rows are fresh
+   * objects, so mutating them cannot move a live budget.
+   */
+  listKeyDelayedCapacities(): Array<{ topic: string; key: string; maxEntries: number }> {
+    const rows: Array<{ topic: string; key: string; maxEntries: number }> = [];
+    for (const [topic, byKey] of this.keyDelayedCapacities.entries()) {
+      for (const [key, maxEntries] of byKey.entries()) {
+        rows.push({ topic, key, maxEntries });
+      }
+    }
+    return rows;
   }
 
   /**
@@ -28797,6 +28959,7 @@ export class EventBus {
         publisherRateLimited: 0,
         delayedCapacityRejected: 0,
         topicDelayedCapacityRejected: 0,
+        keyDelayedCapacityRejected: 0,
         keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
@@ -44960,6 +45123,31 @@ export class EventBus {
       this.countTopicDelayedCapacityRejected(topic, payload, publisherId);
       return undefined;
     }
+    // Fail fast on the per-key delayed capacity budget (EB-389): the
+    // gate sits in the same stretch as the bus-wide and per-topic gates
+    // above — after alias resolution and the topic-pause gate, before
+    // any rate-limit token is taken — and runs after the per-topic
+    // gate, so a schedule refused by both is attributed to the
+    // per-topic gate (and one refused by all three to the bus-wide
+    // gate). The count is the raw pending count for the resolved
+    // concrete (topic, key) pair in `delayedById` (the same pending-set
+    // semantics as the per-topic gate). Unkeyed schedules bypass this
+    // gate — there is no key to cap — but stay under the bus-wide and
+    // per-topic gates. The check and the insert below run in the same
+    // synchronous call with no await between them, so the
+    // check-then-insert cannot race. A refused schedule returns
+    // `undefined` like every other fail-fast shed, which also rolls
+    // back a `publishDelayedBatch` containing it.
+    if (opts.key !== undefined) {
+      const keyDelayedCapacity = this.keyDelayedCapacities.get(topic)?.get(opts.key);
+      if (
+        keyDelayedCapacity !== undefined &&
+        this.countPendingDelayedForTopicAndKey(topic, opts.key) >= keyDelayedCapacity
+      ) {
+        this.countKeyDelayedCapacityRejected(topic, payload, publisherId);
+        return undefined;
+      }
+    }
     // Fail fast on the per-publisher rate limit (EB-79): an over-budget
     // publisher never becomes a scheduled delivery — no id, nothing in
     // the heap, nothing on disk. The token is spent at schedule time, so
@@ -49163,6 +49351,24 @@ export class EventBus {
   }
 
   /**
+   * Counts one delayed schedule refused by a per-key delayed
+   * capacity budget (EB-389) against the topic and the global total,
+   * then fires the admission-rejection hook with reason
+   * `'key-delayed-capacity'`. Same zero-side-effect semantics as
+   * `countDelayedCapacityRejected`: the schedule never becomes a
+   * pending delivery — no id is minted, nothing enters the heap,
+   * nothing is persisted, and no publisher or key rate-limit token is
+   * burned.
+   */
+  private countKeyDelayedCapacityRejected(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).keyDelayedCapacityRejected += 1;
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalKeyDelayedCapacityRejected += 1;
+    this.totalRejected += 1;
+    this.emitAdmissionRejected(topic, 'key-delayed-capacity', payload, publisherId);
+  }
+
+  /**
    * Raw pending delayed-schedule count for one concrete topic
    * (EB-385): how many entries in `delayedById` will publish to
    * `topic`. Cancelled entries are not in `delayedById` and are not
@@ -49173,6 +49379,23 @@ export class EventBus {
     let count = 0;
     for (const entry of this.delayedById.values()) {
       if (entry.topic === topic) count += 1;
+    }
+    return count;
+  }
+
+  /**
+   * Raw pending delayed-schedule count for one concrete (topic, key)
+   * pair (EB-389): how many entries in `delayedById` will publish to
+   * `topic` carrying `key`. Unkeyed entries are never counted — they
+   * carry no `key` — and cancelled entries are not in `delayedById`
+   * and are not counted, while due-but-not-yet-swept entries still
+   * are — the same pending-set semantics as
+   * `countPendingDelayedForTopic`.
+   */
+  private countPendingDelayedForTopicAndKey(topic: string, key: string): number {
+    let count = 0;
+    for (const entry of this.delayedById.values()) {
+      if (entry.topic === topic && entry.key === key) count += 1;
     }
     return count;
   }
@@ -50690,6 +50913,7 @@ export class EventBus {
       publisherRateLimited: 0,
       delayedCapacityRejected: 0,
       topicDelayedCapacityRejected: 0,
+      keyDelayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -50841,6 +51065,7 @@ export class EventBus {
       publisherRateLimited: 0,
       delayedCapacityRejected: 0,
       topicDelayedCapacityRejected: 0,
+      keyDelayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -51015,6 +51240,7 @@ export class EventBus {
         publisherRateLimited: 0,
         delayedCapacityRejected: 0,
         topicDelayedCapacityRejected: 0,
+        keyDelayedCapacityRejected: 0,
         keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
@@ -51173,6 +51399,7 @@ export class EventBus {
       publisherRateLimited: 0,
       delayedCapacityRejected: 0,
       topicDelayedCapacityRejected: 0,
+      keyDelayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -56552,6 +56779,7 @@ export class EventBus {
       publisherRateLimited: this.totalPublisherRateLimited,
       delayedCapacityRejected: this.totalDelayedCapacityRejected,
       topicDelayedCapacityRejected: this.totalTopicDelayedCapacityRejected,
+      keyDelayedCapacityRejected: this.totalKeyDelayedCapacityRejected,
       keyRateLimited: this.totalKeyRateLimited,
       sampledMessages: this.totalSampled,
       pausedMessages: this.totalPaused,
@@ -56962,6 +57190,7 @@ export class EventBus {
         publisherRateLimited: stats.publisherRateLimited,
         delayedCapacityRejected: stats.delayedCapacityRejected,
         topicDelayedCapacityRejected: stats.topicDelayedCapacityRejected,
+        keyDelayedCapacityRejected: stats.keyDelayedCapacityRejected,
         keyRateLimited: stats.keyRateLimited,
         sampledMessages: stats.sampledMessages,
         pausedMessages: stats.pausedMessages,

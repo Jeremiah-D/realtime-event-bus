@@ -3267,6 +3267,29 @@ library.
   schedules without consulting any budget. `publishDelayedBatch`
   inherits the gate entry by entry, so one refused entry rolls the
   whole batch back.
+  Per-key delayed capacity (EB-389, via
+  `bus.setKeyDelayedCapacity(topic, key, maxEntries, actor?)` / read with
+  `bus.getKeyDelayedCapacity(topic, key)` / listed with
+  `bus.listKeyDelayedCapacities()`): the same gate one dimension
+  narrower still — at most that many schedules may sit pending for one
+  concrete (topic, key) pair, so one key's retry storm cannot crowd out
+  the other keys on the same topic the way a per-topic cut would. The
+  gate runs after the per-topic gate, so when several budgets are full
+  the refusal is attributed to the earliest gate — bus-wide
+  (`'delayed-capacity'`), then per-topic (`'topic-delayed-capacity'`),
+  then per-key (`'key-delayed-capacity'`); a per-key refusal counts in
+  the topic's `rejectedMessages` and `keyDelayedCapacityRejected` with
+  the same zero-side-effect semantics. Unkeyed schedules bypass the
+  per-key gate (there is no key to cap) but stay under the bus-wide
+  and per-topic budgets. Tightening never evicts that pair's pending
+  schedules and loosening takes effect for the very next attempt; `0`
+  refuses every new schedule for the pair and `undefined` clears the
+  pair back to unlimited. Revisions are audited as
+  `key_delayed_capacity_revised` (`{ topic, key, maxEntries,
+  oldMaxEntries }`, `null` for unlimited); an identical revision is a
+  no-op with no audit. Per-key budgets are live-only and do not
+  survive a restart, and restart recovery rebuilds persisted schedules
+  without consulting any budget.
   TTL is stamped at schedule time: a message whose
   deadline passes before its due time is dropped as expired, never
   delivered. With `durableLogDir`, the schedule is persisted before
