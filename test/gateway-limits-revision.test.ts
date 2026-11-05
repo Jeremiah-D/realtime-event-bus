@@ -219,6 +219,9 @@ const DEFAULT_LIMITS = {
   maxFrameBytes: 1024 * 1024,
   maxPendingBytes: 1024 * 1024,
   sendHighWaterMarkBytes: 256 * 1024,
+  // EB-390: handshake admission bounds are part of getStats().limits.
+  handshakeTimeoutMs: 10_000,
+  maxHandshakeBytes: 8 * 1024,
 };
 
 const BIG = 'x'.repeat(8 * 1024);
@@ -268,6 +271,8 @@ test('partial revision moves only the fields provided', () => {
     maxFrameBytes: 2048,
     maxPendingBytes: 4096,
     sendHighWaterMarkBytes: 1024,
+    handshakeTimeoutMs: 10_000,
+    maxHandshakeBytes: 8 * 1024,
   });
   // Explicitly `undefined` is not a value: the field keeps its live value.
   gw.setGatewayLimits({ maxPendingBytes: undefined, maxFrameBytes: 8192 });
@@ -275,6 +280,8 @@ test('partial revision moves only the fields provided', () => {
     maxFrameBytes: 8192,
     maxPendingBytes: 4096,
     sendHighWaterMarkBytes: 1024,
+    handshakeTimeoutMs: 10_000,
+    maxHandshakeBytes: 8 * 1024,
   });
 });
 

@@ -210,8 +210,9 @@ const CLOSE_UNAUTHORIZED = 4401;
 const CLOSE_DUPLICATE_ID = 4409;
 const CLOSE_INIT_TIMEOUT = 4429;
 
-const HANDSHAKE_TIMEOUT_MS = 10_000;
-const MAX_HANDSHAKE_BYTES = 8 * 1024;
+/** Defaults for the handshake admission bounds (EB-390). */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_HANDSHAKE_BYTES = 8 * 1024;
 const MAX_FRAME_BYTES = 1024 * 1024;
 const DEFAULT_INIT_TIMEOUT_MS = 5_000;
 
@@ -750,6 +751,30 @@ export interface GraphqlGatewayOptions {
    * its old bound until it reconnects.
    */
   maxFrameBytes?: number;
+  /**
+   * Milliseconds a fresh socket may take to complete the HTTP upgrade
+   * handshake before the server drops it — the raw handshake, before
+   * any `connection_init` (that timeout is `connectionInitTimeoutMs`,
+   * EB-349, and is untouched by this option). Default 10_000.
+   * Revisable live with `setGraphqlGatewayHandshake` (EB-390): the
+   * new timeout arms only handshakes that start after the revision —
+   * a connection whose handshake timer is already armed keeps the
+   * timeout it started with until it reconnects. Must be a positive
+   * finite number when given.
+   */
+  handshakeTimeoutMs?: number;
+  /**
+   * Largest HTTP upgrade head accepted, in bytes: a handshake whose
+   * buffered head grows past this is dropped without an answer.
+   * Default 8 KiB — room for long `Cookie` / authorization headers
+   * behind a TLS-terminating load balancer or corporate proxy.
+   * Revisable live with `setGraphqlGatewayHandshake` (EB-390): the
+   * new cap binds only handshakes that start after the revision — a
+   * connection whose head is already buffered keeps the cap it
+   * started with until it reconnects. Must be a positive integer
+   * when given.
+   */
+  maxHandshakeBytes?: number;
 }
 
 export interface GraphqlGatewayStats {
@@ -768,21 +793,29 @@ export interface GraphqlGatewayStats {
    */
   authEnabled: boolean;
   /**
-   * Live connection limits (EB-349; EB-358 adds `maxFrameBytes`): the
-   * values `setGraphqlGatewayLimits` last revised, or the construction
-   * values. `maxConnections` is the cap the *next* connection is
-   * judged against (`undefined` means unlimited); already-open
-   * connections are never dropped by a revision.
+   * Live connection limits (EB-349; EB-358 adds `maxFrameBytes`;
+   * EB-390 adds the handshake admission bounds): the values
+   * `setGraphqlGatewayLimits` / `setGraphqlGatewayHandshake` last
+   * revised, or the construction values. `maxConnections` is the cap
+   * the *next* connection is judged against (`undefined` means
+   * unlimited); already-open connections are never dropped by a
+   * revision.
    * `connectionInitTimeoutMs` is the timeout the *next* handshake
    * arms — a connection whose init timer is already armed keeps the
    * timeout it started with. `maxFrameBytes` is the frame bound the
    * *next* connection's `FrameParser` is built with — a connection
    * that is already open keeps the bound it started with.
+   * `handshakeTimeoutMs` / `maxHandshakeBytes` are the bounds the
+   * *next* raw HTTP handshake gets — a connection whose handshake
+   * timer is already armed, or whose head is already buffered, keeps
+   * the values it started with.
    */
   limits: {
     maxConnections: number | undefined;
     connectionInitTimeoutMs: number;
     maxFrameBytes: number;
+    handshakeTimeoutMs: number;
+    maxHandshakeBytes: number;
   };
 }
 
@@ -804,6 +837,22 @@ export interface GraphqlGatewayLimitsRevision {
   connectionInitTimeoutMs?: number;
   /** Largest single inbound WebSocket frame accepted (positive integer bytes). */
   maxFrameBytes?: number;
+}
+
+/**
+ * A `setGraphqlGatewayHandshake` revision (EB-390): either raw
+ * handshake admission bound. Only the fields provided move — a field
+ * left out (or explicitly `undefined`) keeps its live value. Both
+ * values always have a value (defaults 10_000ms / 8 KiB), so there
+ * is nothing to clear them to. This revises only the raw HTTP
+ * upgrade handshake — the `connection_init` timeout stays with
+ * `setGraphqlGatewayLimits` (EB-349).
+ */
+export interface GraphqlGatewayHandshakeRevision {
+  /** Milliseconds a fresh socket may take to complete the HTTP upgrade handshake (positive finite). */
+  handshakeTimeoutMs?: number;
+  /** Largest HTTP upgrade head accepted (positive integer bytes). */
+  maxHandshakeBytes?: number;
 }
 
 interface GqlConnection {
@@ -829,6 +878,9 @@ export class GraphqlGateway {
   private connectionInitTimeoutMs: number;
   /** Mutable live via `setGraphqlGatewayLimits` (EB-358) — see that method. */
   private maxFrameBytes: number;
+  /** Mutable live via `setGraphqlGatewayHandshake` (EB-390) — see that method. */
+  private handshakeTimeoutMs: number;
+  private maxHandshakeBytes: number;
   private server: TcpServer | null = null;
   private boundPort = 0;
   private readonly connections = new Set<GqlConnection>();
@@ -870,6 +922,18 @@ export class GraphqlGateway {
       fail('maxFrameBytes must be a positive integer');
     }
     this.maxFrameBytes = maxFrameBytes;
+    // EB-390: raw handshake admission bounds — previously module
+    // constants (10_000ms / 8 KiB) with no construction option at all.
+    const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    if (!Number.isFinite(handshakeTimeoutMs) || handshakeTimeoutMs <= 0) {
+      fail('handshakeTimeoutMs must be a positive finite number');
+    }
+    this.handshakeTimeoutMs = handshakeTimeoutMs;
+    const maxHandshakeBytes = options.maxHandshakeBytes ?? DEFAULT_MAX_HANDSHAKE_BYTES;
+    if (!Number.isInteger(maxHandshakeBytes) || maxHandshakeBytes <= 0) {
+      fail('maxHandshakeBytes must be a positive integer');
+    }
+    this.maxHandshakeBytes = maxHandshakeBytes;
   }
 
   /** Starts listening; resolves once bound. */
@@ -914,6 +978,8 @@ export class GraphqlGateway {
         maxConnections: this.maxConnections,
         connectionInitTimeoutMs: this.connectionInitTimeoutMs,
         maxFrameBytes: this.maxFrameBytes,
+        handshakeTimeoutMs: this.handshakeTimeoutMs,
+        maxHandshakeBytes: this.maxHandshakeBytes,
       },
     };
   }
@@ -1016,6 +1082,82 @@ export class GraphqlGateway {
   }
 
   /**
+   * Revises the gateway's raw handshake admission bounds live
+   * (EB-390) without restarting the server:
+   * `setGraphqlGatewayHandshake({ handshakeTimeoutMs?,
+   * maxHandshakeBytes? })` retunes how long a fresh socket may take
+   * to complete the HTTP upgrade handshake and how large an upgrade
+   * head is accepted (see `GraphqlGatewayOptions` for the defaults:
+   * 10_000ms / 8 KiB). Before EB-390 both were module constants —
+   * not even construction options — so the only way to admit a slow
+   * client behind a TLS-terminating load balancer, or a multi-cookie
+   * handshake head, was to restart the gateway and drop every live
+   * connection. This revises only the raw HTTP handshake: the
+   * `connection_init` timeout stays with `setGraphqlGatewayLimits`
+   * (EB-349).
+   *
+   * Only the fields provided move — a partial revision keeps the field
+   * it leaves out. Both bounds govern from the next connection:
+   * `handleConnection` captures the live values once, at accept, so
+   * a connection whose handshake timer is already armed keeps the
+   * timeout it started with, and a connection whose head is already
+   * buffered keeps the cap it started with, until it reconnects
+   * (the WS gateway's `maxFrameBytes` precedent, EB-325).
+   *
+   * There is no audit event for this revision: like the WS gateway's
+   * `setGatewayLimits` / `setGatewayClientPressure` /
+   * `setGatewayMaxSubscriptionsPerConnection` and this gateway's own
+   * `setGraphqlGatewayLimits`, the gateway keeps no audit log for
+   * numeric tuning — the live values are observable in
+   * `getStats().limits` instead.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with every live bound untouched. Validation reuses the
+   * construction-time rule (a positive finite timeout, a positive
+   * integer head cap), so a value that could not be set at
+   * construction cannot be revised in later either. An empty revision,
+   * and a revision identical to the current bounds, are both no-ops.
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `handshakeTimeoutMs` or `maxHandshakeBytes`.
+   */
+  setGraphqlGatewayHandshake(opts: GraphqlGatewayHandshakeRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGraphqlGatewayHandshake: revision must be an object with handshakeTimeoutMs and/or maxHandshakeBytes',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? this.handshakeTimeoutMs;
+    const maxHandshakeBytes = opts.maxHandshakeBytes ?? this.maxHandshakeBytes;
+    // Re-affirming the current bounds is a no-op.
+    if (
+      handshakeTimeoutMs === this.handshakeTimeoutMs &&
+      maxHandshakeBytes === this.maxHandshakeBytes
+    ) {
+      return;
+    }
+    if (!Number.isFinite(handshakeTimeoutMs) || handshakeTimeoutMs <= 0) {
+      throw new RangeError(
+        'setGraphqlGatewayHandshake: handshakeTimeoutMs must be a positive finite number',
+      );
+    }
+    if (!Number.isInteger(maxHandshakeBytes) || maxHandshakeBytes <= 0) {
+      throw new RangeError(
+        'setGraphqlGatewayHandshake: maxHandshakeBytes must be a positive integer',
+      );
+    }
+    this.handshakeTimeoutMs = handshakeTimeoutMs;
+    this.maxHandshakeBytes = maxHandshakeBytes;
+  }
+
+  /**
    * Rotates or clears the gateway's bearer token live (EB-350) without
    * restarting the server: `setAuthToken(token)` replaces the token the
    * next `connection_init` must present (`authorization: "Bearer
@@ -1088,16 +1230,22 @@ export class GraphqlGateway {
     this.connections.add(conn);
     this.stats.connections += 1;
     let handshakeBuf = Buffer.alloc(0);
+    // EB-390: the admission bounds are captured once, at accept — a
+    // revision after this point governs only connections established
+    // after it; this connection's timer and cap keep the values it
+    // started with.
+    const handshakeTimeoutMs = this.handshakeTimeoutMs;
+    const maxHandshakeBytes = this.maxHandshakeBytes;
     const handshakeTimer = setTimeout(() => {
       if (!conn.handshook) this.destroyConnection(conn);
-    }, HANDSHAKE_TIMEOUT_MS);
+    }, handshakeTimeoutMs);
     if (typeof handshakeTimer.unref === 'function') handshakeTimer.unref();
 
     socket.on('data', (chunk: Buffer) => {
       if (conn.closed) return;
       if (!conn.handshook) {
         handshakeBuf = Buffer.concat([handshakeBuf, chunk]);
-        if (handshakeBuf.length > MAX_HANDSHAKE_BYTES) {
+        if (handshakeBuf.length > maxHandshakeBytes) {
           this.destroyConnection(conn);
           return;
         }

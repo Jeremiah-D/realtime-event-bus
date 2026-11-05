@@ -6037,6 +6037,21 @@ Semantics:
   established after the revision — a connection that is already open
   keeps the bound its `FrameParser` captured at connect time until it
   reconnects. `gw.getStats().limits` reports the live values.
+- **Live handshake-admission revision (EB-390).**
+  `gw.setGatewayHandshake({ handshakeTimeoutMs?, maxHandshakeBytes?
+  })` retunes how long a fresh socket may take to complete the HTTP
+  upgrade handshake (default 10_000ms) and how large an upgrade head
+  is accepted (default 8 KiB — room for long `Cookie` / authorization
+  headers behind a TLS-terminating load balancer or corporate proxy),
+  without restarting the server: only the fields provided move, an
+  illegal value throws `RangeError` with the live bounds untouched
+  (the timeout must be a positive finite number, the head cap a
+  positive integer), and an empty or identical revision is a no-op.
+  Both bounds govern from the next connection — a connection whose
+  handshake timer is already armed, or whose head is already
+  buffered, keeps the values it started with until it reconnects.
+  No audit event — the live values are observable in
+  `gw.getStats().limits`.
 - **Client pressure (EB-161, opt-in).** With
   `clientPressureWatermarkBytes` set, a connection whose queued bytes
   reach the watermark pauses its bus subscriptions (delivery-side hold —
@@ -10388,7 +10403,7 @@ Semantics:
   `{ connections, subscriptions, messagesSent, protocolErrors,
   authFailures, authEnabled, limits }`, where `limits` snapshots the live
   connection limits (`{ maxConnections, connectionInitTimeoutMs,
-  maxFrameBytes }`).
+  maxFrameBytes, handshakeTimeoutMs, maxHandshakeBytes }`).
 - **Live limit revision (EB-349; EB-358 adds `maxFrameBytes`).**
   `setGraphqlGatewayLimits({ maxConnections?,
   connectionInitTimeoutMs?, maxFrameBytes? })` retunes the three
@@ -10402,6 +10417,21 @@ Semantics:
   only connections established after the revision — each connection's
   `FrameParser` captures the bound once, at connect time. No audit event
   — the live tuning is observable in `getStats().limits`.
+- **Live handshake-admission revision (EB-390).**
+  `setGraphqlGatewayHandshake({ handshakeTimeoutMs?,
+  maxHandshakeBytes? })` retunes the raw HTTP upgrade handshake
+  admission — how long a fresh socket may take to complete the upgrade
+  (default 10_000ms) and how large an upgrade head is accepted
+  (default 8 KiB) — without restarting the server: only the fields
+  provided move, an illegal value throws `RangeError` with the live
+  bounds untouched (the timeout must be a positive finite number, the
+  head cap a positive integer), and an empty or identical revision is a
+  no-op. Both bounds govern from the next connection — a connection
+  whose handshake timer is already armed, or whose head is already
+  buffered, keeps the values it started with until it reconnects. This
+  revises only the raw handshake; the `connection_init` timeout stays
+  with `setGraphqlGatewayLimits` (EB-349). No audit event — the live
+  values are observable in `getStats().limits`.
 - **Orthogonality.** `gateway-ws.ts` speaks the bus's own framing; this
   speaks the graphql-ws wire protocol. A text-frame-only WebSocket
   client is all a subscriber needs.

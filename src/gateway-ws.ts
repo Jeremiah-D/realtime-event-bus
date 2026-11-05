@@ -417,6 +417,28 @@ export interface GatewayOptions {
    */
   maxFrameBytes?: number;
   /**
+   * Milliseconds a fresh socket may take to complete the HTTP upgrade
+   * handshake before the server drops it. Default 10_000. Revisable
+   * live with `setGatewayHandshake` (EB-390): the new timeout arms
+   * only handshakes that start after the revision — a connection
+   * whose handshake timer is already armed keeps the timeout it
+   * started with until it reconnects. Must be a positive finite
+   * number when given.
+   */
+  handshakeTimeoutMs?: number;
+  /**
+   * Largest HTTP upgrade head accepted, in bytes: a handshake whose
+   * buffered head grows past this is dropped without an answer.
+   * Default 8 KiB — room for long `Cookie` / authorization headers
+   * behind a TLS-terminating load balancer or corporate proxy.
+   * Revisable live with `setGatewayHandshake` (EB-390): the new cap
+   * binds only handshakes that start after the revision — a
+   * connection whose head is already buffered keeps the cap it
+   * started with until it reconnects. Must be a positive integer
+   * when given.
+   */
+  maxHandshakeBytes?: number;
+  /**
    * Opt-in per-connection send-queue byte watermark (EB-161): while a
    * connection's queued outbound bytes reach this watermark, the
    * connection's bus subscriptions are paused (delivery-side pause, no
@@ -498,6 +520,20 @@ export interface GatewayLimitsRevision {
   maxPendingBytes?: number;
   /** Socket-buffer bytes past which a connection pauses pushing frames (positive finite bytes). */
   sendHighWaterMarkBytes?: number;
+}
+
+/**
+ * A `setGatewayHandshake` revision (EB-390): either handshake
+ * admission bound. Only the fields provided move — a field left out
+ * (or explicitly `undefined`) keeps its live value. Both values
+ * always have a value (defaults 10_000ms / 8 KiB), so there is
+ * nothing to clear them to.
+ */
+export interface GatewayHandshakeRevision {
+  /** Milliseconds a fresh socket may take to complete the HTTP upgrade handshake (positive finite). */
+  handshakeTimeoutMs?: number;
+  /** Largest HTTP upgrade head accepted (positive integer bytes). */
+  maxHandshakeBytes?: number;
 }
 
 /**
@@ -597,15 +633,22 @@ export interface GatewayStats {
   /** Sum of `original − compressed` bytes saved by compression. */
   savedBytes: number;
   /**
-   * Live frame and queue limits (EB-325): the values `setGatewayLimits`
-   * last revised, or the construction defaults. `maxFrameBytes` is the
-   * bound the *next* connection gets — a connection that is already
-   * open keeps the bound its `FrameParser` captured at connect time.
+   * Live frame and queue limits (EB-325; EB-390 adds the handshake
+   * admission bounds): the values `setGatewayLimits` /
+   * `setGatewayHandshake` last revised, or the construction defaults.
+   * `maxFrameBytes` is the bound the *next* connection gets — a
+   * connection that is already open keeps the bound its `FrameParser`
+   * captured at connect time. `handshakeTimeoutMs` /
+   * `maxHandshakeBytes` are the bounds the *next* handshake gets — a
+   * connection whose handshake timer is already armed, or whose head
+   * is already buffered, keeps the values it started with.
    */
   limits: {
     maxFrameBytes: number;
     maxPendingBytes: number;
     sendHighWaterMarkBytes: number;
+    handshakeTimeoutMs: number;
+    maxHandshakeBytes: number;
   };
   /**
    * Live permessage-deflate tuning (EB-330): the values
@@ -681,8 +724,9 @@ type ErrorCode =
   | 'publish_failed'
   | 'not_found';
 
-const HANDSHAKE_TIMEOUT_MS = 10_000;
-const MAX_HANDSHAKE_BYTES = 8 * 1024;
+/** Defaults for the handshake admission bounds (EB-390). */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_HANDSHAKE_BYTES = 8 * 1024;
 
 function fail(msg: string): never {
   throw new RangeError(`invalid gateway options: ${msg}`);
@@ -752,6 +796,30 @@ function assertValidMaxSubscriptionsPerConnection(
   }
 }
 
+/**
+ * Shared handshake-admission rule (EB-390 construction, EB-390
+ * revision): the timeout must be a positive finite number of
+ * milliseconds and the head cap a positive integer number of bytes.
+ * `caller` prefixes the message (`'invalid gateway options'` at
+ * construction, `'setGatewayHandshake'` at revision).
+ */
+function assertValidGatewayHandshake(
+  handshakeTimeoutMs: number,
+  maxHandshakeBytes: number,
+  caller: string,
+): void {
+  if (!Number.isFinite(handshakeTimeoutMs) || handshakeTimeoutMs <= 0) {
+    throw new RangeError(
+      `${caller}: handshakeTimeoutMs must be a positive finite number`,
+    );
+  }
+  if (!Number.isInteger(maxHandshakeBytes) || maxHandshakeBytes <= 0) {
+    throw new RangeError(
+      `${caller}: maxHandshakeBytes must be a positive integer`,
+    );
+  }
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
@@ -768,6 +836,9 @@ export class GatewayServer {
   private sendHighWaterMarkBytes: number;
   private maxPendingBytes: number;
   private maxFrameBytes: number;
+  /** Mutable live via `setGatewayHandshake` (EB-390) — see that method. */
+  private handshakeTimeoutMs: number;
+  private maxHandshakeBytes: number;
   /** Mutable live via `setGatewayClientPressure` (EB-326) — see that method. */
   private clientPressureWatermarkBytes: number | undefined;
   /** Opt-in per-connection subscription cap (EB-173); undefined = unlimited. Mutable live via `setGatewayMaxSubscriptionsPerConnection` (EB-327) — see that method. */
@@ -813,6 +884,17 @@ export class GatewayServer {
     const maxFrameBytes = options.maxFrameBytes ?? 1024 * 1024;
     assertValidGatewayLimitBytes(maxFrameBytes, 'maxFrameBytes', 'invalid gateway options');
     this.maxFrameBytes = maxFrameBytes;
+    // EB-390: handshake admission bounds — previously module
+    // constants (10_000ms / 8 KiB) with no construction option at all.
+    const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    const maxHandshakeBytes = options.maxHandshakeBytes ?? DEFAULT_MAX_HANDSHAKE_BYTES;
+    assertValidGatewayHandshake(
+      handshakeTimeoutMs,
+      maxHandshakeBytes,
+      'invalid gateway options',
+    );
+    this.handshakeTimeoutMs = handshakeTimeoutMs;
+    this.maxHandshakeBytes = maxHandshakeBytes;
     const clientPressureWatermarkBytes = options.clientPressureWatermarkBytes;
     const clientPressureRecoveryWatermarkBytes =
       options.clientPressureRecoveryWatermarkBytes ??
@@ -899,6 +981,8 @@ export class GatewayServer {
         maxFrameBytes: this.maxFrameBytes,
         maxPendingBytes: this.maxPendingBytes,
         sendHighWaterMarkBytes: this.sendHighWaterMarkBytes,
+        handshakeTimeoutMs: this.handshakeTimeoutMs,
+        maxHandshakeBytes: this.maxHandshakeBytes,
       },
       deflate: this.deflateOpts === undefined ? undefined : { ...this.deflateOpts },
     };
@@ -1259,6 +1343,71 @@ export class GatewayServer {
     this.deflateOpts = merged;
   }
 
+  /**
+   * Revises the gateway's handshake admission bounds live (EB-390)
+   * without restarting the server: `setGatewayHandshake({
+   * handshakeTimeoutMs?, maxHandshakeBytes? })` retunes how long a
+   * fresh socket may take to complete the HTTP upgrade handshake and
+   * how large an upgrade head is accepted (see `GatewayOptions` for
+   * the defaults: 10_000ms / 8 KiB). Before EB-390 both were module
+   * constants — not even construction options — so the only way to
+   * admit a slow client behind a TLS-terminating load balancer, or a
+   * multi-cookie handshake head, was to restart the gateway and drop
+   * every live connection.
+   *
+   * Only the fields provided move — a partial revision keeps the field
+   * it leaves out. Both bounds govern from the next connection:
+   * `handleConnection` captures the live values once, at accept, so
+   * a connection whose handshake timer is already armed keeps the
+   * timeout it started with, and a connection whose head is already
+   * buffered keeps the cap it started with, until it reconnects
+   * (the `maxFrameBytes` precedent, EB-325).
+   *
+   * There is no audit event for this revision: like the WS gateway's
+   * `setGatewayLimits` / `setGatewayClientPressure` /
+   * `setGatewayMaxSubscriptionsPerConnection` and the GraphQL
+   * gateway's `setGraphqlGatewayLimits`, the gateway keeps no audit
+   * log for numeric tuning — the live values are observable in
+   * `getStats().limits` instead.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with every live bound untouched. Validation reuses the
+   * construction-time rule (`assertValidGatewayHandshake`: a positive
+   * finite timeout, a positive integer head cap), so a value that
+   * could not be set at construction cannot be revised in later
+   * either. An empty revision, and a revision identical to the
+   * current bounds, are both no-ops.
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `handshakeTimeoutMs` or `maxHandshakeBytes`.
+   */
+  setGatewayHandshake(opts: GatewayHandshakeRevision): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGatewayHandshake: revision must be an object with handshakeTimeoutMs and/or maxHandshakeBytes',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the field it leaves out — so resolution
+    // happens here, against the merged value, before anything moves.
+    const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? this.handshakeTimeoutMs;
+    const maxHandshakeBytes = opts.maxHandshakeBytes ?? this.maxHandshakeBytes;
+    // Re-affirming the current bounds is a no-op.
+    if (
+      handshakeTimeoutMs === this.handshakeTimeoutMs &&
+      maxHandshakeBytes === this.maxHandshakeBytes
+    ) {
+      return;
+    }
+    assertValidGatewayHandshake(handshakeTimeoutMs, maxHandshakeBytes, 'setGatewayHandshake');
+    this.handshakeTimeoutMs = handshakeTimeoutMs;
+    this.maxHandshakeBytes = maxHandshakeBytes;
+  }
+
   // --- connection lifecycle ------------------------------------------------
 
   private handleConnection(socket: Socket): void {
@@ -1282,9 +1431,15 @@ export class GatewayServer {
     this.connections.add(conn);
     this.stats.connections += 1;
     let handshakeBuf = Buffer.alloc(0);
+    // EB-390: the admission bounds are captured once, at accept — a
+    // revision after this point governs only connections established
+    // after it; this connection's timer and cap keep the values it
+    // started with.
+    const handshakeTimeoutMs = this.handshakeTimeoutMs;
+    const maxHandshakeBytes = this.maxHandshakeBytes;
     const handshakeTimer = setTimeout(() => {
       if (!conn.handshook) this.destroyConnection(conn);
-    }, HANDSHAKE_TIMEOUT_MS);
+    }, handshakeTimeoutMs);
     if (typeof handshakeTimer === 'object' && 'unref' in handshakeTimer) {
       (handshakeTimer as { unref(): void }).unref();
     }
@@ -1293,7 +1448,7 @@ export class GatewayServer {
       if (conn.closed) return;
       if (!conn.handshook) {
         handshakeBuf = Buffer.concat([handshakeBuf, chunk]);
-        if (handshakeBuf.length > MAX_HANDSHAKE_BYTES) {
+        if (handshakeBuf.length > maxHandshakeBytes) {
           this.destroyConnection(conn);
           return;
         }
