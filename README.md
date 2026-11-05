@@ -2847,7 +2847,16 @@ library.
   releases a stalled message on the next `push` or `drainDue` even
   when the watermark never advances, so a quiet source cannot hold
   messages forever; `flushAll` drains everything in event-time
-  order for shutdown. Invalid options, event times, and clocks
+  order for shutdown. The hold is revisable live (EB-393, via
+  `setMaxHoldMs(ms)`, observed via the `maxHoldMs` getter): the new
+  value governs from the next `push` / `drainDue`, already-buffered
+  messages keep their original arrival stamps (tightening releases
+  held messages on the next drain, loosening extends their life),
+  an illegal value throws `RangeError` with the live hold untouched,
+  and revising to the current hold is a no-op. This `maxHoldMs`
+  belongs to the per-topic event-time buffer — not the subscriber
+  delivery-window `maxHoldMs` (EB-230), a per-subscriber calendar
+  hold with its own cap. Invalid options, event times, and clocks
   throw `RangeError` before anything is buffered. With no buffer in
   use, delivery order is unchanged. It is orthogonal to the
   watermark (which decides what counts as late, not what order

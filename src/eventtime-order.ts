@@ -36,7 +36,14 @@
  *   reaches `maxHoldMs` (measured from its arrival, on the caller's
  *   clock) is released on the next `push` or `drainDue`, in
  *   event-time order, watermark or not. Bounded lateness beats
- *   perfect order when the stream stalls.
+ *   perfect order when the stream stalls. The hold itself is
+ *   revisable live via `setMaxHoldMs` (EB-393): the new value governs
+ *   from the next `push` / `drainDue`, while already-buffered
+ *   messages keep their original arrival stamps — tightening
+ *   releases held messages on the next drain, loosening extends
+ *   their life. It is not the subscriber delivery-window `maxHoldMs`
+ *   (EB-230, a per-subscriber calendar hold); this one belongs to
+ *   the per-topic event-time buffer.
  *
  * Orthogonality: the watermark decides what counts as late; this
  * buffer decides what order on-time messages are released in. It is
@@ -65,7 +72,8 @@ export interface EventTimeOrderOptions {
   /**
    * Longest a message may sit buffered, in milliseconds, before it
    * is released regardless of the watermark. Must be a positive
-   * finite number. Default 60000.
+   * finite number. Default 60000. Revisable live via `setMaxHoldMs`
+   * (EB-393); the `maxHoldMs` getter reads the live value.
    */
   maxHoldMs?: number;
   /**
@@ -109,13 +117,20 @@ interface Buffered<T> {
   seq: number;
 }
 
+/** Shared max-hold validation for the constructor and `setMaxHoldMs` (EB-393). */
+function assertValidMaxHoldMs(maxHoldMs: unknown): asserts maxHoldMs is number {
+  if (typeof maxHoldMs !== 'number' || !Number.isFinite(maxHoldMs) || maxHoldMs <= 0) {
+    throw new RangeError(`EventTimeOrderedBuffer: maxHoldMs must be a positive finite number of milliseconds`);
+  }
+}
+
 /**
  * Per-topic event-time ordering buffer. One instance per topic;
  * `push` is called once per message in arrival order.
  */
 export class EventTimeOrderedBuffer<T extends { eventTime?: number }> {
   private readonly allowedLatenessMs: number;
-  private readonly maxHoldMs: number;
+  private maxHoldMsValue: number;
   private readonly onLate: ((event: EventTimeLateEvent) => void) | undefined;
   private maxEventTime: number | undefined = undefined;
   private buffered: Buffered<T>[] = [];
@@ -129,22 +144,46 @@ export class EventTimeOrderedBuffer<T extends { eventTime?: number }> {
       );
     }
     const maxHoldMs = options.maxHoldMs ?? 60000;
-    if (typeof maxHoldMs !== 'number' || !Number.isFinite(maxHoldMs) || maxHoldMs <= 0) {
-      throw new RangeError(
-        `EventTimeOrderedBuffer: maxHoldMs must be a positive finite number of milliseconds`,
-      );
-    }
+    assertValidMaxHoldMs(maxHoldMs);
     if (options.onLate !== undefined && typeof options.onLate !== 'function') {
       throw new TypeError(`EventTimeOrderedBuffer: onLate must be a function`);
     }
     this.allowedLatenessMs = allowedLatenessMs;
-    this.maxHoldMs = maxHoldMs;
+    this.maxHoldMsValue = maxHoldMs;
     this.onLate = options.onLate;
   }
 
   /** Current watermark (`maxEventTime - allowedLatenessMs`), `undefined` until the first event-time message. */
   get watermark(): number | undefined {
     return this.maxEventTime === undefined ? undefined : this.maxEventTime - this.allowedLatenessMs;
+  }
+
+  /** The live maximum hold — how long a buffered message may wait before the escape hatch releases it. */
+  get maxHoldMs(): number {
+    return this.maxHoldMsValue;
+  }
+
+  /**
+   * Revises the maximum hold at runtime (EB-393). The new value
+   * governs from the next `push` / `drainDue`; already-buffered
+   * messages keep their original arrival stamps, so tightening
+   * releases held messages on the next drain and loosening extends
+   * their life. The revision itself releases nothing — a held
+   * message past the new hold still waits for the next `push` or
+   * `drainDue`. `allowedLatenessMs` and the watermark are untouched.
+   *
+   * Fail-closed: validation reuses the construction-time rule (a
+   * positive finite number of milliseconds) — an illegal value
+   * throws `RangeError` with the live hold untouched. Revising to
+   * the current hold is a no-op.
+   */
+  setMaxHoldMs(maxHoldMs: number): void {
+    assertValidMaxHoldMs(maxHoldMs);
+    // Re-affirming the current hold is a no-op.
+    if (maxHoldMs === this.maxHoldMsValue) {
+      return;
+    }
+    this.maxHoldMsValue = maxHoldMs;
   }
 
   /** Number of messages currently held in the buffer. */
@@ -217,7 +256,7 @@ export class EventTimeOrderedBuffer<T extends { eventTime?: number }> {
     const kept: Buffered<T>[] = [];
     for (const entry of this.buffered) {
       const byWatermark = watermark !== undefined && entry.eventTime <= watermark;
-      const byHold = nowMs - entry.arrivedAtMs >= this.maxHoldMs;
+      const byHold = nowMs - entry.arrivedAtMs >= this.maxHoldMsValue;
       if (byWatermark || byHold) ready.push(entry);
       else kept.push(entry);
     }
