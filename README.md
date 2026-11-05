@@ -3217,6 +3217,30 @@ library.
   are audited as `delayed_capacity_revised` (`null` stands for
   unlimited); an identical revision is a no-op with no audit, and an
   illegal value throws `RangeError` with the live budget untouched.
+  Per-topic delayed capacity (EB-385, via
+  `bus.setTopicDelayedCapacity(topic, maxEntries, actor?)` / read with
+  `bus.getTopicDelayedCapacity(topic)` / listed with
+  `bus.listTopicDelayedCapacities()`): the same gate one dimension
+  narrower — at most that many schedules may sit pending for one
+  concrete topic, so one topic's retry storm cannot crowd out healthy
+  topics the way a bus-wide cut would. The gate runs after the bus-wide
+  gate, so when both budgets are full the refusal is attributed to the
+  bus-wide gate (`'delayed-capacity'`); a per-topic refusal counts in
+  the topic's `rejectedMessages` and `topicDelayedCapacityRejected`
+  and fires `onAdmissionRejected` with reason
+  `'topic-delayed-capacity'`, with the same zero-side-effect semantics.
+  Tightening never evicts that topic's pending schedules and loosening
+  takes effect for the very next attempt; `0` refuses every new
+  schedule for the topic and `undefined` clears the topic back to
+  unlimited. Revisions are audited as
+  `topic_delayed_capacity_revised` (`{ topic, maxEntries,
+  oldMaxEntries }`, `null` for unlimited); an identical revision is a
+  no-op with no audit. Per-topic budgets are live-only and do not
+  survive a restart — unlike the bus-wide budget, which restores its
+  construction-time option — and restart recovery rebuilds persisted
+  schedules without consulting any budget. `publishDelayedBatch`
+  inherits the gate entry by entry, so one refused entry rolls the
+  whole batch back.
   TTL is stamped at schedule time: a message whose
   deadline passes before its due time is dropped as expired, never
   delivered. With `durableLogDir`, the schedule is persisted before

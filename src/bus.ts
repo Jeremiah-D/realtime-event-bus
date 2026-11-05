@@ -6118,6 +6118,18 @@ export interface TopicStats {
    */
   delayedCapacityRejected: number;
   /**
+   * Delayed schedules on this topic refused by the per-topic delayed
+   * capacity budget (see `setTopicDelayedCapacity`, EB-385): the pending
+   * delayed queue for this concrete topic was already at its per-topic
+   * budget when the schedule was attempted, so it was never queued,
+   * never persisted, and burned no publisher or key rate-limit token.
+   * The shed consumes no sequence number (delayed schedules never
+   * consume one before fan-out) and is invisible to gap detection.
+   * Surfaced on `onAdmissionRejected` with reason
+   * `'topic-delayed-capacity'`.
+   */
+  topicDelayedCapacityRejected: number;
+  /**
    * Messages on this topic shed by per-key publish-side rate limiting
    * (see `setKeyRateLimit`, EB-234): the per-(topic, key) token bucket
    * was empty when the keyed message was published, so it was never
@@ -6797,6 +6809,13 @@ export interface BusStats {
    * `TopicStats.delayedCapacityRejected` for the exact counting rules.
    */
   delayedCapacityRejected: number;
+  /**
+   * Total delayed schedules refused by per-topic delayed capacity
+   * budgets — the sum of every topic's `topicDelayedCapacityRejected`.
+   * See `TopicStats.topicDelayedCapacityRejected` for the exact counting
+   * rules.
+   */
+  topicDelayedCapacityRejected: number;
   /**
    * Total messages shed by per-key publish-side rate limiting — the sum
    * of every topic's `keyRateLimited`. See `TopicStats.keyRateLimited`
@@ -9523,6 +9542,7 @@ function zeroedTopicStats(): {
   rateLimitedMessages: number;
   publisherRateLimited: number;
   delayedCapacityRejected: number;
+  topicDelayedCapacityRejected: number;
   keyRateLimited: number;
   sampledMessages: number;
   pausedMessages: number;
@@ -9572,6 +9592,7 @@ function zeroedTopicStats(): {
     rateLimitedMessages: 0,
     publisherRateLimited: 0,
     delayedCapacityRejected: 0,
+    topicDelayedCapacityRejected: 0,
     keyRateLimited: 0,
     sampledMessages: 0,
     pausedMessages: 0,
@@ -12087,6 +12108,12 @@ interface PauseBufferEntry {
  *   at schedule time — no id minted, nothing in the heap, nothing on
  *   disk, no publisher or key token burned — and also counted in
  *   `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`)
+ * - `'topic-delayed-capacity'` → `TopicStats.topicDelayedCapacityRejected` /
+ *   `BusStats.topicDelayedCapacityRejected` (the pending delayed schedule
+ *   set for one concrete topic was already at its per-topic capacity
+ *   budget, EB-385; refused at schedule time — the same zero-side-effect
+ *   semantics as `'delayed-capacity'` — and also counted in
+ *   `TopicStats.rejectedMessages` / `BusStats.rejectedMessages`)
  * - `'duplicate'` → `TopicStats.duplicateMessages` /
  *   `BusStats.duplicateMessages` (idempotent-publish suppression, EB-27)
  * - `'cas-mismatch'` → `TopicStats.casMismatches` /
@@ -12178,6 +12205,7 @@ export type AdmissionRejectReason =
   | 'tenant-quota'
   | 'global-rate-limit'
   | 'delayed-capacity'
+  | 'topic-delayed-capacity'
   | 'webhook-deny'
   | 'maintenance'
   | 'lineage-cycle'
@@ -15261,6 +15289,7 @@ export class EventBus {
       rateLimitedMessages: number;
       publisherRateLimited: number;
       delayedCapacityRejected: number;
+      topicDelayedCapacityRejected: number;
       keyRateLimited: number;
       pausedMessages: number;
       circuitBrokenMessages: number;
@@ -15920,6 +15949,13 @@ export class EventBus {
    * as `BusStats.delayedCapacityRejected`.
    */
   private totalDelayedCapacityRejected = 0;
+  /**
+   * Total delayed schedules refused by per-topic delayed capacity
+   * budgets (EB-385). Counts each refused schedule once, at the
+   * schedule-time refusal. Surfaced as
+   * `BusStats.topicDelayedCapacityRejected`.
+   */
+  private totalTopicDelayedCapacityRejected = 0;
   /**
    * Per-key publish rate limits (EB-234), keyed by the exact string
    * passed to `setKeyRateLimit` — either a concrete topic name or a
@@ -17137,6 +17173,17 @@ export class EventBus {
    */
   private maxDelayedEntries: number | undefined;
   /**
+   * Per-topic delayed-delivery capacity budgets (EB-385): maps a
+   * concrete topic name to the maximum number of pending
+   * `publishDelayed` schedules that topic may hold. A topic absent
+   * from the map is unlimited. Live-only — a restart clears every
+   * per-topic budget (unlike the bus-wide budget, which restores its
+   * construction-time value). Tunable at runtime via
+   * `setTopicDelayedCapacity` — lowering a budget never evicts pending
+   * schedules, they drain naturally.
+   */
+  private topicDelayedCapacities = new Map<string, number>();
+  /**
    * Bus-level global publish rate limiter (EB-180, see
    * `EventBusOptions.globalPublishRateLimit`). `undefined` when
    * unconfigured — the publish path then pays a single `undefined`
@@ -18240,6 +18287,98 @@ export class EventBus {
    */
   getDelayedCapacity(): number | undefined {
     return this.maxDelayedEntries;
+  }
+
+  /**
+   * Retunes the per-topic delayed-delivery capacity budget for one
+   * concrete topic at runtime (EB-385). `setTopicDelayedCapacity(topic,
+   * maxEntries, actor?)` installs the maximum number of pending
+   * `publishDelayed` schedules that topic may hold: `undefined` clears
+   * the topic's budget back to unlimited, `0` refuses every new
+   * schedule for that topic. Topics without a budget stay unlimited.
+   * Tightening a budget never evicts schedules already pending for
+   * that topic — they drain naturally, and new schedules are admitted
+   * again once the topic's pending count drops below the new budget —
+   * while loosening it takes effect for the very next schedule attempt.
+   *
+   * The gate runs after the bus-wide gate (`setDelayedCapacity`,
+   * EB-384): when both budgets are exhausted the refusal is attributed
+   * to the bus-wide gate. A schedule refused by the per-topic gate is
+   * counted in the topic's `rejectedMessages` and
+   * `topicDelayedCapacityRejected` and fires `onAdmissionRejected`
+   * with reason `'topic-delayed-capacity'`.
+   *
+   * The change is recorded in the subscription audit log as
+   * `topic_delayed_capacity_revised` (with the topic and the previous
+   * and new bound in `detail`; `null` stands for unlimited, since JSON
+   * has no `undefined`), so capacity policy changes stay attributable.
+   * The revision itself is live-only: a restart clears every per-topic
+   * budget (unlike the bus-wide budget, which restores its
+   * construction-time option value), and restart recovery rebuilds
+   * persisted schedules without consulting any budget either way.
+   *
+   * Fail-closed: a bad topic or a non-negative-integer violation throws
+   * `RangeError` with the live budgets and the audit log untouched. A
+   * revision identical to the current budget for the topic (including
+   * clearing an already-unlimited topic) is a no-op with no audit.
+   *
+   * Throws `RangeError` for a bad actor, for an empty topic, or for a
+   * negative or non-integer `maxEntries`.
+   */
+  setTopicDelayedCapacity(topic: string, maxEntries: number | undefined, actor = 'system'): void {
+    assertValidActor(actor, 'setTopicDelayedCapacity');
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    if (
+      maxEntries !== undefined &&
+      (!Number.isInteger(maxEntries) || maxEntries < 0)
+    ) {
+      throw new RangeError('maxEntries must be a non-negative integer');
+    }
+    const previous = this.topicDelayedCapacities.get(topic);
+    // Re-affirming the current budget is a no-op: no retune, no audit.
+    if (maxEntries === previous) {
+      return;
+    }
+    if (maxEntries === undefined) {
+      this.topicDelayedCapacities.delete(topic);
+    } else {
+      this.topicDelayedCapacities.set(topic, maxEntries);
+    }
+    this.auditSubscription({
+      action: 'topic_delayed_capacity_revised',
+      actor,
+      detail: {
+        topic,
+        maxEntries: maxEntries === undefined ? null : maxEntries,
+        oldMaxEntries: previous === undefined ? null : previous,
+      },
+    });
+  }
+
+  /**
+   * Returns the live per-topic delayed-delivery capacity budget for one
+   * concrete topic (EB-385): `undefined` means unlimited (no budget
+   * installed for the topic). Mirrors the value
+   * `setTopicDelayedCapacity` last installed for the topic.
+   */
+  getTopicDelayedCapacity(topic: string): number | undefined {
+    return this.topicDelayedCapacities.get(topic);
+  }
+
+  /**
+   * Lists every per-topic delayed-delivery capacity budget currently
+   * installed (EB-385), in installation order — one row per concrete
+   * topic with a budget. Topics without a budget (unlimited) are not
+   * listed. The returned rows are fresh objects, so mutating them
+   * cannot move a live budget.
+   */
+  listTopicDelayedCapacities(): Array<{ topic: string; maxEntries: number }> {
+    return [...this.topicDelayedCapacities.entries()].map(([topic, maxEntries]) => ({
+      topic,
+      maxEntries,
+    }));
   }
 
   /**
@@ -28418,6 +28557,7 @@ export class EventBus {
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
         delayedCapacityRejected: 0,
+        topicDelayedCapacityRejected: 0,
         keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
@@ -44412,6 +44552,26 @@ export class EventBus {
       this.countDelayedCapacityRejected(topic, payload, publisherId);
       return undefined;
     }
+    // Fail fast on the per-topic delayed capacity budget (EB-385): the
+    // gate sits in the same stretch as the bus-wide gate above — after
+    // alias resolution and the topic-pause gate, before any rate-limit
+    // token is taken — and runs after the bus-wide gate, so a schedule
+    // refused by both is attributed to the bus-wide gate. The count is
+    // the raw pending count for the resolved concrete topic in
+    // `delayedById` (the same pending-set semantics as the bus-wide
+    // gate), and the check and the insert below run in the same
+    // synchronous call with no await between them, so the
+    // check-then-insert cannot race. A refused schedule returns
+    // `undefined` like every other fail-fast shed, which also rolls
+    // back a `publishDelayedBatch` containing it.
+    const topicDelayedCapacity = this.topicDelayedCapacities.get(topic);
+    if (
+      topicDelayedCapacity !== undefined &&
+      this.countPendingDelayedForTopic(topic) >= topicDelayedCapacity
+    ) {
+      this.countTopicDelayedCapacityRejected(topic, payload, publisherId);
+      return undefined;
+    }
     // Fail fast on the per-publisher rate limit (EB-79): an over-budget
     // publisher never becomes a scheduled delivery — no id, nothing in
     // the heap, nothing on disk. The token is spent at schedule time, so
@@ -48597,6 +48757,39 @@ export class EventBus {
   }
 
   /**
+   * Counts one delayed schedule refused by a per-topic delayed
+   * capacity budget (EB-385) against the topic and the global total,
+   * then fires the admission-rejection hook with reason
+   * `'topic-delayed-capacity'`. Same zero-side-effect semantics as
+   * `countDelayedCapacityRejected`: the schedule never becomes a
+   * pending delivery — no id is minted, nothing enters the heap,
+   * nothing is persisted, and no publisher or key rate-limit token is
+   * burned.
+   */
+  private countTopicDelayedCapacityRejected(topic: string, payload: unknown, publisherId?: string): void {
+    this.statsFor(topic).topicDelayedCapacityRejected += 1;
+    this.statsFor(topic).rejectedMessages += 1;
+    this.totalTopicDelayedCapacityRejected += 1;
+    this.totalRejected += 1;
+    this.emitAdmissionRejected(topic, 'topic-delayed-capacity', payload, publisherId);
+  }
+
+  /**
+   * Raw pending delayed-schedule count for one concrete topic
+   * (EB-385): how many entries in `delayedById` will publish to
+   * `topic`. Cancelled entries are not in `delayedById` and are not
+   * counted, and due-but-not-yet-swept entries still are — the same
+   * pending-set semantics as the bus-wide `delayedById.size` gate.
+   */
+  private countPendingDelayedForTopic(topic: string): number {
+    let count = 0;
+    for (const entry of this.delayedById.values()) {
+      if (entry.topic === topic) count += 1;
+    }
+    return count;
+  }
+
+  /**
    * Takes one token from the (topic, key) rate-limit bucket (EB-234),
    * creating the bucket lazily from the configured rule on first use —
    * refilled from the injected clock (`EventBusOptions.now`), so the
@@ -50108,6 +50301,7 @@ export class EventBus {
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
       delayedCapacityRejected: 0,
+      topicDelayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -50258,6 +50452,7 @@ export class EventBus {
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
       delayedCapacityRejected: 0,
+      topicDelayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -50431,6 +50626,7 @@ export class EventBus {
         rateLimitedMessages: 0,
         publisherRateLimited: 0,
         delayedCapacityRejected: 0,
+        topicDelayedCapacityRejected: 0,
         keyRateLimited: 0,
         pausedMessages: 0,
         circuitBrokenMessages: 0,
@@ -50588,6 +50784,7 @@ export class EventBus {
       rateLimitedMessages: 0,
       publisherRateLimited: 0,
       delayedCapacityRejected: 0,
+      topicDelayedCapacityRejected: 0,
       keyRateLimited: 0,
       pausedMessages: 0,
       circuitBrokenMessages: 0,
@@ -55966,6 +56163,7 @@ export class EventBus {
       rateLimitedMessages: this.totalRateLimited,
       publisherRateLimited: this.totalPublisherRateLimited,
       delayedCapacityRejected: this.totalDelayedCapacityRejected,
+      topicDelayedCapacityRejected: this.totalTopicDelayedCapacityRejected,
       keyRateLimited: this.totalKeyRateLimited,
       sampledMessages: this.totalSampled,
       pausedMessages: this.totalPaused,
@@ -56375,6 +56573,7 @@ export class EventBus {
         rateLimitedMessages: stats.rateLimitedMessages,
         publisherRateLimited: stats.publisherRateLimited,
         delayedCapacityRejected: stats.delayedCapacityRejected,
+        topicDelayedCapacityRejected: stats.topicDelayedCapacityRejected,
         keyRateLimited: stats.keyRateLimited,
         sampledMessages: stats.sampledMessages,
         pausedMessages: stats.pausedMessages,
