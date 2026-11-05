@@ -261,6 +261,7 @@ test('CEP absence: validation fails fast', () => {
     matches: 0,
     absencePatterns: 0,
     absenceMatches: 0,
+    pausedPatterns: 0,
   });
 });
 

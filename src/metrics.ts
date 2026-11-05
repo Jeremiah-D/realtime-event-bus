@@ -1394,6 +1394,11 @@ export function renderPrometheus(stats: BusStats, scalingSignals?: ScalingSignal
       'Absence steps satisfied — deadline passed with no matching event for the key (EB-174).',
       stats.cep.absenceMatches,
     );
+    gauge(
+      'eventbus_cep_paused_patterns',
+      'Sequence patterns currently paused (EB-381).',
+      stats.cep.pausedPatterns,
+    );
   }
 
   // Materialized state store (EB-171): key counts. Rendered only when the

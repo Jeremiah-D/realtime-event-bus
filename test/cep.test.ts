@@ -179,6 +179,7 @@ test('CEP: clearSequence removes the pattern', async () => {
     matches: 0,
     absencePatterns: 0,
     absenceMatches: 0,
+    pausedPatterns: 0,
   });
 });
 

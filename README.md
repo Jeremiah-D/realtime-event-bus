@@ -9313,14 +9313,33 @@ Semantics notes:
   untouched; an identical or empty revision is a no-op with no audit.
   Audited as `cep_sequence_pattern_revised` (the `pattern` field carries
   the pattern id; old and new values in `detail`).
+- Pause live with `setCepSequencePatternPaused(id, paused)` (EB-381):
+  the silence switch for a noisy pattern in an alert storm, no clear +
+  define rebuild. While paused the pattern is skipped wholesale — no
+  sweep, no advance, no new partial, no absence evaluation — so its
+  in-flight partials freeze in place (a partial past `withinMs` stays
+  frozen until the next observation after resume settles it against the
+  live window) and its armed absence deadlines are disarmed without
+  killing the partials; resume re-arms the deadlines of partials
+  waiting at absence steps from the resume moment, at the step's
+  `absenceMs` or the live `withinMs` (a revision made while paused
+  governs the re-arm), and derives nothing itself — only the next
+  message evaluates again. Pause is not protection: `clearSequence`
+  still discards a paused pattern's partials, and
+  `updateCepSequencePattern` still retunes a paused pattern.
+  `isCepSequencePatternPaused(id)` reads the switch. Unknown ids and a
+  non-boolean `paused` throw `RangeError`; setting the value the
+  pattern already has is a no-op with no audit. Audited as
+  `cep_sequence_pattern_paused` (the `pattern` field carries the pattern
+  id; `{ paused }` in `detail`).
 - `getStats().cep` → `{ activePatterns, partialMatches, matches,
-  absencePatterns, absenceMatches }` (present once a pattern was
-  defined; the engine persists for the bus's lifetime, so clearing every
-  pattern leaves zero counts).
+  absencePatterns, absenceMatches, pausedPatterns }` (present once a
+  pattern was defined; the engine persists for the bus's lifetime, so
+  clearing every pattern leaves zero counts).
 - Prometheus: `eventbus_cep_patterns`, `eventbus_cep_partial_matches`,
   `eventbus_cep_matches_total`, `eventbus_cep_absence_patterns`,
-  `eventbus_cep_absence_matches_total` — rendered only once a pattern was
-  defined.
+  `eventbus_cep_absence_matches_total`, `eventbus_cep_paused_patterns` —
+  rendered only once a pattern was defined.
 
 ## Stream joins (EB-187)
 

@@ -196,6 +196,8 @@ export interface CepStats {
    * that passed with no matching event for the key (EB-174).
    */
   absenceMatches: number;
+  /** Patterns currently paused (EB-381). */
+  pausedPatterns: number;
 }
 
 const PATTERN_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -249,6 +251,12 @@ interface CompiledPattern {
   partials: Map<string, PartialMatch[]>;
   /** Live partial count (the per-pattern memory bound). */
   partialCount: number;
+  /**
+   * Live pause switch (EB-381): a paused pattern is skipped by
+   * `observe` — no sweep, no advance, no new partial, no absence
+   * evaluation — until resumed. Set at define time to `false`.
+   */
+  paused: boolean;
 }
 
 export interface CepEngineDeps {
@@ -376,6 +384,7 @@ export class CepEngine {
       maxPartialMatches: opts.maxPartialMatches ?? DEFAULT_MAX_PARTIAL_MATCHES,
       partials: new Map(),
       partialCount: 0,
+      paused: false,
     });
     return id;
   }
@@ -483,6 +492,72 @@ export class CepEngine {
     return { changed: true, withinMs, oldWithinMs, maxPartialMatches, oldMaxPartialMatches };
   }
 
+  /**
+   * Pauses or resumes one defined pattern live (EB-381): the operator's
+   * silence switch for a noisy pattern in an alert storm — no
+   * clear + define rebuild, no in-flight partials lost.
+   *
+   * Pausing freezes the pattern: `observe` skips it entirely, so its
+   * partials neither advance nor expire (the sweep is skipped, so a
+   * partial past `withinMs` stays frozen until the next observation
+   * after resume settles it against the live window), no new partial
+   * starts, and no absence deadline is evaluated. Pausing disarms every
+   * armed absence timer of the pattern — the timer handle is cleared
+   * while the armed window is kept, and the partials themselves are
+   * untouched (pause is not protection: `clear` still discards them).
+   *
+   * Resuming re-arms the absence deadline of every partial waiting at
+   * an absence step, from the resume moment, at the step's `absenceMs`
+   * or the live `withinMs` — a revision made while paused (EB-297)
+   * governs the re-arm. Resume itself derives nothing and advances
+   * nothing: only the next observation evaluates again.
+   *
+   * Returns whether anything moved, with the resulting state. Setting
+   * the value the pattern already has is a no-op (`changed: false`).
+   * Throws `RangeError` for an unknown pattern id or a non-boolean
+   * `paused`.
+   */
+  setPaused(patternId: string, paused: boolean): { changed: boolean; paused: boolean } {
+    const pattern = this.patterns.get(patternId);
+    if (pattern === undefined) {
+      throw new RangeError(`sequence pattern "${patternId}" is not defined`);
+    }
+    if (typeof paused !== 'boolean') {
+      throw new RangeError('sequence pattern paused must be a boolean');
+    }
+    if (pattern.paused === paused) {
+      return { changed: false, paused };
+    }
+    pattern.paused = paused;
+    if (paused) {
+      // Disarm every armed absence deadline without killing the
+      // partials: the timer handle goes, the armed window stays, and
+      // the partials wait frozen until resume.
+      for (const partials of pattern.partials.values()) {
+        for (const partial of partials) this.disarmAbsenceTimer(partial);
+      }
+    } else {
+      // Re-arm from the resume moment, at the step's `absenceMs` or
+      // the live `withinMs` — a revision made while paused governs.
+      for (const partials of pattern.partials.values()) {
+        for (const partial of partials) {
+          const step = pattern.steps[partial.stepIndex];
+          if (step !== undefined && step.absence) this.armAbsence(pattern, partial);
+        }
+      }
+    }
+    return { changed: true, paused };
+  }
+
+  /** Whether a defined pattern is currently paused (EB-381). Throws `RangeError` for an unknown id. */
+  isPaused(patternId: string): boolean {
+    const pattern = this.patterns.get(patternId);
+    if (pattern === undefined) {
+      throw new RangeError(`sequence pattern "${patternId}" is not defined`);
+    }
+    return pattern.paused;
+  }
+
   /** Pattern ids in definition order. */
   patternIds(): string[] {
     return [...this.patterns.keys()];
@@ -499,6 +574,10 @@ export class CepEngine {
   observe(msg: BusMessage): void {
     const now = this.deps.now();
     for (const pattern of this.patterns.values()) {
+      // A paused pattern is skipped wholesale (EB-381): no sweep, no
+      // advance, no new partial, no absence evaluation — its partials
+      // stay frozen exactly as they were until resume.
+      if (pattern.paused) continue;
       this.sweepExpired(pattern, now);
       let key: string;
       try {
@@ -592,9 +671,11 @@ export class CepEngine {
   snapshot(): CepStats {
     let partialMatches = 0;
     let absencePatterns = 0;
+    let pausedPatterns = 0;
     for (const pattern of this.patterns.values()) {
       partialMatches += pattern.partialCount;
       if (pattern.steps.some((s) => s.absence)) absencePatterns += 1;
+      if (pattern.paused) pausedPatterns += 1;
     }
     return {
       activePatterns: this.patterns.size,
@@ -602,6 +683,7 @@ export class CepEngine {
       matches: this.totalMatches,
       absencePatterns,
       absenceMatches: this.totalAbsenceMatches,
+      pausedPatterns,
     };
   }
 
@@ -704,6 +786,20 @@ export class CepEngine {
     const now = this.deps.now();
     const outcome = this.settleAbsence(pattern, partial, now);
     if (outcome === 'completed' || outcome === 'dropped') this.dropPartial(pattern, partial);
+  }
+
+  /**
+   * Disarms one partial's absence deadline without killing the partial
+   * (EB-381 pause): the timer handle is cleared while the armed window
+   * and arm moment are kept, so a resume can re-arm from a fresh
+   * moment. Unlike `killPartial` this never marks the partial
+   * resolved — the partial stays live, frozen, in the pattern index.
+   */
+  private disarmAbsenceTimer(partial: PartialMatch): void {
+    if (partial.absenceTimer !== undefined) {
+      this.clearTimer(partial.absenceTimer);
+      partial.absenceTimer = undefined;
+    }
   }
 
   /**

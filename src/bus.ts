@@ -20499,7 +20499,8 @@ export class EventBus {
    * Throws `RangeError` before anything is registered on invalid options
    * or a duplicate id. `getStats().cep` exposes the live counters
    * (activePatterns / partialMatches / matches / absencePatterns /
-   * absenceMatches).
+   * absenceMatches / pausedPatterns). A pattern starts unpaused;
+   * `setCepSequencePatternPaused` freezes / resumes it live (EB-381).
    */
   defineSequence(opts: SequencePatternOptions): string {
     if (this.cep === undefined) {
@@ -20590,6 +20591,72 @@ export class EventBus {
         oldMaxPartialMatches: result.oldMaxPartialMatches,
       },
     });
+  }
+
+  /**
+   * Pauses or resumes one defined sequence pattern live (EB-381):
+   * `setCepSequencePatternPaused(id, true)` silences a noisy pattern in
+   * an alert storm without the clear + define rebuild — its in-flight
+   * partials freeze in place (no sweep, no advance, no new partial, no
+   * absence evaluation) instead of being discarded, and resume picks
+   * observation back up from the next message. Pausing disarms the
+   * pattern's armed absence deadlines; resuming re-arms them from the
+   * resume moment at the step's `absenceMs` or the live `withinMs` (a
+   * revision made while paused governs the re-arm) — resume itself
+   * derives nothing. Pause is not protection: `clearSequence` still
+   * discards a paused pattern's partials, and `updateCepSequencePattern`
+   * still retunes a paused pattern.
+   *
+   * Fail-closed like `updateCepSequencePattern`: a bus with no patterns
+   * defined, an unknown pattern id, and a non-boolean `paused` all
+   * throw `RangeError` with the live state and the audit log untouched.
+   * Setting the value the pattern already has is a no-op with no audit.
+   * Audited as `cep_sequence_pattern_paused` (the `pattern` field
+   * carries the pattern id; `{ paused }`).
+   *
+   * Orthogonal to EB-170 (that is the sequence detection mechanism
+   * itself — this its live pause switch), to EB-297 (that is the window
+   * / bound revision — this the pause switch), and to EB-174/EB-379/
+   * EB-380 (those are the absence semantics and deadline evaluation —
+   * this the timer disarm / re-arm around a pause).
+   *
+   * Throws `RangeError` when no patterns are defined, for an unknown
+   * pattern id, or for a non-boolean `paused`.
+   */
+  setCepSequencePatternPaused(patternId: string, paused: boolean): void {
+    if (typeof patternId !== 'string' || patternId.length === 0) {
+      throw new RangeError('setCepSequencePatternPaused: patternId must be a non-empty string');
+    }
+    const cep = this.cep;
+    if (cep === undefined) {
+      throw new RangeError('setCepSequencePatternPaused: no sequence patterns are defined on this bus');
+    }
+    const result = cep.setPaused(patternId, paused);
+    if (!result.changed) {
+      return;
+    }
+    this.auditSubscription({
+      action: 'cep_sequence_pattern_paused',
+      actor: 'system',
+      pattern: patternId,
+      detail: { paused: result.paused },
+    });
+  }
+
+  /**
+   * Whether a defined sequence pattern is currently paused (EB-381).
+   * Throws `RangeError` when no patterns are defined or for an unknown
+   * pattern id.
+   */
+  isCepSequencePatternPaused(patternId: string): boolean {
+    if (typeof patternId !== 'string' || patternId.length === 0) {
+      throw new RangeError('isCepSequencePatternPaused: patternId must be a non-empty string');
+    }
+    const cep = this.cep;
+    if (cep === undefined) {
+      throw new RangeError('isCepSequencePatternPaused: no sequence patterns are defined on this bus');
+    }
+    return cep.isPaused(patternId);
   }
 
   /**
