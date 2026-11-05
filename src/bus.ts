@@ -8487,6 +8487,15 @@ interface CompositeSubscriberState {
   mode: 'any' | 'all';
   /** Composite-cache keys held by this subscription. */
   cacheKeys: string[];
+  /**
+   * Include patterns as subscribed (untranslated, in order) — the live
+   * revision source for `setCompositePatterns` (EB-387): the merged
+   * revision and the audit previous/current are derived from these,
+   * not from the compiled RegExps.
+   */
+  patterns: string[];
+  /** Exclude patterns as subscribed (untranslated, in order). */
+  excludePatterns: string[];
 }
 
 /** One pending `EventBus.pull` long-poll waiter (EB-111). */
@@ -10369,9 +10378,9 @@ export function patternCovers(cover: string, sub: string): boolean {
  */
 function resolveCompositeOptions(
   opt: CompositeSubscribeOptions | undefined,
+  caller = 'subscribe',
 ): { patterns: string[]; exclude: string[]; mode: 'any' | 'all' } | undefined {
   if (opt === undefined) return undefined;
-  const caller = 'subscribe';
   if (opt === null || typeof opt !== 'object' || Array.isArray(opt)) {
     throw new TypeError(`${caller}: patterns must be an object`);
   }
@@ -34008,6 +34017,153 @@ export class EventBus {
   }
 
   /**
+   * Revises one composite subscription's include/exclude patterns live
+   * (EB-387) without unsubscribing and re-subscribing: a running
+   * composite subscription's filter rules can be hot-tuned.
+   * `setCompositePatterns(subId, opts, actor?)` retunes `patterns` /
+   * `mode` / `exclude` for a subscriber that opted into composite
+   * patterns at subscribe time (`SubscribeOptions.patterns`, EB-70).
+   * The revision is partial: only the fields `opts` provides move; a
+   * field left out keeps its live value. Passing `null` clears the
+   * composite entirely — the subscription degrades to an ordinary
+   * single-pattern subscription (the base pattern keeps matching) and
+   * a later revision is refused until the subscriber opts in again at
+   * subscribe time.
+   *
+   * Matching is evaluated live per message (`matchesComposite` reads
+   * `subscriber.composite` at every enqueue, replay, and retained
+   * check), so the new state governs from the next message awaiting
+   * enqueue: already-queued messages are never re-judged or
+   * reordered, and a replay in progress filters its remaining
+   * records under the new state (the EB-265/EB-287 live-predicate
+   * precedent). Namespaced subscriptions reuse the subscribe-time
+   * prefix translation: the new patterns are compiled under the
+   * subscriber's `namespacePrefix`, exactly like `acquireComposite`
+   * at subscribe time.
+   *
+   * Only the composite state moves: the base pattern, the queue,
+   * backpressure, dedup, and lag state are untouched, and the
+   * `filteredMessages` counting is unchanged (a composite-rejected
+   * message still counts exactly like a filter rejection). The new
+   * state is compiled before the old state is released, so a pattern
+   * shared by both states keeps its composite-cache reference
+   * throughout — no intermediate state can drop it.
+   *
+   * The change is recorded in the subscription audit log as
+   * `composite_patterns_revised` (the `subId` / `pattern` ride on the
+   * event itself, like `lag_monitor_revised`; the detail carries the
+   * new and previous patterns, exclude, and mode — `null` when the
+   * composite was cleared), so filter policy changes stay
+   * attributable.
+   *
+   * Fail-closed: an unknown subscriber id, a subscriber that never
+   * opted into composite patterns, a non-object value, an illegal
+   * merged value (reusing the subscribe-time validation, including
+   * the exclude-covers-include fail-fast), and `undefined` — only an
+   * explicit `null` clears — all throw `RangeError` with the live
+   * composite state, the queue, and the audit log untouched. A
+   * revision identical to the live patterns (comparing the merged
+   * patterns, exclude, and mode) is a no-op with no audit.
+   *
+   * Throws `RangeError` for a bad actor, an unknown / non-composite
+   * subscriber, or an illegal composite value.
+   */
+  setCompositePatterns(
+    subId: string,
+    opts: CompositeSubscribeOptions | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setCompositePatterns');
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setCompositePatterns: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setCompositePatterns: unknown subscriber: ${subId}`);
+    }
+    const composite = subscriber.composite;
+    if (composite == null) {
+      throw new RangeError('setCompositePatterns: subscriber has no composite patterns set');
+    }
+    const oldPatterns = [...composite.patterns];
+    const oldExclude = [...composite.excludePatterns];
+    const oldMode = composite.mode;
+    if (opts === null) {
+      // Clear: release the cache references and degrade to an
+      // ordinary single-pattern subscription. The live composite
+      // count drops with it.
+      this.releaseComposite(composite);
+      subscriber.composite = undefined;
+      this.compositeSubscriptionCount -= 1;
+      this.auditSubscription({
+        action: 'composite_patterns_revised',
+        actor,
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: {
+          patterns: null,
+          exclude: null,
+          mode: null,
+          oldPatterns,
+          oldExclude,
+          oldMode,
+        },
+      });
+      return;
+    }
+    // Validate before touching anything: `undefined` is not a clear
+    // — only an explicit `null` clears — and a partial object keeps
+    // the fields it leaves out, so resolution happens here, against
+    // the merged values, before any field moves.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setCompositePatterns: patterns must be an object with patterns and/or mode and/or exclude, or null to clear it',
+      );
+    }
+    const merged: CompositeSubscribeOptions = {
+      patterns: opts.patterns ?? oldPatterns,
+      mode: opts.mode ?? oldMode,
+      exclude: opts.exclude ?? oldExclude,
+    };
+    const resolved = resolveCompositeOptions(merged, 'setCompositePatterns');
+    if (resolved === undefined) {
+      throw new RangeError('setCompositePatterns: patterns must be a non-empty array');
+    }
+    const sameStrings = (a: string[], b: string[]): boolean =>
+      a.length === b.length && a.every((v, i) => v === b[i]);
+    // Identical merged patterns: a no-op — no audit, and no cache
+    // churn (a restated pattern list must not drop and re-acquire
+    // references).
+    if (
+      sameStrings(resolved.patterns, oldPatterns) &&
+      sameStrings(resolved.exclude, oldExclude) &&
+      resolved.mode === oldMode
+    ) {
+      return;
+    }
+    // Compile the new state before releasing the old one: a pattern
+    // present in both keeps its cache reference throughout, so the
+    // swap has no intermediate state that could drop it.
+    const next = this.acquireComposite(resolved, subscriber.namespacePrefix);
+    this.releaseComposite(composite);
+    subscriber.composite = next;
+    this.auditSubscription({
+      action: 'composite_patterns_revised',
+      actor,
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        patterns: resolved.patterns,
+        exclude: resolved.exclude,
+        mode: resolved.mode,
+        oldPatterns,
+        oldExclude,
+        oldMode,
+      },
+    });
+  }
+
+  /**
    * Revises the slow-handler offload of one subscriber (EB-274): a
    * subscriber that opted into `slowHandler` can retune its
    * threshold and callback without re-subscribing. The revision is
@@ -40723,6 +40879,8 @@ export class EventBus {
       include: compileAll(opts.patterns),
       exclude: compileAll(opts.exclude),
       mode: opts.mode,
+      patterns: [...opts.patterns],
+      excludePatterns: [...opts.exclude],
       cacheKeys,
     };
   }

@@ -457,6 +457,21 @@ library.
   Illegal combinations throw `RangeError` at subscribe time: an empty
   `patterns` array, a bad `mode`, or an `exclude` set covering the include
   space so no message could ever be delivered.
+  `bus.setCompositePatterns(subId, { patterns?, mode?, exclude? } | null)`
+  (EB-387) revises a running composite subscription's rules live,
+  partially — only the fields provided move — without unsubscribing:
+  the next message awaiting enqueue is already judged under the new
+  state, while already-queued messages are never re-judged or
+  reordered and a replay in progress filters its remaining records
+  under the new state. Passing `null` clears the composite (the
+  subscription degrades to an ordinary single-pattern subscription,
+  and later revisions are refused until it opts in again). The change
+  is audited as `composite_patterns_revised` (new and previous
+  patterns/exclude/mode); an identical revision is a no-op, and a
+  subscriber that never opted into composite patterns refuses with
+  `RangeError`. This only moves the composite narrowing — the base
+  pattern itself still moves only through EB-74's pattern hot-update,
+  and the queue, backpressure, dedup, and lag state are untouched.
 - **`src/cluster.ts` — `ClusterHub` / `ClusterLink`**: cross-process
   cluster federation. Multiple Node processes form a cluster through a
   central TCP hub (`new ClusterHub({ port })`, TLS via `tls: { key, cert }`);
