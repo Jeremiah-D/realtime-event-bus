@@ -9313,6 +9313,32 @@ Semantics notes:
   untouched; an identical or empty revision is a no-op with no audit.
   Audited as `cep_sequence_pattern_revised` (the `pattern` field carries
   the pattern id; old and new values in `detail`).
+- Retune one absence step's window live with
+  `updateCepAbsenceWindow(id, stepIndex, absenceMs)` (EB-382): the last
+  define-time knob that previously needed a clear + define rebuild
+  (and its in-flight partials lost) — an operator retuning "order
+  placed, never paid" from a misfiring 50 ms window without dropping
+  the partials already waiting. `null` clears the explicit value, so
+  the step follows the live `withinMs` from the next arming. Only that
+  step's `absenceMs` moves — the steps, the topic, the absence switch,
+  the correlation key, and the id are immutable, and `withinMs` /
+  `maxPartialMatches` still move only through
+  `updateCepSequencePattern` (EB-297). The new value governs from the
+  next arming: an already-armed deadline keeps its armed window
+  (EB-379 — no timer is reset, no armed deadline rewritten), a chained
+  absence step re-arms at the new value when the previous absence
+  settles, and the EB-379 guard is unchanged — an explicit `absenceMs`
+  wider than the live `withinMs` still drops at settle instead of
+  deriving. A paused pattern revises like any other, and the new value
+  governs the re-arm on resume. `getCepAbsenceWindow(id, stepIndex)`
+  reads the live explicit value, or `undefined` while the step follows
+  `withinMs`. Unknown ids, out-of-range steps, non-absence steps, and
+  illegal values (the define-time rule: a positive finite number, or
+  `null` to clear) throw `RangeError` with the live value untouched; a
+  same-value revision is a no-op with no audit; a closed bus refuses
+  the revision (EB-154). Audited as `cep_absence_window_revised` (the
+  `pattern` field carries the pattern id; `{ stepIndex, absenceMs,
+  oldAbsenceMs }` in `detail`).
 - Pause live with `setCepSequencePatternPaused(id, paused)` (EB-381):
   the silence switch for a noisy pattern in an alert storm, no clear +
   define rebuild. While paused the pattern is skipped wholesale — no

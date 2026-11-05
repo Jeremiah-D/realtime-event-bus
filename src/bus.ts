@@ -20660,6 +20660,103 @@ export class EventBus {
   }
 
   /**
+   * Revises one absence step's explicit window live (EB-382):
+   * `updateCepAbsenceWindow(id, stepIndex, absenceMs)` retunes how
+   * long the engine waits for the awaited event NOT to arrive before
+   * deriving the absence — the last define-time knob that previously
+   * needed a clear + define rebuild (and its in-flight partials lost).
+   * `null` clears the explicit value, so the step falls back to
+   * following the live `withinMs` from the next arming.
+   *
+   * Only that step's `absenceMs` moves: the steps, the topic, the
+   * absence switch, the correlation key, and the pattern id are
+   * immutable, and `withinMs` / `maxPartialMatches` still move only
+   * through `updateCepSequencePattern` (EB-297). The new value governs
+   * from the next arming — an already-armed deadline keeps its armed
+   * window (EB-379: no timer is reset, no armed deadline rewritten),
+   * and a chained absence step re-arms at the new value when the
+   * previous absence settles. The EB-379 guard is unchanged: an
+   * explicit `absenceMs` wider than the live `withinMs` still drops
+   * at settle instead of deriving. A paused pattern (EB-381) revises
+   * like any other — the new value governs the re-arm on resume.
+   *
+   * Fail-closed: a bus with no patterns defined, an unknown pattern
+   * id, an out-of-range `stepIndex`, a step that is not an absence
+   * step, and an illegal value all throw `RangeError` with the live
+   * value and the audit log untouched. Validation reuses the
+   * define-time rule (`absenceMs` a positive finite number, or `null`
+   * to clear). Setting the value the step already has is a no-op with
+   * no audit. A closed bus refuses the revision with `RangeError`
+   * (EB-154). Audited as `cep_absence_window_revised` (the `pattern`
+   * field carries the pattern id; `{ stepIndex, absenceMs,
+   * oldAbsenceMs }` — `absenceMs` is `undefined` when the revision
+   * clears the explicit value).
+   *
+   * Orthogonal to EB-170 (that is the sequence detection mechanism
+   * itself — this its absence window's live revision), to EB-174
+   * (that is the absence semantics — this the window it waits out),
+   * to EB-297 (that is the window / bound revision — this the
+   * `absenceMs` field EB-297 explicitly left immutable), to EB-379
+   * (that is the armed-window guard — this only changes what the
+   * next arming captures), to EB-380 (that is the observe-side
+   * deadline evaluation — this the armed value it reads), and to
+   * EB-381 (that is the pause switch — this the window value revised
+   * while paused).
+   *
+   * Throws `RangeError` when the bus is closed, when no patterns are
+   * defined, for an unknown pattern id, for an out-of-range
+   * `stepIndex`, for a non-absence step, or for an illegal
+   * `absenceMs`.
+   */
+  updateCepAbsenceWindow(patternId: string, stepIndex: number, absenceMs: number | null): void {
+    if (typeof patternId !== 'string' || patternId.length === 0) {
+      throw new RangeError('updateCepAbsenceWindow: patternId must be a non-empty string');
+    }
+    // Fail-fast on a closed bus (EB-154): close() already flushed once
+    // and stopped the engine — there is no live tuning left to revise.
+    if (this.closed) {
+      throw new RangeError('updateCepAbsenceWindow: bus is closed');
+    }
+    const cep = this.cep;
+    if (cep === undefined) {
+      throw new RangeError('updateCepAbsenceWindow: no sequence patterns are defined on this bus');
+    }
+    const result = cep.updateAbsenceWindow(patternId, stepIndex, absenceMs);
+    if (!result.changed) {
+      return;
+    }
+    this.auditSubscription({
+      action: 'cep_absence_window_revised',
+      actor: 'system',
+      pattern: patternId,
+      detail: {
+        stepIndex: result.stepIndex,
+        absenceMs: result.absenceMs,
+        oldAbsenceMs: result.oldAbsenceMs,
+      },
+    });
+  }
+
+  /**
+   * The live explicit absence window of one absence step (EB-382):
+   * the value `updateCepAbsenceWindow` last set, or `undefined` when
+   * the step follows the pattern's live `withinMs`. Throws
+   * `RangeError` when no patterns are defined, for an unknown pattern
+   * id, for an out-of-range `stepIndex`, or for a step that is not an
+   * absence step.
+   */
+  getCepAbsenceWindow(patternId: string, stepIndex: number): number | undefined {
+    if (typeof patternId !== 'string' || patternId.length === 0) {
+      throw new RangeError('getCepAbsenceWindow: patternId must be a non-empty string');
+    }
+    const cep = this.cep;
+    if (cep === undefined) {
+      throw new RangeError('getCepAbsenceWindow: no sequence patterns are defined on this bus');
+    }
+    return cep.getAbsenceWindow(patternId, stepIndex);
+  }
+
+  /**
    * Defines a dual-stream window join (EB-187): correlates the `left`
    * and `right` topic patterns by key inside a sliding time window and
    * publishes the combined messages to `opts.outputTopic`. Returns the

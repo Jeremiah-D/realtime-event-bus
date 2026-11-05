@@ -493,6 +493,104 @@ export class CepEngine {
   }
 
   /**
+   * Revises one absence step's explicit window live (EB-382): the last
+   * define-time knob that could only move through a clear + define
+   * rebuild — an operator retuning "order placed, never paid" from a
+   * 50 ms misfire window without discarding every in-flight partial.
+   *
+   * Only the step's `absenceMs` moves: the steps, the topic, the
+   * absence switch, the correlation key, and the pattern id are
+   * untouched, and `withinMs` / `maxPartialMatches` still move only
+   * through `update` (EB-297). The new value governs from the next
+   * arming: `armAbsence` captures `step.absenceMs ?? pattern.withinMs`
+   * at arm time, so an already-armed deadline keeps its armed window
+   * (EB-379 — no timer is reset, no armed deadline rewritten), and a
+   * chained absence step re-arms at the new value when the previous
+   * absence settles (`settleAbsence`). Passing `null` clears the
+   * explicit value, so the step falls back to following the live
+   * `withinMs` from the next arming. The EB-379 guard is unchanged: an
+   * explicit `absenceMs` wider than the live `withinMs` still drops
+   * at settle instead of deriving.
+   *
+   * Returns whether anything moved, with the step and the old and new
+   * explicit values (`absenceMs` is `undefined` when the step follows
+   * `withinMs`). Setting the value the step already has — including
+   * clearing a step that already follows `withinMs` — is a no-op
+   * (`changed: false`). Throws `RangeError` for an unknown pattern
+   * id, an out-of-range `stepIndex`, a step that is not an absence
+   * step, or an illegal value — the define-time rule (a positive
+   * finite number, or `null` to clear) — and a failed call leaves the
+   * live value untouched. A paused pattern (EB-381) revises like any
+   * other: the new value governs the re-arm on resume.
+   */
+  updateAbsenceWindow(
+    patternId: string,
+    stepIndex: number,
+    absenceMs: number | null,
+  ): {
+    changed: boolean;
+    stepIndex: number;
+    absenceMs: number | undefined;
+    oldAbsenceMs: number | undefined;
+  } {
+    const pattern = this.patterns.get(patternId);
+    if (pattern === undefined) {
+      throw new RangeError(`sequence pattern "${patternId}" is not defined`);
+    }
+    if (!Number.isInteger(stepIndex) || stepIndex < 0 || stepIndex >= pattern.steps.length) {
+      throw new RangeError(`absence step index ${stepIndex} is out of range for pattern "${patternId}"`);
+    }
+    const step = pattern.steps[stepIndex];
+    if (!step.absence) {
+      throw new RangeError(`step ${stepIndex} of pattern "${patternId}" is not an absence step`);
+    }
+    if (
+      absenceMs !== null &&
+      (typeof absenceMs !== 'number' || !Number.isFinite(absenceMs) || absenceMs <= 0)
+    ) {
+      throw new RangeError('absenceMs must be a positive finite number of milliseconds');
+    }
+    const oldAbsenceMs = step.absenceMs;
+    const nextAbsenceMs = absenceMs ?? undefined;
+    // Re-affirming the current value — including clearing a step that
+    // already follows `withinMs` — is a no-op: no change, no audit.
+    if (nextAbsenceMs === oldAbsenceMs) {
+      return { changed: false, stepIndex, absenceMs: oldAbsenceMs, oldAbsenceMs };
+    }
+    // Only the step's explicit window moves; the compiled steps, the
+    // live partials, and every armed deadline are untouched, and every
+    // arming from here on reads the live value.
+    if (nextAbsenceMs === undefined) {
+      delete step.absenceMs;
+    } else {
+      step.absenceMs = nextAbsenceMs;
+    }
+    return { changed: true, stepIndex, absenceMs: nextAbsenceMs, oldAbsenceMs };
+  }
+
+  /**
+   * The live explicit absence window of one absence step (EB-382):
+   * the value `updateAbsenceWindow` last set, or `undefined` when the
+   * step follows the pattern's live `withinMs`. Throws `RangeError`
+   * for an unknown pattern id, an out-of-range `stepIndex`, or a step
+   * that is not an absence step.
+   */
+  getAbsenceWindow(patternId: string, stepIndex: number): number | undefined {
+    const pattern = this.patterns.get(patternId);
+    if (pattern === undefined) {
+      throw new RangeError(`sequence pattern "${patternId}" is not defined`);
+    }
+    if (!Number.isInteger(stepIndex) || stepIndex < 0 || stepIndex >= pattern.steps.length) {
+      throw new RangeError(`absence step index ${stepIndex} is out of range for pattern "${patternId}"`);
+    }
+    const step = pattern.steps[stepIndex];
+    if (!step.absence) {
+      throw new RangeError(`step ${stepIndex} of pattern "${patternId}" is not an absence step`);
+    }
+    return step.absenceMs;
+  }
+
+  /**
    * Pauses or resumes one defined pattern live (EB-381): the operator's
    * silence switch for a noisy pattern in an alert storm — no
    * clear + define rebuild, no in-flight partials lost.
