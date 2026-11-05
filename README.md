@@ -10051,7 +10051,21 @@ Semantics:
   is never re-created, which would drop in-flight replies.
 - **Settled ids are a bounded ring.** Recently settled correlation ids
   (4096 max, 5-minute TTL) keep discarding late duplicates; older ids
-  are forgotten and their stragglers drop as unknown.
+  are forgotten and their stragglers drop as unknown. Both bounds are
+  live-tunable without restarting the bus (EB-391):
+  `setRpcSettledRetention({ ringSize?, ttlMs? })` retunes the ring
+  bound and the TTL from the next prune — a widened ring only affects
+  future evictions, a tightened TTL forgets entries older than the new
+  TTL at the next read, and entries already settled keep the
+  `settledAt` they were recorded with. `getRpcSettledRetention()`
+  reads the live values. Partial revisions keep the unmoved field; an
+  illegal value throws `RangeError` with the live retention untouched;
+  a no-change revision is a silent no-op. Every real change is audited
+  as `rpc_settled_retention_revised`
+  (`{ previous: { ringSize, ttlMs }, current: { ringSize, ttlMs } }`).
+  There is no construction-time option — a restart restores the
+  defaults. The per-call `timeoutMs`, the response routing decision,
+  and `rpcPending` are untouched.
 - **Lifecycle.** The timeout timer is `unref`'d — a pending RPC never
   holds the process open. `close()` rejects every pending request with
   `BusClosedError` instead of leaving it to time out. Stats live under

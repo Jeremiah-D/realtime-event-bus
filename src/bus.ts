@@ -194,6 +194,8 @@ import {
   randomCorrelationId,
   routeRpcResponse,
   type RequestResponseOptions,
+  type RpcSettledRetention,
+  type RpcSettledRetentionRevision,
 } from './rpc.ts';
 import {
   BUS_CONFIG_SNAPSHOT_VERSION,
@@ -15199,6 +15201,15 @@ export class EventBus {
     { resolve: (payload: unknown) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
   >();
   private rpcSettled = new Map<string, number>();
+  /**
+   * Live RPC settled-ring retention (EB-391): the ring bound and TTL
+   * `pruneRpcSettled` enforces. Both start at the module defaults
+   * (`RPC_SETTLED_RING_SIZE` / `RPC_SETTLED_TTL_MS`) and move only via
+   * `setRpcSettledRetention` — there is no construction-time option,
+   * and a restart restores the defaults.
+   */
+  private rpcSettledRingSize = RPC_SETTLED_RING_SIZE;
+  private rpcSettledTtlMs = RPC_SETTLED_TTL_MS;
   private rpcRouterSub: Subscription | undefined;
   private rpcRouterReliable = false;
   /** Clock for the RPC settled ring; injectable via `requestResponse` options (tests). */
@@ -42507,20 +42518,106 @@ export class EventBus {
 
   /**
    * Bounds the settled-correlation ring (EB-178): drops entries older
-   * than `RPC_SETTLED_TTL_MS` and, past `RPC_SETTLED_RING_SIZE`, evicts
-   * oldest-inserted first. A forgotten id's late response is dropped as
-   * unknown instead of counted as a late duplicate — the counters stay
-   * honest about what the bus actually recognized.
+   * than the live `rpcSettledTtlMs` and, past the live
+   * `rpcSettledRingSize`, evicts oldest-inserted first. A forgotten id's
+   * late response is dropped as unknown instead of counted as a late
+   * duplicate — the counters stay honest about what the bus actually
+   * recognized. The bounds are live (EB-391): a tightened ring evicts
+   * the oldest entries down to the new bound at the next prune, a
+   * tightened TTL forgets entries older than the new TTL at the next
+   * prune, and entries already settled keep the `settledAt` they were
+   * recorded with — the revision never rewrites history.
    */
   private pruneRpcSettled(nowMs: number): void {
     for (const [id, settledAt] of this.rpcSettled) {
-      if (nowMs - settledAt > RPC_SETTLED_TTL_MS) this.rpcSettled.delete(id);
+      if (nowMs - settledAt > this.rpcSettledTtlMs) this.rpcSettled.delete(id);
     }
-    while (this.rpcSettled.size > RPC_SETTLED_RING_SIZE) {
+    while (this.rpcSettled.size > this.rpcSettledRingSize) {
       const oldest = this.rpcSettled.keys().next();
       if (oldest.done) break;
       this.rpcSettled.delete(oldest.value);
     }
+  }
+
+  /**
+   * Revises the RPC settled-ring retention live (EB-391) without
+   * restarting the bus: `setRpcSettledRetention({ ringSize?, ttlMs? })`
+   * retunes how many settled correlation ids the bus remembers for
+   * late/duplicate discard and for how long (see `src/rpc.ts`:
+   * `RPC_SETTLED_RING_SIZE` / `RPC_SETTLED_TTL_MS`, EB-178).
+   *
+   * Only the fields provided move; the rest keep their live values.
+   * The revision takes effect from the next prune — a widened ring
+   * only affects future evictions, a tightened TTL forgets entries
+   * older than the new TTL at the next read — and entries already
+   * settled keep the `settledAt` they were recorded with. The per-call
+   * `timeoutMs`, the response routing decision, and `rpcPending` are
+   * untouched: this moves only how long a settled id stays
+   * recognizable, never how a live request is waited on or routed.
+   *
+   * Fail-closed: a non-object revision and an illegal value (a
+   * non-positive-integer `ringSize`, a non-positive-finite `ttlMs`)
+   * throw `RangeError` with the live retention and the audit log
+   * untouched. A revision that provides neither field, and a revision
+   * identical to the current retention, are both no-ops with no audit.
+   * Audited as `rpc_settled_retention_revised`
+   * (`{ previous: { ringSize, ttlMs }, current: { ringSize, ttlMs } }`).
+   *
+   * Orthogonal to EB-178 (that is the RPC mechanism itself — this its
+   * settled-ring retention tuning).
+   *
+   * Throws `RangeError` for a bad actor, for a non-object revision, or
+   * for an illegal `ringSize` / `ttlMs`.
+   */
+  setRpcSettledRetention(revision: RpcSettledRetentionRevision, actor = 'system'): void {
+    assertValidActor(actor, 'setRpcSettledRetention');
+    // An absent revision asks nothing to move.
+    if (revision == null) {
+      return;
+    }
+    if (typeof revision !== 'object' || Array.isArray(revision)) {
+      throw new RangeError(
+        'setRpcSettledRetention: revision must be an object with ringSize and/or ttlMs',
+      );
+    }
+    // Validate before touching anything: `undefined` is not a value — a
+    // partial object keeps the fields it leaves out — so resolution
+    // happens here, against the merged values, before anything moves.
+    const current = this.getRpcSettledRetention();
+    const ringSize = revision.ringSize ?? current.ringSize;
+    const ttlMs = revision.ttlMs ?? current.ttlMs;
+    // Re-affirming the current retention is a no-op: no retune, no audit.
+    if (ringSize === current.ringSize && ttlMs === current.ttlMs) {
+      return;
+    }
+    if (!Number.isInteger(ringSize) || ringSize <= 0) {
+      throw new RangeError('setRpcSettledRetention: ringSize must be a positive integer');
+    }
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+      throw new RangeError(
+        'setRpcSettledRetention: ttlMs must be a positive finite number of milliseconds',
+      );
+    }
+    this.rpcSettledRingSize = ringSize;
+    this.rpcSettledTtlMs = ttlMs;
+    this.auditSubscription({
+      action: 'rpc_settled_retention_revised',
+      actor,
+      detail: {
+        previous: { ringSize: current.ringSize, ttlMs: current.ttlMs },
+        current: { ringSize, ttlMs },
+      },
+    });
+  }
+
+  /**
+   * Returns the live RPC settled-ring retention (EB-391): the ring
+   * bound and TTL `pruneRpcSettled` currently enforces. Mirrors the
+   * values `setRpcSettledRetention` last installed (the module defaults
+   * before any revision).
+   */
+  getRpcSettledRetention(): RpcSettledRetention {
+    return { ringSize: this.rpcSettledRingSize, ttlMs: this.rpcSettledTtlMs };
   }
 
   /**

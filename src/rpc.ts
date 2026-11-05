@@ -37,6 +37,32 @@ export const RPC_SETTLED_RING_SIZE = 4096;
 export const RPC_SETTLED_TTL_MS = 5 * 60 * 1000;
 
 /**
+ * Partial revision of the RPC settled-ring retention (EB-391), for
+ * `EventBus.setRpcSettledRetention`. Only the fields provided move; the
+ * rest keep their live values. `ringSize` is the maximum settled
+ * correlation ids remembered for late/duplicate discard (a positive
+ * integer); `ttlMs` is how long a settled id keeps discarding late
+ * responses (a positive finite number of milliseconds). There is no
+ * construction-time option for either — the bus starts at
+ * `RPC_SETTLED_RING_SIZE` / `RPC_SETTLED_TTL_MS` and revisions are
+ * live-only.
+ */
+export interface RpcSettledRetentionRevision {
+  /** Maximum settled correlation ids remembered. Must be a positive integer. */
+  ringSize?: number;
+  /** How long a settled id keeps discarding late responses, in milliseconds. Must be a positive finite number. */
+  ttlMs?: number;
+}
+
+/** The live RPC settled-ring retention values (EB-391). */
+export interface RpcSettledRetention {
+  /** Maximum settled correlation ids remembered. */
+  ringSize: number;
+  /** How long a settled id keeps discarding late responses, in milliseconds. */
+  ttlMs: number;
+}
+
+/**
  * Rejection of `EventBus.requestResponse` when no response arrived within
  * `timeoutMs`. Carries the `correlationId` so callers can correlate the
  * failure with their own logs.
