@@ -527,14 +527,20 @@ library.
   (`{ heartbeatMs: <number>, oldHeartbeatMs: <number> }`). The reconnect
   backoff policy is likewise revisable without reconnecting (EB-340, via
   `bus.setClusterLinkReconnectBackoff({ baseDelayMs?, maxDelayMs?,
-  maxAttempts? }, actor?)`): a field left out keeps its live value, the
+  maxAttempts?, jitterMs? }, actor?)`): a field left out keeps its live value, the
   attempt counter and `onGiveUp` are untouched, and a backoff timer already
   armed keeps running at the delay it was armed with, so the new policy
   governs from the next backoff and the next failure reads the live
-  `maxAttempts`. Only the policy moves — the cached route table, the hub
+  `maxAttempts`. EB-395 adds `jitterMs` to the revision surface (a
+  non-negative finite number, 0 for a deterministic, jitter-free policy):
+  a base/cap revision no longer silently resets a custom jitter to the
+  250ms default — the strategy is rebuilt at the merged jitter, so an
+  operator can widen the spread mid-incident to de-synchronize a fleet
+  rejoining the hub, or tighten it to 0 for a deterministic reconnect
+  cadence. Only the policy moves — the cached route table, the hub
   epoch, and the heartbeat interval are untouched. The validation
   (`baseDelayMs` / `maxDelayMs` positive finite numbers, `maxAttempts` a
-  positive integer) is the revision-time contract: the constructor never
+  positive integer, `jitterMs` a non-negative finite number) is the revision-time contract: the constructor never
   validated these numbers, so a link built with values outside it keeps its
   old unchecked behavior until first revised. A bus with no cluster link,
   and a link built with `reconnect: false`, both throw `RangeError`, as does
@@ -542,7 +548,8 @@ library.
   revision that provides no field, and one identical to the current policy,
   are both no-ops with no audit. Every success is audited as
   `cluster_link_reconnect_backoff_revised` (`{ baseDelayMs, maxDelayMs,
-  maxAttempts, oldBaseDelayMs, oldMaxDelayMs, oldMaxAttempts }`). The hub's
+  maxAttempts, jitterMs, oldBaseDelayMs, oldMaxDelayMs, oldMaxAttempts,
+  oldJitterMs }`). The hub's
   `heartbeatTimeoutMs` is untouched and unvalidated, so a retuned backoff
   that waits longer than the hub's silence bound can still get the node
   swept on the next drop. The hub-side silence bound itself is revisable
@@ -1183,6 +1190,13 @@ library.
   delay cap and injectable randomness for deterministic tests); pass a custom
   strategy for fixed, linear or decorrelated-jitter policies — it takes
   precedence over the legacy `baseDelayMs`/`maxDelayMs`/`jitterMs` options.
+  The live policy is revisable (`retuneBackoff`, EB-340, EB-395): a field
+  left out keeps its live value, and the jitter is part of the revision
+  surface — a base/cap retune rebuilds the strategy at the merged jitter
+  instead of silently resetting it to the 250ms default, so a custom
+  jitter survives ordinary revisions and can itself be widened (to
+  de-synchronize a fleet rejoining after an outage) or tightened to 0
+  (for a deterministic reconnect cadence) mid-incident.
   Supports `onGiveUp` after `maxAttempts` failures. The connect function is
   injectable for testing.
 - **`src/heartbeat.ts` — `HeartbeatMonitor`**: keep-alive for a

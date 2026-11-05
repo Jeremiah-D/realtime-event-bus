@@ -64,7 +64,7 @@ async function makeNode(
     url: `tcp://127.0.0.1:${fx.port}`,
     nodeId: opts.nodeId,
     heartbeatMs: opts.heartbeatMs,
-    reconnect: opts.reconnect ?? { baseDelayMs: 20, maxDelayMs: 200, maxAttempts: 50 },
+    reconnect: opts.reconnect ?? { baseDelayMs: 20, maxDelayMs: 200, maxAttempts: 50, jitterMs: 250 },
   });
   fx.buses.push(bus);
   fx.links.push(link);
@@ -120,11 +120,11 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
   it('illegal values fail closed with no audit and the policy untouched', async () => {
     const { bus, link } = await makeNode(fx, {
       nodeId: 'node-a',
-      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 },
+      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 },
     });
     await waitFor(() => link.getStats().connected, 5000, 'connect');
     const before = link.getReconnectBackoff();
-    assert.deepEqual(before, { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 });
+    assert.deepEqual(before, { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 });
     for (const bad of [
       { baseDelayMs: 0 },
       { baseDelayMs: -1 },
@@ -153,7 +153,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
     }
     assert.deepEqual(
       link.getReconnectBackoff(),
-      { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 },
+      { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 },
       'failed revisions must leave the live policy untouched',
     );
     assert.equal(
@@ -170,7 +170,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
     await waitFor(() => link.getStats().connected, 5000, 'connect');
     assert.throws(() => bus.setClusterLinkReconnectBackoff({ baseDelayMs: 300 }, ''), RangeError);
     assert.throws(() => bus.setClusterLinkReconnectBackoff({ baseDelayMs: 300 }, 7 as never), RangeError);
-    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 20, maxDelayMs: 200, maxAttempts: 50 });
+    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 20, maxDelayMs: 200, maxAttempts: 50, jitterMs: 250 });
     assert.equal(
       bus.getSubscriptionAudit({ action: 'cluster_link_reconnect_backoff_revised' }).length,
       0,
@@ -180,13 +180,13 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
   it('a partial revision keeps the unprovided fields and audits old and new', async () => {
     const { bus, link } = await makeNode(fx, {
       nodeId: 'node-a',
-      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 },
+      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 },
     });
     await waitFor(() => link.getStats().connected, 5000, 'connect');
     const connectsBefore = link.getStats().connects;
     const versionBefore = link.getStats().routeVersion;
     bus.setClusterLinkReconnectBackoff({ baseDelayMs: 50 }, 'ops-lead');
-    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 50, maxDelayMs: 5000, maxAttempts: 10 });
+    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 50, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 });
     const audit = bus.getSubscriptionAudit({ action: 'cluster_link_reconnect_backoff_revised' });
     assert.equal(audit.length, 1);
     assert.equal(audit[0].actor, 'ops-lead');
@@ -194,9 +194,11 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
       baseDelayMs: 50,
       maxDelayMs: 5000,
       maxAttempts: 10,
+      jitterMs: 250,
       oldBaseDelayMs: 200,
       oldMaxDelayMs: 5000,
       oldMaxAttempts: 10,
+      oldJitterMs: 250,
     });
     // No reconnect, no route re-sync: the same connection keeps
     // serving, and the route table is untouched.
@@ -212,10 +214,10 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
   it('re-affirming the current policy, and an empty revision, are no-ops with no audit', async () => {
     const { bus, link } = await makeNode(fx, {
       nodeId: 'node-a',
-      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 },
+      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 },
     });
     await waitFor(() => link.getStats().connected, 5000, 'connect');
-    bus.setClusterLinkReconnectBackoff({ baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 });
+    bus.setClusterLinkReconnectBackoff({ baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 });
     bus.setClusterLinkReconnectBackoff({});
     bus.setClusterLinkReconnectBackoff({ baseDelayMs: undefined, maxDelayMs: undefined });
     assert.equal(
@@ -223,7 +225,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
       0,
       'a same-policy revision must not audit',
     );
-    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 });
+    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 });
   });
 
   it('connect-time defaults read back as 200/5000/10', async () => {
@@ -233,7 +235,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
     fx.buses.push(bus);
     fx.links.push(link);
     await waitFor(() => link.getStats().connected, 5000, 'connect');
-    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 });
+    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 });
   });
 
   it('ClusterLink.retuneReconnectBackoff validates and reads back without a connection', () => {
@@ -241,16 +243,16 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
       url: 'tcp://127.0.0.1:1',
       onMessage: (_msg: BusMessage) => true,
       getPatterns: () => [],
-      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 },
+      reconnect: { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 },
     });
-    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10 });
+    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 10, jitterMs: 250 });
     link.retuneReconnectBackoff({ maxAttempts: 3 });
-    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 3 });
+    assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 3, jitterMs: 250 });
     assert.throws(() => link.retuneReconnectBackoff({ baseDelayMs: 0 }), RangeError);
     assert.throws(() => link.retuneReconnectBackoff({ maxAttempts: 2.5 }), RangeError);
     assert.deepEqual(
       link.getReconnectBackoff(),
-      { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 3 },
+      { baseDelayMs: 200, maxDelayMs: 5000, maxAttempts: 3, jitterMs: 250 },
       'a refused retune must leave the stored policy untouched',
     );
   });
@@ -283,6 +285,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
         baseDelayMs: 5000,
         maxDelayMs: 20000,
         maxAttempts: 100,
+        jitterMs: 250,
       });
       const newDelay = controller.computeDelayMs(1);
       assert.ok(newDelay >= 5000 && newDelay < 5000 + 250 + 1, `new delay ${newDelay} out of range`);
@@ -352,6 +355,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
         baseDelayMs: 20,
         maxDelayMs: 200,
         maxAttempts: 10,
+        jitterMs: 250,
       });
     } finally {
       controller2.stop();
@@ -378,16 +382,18 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
       // Retune while disconnected: the policy is stored — and audited
       // — for the next backoff cycle.
       bus.setClusterLinkReconnectBackoff({ baseDelayMs: 200, maxDelayMs: 400 });
-      assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 400, maxAttempts: 100 });
+      assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 400, maxAttempts: 100, jitterMs: 250 });
       const audit = bus.getSubscriptionAudit({ action: 'cluster_link_reconnect_backoff_revised' });
       assert.equal(audit.length, 1);
       assert.deepEqual(audit[0].detail, {
         baseDelayMs: 200,
         maxDelayMs: 400,
         maxAttempts: 100,
+        jitterMs: 250,
         oldBaseDelayMs: 20,
         oldMaxDelayMs: 100,
         oldMaxAttempts: 100,
+        oldJitterMs: 250,
       });
       // Bring a NEW hub up on the same port (new epoch).
       const hub2 = new ClusterHub({ host: '127.0.0.1', port, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 10000 });
@@ -399,7 +405,7 @@ describe('cluster link reconnect backoff revision (EB-340)', () => {
       assert.equal(link.getStats().connects, connectsBefore + 1);
       assert.deepEqual(link.getStats().members, ['node-a']);
       assert.equal(link.getHeartbeatMs(), 5000, 'the heartbeat interval is untouched by a backoff revision');
-      assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 400, maxAttempts: 100 });
+      assert.deepEqual(link.getReconnectBackoff(), { baseDelayMs: 200, maxDelayMs: 400, maxAttempts: 100, jitterMs: 250 });
       await sleep(300);
       assert.equal(link.getStats().connected, true);
     } finally {

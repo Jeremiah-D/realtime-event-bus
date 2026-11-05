@@ -40766,10 +40766,14 @@ export class EventBus {
   }
 
   /**
-   * Revises the cluster link's reconnect backoff policy live (EB-340)
-   * without reconnecting: `setClusterLinkReconnectBackoff(opts, actor?)`
+   * Revises the cluster link's reconnect backoff policy live (EB-340,
+   * EB-395) without reconnecting: `setClusterLinkReconnectBackoff(opts, actor?)`
    * retunes how the link waits between reconnect attempts (see
-   * `ClusterConnectOptions.reconnect`, EB-37).
+   * `ClusterConnectOptions.reconnect`, EB-37). `opts` may carry
+   * `jitterMs` (EB-395): the max random jitter added to each delay —
+   * a non-negative finite number, 0 for a deterministic, jitter-free
+   * policy — and a base/cap revision no longer silently resets a
+   * custom jitter to the 250ms default (the EB-340 gap).
    *
    * Only the policy moves: a field left out of `opts` keeps its live
    * value, the attempt counter is untouched, `onGiveUp` is untouched,
@@ -40783,13 +40787,14 @@ export class EventBus {
    * stays connected — or keeps backing off — through the revision.
    *
    * Validation: `opts` must be an object; `baseDelayMs` / `maxDelayMs`
-   * must be positive finite numbers and `maxAttempts` a positive
-   * integer. The rule is checked before anything mutates, so one
-   * illegal field vetoes the whole revision and leaves every live
-   * value exactly as it was. Note the constructor never validated
-   * these numbers, so this is the revision-time contract, not a
-   * restatement of a connect-time check — a link built with values
-   * outside it keeps its old unchecked behavior until first revised.
+   * must be positive finite numbers, `maxAttempts` a positive
+   * integer, and `jitterMs` a non-negative finite number. The rule is
+   * checked before anything mutates, so one illegal field vetoes the
+   * whole revision and leaves every live value exactly as it was. Note
+   * the constructor never validated these numbers, so this is the
+   * revision-time contract, not a restatement of a connect-time
+   * check — a link built with values outside it keeps its old
+   * unchecked behavior until first revised.
    *
    * Fail-closed: a bus with no cluster link (never connected, or
    * already disconnected via `disconnectCluster()`) and a link built
@@ -40799,8 +40804,8 @@ export class EventBus {
    * identical to the current policy field for field, are both no-ops
    * with no audit. Audited as
    * `cluster_link_reconnect_backoff_revised`
-   * (`{ baseDelayMs, maxDelayMs, maxAttempts, oldBaseDelayMs,
-   * oldMaxDelayMs, oldMaxAttempts }`).
+   * (`{ baseDelayMs, maxDelayMs, maxAttempts, jitterMs,
+   * oldBaseDelayMs, oldMaxDelayMs, oldMaxAttempts, oldJitterMs }`).
    *
    * Hub-side coupling, documented not validated: the hub drops
    * members silent for longer than its `heartbeatTimeoutMs`, so a
@@ -40835,6 +40840,7 @@ export class EventBus {
     const baseDelayMs = opts.baseDelayMs ?? current.baseDelayMs;
     const maxDelayMs = opts.maxDelayMs ?? current.maxDelayMs;
     const maxAttempts = opts.maxAttempts ?? current.maxAttempts;
+    const jitterMs = opts.jitterMs ?? current.jitterMs;
     if (!Number.isFinite(baseDelayMs) || baseDelayMs <= 0) {
       throw new RangeError('setClusterLinkReconnectBackoff: baseDelayMs must be a positive finite number');
     }
@@ -40844,15 +40850,19 @@ export class EventBus {
     if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
       throw new RangeError('setClusterLinkReconnectBackoff: maxAttempts must be a positive integer');
     }
+    if (!Number.isFinite(jitterMs) || jitterMs < 0) {
+      throw new RangeError('setClusterLinkReconnectBackoff: jitterMs must be a non-negative finite number');
+    }
     // Re-affirming the current policy is a no-op: no retune, no audit.
     if (
       baseDelayMs === current.baseDelayMs &&
       maxDelayMs === current.maxDelayMs &&
-      maxAttempts === current.maxAttempts
+      maxAttempts === current.maxAttempts &&
+      jitterMs === current.jitterMs
     ) {
       return;
     }
-    link.retuneReconnectBackoff({ baseDelayMs, maxDelayMs, maxAttempts });
+    link.retuneReconnectBackoff({ baseDelayMs, maxDelayMs, maxAttempts, jitterMs });
     this.auditSubscription({
       action: 'cluster_link_reconnect_backoff_revised',
       actor,
@@ -40860,9 +40870,11 @@ export class EventBus {
         baseDelayMs,
         maxDelayMs,
         maxAttempts,
+        jitterMs,
         oldBaseDelayMs: current.baseDelayMs,
         oldMaxDelayMs: current.maxDelayMs,
         oldMaxAttempts: current.maxAttempts,
+        oldJitterMs: current.jitterMs,
       },
     });
   }

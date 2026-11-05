@@ -88,11 +88,13 @@ export interface ClusterConnectOptions {
    * Reconnect behavior. `false` disables reconnecting (the link stays
    * degraded after a drop, and the initial `connect()` is a single
    * attempt); otherwise the initial connect AND later drops all ride the
-   * backoff policy (`{ baseDelayMs, maxDelayMs, maxAttempts }`, defaults
-   * 200 / 5000 / 10) — the initial `connect()` rejects only when the
-   * policy gives up.
+   * backoff policy (`{ baseDelayMs, maxDelayMs, maxAttempts, jitterMs }`,
+   * defaults 200 / 5000 / 10 / 250) — the initial `connect()` rejects
+   * only when the policy gives up. `jitterMs` (EB-395) is the max
+   * random jitter added to each delay; 0 is a deterministic,
+   * jitter-free policy.
    */
-  reconnect?: false | { baseDelayMs?: number; maxDelayMs?: number; maxAttempts?: number };
+  reconnect?: false | { baseDelayMs?: number; maxDelayMs?: number; maxAttempts?: number; jitterMs?: number };
   /** Fired on connect / disconnect / route-table updates (best effort). */
   onStatusChange?: (status: ClusterLinkStatus) => void;
 }
@@ -940,6 +942,7 @@ export class ClusterLink {
         },
         baseDelayMs: rc.baseDelayMs ?? 200,
         maxDelayMs: rc.maxDelayMs ?? 5000,
+        jitterMs: rc.jitterMs,
         maxAttempts,
         onGiveUp: () => {
           this.initialReject?.(new Error(`cluster connect gave up after ${maxAttempts} attempts`));
@@ -1370,13 +1373,13 @@ export class ClusterLink {
   }
 
   /**
-   * The live reconnect backoff policy (EB-340): `{ baseDelayMs,
-   * maxDelayMs, maxAttempts }` — the connect-time policy, or the
-   * revised one after `retuneReconnectBackoff`. Throws `RangeError`
+   * The live reconnect backoff policy (EB-340, EB-395): `{ baseDelayMs,
+   * maxDelayMs, maxAttempts, jitterMs }` — the connect-time policy, or
+   * the revised one after `retuneReconnectBackoff`. Throws `RangeError`
    * on a link built with `reconnect: false`, which has no controller
    * and therefore no policy to read.
    */
-  getReconnectBackoff(): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number } {
+  getReconnectBackoff(): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number; jitterMs: number } {
     const controller = this.reconnectController;
     if (controller == null) {
       throw new RangeError('getReconnectBackoff: no reconnect policy — the link was built with reconnect: false');
@@ -1385,7 +1388,7 @@ export class ClusterLink {
   }
 
   /**
-   * Retunes the reconnect backoff policy live (EB-340) without
+   * Retunes the reconnect backoff policy live (EB-340, EB-395) without
    * reconnecting, re-syncing routes, or changing the connection state:
    * a field left out keeps its live value. The attempt counter is
    * untouched, `onGiveUp` is untouched, and a backoff timer already
@@ -1395,16 +1398,20 @@ export class ClusterLink {
    *
    * Reuses the documented connect-time rule (`baseDelayMs` /
    * `maxDelayMs` positive finite numbers, `maxAttempts` a positive
-   * integer); an illegal value throws `RangeError` with the live
+   * integer, `jitterMs` a non-negative finite number with 0 meaning
+   * deterministic); an illegal value throws `RangeError` with the live
    * policy untouched. Note the constructor never validated these
    * numbers, so this rule is the revision-time contract — see
    * `ReconnectController.retuneBackoff`. Throws `RangeError` on a link
    * built with `reconnect: false`, which has no controller to retune.
-   * A revision that moves `baseDelayMs` or `maxDelayMs` rebuilds the
-   * strategy as a fresh `ExponentialBackoff` (default 250ms jitter);
-   * a `maxAttempts`-only revision leaves the strategy object alone.
-   * The hub side is untouched: the hub's `heartbeatTimeoutMs` and
-   * the cached route table never move.
+   * A revision that moves `baseDelayMs`, `maxDelayMs`, or `jitterMs`
+   * rebuilds the strategy as a fresh `ExponentialBackoff` at the
+   * merged values — including the merged jitter, so a plain base/cap
+   * revision no longer silently resets a custom jitter to the 250ms
+   * default (the EB-340 gap closed by EB-395); a `maxAttempts`-only
+   * revision leaves the strategy object alone. The hub side is
+   * untouched: the hub's `heartbeatTimeoutMs` and the cached route
+   * table never move.
    */
   retuneReconnectBackoff(revision: ClusterLinkReconnectBackoffRevision): void {
     const controller = this.reconnectController;

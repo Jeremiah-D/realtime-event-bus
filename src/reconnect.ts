@@ -47,7 +47,7 @@ export class ExponentialBackoff implements BackoffStrategy {
   }
 }
 
-/** Live revision of the exponential backoff policy (EB-340): any field may be omitted to keep its live value. */
+/** Live revision of the exponential backoff policy (EB-340, EB-395): any field may be omitted to keep its live value. */
 export interface ReconnectBackoffRevision {
   /** Base backoff delay in ms; attempt n waits baseDelay * 2^(n-1) plus jitter. */
   baseDelayMs?: number;
@@ -55,6 +55,13 @@ export interface ReconnectBackoffRevision {
   maxDelayMs?: number;
   /** Connection attempts before giving up and returning to idle. */
   maxAttempts?: number;
+  /**
+   * Max random jitter added to each delay in ms (EB-395). A non-negative
+   * finite number; 0 is a deterministic, jitter-free policy. Jitter is
+   * part of the revision surface: a base/cap revision no longer resets
+   * it to the 250ms default (the EB-340 gap this item closes).
+   */
+  jitterMs?: number;
 }
 
 export interface ReconnectOptions {
@@ -92,25 +99,30 @@ export class ReconnectController {
   private maxAttempts: number;
   private readonly onGiveUp?: (attempts: number) => void;
   /**
-   * Live numeric backoff parameters (EB-340). These describe the
+   * Live numeric backoff parameters (EB-340, EB-395). These describe the
    * default exponential strategy: when the controller was built with a
    * custom `strategy` they are the constructor-provided numbers (which
    * that strategy ignores) until a retune replaces the strategy — see
-   * `retuneBackoff`.
+   * `retuneBackoff`. `backoffJitterMs` is the live jitter (EB-395):
+   * the default strategy is built with it, and a retune that moves
+   * base/cap/jitter rebuilds the strategy at the merged jitter instead
+   * of silently resetting it to the 250ms default.
    */
   private backoffBaseDelayMs: number;
   private backoffMaxDelayMs: number;
+  private backoffJitterMs: number;
 
   constructor(options: ReconnectOptions) {
     this.connectFn = options.connectFn;
     this.backoffBaseDelayMs = options.baseDelayMs ?? 1000;
     this.backoffMaxDelayMs = options.maxDelayMs ?? 30000;
+    this.backoffJitterMs = options.jitterMs ?? 250;
     this.strategy =
       options.strategy ??
       new ExponentialBackoff({
         baseDelayMs: this.backoffBaseDelayMs,
         maxDelayMs: this.backoffMaxDelayMs,
-        jitterMs: options.jitterMs,
+        jitterMs: this.backoffJitterMs,
       });
     this.maxAttempts = options.maxAttempts ?? 10;
     this.onGiveUp = options.onGiveUp;
@@ -131,38 +143,43 @@ export class ReconnectController {
   }
 
   /**
-   * The live reconnect backoff policy (EB-340): `{ baseDelayMs,
-   * maxDelayMs, maxAttempts }`. Reads the tracked numeric parameters
-   * and the live attempt budget — after a retune this is the revised
-   * policy, before one it is the connect-time policy.
+   * The live reconnect backoff policy (EB-340, EB-395): `{ baseDelayMs,
+   * maxDelayMs, maxAttempts, jitterMs }`. Reads the tracked numeric
+   * parameters and the live attempt budget — after a retune this is the
+   * revised policy, before one it is the connect-time policy.
    */
-  getReconnectBackoff(): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number } {
+  getReconnectBackoff(): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number; jitterMs: number } {
     return {
       baseDelayMs: this.backoffBaseDelayMs,
       maxDelayMs: this.backoffMaxDelayMs,
       maxAttempts: this.maxAttempts,
+      jitterMs: this.backoffJitterMs,
     };
   }
 
   /**
-   * Retunes the reconnect backoff policy live (EB-340) without
+   * Retunes the reconnect backoff policy live (EB-340, EB-395) without
    * resetting the attempt counter, touching an armed backoff timer,
    * or changing `onGiveUp`: a field left out keeps its live value.
    *
    * Validation reuses the documented connect-time rule — `baseDelayMs`
    * / `maxDelayMs` positive finite numbers, `maxAttempts` a positive
-   * integer — and is checked before anything mutates, so an illegal
-   * revision throws `RangeError` with the live policy untouched. (The
+   * integer — plus the EB-395 jitter rule: `jitterMs` a non-negative
+   * finite number, where 0 is a deterministic, jitter-free policy.
+   * It is checked before anything mutates, so an illegal revision
+   * throws `RangeError` with the live policy untouched. (The
    * constructor itself never validated these numbers, so this rule is
    * the revision-time contract; connect-time values outside it keep
    * their old unchecked behavior until first revised.)
    *
-   * Effect: when `baseDelayMs` or `maxDelayMs` moves, the strategy is
-   * rebuilt as a fresh `ExponentialBackoff` at the merged values —
-   * which replaces a custom strategy, if one was installed, and resets
-   * the jitter to the default 250ms with `Math.random` (jitter is not
-   * part of the revision surface). A revision that only moves
-   * `maxAttempts` leaves the strategy object — custom or default —
+   * Effect: when `baseDelayMs`, `maxDelayMs`, or `jitterMs` moves, the
+   * strategy is rebuilt as a fresh `ExponentialBackoff` at the merged
+   * values — which replaces a custom strategy, if one was installed,
+   * and carries the merged jitter forward, so a plain base/cap
+   * revision no longer silently resets a custom jitter to the 250ms
+   * default (the EB-340 gap). A revision that only moves
+   * `maxAttempts`, or that re-affirms the current numeric policy
+   * field for field, leaves the strategy object — custom or default —
    * exactly as it is. A backoff timer already armed keeps running at
    * the delay it was armed with; the new policy governs from the next
    * `enterBackoff`, which reads the live strategy, and the next
@@ -174,6 +191,7 @@ export class ReconnectController {
     const baseDelayMs = revision.baseDelayMs ?? this.backoffBaseDelayMs;
     const maxDelayMs = revision.maxDelayMs ?? this.backoffMaxDelayMs;
     const maxAttempts = revision.maxAttempts ?? this.maxAttempts;
+    const jitterMs = revision.jitterMs ?? this.backoffJitterMs;
     if (!Number.isFinite(baseDelayMs) || baseDelayMs <= 0) {
       throw new RangeError('retuneBackoff: baseDelayMs must be a positive finite number');
     }
@@ -183,10 +201,18 @@ export class ReconnectController {
     if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
       throw new RangeError('retuneBackoff: maxAttempts must be a positive integer');
     }
-    if (baseDelayMs !== this.backoffBaseDelayMs || maxDelayMs !== this.backoffMaxDelayMs) {
+    if (!Number.isFinite(jitterMs) || jitterMs < 0) {
+      throw new RangeError('retuneBackoff: jitterMs must be a non-negative finite number');
+    }
+    if (
+      baseDelayMs !== this.backoffBaseDelayMs ||
+      maxDelayMs !== this.backoffMaxDelayMs ||
+      jitterMs !== this.backoffJitterMs
+    ) {
       this.backoffBaseDelayMs = baseDelayMs;
       this.backoffMaxDelayMs = maxDelayMs;
-      this.strategy = new ExponentialBackoff({ baseDelayMs, maxDelayMs });
+      this.backoffJitterMs = jitterMs;
+      this.strategy = new ExponentialBackoff({ baseDelayMs, maxDelayMs, jitterMs });
     }
     this.maxAttempts = maxAttempts;
   }
