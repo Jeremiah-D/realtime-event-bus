@@ -34,6 +34,10 @@ export interface HeartbeatOptions {
  * connecting, backoff), so heartbeats never fire during a reconnect cycle.
  * An in-flight ping blocks the next tick, so a hung peer cannot stack up
  * overlapping pings.
+ *
+ * The cadence and timeout are revisable live via `retune` (EB-394); see
+ * that method. This class has no consumers on the bus — it is a public
+ * exported API exercised directly by its tests.
  */
 export class HeartbeatMonitor {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -41,16 +45,24 @@ export class HeartbeatMonitor {
   private missed = 0;
 
   private readonly controller: ReconnectController;
-  private readonly intervalMs: number;
-  private readonly timeoutMs: number;
+  // Live-tuned by `retune` (EB-394): `start` arms the timer at the live
+  // `intervalMs` and `tick` reads the live `timeoutMs` for each new
+  // ping's race, so a revision governs from the next tick / next ping.
+  // The miss counter is never moved by a retune.
+  private intervalMs: number;
+  private timeoutMs: number;
   private readonly pingFn: () => Promise<void>;
   private readonly onPong?: (latencyMs: number) => void;
   private readonly onTimeout?: (missed: number) => void;
 
   constructor(controller: ReconnectController, options: HeartbeatOptions) {
     this.controller = controller;
-    this.intervalMs = options.intervalMs ?? 30_000;
-    this.timeoutMs = options.timeoutMs ?? 5_000;
+    const intervalMs = options.intervalMs ?? 30_000;
+    const timeoutMs = options.timeoutMs ?? 5_000;
+    assertValidHeartbeatMs(intervalMs, 'intervalMs');
+    assertValidHeartbeatMs(timeoutMs, 'timeoutMs');
+    this.intervalMs = intervalMs;
+    this.timeoutMs = timeoutMs;
     this.pingFn = options.pingFn;
     this.onPong = options.onPong;
     this.onTimeout = options.onTimeout;
@@ -61,13 +73,52 @@ export class HeartbeatMonitor {
     return this.missed;
   }
 
+  /** The live ping cadence, in milliseconds. */
+  getIntervalMs(): number {
+    return this.intervalMs;
+  }
+
+  /** The live pong timeout, in milliseconds. */
+  getTimeoutMs(): number {
+    return this.timeoutMs;
+  }
+
+  /**
+   * Retunes the ping cadence and pong timeout live (EB-394). The
+   * revision is partial: a field left out keeps its value.
+   *
+   * A revised `intervalMs` rebuilds the ping timer at the new cadence
+   * (the old timer is cleared first, so a tick never fires twice and
+   * no tick is lost — the new cadence governs from the next tick). A
+   * monitor that has not been started only stores the values for the
+   * next `start()`; a stopped monitor stays stopped. A revised
+   * `timeoutMs` governs from the next ping's race: an in-flight ping
+   * keeps the timeout it was armed with.
+   *
+   * Fail-closed: validation reuses the construction-time rule (a
+   * positive finite number of milliseconds) — an illegal value throws
+   * `RangeError` with both live values untouched, even when the other
+   * field is legal. Revising to the current values is a no-op (the
+   * timer is not rebuilt). The miss counter is never reset.
+   */
+  retune(next: { intervalMs?: number; timeoutMs?: number }): void {
+    // Validate both fields before moving either.
+    if (next.intervalMs !== undefined) assertValidHeartbeatMs(next.intervalMs, 'intervalMs');
+    if (next.timeoutMs !== undefined) assertValidHeartbeatMs(next.timeoutMs, 'timeoutMs');
+    if (next.timeoutMs !== undefined) this.timeoutMs = next.timeoutMs;
+    if (next.intervalMs !== undefined && next.intervalMs !== this.intervalMs) {
+      this.intervalMs = next.intervalMs;
+      if (this.timer != null) {
+        clearInterval(this.timer);
+        this.timer = this.armTimer();
+      }
+    }
+  }
+
   /** Start the ping interval; a second call is a no-op. */
   start(): void {
     if (this.timer != null) return;
-    this.timer = setInterval(() => this.tick(), this.intervalMs);
-    if (typeof this.timer === 'object' && this.timer != null && 'unref' in this.timer) {
-      (this.timer as { unref(): void }).unref();
-    }
+    this.timer = this.armTimer();
   }
 
   /**
@@ -81,6 +132,19 @@ export class HeartbeatMonitor {
       this.timer = null;
     }
     this.pingInFlight = false;
+  }
+
+  /**
+   * Arms the ping timer at the live `intervalMs`. Unref'd: a heartbeat
+   * must never hold the process open on its own. Every arm goes through
+   * here so a retune (EB-394) rebuilds the same timer `start` armed.
+   */
+  private armTimer(): ReturnType<typeof setInterval> {
+    const timer = setInterval(() => this.tick(), this.intervalMs);
+    if (typeof timer === 'object' && timer != null && 'unref' in timer) {
+      (timer as { unref(): void }).unref();
+    }
+    return timer;
   }
 
   private tick(): void {
@@ -104,6 +168,13 @@ export class HeartbeatMonitor {
         this.controller.notifyDisconnected();
       },
     );
+  }
+}
+
+/** Shared ping-cadence / pong-timeout validation for the constructor and `retune` (EB-394). */
+function assertValidHeartbeatMs(value: unknown, name: string): asserts value is number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`HeartbeatMonitor: ${name} must be a positive finite number of milliseconds`);
   }
 }
 

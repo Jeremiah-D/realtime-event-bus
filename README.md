@@ -1195,6 +1195,18 @@ library.
   controller is not `connected`, an in-flight ping blocks the next tick so a
   hung peer cannot stack pings, and `onPong(latencyMs)` reports each
   round-trip.
+  Revisable live (EB-394, via `retune({ intervalMs?, timeoutMs? })`): the
+  revision is partial (a field left out keeps its value) and only the
+  cadence and timeout ever move — the miss counter is untouched. A revised
+  interval rebuilds the ping timer at the new cadence (the new cadence
+  governs from the next tick); a monitor that has not been started only
+  stores the values for the next `start()`. A revised timeout governs from
+  the next ping's race — an in-flight ping keeps the timeout it was armed
+  with. It is fail-closed (an illegal value throws `RangeError` with both
+  live values untouched; the constructor enforces the same rule), revising
+  to the current values is a no-op, and `getIntervalMs()` /
+  `getTimeoutMs()` read the live values. The class has no consumers on the
+  bus — it is a public exported API.
 - **Subscriber health probing** (in `src/bus.ts`, opt-in via
   `subscribe(..., { healthProbe: true })`): the bus watches every delivery to
   the subscriber — a handler that throws, or one that overruns its
