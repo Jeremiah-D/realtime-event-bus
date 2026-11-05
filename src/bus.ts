@@ -17193,6 +17193,20 @@ export class EventBus {
    */
   private topicDelayedCapacities = new Map<string, number>();
   /**
+   * Per-topic durable-log age-retention overrides (EB-388): maps a
+   * concrete topic name to its own `maxAgeMs` bound. A topic present
+   * here compacts under its override and no longer follows later
+   * `setDurableLogMaxAgeMs` moves (the override pins it) until cleared;
+   * a topic absent from the map keeps following the live global value.
+   * Live-only — a restart clears every per-topic override (unlike the
+   * bus-wide bound, which restores its construction-time value), and
+   * there is no construction-time option for them. Tunable at runtime
+   * via `setTopicDurableLogMaxAgeMs`, fanned out to the root log and
+   * every namespace child log; a namespace registered later reads this
+   * live mapping when its child log opens.
+   */
+  private topicDurableLogMaxAgeMs = new Map<string, number>();
+  /**
    * Bus-level global publish rate limiter (EB-180, see
    * `EventBusOptions.globalPublishRateLimit`). `undefined` when
    * unconfigured — the publish path then pays a single `undefined`
@@ -22701,6 +22715,133 @@ export class EventBus {
       actor,
       detail: { from: previous ?? null, to: maxAgeMs ?? null },
     });
+  }
+
+  /**
+   * Retunes the durable log's time-based retention bound for one
+   * concrete topic at runtime (EB-388). `setTopicDurableLogMaxAgeMs(topic,
+   * maxAgeMs, actor?)` installs the topic's own age bound: records older
+   * than `now - maxAgeMs` (bus clock) are evicted at the topic's next
+   * compact, dual-bounded with the count limit like the global bound.
+   * Pass `undefined` to clear the topic's override and fall back to the
+   * live bus-global value, the same clear semantic as
+   * `setDurableLogMaxAgeMs`.
+   *
+   * Only the topic's bound moves — the retention mechanism itself is
+   * untouched: the amortized 2x compact trigger keeps reading the bound
+   * live, and the records already persisted are retained, never cleared
+   * or rewritten. The new bound governs from the next append-triggered
+   * compact of the topic: tightening it does not force an immediate
+   * compact (the next append past twice the entry budget rewrites the
+   * file down to the newest records within the new window), while
+   * loosening it simply allows more history. Seq-0 delayed-delivery
+   * schedule records are timer intents and never age out, under an
+   * override exactly as under the global bound.
+   *
+   * An overridden topic no longer follows later
+   * `setDurableLogMaxAgeMs` moves — the override pins it — while
+   * uncovered topics keep following the live global value.
+   *
+   * The change applies to the root log and every namespace child log,
+   * and is recorded in the subscription audit log as
+   * `topic_durable_log_max_age_revised` (with the topic and the previous
+   * and new bound in `detail`; `null` when a bound is unset, since JSON
+   * has no `undefined` — the first revision of a topic reports the live
+   * global value as its previous bound, since that is what the topic
+   * was following). A namespace registered after the revision opens its
+   * child log with the live bus mapping, like every other durable-log
+   * option. `getStats().durableLog.retentionEvicted` stays a global
+   * counter — per-topic state is observed through
+   * `getTopicDurableLogMaxAgeMs` / `listTopicDurableLogMaxAgeMs`.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A bad topic or a non-positive-finite bound also
+   * throws `RangeError` with the live overrides and the audit log
+   * untouched. A revision identical to the topic's current override
+   * (including clearing a topic that holds no override) is a no-op with
+   * no audit — installing the live global value as an override still
+   * counts as a change, since it pins the topic against later global
+   * moves.
+   *
+   * The revision itself is live-only: a restart clears every per-topic
+   * override (there is no construction-time option for them), and
+   * already-evicted history stays evicted.
+   *
+   * Orthogonal to EB-85 (that retunes the bus-global age bound — this
+   * its per-topic override), to EB-322 (that retunes the per-topic
+   * entry-count bound — this the age bound), to EB-323 (that retunes
+   * the byte bound — this the age bound), and to EB-221 (that retunes
+   * per-topic key TTLs — this the age retention).
+   *
+   * Throws `RangeError` for a bad actor, for an empty topic, for a
+   * non-positive-finite `maxAgeMs`, or when the bus has no
+   * `durableLogDir`.
+   */
+  setTopicDurableLogMaxAgeMs(topic: string, maxAgeMs: number | undefined, actor = 'system'): void {
+    assertValidActor(actor, 'setTopicDurableLogMaxAgeMs');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setTopicDurableLogMaxAgeMs requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
+      throw new RangeError('maxAgeMs must be a positive finite number of milliseconds');
+    }
+    const previous = this.topicDurableLogMaxAgeMs.get(topic);
+    // Re-affirming the topic's current override is a no-op: no retune,
+    // no audit. (Installing the live global value still counts: it pins
+    // the topic against later global moves.)
+    if (maxAgeMs === previous) {
+      return;
+    }
+    const oldMaxAgeMs = previous ?? this.durableLogMaxAgeMs;
+    if (maxAgeMs === undefined) {
+      this.topicDurableLogMaxAgeMs.delete(topic);
+    } else {
+      this.topicDurableLogMaxAgeMs.set(topic, maxAgeMs);
+    }
+    log.setTopicMaxAgeMs(topic, maxAgeMs);
+    for (const child of this.namespaceLogs.values()) child.setTopicMaxAgeMs(topic, maxAgeMs);
+    this.auditSubscription({
+      action: 'topic_durable_log_max_age_revised',
+      actor,
+      detail: {
+        topic,
+        maxAgeMs: maxAgeMs ?? null,
+        oldMaxAgeMs: oldMaxAgeMs ?? null,
+      },
+    });
+  }
+
+  /**
+   * Returns the live per-topic durable-log age-retention override for
+   * one concrete topic (EB-388): `undefined` means no override is
+   * installed and the topic follows the live bus-global value
+   * (`setDurableLogMaxAgeMs`). Mirrors the value
+   * `setTopicDurableLogMaxAgeMs` last installed for the topic.
+   */
+  getTopicDurableLogMaxAgeMs(topic: string): number | undefined {
+    return this.topicDurableLogMaxAgeMs.get(topic);
+  }
+
+  /**
+   * Lists every per-topic durable-log age-retention override currently
+   * installed (EB-388), in installation order — one row per concrete
+   * topic with an override. Topics without an override (following the
+   * live global value) are not listed. The returned rows are fresh
+   * objects, so mutating them cannot move a live override.
+   */
+  listTopicDurableLogMaxAgeMs(): Array<{ topic: string; maxAgeMs: number }> {
+    return [...this.topicDurableLogMaxAgeMs.entries()].map(([topic, maxAgeMs]) => ({
+      topic,
+      maxAgeMs,
+    }));
   }
 
   /**
@@ -28318,6 +28459,12 @@ export class EventBus {
           }),
       });
       this.namespaceLogs.set(prefix, child);
+      // EB-388: a namespace registered after a per-topic age-retention
+      // override opens its child log with the live bus mapping, like
+      // every other durable-log option.
+      for (const [topic, maxAgeMs] of this.topicDurableLogMaxAgeMs) {
+        child.setTopicMaxAgeMs(topic, maxAgeMs);
+      }
       // A restarted bus reopens the namespace's on-disk history: reseed
       // the bus-side sequence/stats cursors from it, like the root log's
       // construction-time recovery, so numbering continues instead of

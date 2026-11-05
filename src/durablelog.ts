@@ -1992,6 +1992,16 @@ export class DurableTopicLog {
    * subscription-audit trail.
    */
   private maxAgeMs: number | undefined;
+  /**
+   * EB-388: per-topic time-based retention overrides in milliseconds,
+   * exact topics only. A topic present here compacts under its own age
+   * bound instead of the bus-global `maxAgeMs` — and no longer follows
+   * later global moves (the override pins it) until cleared. Absent
+   * topics keep following the live global value. Runtime-only: restart
+   * recovery does not restore it — the bus re-applies its live mapping
+   * on first access (namespace child logs included).
+   */
+  private readonly topicMaxAgeMs = new Map<string, number>();
   /** Clock source for the retention cutoff; defaults to `Date.now`. */
   private readonly now: () => number;
   /** Records evicted by time-based retention, across compactions. */
@@ -2181,6 +2191,35 @@ export class DurableTopicLog {
     const previous = this.maxAgeMs;
     this.maxAgeMs = maxAgeMs;
     return previous;
+  }
+
+  /**
+   * Changes the per-topic time-based retention bound for one exact
+   * topic at runtime (EB-388). Pass `undefined` to clear the topic's
+   * override and fall back to the live bus-global `maxAgeMs`, the same
+   * clear semantic as `setMaxAgeMs`. Returns the previous override
+   * (`undefined` when the topic followed the global bound). Throws
+   * `RangeError` for a non-positive-finite value, leaving the live
+   * override exactly as it was. The change takes effect on the next
+   * compact of the topic — already-persisted records are untouched, a
+   * tightened bound does not force an immediate compact, and a
+   * loosened bound simply allows more history. The bus wraps this as
+   * `setTopicDurableLogMaxAgeMs` and records the change in the
+   * subscription audit log (`topic_durable_log_max_age_revised`).
+   */
+  setTopicMaxAgeMs(topic: string, maxAgeMs: number | undefined): number | undefined {
+    if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
+      throw new RangeError('topicDurableLogMaxAgeMs must be a positive finite number of milliseconds');
+    }
+    const previous = this.topicMaxAgeMs.get(topic);
+    if (maxAgeMs === undefined) this.topicMaxAgeMs.delete(topic);
+    else this.topicMaxAgeMs.set(topic, maxAgeMs);
+    return previous;
+  }
+
+  /** EB-388: the per-topic age-retention override for one exact topic, if any. */
+  topicMaxAge(topic: string): number | undefined {
+    return this.topicMaxAgeMs.get(topic);
   }
 
   /**
@@ -3759,7 +3798,8 @@ export class DurableTopicLog {
 
   /**
    * Rewrites a topic's file keeping only the newest entries. Time-based
-   * retention (`maxAgeMs`) applies first — records older than
+   * retention (the topic's EB-388 override when installed, else the
+   * bus-global `maxAgeMs`) applies first — records older than
    * `now - maxAgeMs` are evicted, except the seq-0 delayed-delivery
    * schedule records, which are timer intents and never age out — then
    * the count bound trims the survivors, so both constraints hold.
@@ -3772,7 +3812,7 @@ export class DurableTopicLog {
     // retention-dropped without one (the pre-EB-221 `maxAgeMs` behavior;
     // set the key TTL <= `maxAgeMs` to keep the baseline guarantee for
     // every key).
-    const retained = this.applyRetention(this.applyKeyTtl(topic, records));
+    const retained = this.applyRetention(topic, this.applyKeyTtl(topic, records));
     const kept = this.applyBytesBound(
       this.keyCompaction
         ? compactKeyed(retained, this.maxEntriesPerTopic)
@@ -3853,16 +3893,19 @@ export class DurableTopicLog {
   }
 
   /**
-   * Evicts records older than the time-based retention window
-   * (`now - maxAgeMs`), counting them in `retentionEvicted`. Seq-0
-   * delayed-delivery schedule records (and their tombstones) are timer
-   * intents, not messages — they are never evicted by age, or a restart
-   * would lose pending timers. A record exactly on the cutoff
-   * (`at === now - maxAgeMs`) is kept; only strictly older records go.
-   * No-op when no age bound is configured.
+   * Evicts records older than the time-based retention window for the
+   * topic (`now - maxAgeMs`), counting them in `retentionEvicted`.
+   * EB-388: the bound is the topic's own override when one is installed
+   * (`topicMaxAgeMs`), otherwise the live bus-global `maxAgeMs` — so a
+   * pinned topic ignores later global moves and an uncovered topic keeps
+   * following them. Seq-0 delayed-delivery schedule records (and their
+   * tombstones) are timer intents, not messages — they are never evicted
+   * by age, or a restart would lose pending timers. A record exactly on
+   * the cutoff (`at === now - maxAgeMs`) is kept; only strictly older
+   * records go. No-op when no age bound is configured.
    */
-  private applyRetention(records: DurableLogRecord[]): DurableLogRecord[] {
-    const maxAgeMs = this.maxAgeMs;
+  private applyRetention(topic: string, records: DurableLogRecord[]): DurableLogRecord[] {
+    const maxAgeMs = this.topicMaxAgeMs.get(topic) ?? this.maxAgeMs;
     if (maxAgeMs === undefined) return records;
     const cutoff = this.now() - maxAgeMs;
     const retained: DurableLogRecord[] = [];

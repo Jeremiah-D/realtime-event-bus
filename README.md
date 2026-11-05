@@ -693,7 +693,18 @@ library.
   `getStats().durableLog.retentionEvicted`. Change the bound at runtime
   with `setDurableLogMaxAgeMs(ms, actor?)` (applies to the root log and
   every namespace child log); the change is recorded in the subscription
-  audit log as `retention_updated` with `{ from, to }`. Retune the
+  audit log as `retention_updated` with `{ from, to }`. Retune one
+  topic's bound live with `setTopicDurableLogMaxAgeMs(topic, ms,
+  actor?)` (EB-388): the topic compacts under its own bound from its
+  next compact, `undefined` clears the override back to the live global
+  value, and an overridden topic no longer follows later global moves
+  (the override pins it) until cleared. The change is recorded as
+  `topic_durable_log_max_age_revised` with `{ topic, maxAgeMs,
+  oldMaxAgeMs }` (the first revision of a topic reports the live global
+  value as its previous bound); `getTopicDurableLogMaxAgeMs(topic)` /
+  `listTopicDurableLogMaxAgeMs()` observe the live overrides. Revisions
+  are live-only — a restart clears every per-topic override, while
+  already-evicted history stays evicted. Retune the
   per-topic entry budget live with
   `setDurableLogMaxEntriesPerTopic(maxEntriesPerTopic, actor?)` (EB-322):
   only the bound moves, already-persisted records are untouched, and the
@@ -8071,12 +8082,17 @@ earlier re-provisions fresh (`{ created: true }`) and admits publishes
 again. This registry is independent of the advisory EB-77 catalog:
 `createTopic` neither requires nor performs `registerTopic`.
 
-One honest deviation: **retention is bus-global** in this codebase (EB-85
-`setDurableLogMaxAgeMs`, EB-119 `durableLogMaxBytesPerTopic`) — there is
-no per-topic retention rule API to apply. `retention.maxAgeMs` therefore
+One honest deviation: **retention is bus-global by default** in this codebase (EB-85
+`setDurableLogMaxAgeMs`, EB-119 `durableLogMaxBytesPerTopic`) — `createTopic`
+applies no per-topic retention rule of its own. `retention.maxAgeMs` therefore
 moves the shared durable-log age bound for every topic, exactly like
 calling `setDurableLogMaxAgeMs` yourself (same validation, same audit
-trail). Pass it only when you mean it.
+trail). Pass it only when you mean it. To give one topic its own age
+bound instead, use `setTopicDurableLogMaxAgeMs(topic, ms, actor?)`
+(EB-388): the topic compacts under its override from its next compact,
+`undefined` clears it back to the live global value, and an overridden
+topic no longer follows later global moves until cleared — the override
+is live-only and a restart clears it.
 
 `bus.deleteTopic(name, { purge })` tears the topic down and leaves a
 tombstone:
