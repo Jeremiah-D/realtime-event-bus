@@ -97,9 +97,10 @@ export interface ResolvedOtlpSpanExporterOptions {
 /**
  * Revision for the bus-level OTLP export tuning (see
  * `EventBus.setOtlp`, EB-299; EB-357 adds `flushIntervalMs`). Only the
- * fields provided move; the rest keep their live values. `endpoint`,
- * `headers`, and `serviceName` are not revisable here — they are the
- * export destination and identity fixed at construction.
+ * fields provided move; the rest keep their live values. `headers` and
+ * `serviceName` are not revisable here — they are the export identity
+ * fixed at construction. The `endpoint` is not revisable here either —
+ * it moves via `EventBus.setOtlpEndpoint` (EB-406).
  */
 export interface OtlpRevision {
   /**
@@ -287,7 +288,11 @@ function encodeBatch(serviceName: string, batch: TraceSpan[]): string {
  * pipeline's span fan-out.
  */
 export class OtlpSpanExporter {
-  private readonly endpoint: URL;
+  // The export destination. Moves only via `setEndpoint` (EB-406):
+  // `postBatch` reads it at call time, so a POST already in flight
+  // keeps the URL it started with while the next POST goes to the new
+  // destination.
+  private endpoint: URL;
   // Live-tuned by `retune` (EB-299; EB-357 adds the flush interval):
   // every use point reads these fields on each call — `exportSpan`
   // samples at the live `sampleRate` and drops the oldest past the
@@ -295,8 +300,8 @@ export class OtlpSpanExporter {
   // slices at the live `batchSize`, and `postBatch` times out at the
   // live `timeoutMs` — so a revision governs from the next
   // admission/flush/POST without draining or rebuilding the exporter.
-  // `endpoint`, `headers`, and `serviceName` stay fixed for the
-  // exporter's lifetime.
+  // `headers` and `serviceName` stay fixed for the exporter's
+  // lifetime.
   private sampleRate: number;
   private batchSize: number;
   private flushIntervalMs: number;
@@ -365,9 +370,10 @@ export class OtlpSpanExporter {
    * `flushIntervalMs` rebuilds the flush timer at the new interval
    * (the old timer is cleared first, so a tick never fires twice and
    * no tick is lost — the new cadence governs from the next tick).
-   * `endpoint`, `headers`, and `serviceName` are never moved here. A
-   * retune after `shutdown()` moves the values but does not re-arm the
-   * timer — a stopped exporter stays stopped.
+   * `headers` and `serviceName` are never moved here. The `endpoint`
+   * is never moved here either — it moves via `setEndpoint` (EB-406).
+   * A retune after `shutdown()` moves the values but does not re-arm
+   * the timer — a stopped exporter stays stopped.
    */
   retune(next: ResolvedOtlpSpanExporterOptions): void {
     this.sampleRate = next.sampleRate;
@@ -381,6 +387,23 @@ export class OtlpSpanExporter {
         this.timer = this.armFlushTimer(next.flushIntervalMs);
       }
     }
+  }
+
+  /**
+   * Repoints the export destination live (EB-406). Only the endpoint
+   * field moves: `current()` and `getStats()` read it on every call,
+   * so they report the new destination at once, and the flush timer is
+   * untouched — the next POST (a timer tick or a `batchSize`-triggered
+   * flush) goes to the new collector. A POST already in flight keeps
+   * the URL it started with: `postBatch` reads `this.endpoint` when
+   * the request is built and holds that URL object for the request's
+   * lifetime. Buffered spans are untouched — they stay buffered, are
+   * never re-sent, and are never dropped by the repoint. The caller
+   * must have validated `endpoint` through `resolveOtlpOptions` first
+   * — this method applies unconditionally.
+   */
+  setEndpoint(endpoint: URL): void {
+    this.endpoint = endpoint;
   }
 
   /**

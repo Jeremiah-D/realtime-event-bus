@@ -24852,9 +24852,9 @@ export class EventBus {
    * `flushIntervalMs` rebuilds the flush timer at the new interval
    * without rebuilding the exporter — the buffer is retained, nothing
    * is lost or re-sent, and the new cadence governs from the next
-   * tick. `endpoint`, `headers`, and `serviceName` are not revisable
-   * here — they are the export destination and identity fixed at
-   * construction.
+   * tick. `headers` and `serviceName` are not revisable
+   * here — they are the export identity fixed at construction; the
+   * `endpoint` moves via `setOtlpEndpoint` (EB-406), not here.
    *
    * Fail-closed: a bus that never enabled `otlp`, a non-object
    * revision, and an illegal value all throw `RangeError` with the live
@@ -24946,6 +24946,110 @@ export class EventBus {
         maxBuffered,
         oldMaxBuffered: current.maxBuffered,
       },
+    });
+  }
+
+  /**
+   * Repoints the OTLP span export destination live (EB-406) without
+   * restarting the bus: `setOtlpEndpoint(endpoint, actor = 'system')`
+   * moves where the next export POST goes (see `EventBusOptions.otlp`,
+   * EB-105) — a collector migration, a staging-to-prod cutover, or a
+   * failover to a standby collector, with no restart and no loss of
+   * the live subscriptions, replay positions, consumer-group
+   * assignments, or rate-limit and dedup state a restart would drop.
+   *
+   * Only the endpoint moves. A POST already in flight keeps the
+   * destination it started with (`postBatch` reads the endpoint when
+   * the request is built); buffered spans stay buffered, are never
+   * re-sent and never dropped by the repoint; the next POST — a timer
+   * tick or a `batchSize`-triggered flush — goes to the new collector.
+   * The flush timer is not rebuilt (`flushIntervalMs` is untouched,
+   * so the next tick keeps its phase), and the five numeric bounds
+   * (`sampleRate`/`batchSize`/`flushIntervalMs`/`timeoutMs`/
+   * `maxBuffered`), `headers`, and `serviceName` are untouched — the
+   * new collector still receives the same identity and credentials.
+   * There is no getter: the live destination is already visible as
+   * `getStats().otlp.endpoint`, which reads the live field on every
+   * call. The revision is live-only — a restart restores the
+   * construction-time endpoint — and it never enters a config
+   * snapshot. No health check, no automatic fallback: the repoint only
+   * changes the destination, it never verifies the new collector
+   * answers — a failed POST still drops that batch and counts it in
+   * `failedSpans`, exactly as before.
+   *
+   * Fail-closed: a bus that never enabled `otlp`, a closed bus, an
+   * illegal actor, and an illegal endpoint all throw `RangeError`
+   * with the live endpoint and the audit log untouched. Validation
+   * reuses the construction-time rule (`resolveOtlpOptions`: a
+   * non-empty `http:`/`https:` URL) against the merged values — the
+   * endpoint takes the new value, the other five numerics plus
+   * `headers` and `serviceName` take their live values — so a value
+   * that could not be set at construction cannot be repointed to
+   * later either. A revision identical to the current endpoint (string
+   * equality) is a no-op with no audit. Audited as
+   * `otlp_endpoint_revised` (`{ endpoint, oldEndpoint }`, URL strings
+   * only — `headers` are never written to the audit record, since
+   * they may carry an `Authorization` bearer).
+   *
+   * Orthogonal to EB-105 (that is the export mechanism itself — this
+   * its missing destination repoint entry), to EB-299/EB-357 (those
+   * revise the five numeric bounds — their docs name the endpoint as
+   * fixed, and this fills exactly that named gap), to EB-370/EB-374
+   * (those are the metrics exporter and its numeric revision — the
+   * metrics endpoint stays construction-time fixed, a separate item),
+   * to EB-399 (that swaps the durable-log S3 offload client — same
+   * "change the transport destination" family, a different module and
+   * layer), to EB-398 (that rotates the at-rest encryption DEK — this
+   * the export destination), and to EB-350 (that rotates the gateway
+   * bearer token — this the collector destination).
+   *
+   * Throws `RangeError` when OTLP export is not enabled, when the bus
+   * is closed, for an illegal actor, or for an illegal endpoint.
+   */
+  setOtlpEndpoint(endpoint: string, actor = 'system'): void {
+    assertValidActor(actor, 'setOtlpEndpoint');
+    const exporter = this.otlpExporter;
+    if (exporter === undefined) {
+      throw new RangeError('setOtlpEndpoint: otlp is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setOtlpMetrics`): close()
+    // already flushed once and stopped the exporter — there is no live
+    // destination left to repoint.
+    if (this.closed) {
+      throw new RangeError('setOtlpEndpoint: bus is closed');
+    }
+    // Validate before touching anything: the endpoint takes the new
+    // value, everything else takes its live value, so a failed call
+    // changes nothing at all.
+    const current = exporter.current();
+    const oldEndpoint = current.endpoint.toString();
+    // Re-affirming the current destination is a no-op: no repoint, no
+    // audit. String equality: a differently-spelled URL for the same
+    // destination still counts as a move.
+    if (endpoint === oldEndpoint) {
+      return;
+    }
+    const resolved = resolveOtlpOptions(
+      {
+        endpoint,
+        sampleRate: current.sampleRate,
+        batchSize: current.batchSize,
+        flushIntervalMs: current.flushIntervalMs,
+        timeoutMs: current.timeoutMs,
+        headers: { ...current.headers },
+        serviceName: current.serviceName,
+        maxBuffered: current.maxBuffered,
+      },
+      'setOtlpEndpoint',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setOtlpEndpoint: otlp is not enabled on this bus');
+    }
+    exporter.setEndpoint(resolved.endpoint);
+    this.auditSubscription({
+      action: 'otlp_endpoint_revised',
+      actor,
+      detail: { endpoint: resolved.endpoint.toString(), oldEndpoint },
     });
   }
 

@@ -6732,9 +6732,23 @@ Semantics notes:
   and the new values govern from the next admission/flush/POST. A
   revised `flushIntervalMs` rebuilds the flush timer at the new
   interval without rebuilding the exporter — the buffer is retained,
-  nothing is lost or re-sent. `endpoint`, `headers`, and `serviceName`
-  are not revisable here — they are the export destination and identity
-  fixed at construction.
+  nothing is lost or re-sent. `headers` and `serviceName`
+  are not revisable here — they are the export identity
+  fixed at construction; the `endpoint` moves via `setOtlpEndpoint`
+  (EB-406), not here.
+- `bus.setOtlpEndpoint(endpoint, actor = 'system')` (EB-406) repoints
+  the export destination live without restarting the bus — only a bus
+  that already enabled `otlp` can be repointed (a never-enabled bus
+  and a closed bus throw `RangeError`); an illegal endpoint fails
+  closed with the live endpoint untouched; an identical endpoint is a
+  no-op with no audit (audited as `otlp_endpoint_revised` with
+  `{ endpoint, oldEndpoint }`, URL strings only — `headers` are never
+  written to the audit record). A POST already in flight keeps the
+  destination it started with; buffered spans stay buffered, never
+  re-sent and never dropped; the next POST goes to the new collector;
+  the flush timer is not rebuilt and the five numeric bounds,
+  `headers`, and `serviceName` are untouched. `getStats().otlp.endpoint`
+  reports the live destination.
 
 ## OTLP metrics export (EB-370)
 
