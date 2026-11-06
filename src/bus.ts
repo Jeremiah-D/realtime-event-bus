@@ -5009,7 +5009,9 @@ export interface UnsubscribeOptions {
    * subscription is torn down immediately — outstanding reliable
    * deliveries are forgotten exactly as a normal immediate unsubscribe
    * would (no requeue, no further redelivery). Must be a positive finite
-   * number; defaults to 30000. Only meaningful with `drain: true`.
+   * number; defaults to the live bus default (`getDefaultDrainTimeout()`,
+   * 30000 before any revision via `setDefaultDrainTimeout`, EB-405).
+   * Only meaningful with `drain: true`.
    */
   drainTimeoutMs?: number;
 }
@@ -8572,11 +8574,14 @@ export interface BusCloseOptions {
   /**
    * Wall-clock milliseconds to wait for subscriber queues to drain and
    * in-flight reliable deliveries to settle (ack/nack/ack-timeout)
-   * before forcing the close. Defaults to `DEFAULT_DRAIN_TIMEOUT_MS`
-   * (the same bound `unsubscribe({ drain: true })` uses). Must be a
+   * before forcing the close. Defaults to the live bus default (see
+   * `setDefaultDrainTimeout`, EB-405 — 30000 before any revision, the
+   * same bound `unsubscribe({ drain: true })` uses). Must be a
    * finite number `>= 0`; `0` means "do not wait past the current
-   * microtask round". An illegal value throws `RangeError` before
-   * anything is closed — a failed validation never half-closes a bus.
+   * microtask round" and stays a per-call-only value — the bus default
+   * itself must be a positive finite number. An illegal value throws
+   * `RangeError` before anything is closed — a failed validation never
+   * half-closes a bus.
    */
   drainTimeoutMs?: number;
 }
@@ -15242,6 +15247,15 @@ export class EventBus {
    * and a restart restores the default.
    */
   private defaultAckTimeoutMs = DEFAULT_ACK_TIMEOUT_MS;
+  /**
+   * Live bus-level default drain timeout for graceful drains
+   * (EB-405): the value `unsubscribe({ drain: true })` and `close()`
+   * fall back to when the caller omits `drainTimeoutMs`. Starts at the
+   * module default (`DEFAULT_DRAIN_TIMEOUT_MS`) and moves only via
+   * `setDefaultDrainTimeout` — there is no construction-time option,
+   * and a restart restores the default.
+   */
+  private defaultDrainTimeoutMs = DEFAULT_DRAIN_TIMEOUT_MS;
   private rpcRouterSub: Subscription | undefined;
   private rpcRouterReliable = false;
   /** Clock for the RPC settled ring; injectable via `requestResponse` options (tests). */
@@ -30489,7 +30503,7 @@ export class EventBus {
       return;
     }
     if (opts?.drain === true) {
-      this.startDrain(subscriber, opts.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS, teardown);
+      this.startDrain(subscriber, opts.drainTimeoutMs ?? this.defaultDrainTimeoutMs, teardown);
       return;
     }
     teardown();
@@ -31662,6 +31676,90 @@ export class EventBus {
    */
   getDefaultAckTimeout(): number {
     return this.defaultAckTimeoutMs;
+  }
+
+  /**
+   * Revises the bus-level default drain timeout live (EB-405) without
+   * restarting the bus: `setDefaultDrainTimeout(timeoutMs, actor =
+   * 'system')` retunes how long a graceful drain waits before forcing
+   * teardown, for every `unsubscribe({ drain: true })` and `close()`
+   * that omits its own `drainTimeoutMs` (see EB-128 / EB-154).
+   *
+   * Only the default moves: the revision takes effect from the next
+   * drain — a new `unsubscribe({ drain: true })` without a per-call
+   * value arms its timer at the new default, and a new `close()`
+   * without a per-call value arms its watchdog at the new default —
+   * while a drain already armed keeps the timer it was armed with
+   * (`startDrain` captures the value at call time; the close watchdog
+   * likewise takes its value when `close()` starts). A slow downstream
+   * that needs the drain window widened from 30s to 120s (so in-flight
+   * reliable deliveries settle instead of being forgotten) gets it for
+   * all future drains without dropping any live connection; tightening
+   * it back down never shortens a drain already counting down.
+   *
+   * There is no construction-time option for this default (along
+   * `setDefaultAckTimeout`, EB-404): a deployment that wants a
+   * non-factory default sets it once after startup. The default is
+   * live-only — a restart restores 30000 — and it never enters a
+   * config snapshot. An explicit per-call `drainTimeoutMs` always wins
+   * over the bus default, in both directions and at both call sites.
+   *
+   * Fail-closed: a non-positive / non-finite `timeoutMs` and an
+   * illegal actor throw `RangeError` with the live default and the
+   * audit log untouched. The default must be a positive finite number
+   * because it has to be legal at both call sites — `unsubscribe`
+   * requires `> 0` while `close` allows `0` — so `0` stays a
+   * per-call-only value for `close()` (an immediate forced teardown)
+   * and can never be installed as the bus default. A revision
+   * identical to the current default is a no-op with no audit.
+   * Audited as `default_drain_timeout_revised`
+   * (`{ previous_timeout_ms, timeout_ms }`, both always numbers).
+   * There is no clear method — restoring the factory default is
+   * `setDefaultDrainTimeout(30000)` (the default is always a number,
+   * never `undefined`, unlike EB-400's clearable group default).
+   *
+   * Orthogonal to EB-128 (that is the drain mechanism itself — this
+   * its missing bus-level default revision entry), to EB-154 (that is
+   * the close mechanism itself — this the close side's default, same
+   * shared revision entry), to EB-404 (that revises the reliable
+   * subscription ack-timeout default — same live-only bus-level
+   * default shape, a different knob), to EB-324 (that revises the
+   * watermark grace default — same bus-level default shape, a
+   * different module), to EB-259 (that revises one already-created
+   * subscription's ack tracker value — this sets the drain-window
+   * default for future drains), and to EB-390 (that governs gateway
+   * handshake admission — a different module).
+   *
+   * Throws `RangeError` for an illegal actor or timeout value.
+   */
+  setDefaultDrainTimeout(timeoutMs: number, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDrainTimeout');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError(
+        'setDefaultDrainTimeout: timeoutMs must be a positive finite number of milliseconds',
+      );
+    }
+    const previousTimeoutMs = this.defaultDrainTimeoutMs;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previousTimeoutMs === timeoutMs) {
+      return;
+    }
+    this.defaultDrainTimeoutMs = timeoutMs;
+    this.auditSubscription({
+      action: 'default_drain_timeout_revised',
+      actor,
+      detail: { previous_timeout_ms: previousTimeoutMs, timeout_ms: timeoutMs },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default drain timeout (EB-405): the
+   * timeout `unsubscribe({ drain: true })` and `close()` fall back to
+   * when the caller omits `drainTimeoutMs` — 30000 before any revision,
+   * then whatever `setDefaultDrainTimeout` last installed.
+   */
+  getDefaultDrainTimeout(): number {
+    return this.defaultDrainTimeoutMs;
   }
 
   /**
@@ -57122,7 +57220,7 @@ export class EventBus {
     // Idempotency first: a second call resolves with the first call's
     // result, even with different (or illegal) options.
     if (this.closePromise !== undefined) return this.closePromise;
-    const drainTimeoutMs = options?.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
+    const drainTimeoutMs = options?.drainTimeoutMs ?? this.defaultDrainTimeoutMs;
     if (!Number.isFinite(drainTimeoutMs) || drainTimeoutMs < 0) {
       throw new RangeError(
         'close: drainTimeoutMs must be a non-negative finite number of milliseconds',

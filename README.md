@@ -1532,7 +1532,8 @@ library.
   asked to leave, so fresh work must not be enqueued behind it nor pollute
   backpressure statistics). A second `unsubscribe()` call while draining
   abandons the drain and tears down immediately; `drainTimeoutMs` (default
-  30000, must be a positive finite number) bounds the wait — on expiry the
+  the live bus default — 30000 unless revised via `setDefaultDrainTimeout`,
+  EB-405 — must be a positive finite number) bounds the wait — on expiry the
   subscription is torn down through the normal path, with outstanding
   reliable deliveries forgotten exactly as an immediate unsubscribe would
   (no requeue, no further redelivery). `getStats().drainingSubscribers`
@@ -9260,7 +9261,9 @@ Semantics:
   (`cancelledRecurring`). Waiting out arbitrary future due times would make
   `close()` hang indefinitely, so cancellation (not waiting) is the
   documented semantic.
-- **Timeout forces.** Past `drainTimeoutMs` (default 30s, the EB-128 bound)
+- **Timeout forces.** Past `drainTimeoutMs` (default 30s, the EB-128 bound
+  — the live bus default, revisable via `setDefaultDrainTimeout`,
+  EB-405; a per-call value always wins over the default)
   every still-draining subscriber is force-torn-down and the result reports
   `drained: false` with the uncompleted `pendingMessages` /
   `unackedDeliveries` counts. A forced teardown clears each subscriber's

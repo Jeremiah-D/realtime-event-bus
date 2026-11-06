@@ -89,6 +89,7 @@ export type SubscriptionAuditAction =
   | 'ack_deadline_extended'
   | 'ack_timeout_revised'
   | 'default_ack_timeout_revised'
+  | 'default_drain_timeout_revised'
   | 'redelivery_backoff_revised'
   | 'delivery_window_revised'
   | 'max_inflight_revised'
@@ -384,6 +385,7 @@ export type SubscriptionAuditAction =
  * - `ack_deadline_extended`: `{ seq, extensionMs, deadlineMs }` — one outstanding reliable delivery's ack timeout was reset (EB-255; `subId` carries the subscriber, `deadlineMs` is the new bus-clock deadline)
  * - `ack_timeout_revised`: `{ ackTimeoutMs, oldAckTimeoutMs }` — a reliable subscriber's ack-timeout default for future deliveries was revised (EB-259; already-armed timers are untouched)
  * - `default_ack_timeout_revised`: `{ previous_timeout_ms: <number>, timeout_ms: <number> }` — the bus-level default ack timeout for reliable subscriptions was revised live (EB-404; both values are always numbers; the revision only affects reliable subscriptions created after it — a subscription created without an explicit `ackTimeoutMs` arms its deliveries' timers at the new default, while subscriptions that already exist keep the tracker value they were created with or last revised to via `setAckTimeout` (EB-259), and deliveries already outstanding keep the timer they were armed with; the new value reuses the subscribe-time validation (a positive finite number of milliseconds), so a failed call leaves the live default untouched; there is no construction-time option and the revision is live-only — a restart restores the 5000ms factory default; restoring the factory default is `setDefaultAckTimeout(5000)`, there is no clear method; a revision identical to the current default is a no-op with no audit)
+ * - `default_drain_timeout_revised`: `{ previous_timeout_ms: <number>, timeout_ms: <number> }` — the bus-level default drain timeout for graceful drains was revised live (EB-405; both values are always numbers; the revision only affects drains started after it — a new `unsubscribe({ drain: true })` without a per-call value arms its timer at the new default and a new `close()` without a per-call value arms its watchdog at the new default, while a drain already armed keeps the timer it was armed with; an explicit per-call `drainTimeoutMs` always wins over the bus default at both call sites; the new value reuses the stricter of the two call-site validations (a positive finite number of milliseconds, since `unsubscribe` requires `> 0` while `close` allows `0` — `0` stays a per-call-only value for `close()`), so a failed call leaves the live default untouched; there is no construction-time option and the revision is live-only — a restart restores the 30000ms factory default; restoring the factory default is `setDefaultDrainTimeout(30000)`, there is no clear method; a revision identical to the current default is a no-op with no audit)
  * - `redelivery_backoff_revised`: `{ redeliveryBackoff: <normalized config or null>, oldRedeliveryBackoff: <normalized config or null> }` — a reliable subscriber's redelivery-backoff policy for future redeliveries was revised (EB-261; `null` on either side means "no backoff, requeue immediately"; already-armed backoff delays keep the delay they were armed with)
  * - `delivery_window_revised`: `{ deliveryWindows: <resolved windows or null>, oldDeliveryWindows: <resolved windows> }` — a windowed subscriber's delivery windows were revised (EB-263; resolved windows carry `startMin`/`endMin`/`days`/`timeZone` plus `maxHoldMs` when set; `null` means the windows were cleared back to all-day delivery; held messages move to the new gate, or are released immediately on a clear)
  * - `max_inflight_revised`: `{ maxInflight: <number or null>, oldMaxInflight: <number> }` — a capped subscriber's max in-flight cap was revised (EB-264; `null` means the cap was cleared back to unlimited; the live in-flight count and the subscribe-time delivery-concurrency cap are untouched)
@@ -598,6 +600,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'ack_deadline_extended',
   'ack_timeout_revised',
   'default_ack_timeout_revised',
+  'default_drain_timeout_revised',
   'redelivery_backoff_revised',
   'delivery_window_revised',
   'max_inflight_revised',
