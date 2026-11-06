@@ -24852,9 +24852,10 @@ export class EventBus {
    * `flushIntervalMs` rebuilds the flush timer at the new interval
    * without rebuilding the exporter — the buffer is retained, nothing
    * is lost or re-sent, and the new cadence governs from the next
-   * tick. `headers` and `serviceName` are not revisable
-   * here — they are the export identity fixed at construction; the
-   * `endpoint` moves via `setOtlpEndpoint` (EB-406), not here.
+   * tick. `serviceName` is not revisable here — it is the export
+   * identity fixed at construction; `headers` move via
+   * `setOtlpHeaders` (EB-409) and the `endpoint` via `setOtlpEndpoint`
+   * (EB-406), not here.
    *
    * Fail-closed: a bus that never enabled `otlp`, a non-object
    * revision, and an illegal value all throw `RangeError` with the live
@@ -25050,6 +25051,114 @@ export class EventBus {
       action: 'otlp_endpoint_revised',
       actor,
       detail: { endpoint: resolved.endpoint.toString(), oldEndpoint },
+    });
+  }
+
+  /**
+   * Rotates the OTLP span export request headers live (EB-409) without
+   * restarting the bus: `setOtlpHeaders(headers, actor = 'system')`
+   * replaces the whole header set the next export POST carries (see
+   * `EventBusOptions.otlp`, EB-105) — a collector credential rotation,
+   * an expired `Authorization` bearer, or a tenant-header change, with
+   * no restart and no loss of the live subscriptions, replay
+   * positions, consumer-group assignments, or rate-limit and dedup
+   * state a restart would drop.
+   *
+   * Full replacement, never a per-header merge: the new map is the
+   * whole header set — a header absent from it stops being sent, so a
+   * rotated-out credential is gone from the next POST, not lingering
+   * beside its replacement. An empty object `{}` clears the headers
+   * back to the construction-time default (no extra headers). The next
+   * export POST — a timer tick or a `batchSize`-triggered flush —
+   * carries the new headers; a POST already in flight keeps the
+   * headers it started with (`postBatch` spreads `this.headers` when
+   * the request is built). Buffered spans stay buffered, are never
+   * re-sent and never dropped by the rotation. The flush timer is not
+   * rebuilt, and the five numeric bounds (`sampleRate`/`batchSize`/
+   * `flushIntervalMs`/`timeoutMs`/`maxBuffered`), the `endpoint`,
+   * and `serviceName` are untouched. The live headers are not exposed
+   * in `getStats().otlp` — they may carry an `Authorization` bearer —
+   * the rotation is observable in the next export POST and in the
+   * audit record (header names only). The revision is live-only — a
+   * restart restores the construction-time headers — and it never
+   * enters a config snapshot.
+   *
+   * Fail-closed: a bus that never enabled `otlp`, a closed bus, an
+   * illegal actor, and illegal headers all throw `RangeError` with the
+   * live headers and the audit log untouched. Validation reuses the
+   * construction-time rule (`resolveOtlpOptions`: a string-valued
+   * object) against the merged values — the headers take the new
+   * value, the other five numerics plus the endpoint and `serviceName`
+   * take their live values — so a value that could not be set at
+   * construction cannot be rotated to later either. Validation runs
+   * before the no-op check, so an illegal value can never pass as
+   * "same as current". A revision identical to the current header set
+   * (deep equality, key order-insensitive) is a no-op with no audit.
+   * Audited as `otlp_headers_revised` (`{ headers, oldHeaders }`,
+   * header names only — values are never written to the audit record,
+   * since they may carry an `Authorization` bearer).
+   *
+   * Orthogonal to EB-105 (that is the export mechanism itself — this
+   * its missing header-rotation entry), to EB-406 (that repoints the
+   * span exporter endpoint — another field), to EB-299/EB-357 (those
+   * revise the five numeric bounds — their docs name the headers as
+   * fixed, and this fills exactly that named gap), to EB-410 (that
+   * rotates the metrics exporter headers — the other exporter), and
+   * to EB-397 (that rotates the ops-alert signing key — same
+   * "credential rotation" family, a different subsystem).
+   *
+   * Throws `RangeError` when OTLP export is not enabled, when the bus
+   * is closed, for an illegal actor, or for illegal headers.
+   */
+  setOtlpHeaders(headers: Record<string, string>, actor = 'system'): void {
+    assertValidActor(actor, 'setOtlpHeaders');
+    const exporter = this.otlpExporter;
+    if (exporter === undefined) {
+      throw new RangeError('setOtlpHeaders: otlp is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setOtlpEndpoint`):
+    // close() already flushed once and stopped the exporter — there
+    // is no live export left to rotate headers for.
+    if (this.closed) {
+      throw new RangeError('setOtlpHeaders: bus is closed');
+    }
+    // Validate before touching anything: the headers take the new
+    // value, everything else takes its live value, so a failed call
+    // changes nothing at all. Validation reuses the construction-time
+    // rule, so a non-object, an array, or a non-string value is
+    // rejected here — before the no-op check, so an illegal value can
+    // never pass as "same as current".
+    const current = exporter.current();
+    const resolved = resolveOtlpOptions(
+      {
+        endpoint: current.endpoint.toString(),
+        sampleRate: current.sampleRate,
+        batchSize: current.batchSize,
+        flushIntervalMs: current.flushIntervalMs,
+        timeoutMs: current.timeoutMs,
+        headers,
+        serviceName: current.serviceName,
+        maxBuffered: current.maxBuffered,
+      },
+      'setOtlpHeaders',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setOtlpHeaders: otlp is not enabled on this bus');
+    }
+    // Re-affirming the current header set is a no-op: no rotation, no
+    // audit. Headers compare by value (key order-insensitive): a
+    // reordered copy of the same set is still the same tuning.
+    if (sameHeaders(resolved.headers, current.headers)) {
+      return;
+    }
+    exporter.setHeaders(resolved.headers);
+    this.auditSubscription({
+      action: 'otlp_headers_revised',
+      actor,
+      detail: {
+        headers: Object.keys(resolved.headers),
+        oldHeaders: Object.keys(current.headers),
+      },
     });
   }
 

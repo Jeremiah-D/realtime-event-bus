@@ -97,10 +97,12 @@ export interface ResolvedOtlpSpanExporterOptions {
 /**
  * Revision for the bus-level OTLP export tuning (see
  * `EventBus.setOtlp`, EB-299; EB-357 adds `flushIntervalMs`). Only the
- * fields provided move; the rest keep their live values. `headers` and
- * `serviceName` are not revisable here — they are the export identity
- * fixed at construction. The `endpoint` is not revisable here either —
- * it moves via `EventBus.setOtlpEndpoint` (EB-406).
+ * fields provided move; the rest keep their live values. `serviceName`
+ * is not revisable here — it is the export identity fixed at
+ * construction. `headers` are not revisable here either — they move
+ * via `EventBus.setOtlpHeaders` (EB-409). The `endpoint` is not
+ * revisable here either — it moves via `EventBus.setOtlpEndpoint`
+ * (EB-406).
  */
 export interface OtlpRevision {
   /**
@@ -300,13 +302,13 @@ export class OtlpSpanExporter {
   // slices at the live `batchSize`, and `postBatch` times out at the
   // live `timeoutMs` — so a revision governs from the next
   // admission/flush/POST without draining or rebuilding the exporter.
-  // `headers` and `serviceName` stay fixed for the exporter's
-  // lifetime.
+  // `serviceName` stays fixed for the exporter's lifetime; `headers`
+  // move only via `setHeaders` (EB-409).
   private sampleRate: number;
   private batchSize: number;
   private flushIntervalMs: number;
   private timeoutMs: number;
-  private readonly headers: Record<string, string>;
+  private headers: Record<string, string>;
   private readonly serviceName: string;
   private maxBuffered: number;
   private readonly buffer: TraceSpan[] = [];
@@ -370,7 +372,8 @@ export class OtlpSpanExporter {
    * `flushIntervalMs` rebuilds the flush timer at the new interval
    * (the old timer is cleared first, so a tick never fires twice and
    * no tick is lost — the new cadence governs from the next tick).
-   * `headers` and `serviceName` are never moved here. The `endpoint`
+   * `serviceName` is never moved here. `headers` are never moved here
+   * either — they move via `setHeaders` (EB-409). The `endpoint`
    * is never moved here either — it moves via `setEndpoint` (EB-406).
    * A retune after `shutdown()` moves the values but does not re-arm
    * the timer — a stopped exporter stays stopped.
@@ -404,6 +407,27 @@ export class OtlpSpanExporter {
    */
   setEndpoint(endpoint: URL): void {
     this.endpoint = endpoint;
+  }
+
+  /**
+   * Rotates the export request headers live (EB-409). Only the
+   * headers move: `current()` reads them on every call, so it reports
+   * the new set at once, and the flush timer is untouched — the next
+   * POST (a timer tick or a `batchSize`-triggered flush) carries the
+   * new headers. A POST already in flight keeps the headers it started
+   * with: `postBatch` spreads `this.headers` when the request is built
+   * and holds that header object for the request's lifetime. Buffered
+   * spans are untouched — they stay buffered, are never re-sent, and
+   * are never dropped by the rotation. This is a full replacement,
+   * never a per-header merge: a header absent from the new map stops
+   * being sent, and an empty object clears the headers back to the
+   * construction-time default. The caller must have validated
+   * `headers` through `resolveOtlpOptions` first — this method applies
+   * unconditionally, storing a defensive copy so later mutation of the
+   * caller's object cannot move the live headers without an audit.
+   */
+  setHeaders(headers: Record<string, string>): void {
+    this.headers = { ...headers };
   }
 
   /**
