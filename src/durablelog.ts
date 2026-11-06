@@ -2458,6 +2458,18 @@ export class DurableTopicLog {
   }
 
   /**
+   * Whether the live S3 offload client is a dry-run (rehearsal) client —
+   * the live value `retuneOffloadClient` moves. `undefined` when S3
+   * offload is not enabled on this log (there is no client to ask). The
+   * client itself is never returned: a real client holds credentials
+   * (`SigV4S3Client` carries `accessKeyId` / `secretAccessKey` /
+   * `sessionToken`), so only its dry-run brand escapes the log.
+   */
+  currentOffloadClientIsDryRun(): boolean | undefined {
+    return this.offload === undefined ? undefined : this.offload.s3.isDryRun;
+  }
+
+  /**
    * Changes the S3 offload local-retain segment count at runtime
    * (EB-362): how many newest archived segments per topic stay local
    * after upload (see `EventBusOptions.durableLogSegmentOffload`,
@@ -2525,6 +2537,66 @@ export class DurableTopicLog {
     }
     this.trimLocalSegments(manifest);
     return old;
+  }
+
+  /**
+   * Changes the S3 offload client at runtime (EB-399): swaps the
+   * transport the log uploads sealed segments with, reads the remote
+   * manifest through, and pulls trimmed segments back down through —
+   * without restarting the log. Returns the previous client's dry-run
+   * brand (`undefined` when the previous client carried no brand).
+   * Throws `RangeError` for a client that is not a usable
+   * `RemoteSegmentS3Client` (reusing the construction-time rule: all
+   * five methods `putObject` / `getObject` / `headObject` /
+   * `listObjects` / `deleteObject` must be functions), leaving the live
+   * client exactly as it was.
+   *
+   * Fail-closed: a log constructed without `segmentOffload` refuses
+   * outright — the client cannot be enabled after the fact, because
+   * there is no remote key space for it to serve. The bus enforces the
+   * same gate as `setDurableLogSegmentOffloadClient` and records the
+   * change in the subscription audit log
+   * (`durable_log_segment_offload_client_revised`). Installing the very
+   * same client object is a no-op returning the current brand.
+   *
+   * Only the client moves: the key prefix, namespace,
+   * `retainLocalSegments`, readback-cache bounds, and segment rotation
+   * are untouched, and segments already uploaded are not re-pushed (the
+   * manifest entries stand — only later uploads and readbacks walk the
+   * new client). The new client governs from the next offload call: the
+   * next `offloadNow` pass, the next manifest load, the next remote
+   * readback. A pass already in flight keeps the resolved offload
+   * object it started with — the replacement is in place on that same
+   * object, so its remaining calls still address the same key space.
+   * Both clients must serve the same bucket and key space; that is the
+   * operator's precondition (a new client over a different key space
+   * would read an empty manifest and re-upload, and trimmed segments
+   * would read back as missing). A dry-run client (`isDryRun === true`)
+   * rehearses only: the next pass records intended keys and never
+   * uploads, writes a manifest, or trims local segments — swapping back
+   * to a real client resumes real uploads.
+   */
+  retuneOffloadClient(s3: RemoteSegmentS3Client): boolean | undefined {
+    if (this.offload === undefined) {
+      throw new RangeError(
+        'DurableTopicLog.retuneOffloadClient requires segmentOffload to be enabled at construction: the S3 client cannot be enabled after the fact',
+      );
+    }
+    const methods = ['putObject', 'getObject', 'headObject', 'listObjects', 'deleteObject'] as const;
+    if (
+      typeof s3 !== 'object' ||
+      s3 === null ||
+      !methods.every((m) => typeof (s3 as Record<string, unknown>)[m] === 'function')
+    ) {
+      throw new RangeError(
+        'DurableTopicLog.retuneOffloadClient: s3 must be a RemoteSegmentS3Client (putObject/getObject/headObject/listObjects/deleteObject)',
+      );
+    }
+    const offload = this.offload as ResolvedSegmentOffload;
+    const oldIsDryRun = offload.s3.isDryRun;
+    if (s3 === offload.s3) return oldIsDryRun;
+    offload.s3 = s3;
+    return oldIsDryRun;
   }
 
   /**

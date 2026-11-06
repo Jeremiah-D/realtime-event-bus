@@ -177,6 +177,7 @@ import {
   type OutboxStore,
 } from './outbox.ts';
 import type { DurableStorageBackend } from './storage.ts';
+import type { RemoteSegmentS3Client } from './storage-s3.ts';
 import {
   RotatingDekEncryptor,
   isEncryptedPayload,
@@ -17384,6 +17385,15 @@ export class EventBus {
    */
   private readonly durableLogEncryptor?: PayloadEncryptor;
   /**
+   * The S3 client the durable log currently offloads through (EB-399) —
+   * the construction-time client, then whatever
+   * `setDurableLogSegmentOffloadClient` last installed. Tracked here so
+   * a same-client revision is a no-op without ever exposing the client
+   * itself (a real client holds credentials). `undefined` when the bus
+   * was constructed without `durableLogSegmentOffload`.
+   */
+  private durableLogOffloadClient?: RemoteSegmentS3Client;
+  /**
    * Subscription lifecycle audit log (EB-78): always present, always
    * records into its bounded in-memory index; persists to daily JSONL
    * files only when `EventBusOptions.subscriptionAuditDir` was given.
@@ -18039,6 +18049,10 @@ export class EventBus {
       this.durableLogKeyCompaction = options.durableLogKeyCompaction ?? false;
       this.durableLogSegmentRotation = options.durableLogSegmentRotation;
       this.durableLogEncryptor = options.durableLogEncryptor;
+      // EB-399: remember the construction-time offload client so a
+      // same-client revision is a no-op (the client itself is never
+      // exposed — it may hold credentials).
+      this.durableLogOffloadClient = options.durableLogSegmentOffload?.s3;
       // Reseed the publish-side idempotent-dedup window from the journal
       // (EB-66): a restarted bus keeps suppressing within-window retries.
       // Claims that aged out of the window are "unknown" — dropped here,
@@ -23629,6 +23643,116 @@ export class EventBus {
   getDurableLogEncryptionKeyId(): string | undefined {
     const ring = this.durableLogEncryptor;
     return ring instanceof RotatingDekEncryptor ? ring.liveKeyId : undefined;
+  }
+
+  /**
+   * Replaces the durable log's S3 offload client live (EB-399) without
+   * restarting the bus: `setDurableLogSegmentOffloadClient(s3, actor?)`
+   * swaps the transport the log uploads sealed segments with, reads the
+   * remote manifest through, and pulls trimmed segments back down
+   * through — so expiring STS credentials can be rotated, an endpoint
+   * migrated, or a dry-run rehearsal switched on mid-flight, without
+   * rebuilding the bus (which would drop every live subscription,
+   * queue, and replay position). See
+   * `EventBusOptions.durableLogSegmentOffload`, EB-163.
+   *
+   * Only the client moves — the key prefix, namespace,
+   * `retainLocalSegments`, readback-cache bounds, and segment rotation
+   * are untouched, and segments already uploaded are not re-pushed (the
+   * manifest entries stand; only later uploads and readbacks walk the
+   * new client). The new client governs from the next offload call: the
+   * next `offloadNow` pass, the next manifest load, the next remote
+   * readback. A pass already in flight keeps the resolved offload
+   * object it started with — the replacement is in place on that same
+   * object, so its remaining calls still address the same key space.
+   * Both clients must serve the same bucket and key space; that is the
+   * operator's precondition (a new client over a different key space
+   * would read an empty manifest and re-upload, and trimmed segments
+   * would read back as missing). A dry-run client (`isDryRun === true`,
+   * `DryRunS3Client`) rehearses only: the next pass records intended
+   * keys and never uploads, writes a manifest, or trims local segments
+   * — swapping back to a real client resumes real uploads, and the
+   * dry-run brand follows the live client (see
+   * `getDurableLogSegmentOffloadClientIsDryRun`).
+   *
+   * The change applies to the root log; namespace child logs do not
+   * offload, so the revision skips them. It is recorded in the
+   * subscription audit log as
+   * `durable_log_segment_offload_client_revised` (with the previous and
+   * new dry-run brands in `detail`; an absent brand is recorded as
+   * `null`). Only the dry-run booleans are recorded — never an endpoint
+   * or a credential, along the `storage-s3.ts` "passed at configuration
+   * time — never logged" rule — and there is no getter that returns the
+   * client itself, since a real client holds credentials.
+   *
+   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * retune and throws `RangeError` — unlike the construction-time
+   * option, which is silently ignored without a dir, a revision
+   * explicitly refuses. A bus constructed without
+   * `durableLogSegmentOffload` also throws `RangeError`: offload
+   * cannot be enabled after the fact, because there is no S3 client or
+   * remote key space for the new client to serve. A client that is not
+   * a usable `RemoteSegmentS3Client` throws `RangeError` with the live
+   * client untouched: validation reuses the construction-time rule
+   * (all five methods `putObject` / `getObject` / `headObject` /
+   * `listObjects` / `deleteObject` must be functions). Installing the
+   * very same client object is a no-op with no audit.
+   *
+   * Orthogonal to EB-163 (that is S3 offload itself — this its
+   * transport client's replacement), to EB-361 (that retunes the
+   * readback-cache bounds — this the client; its doc states the S3
+   * client is untouched by a bounds revision), to EB-362 (that retunes
+   * the local retain count — same), to EB-355 (that retunes the
+   * segment-rotation triggers — this the upload transport), and to
+   * EB-80/EB-398 (those are the encryption layer — this the offload
+   * transport layer).
+   *
+   * Throws `RangeError` for a bad actor, for an unusable client, when
+   * the bus has no `durableLogDir`, or when the bus was constructed
+   * without `durableLogSegmentOffload`.
+   */
+  setDurableLogSegmentOffloadClient(s3: RemoteSegmentS3Client, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogSegmentOffloadClient');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogSegmentOffloadClient requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    // The retain count exists exactly when offload is enabled — a real
+    // client's `isDryRun` may itself be `undefined`, so it cannot gate.
+    if (log.currentRetainLocalSegments() === undefined) {
+      throw new RangeError(
+        'setDurableLogSegmentOffloadClient requires EventBusOptions.durableLogSegmentOffload to be set: offload cannot be enabled after the fact',
+      );
+    }
+    // Re-installing the live client is a no-op: no retune, no audit.
+    if (s3 === this.durableLogOffloadClient) {
+      return;
+    }
+    // `retuneOffloadClient` validates the five-method shape before
+    // moving anything, so an illegal client leaves the live one untouched.
+    const oldIsDryRun = log.retuneOffloadClient(s3);
+    this.durableLogOffloadClient = s3;
+    this.auditSubscription({
+      action: 'durable_log_segment_offload_client_revised',
+      actor,
+      detail: {
+        isDryRun: s3.isDryRun ?? null,
+        oldIsDryRun: oldIsDryRun ?? null,
+      },
+    });
+  }
+
+  /**
+   * Returns whether the live durable-log S3 offload client is a dry-run
+   * (rehearsal) client (EB-399) — `true` after a `DryRunS3Client` was
+   * installed, `undefined` when offload is not enabled or when the live
+   * client carries no dry-run brand (a real client). The client itself
+   * is never returned: it may hold credentials.
+   */
+  getDurableLogSegmentOffloadClientIsDryRun(): boolean | undefined {
+    return this.durableLog?.currentOffloadClientIsDryRun();
   }
 
   /**

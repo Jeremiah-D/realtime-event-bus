@@ -966,7 +966,27 @@ library.
   nothing local and `Infinity` restores full retention; same gates (requires a `durableLogDir`
   and a bus constructed with `durableLogSegmentOffload`, skips namespace child logs) and the
   same no-op rule, audited as `durable_log_retain_local_segments_revised` (`Infinity` recorded
-  as `null`), live value in `getStats().durableLog.retainLocalSegments`. Flip keyed compaction live
+  as `null`), live value in `getStats().durableLog.retainLocalSegments`. Replace the offload client
+  live with `setDurableLogSegmentOffloadClient(s3, actor?)` (EB-399):
+  only the transport moves — the key prefix, namespace,
+  `retainLocalSegments`, readback-cache bounds, and segment rotation are
+  untouched, and segments already uploaded are not re-pushed (the manifest
+  entries stand; only later uploads and readbacks walk the new client).
+  The new client governs from the next offload call, so expiring STS
+  credentials can be rotated, an endpoint migrated, or a dry-run
+  rehearsal switched on without restarting the bus; both clients must
+  serve the same bucket and key space (the operator's precondition). A
+  dry-run client (`DryRunS3Client`) records intended keys and never
+  uploads, writes a manifest, or trims local segments — swapping back to
+  a real client resumes real uploads. Same gates (requires a
+  `durableLogDir` and a bus constructed with
+  `durableLogSegmentOffload`, skips namespace child logs) and the same
+  no-op rule for re-installing the live client, audited as
+  `durable_log_segment_offload_client_revised` (`{ isDryRun, oldIsDryRun }`,
+  `null` when a client carries no brand — never an endpoint or a
+  credential), live brand in
+  `getDurableLogSegmentOffloadClientIsDryRun()` (the client itself is
+  never returned: it may hold credentials). Flip keyed compaction live
   with `setDurableLogKeyCompaction(enabled, actor?)` (EB-364): enabling switches the read view to
   latest-per-key at once (superseded records stop replaying even before the file is rewritten) and
   rebuilds each log's key index and superseded counts from disk, so the next append counts the dead
