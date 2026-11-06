@@ -71,7 +71,8 @@ library.
   subscriber into at-least-once delivery: the handler receives a `Delivery`
   envelope (`msg`, per-subscriber `seq`, `redeliveries` count) with `ack()` /
   `nack()` — `nack()` requeues immediately at the tail (FIFO order kept),
-  and deliveries still outstanding after `ackTimeoutMs` (default 5 s) are
+  and deliveries still outstanding after `ackTimeoutMs` (default 5 s,
+  live-revisable bus-wide with `setDefaultAckTimeout`, EB-404) are
   requeued automatically. Redelivered messages keep their original TTL
   deadline. `unackedCount(subId)` and `getStats().unackedDeliveries` expose
   the outstanding-delivery backlog. Opt-in `deadLetter` bounds redelivery:
@@ -179,7 +180,21 @@ library.
   or a non-positive / non-finite value, throws `RangeError` with the
   old default and the audit log untouched), and every success is
   audited as `ack_timeout_revised`
-  (`{ ackTimeoutMs, oldAckTimeoutMs }`). The
+  (`{ ackTimeoutMs, oldAckTimeoutMs }`). The bus-wide default itself
+  (5 s at startup) can be revised with
+  `setDefaultAckTimeout(timeoutMs, actor = 'system')` (EB-404): reliable
+  subscriptions created after the call that omit their own
+  `ackTimeoutMs` arm their timers at the new default, while
+  subscriptions that already exist keep the tracker value they were
+  created with (or last revised to), and already-outstanding deliveries
+  keep the timer they were armed with. It is fail-closed like the
+  others (a non-positive / non-finite value throws `RangeError` with
+  the live default untouched), a revision identical to the current
+  default is a no-op with no audit, and every success is audited as
+  `default_ack_timeout_revised`
+  (`{ previous_timeout_ms, timeout_ms }`); restoring the factory
+  default is `setDefaultAckTimeout(5000)`, and a restart restores it
+  too. The
   diagnostic goes through the normal publish
   pipeline (ACL, schema validation, rate limiting); an admission rejection
   suppresses it without affecting the DLQ move, and a dead-lettered

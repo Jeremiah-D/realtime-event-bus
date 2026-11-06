@@ -14081,6 +14081,16 @@ const DEFAULT_AUTO_TRAIN_RETRAIN_MS = 60_000;
  */
 const DEFAULT_STATIC_SESSION_TIMEOUT_MS = 30_000;
 
+/**
+ * Default reliable-delivery ack timeout (EB-404): how long a delivery
+ * stays outstanding before it is requeued. 5s — short enough that a
+ * dead consumer is noticed quickly, long enough for a normal handler
+ * to settle. The bus-level default is live-revisable via
+ * `setDefaultAckTimeout`; a subscriber-explicit `ackTimeoutMs` always
+ * wins over it.
+ */
+const DEFAULT_ACK_TIMEOUT_MS = 5000;
+
 /** Resolved (validated, defaulted) form of `CompressionAutoTrainOptions`. */
 interface ResolvedAutoTrainOptions {
   sampleCount: number;
@@ -15223,6 +15233,15 @@ export class EventBus {
    */
   private rpcSettledRingSize = RPC_SETTLED_RING_SIZE;
   private rpcSettledTtlMs = RPC_SETTLED_TTL_MS;
+  /**
+   * Live bus-level default ack timeout for reliable subscriptions
+   * (EB-404): the value `subscribeReliable` falls back to when the
+   * caller omits `ackTimeoutMs`. Starts at the module default
+   * (`DEFAULT_ACK_TIMEOUT_MS`) and moves only via
+   * `setDefaultAckTimeout` — there is no construction-time option,
+   * and a restart restores the default.
+   */
+  private defaultAckTimeoutMs = DEFAULT_ACK_TIMEOUT_MS;
   private rpcRouterSub: Subscription | undefined;
   private rpcRouterReliable = false;
   /** Clock for the RPC settled ring; injectable via `requestResponse` options (tests). */
@@ -31560,6 +31579,92 @@ export class EventBus {
   }
 
   /**
+   * Revises the bus-level default ack timeout for reliable
+   * subscriptions live (EB-404) without restarting the bus:
+   * `setDefaultAckTimeout(timeoutMs, actor = 'system')` retunes how
+   * long a delivery stays outstanding before it is requeued, for
+   * every reliable subscription created after the call that omits its
+   * own `ackTimeoutMs` (see `subscribeReliable`, EB-11).
+   *
+   * Only the default moves: the revision takes effect from the next
+   * `subscribeReliable` — a subscription created after the call arms
+   * its deliveries' timers at the new default — while reliable
+   * subscriptions that already exist keep the tracker value they were
+   * created with (or last revised to via `setAckTimeout`, EB-259),
+   * and deliveries already outstanding keep the timer they were armed
+   * with. A slow downstream that needs the ack deadline widened from
+   * 5s to 30s gets it for all future reliable subscriptions without
+   * dropping any live connection; tightening it back down never
+   * shortens a deadline already counting down.
+   *
+   * There is no construction-time option for this default (along
+   * `setRpcSettledRetention`, EB-391): a deployment that wants a
+   * non-factory default sets it once after startup. The default is
+   * live-only — a restart restores 5000 — and it never enters a config
+   * snapshot. The RPC router's reliable subscription is created
+   * through the same `subscribeReliable` path (`ensureRpcRouter`), so
+   * a caller that passes `reliable: true` (no `ackTimeoutMs`) inherits
+   * the live bus default, and a caller that passes an explicit
+   * `ackTimeoutMs` still wins over it.
+   *
+   * Fail-closed: a non-positive / non-finite `timeoutMs` and an
+   * illegal actor throw `RangeError` with the live default and the
+   * audit log untouched (the subscribe-time validation, EB-259's same
+   * gate). A revision identical to the current default is a no-op
+   * with no audit. Audited as `default_ack_timeout_revised`
+   * (`{ previous_timeout_ms, timeout_ms }`, both always numbers).
+   * There is no clear method — restoring the factory default is
+   * `setDefaultAckTimeout(5000)` (the default is always a number,
+   * never `undefined`, unlike EB-400's clearable group default).
+   *
+   * Orthogonal to EB-11 (that is the ack mechanism itself — this its
+   * missing bus-level default revision entry), to EB-259 (that revises
+   * one already-created subscription's tracker value — this sets the
+   * default for future subscriptions; an explicit value wins over the
+   * default), to EB-255 / EB-257 (that extend one outstanding
+   * delivery's live timer — this sets the default for future
+   * subscriptions), to EB-391 (that revises the RPC settled-ring
+   * retention — same live-only bus-level revision shape, a different
+   * knob), to EB-396 (that revises the publish-rate ring capacity —
+   * same future-effective shape, a different knob), to EB-403 (that
+   * revises the consumer-group session-timeout group default — same
+   * "default" shape, a different module and object), and to EB-220
+   * (that governs redelivery backoff — this governs the ack deadline
+   * default).
+   *
+   * Throws `RangeError` for an illegal actor or timeout value.
+   */
+  setDefaultAckTimeout(timeoutMs: number, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultAckTimeout');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError(
+        'setDefaultAckTimeout: timeoutMs must be a positive finite number of milliseconds',
+      );
+    }
+    const previousTimeoutMs = this.defaultAckTimeoutMs;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previousTimeoutMs === timeoutMs) {
+      return;
+    }
+    this.defaultAckTimeoutMs = timeoutMs;
+    this.auditSubscription({
+      action: 'default_ack_timeout_revised',
+      actor,
+      detail: { previous_timeout_ms: previousTimeoutMs, timeout_ms: timeoutMs },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default ack timeout (EB-404): the
+   * timeout `subscribeReliable` falls back to when the caller omits
+   * `ackTimeoutMs` — 5000 before any revision, then whatever
+   * `setDefaultAckTimeout` last installed.
+   */
+  getDefaultAckTimeout(): number {
+    return this.defaultAckTimeoutMs;
+  }
+
+  /**
    * Revises the redelivery-backoff policy of one reliable subscriber
    * (EB-261): every redelivery scheduled after this call waits out
    * the new policy's delay instead of the value the subscriber was
@@ -37195,7 +37300,7 @@ export class EventBus {
       { raw: Delivery<BusMessage>; deliveredAtMs: number }
     >();
     const tracker = new AckTracker<BusMessage>({
-      ackTimeoutMs: opts?.ackTimeoutMs ?? 5000,
+      ackTimeoutMs: opts?.ackTimeoutMs ?? this.defaultAckTimeoutMs,
       now: this.now,
       // EB-67: the tracker's single settle path (ack/nack/ack-timeout)
       // releases one in-flight slot and re-flushes so queued messages are
