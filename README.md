@@ -1008,7 +1008,27 @@ library.
   empty or corrupt). `durableLogEncryptor` without `durableLogDir` is a
   `RangeError`; namespace child logs seal with the same encryptor as the
   root log. `getStats().durableLog.encrypted` reports whether the log seals
-  at rest.
+  at rest. Rotate the durable-log DEK live with
+  `rotateDurableLogEncryptionKey(newKeyId?, actor?)` (EB-398): it mints a
+  fresh random 32-byte DEK in the `RotatingDekEncryptor` ring and makes it
+  live, without restarting the bus — the new key seals from the next append
+  onward, old sealed lines keep their envelope key id and are never
+  re-sealed, and namespace child logs share the same ring reference so they
+  follow automatically. Only a bus constructed with a
+  `RotatingDekEncryptor` can rotate: a plain `AesGcmEncryptor`,
+  `NoopEncryptor`, or any other ringless `PayloadEncryptor` refuses, as
+  does a bus with no encryptor (encryption cannot be enabled after the
+  fact). Omitting `newKeyId` takes the ring's smallest free `k<N>`; an
+  illegal or already-held id refuses with the live key untouched. The
+  retired key keeps decrypting inside the ring's live grace window — with
+  the default grace of 0 an old line fails loudly at recovery once the
+  wall clock has moved past the rotation, is counted in `corruptLines`,
+  and is never returned as garbage — so set a grace window on the ring via
+  `setGraceMs` (EB-354) before rotating if the old key must keep opening
+  history. Every rotation mints a fresh DEK, so there is no same-value
+  no-op; each is audited as `durable_log_encryption_key_rotated`
+  (`{ keyId, oldKeyId }`, labels only — the key itself is never recorded),
+  and the live id is visible via `getDurableLogEncryptionKeyId()`.
 - **`src/backpressure.ts` — `BoundedQueue<T>`**: fixed-capacity FIFO queue
   with `drop-oldest` / `drop-newest` policies, a drop counter, and a
   high-water-mark callback that fires once at 80% capacity and re-arms after

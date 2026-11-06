@@ -23530,6 +23530,108 @@ export class EventBus {
   }
 
   /**
+   * Rotates the durable log's at-rest encryption DEK live (EB-398)
+   * without restarting the bus: `rotateDurableLogEncryptionKey(newKeyId?, actor?)`
+   * mints a fresh random 32-byte DEK in the `RotatingDekEncryptor` ring the bus
+   * was constructed with (`EventBusOptions.durableLogEncryptor`, EB-80) and
+   * makes it the live key, so a leaked or aging key can be replaced
+   * mid-incident without rebuilding the bus (which would drop every live
+   * subscription, queue, and replay position).
+   *
+   * The new key seals from the next append onward: the log calls the same
+   * ring object on every line (`sealLine` / `openLine`), so newly appended
+   * lines — and later-sealed archived segments — carry the new live key id
+   * with no log rebuild. Old sealed lines keep their envelope key id and
+   * are never re-sealed: history is not rewritten, so a rotation never
+   * rewrites the journal. Namespace child logs share the same ring
+   * reference as the root log, so they follow the rotation automatically.
+   *
+   * The retired key stays decryptable inside the ring's live grace window
+   * (`graceMs`, revised by the operator directly on their ring reference
+   * via `setGraceMs`, EB-354) — so records sealed just before the rotation
+   * still open. With the default grace of 0, an old line fails loudly at
+   * recovery once the wall clock has moved past the rotation, is skipped
+   * and counted in `getStats().durableLog.corruptLines`, and is never
+   * returned as garbage — set a grace window on the ring BEFORE rotating
+   * if the old key must keep opening history. The retirement stamp uses
+   * the bus clock, so a rotation under an injected `EventBusOptions.now`
+   * stays deterministic.
+   *
+   * Every rotation mints a fresh random DEK, so there is no same-value
+   * no-op: every call rotates and is audited as
+   * `durable_log_encryption_key_rotated` (`{ keyId, oldKeyId }` — key ids
+   * are labels, never key material; the key itself is never written to
+   * the audit log, the logs, or the stats). Omitting `newKeyId` takes the
+   * ring's smallest free `k<N>` id. The live key id is visible via
+   * `getDurableLogEncryptionKeyId()`.
+   *
+   * Fail-closed: a bus constructed without `durableLogEncryptor` throws
+   * `RangeError` — encryption cannot be enabled after the fact. A bus
+   * whose encryptor is not a rotating ring (a plain `AesGcmEncryptor`,
+   * `NoopEncryptor`, or any other `PayloadEncryptor` with no key ring)
+   * also throws `RangeError`: a ringless encryptor has nothing to
+   * rotate. An illegal or already-held `newKeyId` throws `RangeError`
+   * with the live key untouched (the ring validates before moving —
+   * `assertValidKeyId`: 1–64 `[A-Za-z0-9_-]`).
+   *
+   * Orthogonal to EB-80 (that is the at-rest encryption mechanism itself
+   * — this its runtime DEK rotation), to EB-179 (that rotates per-topic
+   * message-payload DEKs via `rotateTopicKey` — this the bus-level
+   * durable-log key ring, a different layer), to EB-354 (that revises the
+   * grace window on a directly-held ring — this the bus-level rotation
+   * entry point; grace still goes through the operator's ring
+   * reference), to EB-397 (that rotates the ops-alert HMAC secret —
+   * this the at-rest DEK, same rotation family, a different key), and to
+   * EB-361/EB-362 (those retune offload numbers — this the encryption
+   * ring).
+   *
+   * Returns `{ keyId, oldKeyId }` — the live key id after the call and
+   * the one it replaced. Throws `RangeError` when the bus has no
+   * `durableLogEncryptor`, when its encryptor is not a rotating ring,
+   * for a bad actor, or for an illegal / already-held `newKeyId`.
+   */
+  rotateDurableLogEncryptionKey(
+    newKeyId?: string,
+    actor = 'system',
+  ): { keyId: string; oldKeyId: string } {
+    assertValidActor(actor, 'rotateDurableLogEncryptionKey');
+    const ring = this.durableLogEncryptor;
+    if (ring === undefined) {
+      throw new RangeError(
+        'rotateDurableLogEncryptionKey: durableLogEncryptor is not enabled on this bus',
+      );
+    }
+    if (!(ring instanceof RotatingDekEncryptor)) {
+      throw new RangeError(
+        'rotateDurableLogEncryptionKey: durableLogEncryptor is not a RotatingDekEncryptor — only a rotating key ring can be rotated live',
+      );
+    }
+    const oldKeyId = ring.liveKeyId;
+    // `ring.rotate` validates the new id (shape and uniqueness) before
+    // moving anything, so an illegal call leaves the live key untouched.
+    const keyId = ring.rotate(newKeyId, this.now());
+    this.auditSubscription({
+      action: 'durable_log_encryption_key_rotated',
+      actor,
+      detail: { keyId, oldKeyId },
+    });
+    return { keyId, oldKeyId };
+  }
+
+  /**
+   * Returns the live durable-log encryption key id (EB-398): the id
+   * `rotateDurableLogEncryptionKey` last installed, or the
+   * construction-time live id before any rotation — `undefined` when the
+   * bus has no `durableLogEncryptor`, or when its encryptor is not a
+   * rotating key ring. The key itself is never exposed through this
+   * getter.
+   */
+  getDurableLogEncryptionKeyId(): string | undefined {
+    const ring = this.durableLogEncryptor;
+    return ring instanceof RotatingDekEncryptor ? ring.liveKeyId : undefined;
+  }
+
+  /**
    * Flips the durable log's keyed compaction live (EB-364):
    * `setDurableLogKeyCompaction(enabled, actor?)` switches the log
    * between Kafka-style latest-per-key retention and full-history
