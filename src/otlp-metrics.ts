@@ -147,10 +147,12 @@ export interface OtlpMetricsExportStats {
 /**
  * Revision for the bus-level OTLP metrics export tuning (see
  * `EventBus.setOtlpMetrics`, EB-374). Only the fields provided move;
- * the rest keep their live values. `headers` and `serviceName` are
- * not revisable here — they are the export identity fixed at
- * construction. The `endpoint` is not revisable here either — it
- * moves via `EventBus.setOtlpMetricsEndpoint` (EB-407). `perTopic: false`
+ * the rest keep their live values. `serviceName` is not revisable
+ * here — it is the export identity fixed at construction. `headers`
+ * are not revisable here either — they move via
+ * `EventBus.setOtlpMetricsHeaders` (EB-410). The `endpoint` is not
+ * revisable here either — it moves via
+ * `EventBus.setOtlpMetricsEndpoint` (EB-407). `perTopic: false`
  * disables every per-topic series (bus aggregates only); `true`
  * re-enables them at the live `maxTopics`; `{ maxTopics }` keeps
  * per-topic series enabled and moves the cap.
@@ -575,7 +577,9 @@ export class OtlpMetricsExporter {
   private readonly serviceName: string;
   private flushIntervalMs: number;
   private timeoutMs: number;
-  private readonly headers: Record<string, string>;
+  // Moves only via `setHeaders` (EB-410); `serviceName` stays fixed
+  // for the exporter's lifetime.
+  private headers: Record<string, string>;
   private perTopic: { enabled: boolean; maxTopics: number };
   private readonly collect: () => BusStats;
   private readonly startTimeUnixNano: string;
@@ -639,7 +643,8 @@ export class OtlpMetricsExporter {
    * revised `flushIntervalMs` rebuilds the flush timer at the new
    * interval (the old timer is cleared first, so a tick never fires
    * twice and no tick is lost — the new cadence governs from the
-   * next tick). `headers` and `serviceName` are never moved here.
+   * next tick). `serviceName` is never moved here. `headers` are
+   * never moved here either — they move via `setHeaders` (EB-410).
    * The `endpoint` is never moved here either — it moves via
    * `setEndpoint` (EB-407). A retune after `shutdown()` moves the values but
    * does not re-arm the timer — a stopped exporter stays stopped.
@@ -674,6 +679,30 @@ export class OtlpMetricsExporter {
    */
   setEndpoint(endpoint: URL): void {
     this.endpoint = endpoint;
+  }
+
+  /**
+   * Rotates the export request headers live (EB-410). Only the
+   * headers move: `current()` reads them on every call, so it reports
+   * the new set at once, and the flush timer is untouched — the next
+   * export POST carries the new headers. A POST already in flight
+   * keeps the headers it started with: `postMetrics` spreads
+   * `this.headers` when the request is built and holds that header
+   * object for the request's lifetime. Metrics are snapshots, not a
+   * buffered stream, so there is nothing to re-send or drop, and the
+   * counters (`exportedMetrics`/`failedExports`/`lastExportAtMs`)
+   * and the Sum `startTimeUnixNano` are retained — a rotation never
+   * restarts the cumulative series. This is a full replacement,
+   * never a per-header merge: a header absent from the new map stops
+   * being sent, and an empty object clears the headers back to the
+   * construction-time default. The caller must have validated
+   * `headers` through `resolveOtlpMetricsOptions` first — this method
+   * applies unconditionally, storing a defensive copy so later
+   * mutation of the caller's object cannot move the live headers
+   * without an audit.
+   */
+  setHeaders(headers: Record<string, string>): void {
+    this.headers = { ...headers };
   }
 
   /**
