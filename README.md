@@ -6833,13 +6833,29 @@ cumulative series, and an in-flight flush is untouched. A revised
 the next tick; a revised `timeoutMs` governs the next POST; a
 revised `perTopic` (`false` disables every per-topic series, `true`
 re-enables them at the live cap, `{ maxTopics }` moves the cap)
-governs the next export. `endpoint`, `headers`, and `serviceName`
-stay fixed at construction. Illegal values fail closed with
+governs the next export. `headers` and `serviceName` stay fixed at
+construction — the endpoint moves via `setOtlpMetricsEndpoint`
+(below). Illegal values fail closed with
 `RangeError` and leave the live tuning untouched; an identical (or
 empty) revision is a no-op with no audit. Audited as
 `otlp_metrics_revised` (`{ flushIntervalMs, oldFlushIntervalMs,
 timeoutMs, oldTimeoutMs, perTopicEnabled, oldPerTopicEnabled,
 perTopicMaxTopics, oldPerTopicMaxTopics }`).
+
+**Repointing the metrics export destination live (EB-407).**
+`bus.setOtlpMetricsEndpoint(endpoint)` moves the collector the next
+export POST goes to without restarting the bus — only a bus that
+already enabled `otlpMetrics` can be repointed (a never-enabled bus
+and a closed bus throw `RangeError`); an illegal endpoint fails
+closed with the live endpoint untouched; an identical endpoint is a
+no-op with no audit (audited as `otlp_metrics_endpoint_revised` with
+`{ endpoint, oldEndpoint }`, URL strings only — `headers` are never
+written to the audit record). A POST already in flight keeps the
+destination it started with; the counters and the Sum
+`startTimeUnixNano` are retained, so a repoint never restarts the
+cumulative series; the flush timer is not rebuilt and the three
+numeric bounds, `headers`, and `serviceName` are untouched.
+`getStats().otlpMetrics.endpoint` reports the live destination.
 
 ## Trace span archive journal (EB-167)
 

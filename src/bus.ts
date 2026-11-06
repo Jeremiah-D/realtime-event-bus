@@ -25070,9 +25070,10 @@ export class EventBus {
    * the next export covers the hottest topics under the live
    * `perTopic` cap, and a revised `flushIntervalMs` rebuilds the
    * flush timer at the new interval without rebuilding the exporter,
-   * so the new cadence governs from the next tick. `endpoint`,
-   * `headers`, and `serviceName` are not revisable here — they are
-   * the export destination and identity fixed at construction.
+   * so the new cadence governs from the next tick. `headers` and
+   * `serviceName` are not revisable here — they are the export
+   * identity fixed at construction. The `endpoint` moves via
+   * `setOtlpMetricsEndpoint` (EB-407).
    * `perTopic: false` disables every per-topic series (bus aggregates
    * only); `true` re-enables them at the live `maxTopics`; an object
    * moves the cap and keeps per-topic series enabled. Disabling
@@ -25196,6 +25197,99 @@ export class EventBus {
         perTopicMaxTopics,
         oldPerTopicMaxTopics: current.perTopic.maxTopics,
       },
+    });
+  }
+
+  /**
+   * Repoints the bus-level OTLP metrics export destination live
+   * (EB-407) without restarting the bus:
+   * `setOtlpMetricsEndpoint(endpoint)` moves the collector the next
+   * export POST goes to (see `EventBusOptions.otlpMetrics`, EB-370).
+   *
+   * Only the endpoint moves: the flush timer is not rebuilt, the
+   * counters (`exportedMetrics`/`failedExports`/`lastExportAtMs`)
+   * and the Sum `startTimeUnixNano` are retained — a repoint never
+   * restarts the cumulative series, so the collector-side rate
+   * computation is uninterrupted — and the live tuning
+   * (`flushIntervalMs`/`timeoutMs`/`perTopic`), `headers`, and
+   * `serviceName` are untouched. Metrics are snapshots, not a
+   * buffered stream, so there is nothing to re-send or drop, and an
+   * export POST already in flight keeps the destination it started
+   * with: `postMetrics` reads the endpoint when the request is
+   * built. A failed export after a repoint drops that snapshot and
+   * counts it in `failedExports`, exactly as before.
+   *
+   * Fail-closed: a bus that never enabled `otlpMetrics`, a closed
+   * bus, an illegal actor, and an illegal endpoint all throw
+   * `RangeError` with the live endpoint and the audit log
+   * untouched. Validation reuses the construction-time rule
+   * (`resolveOtlpMetricsOptions`: a non-empty `http:`/`https:` URL)
+   * against the merged values — the endpoint takes the new value,
+   * the other tuning plus `headers` and `serviceName` take their
+   * live values — so a value that could not be set at construction
+   * cannot be repointed to later either. A revision identical to
+   * the current endpoint (string equality) is a no-op with no
+   * audit. Audited as `otlp_metrics_endpoint_revised`
+   * (`{ endpoint, oldEndpoint }`, URL strings only — `headers` are
+   * never written to the audit record, since they may carry an
+   * `Authorization` bearer).
+   *
+   * Orthogonal to EB-370 (that is the metrics export mechanism
+   * itself — this its missing destination repoint entry), to
+   * EB-374 (that revises the three numeric bounds — its docs name
+   * the endpoint as fixed, and this fills exactly that named gap),
+   * to EB-406 (that repoints the span exporter endpoint — the other
+   * exporter), and to EB-409/EB-410 (those rotate the two
+   * exporters' headers — another field).
+   *
+   * Throws `RangeError` when OTLP metrics export is not enabled,
+   * when the bus is closed, for an illegal actor, or for an illegal
+   * endpoint.
+   */
+  setOtlpMetricsEndpoint(endpoint: string, actor = 'system'): void {
+    assertValidActor(actor, 'setOtlpMetricsEndpoint');
+    const exporter = this.otlpMetricsExporter;
+    if (exporter === undefined) {
+      throw new RangeError('setOtlpMetricsEndpoint: otlpMetrics is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setOtlpMetrics`):
+    // close() already flushed once and stopped the exporter — there
+    // is no live destination left to repoint.
+    if (this.closed) {
+      throw new RangeError('setOtlpMetricsEndpoint: bus is closed');
+    }
+    // Validate before touching anything: the endpoint takes the new
+    // value, everything else takes its live value, so a failed call
+    // changes nothing at all.
+    const current = exporter.current();
+    const oldEndpoint = current.endpoint.toString();
+    // Re-affirming the current destination is a no-op: no repoint, no
+    // audit. String equality: a differently-spelled URL for the same
+    // destination still counts as a move.
+    if (endpoint === oldEndpoint) {
+      return;
+    }
+    const resolved = resolveOtlpMetricsOptions(
+      {
+        endpoint,
+        serviceName: current.serviceName,
+        flushIntervalMs: current.flushIntervalMs,
+        timeoutMs: current.timeoutMs,
+        headers: { ...current.headers },
+        perTopic: current.perTopic.enabled
+          ? { maxTopics: current.perTopic.maxTopics }
+          : false,
+      },
+      'setOtlpMetricsEndpoint',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setOtlpMetricsEndpoint: otlpMetrics is not enabled on this bus');
+    }
+    exporter.setEndpoint(resolved.endpoint);
+    this.auditSubscription({
+      action: 'otlp_metrics_endpoint_revised',
+      actor,
+      detail: { endpoint: resolved.endpoint.toString(), oldEndpoint },
     });
   }
 

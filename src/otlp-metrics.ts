@@ -147,9 +147,10 @@ export interface OtlpMetricsExportStats {
 /**
  * Revision for the bus-level OTLP metrics export tuning (see
  * `EventBus.setOtlpMetrics`, EB-374). Only the fields provided move;
- * the rest keep their live values. `endpoint`, `headers`, and
- * `serviceName` are not revisable here — they are the export
- * destination and identity fixed at construction. `perTopic: false`
+ * the rest keep their live values. `headers` and `serviceName` are
+ * not revisable here — they are the export identity fixed at
+ * construction. The `endpoint` is not revisable here either — it
+ * moves via `EventBus.setOtlpMetricsEndpoint` (EB-407). `perTopic: false`
  * disables every per-topic series (bus aggregates only); `true`
  * re-enables them at the live `maxTopics`; `{ maxTopics }` keeps
  * per-topic series enabled and moves the cap.
@@ -570,7 +571,7 @@ function histogramPoint(
  * snapshot via `collect`.
  */
 export class OtlpMetricsExporter {
-  private readonly endpoint: URL;
+  private endpoint: URL;
   private readonly serviceName: string;
   private flushIntervalMs: number;
   private timeoutMs: number;
@@ -638,8 +639,9 @@ export class OtlpMetricsExporter {
    * revised `flushIntervalMs` rebuilds the flush timer at the new
    * interval (the old timer is cleared first, so a tick never fires
    * twice and no tick is lost — the new cadence governs from the
-   * next tick). `endpoint`, `headers`, and `serviceName` are never
-   * moved here. A retune after `shutdown()` moves the values but
+   * next tick). `headers` and `serviceName` are never moved here.
+   * The `endpoint` is never moved here either — it moves via
+   * `setEndpoint` (EB-407). A retune after `shutdown()` moves the values but
    * does not re-arm the timer — a stopped exporter stays stopped.
    */
   retune(next: ResolvedOtlpMetricsExporterOptions): void {
@@ -652,6 +654,26 @@ export class OtlpMetricsExporter {
         this.timer = this.armFlushTimer(next.flushIntervalMs);
       }
     }
+  }
+
+  /**
+   * Repoints the export destination live (EB-407). Only the endpoint
+   * field moves: `current()` and `getStats()` read it on every call,
+   * so they report the new destination at once, and the flush timer is
+   * untouched — the next export POST goes to the new collector. A POST
+   * already in flight keeps the URL it started with: `postMetrics`
+   * reads `this.endpoint` when the request is built and holds that
+   * URL object for the request's lifetime. The counters
+   * (`exportedMetrics`/`failedExports`/`lastExportAtMs`) and the Sum
+   * `startTimeUnixNano` are retained — a repoint never restarts the
+   * cumulative series, so the collector-side rate computation is
+   * uninterrupted. Metrics are snapshots, not a buffered stream, so
+   * there is nothing to re-send or drop. The caller must have
+   * validated `endpoint` through `resolveOtlpMetricsOptions` first —
+   * this method applies unconditionally.
+   */
+  setEndpoint(endpoint: URL): void {
+    this.endpoint = endpoint;
   }
 
   /**
