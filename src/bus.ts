@@ -25627,7 +25627,8 @@ export class EventBus {
    * Only the fields provided move; the rest keep their live values.
    * `sink` / `secret` / `keyId` / `busId` are not revisable here —
    * they are the delivery destination and the signing identity fixed
-   * at construction — and neither is the `now` clock. In-flight state
+   * at construction — and neither is the `now` clock. (The signing
+   * secret alone rotates live through `rotateOpsAlertSecret`, EB-397.) In-flight state
    * is untouched: the dedup table keeps its entries and the in-flight
    * disconnect times keep theirs, so the new values govern from the
    * next note onward — the next dedup check reads the live window
@@ -25723,6 +25724,79 @@ export class EventBus {
         oldGatewayDisconnectWindowMs: current.gatewayDisconnectWindowMs,
       },
     });
+  }
+
+  /**
+   * Rotates the ops-alert signing secret live (EB-397) without
+   * restarting the bus: `rotateOpsAlertSecret(secret, keyId?, actor?)`
+   * swaps the HMAC secret the outlet signs with, so a leaked or
+   * expiring key can be replaced mid-incident without rebuilding the
+   * bus (which would drop every live subscription, queue, and replay
+   * position). The new secret signs from the next `note()` onward; a
+   * delivery already signed keeps its old signature through its
+   * bounded retry chain and is never re-signed. The dedup table and
+   * the storm state are untouched.
+   *
+   * Omitting `keyId` keeps the live key id (still omitted when the
+   * outlet never had one). A rotation whose secret bytes (normalized
+   * to a Buffer) and effective key id both match the live values is a
+   * no-op with no audit. Only a bus that already enabled `opsAlert`
+   * can be rotated; a never-enabled bus throws `RangeError`. Illegal
+   * values reuse the construction-time rule
+   * (`resolveOpsAlerterOptions`: the secret a non-empty string or
+   * Buffer, the key id a non-empty string when given) and throw
+   * `RangeError` with the live identity untouched. Audited as
+   * `ops_alert_secret_rotated` (`{ keyId, oldKeyId }`, an absent key
+   * id recorded as `null`); the secret value itself is never written
+   * to the audit log, the logs, or the stats.
+   *
+   * Receiver coordination: there is no bus-side dual-key grace
+   * window (`verifyDelivery` stays single-key), so deploy the new
+   * secret to the receiver first, then rotate the bus.
+   *
+   * Orthogonal to EB-307 (that retunes the outlet's five numeric
+   * bounds — this its signing identity), EB-132 (that is the outlet
+   * mechanism itself), and EB-84/EB-97 (those rotate message-envelope
+   * signing keys — this the alert channel's key).
+   *
+   * Returns `{ keyId, oldKeyId }` — the live key id after the call
+   * and the one it replaced. Throws `RangeError` when ops alerts are
+   * not enabled, for a bad actor, or for an illegal secret / key id.
+   */
+  rotateOpsAlertSecret(
+    secret: string | Buffer,
+    keyId?: string,
+    actor = 'system',
+  ): { keyId: string | undefined; oldKeyId: string | undefined } {
+    assertValidActor(actor, 'rotateOpsAlertSecret');
+    const alerter = this.opsAlerter;
+    if (alerter === undefined) {
+      throw new RangeError('rotateOpsAlertSecret: opsAlert is not enabled on this bus');
+    }
+    const result = alerter.rotateSecret(secret, keyId);
+    if (!result.changed) {
+      return { keyId: result.keyId, oldKeyId: result.oldKeyId };
+    }
+    this.auditSubscription({
+      action: 'ops_alert_secret_rotated',
+      actor,
+      detail: {
+        keyId: result.keyId ?? null,
+        oldKeyId: result.oldKeyId ?? null,
+      },
+    });
+    return { keyId: result.keyId, oldKeyId: result.oldKeyId };
+  }
+
+  /**
+   * Returns the live ops-alert signing key id (EB-397): the id
+   * `rotateOpsAlertSecret` last installed, or the construction-time
+   * id before any rotation — `undefined` when the outlet has no key
+   * id (including a bus that never enabled `opsAlert`). The secret
+   * itself is never exposed through this getter.
+   */
+  getOpsAlertKeyId(): string | undefined {
+    return this.opsAlerter?.currentKeyId();
   }
 
   /**

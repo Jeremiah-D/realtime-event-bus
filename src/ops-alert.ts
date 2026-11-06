@@ -186,7 +186,8 @@ export interface OpsAlerterOptions {
  * rest keep their live values. `sink` / `secret` / `keyId` / `busId`
  * are not revisable here — they are the delivery destination and the
  * signing identity fixed at construction — and neither is the `now`
- * clock.
+ * clock. (The signing secret alone rotates live through
+ * `OpsAlerter.rotateSecret` / `EventBus.rotateOpsAlertSecret`, EB-397.)
  */
 export interface OpsAlertRevision {
   /**
@@ -322,15 +323,21 @@ export interface OpsAlertStats {
  */
 export class OpsAlerter {
   private readonly sink: OpsAlertSink;
-  private readonly secret: string | Buffer;
-  private readonly keyId: string | undefined;
+  // Live-rotated by `rotateSecret` (EB-397): the signing identity is
+  // no longer fixed at construction. `note` reads both fields on every
+  // call, so a rotation governs from the next note onward; a delivery
+  // already signed keeps the secret/keyId it was signed with through
+  // its bounded retry chain. `sink`, `busId`, and `now` stay fixed
+  // for the alerter's lifetime.
+  private secret: string | Buffer;
+  private keyId: string | undefined;
   private readonly busId: string;
   private readonly now: () => number;
   // Live-tuned by `retune` (EB-307): the dedup, storm, and retry sites
   // read these fields on every call, so a revision governs from the
   // next note without draining or rebuilding any alert. `sink`,
-  // `secret`, `keyId`, `busId`, and `now` stay fixed for the alerter's
-  // lifetime.
+  // `busId`, and `now` stay fixed for the alerter's lifetime (the
+  // signing identity moves only through `rotateSecret`, EB-397).
   private dedupWindowMs: number;
   private maxAttempts: number;
   private retryBaseMs: number;
@@ -413,6 +420,69 @@ export class OpsAlerter {
     this.retryBaseMs = resolved.retryBaseMs;
     this.stormThreshold = resolved.gatewayDisconnectThreshold;
     this.stormWindowMs = resolved.gatewayDisconnectWindowMs;
+  }
+
+  /** The live key id that signs the next note, if any (EB-397). Never the secret itself. */
+  currentKeyId(): string | undefined {
+    return this.keyId;
+  }
+
+  /**
+   * Rotates the signing secret live (EB-397). The new secret signs
+   * from the next `note()` onward — `note` reads the live `secret` /
+   * `keyId` on every call — while a delivery already signed keeps the
+   * secret and key id it was signed with through its bounded retry
+   * chain (deliveries are never re-signed). The dedup table and the
+   * storm state are untouched.
+   *
+   * Validation reuses the construction-time rule
+   * (`resolveOpsAlerterOptions`: the secret a non-empty string or
+   * Buffer, the key id a non-empty string when given), so an illegal
+   * value throws `RangeError` with the live identity untouched.
+   * Omitting `newKeyId` keeps the live key id (still omitted when the
+   * alerter never had one). A rotation whose normalized secret bytes
+   * and effective key id both match the live values is a no-op:
+   * nothing moves and `changed` is false, so the caller can skip the
+   * audit. The secret value itself is never returned, logged, or
+   * audited — only the key ids move through this return.
+   *
+   * There is no bus-side dual-key grace window (`verifyDelivery`
+   * stays single-key): deploy the new secret to the receiver first,
+   * then rotate the bus.
+   */
+  rotateSecret(
+    newSecret: string | Buffer,
+    newKeyId?: string,
+  ): { keyId: string | undefined; oldKeyId: string | undefined; changed: boolean } {
+    const effectiveKeyId = newKeyId ?? this.keyId;
+    const oldKeyId = this.keyId;
+    const toBytes = (s: string | Buffer): Buffer =>
+      typeof s === 'string' ? Buffer.from(s, 'utf8') : s;
+    // Validate before touching anything: the merged identity must pass
+    // the construction-time rule, exactly as `retune` validates the
+    // merged tuning.
+    resolveOpsAlerterOptions(
+      {
+        sink: this.sink,
+        secret: newSecret,
+        keyId: effectiveKeyId,
+        busId: this.busId,
+        now: this.now,
+        dedupWindowMs: this.dedupWindowMs,
+        maxAttempts: this.maxAttempts,
+        retryBaseMs: this.retryBaseMs,
+        gatewayDisconnectThreshold: this.stormThreshold,
+        gatewayDisconnectWindowMs: this.stormWindowMs,
+      },
+      'OpsAlerter.rotateSecret',
+    );
+    const sameSecret = Buffer.compare(toBytes(newSecret), toBytes(this.secret)) === 0;
+    if (sameSecret && effectiveKeyId === oldKeyId) {
+      return { keyId: oldKeyId, oldKeyId, changed: false };
+    }
+    this.secret = newSecret;
+    this.keyId = effectiveKeyId;
+    return { keyId: effectiveKeyId, oldKeyId, changed: true };
   }
 
   /**

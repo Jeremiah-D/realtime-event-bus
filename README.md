@@ -7276,6 +7276,18 @@ Semantics:
   hex(HMAC-SHA256(secret, canonicalJSON(alert)))` in the
   `x-ops-signature` header, with an optional `keyId`. `verifyDelivery`
   is the receiver-side check — forge a byte and it fails.
+- **Rotatable (EB-397).** `bus.rotateOpsAlertSecret(secret, keyId?)`
+  swaps the signing key live without restarting the bus: the next
+  alert signs under the new key, while a delivery already signed
+  keeps its old signature through its bounded retry chain. Deploy the
+  new key to the receiver first, then rotate the bus — there is no
+  dual-key grace window on the bus side. Omitting `keyId` keeps the
+  live key id; a rotation identical to the live identity is a no-op
+  with no audit. `bus.getOpsAlertKeyId()` reports the live key id
+  (never the key itself). Audited as `ops_alert_secret_rotated`
+  (`{ keyId, oldKeyId }`, an absent id recorded as `null`) with no key
+  material in the audit trail; a bus that never enabled `opsAlert`
+  refuses with `RangeError`.
 - **Bounded + deduplicated.** Each alert is attempted at most
   `maxAttempts` times with capped exponential backoff (unref'd timers),
   then dropped and counted. Repeats for the same `(kind, key)` inside
@@ -7293,7 +7305,8 @@ gatewayDisconnectThreshold?, gatewayDisconnectWindowMs? })` (EB-307)
 retunes that outlet live without restarting the bus — only a bus that
 already enabled the opt-in can be revised, and only the fields
 provided move (the `sink` / `secret` / `keyId` / `busId` and the `now`
-clock are not revisable). In-flight state is untouched: the dedup
+clock are not revisable — rotate the signing key instead with
+`rotateOpsAlertSecret`, EB-397, above). In-flight state is untouched: the dedup
 table and the in-flight disconnect times keep their entries, so the
 new values govern from the next note onward — the next dedup check
 reads the live window, the next disconnect note truncates at the live
