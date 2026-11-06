@@ -42633,6 +42633,67 @@ export class EventBus {
   }
 
   /**
+   * Revises the publish-rate ring capacity live (EB-396) without
+   * restarting the bus: `setPublishRateRingCapacity(capacity)` retunes
+   * how many publish timestamps each topic's sliding-window ring keeps
+   * (see `src/rates.ts`: `DEFAULT_RATE_RING_CAPACITY` /
+   * `PublishRateTable`, EB-34).
+   *
+   * New topics build their ring at the new capacity from the next
+   * publish. Existing rings are rebuilt in place, keeping their newest
+   * `min(len, capacity)` samples: tightening drops the oldest samples
+   * first — the 5m rate then caps at `capacity / 300` msg/s, while the
+   * narrower windows stay exact much longer — and widening keeps every
+   * sample the old ring held, so the wider windows regain exactness for
+   * future publishes. `getStats().rates` and `hotTopics` read the live
+   * rings, so both reflect the revision immediately; no stats shape
+   * changes.
+   *
+   * Fail-closed: a non-positive-integer capacity throws `RangeError`
+   * with the live capacity and the audit log untouched (the same gate
+   * the table enforces at construction). Re-affirming the current
+   * capacity is a no-op with no audit. Audited as
+   * `publish_rate_ring_capacity_revised`
+   * (`{ capacity, oldCapacity }`). Live-only: a restart restores the
+   * 60_000 default, since there is no construction-time option.
+   *
+   * Orthogonal to EB-34 (that is the rate table itself — this its ring
+   * capacity tuning), EB-301 (publish admission rate limits — this is
+   * the observation ring, not a limit), and EB-192 (the autoscale
+   * signal that consumes `r1m` — this tunes its input precision).
+   *
+   * Throws `RangeError` for a bad actor or for an illegal capacity.
+   */
+  setPublishRateRingCapacity(capacity: number, actor = 'system'): void {
+    assertValidActor(actor, 'setPublishRateRingCapacity');
+    const oldCapacity = this.publishRates.capacity;
+    // Re-affirming the current capacity is a no-op: no retune, no audit.
+    if (capacity === oldCapacity) {
+      return;
+    }
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new RangeError('setPublishRateRingCapacity: capacity must be a positive integer');
+    }
+    this.publishRates.setCapacity(capacity);
+    this.auditSubscription({
+      action: 'publish_rate_ring_capacity_revised',
+      actor,
+      detail: { capacity, oldCapacity },
+    });
+  }
+
+  /**
+   * Returns the live publish-rate ring capacity (EB-396): the capacity
+   * `PublishRateTable` currently builds new topic rings with and
+   * rebuilt the existing rings to. Mirrors the value
+   * `setPublishRateRingCapacity` last installed (the module default
+   * 60_000 before any revision).
+   */
+  getPublishRateRingCapacity(): number {
+    return this.publishRates.capacity;
+  }
+
+  /**
    * The shared publish pipeline behind `publish` and
    * `publishWithConfirmation` (EB-125): chaos gate, option validation,
    * namespace resolution, the barrier slim path, the circuit-breaker

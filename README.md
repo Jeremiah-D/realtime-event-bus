@@ -2800,7 +2800,17 @@ library.
   would tie series cardinality to publisher-chosen topic names). Sizing
   tradeoff: the 5m window is exact up to 200 msg/s sustained per topic;
   past that the ring wraps and the 5m rate degrades to a lower bound, while
-  the 1s/1m windows stay exact much longer.
+  the 1s/1m windows stay exact much longer. The capacity is live-revisable
+  (`EventBus.setPublishRateRingCapacity(capacity)`, EB-396, with a live
+  getter `getPublishRateRingCapacity()`): new topics build their ring at
+  the live capacity and existing rings are rebuilt in place, keeping their
+  newest samples — tightening caps the 5m rate at `capacity / 300` msg/s,
+  widening restores exactness for later publishes, and `getStats().rates`
+  / `hotTopics` reflect the revision immediately. An illegal capacity
+  throws `RangeError` with the live capacity untouched; re-affirming the
+  current capacity is a no-op. Audited as
+  `publish_rate_ring_capacity_revised` (`{ capacity, oldCapacity }`).
+  Live-only: a restart restores the 60,000 default.
 - **Event-time watermarks and late-message detection** (in
   `src/watermark.ts` + `src/bus.ts`, via `PublishOptions.eventTime`):
   stream-processing semantics, Kafka/Flink-style. A publish may carry its

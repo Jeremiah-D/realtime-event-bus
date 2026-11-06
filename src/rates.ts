@@ -32,7 +32,11 @@
  * much longer. The default is deliberately generous for an in-process bus:
  * a topic sustaining >200 msg/s for five straight minutes is either a
  * load test or a runaway publisher — and even then the table still tracks
- * the spike's shape, just with a floored 5m average.
+ * the spike's shape, just with a floored 5m average. The capacity is
+ * live-revisable (`EventBus.setPublishRateRingCapacity`, EB-396): new
+ * topics build rings at the live capacity, and existing rings are rebuilt
+ * in place keeping their newest samples — no restart, no lost history
+ * beyond what the new bound itself drops.
  *
  * Window-edge semantics: a sample counts for a window while
  * `nowMs - t <= windowMs` — a message exactly `windowMs` old still
@@ -88,22 +92,58 @@ export interface TopicRates {
 export const ZERO_RATES: TopicRates = { r1s: 0, r1m: 0, r5m: 0 };
 
 /**
+ * Shared construction-time capacity gate: a ring capacity is a positive
+ * integer, otherwise the live table is left untouched and the caller gets
+ * a `RangeError` with the given message.
+ */
+function assertValidCapacity(capacity: number, message: string): void {
+  if (!Number.isInteger(capacity) || capacity <= 0) {
+    throw new RangeError(message);
+  }
+}
+
+/**
  * Fixed-capacity ring buffer of publish timestamps for one topic. Writes
  * are O(1) and allocation-free; reads scan the whole ring (no early exit)
  * so they stay correct even if the injected clock moved non-monotonically.
  */
 class RateRing {
-  private readonly times: Float64Array;
+  private times: Float64Array;
   /** Next write slot. */
   private head = 0;
   /** Valid entries in the ring, at most `times.length`. */
   private len = 0;
 
   constructor(capacity: number) {
-    if (!Number.isInteger(capacity) || capacity <= 0) {
-      throw new RangeError('rate ring capacity must be a positive integer');
-    }
+    assertValidCapacity(capacity, 'rate ring capacity must be a positive integer');
     this.times = new Float64Array(capacity);
+  }
+
+  /**
+   * Rebuilds the ring at a new capacity in place (EB-396): the ring
+   * keeps its newest `min(len, newCapacity)` samples — tightening drops
+   * the oldest first, widening keeps everything — in chronological
+   * order, so `countInWindow` (a full scan, order-insensitive) reads
+   * correctly immediately after. A resize is a synchronous swap: no
+   * sample concurrent with it can be lost or counted twice.
+   */
+  resize(newCapacity: number): void {
+    assertValidCapacity(newCapacity, 'rate ring capacity must be a positive integer');
+    if (newCapacity === this.times.length) return;
+    const keep = Math.min(this.len, newCapacity);
+    const next = new Float64Array(newCapacity);
+    // Oldest valid slot: `head` is the next write slot, so the oldest
+    // sample sits `len` slots behind it. Skip the `len - keep` oldest
+    // samples, then copy the newest `keep` in chronological order.
+    const cap = this.times.length;
+    const oldest = (this.head - this.len + cap) % cap;
+    const skip = this.len - keep;
+    for (let i = 0; i < keep; i++) {
+      next[i] = this.times[(oldest + skip + i) % cap];
+    }
+    this.times = next;
+    this.head = keep % newCapacity;
+    this.len = keep;
   }
 
   /**
@@ -149,13 +189,32 @@ export interface HotTopic {
  */
 export class PublishRateTable {
   private readonly rings = new Map<string, RateRing>();
-  private readonly capacity: number;
+  /** Live per-topic ring capacity (EB-396): revisable without a restart. */
+  private ringCapacity: number;
 
   constructor(capacity: number = DEFAULT_RATE_RING_CAPACITY) {
-    if (!Number.isInteger(capacity) || capacity <= 0) {
-      throw new RangeError('rate table capacity must be a positive integer');
-    }
-    this.capacity = capacity;
+    assertValidCapacity(capacity, 'rate table capacity must be a positive integer');
+    this.ringCapacity = capacity;
+  }
+
+  /** The live per-topic ring capacity new topics' rings are built with. */
+  get capacity(): number {
+    return this.ringCapacity;
+  }
+
+  /**
+   * Revises the live ring capacity (EB-396): new topics' rings are built
+   * at the new capacity, and every existing ring is rebuilt in place,
+   * keeping its newest `min(len, newCapacity)` samples. Reuses the
+   * construction-time gate (a positive integer, otherwise `RangeError`
+   * with every live value untouched); re-affirming the current capacity
+   * is a silent no-op.
+   */
+  setCapacity(capacity: number): void {
+    assertValidCapacity(capacity, 'rate table capacity must be a positive integer');
+    if (capacity === this.ringCapacity) return;
+    this.ringCapacity = capacity;
+    for (const ring of this.rings.values()) ring.resize(capacity);
   }
 
   /**
@@ -166,7 +225,7 @@ export class PublishRateTable {
   sample(topic: string, nowMs: number): void {
     let ring = this.rings.get(topic);
     if (ring === undefined) {
-      ring = new RateRing(this.capacity);
+      ring = new RateRing(this.ringCapacity);
       this.rings.set(topic, ring);
     }
     ring.record(nowMs);
