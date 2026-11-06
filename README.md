@@ -6496,6 +6496,9 @@ roster by it instead of the ephemeral subscription id:
 const member = bus.subscribeToGroup('orders', 'orders.events', onOrder, {
   instanceId: 'order-processor-3',
   sessionTimeoutMs: 30_000, // default 30s; must be a finite number > 0
+  // (a group-level default set with setGroupDefaultSessionTimeout, EB-403,
+  // governs members that omit sessionTimeoutMs — the 30s module default
+  // is only the last fallback)
 });
 ```
 
@@ -6545,6 +6548,30 @@ Details worth knowing:
   (`{ instanceId, previous_timeout_ms, timeout_ms }`);
   `getGroupSessionTimeout(groupId, pattern, instanceId)` reports the
   live timeout, or `undefined` when the member holds no stored timeout.
+- **Group session-timeout default live revision** (EB-403):
+  `setGroupDefaultSessionTimeout(groupId, pattern, timeoutMs, actor = 'system')`
+  sets the hold window future static members of the group fall back to
+  when they omit their own `sessionTimeoutMs` — `60_000` for a
+  slow-restarting fleet, `10_000` for a group that must fail over fast.
+  The resolution is four levels: a member-explicit option always wins,
+  then an EB-347 per-instance revised value, then the group default,
+  then the 30s module default (a rejoin after expiry, whose stored value
+  was deleted, falls back to the group default rather than 30s). A
+  member already in limbo keeps the timeout armed at join time; only
+  `setGroupSessionTimeout` re-arms it. No rebalance fires for the
+  revision itself. The timeout must be a finite number of milliseconds
+  > 0; an empty groupId or pattern and an illegal value throw
+  `RangeError` with the live default untouched, and re-affirming the
+  current default is a no-op with no audit. Audited as
+  `group_default_session_timeout_revised`
+  (`{ previous_timeout_ms, timeout_ms }`, `previous_timeout_ms` is
+  `null` when no default was stored); `getGroupDefaultSessionTimeout`
+  reports the live default, or `undefined` when none is stored, and
+  `clearGroupDefaultSessionTimeout` restores the 30s module default
+  (audited as `group_default_session_timeout_cleared`; clearing a group
+  that holds none returns `false` with no audit). `getStats()`
+  `.consumerGroups` rows carry `defaultSessionTimeoutMs` while a default
+  is stored.
 
 ## Consumer-group assignment snapshot (EB-256)
 

@@ -17161,6 +17161,17 @@ export class EventBus {
    */
   private groupAutoOffsetReset = new Map<string, 'earliest' | 'latest'>();
   /**
+   * Per-group static-membership session-timeout defaults (EB-403):
+   * groupKey -> sessionTimeoutMs, set live via
+   * `setGroupDefaultSessionTimeout` for future static members that
+   * omit their own `sessionTimeoutMs` and hold no stored timeout.
+   * A member-explicit option always wins, and an EB-347 per-instance
+   * revision wins over the group default; the map holds runtime group
+   * state only — it never enters a config snapshot and does not
+   * survive a restart.
+   */
+  private groupDefaultSessionTimeouts = new Map<string, number>();
+  /**
    * Per-member assignment watermarks (EB-104): groupId -> roster key
    * (instanceId for static members, subscription id otherwise) ->
    * concrete topic -> highest per-topic `seq` assigned to that member.
@@ -37765,13 +37776,17 @@ export class EventBus {
     // A rejoin that does not pass its own sessionTimeoutMs keeps the
     // member's stored timeout (EB-347: a live-revised timeout survives
     // a rejoin); an explicit value still wins, and a first join falls
-    // back to the default. The stored value was validated when set, so
-    // the gate below still holds for every resolved value.
+    // back to the group default (EB-403) and then the module default.
+    // Four levels, in order: the member-explicit option, the stored
+    // per-instance value (EB-347), the group default (EB-403), the
+    // module constant. The stored value was validated when set, so the
+    // gate below still holds for every resolved value.
     const sessionTimeoutMs =
       opts?.sessionTimeoutMs ??
       (instanceId !== undefined
         ? this.groupStaticTimeouts.get(EventBus.groupKey(groupId, topicPattern))?.get(instanceId)
         : undefined) ??
+      this.groupDefaultSessionTimeouts.get(EventBus.groupKey(groupId, topicPattern)) ??
       DEFAULT_STATIC_SESSION_TIMEOUT_MS;
     if (!Number.isFinite(sessionTimeoutMs) || sessionTimeoutMs <= 0) {
       throw new RangeError('sessionTimeoutMs must be a finite number of milliseconds > 0');
@@ -41213,6 +41228,151 @@ export class EventBus {
       groupId,
       pattern,
       detail: { previous_policy: previousPolicy },
+    });
+    return true;
+  }
+
+  /**
+   * Sets the live static-membership session-timeout default for one
+   * consumer group (EB-403) without re-subscribing anyone:
+   * `setGroupDefaultSessionTimeout(groupId, pattern, timeoutMs, actor = 'system')`
+   * decides how long the roster slot of a future static member of the
+   * group is held after it leaves, when that member omits its own
+   * `sessionTimeoutMs` (see `GroupSubscribeOptions.sessionTimeoutMs`,
+   * EB-104) — `60_000` for a slow-restarting fleet, `10_000` for a
+   * group that must fail over fast.
+   *
+   * Only the default moves: the roster, the partition assignment, the
+   * committed offsets, and every live member are untouched, and no
+   * rebalance fires for the revision itself. The default governs only
+   * members that join after the revision: a member-explicit
+   * `sessionTimeoutMs` always wins over the group default (EB-104 /
+   * EB-207 semantics unchanged), and an EB-347 per-instance revised
+   * value wins over the group default — including a rejoin after
+   * expiry, whose stored value was deleted by `expireStaticSession`
+   * and so falls back to the group default rather than the 30s module
+   * constant. A member already in limbo is untouched: its expiry timer
+   * was armed at join time from the value baked in then, and only
+   * `setGroupSessionTimeout` re-arms it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * members that have not joined yet (along `setGroupAutoOffsetReset`),
+   * so a misspelled groupId just stores a harmless one-entry default.
+   * The default is runtime group state: it never enters a config
+   * snapshot and does not survive a restart, like the group's other
+   * live revisions.
+   *
+   * Fail-closed: an empty groupId or pattern, an illegal actor, or an
+   * illegal timeout (anything but a finite number > 0 — the join-time
+   * validation, EB-347's same gate) all throw `RangeError` with the
+   * live default and the audit log untouched. A revision identical to
+   * the current default is a no-op with no audit. Audited as
+   * `group_default_session_timeout_revised`
+   * (`{ previous_timeout_ms, timeout_ms }`; `groupId` and `pattern`
+   * ride on the event itself; `previous_timeout_ms` is the previously
+   * stored group default, `null` when none was stored).
+   *
+   * Orthogonal to EB-104 (that is the static-membership session
+   * mechanism itself — this its missing group-level default revision
+   * entry), to EB-347 (that revises one already-joined member's stored
+   * timeout — this sets the default for future joins; a stored value
+   * wins over the default), to EB-400 (that revises the group's
+   * auto.offset.reset default — same "group default" shape, a
+   * different knob), to EB-363 (that revises the group's lag threshold
+   * default — same "group default" shape, a different knob), to EB-333
+   * (that retunes the rebalance-debounce window — this retunes the
+   * session-timeout default), to EB-335 (that retunes the handoff-linger
+   * window — this retunes the session-timeout default), and to EB-344
+   * (that revises the group's auto-commit interval — this revises the
+   * session-timeout default).
+   *
+   * Throws `RangeError` for an empty groupId or pattern, an illegal
+   * actor, or an illegal timeout.
+   */
+  setGroupDefaultSessionTimeout(
+    groupId: string,
+    pattern: string,
+    timeoutMs: number,
+    actor = 'system',
+  ): void {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('setGroupDefaultSessionTimeout: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('setGroupDefaultSessionTimeout: pattern must be a non-empty string');
+    }
+    assertValidActor(actor, 'setGroupDefaultSessionTimeout');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError(
+        'setGroupDefaultSessionTimeout: timeoutMs must be a finite number of milliseconds > 0',
+      );
+    }
+    const key = EventBus.groupKey(groupId, pattern);
+    const previousTimeoutMs = this.groupDefaultSessionTimeouts.get(key) ?? null;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previousTimeoutMs === timeoutMs) {
+      return;
+    }
+    this.groupDefaultSessionTimeouts.set(key, timeoutMs);
+    this.auditSubscription({
+      action: 'group_default_session_timeout_revised',
+      actor,
+      groupId,
+      pattern,
+      detail: { previous_timeout_ms: previousTimeoutMs, timeout_ms: timeoutMs },
+    });
+  }
+
+  /**
+   * Returns the live static-membership session-timeout default for one
+   * consumer group (EB-403) — the timeout future static members fall
+   * back to when they omit their own `sessionTimeoutMs` and hold no
+   * stored timeout — or `undefined` when the group holds no stored
+   * default (joins then fall back to the 30s module default). Throws
+   * `RangeError` for an empty groupId or pattern.
+   */
+  getGroupDefaultSessionTimeout(groupId: string, pattern: string): number | undefined {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('getGroupDefaultSessionTimeout: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('getGroupDefaultSessionTimeout: pattern must be a non-empty string');
+    }
+    return this.groupDefaultSessionTimeouts.get(EventBus.groupKey(groupId, pattern));
+  }
+
+  /**
+   * Clears the live static-membership session-timeout default for one
+   * consumer group (EB-403), so future static members that omit their
+   * own `sessionTimeoutMs` fall back to the 30s module default again.
+   * Returns whether a default was stored (clearing a group that holds
+   * none returns `false` with nothing audited). Live members, committed
+   * offsets, and the roster are untouched. Audited as
+   * `group_default_session_timeout_cleared`
+   * (`{ previous_timeout_ms }`; `groupId` and `pattern` ride on the
+   * event itself). Throws `RangeError` for an empty groupId or pattern
+   * or an illegal actor.
+   */
+  clearGroupDefaultSessionTimeout(groupId: string, pattern: string, actor = 'system'): boolean {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('clearGroupDefaultSessionTimeout: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('clearGroupDefaultSessionTimeout: pattern must be a non-empty string');
+    }
+    assertValidActor(actor, 'clearGroupDefaultSessionTimeout');
+    const key = EventBus.groupKey(groupId, pattern);
+    const previousTimeoutMs = this.groupDefaultSessionTimeouts.get(key);
+    if (previousTimeoutMs === undefined) {
+      return false;
+    }
+    this.groupDefaultSessionTimeouts.delete(key);
+    this.auditSubscription({
+      action: 'group_default_session_timeout_cleared',
+      actor,
+      groupId,
+      pattern,
+      detail: { previous_timeout_ms: previousTimeoutMs },
     });
     return true;
   }
@@ -57915,6 +58075,7 @@ export class EventBus {
         const partitions = this.groupPartitions.get(key);
         const memberLimit = this.groupMemberLimits.get(key);
         const autoOffsetReset = this.groupAutoOffsetReset.get(key);
+        const defaultSessionTimeoutMs = this.groupDefaultSessionTimeouts.get(key);
         return {
           groupId: key.slice(0, sep),
           pattern: key.slice(sep + 1),
@@ -57927,6 +58088,11 @@ export class EventBus {
           // the live default future members fall back to; absent when
           // no default is stored (joins fall back to 'earliest').
           ...(autoOffsetReset === undefined ? {} : { autoOffsetReset }),
+          // Consumer-group static session-timeout group default
+          // (EB-403): the live default future static members fall back
+          // to; absent when no default is stored (joins fall back to
+          // the 30s module default).
+          ...(defaultSessionTimeoutMs === undefined ? {} : { defaultSessionTimeoutMs }),
         };
       }),
       pausedGroups: [...this.pausedGroups].sort(),
