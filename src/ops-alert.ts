@@ -183,11 +183,13 @@ export interface OpsAlerterOptions {
 /**
  * A partial bus-level revision of the ops-alert tuning, for
  * `EventBus.setOpsAlert` (EB-307). Only the fields provided move; the
- * rest keep their live values. `sink` / `secret` / `keyId` / `busId`
- * are not revisable here — they are the delivery destination and the
- * signing identity fixed at construction — and neither is the `now`
- * clock. (The signing secret alone rotates live through
- * `OpsAlerter.rotateSecret` / `EventBus.rotateOpsAlertSecret`, EB-397.)
+ * rest keep their live values. `secret` / `keyId` / `busId` are not
+ * revisable here — they are the signing identity and the bus identity
+ * fixed at construction — and neither is the `now` clock. (The
+ * signing secret alone rotates live through
+ * `OpsAlerter.rotateSecret` / `EventBus.rotateOpsAlertSecret`, EB-397;
+ * the delivery sink alone moves live through `OpsAlerter.setSink` /
+ * `EventBus.setOpsAlertSink`, EB-411.)
  */
 export interface OpsAlertRevision {
   /**
@@ -322,22 +324,28 @@ export interface OpsAlertStats {
  * retries, and every failure mode is counted, never thrown.
  */
 export class OpsAlerter {
-  private readonly sink: OpsAlertSink;
+  // Live-replaced by `setSink` (EB-411): the delivery destination is
+  // no longer fixed at construction. `deliver` reads the field on
+  // every attempt, so a replacement governs from the next note — and
+  // from the next retry attempt of a delivery already in flight.
+  private sink: OpsAlertSink;
   // Live-rotated by `rotateSecret` (EB-397): the signing identity is
   // no longer fixed at construction. `note` reads both fields on every
   // call, so a rotation governs from the next note onward; a delivery
   // already signed keeps the secret/keyId it was signed with through
-  // its bounded retry chain. `sink`, `busId`, and `now` stay fixed
-  // for the alerter's lifetime.
+  // its bounded retry chain. `busId` and `now` stay fixed for the
+  // alerter's lifetime (the sink moves only through `setSink`,
+  // EB-411).
   private secret: string | Buffer;
   private keyId: string | undefined;
   private readonly busId: string;
   private readonly now: () => number;
   // Live-tuned by `retune` (EB-307): the dedup, storm, and retry sites
   // read these fields on every call, so a revision governs from the
-  // next note without draining or rebuilding any alert. `sink`,
-  // `busId`, and `now` stay fixed for the alerter's lifetime (the
-  // signing identity moves only through `rotateSecret`, EB-397).
+  // next note without draining or rebuilding any alert. `busId` and
+  // `now` stay fixed for the alerter's lifetime (the signing identity
+  // moves only through `rotateSecret`, EB-397; the sink only through
+  // `setSink`, EB-411).
   private dedupWindowMs: number;
   private maxAttempts: number;
   private retryBaseMs: number;
@@ -483,6 +491,49 @@ export class OpsAlerter {
     this.secret = newSecret;
     this.keyId = effectiveKeyId;
     return { keyId: effectiveKeyId, oldKeyId, changed: true };
+  }
+
+  /**
+   * Replaces the delivery sink live (EB-411). The new sink governs
+   * from the next `note()` onward — `deliver` reads the live `sink`
+   * on every attempt, so the next retry of a delivery already in
+   * flight also goes to the new sink — while a delivery already
+   * signed keeps the signature and key id it was signed with (the
+   * signature is over the alert, not the transport). The dedup table
+   * and the storm state are untouched.
+   *
+   * Validation reuses the construction-time rule
+   * (`resolveOpsAlerterOptions`: the sink an object with a
+   * `send(delivery)` method), so an illegal value throws `RangeError`
+   * with the live sink untouched. Re-installing the live sink is a
+   * no-op: nothing moves and `changed` is false, so the caller can
+   * skip the audit. The sink itself is never returned, logged, or
+   * audited — it may hold credentials or an endpoint.
+   */
+  setSink(sink: OpsAlertSink): { changed: boolean } {
+    // Validate before touching anything: the merged options must pass
+    // the construction-time rule, exactly as `retune` and
+    // `rotateSecret` validate the merged tuning and identity.
+    resolveOpsAlerterOptions(
+      {
+        sink,
+        secret: this.secret,
+        keyId: this.keyId,
+        busId: this.busId,
+        now: this.now,
+        dedupWindowMs: this.dedupWindowMs,
+        maxAttempts: this.maxAttempts,
+        retryBaseMs: this.retryBaseMs,
+        gatewayDisconnectThreshold: this.stormThreshold,
+        gatewayDisconnectWindowMs: this.stormWindowMs,
+      },
+      'OpsAlerter.setSink',
+    );
+    if (sink === this.sink) {
+      return { changed: false };
+    }
+    this.sink = sink;
+    return { changed: true };
   }
 
   /**

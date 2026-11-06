@@ -277,6 +277,7 @@ import {
   OpsAlerter,
   resolveOpsAlerterOptions,
   type OpsAlertRevision,
+  type OpsAlertSink,
   type OpsAlertStats,
 } from './ops-alert.ts';
 import {
@@ -26333,10 +26334,11 @@ export class EventBus {
    * disconnect storms (see `EventBusOptions.opsAlert`, EB-132).
    *
    * Only the fields provided move; the rest keep their live values.
-   * `sink` / `secret` / `keyId` / `busId` are not revisable here —
-   * they are the delivery destination and the signing identity fixed
-   * at construction — and neither is the `now` clock. (The signing
-   * secret alone rotates live through `rotateOpsAlertSecret`, EB-397.) In-flight state
+   * `secret` / `keyId` / `busId` are not revisable here — they are
+   * the signing identity and the bus identity fixed at construction —
+   * and neither is the `now` clock. (The signing secret alone rotates
+   * live through `rotateOpsAlertSecret`, EB-397; the delivery sink
+   * alone moves live through `setOpsAlertSink`, EB-411.) In-flight state
    * is untouched: the dedup table keeps its entries and the in-flight
    * disconnect times keep theirs, so the new values govern from the
    * next note onward — the next dedup check reads the live window
@@ -26505,6 +26507,75 @@ export class EventBus {
    */
   getOpsAlertKeyId(): string | undefined {
     return this.opsAlerter?.currentKeyId();
+  }
+
+  /**
+   * Replaces the ops-alert delivery sink live (EB-411) without
+   * restarting the bus: `setOpsAlertSink(sink, actor?)` swaps the
+   * transport the outlet POSTs signed alerts through, so an alert
+   * channel can migrate (a Slack webhook to PagerDuty, a sink whose
+   * credentials expired, an endpoint taken offline) mid-incident
+   * without rebuilding the bus (which would drop every live
+   * subscription, queue, and replay position). See
+   * `EventBusOptions.opsAlert`, EB-132.
+   *
+   * Only the sink moves — the signing secret and key id, the bus id,
+   * the dedup window, the retry bounds, and the storm tuning are
+   * untouched, and a delivery already signed keeps its signature and
+   * key id through its bounded retry chain (the signature is over the
+   * alert, not the transport). The new sink governs from the next
+   * `note()` onward, and `deliver` reads the live sink on every
+   * attempt, so the next retry of a delivery already in flight also
+   * goes to the new sink. In-flight state is untouched: the dedup
+   * table keeps its entries and the storm detector keeps its window,
+   * so a burst still collapses and a storm still trips across the
+   * swap.
+   *
+   * Fail-closed: a bus that never enabled `opsAlert`, a closed bus,
+   * an illegal actor, and an illegal sink all throw `RangeError`
+   * with the live sink and the audit log untouched. Validation
+   * reuses the construction-time rule
+   * (`resolveOpsAlerterOptions`: the sink an object with a
+   * `send(delivery)` method), so a value that could not be set at
+   * construction cannot be installed later either. Re-installing the
+   * live sink is a no-op with no audit. Audited as
+   * `ops_alert_sink_revised` (`{ hasSink: true }` — the sink itself
+   * is never written to the audit log; it may hold credentials or an
+   * endpoint).
+   *
+   * Orthogonal to EB-132 (that is the alert outlet mechanism itself
+   * — this its missing delivery-transport replacement entry), to
+   * EB-307 (that retunes the outlet's five numeric bounds — this the
+   * sink; its docs name the sink as fixed, and this fills exactly
+   * that named gap), to EB-397 (that rotates the signing secret —
+   * this the delivery channel; the two are independent: a sink swap
+   * never re-signs, a secret rotation never retargets), and to
+   * EB-399 (that replaces the durable-log S3 offload client — same
+   * "swap a caller-injected transport live" shape, a different
+   * subsystem).
+   *
+   * Throws `RangeError` when ops alerts are not enabled, when the
+   * bus is closed, for a bad actor, or for an illegal sink.
+   */
+  setOpsAlertSink(sink: OpsAlertSink, actor = 'system'): void {
+    assertValidActor(actor, 'setOpsAlertSink');
+    const alerter = this.opsAlerter;
+    if (alerter === undefined) {
+      throw new RangeError('setOpsAlertSink: opsAlert is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154): there is no live outlet
+    // left to repoint.
+    if (this.closed) {
+      throw new RangeError('setOpsAlertSink: bus is closed');
+    }
+    if (!alerter.setSink(sink).changed) {
+      return;
+    }
+    this.auditSubscription({
+      action: 'ops_alert_sink_revised',
+      actor,
+      detail: { hasSink: true },
+    });
   }
 
   /**

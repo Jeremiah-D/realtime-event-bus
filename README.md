@@ -7479,9 +7479,10 @@ Semantics:
 gatewayDisconnectThreshold?, gatewayDisconnectWindowMs? })` (EB-307)
 retunes that outlet live without restarting the bus — only a bus that
 already enabled the opt-in can be revised, and only the fields
-provided move (the `sink` / `secret` / `keyId` / `busId` and the `now`
+provided move (the `secret` / `keyId` / `busId` and the `now`
 clock are not revisable — rotate the signing key instead with
-`rotateOpsAlertSecret`, EB-397, above). In-flight state is untouched: the dedup
+`rotateOpsAlertSecret`, EB-397, above; the delivery sink moves
+instead with `setOpsAlertSink`, EB-411, below). In-flight state is untouched: the dedup
 table and the in-flight disconnect times keep their entries, so the
 new values govern from the next note onward — the next dedup check
 reads the live window, the next disconnect note truncates at the live
@@ -7494,6 +7495,23 @@ oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs,
 oldRetryBaseMs, gatewayDisconnectThreshold,
 oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs,
 oldGatewayDisconnectWindowMs }`).
+
+`bus.setOpsAlertSink(sink, actor?)` (EB-411) replaces that outlet's
+delivery sink live without restarting the bus — the alert channel can
+migrate (a Slack webhook to PagerDuty, a sink whose credentials
+expired, an endpoint taken offline) mid-incident instead of only by
+rebuilding the bus. Only the sink moves: the signing secret and key
+id, the bus id, the dedup window, the retry bounds, and the storm
+tuning are untouched, and a delivery already signed keeps its
+signature through its bounded retry chain. The new sink governs from
+the next note onward, and the next retry attempt of a delivery already
+in flight also goes to the new sink. Illegal sinks throw `RangeError`
+with the live sink untouched, a bus that never enabled `opsAlert`
+(or a closed bus) refuses, and re-installing the live sink is a no-op
+with no audit. Audited as `ops_alert_sink_revised`
+(`{ hasSink: true }` — the sink itself is never written to the audit
+log). Unlike the key rotation above, a sink swap never re-signs; unlike
+the tuning revision, it moves the destination, not the bounds.
 
 ## Manual subscriber pause/resume (EB-113)
 
