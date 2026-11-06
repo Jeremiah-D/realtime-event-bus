@@ -17141,6 +17141,14 @@ export class EventBus {
    */
   private groupStaticTimeouts = new Map<string, Map<string, number>>();
   /**
+   * Per-group auto.offset.reset defaults (EB-400): groupKey -> policy,
+   * set live via `setGroupAutoOffsetReset` for future joins that omit
+   * their own `autoOffsetReset`. A member-explicit option always wins;
+   * the map holds runtime group state only — it never enters a config
+   * snapshot and does not survive a restart.
+   */
+  private groupAutoOffsetReset = new Map<string, 'earliest' | 'latest'>();
+  /**
    * Per-member assignment watermarks (EB-104): groupId -> roster key
    * (instanceId for static members, subscription id otherwise) ->
    * concrete topic -> highest per-topic `seq` assigned to that member.
@@ -37571,7 +37579,9 @@ export class EventBus {
     if (autoOffsetReset !== undefined && autoOffsetReset !== 'earliest' && autoOffsetReset !== 'latest') {
       throw new RangeError("autoOffsetReset must be 'earliest' or 'latest'");
     }
-    const resetPolicy = autoOffsetReset ?? 'earliest';
+    // The effective policy is resolved once `key` exists below (EB-400):
+    // a member that omits its own option falls back to the group's live
+    // default, then to 'earliest'.
     // Consumer rebalance listener (EB-209): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const rebalanceListener = opts?.rebalanceListener;
@@ -37672,6 +37682,10 @@ export class EventBus {
     );
     const sub = this.subscribe(topicPattern, handler, restOpts);
     const key = EventBus.groupKey(groupId, topicPattern);
+    // Consumer-group auto.offset.reset group default (EB-400): the
+    // member-explicit option always wins (EB-207 semantics unchanged);
+    // the group default only fills in when the member omits the option.
+    const resetPolicy = autoOffsetReset ?? this.groupAutoOffsetReset.get(key) ?? 'earliest';
     // Partition mode is fixed by the group's first member; a disagreeing
     // joiner fails fast here, rolling back the just-registered subscriber
     // so no half-joined member is left behind.
@@ -40933,6 +40947,138 @@ export class EventBus {
       throw new RangeError('getGroupSessionTimeout: instanceId must be a non-empty string');
     }
     return this.groupStaticTimeouts.get(EventBus.groupKey(groupId, pattern))?.get(instanceId);
+  }
+
+  /**
+   * Sets the live auto.offset.reset default for one consumer group
+   * (EB-400) without re-subscribing anyone:
+   * `setGroupAutoOffsetReset(groupId, pattern, policy, actor = 'system')`
+   * decides where future members of the group start when they omit
+   * their own `autoOffsetReset` (see `GroupSubscribeOptions.autoOffsetReset`,
+   * EB-207) — `'latest'` to skip the backlog after an incident, `'earliest'`
+   * to replay it after a fix.
+   *
+   * Only the default moves: the roster, the partition assignment, the
+   * committed offsets, and every live member are untouched, and no
+   * rebalance fires for the revision itself. A member that passes its own
+   * `autoOffsetReset` still wins over the default, and an explicit
+   * `resumeFromSeq` / `resumeFromTime` still wins over the policy
+   * (EB-207); a static rejoin inside its session window never resets.
+   * The resetOnlyOnce gate is unchanged: once any committed offset exists
+   * for the group, a joining member takes the normal committed-offset
+   * recovery path and the default never fires. There is no existence
+   * gate — the default exists precisely for members that have not joined
+   * yet (along `setGroupLagThreshold`), so a misspelled groupId just
+   * stores a harmless one-entry default. The default is runtime group
+   * state: it never enters a config snapshot and does not survive a
+   * restart, like the group's other live revisions.
+   *
+   * Fail-closed: an empty groupId or pattern, an illegal actor, or a
+   * policy other than `'earliest'` / `'latest'` all throw `RangeError`
+   * with the live default and the audit log untouched. A revision
+   * identical to the current default is a no-op with no audit. Audited
+   * as `group_auto_offset_reset_revised`
+   * (`{ previous_policy, policy }`; `groupId` and `pattern` ride on the
+   * event itself; `previous_policy` is the previously stored default,
+   * `null` when none was stored).
+   *
+   * Orthogonal to EB-207 (that is the positioning mechanism itself —
+   * this its missing group-level default revision entry), to EB-376
+   * (that seeks live members and checkpoints — this only positions
+   * future joins with no committed offset), to EB-363 (that revises the
+   * group's lag threshold default — same "group default" shape, a
+   * different knob), to `setGroupSessionTimeout` (that revises a static
+   * member's slot hold — same `(groupId, pattern)` key, actor, and
+   * no-op shape, a different object), to `setGroupMaxMembers` /
+   * `setGroupPartitionCount` (group scale governance — different
+   * knobs), to EB-127 (commit timing — this is positioning policy),
+   * and to EB-32 (offset storage — this reads that storage's policy).
+   *
+   * Throws `RangeError` for an empty groupId or pattern, an illegal
+   * actor, or a policy other than `'earliest'` / `'latest'`.
+   */
+  setGroupAutoOffsetReset(
+    groupId: string,
+    pattern: string,
+    policy: 'earliest' | 'latest',
+    actor = 'system',
+  ): void {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('setGroupAutoOffsetReset: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('setGroupAutoOffsetReset: pattern must be a non-empty string');
+    }
+    assertValidActor(actor, 'setGroupAutoOffsetReset');
+    if (policy !== 'earliest' && policy !== 'latest') {
+      throw new RangeError("setGroupAutoOffsetReset: policy must be 'earliest' or 'latest'");
+    }
+    const key = EventBus.groupKey(groupId, pattern);
+    const previousPolicy = this.groupAutoOffsetReset.get(key) ?? null;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previousPolicy === policy) {
+      return;
+    }
+    this.groupAutoOffsetReset.set(key, policy);
+    this.auditSubscription({
+      action: 'group_auto_offset_reset_revised',
+      actor,
+      groupId,
+      pattern,
+      detail: { previous_policy: previousPolicy, policy },
+    });
+  }
+
+  /**
+   * Returns the live auto.offset.reset default for one consumer group
+   * (EB-400) — the policy future members fall back to when they omit
+   * their own `autoOffsetReset` — or `undefined` when the group holds
+   * no stored default (joins then fall back to `'earliest'`). Throws
+   * `RangeError` for an empty groupId or pattern.
+   */
+  getGroupAutoOffsetReset(groupId: string, pattern: string): 'earliest' | 'latest' | undefined {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('getGroupAutoOffsetReset: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('getGroupAutoOffsetReset: pattern must be a non-empty string');
+    }
+    return this.groupAutoOffsetReset.get(EventBus.groupKey(groupId, pattern));
+  }
+
+  /**
+   * Clears the live auto.offset.reset default for one consumer group
+   * (EB-400), so future members that omit their own `autoOffsetReset`
+   * fall back to `'earliest'` again. Returns whether a default was
+   * stored (clearing a group that holds none returns `false` with
+   * nothing audited). Live members, committed offsets, and the roster
+   * are untouched. Audited as `group_auto_offset_reset_cleared`
+   * (`{ previous_policy }`; `groupId` and `pattern` ride on the event
+   * itself). Throws `RangeError` for an empty groupId or pattern or an
+   * illegal actor.
+   */
+  clearGroupAutoOffsetReset(groupId: string, pattern: string, actor = 'system'): boolean {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new RangeError('clearGroupAutoOffsetReset: groupId must be a non-empty string');
+    }
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RangeError('clearGroupAutoOffsetReset: pattern must be a non-empty string');
+    }
+    assertValidActor(actor, 'clearGroupAutoOffsetReset');
+    const key = EventBus.groupKey(groupId, pattern);
+    const previousPolicy = this.groupAutoOffsetReset.get(key);
+    if (previousPolicy === undefined) {
+      return false;
+    }
+    this.groupAutoOffsetReset.delete(key);
+    this.auditSubscription({
+      action: 'group_auto_offset_reset_cleared',
+      actor,
+      groupId,
+      pattern,
+      detail: { previous_policy: previousPolicy },
+    });
+    return true;
   }
 
   /**
@@ -57593,6 +57739,7 @@ export class EventBus {
         const sep = key.indexOf('\0');
         const partitions = this.groupPartitions.get(key);
         const memberLimit = this.groupMemberLimits.get(key);
+        const autoOffsetReset = this.groupAutoOffsetReset.get(key);
         return {
           groupId: key.slice(0, sep),
           pattern: key.slice(sep + 1),
@@ -57601,6 +57748,10 @@ export class EventBus {
           // Consumer-group member limit (EB-196): the cap fixed by the
           // group's first member or `setGroupMaxMembers`.
           ...(memberLimit === undefined ? {} : { memberLimit }),
+          // Consumer-group auto.offset.reset group default (EB-400):
+          // the live default future members fall back to; absent when
+          // no default is stored (joins fall back to 'earliest').
+          ...(autoOffsetReset === undefined ? {} : { autoOffsetReset }),
         };
       }),
       pausedGroups: [...this.pausedGroups].sort(),

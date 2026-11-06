@@ -375,7 +375,21 @@ library.
   `resumeFromTime` always wins over the policy, and a static rejoin inside
   its session window never resets. Partitioned groups decide per
   partition. Any other value throws `RangeError` before anything
-  registers. **Consumer-group offset seek** (EB-376):
+  registers. The group-level default can be revised live via
+  `setGroupAutoOffsetReset(groupId, pattern, policy, actor = 'system')`
+  (EB-400): future members that omit their own `autoOffsetReset` fall back
+  to the stored default instead of `'earliest'` — `'latest'` to skip the
+  backlog after an incident, `'earliest'` to replay it after a fix. A
+  member-explicit option always wins, an explicit `resumeFromSeq` /
+  `resumeFromTime` still wins over the policy, and the revision never
+  touches live members or committed offsets and fires no rebalance; the
+  default is runtime state (no snapshot, no restart recovery).
+  `getGroupAutoOffsetReset(groupId, pattern)` reports the stored default
+  (`undefined` when none), `clearGroupAutoOffsetReset(groupId, pattern,
+  actor = 'system')` drops it (returning whether one was stored), and
+  `getStats().consumerGroups` rows report it as `autoOffsetReset`. Audited
+  as `group_auto_offset_reset_revised` / `group_auto_offset_reset_cleared`.
+  **Consumer-group offset seek** (EB-376):
   `seekGroupOffsets(groupId, pattern, targets, { actor = 'system' })` is the Kafka-style operator seek —
   it repositions a group's committed offsets at runtime and replays the live members from the new positions,
   without re-subscribing anyone: `targets` maps each concrete topic to `'earliest'` (replay from the log's
