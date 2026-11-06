@@ -26296,8 +26296,8 @@ export class EventBus {
    * `EventBusOptions.admissionWebhook`, EB-157).
    *
    * Only the fields provided move; the rest keep their live values.
-   * `url` is not revisable here — it is the policy endpoint's
-   * identity fixed at construction. A revision swaps in a fresh merged
+   * `url` is not revisable here either — it moves via
+   * `setAdmissionWebhookUrl` (EB-408). A revision swaps in a fresh merged
    * options object (the caller's objects are never mutated, and the
    * construction-time object is never aliased); the admission check
    * reads the live field on every publish, so the new timeout governs
@@ -26399,6 +26399,94 @@ export class EventBus {
         oldFailureMode: current.failureMode ?? 'fail-closed',
         headersChanged: !sameHeaders(headers, current.headers),
       },
+    });
+  }
+
+  /**
+   * Repoints the bus-level external admission webhook live (EB-408)
+   * without restarting the bus: `setAdmissionWebhookUrl(url)` moves
+   * the policy endpoint the next admission decision POSTs to (see
+   * `EventBusOptions.admissionWebhook`, EB-157).
+   *
+   * Only the URL moves: the timeout, the failure mode, and the extra
+   * headers keep their live values, and the admission check reads the
+   * live field on every publish, so the new endpoint governs from the
+   * next `decideAdmission` call. A decision already dispatched keeps
+   * the URL it started with: the worker is spawned per call with the
+   * URL in its worker data, so a repoint mid-decision cannot retarget
+   * it. No connection or timer is rebuilt — the decision worker is
+   * per-call by construction.
+   *
+   * Fail-closed: a bus that never enabled `admissionWebhook`, a
+   * closed bus, an illegal actor, and an illegal URL all throw
+   * `RangeError` with the live URL and the audit log untouched.
+   * Validation reuses the construction-time rule
+   * (`validateAdmissionWebhookOptions`: a non-empty `http:`/`https:`
+   * URL) against the merged values — the URL takes the new value,
+   * the timeout, failure mode, and headers take their live values —
+   * so a value that could not be set at construction cannot be
+   * repointed to later either. (The validator reports some illegal
+   * shapes as `TypeError`; this method normalizes those to
+   * `RangeError` so the revision API has one failure type, along
+   * `setAdmissionWebhook`.) A revision identical to the current URL
+   * (string equality) is a no-op with no audit. Audited as
+   * `admission_webhook_url_revised` (`{ url, oldUrl }`, URL strings
+   * only — header values are never written to the audit record).
+   *
+   * Orthogonal to EB-157 (that is the admission webhook mechanism
+   * itself — this its missing policy-endpoint repoint entry), to
+   * EB-308 (that revises the timeout, failure mode, and headers —
+   * its docs name the URL as fixed, and this fills exactly that
+   * named gap), and to EB-406 (that repoints the OTLP span export
+   * endpoint — same "change the destination" family, a different
+   * subsystem).
+   *
+   * Throws `RangeError` when the admission webhook is not enabled,
+   * when the bus is closed, for an illegal actor, or for an illegal
+   * URL.
+   */
+  setAdmissionWebhookUrl(url: string, actor = 'system'): void {
+    assertValidActor(actor, 'setAdmissionWebhookUrl');
+    const current = this.admissionWebhook;
+    if (current === undefined) {
+      throw new RangeError('setAdmissionWebhookUrl: admissionWebhook is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154): there is no live policy
+    // endpoint left to repoint.
+    if (this.closed) {
+      throw new RangeError('setAdmissionWebhookUrl: bus is closed');
+    }
+    // Validate before touching anything: the URL takes the new value,
+    // everything else takes its live value, so a failed call changes
+    // nothing at all.
+    const oldUrl = current.url;
+    // Re-affirming the current endpoint is a no-op: no repoint, no
+    // audit. String equality: a differently-spelled URL for the same
+    // endpoint still counts as a move.
+    if (url === oldUrl) {
+      return;
+    }
+    // Copy the header map on assignment so later mutation of the
+    // caller's object cannot move the live tuning without an audit.
+    const merged: AdmissionWebhookOptions = {
+      url,
+      timeoutMs: current.timeoutMs ?? 1000,
+      failureMode: current.failureMode ?? 'fail-closed',
+      ...(current.headers === undefined ? {} : { headers: { ...current.headers } }),
+    };
+    try {
+      validateAdmissionWebhookOptions(merged, 'setAdmissionWebhookUrl');
+    } catch (err) {
+      if (err instanceof TypeError) {
+        throw new RangeError(err.message);
+      }
+      throw err;
+    }
+    this.admissionWebhook = merged;
+    this.auditSubscription({
+      action: 'admission_webhook_url_revised',
+      actor,
+      detail: { url, oldUrl },
     });
   }
 

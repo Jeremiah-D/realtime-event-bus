@@ -52,8 +52,8 @@ export interface AdmissionWebhookOptions {
 /**
  * A partial bus-level revision of the admission webhook tuning, for
  * `EventBus.setAdmissionWebhook` (EB-308). Only the fields provided
- * move; the rest keep their live values. `url` is not revisable here —
- * it is the policy endpoint's identity fixed at construction.
+ * move; the rest keep their live values. `url` is not revisable here
+ * either — it moves via `EventBus.setAdmissionWebhookUrl` (EB-408).
  */
 export interface AdmissionWebhookRevision {
   /**

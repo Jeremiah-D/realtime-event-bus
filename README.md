@@ -10433,8 +10433,8 @@ values).
 
 Retune the admission webhook live with `bus.setAdmissionWebhook({
 timeoutMs?, failureMode?, headers? })` (EB-308): only the fields
-provided move — the `url` is the policy endpoint's identity and is not
-revisable; the new timeout governs from the next decision, the new
+provided move — the `url` moves via `setAdmissionWebhookUrl`
+(below); the new timeout governs from the next decision, the new
 failure mode from the next timeout or transport failure, and the new
 headers from the next decision request; only a bus that already
 enabled `admissionWebhook` can be revised (otherwise `RangeError`);
@@ -10443,6 +10443,17 @@ or empty revision is a no-op with no audit. Audited as
 `admission_webhook_revised` (`{ timeoutMs, oldTimeoutMs, failureMode,
 oldFailureMode, headersChanged }`) — header values are never written
 to the audit log (they may carry bearer tokens).
+
+Repoint the admission webhook live with
+`bus.setAdmissionWebhookUrl(url)` (EB-408): moves the policy endpoint
+the next decision POSTs to without restarting the bus — only a bus
+that already enabled `admissionWebhook` can be repointed, and a
+closed bus refuses. Only the URL moves: the timeout, failure mode,
+and headers keep their live values, and a decision already dispatched
+keeps the URL it started with. Illegal URLs fail closed with
+`RangeError` and leave the live URL untouched; an identical URL is a
+no-op with no audit. Audited as `admission_webhook_url_revised`
+(`{ url, oldUrl }`, URL strings only).
 
 ## Subscriber lag forecasting (EB-183)
 
