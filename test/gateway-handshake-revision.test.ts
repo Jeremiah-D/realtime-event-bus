@@ -431,6 +431,7 @@ test('GraphQL gateway mirrors the handshake revision: validation, partial moves,
     connectionInitTimeoutMs: 5000,
     maxFrameBytes: 1024 * 1024,
     ...DEFAULT_HANDSHAKE,
+    maxSubscriptionsPerConnection: undefined,
   });
   const bad: Array<unknown> = [
     { handshakeTimeoutMs: 0 },

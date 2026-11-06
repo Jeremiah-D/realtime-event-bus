@@ -10556,7 +10556,8 @@ Semantics:
   `{ connections, subscriptions, messagesSent, protocolErrors,
   authFailures, authEnabled, limits }`, where `limits` snapshots the live
   connection limits (`{ maxConnections, connectionInitTimeoutMs,
-  maxFrameBytes, handshakeTimeoutMs, maxHandshakeBytes }`).
+  maxFrameBytes, handshakeTimeoutMs, maxHandshakeBytes,
+  maxSubscriptionsPerConnection }`).
 - **Live limit revision (EB-349; EB-358 adds `maxFrameBytes`).**
   `setGraphqlGatewayLimits({ maxConnections?,
   connectionInitTimeoutMs?, maxFrameBytes? })` retunes the three
@@ -10585,6 +10586,27 @@ Semantics:
   revises only the raw handshake; the `connection_init` timeout stays
   with `setGraphqlGatewayLimits` (EB-349). No audit event — the live
   values are observable in `getStats().limits`.
+- **Per-connection subscription cap (EB-402).**
+  `setGraphqlGatewayMaxSubscriptionsPerConnection({
+  maxSubscriptionsPerConnection? })` retunes the opt-in cap on live bus
+  subscriptions per connection without restarting the server (also
+  available as the construction option `maxSubscriptionsPerConnection`;
+  unset means unlimited, the historical behavior). The new cap governs
+  from the next `subscribe` frame on every connection, existing ones
+  included: tightening denies only new subscribes — a connection that
+  already holds more subscriptions than the new cap keeps them — and
+  loosening admits the next subscribe on an over-cap connection at once.
+  A denied subscribe gets an `error` frame (`subscription limit reached
+  (maxSubscriptionsPerConnection=<cap>)`) and the connection stays open,
+  so the client can `complete` a subscription and retry; a duplicate
+  subscription id still closes with 4409 first, and a subscribe before
+  `connection_init` still closes with 4401 first. An explicitly
+  `undefined` revision clears the cap back to unlimited; an illegal
+  value throws `RangeError` with the live cap untouched, and an empty or
+  identical revision is a no-op. No audit event — the live value is
+  observable in `getStats().limits`. This mirrors the WS gateway's
+  `setGatewayMaxSubscriptionsPerConnection` (EB-327); before EB-402 the
+  GraphQL gateway had no per-connection subscription limit at all.
 - **Orthogonality.** `gateway-ws.ts` speaks the bus's own framing; this
   speaks the graphql-ws wire protocol. A text-frame-only WebSocket
   client is all a subscriber needs.

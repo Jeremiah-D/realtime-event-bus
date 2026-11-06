@@ -775,6 +775,17 @@ export interface GraphqlGatewayOptions {
    * when given.
    */
   maxHandshakeBytes?: number;
+  /**
+   * Cap on live bus subscriptions per connection; past it further
+   * `subscribe` frames get an `error` frame and the connection stays
+   * open. Unset means unlimited. Revisable live with
+   * `setGraphqlGatewayMaxSubscriptionsPerConnection` (EB-402): the new
+   * cap governs from the next `subscribe` frame on every connection,
+   * existing ones included — tightening denies only new subscribes
+   * (existing subscriptions are kept), and an explicitly `undefined`
+   * revision clears the cap back to unlimited.
+   */
+  maxSubscriptionsPerConnection?: number;
 }
 
 export interface GraphqlGatewayStats {
@@ -794,12 +805,13 @@ export interface GraphqlGatewayStats {
   authEnabled: boolean;
   /**
    * Live connection limits (EB-349; EB-358 adds `maxFrameBytes`;
-   * EB-390 adds the handshake admission bounds): the values
-   * `setGraphqlGatewayLimits` / `setGraphqlGatewayHandshake` last
-   * revised, or the construction values. `maxConnections` is the cap
-   * the *next* connection is judged against (`undefined` means
-   * unlimited); already-open connections are never dropped by a
-   * revision.
+   * EB-390 adds the handshake admission bounds; EB-402 adds
+   * `maxSubscriptionsPerConnection`): the values
+   * `setGraphqlGatewayLimits` / `setGraphqlGatewayHandshake` /
+   * `setGraphqlGatewayMaxSubscriptionsPerConnection` last revised, or
+   * the construction values. `maxConnections` is the cap the *next*
+   * connection is judged against (`undefined` means unlimited);
+   * already-open connections are never dropped by a revision.
    * `connectionInitTimeoutMs` is the timeout the *next* handshake
    * arms — a connection whose init timer is already armed keeps the
    * timeout it started with. `maxFrameBytes` is the frame bound the
@@ -808,7 +820,10 @@ export interface GraphqlGatewayStats {
    * `handshakeTimeoutMs` / `maxHandshakeBytes` are the bounds the
    * *next* raw HTTP handshake gets — a connection whose handshake
    * timer is already armed, or whose head is already buffered, keeps
-   * the values it started with.
+   * the values it started with. `maxSubscriptionsPerConnection` is
+   * the cap the *next* `subscribe` frame on every connection is
+   * judged against (`undefined` means unlimited); a connection that
+   * already holds more subscriptions than a tightened cap keeps them.
    */
   limits: {
     maxConnections: number | undefined;
@@ -816,6 +831,7 @@ export interface GraphqlGatewayStats {
     maxFrameBytes: number;
     handshakeTimeoutMs: number;
     maxHandshakeBytes: number;
+    maxSubscriptionsPerConnection: number | undefined;
   };
 }
 
@@ -855,6 +871,17 @@ export interface GraphqlGatewayHandshakeRevision {
   maxHandshakeBytes?: number;
 }
 
+/**
+ * A `setGraphqlGatewayMaxSubscriptionsPerConnection` revision (EB-402):
+ * the per-connection subscription cap. Only the field provided moves —
+ * left out it keeps the live cap, explicitly `undefined` clears it back
+ * to unlimited.
+ */
+export interface GraphqlGatewaySubscriptionLimitRevision {
+  /** Per-connection subscription cap (positive integer); `undefined` clears it to unlimited. */
+  maxSubscriptionsPerConnection?: number;
+}
+
 interface GqlConnection {
   socket: Socket;
   parser: FrameParser;
@@ -881,6 +908,8 @@ export class GraphqlGateway {
   /** Mutable live via `setGraphqlGatewayHandshake` (EB-390) — see that method. */
   private handshakeTimeoutMs: number;
   private maxHandshakeBytes: number;
+  /** Mutable live via `setGraphqlGatewayMaxSubscriptionsPerConnection` (EB-402) — see that method. */
+  private maxSubscriptionsPerConnection: number | undefined;
   private server: TcpServer | null = null;
   private boundPort = 0;
   private readonly connections = new Set<GqlConnection>();
@@ -934,6 +963,14 @@ export class GraphqlGateway {
       fail('maxHandshakeBytes must be a positive integer');
     }
     this.maxHandshakeBytes = maxHandshakeBytes;
+    const maxSubscriptionsPerConnection = options.maxSubscriptionsPerConnection;
+    if (
+      maxSubscriptionsPerConnection !== undefined &&
+      (!Number.isInteger(maxSubscriptionsPerConnection) || maxSubscriptionsPerConnection <= 0)
+    ) {
+      fail('maxSubscriptionsPerConnection must be a positive integer');
+    }
+    this.maxSubscriptionsPerConnection = maxSubscriptionsPerConnection;
   }
 
   /** Starts listening; resolves once bound. */
@@ -980,6 +1017,7 @@ export class GraphqlGateway {
         maxFrameBytes: this.maxFrameBytes,
         handshakeTimeoutMs: this.handshakeTimeoutMs,
         maxHandshakeBytes: this.maxHandshakeBytes,
+        maxSubscriptionsPerConnection: this.maxSubscriptionsPerConnection,
       },
     };
   }
@@ -1155,6 +1193,68 @@ export class GraphqlGateway {
     }
     this.handshakeTimeoutMs = handshakeTimeoutMs;
     this.maxHandshakeBytes = maxHandshakeBytes;
+  }
+
+  /**
+   * Revises the per-connection subscription cap live (EB-402) without
+   * restarting the server: `setGraphqlGatewayMaxSubscriptionsPerConnection({
+   * maxSubscriptionsPerConnection? })` retunes the opt-in cap (see
+   * `GraphqlGatewayOptions`: unset means unlimited, the historical
+   * behavior).
+   *
+   * An explicitly `undefined` cap clears it back to unlimited; a field
+   * left out keeps the live cap. The new cap governs from the next
+   * `subscribe` frame on every connection, existing ones included:
+   * `handleSubscribe` reads the live value, so tightening the cap
+   * denies only new subscribes — a connection that already holds more
+   * subscriptions than the new cap keeps them, and loosening the cap
+   * admits the next subscribe on an over-cap connection at once.
+   * `complete` frees a slot at once: a client that completes one
+   * subscription can subscribe again under the same cap.
+   *
+   * There is no audit event for this revision: like the WS gateway's
+   * `setGatewayMaxSubscriptionsPerConnection` and this gateway's own
+   * `setGraphqlGatewayLimits` / `setGraphqlGatewayHandshake`, the
+   * gateway keeps no audit log for numeric tuning — the live tuning is
+   * observable in `getStats().limits` instead.
+   *
+   * Fail-closed: a non-object revision and an illegal value both throw
+   * `RangeError` with the live cap untouched. Validation reuses the
+   * construction-time rule: a cap must be a positive integer when
+   * given — so a value that could not be set at construction cannot be
+   * revised in later either. An empty revision, and a revision
+   * identical to the current cap, are both no-ops.
+   *
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `maxSubscriptionsPerConnection`.
+   */
+  setGraphqlGatewayMaxSubscriptionsPerConnection(
+    opts: GraphqlGatewaySubscriptionLimitRevision,
+  ): void {
+    // An absent revision asks nothing to move.
+    if (opts == null) {
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError(
+        'setGraphqlGatewayMaxSubscriptionsPerConnection: revision must be an object with maxSubscriptionsPerConnection',
+      );
+    }
+    // An explicitly `undefined` cap is a value here: it clears the cap
+    // back to unlimited. The `in` check tells it apart from a field
+    // left out.
+    const given = 'maxSubscriptionsPerConnection' in opts;
+    const next = given ? opts.maxSubscriptionsPerConnection : this.maxSubscriptionsPerConnection;
+    // Re-affirming the current cap is a no-op.
+    if (next === this.maxSubscriptionsPerConnection) {
+      return;
+    }
+    if (next !== undefined && (!Number.isInteger(next) || next <= 0)) {
+      throw new RangeError(
+        'setGraphqlGatewayMaxSubscriptionsPerConnection: maxSubscriptionsPerConnection must be a positive integer',
+      );
+    }
+    this.maxSubscriptionsPerConnection = next;
   }
 
   /**
@@ -1546,6 +1646,22 @@ export class GraphqlGateway {
     }
     if (conn.subscriptions.has(id)) {
       this.closeWithCode(conn, CLOSE_DUPLICATE_ID, `duplicate subscription id: ${id}`);
+      return;
+    }
+    // EB-402: per-connection subscription cap. Over-cap subscribes get
+    // an `error` frame — the connection stays open, so a client can
+    // complete a subscription and retry. Checked after the duplicate-id
+    // close (4409) so a duplicate id still reports first, and before
+    // `bus.subscribe` so a denied subscribe never registers.
+    if (
+      this.maxSubscriptionsPerConnection !== undefined &&
+      conn.subscriptions.size >= this.maxSubscriptionsPerConnection
+    ) {
+      this.sendError(
+        conn,
+        id,
+        `subscription limit reached (maxSubscriptionsPerConnection=${this.maxSubscriptionsPerConnection})`,
+      );
       return;
     }
     const payload = frame.payload;

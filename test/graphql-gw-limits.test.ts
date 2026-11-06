@@ -257,6 +257,7 @@ test('tightening maxConnections refuses new sockets with 503; the open one is un
         maxFrameBytes: 1024 * 1024,
         handshakeTimeoutMs: 10_000,
         maxHandshakeBytes: 8 * 1024,
+        maxSubscriptionsPerConnection: undefined,
       });
       const third = await rawGqlConnect(port, { protocol: 'graphql-ws' });
       assert.match(third.statusLine, /^HTTP\/1\.1 503/);
@@ -340,7 +341,7 @@ test('the new init timeout arms only new handshakes; an armed timer keeps the ol
 test('illegal values throw RangeError and leave the live limits untouched', async () => {
   const bus = new EventBus();
   await withGqlGateway(bus, { port: 0, maxConnections: 2 }, async (gw) => {
-    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000, maxFrameBytes: 1024 * 1024, handshakeTimeoutMs: 10_000, maxHandshakeBytes: 8 * 1024 };
+    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000, maxFrameBytes: 1024 * 1024, handshakeTimeoutMs: 10_000, maxHandshakeBytes: 8 * 1024, maxSubscriptionsPerConnection: undefined };
     assert.deepEqual(gw.getStats().limits, live);
     for (const bad of [0, -1, 1.5, NaN, Infinity, '2' as never]) {
       assert.throws(
@@ -376,7 +377,7 @@ test('illegal values throw RangeError and leave the live limits untouched', asyn
 test('an empty revision, an identical revision, and an absent one are no-ops', async () => {
   const bus = new EventBus();
   await withGqlGateway(bus, { port: 0, maxConnections: 2 }, async (gw) => {
-    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000, maxFrameBytes: 1024 * 1024, handshakeTimeoutMs: 10_000, maxHandshakeBytes: 8 * 1024 };
+    const live = { maxConnections: 2, connectionInitTimeoutMs: 5000, maxFrameBytes: 1024 * 1024, handshakeTimeoutMs: 10_000, maxHandshakeBytes: 8 * 1024, maxSubscriptionsPerConnection: undefined };
     gw.setGraphqlGatewayLimits({});
     assert.deepEqual(gw.getStats().limits, live);
     gw.setGraphqlGatewayLimits({ maxConnections: 2 });
@@ -400,6 +401,7 @@ test('getStats reflects the live limits, including a cleared cap', async () => {
       maxFrameBytes: 1024 * 1024,
       handshakeTimeoutMs: 10_000,
       maxHandshakeBytes: 8 * 1024,
+      maxSubscriptionsPerConnection: undefined,
     });
     gw.setGraphqlGatewayLimits({ maxConnections: 3, connectionInitTimeoutMs: 2500 });
     assert.deepEqual(gw.getStats().limits, {
@@ -408,6 +410,7 @@ test('getStats reflects the live limits, including a cleared cap', async () => {
       maxFrameBytes: 1024 * 1024,
       handshakeTimeoutMs: 10_000,
       maxHandshakeBytes: 8 * 1024,
+      maxSubscriptionsPerConnection: undefined,
     });
     // Clearing only the cap keeps the revised timeout.
     gw.setGraphqlGatewayLimits({ maxConnections: undefined });
@@ -417,6 +420,7 @@ test('getStats reflects the live limits, including a cleared cap', async () => {
       maxFrameBytes: 1024 * 1024,
       handshakeTimeoutMs: 10_000,
       maxHandshakeBytes: 8 * 1024,
+      maxSubscriptionsPerConnection: undefined,
     });
     // Revising only the frame bound keeps the other two limits.
     gw.setGraphqlGatewayLimits({ maxFrameBytes: 4096 });
@@ -426,6 +430,7 @@ test('getStats reflects the live limits, including a cleared cap', async () => {
       maxFrameBytes: 4096,
       handshakeTimeoutMs: 10_000,
       maxHandshakeBytes: 8 * 1024,
+      maxSubscriptionsPerConnection: undefined,
     });
   });
 });
