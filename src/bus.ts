@@ -12037,6 +12037,16 @@ export interface TopicPauseOptions {
    * else throws `RangeError` at call time.
    */
   mode?: TopicPauseMode;
+  /**
+   * Queue-mode buffer bound (EB-401): the maximum number of messages the
+   * rule holds before further publishes shed like shed mode (counted with
+   * reason `'topic-paused'`, no sequence number consumed). A positive
+   * integer; omitted means unbounded (the historical behavior). Passing
+   * it with `'shed'` mode throws `RangeError` — shed mode never buffers,
+   * so silently ignoring the bound would lie. Live-revisable via
+   * `setTopicPauseBufferLimit` without re-pausing.
+   */
+  maxBuffered?: number;
 }
 
 /**
@@ -12050,6 +12060,8 @@ export interface PausedTopicRule {
   mode: TopicPauseMode;
   /** Messages currently held in the rule's durable-side buffer (queue mode only; 0 for shed). */
   bufferedMessages: number;
+  /** Queue-mode buffer bound (EB-401); absent while the rule is unbounded. */
+  maxBuffered?: number;
 }
 
 /**
@@ -16049,7 +16061,7 @@ export class EventBus {
    * (the `Map` keeps registration order). Queue-mode rules additionally
    * hold their buffered messages in FIFO publish order.
    */
-  private pauseRules = new Map<string, { mode: TopicPauseMode; buffer: PauseBufferEntry[] }>();
+  private pauseRules = new Map<string, { mode: TopicPauseMode; buffer: PauseBufferEntry[]; maxBuffered?: number }>();
   /**
    * Compiled matchers for the wildcard entries in `pauseRules`, kept
    * apart from the subscriber pattern cache so pause configuration never
@@ -27449,7 +27461,15 @@ export class EventBus {
    *   resurrected — the EB-32 precedent). Queue mode requires
    *   `EventBusOptions.durableLogDir`: the buffer is persisted as seq-0
    *   pause records (tombstoned as each message drains), so a restart
-   *   rebuilds the buffer instead of losing it.
+   *   rebuilds the buffer instead of losing it. `maxBuffered` (EB-401)
+   *   caps that buffer: once it holds that many messages, further
+   *   publishes shed like shed mode — counted with reason `'topic-paused'`,
+   *   no sequence number consumed — instead of growing the buffer without
+   *   bound. Tightening the bound never evicts buffered messages;
+   *   loosening or clearing it (`null` via `setTopicPauseBufferLimit`)
+   *   resumes buffering at once. The bound is runtime state like the rule
+   *   itself: it never enters a durable pause record and does not survive
+   *   a restart.
    *
    * The pause check is the first gate in the publish admission pipeline —
    * before the per-publisher rate limiter (EB-79), so a paused shed never
@@ -27464,8 +27484,9 @@ export class EventBus {
    *
    * Audited as `topic_paused` (`{ mode }`). Throws `TypeError` when
    * `topicPattern` is not a string; throws `RangeError` when it is empty,
-   * when `mode` is not `'shed'`/`'queue'`, or when queue mode is requested
-   * without a durable log.
+   * when `mode` is not `'shed'`/`'queue'`, when queue mode is requested
+   * without a durable log, when `maxBuffered` is not a positive integer,
+   * or when `maxBuffered` is passed with shed mode.
    */
   pauseTopic(topicPattern: string, opts?: TopicPauseOptions): void {
     if (typeof topicPattern !== 'string') {
@@ -27484,11 +27505,27 @@ export class EventBus {
     if (mode === 'queue' && this.durableLog == null) {
       throw new RangeError('pauseTopic: queue mode requires EventBusOptions.durableLogDir');
     }
+    // Queue-buffer bound (EB-401): a positive integer, queue mode only —
+    // shed mode never buffers, so accepting a bound there would lie.
+    const maxBuffered = opts?.maxBuffered;
+    if (maxBuffered !== undefined) {
+      if (!Number.isInteger(maxBuffered) || maxBuffered < 1) {
+        throw new RangeError('pauseTopic: maxBuffered must be a positive integer');
+      }
+      if (mode === 'shed') {
+        throw new RangeError('pauseTopic: maxBuffered applies to queue mode only');
+      }
+    }
     const existing = this.pauseRules.get(topicPattern);
     // Re-setting keeps a queue-mode buffer already held under the key:
     // the mode is ops intent, the buffered messages are data — replacing
-    // the rule must not silently drop them. They drain on resume.
-    this.pauseRules.set(topicPattern, { mode, buffer: existing?.buffer ?? [] });
+    // the rule must not silently drop them. They drain on resume. The
+    // new bound governs only future admissions.
+    this.pauseRules.set(topicPattern, {
+      mode,
+      buffer: existing?.buffer ?? [],
+      ...(maxBuffered === undefined ? {} : { maxBuffered }),
+    });
     this.auditSubscription({
       action: 'topic_paused',
       actor: 'system',
@@ -27523,6 +27560,105 @@ export class EventBus {
       detail: { mode: rule.mode, drainedMessages: drained },
     });
     return true;
+  }
+
+  /**
+   * Revises the queue-buffer bound of one paused topic live (EB-401)
+   * without re-pausing it:
+   * `setTopicPauseBufferLimit(topicPattern, maxBuffered, actor = 'system')`
+   * caps how many messages the rule's queue-mode buffer holds — `null`
+   * clears the bound back to unbounded (the historical behavior).
+   *
+   * Only the bound moves: the rule's mode and its already-buffered
+   * messages are untouched, and no resume fires for the revision itself.
+   * The new bound governs only admissions after the revision — tightening
+   * never evicts buffered entries (they drain in original order at
+   * resume), while loosening or clearing resumes buffering at once. A
+   * message that arrives while the buffer is full sheds like shed mode:
+   * counted in `pausedMessages` with reason `'topic-paused'`, consuming
+   * no sequence number, no rate-limit budget, and no idempotent slot.
+   * The bound is runtime state like the rule itself: it never enters a
+   * durable pause record and does not survive a restart, so a restarted
+   * bus needs `pauseTopic` again to re-establish it.
+   *
+   * Fail-closed: a non-string pattern, an empty pattern, an illegal
+   * actor, a bound that is neither a positive integer nor `null`, and an
+   * unknown pattern (no pause rule under that exact key) all throw with
+   * the live bound and the audit log untouched. A revision identical to
+   * the current bound is a no-op with no audit. Audited as
+   * `topic_pause_buffer_limit_revised`
+   * (`{ previous_max_buffered, max_buffered }`; the `pattern` field
+   * carries the rule key; `null` means unbounded on either side).
+   *
+   * Orthogonal to EB-88 (that is the pause mechanism itself — this its
+   * queue buffer's missing capacity bound and live revision entry), to
+   * EB-250 (that holds the delayed-delivery sweep — this the pause
+   * buffer), to EB-384/385/389 (the delayed heap's three-level capacity
+   * budgets — same fail-fast shed shape, a different queue), to EB-345
+   * (the stream-join per-key buffer bound — a different queue), to
+   * `setDurableLogMaxEntriesPerTopic` (log retention counts — this
+   * memory-buffer admission), and to `setQueueSize` (subscriber queues —
+   * this the publish-side rule buffer).
+   *
+   * Throws `TypeError` for a non-string pattern; throws `RangeError` for
+   * an empty pattern, an illegal actor, a bound that is neither a
+   * positive integer nor `null`, or an unknown pattern.
+   */
+  setTopicPauseBufferLimit(
+    topicPattern: string,
+    maxBuffered: number | null,
+    actor = 'system',
+  ): void {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('setTopicPauseBufferLimit: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('setTopicPauseBufferLimit: topicPattern must be a non-empty string');
+    }
+    assertValidActor(actor, 'setTopicPauseBufferLimit');
+    if (maxBuffered !== null && (!Number.isInteger(maxBuffered) || maxBuffered < 1)) {
+      throw new RangeError(
+        'setTopicPauseBufferLimit: maxBuffered must be a positive integer or null (unbounded)',
+      );
+    }
+    const rule = this.pauseRules.get(topicPattern);
+    if (rule === undefined) {
+      throw new RangeError(
+        `setTopicPauseBufferLimit: unknown paused topic "${topicPattern}"`,
+      );
+    }
+    const previousMaxBuffered = rule.maxBuffered ?? null;
+    // Re-affirming the current bound is a no-op: no audit.
+    if (previousMaxBuffered === maxBuffered) {
+      return;
+    }
+    if (maxBuffered === null) {
+      delete rule.maxBuffered;
+    } else {
+      rule.maxBuffered = maxBuffered;
+    }
+    this.auditSubscription({
+      action: 'topic_pause_buffer_limit_revised',
+      actor,
+      pattern: topicPattern,
+      detail: { previous_max_buffered: previousMaxBuffered, max_buffered: maxBuffered },
+    });
+  }
+
+  /**
+   * Returns the live queue-buffer bound for one paused topic (EB-401),
+   * or `undefined` when the topic holds no pause rule or its rule is
+   * unbounded. Throws `TypeError` for a non-string pattern and
+   * `RangeError` for an empty pattern.
+   */
+  getTopicPauseBufferLimit(topicPattern: string): number | undefined {
+    if (typeof topicPattern !== 'string') {
+      throw new TypeError('getTopicPauseBufferLimit: topicPattern must be a string');
+    }
+    if (topicPattern.length === 0) {
+      throw new RangeError('getTopicPauseBufferLimit: topicPattern must be a non-empty string');
+    }
+    return this.pauseRules.get(topicPattern)?.maxBuffered;
   }
 
   /**
@@ -27943,7 +28079,7 @@ export class EventBus {
    * exact-topic rule wins over patterns; between patterns the
    * earliest-registered matching rule wins.
    */
-  private pauseForTopic(topic: string): { mode: TopicPauseMode; buffer: PauseBufferEntry[] } | undefined {
+  private pauseForTopic(topic: string): { mode: TopicPauseMode; buffer: PauseBufferEntry[]; maxBuffered?: number } | undefined {
     const exact = this.pauseRules.get(topic);
     if (exact !== undefined) return exact;
     for (const [pattern, rule] of this.pauseRules) {
@@ -48561,7 +48697,7 @@ export class EventBus {
             fannedOut = true;
           }
           this.countTopicPaused(top.topic, top.payload, top.publisherId);
-        } else {
+        } else if (
           this.bufferPausedMessage(pauseRule, top.topic, top.payload, {
             key: top.key,
             traceparent: top.traceparent,
@@ -48581,7 +48717,21 @@ export class EventBus {
             deadline: top.deadline,
             // The schedule-time lane rides along too (EB-122).
             priority: top.priority,
-          });
+          })
+        ) {
+          // Buffered: the schedule closes below via its tombstone.
+        } else {
+          // EB-401: the pause buffer is full — the due fan-out sheds
+          // like shed mode: counted with reason 'topic-paused', no
+          // sequence number consumed. A keyed schedule still releases
+          // its key sequence so successors are not stuck behind a
+          // dropped entry. The schedule closes below via its tombstone
+          // and is never re-fanned.
+          if (top.key !== undefined && top.keySeq !== undefined) {
+            this.releaseKeySequence(top.key, top.keySeq);
+            fannedOut = true;
+          }
+          this.countTopicPaused(top.topic, top.payload, top.publisherId);
         }
         this.appendDelayTombstone(top.id, top.topic);
         continue;
@@ -48764,9 +48914,16 @@ export class EventBus {
    * (queue mode requires the durable log for exactly this reason): a
    * crash between pause and resume rebuilds the buffer instead of losing
    * the messages.
+   *
+   * Returns whether the message was buffered (EB-401): `false` when the
+   * rule's `maxBuffered` bound is already reached — the caller then takes
+   * its existing shed branch. The bound is checked before anything is
+   * stamped or journaled, so a refused message burns nothing: no
+   * sequence number, no rate-limit budget, no idempotent slot, no
+   * journal record.
    */
   private bufferPausedMessage(
-    rule: { mode: TopicPauseMode; buffer: PauseBufferEntry[] },
+    rule: { mode: TopicPauseMode; buffer: PauseBufferEntry[]; maxBuffered?: number },
     topic: string,
     payload: unknown,
     opts: {
@@ -48806,7 +48963,13 @@ export class EventBus {
        */
       priority?: MessageLane;
     },
-  ): void {
+  ): boolean {
+    // Queue-buffer bound (EB-401): a full buffer sheds the message
+    // instead of growing without bound. Checked before any stamping or
+    // journaling, so the refusal is side-effect-free.
+    if (rule.maxBuffered !== undefined && rule.buffer.length >= rule.maxBuffered) {
+      return false;
+    }
     const nowMs = this.now();
     const topicTtlMs = this.ttlForTopic(topic);
     // Per-message TTL (EB-149) wins over the topic rule here too: pause
@@ -48887,6 +49050,7 @@ export class EventBus {
       ...(entry.priority === undefined || entry.priority === 'normal' ? {} : { lane: entry.priority }),
     });
     rule.buffer.push(entry);
+    return true;
   }
 
   /**
@@ -48906,7 +49070,7 @@ export class EventBus {
    * fanned out (admitted or shed — both left the buffer; expired and
    * duplicate-suppressed entries drained without fan-out).
    */
-  private drainPauseBuffer(rule: { mode: TopicPauseMode; buffer: PauseBufferEntry[] }): number {
+  private drainPauseBuffer(rule: { mode: TopicPauseMode; buffer: PauseBufferEntry[]; maxBuffered?: number }): number {
     // Splice the buffer up front: re-entrant fan-out below can buffer
     // into *another* rule's buffer, but never back into this one (the
     // rule is already removed from `pauseRules`).
@@ -55058,31 +55222,40 @@ export class EventBus {
           auditPublish(false, undefined, 'topic-paused');
           return { matched: 0, accepted: 0, admitted: false, rejectReason: 'topic-paused' };
         }
-        this.bufferPausedMessage(pauseRule, topic, payload, {
-          key,
-          traceparent,
-          messageId,
-          eventTime,
-          causal,
-          publisherId,
-          schemaVersion,
-          retain,
-          routed,
-          fromBridge,
-          diagnostic,
-          binary,
-          // The per-message TTL (EB-149) rides along so the pause
-          // admission stamps `nowMs + ttlMs` — it wins over the topic TTL
-          // rules exactly like the unpaused path.
-          ttlMs: messageTtlMs,
-          // The per-message absolute delivery deadline (EB-177) rides
-          // along verbatim — the pause admission keeps the earlier of it
-          // and the TTL-derived deadline, exactly like the unpaused path.
-          deadline: messageDeadline,
-          // The pause-time lane rides the buffer entry so the resume
-          // fan-out re-admits the message into its original lane.
-          priority,
-        });
+        // Queue-buffer bound (EB-401): a full buffer sheds the publish
+        // like shed mode — counted with reason 'topic-paused', no
+        // sequence number consumed — instead of growing without bound.
+        if (
+          !this.bufferPausedMessage(pauseRule, topic, payload, {
+            key,
+            traceparent,
+            messageId,
+            eventTime,
+            causal,
+            publisherId,
+            schemaVersion,
+            retain,
+            routed,
+            fromBridge,
+            diagnostic,
+            binary,
+            // The per-message TTL (EB-149) rides along so the pause
+            // admission stamps `nowMs + ttlMs` — it wins over the topic TTL
+            // rules exactly like the unpaused path.
+            ttlMs: messageTtlMs,
+            // The per-message absolute delivery deadline (EB-177) rides
+            // along verbatim — the pause admission keeps the earlier of it
+            // and the TTL-derived deadline, exactly like the unpaused path.
+            deadline: messageDeadline,
+            // The pause-time lane rides the buffer entry so the resume
+            // fan-out re-admits the message into its original lane.
+            priority,
+          })
+        ) {
+          this.countTopicPaused(topic, payload, publisherId);
+          auditPublish(false, undefined, 'topic-paused');
+          return { matched: 0, accepted: 0, admitted: false, rejectReason: 'topic-paused' };
+        }
         // Publisher confirmation (EB-125): a buffered publish is held
         // for resume, not rejected — but it is not admitted either, so
         // it reports 'topic-paused' with no admission. Documented on
@@ -57416,6 +57589,8 @@ export class EventBus {
         topicPattern,
         mode: rule.mode,
         bufferedMessages: rule.buffer.length,
+        // Queue-buffer bound (EB-401): present only while a bound is set.
+        ...(rule.maxBuffered === undefined ? {} : { maxBuffered: rule.maxBuffered }),
       })),
       // Publish-side partition rules (EB-90/EB-216), in registration
       // order — the raw rules; a concrete topic's effective count is the

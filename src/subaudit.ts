@@ -80,6 +80,7 @@ export type SubscriptionAuditAction =
   | 'retained_cleared'
   | 'topic_paused'
   | 'topic_resumed'
+  | 'topic_pause_buffer_limit_revised'
   | 'delayed_cancelled'
   | 'delayed_rescheduled'
   | 'delayed_ttl_extended'
@@ -368,6 +369,7 @@ export type SubscriptionAuditAction =
  *   (the `pattern` and `topic` fields carry the scaled topic)
  * - `topic_paused`: `{ mode: 'shed'|'queue' }` (the `pattern` field carries the rule key)
  * - `topic_resumed`: `{ mode: 'shed'|'queue', drainedMessages: <count> }` (the `pattern` field carries the rule key)
+ * - `topic_pause_buffer_limit_revised`: `{ previous_max_buffered: <number | null>, max_buffered: <number | null> }` — one paused topic's queue-buffer bound was revised live (EB-401; the `pattern` field carries the rule key; `null` means unbounded on either side; only a topic the bus currently holds a pause rule for can be revised — an unknown pattern refuses with `RangeError`, since there is no rule to bound; the new value reuses the pause-time validation (a positive integer, or `null` to clear back to unbounded), so a failed call leaves the live bound untouched; only the bound moves — the rule's mode and its already-buffered messages are untouched, and no resume fires for the revision itself — and the new bound governs only admissions after the revision, so tightening never evicts buffered entries (they drain in order at resume) while loosening or clearing resumes buffering at once; a revision identical to the current bound is a no-op with no audit)
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
  * - `recurring_job_cancelled`: `{ id, topic, cron }` — one live cron recurring job was cancelled by id (EB-371; the `topic` field carries the job's topic)
  * - `recurring_job_revised`: `{ id, previous_cron, cron, payloadFactoryReplaced }` — one live cron recurring job's schedule and/or payload factory was revised by id (EB-371; the `topic` field carries the job's topic)
@@ -581,6 +583,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'retained_cleared',
   'topic_paused',
   'topic_resumed',
+  'topic_pause_buffer_limit_revised',
   'delayed_cancelled',
   'delayed_rescheduled',
   'delayed_ttl_extended',

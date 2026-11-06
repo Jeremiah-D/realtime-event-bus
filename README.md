@@ -4939,6 +4939,19 @@ How it works:
   earliest-registered matching pattern wins (independent matcher cache —
   never inflates `patternCacheSize`). Re-setting a rule replaces its mode
   but keeps an already-held queue buffer (it drains on resume).
+  Queue mode accepts `maxBuffered` (EB-401): a positive-integer cap on the
+  buffer — once full, further publishes shed like shed mode (counted with
+  reason `'topic-paused'`, no sequence number consumed) instead of growing
+  the buffer without bound; `setTopicPauseBufferLimit(topicPattern,
+  maxBuffered | null, actor = 'system')` revises the bound live (`null`
+  clears it back to unbounded; an unknown pattern, an illegal bound, or
+  an illegal actor throws `RangeError`, a same-value revision is a no-op
+  with no audit), `getTopicPauseBufferLimit(topicPattern)` reports it, and
+  the revision is audited as `topic_pause_buffer_limit_revised`
+  (`{ previous_max_buffered, max_buffered }`, `null` meaning unbounded).
+  Tightening the bound never evicts buffered messages; loosening or
+  clearing resumes buffering at once. Passing `maxBuffered` with shed mode
+  throws `RangeError` — shed mode never buffers.
   `resumeTopic` on an unknown pattern is a no-op returning `false`.
   Empty patterns throw `RangeError`, non-string patterns `TypeError`,
   an unknown mode `RangeError`, and queue mode without
@@ -4975,12 +4988,14 @@ How it works:
   themselves are runtime state and do not survive a restart, so the new
   process starts unpaused (the delayed-delivery "already due" precedent).
 - **Observability** — `getStats().pausedTopics` lists the active rules
-  (`{ topicPattern, mode, bufferedMessages }`); Prometheus:
+  (`{ topicPattern, mode, bufferedMessages, maxBuffered? }` — the bound
+  appears only while one is set); Prometheus:
   `eventbus_paused_messages_total` (counter),
   `eventbus_topic_paused_messages_total{topic}` (counter),
   `eventbus_paused_topics` (gauge). Pauses and resumes are recorded in
   the subscription audit log as `topic_paused` (`{ mode }`) and
-  `topic_resumed` (`{ mode, drainedMessages }`).
+  `topic_resumed` (`{ mode, drainedMessages }`); buffer-bound revisions as
+  `topic_pause_buffer_limit_revised` (`{ previous_max_buffered, max_buffered }`).
 
 ## Consumer group pause / resume (ops window)
 
