@@ -7410,7 +7410,9 @@ Semantics:
   bound tripped (`'maxLagMessages'` / `'maxLagMs'` / `'both'`).
 - **Isolated.** A throwing `onLagSloBreach` is swallowed — monitoring
   never breaks the publish/commit path. Works with or without
-  `onGroupLag`; valid but silent when no callback is set.
+  `onGroupLag`; valid but silent when no callback is set. A `groupLag`
+  configured without `onGroupLag` is likewise valid but silent — install
+  its callback later with `setGroupLagCallback` (EB-417).
 
 `getStats().lagSloBreaches` counts total breach episodes fired, and the
 Prometheus exposition carries
@@ -7437,6 +7439,22 @@ or empty revision is a no-op with no audit. Audited as `lag_slo_revised`
 (`{ maxLagMessages?, oldMaxLagMessages?, maxLagMs?, oldMaxLagMs?,
 breachSamples, oldBreachSamples }` — a bound's old value is omitted
 when it was not configured).
+
+Swap the threshold-alert callback live with
+`bus.setGroupLagCallback(callback | null)` (EB-417): the new hook pages
+from the next lag evaluation, `null` silences threshold paging — the
+latch freezes rather than resetting, so a reinstall resumes from the
+frozen state, and a silent `groupLag` that gains a callback pages
+already-lagging rows on the next evaluation — a latched row never
+re-fires under the new hook. Clearing makes
+`setGroupLagDefaultThreshold` refuse until a callback returns, while
+the SLO keeps paging and `lagSloBreaches` keeps climbing. Only a bus
+that already enabled `groupLag` can be revised (otherwise `RangeError`);
+illegal values fail closed with the live callback untouched;
+re-installing the live callback is a no-op with no audit. Audited as
+`group_lag_callback_revised` (`{ hasCallback, oldHasCallback }` — only
+whether a callback is installed is recorded, never the function).
+Observe the live value via `getStats().groupLagHasCallback`.
 
 Retune the alert default live with
 `bus.setGroupLagDefaultThreshold(thresholdMessages)` (EB-363): only the

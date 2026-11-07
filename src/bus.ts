@@ -8152,6 +8152,15 @@ export interface BusStats {
    */
   lagSloHasBreachCallback: boolean;
   /**
+   * Whether an `onGroupLag` callback is currently installed on the
+   * consumer-group lag alerting (see `EventBusOptions.groupLag` and
+   * `setGroupLagCallback`, EB-417): `true` when a threshold excursion
+   * pages a callback, `false` when `groupLag` is silent (no callback
+   * configured, or cleared). The callback function itself is never
+   * exposed.
+   */
+  groupLagHasCallback: boolean;
+  /**
    * Per-subscriber durable-log replay progress (EB-71): one row per
    * subscription that ran a `resumeFromSeq` / `resumeFromTime` replay,
    * in subscription order. Each row carries the pass's `total`,
@@ -17099,6 +17108,15 @@ export class EventBus {
    */
   private lagSloBreachUserHook: ((event: LagSloBreachEvent) => void) | undefined;
   /**
+   * The operator-supplied `onGroupLag` callback (EB-417): `onGroupLag`
+   * carries no ops-alert outlet, so the monitor holds this hook
+   * directly and this field is simply its live reference, kept so a
+   * same-reference check can tell a re-install from a replacement.
+   * `undefined` when no callback is installed (silent `groupLag`, or
+   * cleared via `setGroupLagCallback(null)`).
+   */
+  private groupLagUserHook: ((event: GroupLagEvent) => void) | undefined;
+  /**
    * Stable accessor for the live per-group lag threshold (EB-363): one
    * shared function reference, so `getStats()` snapshots stay
    * `deepEqual` across calls (a fresh arrow per snapshot would break
@@ -18067,6 +18085,10 @@ export class EventBus {
     // live replacement can re-wrap exactly once; the monitor holds the
     // wrapped copy.
     this.lagSloBreachUserHook = resolvedGroupLag?.slo?.onLagSloBreach;
+    // `onGroupLag` carries no ops-alert outlet (EB-417), so the raw
+    // hook is kept on `groupLagUserHook` as the live reference the
+    // monitor already holds — no wrapping, no second copy.
+    this.groupLagUserHook = resolvedGroupLag?.onGroupLag;
     // EB-132: the ops alert outlet sits on top of the EB-112 lag-SLO
     // in-process callback — a breach fires the user's hook first, then
     // raises a signed alert. The user's hook still runs even when the
@@ -41301,6 +41323,116 @@ export class EventBus {
   }
 
   /**
+   * Replaces the consumer-group lag threshold-alert callback live
+   * (EB-417) without restarting the bus: `setGroupLagCallback(callback,
+   * actor = 'system')` swaps the `onGroupLag` paging hook the next
+   * lag evaluation fires (see `EventBusOptions.groupLag`, EB-48) —
+   * repoint threshold paging from one on-call channel to another, or
+   * silence paging for a drill while the SLO and the lag counts keep
+   * their accounting, with no restart and no loss of the live
+   * subscriptions, replay positions, consumer-group assignments, or
+   * rate-limit and dedup state a restart would drop.
+   *
+   * Only the callback moves. The default and per-group thresholds keep
+   * their live values (they still move via `setGroupLagDefaultThreshold`
+   * / `setGroupLagThreshold`, EB-363/EB-48), the SLO bounds and
+   * `onLagSloBreach` are untouched (they still move via `setLagSlo` /
+   * `setLagSloBreachCallback`, EB-314/EB-415), and the alarm latch is
+   * fully preserved: a row already latched does not re-fire under the
+   * new callback (it fires only after recovery and a fresh excursion),
+   * and a silent `groupLag` that gains a callback fires on the next
+   * evaluation for every row already over threshold (its latch starts
+   * empty). `null` clears the callback: `check()` skips the threshold
+   * loop, so the latch freezes rather than resetting — a reinstalled
+   * callback resumes from the frozen state — and `enabled()` may go
+   * false (when no SLO callback exists either), so `check()` stops
+   * being called at all until a callback returns. The lag rows
+   * themselves (`getStats().groupLag`) are still computed on demand
+   * and are unaffected by the freeze. Clearing has one knock-on
+   * effect to know about: `setGroupLagDefaultThreshold` refuses while
+   * no `onGroupLag` is installed (its gate is the callback's
+   * presence), and works again once a callback is reinstalled. The
+   * SLO is unaffected — clearing `onGroupLag` never touches
+   * `sloMonitor.check`, so SLO breaches still page and
+   * `lagSloBreaches` still climbs. No re-evaluation is queued: the
+   * new callback governs from the next lag evaluation (publish,
+   * commit, rebalance, or threshold change), exactly like EB-415.
+   * The callback function itself is never written to the audit log or
+   * any log — only whether one is installed is recorded — and it never
+   * enters a config snapshot: the revision is live-only, a restart
+   * restores the construction-time callback.
+   *
+   * Fail-closed: a bus that never enabled `groupLag`, a closed bus, an
+   * illegal actor, and an illegal callback all throw `RangeError`
+   * with the live callback and the audit log untouched. The gate is
+   * `groupLag` being configured, not a callback already existing — a
+   * silent `groupLag` can gain a callback. Validation reuses the
+   * construction-time rule (`resolveGroupLagOptions`: a callback must
+   * be a function) — `null` clears back to silent — so a value that
+   * could not be set at construction cannot be installed later either.
+   * A throwing callback is still swallowed by `check()`: monitoring
+   * never breaks the publish/commit path. Re-installing the live
+   * callback (the same reference, including `null` against a bus with
+   * no callback) is a no-op with no audit. Audited as
+   * `group_lag_callback_revised` (`{ hasCallback, oldHasCallback }`).
+   *
+   * Orthogonal to EB-48 (that is the per-group runtime lag threshold
+   * — this the missing callback-replacement entry for the same
+   * alerting), to EB-363 (that revises the group-lag default threshold
+   * — its gate is exactly this callback's presence, and this fills the
+   * callback itself), to EB-314 (that retunes the three SLO bounds —
+   * this the threshold-alert callback), to EB-415 (that replaces the
+   * SLO breach callback — same live-replacement shape, different
+   * object: SLO episode callback vs single-excursion callback; that
+   * one re-wraps through the ops-alert outlet, this one has no wrap),
+   * and to EB-112 (that is the SLO mechanism itself — this the
+   * threshold-alert callback).
+   *
+   * Throws `RangeError` when `groupLag` is not enabled, when the bus
+   * is closed, for an illegal actor, or for an illegal callback.
+   */
+  setGroupLagCallback(
+    callback: ((event: GroupLagEvent) => void) | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setGroupLagCallback');
+    const current = this.groupLagMonitor.groupLagCurrent();
+    if (current === undefined) {
+      throw new RangeError('setGroupLagCallback: groupLag is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setLagSloBreachCallback`):
+    // close() already flushed once — there is no live alerting left to
+    // retune.
+    if (this.closed) {
+      throw new RangeError('setGroupLagCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to
+    // silent, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live callback untouched.
+    if (callback !== null && typeof callback !== 'function') {
+      throw new RangeError('setGroupLagCallback: callback must be a function or null');
+    }
+    const next = callback ?? undefined;
+    // Re-installing the live callback (the same reference, including
+    // clearing a bus with no callback) is a no-op: no swap, no audit.
+    if (next === this.groupLagUserHook) {
+      return;
+    }
+    const oldHasCallback = this.groupLagUserHook !== undefined;
+    this.groupLagUserHook = next;
+    this.groupLagMonitor.setGroupLagCallback(next);
+    this.auditSubscription({
+      action: 'group_lag_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
+  /**
    * Adjusts the autoscale signal thresholds at runtime (EB-192),
    * following the `setGroupLagThreshold` convention: the partial is
    * merged over the current thresholds and the merged result is
@@ -59552,6 +59684,7 @@ export class EventBus {
       groupLagThresholdFor: this.groupLagThresholdForFn,
       lagSloBreaches: this.groupLagMonitor.lagSloBreaches(),
       lagSloHasBreachCallback: this.groupLagMonitor.lagSloHasBreachCallback(),
+      groupLagHasCallback: this.groupLagMonitor.groupLagHasCallback(),
       replayProgress,
       // MQTT-style retained messages (EB-87): one row per concrete
       // topic currently holding a retained message, sorted by topic. A

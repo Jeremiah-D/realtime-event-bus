@@ -90,7 +90,10 @@ export interface GroupLagMonitorOptions {
    * threshold, and again only after the lag fell back to or below the
    * threshold and crossed again (latch semantics). A snapshot — mutating
    * it does not affect the bus. Throwing inside the callback is swallowed
-   * and isolated: monitoring never breaks the publish path.
+   * and isolated: monitoring never breaks the publish path. Replaceable
+   * live via `EventBus.setGroupLagCallback` (EB-417): a `groupLag`
+   * configured without a callback is valid but silent until one is
+   * installed, and `null` clears back to silent.
    */
   onGroupLag?: (event: GroupLagEvent) => void;
 }
@@ -462,6 +465,17 @@ export class GroupLagMonitor {
   }
 
   /**
+   * The live group-lag tuning, for bus-level revision (EB-417):
+   * `undefined` when no `groupLag` is configured at all. The gate for
+   * `setGroupLagCallback` — a bus that never enabled `groupLag` holds
+   * no resolved tuning to revise, while a `groupLag` configured
+   * without `onGroupLag` (valid but silent) can gain a callback.
+   */
+  groupLagCurrent(): ResolvedGroupLagOptions | undefined {
+    return this.resolved === undefined ? undefined : { ...this.resolved };
+  }
+
+  /**
    * Retunes the lag-SLO bounds live (EB-314). Throws `RangeError` when
    * no SLO is configured — only a bus that enabled `groupLag.slo` can
    * be revised. The `onLagSloBreach` callback is untouched.
@@ -482,9 +496,37 @@ export class GroupLagMonitor {
     this.sloMonitor.setBreachCallback(callback);
   }
 
+  /**
+   * Replaces the threshold-alert callback live (EB-417), following
+   * `setLagSloBreachCallback` (EB-415): the caller must have validated
+   * `callback` first — this method applies unconditionally, replacing
+   * only the callback while keeping the default and per-group
+   * thresholds, the SLO tuning, and the alarm latch untouched. The
+   * replacement is an object-spread swap of the resolved tuning, so
+   * the next lag evaluation reads the new callback; a latched row does
+   * not re-fire under it (it fires only after recovery and a fresh
+   * excursion). `undefined` clears the callback: `check()` then skips
+   * the threshold loop, so the latch freezes rather than resetting —
+   * a reinstalled callback resumes from the frozen state, and a
+   * silent `groupLag` that gains a callback fires on the next
+   * evaluation for every row already over threshold (its latch starts
+   * empty). When no `groupLag` is configured at all the monitor stays
+   * unconfigured (the bus refuses before reaching here).
+   */
+  setGroupLagCallback(
+    callback: ((event: GroupLagEvent) => void) | undefined,
+  ): void {
+    this.resolved = this.resolved === undefined ? undefined : { ...this.resolved, onGroupLag: callback };
+  }
+
   /** Whether an `onLagSloBreach` callback is currently installed. */
   lagSloHasBreachCallback(): boolean {
     return this.sloMonitor.enabled();
+  }
+
+  /** Whether an `onGroupLag` callback is currently installed. */
+  groupLagHasCallback(): boolean {
+    return this.resolved?.onGroupLag != null;
   }
 
   /** Effective threshold for a group: its override, else the default. */
