@@ -216,10 +216,13 @@ interface TailTraceRecord {
 export class TailSampler {
   // Live-tuned by `retune` (EB-296): the decision and admission sites
   // read these fields on every call, so a revision governs from the next
-  // decision without draining or rebuilding any trace. `onTraceSpan` and
-  // `now` stay fixed for the sampler's lifetime.
+  // decision without draining or rebuilding any trace. `now` stays
+  // fixed for the sampler's lifetime; `onTraceSpan` moves only when
+  // the tail shares the head channel, via `setSpanCallback` (EB-416) —
+  // a tail with its own callback is a separate channel and is never
+  // retargeted by the bus.
   private successSampleRate: number;
-  private readonly onTraceSpan: ((span: TraceSpan) => void) | undefined;
+  private onTraceSpan: ((span: TraceSpan) => void) | undefined;
   private maxOpenTraces: number;
   private maxSpansPerTrace: number;
   private readonly traces = new WeakMap<object, TailTraceRecord>();
@@ -286,6 +289,23 @@ export class TailSampler {
         this.ringHead = 0;
       }
     }
+  }
+
+  /**
+   * Replaces the span observer callback live (EB-416), but only when
+   * the tail shares the head channel — the bus calls this only when
+   * the tail sampler was constructed without its own `onTraceSpan`
+   * and fell back to the head-based composed closure. The caller must
+   * have validated `handler` through `resolveTraceOptions` first —
+   * this method applies unconditionally, like `retune`. The new
+   * callback governs from the next `emit` call, which reads the live
+   * field on every kept span; `undefined` clears back to no observer
+   * (the ring still records every kept span). Open tail traces are
+   * untouched: already-buffered spans stay buffered, and a span
+   * already emitted is never re-delivered.
+   */
+  setSpanCallback(handler: ((span: TraceSpan) => void) | undefined): void {
+    this.onTraceSpan = handler;
   }
 
   /** Whether this message has an open (undecided) tail trace. */

@@ -5845,7 +5845,9 @@ export interface EventBusOptions {
    * dead-letter is always kept; a trace whose deliveries all succeeded
    * is kept with probability `successSampleRate` (default 1). Kept
    * spans flow to the `onTraceSpan` callback channel (the tail option's
-   * own `onTraceSpan`, falling back to `trace.onTraceSpan` when absent)
+   * own `onTraceSpan`, falling back to `trace.onTraceSpan` when absent
+   * — the shared channel moves live via `setTraceSpanCallback`
+   * (EB-416), while a tail with its own callback is untouched by it)
    * and to a bounded ring buffer exported as
    * `getStats().tailSampledSpans` (oldest evicted first, `bufferSize`
    * default 1024). The kept publish root span carries
@@ -7965,6 +7967,15 @@ export interface BusStats {
    * installed — the sampler function itself is never exposed.
    */
   traceHasCustomSampler: boolean;
+  /**
+   * Whether a span observer callback is currently installed on the
+   * trace recorder (see `EventBusOptions.trace.onTraceSpan` and
+   * `setTraceSpanCallback`, EB-416): `true` when sampled spans are
+   * handed to a caller-supplied callback in addition to the ring
+   * buffer, `false` when tracing is disabled or no callback is
+   * installed — the callback function itself is never exposed.
+   */
+  traceHasSpanHandler: boolean;
   /**
    * Tail-sampled delivery-trace spans (see `EventBusOptions.tailSampling`
    * and `src/tail-sampling.ts`, EB-181), oldest first: every span of
@@ -16517,6 +16528,29 @@ export class EventBus {
    */
   private readonly trace: TraceRecorder | undefined;
   /**
+   * The operator-supplied `onTraceSpan` callback, unwrapped (EB-416):
+   * the recorder holds the composed copy (user hook, then the OTLP
+   * exporter, then the archive journal — see
+   * `composeTraceSpanHook`), this field holds the raw hook, so a live
+   * callback replacement can re-compose exactly once and a
+   * same-reference check compares raw against raw. `undefined` when no
+   * callback is installed (never configured, or cleared via
+   * `setTraceSpanCallback(null)`).
+   */
+  private traceSpanUserHook: ((span: TraceSpan) => void) | undefined;
+  /**
+   * Whether the tail sampler shares the head span-observer channel
+   * (EB-416): `true` when the tail sampler was constructed without
+   * its own `onTraceSpan` and fell back to the head-based composed
+   * closure, so a live callback replacement must install the new
+   * composed closure in the tail sampler too. `false` when tail
+   * sampling is disabled, when the tail carries its own callback
+   * (a separate channel), or when tracing itself is disabled.
+   * Decided once at construction; the tail's own callback is never
+   * retargeted.
+   */
+  private readonly tailSharesTraceSpanChannel: boolean;
+  /**
    * Tail-based trace sampler (EB-181, see
    * `EventBusOptions.tailSampling`). `undefined` when disabled — every
    * instrumentation site checks this field first, which is what makes
@@ -17920,22 +17954,17 @@ export class EventBus {
     if (resolvedOtlp !== undefined && resolvedTrace === undefined) {
       throw new RangeError('EventBus: otlp span export requires EventBusOptions.trace to be enabled');
     }
+    // The raw user hook is kept on `traceSpanUserHook` (EB-416) so a
+    // live replacement can re-compose exactly once; the recorder holds
+    // the composed copy (see `composeTraceSpanHook`).
+    this.traceSpanUserHook = resolvedTrace?.onTraceSpan;
     if (resolvedOtlp !== undefined && resolvedTrace !== undefined) {
       // The exporter rides the trace pipeline's span fan-out behind the
       // user's own onTraceSpan (if any): one composition point, no
       // changes to TraceRecorder, and the disabled-trace path stays
       // untouched. resolvedTrace is a fresh object from the resolver, so
       // replacing its callback cannot affect the caller's options.
-      const exporter = new OtlpSpanExporter(resolvedOtlp);
-      const userHook = resolvedTrace.onTraceSpan;
-      resolvedTrace.onTraceSpan =
-        userHook === undefined
-          ? (span) => exporter.exportSpan(span)
-          : (span) => {
-              userHook(span);
-              exporter.exportSpan(span);
-            };
-      this.otlpExporter = exporter;
+      this.otlpExporter = new OtlpSpanExporter(resolvedOtlp);
     } else {
       this.otlpExporter = undefined;
     }
@@ -17950,10 +17979,11 @@ export class EventBus {
         ? undefined
         : new OtlpMetricsExporter(resolvedOtlpMetrics, () => this.getStats());
     // Trace span archive journal (EB-167): the journal rides the trace
-    // pipeline's span fan-out behind the OTLP exporter (if any) — one
-    // more composition point, still no changes to TraceRecorder. Every
-    // sampled span lands in the journal for post-restart
-    // reconstruction; the journal never throws into the span pipeline.
+    // pipeline's span fan-out behind the OTLP exporter (if any) — the
+    // same single composition point (`composeTraceSpanHook`, EB-416),
+    // still no changes to TraceRecorder. Every sampled span lands in
+    // the journal for post-restart reconstruction; the journal never
+    // throws into the span pipeline.
     const traceArchiveOpt = resolvedTrace?.archive;
     let traceArchive: TraceSpanJournal | undefined;
     if (traceArchiveOpt !== undefined && resolvedTrace !== undefined) {
@@ -17964,24 +17994,35 @@ export class EventBus {
         ...traceArchiveOpt,
         now: traceArchiveOpt.now ?? this.now,
       });
-      const spanHook = resolvedTrace.onTraceSpan;
-      resolvedTrace.onTraceSpan =
-        spanHook === undefined
-          ? (span) => journal.record(span)
-          : (span) => {
-              spanHook(span);
-              journal.record(span);
-            };
       traceArchive = journal;
     }
-    this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     this.traceArchive = traceArchive;
+    // One composition point (EB-416): the user hook, the OTLP exporter,
+    // and the archive journal ride a single composed closure — the
+    // constructor and `setTraceSpanCallback` both go through here, so a
+    // replacement never drops either rider. `resolvedTrace` is a fresh
+    // object from the resolver, so replacing its callback cannot affect
+    // the caller's options.
+    if (resolvedTrace !== undefined) {
+      resolvedTrace.onTraceSpan = this.composeTraceSpanHook(resolvedTrace.onTraceSpan);
+    }
+    this.trace = resolvedTrace === undefined ? undefined : new TraceRecorder(resolvedTrace);
     // Tail-based trace sampling (EB-181): resolved after the head-based
     // pipeline so the tail sampler reuses its composed `onTraceSpan`
     // when the tail options carry no callback of their own — the shared
     // callback channel (OTLP exporter and the trace archive journal ride
     // along, like they do for head-based spans).
     const resolvedTailSampling = resolveTailSamplingOptions(options?.tailSampling, 'EventBus');
+    // The tail shares the head observer channel (EB-416) exactly when
+    // it carries no callback of its own and tracing is enabled: the
+    // composed head closure is its callback too, so a live replacement
+    // must retarget both emitters. Recorded once here — the flag is
+    // what `setTraceSpanCallback` consults, so a tail with its own
+    // callback is never retargeted.
+    this.tailSharesTraceSpanChannel =
+      resolvedTailSampling !== undefined &&
+      resolvedTailSampling.onTraceSpan === undefined &&
+      resolvedTrace !== undefined;
     if (resolvedTailSampling !== undefined && resolvedTailSampling.onTraceSpan === undefined) {
       resolvedTailSampling.onTraceSpan = resolvedTrace?.onTraceSpan;
     }
@@ -23931,8 +23972,10 @@ export class EventBus {
    * sampler may hold (see `EventBusOptions.tailSampling`, EB-181).
    *
    * Only the fields provided move; the rest keep their live values.
-   * `onTraceSpan` is not revisable here — it is the observer channel
-   * fixed at construction. In-flight open traces are untouched:
+   * The tail's own `onTraceSpan` is not revisable here — it is a
+   * separate observer channel fixed at construction; the shared head
+   * channel moves via `setTraceSpanCallback` (EB-416). In-flight open
+   * traces are untouched:
    * already-buffered spans stay buffered, and the new values govern
    * from the next decision onward — the next trace decision samples at
    * the live `successSampleRate`, the next span buffers truncate at the
@@ -24029,8 +24072,9 @@ export class EventBus {
    * `EventBusOptions.trace`, EB-45).
    *
    * Only the fields provided move; the rest keep their live values.
-   * `onTraceSpan` and `archive` are not revisable here — they are the
-   * observer channel and the journal identity fixed at construction.
+   * `archive` is not revisable here — it is the journal identity
+   * fixed at construction. `onTraceSpan` moves separately via
+   * `setTraceSpanCallback` (EB-416).
    * `sampler` moves separately via `setTraceSampler` (EB-414).
    * In-flight trace records are untouched: a publish already sampled
    * keeps its trace, and the new values govern from the next decision
@@ -24117,8 +24161,9 @@ export class EventBus {
    * rate-limit and dedup state a restart would drop.
    *
    * Only the sampler moves. `sampleRate` / `bufferSize` keep their
-   * live values (they still move via `setTrace`, EB-311), `onTraceSpan`
-   * and `archive` are untouched, and the ring is never rebuilt: a
+   * live values (they still move via `setTrace`, EB-311), `archive`
+   * is untouched, and `onTraceSpan` moves separately via
+   * `setTraceSpanCallback` (EB-416). The ring is never rebuilt: a
    * publish already sampled keeps its trace — `sample()` decides once
    * at admission, so an already-decided publish is never re-judged —
    * and the buffered spans stay buffered. `null` clears the sampler
@@ -24198,6 +24243,155 @@ export class EventBus {
       detail: {
         hasSampler: resolved.sampler !== undefined,
         oldHasSampler: current.hasSampler,
+      },
+    });
+  }
+
+  /**
+   * Composes the single span-observer closure (EB-416): the user hook
+   * first, then the OTLP span exporter (when configured), then the
+   * trace archive journal (when configured) — the same order the
+   * constructor used to build the two riders inline. The constructor
+   * and `setTraceSpanCallback` both go through here, so a replacement
+   * can never drop a rider or double-wrap one, and the two fan-out
+   * sites can never drift apart. `undefined` when there is no user
+   * hook and neither rider is configured — the recorders then hold no
+   * callback at all and the ring alone records spans. The closure
+   * calls each rider in turn without catching: a throwing user hook
+   * skips the riders behind it for that span, exactly as the
+   * construction-time composition did, and both `emit` sites swallow
+   * the throw so the publish/deliver path is undisturbed.
+   */
+  private composeTraceSpanHook(
+    userHook: ((span: TraceSpan) => void) | undefined,
+  ): ((span: TraceSpan) => void) | undefined {
+    const exporter = this.otlpExporter;
+    const journal = this.traceArchive;
+    if (userHook === undefined && exporter === undefined && journal === undefined) {
+      return undefined;
+    }
+    return (span) => {
+      if (userHook !== undefined) userHook(span);
+      if (exporter !== undefined) exporter.exportSpan(span);
+      if (journal !== undefined) journal.record(span);
+    };
+  }
+
+  /**
+   * Replaces the bus-level trace span observer callback live (EB-416)
+   * without restarting the bus: `setTraceSpanCallback(handler, actor =
+   * 'system')` swaps the `onTraceSpan` hook every sampled span is
+   * handed to (see `EventBusOptions.trace.onTraceSpan`, EB-45) —
+   * repoint span observation from one collector to another, or
+   * withdraw observation for a drill while the ring buffer keeps
+   * recording, with no restart and no loss of the live subscriptions,
+   * replay positions, consumer-group assignments, or rate-limit and
+   * dedup state a restart would drop.
+   *
+   * Only the observer channel moves. `sampleRate` / `bufferSize` keep
+   * their live values (they still move via `setTrace`, EB-311), the
+   * `sampler` is untouched (it still moves via `setTraceSampler`,
+   * EB-414), `archive` is untouched, and the ring is never rebuilt: a
+   * span already emitted is never re-delivered, and the buffered spans
+   * stay buffered. `null` clears the callback back to no observer —
+   * the composed closure degrades to the OTLP exporter and/or the
+   * archive journal alone, or to no callback at all when neither rider
+   * is configured — while the ring keeps recording every sampled span.
+   * The new callback governs from the next span onward. Both emitters
+   * that share the channel move together: the head recorder and, when
+   * the tail sampler fell back to the head channel at construction
+   * (`tailSharesTraceSpanChannel`), the tail sampler — so a tail-kept
+   * span follows the new callback exactly like a head span, and the
+   * two channels can never split. A tail sampler with its own
+   * `onTraceSpan` is a separate channel and is untouched. The callback
+   * function itself is never written to the audit log or any log —
+   * only whether one is installed is recorded — and it never enters a
+   * config snapshot: the revision is live-only, a restart restores the
+   * construction-time callback.
+   *
+   * Fail-closed: a bus that never enabled `trace`, a closed bus, an
+   * illegal actor, and an illegal callback all throw `RangeError` with
+   * the live channel and the audit log untouched. Validation reuses
+   * the construction-time rule (`resolveTraceOptions`: a callback must
+   * be a function) against the merged values — the callback takes the
+   * new value, `sampleRate` / `bufferSize` / `sampler` take their live
+   * values — so a value that could not be set at construction cannot
+   * be installed later either. A throwing callback is still swallowed
+   * by both `emit` sites: observation never breaks the publish/commit
+   * path. Re-installing the live callback (the same reference,
+   * including `null` against a bus with no callback) is a no-op with
+   * no audit. Audited as `trace_span_callback_revised`
+   * (`{ hasHandler, oldHasHandler }`).
+   *
+   * Orthogonal to EB-45 (that is the tracing mechanism itself — this
+   * its missing observer-channel replacement entry), to EB-311 (that
+   * retunes the two numeric bounds — its docs name the observer
+   * channel as fixed, and this fills exactly that named gap), to
+   * EB-414 (that replaces the head sampling decision function — this
+   * the observation channel), to EB-296 (that retunes tail sampling —
+   * this the shared observation channel itself; a tail with its own
+   * callback is a separate channel, left for another item), to EB-167
+   * (that is the archive journal — this the callback riding on top of
+   * it), and to EB-105/406/409/412 (those are the OTLP exporter and
+   * its revisions — this reuses their fan-out composition point but
+   * swaps the user callback).
+   *
+   * Throws `RangeError` when trace is not enabled, when the bus is
+   * closed, for an illegal actor, or for an illegal callback.
+   */
+  setTraceSpanCallback(handler: ((span: TraceSpan) => void) | null, actor = 'system'): void {
+    assertValidActor(actor, 'setTraceSpanCallback');
+    const recorder = this.trace;
+    if (recorder === undefined) {
+      throw new RangeError('setTraceSpanCallback: trace is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setOtlpServiceName`):
+    // close() already flushed once — there is no live trace left to
+    // retune.
+    if (this.closed) {
+      throw new RangeError('setTraceSpanCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined` (the resolver's "no
+    // callback" state) before the merged validation; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live channel untouched.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setTraceSpanCallback: handler must be a function or null');
+    }
+    const current = recorder.current();
+    const resolved = resolveTraceOptions(
+      {
+        sampleRate: current.sampleRate,
+        bufferSize: current.bufferSize,
+        sampler: recorder.currentSampler(),
+        onTraceSpan: handler ?? undefined,
+      },
+      'setTraceSpanCallback',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setTraceSpanCallback: trace is not enabled on this bus');
+    }
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit. The comparison is raw against raw — the recorder holds
+    // the composed copy, which is a fresh closure per composition.
+    if (resolved.onTraceSpan === this.traceSpanUserHook) {
+      return;
+    }
+    const oldHasHandler = this.traceSpanUserHook !== undefined;
+    this.traceSpanUserHook = resolved.onTraceSpan;
+    const composed = this.composeTraceSpanHook(resolved.onTraceSpan);
+    recorder.setSpanCallback(composed);
+    if (this.tailSharesTraceSpanChannel && this.tailSampler !== undefined) {
+      this.tailSampler.setSpanCallback(composed);
+    }
+    this.auditSubscription({
+      action: 'trace_span_callback_revised',
+      actor,
+      detail: {
+        hasHandler: resolved.onTraceSpan !== undefined,
+        oldHasHandler,
       },
     });
   }
@@ -59294,6 +59488,7 @@ export class EventBus {
       },
       traceSpans: this.trace?.snapshot() ?? [],
       traceHasCustomSampler: this.trace?.current().hasSampler ?? false,
+      traceHasSpanHandler: this.traceSpanUserHook !== undefined,
       tailSampledSpans: this.tailSampler?.snapshot() ?? [],
       // OTLP span export (EB-105): present only when configured — the
       // field stays absent otherwise so unconfigured buses keep

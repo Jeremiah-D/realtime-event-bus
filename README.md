@@ -2818,12 +2818,20 @@ library.
   provided move, the rest keep their live values, and the new values
   govern from the next decision — the next publish samples at the live
   rate and the next span write wraps at the live capacity.
-  `onTraceSpan` and `archive` are not revisable. Swap the head sampler
+  `archive` is not revisable. Swap the head sampler
   live with `setTraceSampler(sampler | null)` (EB-414): the new decision
   function governs from the next admission-time sample, `null` clears
   back to the live rate, already-sampled publishes are never re-judged,
   and the audit records only whether a sampler is installed
   (`{ hasSampler, oldHasSampler }`, audited as `trace_sampler_revised`).
+  Swap the span observer callback live with
+  `setTraceSpanCallback(handler | null)` (EB-416): the new callback
+  governs from the next span, `null` clears back to no observer, the
+  composed closure (user hook, OTLP exporter, archive journal) is
+  rebuilt once and installed in both the head recorder and — when the
+  tail shares the channel — the tail sampler, and the audit records
+  only whether a callback is installed (`{ hasHandler, oldHasHandler }`,
+  audited as `trace_span_callback_revised`).
   Shrinking `bufferSize`
   keeps the buffered spans until the next span covers the excess down to
   the live bound; growing keeps every buffered span in chronological
@@ -2852,8 +2860,9 @@ library.
   live rate, the next span buffers truncate at the live per-trace cap,
   the next open enforces the live open-trace budget (tightening it
   force-decides the oldest open traces), and shrinking `bufferSize`
-  trims the ring to the newest spans at once. `onTraceSpan` is not
-  revisable. Only a bus that enabled `tailSampling` can be revised
+  trims the ring to the newest spans at once. The tail's own
+  `onTraceSpan` is not revisable (the shared head channel moves via
+  `setTraceSpanCallback`, EB-416). Only a bus that enabled `tailSampling` can be revised
   (otherwise `RangeError`); illegal values fail closed with the live
   tuning untouched; an identical or empty revision is a no-op with no
   audit. Audited as `tail_sampling_revised` (old and new values).

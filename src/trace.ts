@@ -159,9 +159,9 @@ export interface ResolvedTraceOptions {
 
 /**
  * Bus-level revision for head-based trace tuning (EB-311). Only the two
- * numeric bounds move — `onTraceSpan` and `archive` are fixed at
- * construction and are not revisable here. The `sampler` moves
- * separately, via `setTraceSampler` (EB-414).
+ * numeric bounds move — `archive` is fixed at construction and is not
+ * revisable here. The `sampler` moves separately, via `setTraceSampler`
+ * (EB-414), and `onTraceSpan` via `setTraceSpanCallback` (EB-416).
  */
 export interface TraceRevision {
   /**
@@ -321,11 +321,13 @@ export class TraceRecorder {
   // Live-tuned by `retune` (EB-311) and `setSampler` (EB-414): the
   // sampling decision and the ring write read these fields on every
   // call, so a revision governs from the next sample / next span
-  // without draining or rebuilding anything. `onTraceSpan` stays fixed
-  // for the recorder's lifetime.
+  // without draining or rebuilding anything. `onTraceSpan` moves via
+  // `setSpanCallback` (EB-416): the bus re-composes it on every
+  // callback replacement, so the OTLP exporter and the archive journal
+  // riding the same closure follow the new user hook.
   private sampleRate: number;
   private sampler: TraceSampler | undefined;
-  private readonly onTraceSpan: ((span: TraceSpan) => void) | undefined;
+  private onTraceSpan: ((span: TraceSpan) => void) | undefined;
   private readonly traces = new WeakMap<object, MessageTraceState>();
   private readonly ring: TraceSpan[] = [];
   private ringHead = 0;
@@ -368,6 +370,24 @@ export class TraceRecorder {
    */
   setSampler(sampler: TraceSampler | undefined): void {
     this.sampler = sampler;
+  }
+
+  /**
+   * Replaces the span observer callback live (EB-416). The caller must
+   * have validated `handler` through `resolveTraceOptions` first —
+   * this method applies unconditionally, like `setSampler`. The new
+   * callback governs from the next `emit` call, which reads the live
+   * field on every span; `undefined` clears back to no observer (the
+   * ring still records every sampled span). The installed callback is
+   * normally the bus's composed closure — the user hook with the OTLP
+   * exporter and the archive journal riding behind it — so a
+   * replacement never drops either rider. In-flight trace records
+   * (the `WeakMap` of open publishes) are untouched: a span already
+   * emitted is never re-delivered, and a throwing callback is still
+   * swallowed by `emit`.
+   */
+  setSpanCallback(handler: ((span: TraceSpan) => void) | undefined): void {
+    this.onTraceSpan = handler;
   }
 
   /**
