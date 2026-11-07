@@ -16619,7 +16619,8 @@ export class EventBus {
    * once, so a live attach needs the directory kept here — a journal
    * attached later is always built under this directory, never under
    * a caller-supplied one. `undefined` when the bus was built
-   * without a durable log directory, in which case an attach refuses.
+   * without a durable log directory, in which case an attach refuses
+   * until the directory moves live via `setTraceArchiveDir` (EB-421).
    */
   private traceArchiveDir: string | undefined;
   /**
@@ -24713,8 +24714,9 @@ export class EventBus {
    * and the ring is never rebuilt: a span already emitted is never
    * re-delivered, and the buffered spans stay buffered. Attaching
    * builds a fresh `TraceSpanJournal` under the bus's
-   * `durableLogDir` (captured at construction — the directory is
-   * never revisable, and no `dir` parameter is accepted), with the
+   * `durableLogDir` (captured at construction — the directory moves
+   * live only via `setTraceArchiveDir`, EB-421, and no `dir` parameter
+   * is accepted here), with the
    * bus clock (`opts` never accepts `now`), and the new journal
    * governs from the next span onward. Its constructor `recover()`
    * back-fills from disk, so spans archived before the attach —
@@ -24847,6 +24849,124 @@ export class EventBus {
       detail: {
         enabled,
         oldEnabled,
+      },
+    });
+  }
+
+  /**
+   * Migrates the trace span archive journal's directory live (EB-421)
+   * without restarting the bus:
+   * `setTraceArchiveDir(dir, actor = 'system')` moves the directory
+   * the journal is built under — the archive volume filled up, or the
+   * bus was built without a `durableLogDir` and archiving should
+   * start somewhere now — with no restart and no loss of the live
+   * subscriptions, replay positions, consumer-group assignments, or
+   * rate-limit and dedup state a restart would drop.
+   *
+   * Only the directory moves. When a journal is attached, a fresh
+   * `TraceSpanJournal` is built under the new directory with the live
+   * journal's current `maxEntries` / `maxBytes` (they still move via
+   * `setTraceArchive`, EB-315) and the bus clock, the captured
+   * directory is updated (a later detach/re-attach builds under the
+   * new directory), and the single shared span closure is re-composed
+   * and installed in both emitters that share the channel — the head
+   * recorder and, when the tail sampler fell back to the head channel
+   * at construction, the tail sampler — so the new journal never
+   * misses a span, while a tail with its own callback is a separate
+   * channel and is untouched. The new journal's constructor
+   * `recover()` back-fills spans already in the new directory, so
+   * they are queryable through `getTraceArchive()` at once, and spans
+   * already emitted are never re-sent. When no journal is attached
+   * only the captured directory moves — the next attach (via
+   * `setTraceArchiveEnabled`, EB-419) builds under the new directory.
+   * The old directory's files are left exactly as they are (never
+   * deleted, along the EB-61 archive convention), and the in-memory
+   * read view is replaced by the new journal's recovered view.
+   *
+   * The `sampleRate` / `bufferSize` keep their live values (they
+   * still move via `setTrace`, EB-311), the `sampler` is untouched
+   * (it still moves via `setTraceSampler`, EB-414), the `onTraceSpan`
+   * callback is untouched (it still moves via `setTraceSpanCallback`,
+   * EB-416), and the ring is never rebuilt. Migrating to the current
+   * directory is a no-op with no audit.
+   *
+   * Fail-closed: a bus that never enabled `trace`, a closed bus, an
+   * illegal actor, and a non-string or empty `dir` all throw
+   * `RangeError` with the live state and the audit log untouched.
+   * The migration is live-only — a restart restores the
+   * construction-time directory — and it never enters a config
+   * snapshot. Audited as `trace_archive_dir_revised`
+   * (`{ oldDir, dir }` — only the directories, never any bound;
+   * `oldDir` is `null` when the bus was built without a
+   * `durableLogDir`). This overturns the EB-419 exclusion (the
+   * directory "is never revisable"), along the EB-418 precedent of
+   * overturning an EB-296 exclusion.
+   *
+   * Orthogonal to EB-167 (that is the archive journal itself — this
+   * its missing live directory migration), to EB-315 (that retunes
+   * the two numeric bounds of an already-enabled journal — this the
+   * directory), to EB-311/EB-414/EB-416 (those are sampling, the
+   * sampler, and the callback — this the directory), to EB-419 (that
+   * is the attach/detach switch — this the directory that switch
+   * builds under), and to EB-309 (that is the publish audit journal
+   * — its directory stays fixed).
+   *
+   * Throws `RangeError` when trace is not enabled, when the bus is
+   * closed, for an illegal actor, or for a non-string or empty `dir`.
+   */
+  setTraceArchiveDir(dir: string, actor = 'system'): void {
+    assertValidActor(actor, 'setTraceArchiveDir');
+    const recorder = this.trace;
+    if (recorder === undefined) {
+      throw new RangeError('setTraceArchiveDir: trace is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live trace left to
+    // archive anywhere.
+    if (this.closed) {
+      throw new RangeError('setTraceArchiveDir: bus is closed');
+    }
+    if (typeof dir !== 'string' || dir.length === 0) {
+      throw new RangeError('setTraceArchiveDir: dir must be a non-empty string');
+    }
+    // Migrating to the current directory moves nothing: no rebuild, no
+    // audit.
+    const oldDir = this.traceArchiveDir;
+    if (dir === oldDir) {
+      return;
+    }
+    if (this.traceArchive !== undefined) {
+      // Carry the live bounds forward; the clock is always the bus
+      // clock. The constructor `recover()` back-fills from the new
+      // directory, so spans already there are queryable at once.
+      const current = this.traceArchive.current();
+      this.traceArchive = new TraceSpanJournal(dir, {
+        maxEntries: current.maxEntries,
+        maxBytes: current.maxBytes,
+        now: this.now,
+      });
+      // The composed closure captured the old journal reference at
+      // composition time, so the head recorder — and, when the tail
+      // shares the head channel, the tail sampler — must be re-pointed
+      // at the freshly composed closure, or the new journal would
+      // never see a span. A tail with its own callback is a separate
+      // channel and is untouched.
+      const composed = this.composeTraceSpanHook(this.traceSpanUserHook);
+      recorder.setSpanCallback(composed);
+      if (this.tailSharesTraceSpanChannel && this.tailSampler !== undefined) {
+        this.tailSampler.setSpanCallback(composed);
+      }
+    }
+    // The captured directory moves last, so a later detach/re-attach
+    // builds under the new directory; a bus built without one gains a
+    // directory it can attach under.
+    this.traceArchiveDir = dir;
+    this.auditSubscription({
+      action: 'trace_archive_dir_revised',
+      actor,
+      detail: {
+        oldDir: oldDir ?? null,
+        dir,
       },
     });
   }

@@ -7018,8 +7018,26 @@ the journal reference and never deletes disk files, so re-attaching
 recovers them. `opts` takes only `maxEntries` / `maxBytes` (omitted
 bounds fall back to the defaults); on an already-attached bus a repeat
 attach is a no-op and `opts` is ignored (the bounds still move via
-`setTraceArchive`). The directory and the clock are never revisable.
+`setTraceArchive`). The clock is never revisable; the directory moves
+live via `setTraceArchiveDir` (EB-421, below).
 Audited as `trace_archive_enabled_revised` (`{ enabled, oldEnabled }`).
+
+Migrate the journal's directory live with
+`bus.setTraceArchiveDir(dir, actor?)` (EB-421): when a journal is
+attached, a fresh journal is built under the new directory with the
+live journal's current `maxEntries` / `maxBytes` and the bus clock,
+and the shared span closure is re-composed so new spans land in the
+new directory; the new journal back-fills spans already in the new
+directory, and the old directory's files are left exactly as they are
+(never deleted). When no journal is attached only the captured
+directory moves, so the next attach builds under the new directory —
+a bus built without a `durableLogDir` gains a directory it can attach
+under. Migrating to the current directory is a no-op with no audit;
+a bus that never enabled `trace`, a closed bus, and an empty or
+non-string `dir` all throw `RangeError`. The migration is live-only
+(a restart restores the construction-time directory).
+Audited as `trace_archive_dir_revised` (`{ oldDir, dir }` — `oldDir`
+is `null` when the bus was built without a `durableLogDir`).
 
 ## Pluggable partition assignors (EB-106)
 
