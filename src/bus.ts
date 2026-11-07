@@ -141,6 +141,7 @@ import {
   resolveGroupLagOptions,
   resolveLagSloOptions,
   type GroupLagStat,
+  type LagSloBreachEvent,
   type LagSloRevision,
 } from './grouplag.ts';
 import {
@@ -8130,6 +8131,15 @@ export interface BusStats {
    * not configured.
    */
   lagSloBreaches: number;
+  /**
+   * Whether an `onLagSloBreach` callback is currently installed on
+   * the consumer-lag SLO (see `EventBusOptions.groupLag.slo` and
+   * `setLagSloBreachCallback`, EB-415): `true` when a breach episode
+   * pages a callback, `false` when the SLO has bounds only (valid but
+   * silent) or the callback was cleared. The callback function itself
+   * is never exposed.
+   */
+  lagSloHasBreachCallback: boolean;
   /**
    * Per-subscriber durable-log replay progress (EB-71): one row per
    * subscription that ran a `resumeFromSeq` / `resumeFromTime` replay,
@@ -17045,6 +17055,16 @@ export class EventBus {
    */
   private readonly groupLagMonitor: GroupLagMonitor;
   /**
+   * The operator-supplied `onLagSloBreach` callback, unwrapped (EB-415):
+   * the monitor holds the ops-alert-wrapped copy (when an alerter is
+   * configured), this field holds the raw hook, so a live callback
+   * replacement can re-wrap exactly once and a same-reference check
+   * compares raw against raw. `undefined` when no callback is
+   * installed (bounds-only SLO, or cleared via
+   * `setLagSloBreachCallback(null)`).
+   */
+  private lagSloBreachUserHook: ((event: LagSloBreachEvent) => void) | undefined;
+  /**
    * Stable accessor for the live per-group lag threshold (EB-363): one
    * shared function reference, so `getStats()` snapshots stay
    * `deepEqual` across calls (a fresh arrow per snapshot would break
@@ -18002,33 +18022,19 @@ export class EventBus {
       this.armRemediateTimer();
     }
     const resolvedGroupLag = resolveGroupLagOptions(options?.groupLag, 'EventBus');
+    // The raw user hook is kept on `lagSloBreachUserHook` (EB-415) so a
+    // live replacement can re-wrap exactly once; the monitor holds the
+    // wrapped copy.
+    this.lagSloBreachUserHook = resolvedGroupLag?.slo?.onLagSloBreach;
     // EB-132: the ops alert outlet sits on top of the EB-112 lag-SLO
     // in-process callback — a breach fires the user's hook first, then
     // raises a signed alert. The user's hook still runs even when the
     // alert path throws (it cannot — `note` is infallible — but the
     // `finally` documents the ordering contract).
     if (this.opsAlerter !== undefined && resolvedGroupLag?.slo?.onLagSloBreach !== undefined) {
-      const userHook = resolvedGroupLag.slo.onLagSloBreach;
-      const alerter = this.opsAlerter;
-      resolvedGroupLag.slo.onLagSloBreach = (event) => {
-        try {
-          userHook(event);
-        } finally {
-          alerter.note(
-            'lag-slo-breach',
-            [event.groupId, event.pattern, event.topic, String(event.partition ?? '')].join('\0'),
-            {
-              groupId: event.groupId,
-              pattern: event.pattern,
-              topic: event.topic,
-              ...(event.partition === undefined ? {} : { partition: event.partition }),
-              lag: event.lag,
-              violated: event.violated,
-              consecutiveSamples: event.consecutiveSamples,
-            },
-          );
-        }
-      };
+      resolvedGroupLag.slo.onLagSloBreach = this.wrapLagSloBreachHook(
+        resolvedGroupLag.slo.onLagSloBreach,
+      );
     }
     this.groupLagMonitor = new GroupLagMonitor(resolvedGroupLag);
     // EB-192: validated fail-fast — bad autoscale thresholds must never
@@ -40861,9 +40867,8 @@ export class EventBus {
    * breach episode pages (see `EventBusOptions.groupLag.slo`, EB-112).
    *
    * Only the fields provided move; the rest keep their live values.
-   * `onLagSloBreach` is not revisable here — the alert callback (and
-   * its identity, including the ops-alert outlet wrap) is fixed at
-   * construction. In-flight episode state is preserved: a row's
+   * `onLagSloBreach` moves separately via `setLagSloBreachCallback`
+   * (EB-415). In-flight episode state is preserved: a row's
    * consecutive-breach count, latched breach, and episode start are not
    * reset, so a new bound governs from the next lag evaluation and a
    * new `breachSamples` from the next consecutive count — a tightened
@@ -40952,6 +40957,151 @@ export class EventBus {
             }),
         breachSamples,
         oldBreachSamples: current.breachSamples,
+      },
+    });
+  }
+
+  /**
+   * Wraps a user-supplied `onLagSloBreach` hook with the ops-alert
+   * outlet (EB-132/EB-415): a breach fires the user's hook first, then
+   * raises a signed `lag-slo-breach` alert. Without an alerter the hook
+   * passes through unwrapped. The wrap is applied exactly once per
+   * hook — the constructor and `setLagSloBreachCallback` both go
+   * through here, and the raw hook is kept on
+   * `lagSloBreachUserHook`, so a replacement is never wrapped twice
+   * (which would note every episode twice) and never loses the outlet
+   * (a naive swap would drop it). The user's hook still runs even
+   * when the alert path throws (it cannot — `note` is infallible —
+   * but the `finally` documents the ordering contract).
+   */
+  private wrapLagSloBreachHook(
+    hook: (event: LagSloBreachEvent) => void,
+  ): (event: LagSloBreachEvent) => void {
+    const alerter = this.opsAlerter;
+    if (alerter === undefined) return hook;
+    return (event) => {
+      try {
+        hook(event);
+      } finally {
+        alerter.note(
+          'lag-slo-breach',
+          [event.groupId, event.pattern, event.topic, String(event.partition ?? '')].join('\0'),
+          {
+            groupId: event.groupId,
+            pattern: event.pattern,
+            topic: event.topic,
+            ...(event.partition === undefined ? {} : { partition: event.partition }),
+            lag: event.lag,
+            violated: event.violated,
+            consecutiveSamples: event.consecutiveSamples,
+          },
+        );
+      }
+    };
+  }
+
+  /**
+   * Replaces the consumer-lag SLO breach callback live (EB-415)
+   * without restarting the bus: `setLagSloBreachCallback(callback,
+   * actor = 'system')` swaps the `onLagSloBreach` paging hook the
+   * next lag evaluation fires (see `EventBusOptions.groupLag.slo`,
+   * EB-112) — repoint paging from one on-call channel to another, or
+   * silence paging for a drill while the breach count keeps its
+   * accounting, with no restart and no loss of the live
+   * subscriptions, replay positions, consumer-group assignments, or
+   * rate-limit and dedup state a restart would drop.
+   *
+   * Only the callback moves. The three numeric bounds keep their live
+   * values (they still move via `setLagSlo`, EB-314), `onGroupLag`
+   * is untouched, and the episode state is fully preserved: a row's
+   * consecutive-breach count, latched breach, and episode start are
+   * not reset — a latched episode does not re-fire under the new
+   * callback (it fires only after recovery and a fresh breach), and
+   * a mid-debounce swap hands the remaining samples over to the new
+   * callback. `null` clears the callback: `check()` returns early,
+   * so the episode state freezes rather than resetting — a reinstalled
+   * callback resumes from the frozen state, and since `episodeStartAt`
+   * is measured on the bus clock, lag accrued during the silence may
+   * trip the `maxLagMs` bound on the very next sample after the
+   * reinstall. The ops-alert outlet follows the new callback: the
+   * replacement is wrapped exactly once (see
+   * `wrapLagSloBreachHook`), so every episode notes exactly once,
+   * and clearing silences the outlet too — with no callback installed
+   * there is no hook to wrap, matching the construction-time "no
+   * callback, no note" rule. The callback function itself is never
+   * written to the audit log or any log — only whether one is
+   * installed is recorded — and it never enters a config snapshot:
+   * the revision is live-only, a restart restores the
+   * construction-time callback.
+   *
+   * Fail-closed: a bus that never enabled `groupLag.slo`, a closed
+   * bus, an illegal actor, and an illegal callback all throw
+   * `RangeError` with the live callback and the audit log untouched.
+   * The gate is the SLO being configured, not a callback already
+   * existing — a bounds-only SLO can gain a callback. Validation
+   * reuses the construction-time rule (`resolveLagSloOptions`: a
+   * callback must be a function) — `null` clears back to silent —
+   * so a value that could not be set at construction cannot be
+   * installed later either. A throwing callback is still swallowed
+   * by `check()`: monitoring never breaks the publish/commit path.
+   * Re-installing the live callback (the same reference, including
+   * `null` against a bus with no callback) is a no-op with no audit.
+   * Audited as `lag_slo_breach_callback_revised`
+   * (`{ hasCallback, oldHasCallback }`).
+   *
+   * Orthogonal to EB-112 (that is the SLO alerting mechanism itself
+   * — this its missing callback-replacement entry), to EB-314 (that
+   * retunes the three numeric bounds — its docs name the callback as
+   * fixed, and this fills exactly that named gap), to EB-48 (that is
+   * the per-group runtime lag threshold — this the bus-level SLO
+   * callback), to EB-132 (that is the ops-alert signed webhook outlet
+   * — this its upstream in-process callback), and to EB-363 (that
+   * revises the group-lag default threshold — this the SLO callback).
+   *
+   * Throws `RangeError` when `groupLag.slo` is not enabled, when the
+   * bus is closed, for an illegal actor, or for an illegal callback.
+   */
+  setLagSloBreachCallback(
+    callback: ((event: LagSloBreachEvent) => void) | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setLagSloBreachCallback');
+    const current = this.groupLagMonitor.lagSloCurrent();
+    if (current === undefined) {
+      throw new RangeError('setLagSloBreachCallback: groupLag.slo is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setOtlpServiceName`):
+    // close() already flushed once — there is no live SLO left to
+    // retune.
+    if (this.closed) {
+      throw new RangeError('setLagSloBreachCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to
+    // silent, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live callback untouched.
+    if (callback !== null && typeof callback !== 'function') {
+      throw new RangeError('setLagSloBreachCallback: callback must be a function or null');
+    }
+    const next = callback ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit. The comparison is raw against raw — the monitor holds
+    // the ops-alert-wrapped copy, which is a fresh closure per wrap.
+    if (next === this.lagSloBreachUserHook) {
+      return;
+    }
+    const oldHasCallback = this.lagSloBreachUserHook !== undefined;
+    this.lagSloBreachUserHook = next;
+    this.groupLagMonitor.setLagSloBreachCallback(
+      next === undefined ? undefined : this.wrapLagSloBreachHook(next),
+    );
+    this.auditSubscription({
+      action: 'lag_slo_breach_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
       },
     });
   }
@@ -59206,6 +59356,7 @@ export class EventBus {
       groupLag: this.groupLagRowsFor(undefined),
       groupLagThresholdFor: this.groupLagThresholdForFn,
       lagSloBreaches: this.groupLagMonitor.lagSloBreaches(),
+      lagSloHasBreachCallback: this.groupLagMonitor.lagSloHasBreachCallback(),
       replayProgress,
       // MQTT-style retained messages (EB-87): one row per concrete
       // topic currently holding a retained message, sorted by topic. A

@@ -168,8 +168,8 @@ export interface ResolvedLagSloOptions {
 /**
  * A partial bus-level revision of the consumer-lag SLO tuning, for
  * `EventBus.setLagSlo` (EB-314). Only the fields provided move; the rest
- * keep their live values. The `onLagSloBreach` callback is not revisable
- * here — it is fixed at construction.
+ * keep their live values. The `onLagSloBreach` callback moves
+ * separately, via `EventBus.setLagSloBreachCallback` (EB-415).
  */
 export interface LagSloRevision {
   /**
@@ -291,6 +291,21 @@ export class LagSloMonitor {
       throw new RangeError('LagSloMonitor.retune: no lag SLO is configured');
     }
     this.slo = { ...this.slo, ...next };
+  }
+
+  /**
+   * Replaces the breach callback live (EB-415). The caller must have
+   * validated `callback` first — this method applies unconditionally,
+   * like `retune`, replacing only the callback while keeping the three
+   * numeric bounds and their identity untouched. `undefined` clears
+   * the callback: `check()` then returns early (the early return at
+   * the top of `check`), so in-flight episode state (`rows`) freezes
+   * rather than resetting — a reinstalled callback resumes from the
+   * frozen state. When no SLO is configured at all the monitor stays
+   * unconfigured (the bus refuses before reaching here).
+   */
+  setBreachCallback(callback: ((event: LagSloBreachEvent) => void) | undefined): void {
+    this.slo = this.slo === undefined ? undefined : { ...this.slo, onLagSloBreach: callback };
   }
 
   /**
@@ -453,6 +468,23 @@ export class GroupLagMonitor {
    */
   retuneLagSlo(next: { maxLagMessages?: number; maxLagMs?: number; breachSamples: number }): void {
     this.sloMonitor.retune(next);
+  }
+
+  /**
+   * Replaces the lag-SLO breach callback live (EB-415), delegating to
+   * `LagSloMonitor.setBreachCallback`. The three numeric bounds and
+   * the in-flight episode state are untouched — the new callback
+   * governs from the next lag evaluation.
+   */
+  setLagSloBreachCallback(
+    callback: ((event: LagSloBreachEvent) => void) | undefined,
+  ): void {
+    this.sloMonitor.setBreachCallback(callback);
+  }
+
+  /** Whether an `onLagSloBreach` callback is currently installed. */
+  lagSloHasBreachCallback(): boolean {
+    return this.sloMonitor.enabled();
   }
 
   /** Effective threshold for a group: its override, else the default. */
