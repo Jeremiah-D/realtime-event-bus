@@ -24853,8 +24853,8 @@ export class EventBus {
    * `flushIntervalMs` rebuilds the flush timer at the new interval
    * without rebuilding the exporter — the buffer is retained, nothing
    * is lost or re-sent, and the new cadence governs from the next
-   * tick. `serviceName` is not revisable here — it is the export
-   * identity fixed at construction; `headers` move via
+   * tick. `serviceName` is not revisable here — it moves via
+   * `setOtlpServiceName` (EB-412); `headers` move via
    * `setOtlpHeaders` (EB-409) and the `endpoint` via `setOtlpEndpoint`
    * (EB-406), not here.
    *
@@ -25160,6 +25160,113 @@ export class EventBus {
         headers: Object.keys(resolved.headers),
         oldHeaders: Object.keys(current.headers),
       },
+    });
+  }
+
+  /**
+   * Renames the OTLP span export identity live (EB-412) without
+   * restarting the bus: `setOtlpServiceName(serviceName, actor =
+   * 'system')` moves the `service.name` resource attribute the next
+   * export POST carries (see `EventBusOptions.otlp`, EB-105) — a
+   * service rename, a staging-to-prod promotion, or a multi-tenant
+   * re-attribution, with no restart and no loss of the live
+   * subscriptions, replay positions, consumer-group assignments, or
+   * rate-limit and dedup state a restart would drop.
+   *
+   * Only the service name moves. A POST already in flight keeps the
+   * name it started with (`postBatch` encodes `serviceName` when the
+   * request body is built); buffered spans stay buffered, are never
+   * re-sent and never dropped by the rename — but they export under
+   * the new name, since the name is encoded at export time: the
+   * series forks at the rename point (no backfill, no re-send of
+   * already-exported spans). The flush timer is not rebuilt, and the
+   * five numeric bounds (`sampleRate`/`batchSize`/`flushIntervalMs`/
+   * `timeoutMs`/`maxBuffered`), the `endpoint`, and `headers` are
+   * untouched. The live name is visible as
+   * `getStats().otlp.serviceName`, which reads the live field on
+   * every call. The revision is live-only — a restart restores the
+   * construction-time service name — and it never enters a config
+   * snapshot. No collector-side series merge: the old name's series
+   * simply stops receiving new spans.
+   *
+   * Fail-closed: a bus that never enabled `otlp`, a closed bus, an
+   * illegal actor, and an illegal service name all throw `RangeError`
+   * with the live name and the audit log untouched. Validation reuses
+   * the construction-time rule (`resolveOtlpOptions`: a non-empty
+   * string) against the merged values — the service name takes the
+   * new value, the other five numerics plus the endpoint and
+   * `headers` take their live values — so a value that could not be
+   * set at construction cannot be renamed to later either.
+   * Validation runs before the no-op check, so an illegal value can
+   * never pass as "same as current". A revision identical to the
+   * current name is a no-op with no audit. Audited as
+   * `otlp_service_name_revised` (`{ serviceName, oldServiceName }`).
+   *
+   * Orthogonal to EB-105 (that is the export mechanism itself — this
+   * its missing identity-rename entry), to EB-406 (that repoints the
+   * span exporter endpoint — another field), to EB-409 (that rotates
+   * the span exporter headers — another field), to EB-299/EB-357
+   * (those revise the five numeric bounds — their docs name the
+   * service name as fixed, and this fills exactly that named gap),
+   * and to EB-413 (that renames the metrics exporter — the other
+   * exporter).
+   *
+   * Throws `RangeError` when OTLP export is not enabled, when the bus
+   * is closed, for an illegal actor, or for an illegal service name.
+   */
+  setOtlpServiceName(serviceName: string, actor = 'system'): void {
+    assertValidActor(actor, 'setOtlpServiceName');
+    const exporter = this.otlpExporter;
+    if (exporter === undefined) {
+      throw new RangeError('setOtlpServiceName: otlp is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setOtlpEndpoint`):
+    // close() already flushed once and stopped the exporter — there
+    // is no live export left to rename.
+    if (this.closed) {
+      throw new RangeError('setOtlpServiceName: bus is closed');
+    }
+    // A non-string or empty name is rejected outright: the resolver
+    // would otherwise coalesce `null`/`undefined` to the default
+    // (an absent optional at construction), which at this level must
+    // be a fail-closed illegal value, not a silent rename to the
+    // default — matching `setOtlpEndpoint`/`setOtlpHeaders`, where a
+    // null argument throws.
+    if (typeof serviceName !== 'string' || serviceName.length === 0) {
+      throw new RangeError('setOtlpServiceName: serviceName must be a non-empty string');
+    }
+    // Validate before touching anything: the service name takes the
+    // new value, everything else takes its live value, so a failed
+    // call changes nothing at all. Validation reuses the
+    // construction-time rule, so a non-string or empty value is
+    // rejected here — before the no-op check, so an illegal value can
+    // never pass as "same as current".
+    const current = exporter.current();
+    const resolved = resolveOtlpOptions(
+      {
+        endpoint: current.endpoint.toString(),
+        sampleRate: current.sampleRate,
+        batchSize: current.batchSize,
+        flushIntervalMs: current.flushIntervalMs,
+        timeoutMs: current.timeoutMs,
+        headers: { ...current.headers },
+        serviceName,
+        maxBuffered: current.maxBuffered,
+      },
+      'setOtlpServiceName',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setOtlpServiceName: otlp is not enabled on this bus');
+    }
+    // Re-affirming the current name is a no-op: no rename, no audit.
+    if (resolved.serviceName === current.serviceName) {
+      return;
+    }
+    exporter.setServiceName(resolved.serviceName);
+    this.auditSubscription({
+      action: 'otlp_service_name_revised',
+      actor,
+      detail: { serviceName: resolved.serviceName, oldServiceName: current.serviceName },
     });
   }
 

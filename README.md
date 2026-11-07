@@ -6716,9 +6716,10 @@ Semantics notes:
   as a rising counter, not as backpressure.
 - Composes with a user-supplied `TraceOptions.onTraceSpan`: the callback
   still fires for every sampled span.
-- `getStats().otlp` (`{ endpoint, bufferedSpans, exportedSpans,
-  failedSpans, droppedSpans }`) is present only when export is
-  configured; without it the stats shape is byte-identical to before.
+- `getStats().otlp` (`{ endpoint, serviceName, bufferedSpans,
+  exportedSpans, failedSpans, droppedSpans }`) is present only when
+  export is configured; without it the stats shape is byte-identical
+  to before.
 - `bus.flushOtlp()` drains the buffer deterministically — the hook for
   tests and graceful shutdown. Invalid options throw `RangeError` from
   the constructor.
@@ -6732,9 +6733,9 @@ Semantics notes:
   and the new values govern from the next admission/flush/POST. A
   revised `flushIntervalMs` rebuilds the flush timer at the new
   interval without rebuilding the exporter — the buffer is retained,
-  nothing is lost or re-sent. `serviceName` is not revisable here — it
-  is the export identity fixed at construction; `headers` move via
-  `setOtlpHeaders` (EB-409, below) and the `endpoint` via
+  nothing is lost or re-sent. `serviceName` is not revisable here —
+  it moves via `setOtlpServiceName` (EB-412, below); `headers` move
+  via `setOtlpHeaders` (EB-409, below) and the `endpoint` via
   `setOtlpEndpoint` (EB-406), not here.
 - `bus.setOtlpEndpoint(endpoint, actor = 'system')` (EB-406) repoints
   the export destination live without restarting the bus — only a bus
@@ -6764,6 +6765,19 @@ Semantics notes:
   with; buffered spans stay buffered, never re-sent and never dropped;
   the flush timer is not rebuilt and the five numeric bounds, the
   endpoint, and `serviceName` are untouched.
+- `bus.setOtlpServiceName(serviceName, actor = 'system')` (EB-412)
+  renames the export identity live without restarting the bus — only a
+  bus that already enabled `otlp` can be renamed (a never-enabled bus
+  and a closed bus throw `RangeError`); an illegal name fails closed
+  with the live name untouched; an identical name is a no-op with no
+  audit (audited as `otlp_service_name_revised` with
+  `{ serviceName, oldServiceName }`). A POST already in flight keeps
+  the name it started with; buffered spans stay buffered, never
+  re-sent and never dropped — but they export under the new name,
+  since the name is encoded at export time (the series forks at the
+  rename point, no backfill). The flush timer is not rebuilt and the
+  five numeric bounds, the endpoint, and `headers` are untouched.
+  `getStats().otlp.serviceName` reports the live name.
 
 ## OTLP metrics export (EB-370)
 

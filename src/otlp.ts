@@ -98,8 +98,8 @@ export interface ResolvedOtlpSpanExporterOptions {
  * Revision for the bus-level OTLP export tuning (see
  * `EventBus.setOtlp`, EB-299; EB-357 adds `flushIntervalMs`). Only the
  * fields provided move; the rest keep their live values. `serviceName`
- * is not revisable here — it is the export identity fixed at
- * construction. `headers` are not revisable here either — they move
+ * is not revisable here — it moves via `EventBus.setOtlpServiceName`
+ * (EB-412). `headers` are not revisable here either — they move
  * via `EventBus.setOtlpHeaders` (EB-409). The `endpoint` is not
  * revisable here either — it moves via `EventBus.setOtlpEndpoint`
  * (EB-406).
@@ -139,6 +139,8 @@ export interface OtlpRevision {
 export interface OtlpSpanExportStats {
   /** The configured endpoint, as a string. */
   endpoint: string;
+  /** The live `service.name` resource attribute (EB-412). */
+  serviceName: string;
   /** Spans currently buffered, awaiting flush. */
   bufferedSpans: number;
   /** Spans successfully POSTed to the collector. */
@@ -302,14 +304,14 @@ export class OtlpSpanExporter {
   // slices at the live `batchSize`, and `postBatch` times out at the
   // live `timeoutMs` — so a revision governs from the next
   // admission/flush/POST without draining or rebuilding the exporter.
-  // `serviceName` stays fixed for the exporter's lifetime; `headers`
-  // move only via `setHeaders` (EB-409).
+  // `serviceName` moves only via `setServiceName` (EB-412);
+  // `headers` move only via `setHeaders` (EB-409).
   private sampleRate: number;
   private batchSize: number;
   private flushIntervalMs: number;
   private timeoutMs: number;
   private headers: Record<string, string>;
-  private readonly serviceName: string;
+  private serviceName: string;
   private maxBuffered: number;
   private readonly buffer: TraceSpan[] = [];
   private timer: ReturnType<typeof setInterval>;
@@ -372,8 +374,9 @@ export class OtlpSpanExporter {
    * `flushIntervalMs` rebuilds the flush timer at the new interval
    * (the old timer is cleared first, so a tick never fires twice and
    * no tick is lost — the new cadence governs from the next tick).
-   * `serviceName` is never moved here. `headers` are never moved here
-   * either — they move via `setHeaders` (EB-409). The `endpoint`
+   * `serviceName` is never moved here — it moves via `setServiceName`
+   * (EB-412). `headers` are never moved here either — they move via
+   * `setHeaders` (EB-409). The `endpoint`
    * is never moved here either — it moves via `setEndpoint` (EB-406).
    * A retune after `shutdown()` moves the values but does not re-arm
    * the timer — a stopped exporter stays stopped.
@@ -428,6 +431,26 @@ export class OtlpSpanExporter {
    */
   setHeaders(headers: Record<string, string>): void {
     this.headers = { ...headers };
+  }
+
+  /**
+   * Renames the export identity live (EB-412). Only the service name
+   * moves: `current()` and `getStats()` read it on every call, so
+   * they report the new name at once, and the flush timer is
+   * untouched — the next POST (a timer tick or a `batchSize`-triggered
+   * flush) carries the new `service.name`. A POST already in flight
+   * keeps the name it started with: `postBatch` encodes
+   * `this.serviceName` when the request body is built and holds that
+   * body for the request's lifetime. Buffered spans are untouched —
+   * they stay buffered, are never re-sent, and are never dropped by
+   * the rename — but they export under the new name: the name is
+   * encoded at export time, so the series forks at the rename point
+   * (no backfill, no re-send of already-exported spans). The caller
+   * must have validated `serviceName` through `resolveOtlpOptions`
+   * first — this method applies unconditionally.
+   */
+  setServiceName(serviceName: string): void {
+    this.serviceName = serviceName;
   }
 
   /**
@@ -493,6 +516,7 @@ export class OtlpSpanExporter {
   getStats(): OtlpSpanExportStats {
     return {
       endpoint: this.endpoint.toString(),
+      serviceName: this.serviceName,
       bufferedSpans: this.buffer.length,
       exportedSpans: this.exportedSpans,
       failedSpans: this.failedSpans,
