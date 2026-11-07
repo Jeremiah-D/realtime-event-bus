@@ -7002,6 +7002,20 @@ untouched; an identical or empty revision is a no-op with no audit.
 Audited as `trace_archive_revised` (`{ maxEntries, oldMaxEntries,
 maxBytes, oldMaxBytes }`).
 
+Attach or detach the journal live with
+`bus.setTraceArchiveEnabled(enabled, opts?, actor?)` (EB-419): a bus
+that never enabled `trace.archive` gains a journal without a restart
+— the journal is built under the bus's construction-time
+`durableLogDir` (an attach without one throws `RangeError`), with the
+bus clock, and its constructor back-fills spans already on disk, so
+previously archived spans are queryable at once; detaching drops only
+the journal reference and never deletes disk files, so re-attaching
+recovers them. `opts` takes only `maxEntries` / `maxBytes` (omitted
+bounds fall back to the defaults); on an already-attached bus a repeat
+attach is a no-op and `opts` is ignored (the bounds still move via
+`setTraceArchive`). The directory and the clock are never revisable.
+Audited as `trace_archive_enabled_revised` (`{ enabled, oldEnabled }`).
+
 ## Pluggable partition assignors (EB-106)
 
 **Opt-in.** Consumer-group partition placement (`partitions` on

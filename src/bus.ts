@@ -401,6 +401,8 @@ import {
 import { type ChainVerification } from './auditchain.ts';
 import {
   TraceSpanJournal,
+  TRACE_ARCHIVE_DEFAULT_MAX_BYTES,
+  TRACE_ARCHIVE_DEFAULT_MAX_ENTRIES,
   assertValidTraceArchiveOptions,
   type TraceArchiveEntry,
   type TraceArchiveOptions,
@@ -6783,6 +6785,15 @@ export interface BusStats {
    * construction. Always 0 when the archive is disabled.
    */
   traceArchiveCorruptLines: number;
+  /**
+   * Whether the trace span archive journal is currently attached
+   * (see `EventBusOptions.trace.archive` and
+   * `setTraceArchiveEnabled`, EB-419): `true` when sampled spans
+   * are landing in the journal, `false` when the journal is
+   * detached or was never enabled — the only place the attach state
+   * is observable without publishing.
+   */
+  traceArchiveEnabled: boolean;
   /**
    * Currently active subscriptions paused for cross-instance migration
    * (see `exportSubscription`, EB-82): delivery is paused but the
@@ -16597,9 +16608,20 @@ export class EventBus {
    * Trace span archive journal (`EventBusOptions.trace.archive`,
    * EB-167), or `undefined` when the archive is disabled — every
    * sampled span lands here (via the trace pipeline's span fan-out)
-   * for post-restart reconstruction.
+   * for post-restart reconstruction. Attached and detached live by
+   * `setTraceArchiveEnabled` (EB-419); detaching drops only the
+   * reference, never the disk files.
    */
-  private readonly traceArchive: TraceSpanJournal | undefined;
+  private traceArchive: TraceSpanJournal | undefined;
+  /**
+   * The bus's durable log directory, captured once at construction
+   * (EB-419): the constructor reads `options?.durableLogDir` only
+   * once, so a live attach needs the directory kept here — a journal
+   * attached later is always built under this directory, never under
+   * a caller-supplied one. `undefined` when the bus was built
+   * without a durable log directory, in which case an attach refuses.
+   */
+  private traceArchiveDir: string | undefined;
   /**
    * OTLP span exporter (`EventBusOptions.otlp`), or `undefined` when
    * export is not configured (EB-105). Fed through the trace pipeline's
@@ -18031,6 +18053,10 @@ export class EventBus {
     // throws into the span pipeline.
     const traceArchiveOpt = resolvedTrace?.archive;
     let traceArchive: TraceSpanJournal | undefined;
+    // The durable log directory is captured (EB-419) so a journal
+    // attached later has a directory to build under — the constructor
+    // reads `options?.durableLogDir` only here.
+    this.traceArchiveDir = options?.durableLogDir;
     if (traceArchiveOpt !== undefined && resolvedTrace !== undefined) {
       if (options?.durableLogDir == null) {
         throw new RangeError('trace.archive requires EventBusOptions.durableLogDir to be set');
@@ -24624,7 +24650,8 @@ export class EventBus {
    * Orthogonal to EB-311 (that retunes the head-based trace sampling
    * rate and ring buffer — this the archive journal's retention), and
    * to EB-167 (that is the trace span archive journal itself — this
-   * the journal's tuning).
+   * the journal's tuning). A bus that never enabled `trace.archive`
+   * gains a journal live via `setTraceArchiveEnabled` (EB-419).
    *
    * Throws `RangeError` when the trace archive is not enabled, for a
    * non-object revision, or for an illegal `maxEntries` / `maxBytes`.
@@ -24663,6 +24690,163 @@ export class EventBus {
         oldMaxEntries: current.maxEntries,
         maxBytes,
         oldMaxBytes: current.maxBytes,
+      },
+    });
+  }
+
+  /**
+   * Attaches or detaches the bus-level trace span archive journal
+   * live (EB-419) without restarting the bus:
+   * `setTraceArchiveEnabled(enabled, opts?, actor = 'system')`
+   * switches `EventBusOptions.trace.archive` (EB-167) on or off at
+   * runtime — open span archiving for a fault-investigation window
+   * and close it again when disk is tight, with no restart and no
+   * loss of the live subscriptions, replay positions,
+   * consumer-group assignments, or rate-limit and dedup state a
+   * restart would drop.
+   *
+   * Only the journal's attachment moves. The `sampleRate` /
+   * `bufferSize` keep their live values (they still move via
+   * `setTrace`, EB-311), the `sampler` is untouched (it still moves
+   * via `setTraceSampler`, EB-414), the `onTraceSpan` callback is
+   * untouched (it still moves via `setTraceSpanCallback`, EB-416),
+   * and the ring is never rebuilt: a span already emitted is never
+   * re-delivered, and the buffered spans stay buffered. Attaching
+   * builds a fresh `TraceSpanJournal` under the bus's
+   * `durableLogDir` (captured at construction — the directory is
+   * never revisable, and no `dir` parameter is accepted), with the
+   * bus clock (`opts` never accepts `now`), and the new journal
+   * governs from the next span onward. Its constructor `recover()`
+   * back-fills from disk, so spans archived before the attach —
+   * including spans written by an earlier journal on the same
+   * directory — are queryable through `getTraceArchive()` at once
+   * (`liveBytes` / `liveDay` resume from the live file, so the
+   * rotation budget continues). Detaching drops only the journal
+   * reference: the disk files are left exactly as they are (never
+   * deleted, along the EB-61 archive convention), the in-memory
+   * read view goes away with the reference, and re-attaching
+   * recovers everything from disk again.
+   *
+   * `opts` takes only `maxEntries` / `maxBytes` (the
+   * `TraceArchiveRevision` shape); omitted bounds fall back to
+   * `TRACE_ARCHIVE_DEFAULT_MAX_ENTRIES` /
+   * `TRACE_ARCHIVE_DEFAULT_MAX_BYTES`. On an already-attached bus a
+   * repeat attach is a same-state no-op and `opts` is ignored — the
+   * two bounds still move via `setTraceArchive` (EB-315).
+   *
+   * Fail-closed: a bus that never enabled `trace`, a closed bus, an
+   * illegal actor, a non-boolean `enabled`, an attach without a
+   * `durableLogDir`, and illegal `opts` all throw `RangeError` with
+   * the live state and the audit log untouched. Validation reuses
+   * the construction-time rule (`assertValidTraceArchiveOptions`:
+   * `maxEntries` a positive integer, `maxBytes` a positive finite
+   * number of bytes) against the merged values, so a value that
+   * could not be set at construction cannot be attached with later
+   * either. The switch is live-only — a restart restores the
+   * construction-time archive state — and it never enters a config
+   * snapshot. Audited as `trace_archive_enabled_revised`
+   * (`{ enabled, oldEnabled }` — only the switch state, never the
+   * directory or any bound beyond the two numbers above).
+   *
+   * Orthogonal to EB-167 (that is the archive journal itself — this
+   * its missing live attach/detach entry), to EB-315 (that retunes
+   * the two numeric bounds of an already-enabled journal — its first
+   * line refuses a never-enabled bus, and this fills exactly that
+   * named gap), to EB-311 (that retunes head sampling — this the
+   * journal switch), to EB-414/416 (those are the sampler and the
+   * observer callback — this the journal; the attach re-composes
+   * the shared closure through their composition point so neither
+   * rider is dropped), and to EB-45 (that is the tracing mechanism
+   * itself — this the archive switch on top of it).
+   *
+   * Throws `RangeError` when trace is not enabled, when the bus is
+   * closed, for an illegal actor, for a non-boolean `enabled`, when
+   * attaching without a `durableLogDir`, or for illegal `opts`.
+   */
+  setTraceArchiveEnabled(
+    enabled: boolean,
+    opts?: TraceArchiveRevision,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setTraceArchiveEnabled');
+    const recorder = this.trace;
+    if (recorder === undefined) {
+      throw new RangeError('setTraceArchiveEnabled: trace is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live trace left to
+    // archive.
+    if (this.closed) {
+      throw new RangeError('setTraceArchiveEnabled: bus is closed');
+    }
+    if (typeof enabled !== 'boolean') {
+      throw new RangeError('setTraceArchiveEnabled: enabled must be a boolean');
+    }
+    // Attaching needs a directory to build under: the bus captured
+    // `options?.durableLogDir` once at construction (EB-419), and a
+    // bus built without one can never gain a journal live.
+    if (enabled && this.traceArchiveDir === undefined) {
+      throw new RangeError(
+        'setTraceArchiveEnabled: trace.archive requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    // Validate before touching anything: `opts` takes only the two
+    // bounds (the `TraceArchiveRevision` shape), missing bounds fall
+    // back to the journal defaults, and the clock is always the bus
+    // clock — `opts` never accepts `now` or a directory. An absent
+    // `opts` attaches with the defaults; a non-object `opts` is
+    // rejected outright by the same validator.
+    let maxEntries = TRACE_ARCHIVE_DEFAULT_MAX_ENTRIES;
+    let maxBytes = TRACE_ARCHIVE_DEFAULT_MAX_BYTES;
+    if (opts !== undefined && opts !== null) {
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setTraceArchiveEnabled: opts must be a TraceArchiveRevision object with maxEntries and/or maxBytes',
+        );
+      }
+      maxEntries = opts.maxEntries ?? TRACE_ARCHIVE_DEFAULT_MAX_ENTRIES;
+      maxBytes = opts.maxBytes ?? TRACE_ARCHIVE_DEFAULT_MAX_BYTES;
+      assertValidTraceArchiveOptions({ maxEntries, maxBytes }, 'setTraceArchiveEnabled');
+    }
+    // Attaching an attached journal, and detaching a detached one,
+    // are same-state no-ops: no rebuild, no audit — and on a repeat
+    // attach the bounds in `opts` are ignored (they still move via
+    // `setTraceArchive`).
+    const oldEnabled = this.traceArchive !== undefined;
+    if (enabled === oldEnabled) {
+      return;
+    }
+    if (enabled) {
+      // The constructor `recover()` back-fills from disk, so spans
+      // archived before this attach are queryable at once.
+      this.traceArchive = new TraceSpanJournal(this.traceArchiveDir as string, {
+        maxEntries,
+        maxBytes,
+        now: this.now,
+      });
+    } else {
+      // Detaching drops only the reference — the disk files stay
+      // exactly as they are, and re-attaching recovers them.
+      this.traceArchive = undefined;
+    }
+    // The composed closure captured the old journal reference at
+    // composition time, so the head recorder — and, when the tail
+    // shares the head channel, the tail sampler — must be re-pointed
+    // at the freshly composed closure, or the new journal would
+    // never see a span and a detached one would keep receiving them.
+    // A tail with its own callback is a separate channel and is
+    // untouched.
+    const composed = this.composeTraceSpanHook(this.traceSpanUserHook);
+    recorder.setSpanCallback(composed);
+    if (this.tailSharesTraceSpanChannel && this.tailSampler !== undefined) {
+      this.tailSampler.setSpanCallback(composed);
+    }
+    this.auditSubscription({
+      action: 'trace_archive_enabled_revised',
+      actor,
+      detail: {
+        enabled,
+        oldEnabled,
       },
     });
   }
@@ -59469,6 +59653,7 @@ export class EventBus {
       publishAuditWriteErrors: this.publishAudit?.writeErrors() ?? 0,
       traceArchiveWriteErrors: this.traceArchive?.writeErrors() ?? 0,
       traceArchiveCorruptLines: this.traceArchive?.corruptLineCount() ?? 0,
+      traceArchiveEnabled: this.traceArchive !== undefined,
       migratingSubscribers,
       drainingSubscribers,
       indexSize: this.prefixIndex.size,
