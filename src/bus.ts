@@ -7990,6 +7990,17 @@ export interface BusStats {
    */
   tailSampledSpans: TraceSpan[];
   /**
+   * Whether a span observer callback is currently installed on the
+   * tail sampler's own channel (see
+   * `EventBusOptions.tailSampling.onTraceSpan` and
+   * `setTailSpanCallback`, EB-418): `true` when tail-kept spans are
+   * handed to a caller-supplied callback in addition to the ring
+   * buffer, `false` when the tail shares the head channel, was
+   * cleared, or tail sampling is disabled — the callback function
+   * itself is never exposed.
+   */
+  tailHasSpanCallback: boolean;
+  /**
    * OTLP span export state (see `EventBusOptions.otlp` and `src/otlp.ts`,
    * EB-105). Present only when OTLP export is configured: `bufferedSpans`
    * spans awaiting flush, `exportedSpans` successfully POSTed,
@@ -16548,6 +16559,18 @@ export class EventBus {
    */
   private traceSpanUserHook: ((span: TraceSpan) => void) | undefined;
   /**
+   * The operator-supplied tail `onTraceSpan` callback, unwrapped
+   * (EB-418): the tail sampler holds this callback raw — no OTLP
+   * exporter or archive journal rides the tail's own channel, a tail
+   * with its own callback is a separate channel — and this field
+   * holds the raw hook, so a live replacement can compare raw
+   * against raw and `getStats().tailHasSpanCallback` can report
+   * whether one is installed. `undefined` when the tail shares the
+   * head channel (no callback of its own) or was cleared via
+   * `setTailSpanCallback(null)`.
+   */
+  private tailSpanUserHook: ((span: TraceSpan) => void) | undefined;
+  /**
    * Whether the tail sampler shares the head span-observer channel
    * (EB-416): `true` when the tail sampler was constructed without
    * its own `onTraceSpan` and fell back to the head-based composed
@@ -16555,10 +16578,14 @@ export class EventBus {
    * composed closure in the tail sampler too. `false` when tail
    * sampling is disabled, when the tail carries its own callback
    * (a separate channel), or when tracing itself is disabled.
-   * Decided once at construction; the tail's own callback is never
-   * retargeted.
+   * Decided at construction, and flipped to `false` by
+   * `setTailSpanCallback` (EB-418) the first time the tail gains its
+   * own live callback — the split off the shared channel is one-way:
+   * clearing the tail's own callback never rejoins the shared
+   * channel, only a restart restores it. A split tail is never
+   * retargeted by `setTraceSpanCallback`.
    */
-  private readonly tailSharesTraceSpanChannel: boolean;
+  private tailSharesTraceSpanChannel: boolean;
   /**
    * Tail-based trace sampler (EB-181, see
    * `EventBusOptions.tailSampling`). `undefined` when disabled — every
@@ -18037,6 +18064,11 @@ export class EventBus {
     // must retarget both emitters. Recorded once here — the flag is
     // what `setTraceSpanCallback` consults, so a tail with its own
     // callback is never retargeted.
+    // The raw tail hook is kept on `tailSpanUserHook` (EB-418) so a
+    // live replacement can compare raw against raw — captured before
+    // the shared-channel fallback below overwrites the resolved
+    // options with the composed head closure.
+    this.tailSpanUserHook = resolvedTailSampling?.onTraceSpan;
     this.tailSharesTraceSpanChannel =
       resolvedTailSampling !== undefined &&
       resolvedTailSampling.onTraceSpan === undefined &&
@@ -23994,9 +24026,10 @@ export class EventBus {
    * sampler may hold (see `EventBusOptions.tailSampling`, EB-181).
    *
    * Only the fields provided move; the rest keep their live values.
-   * The tail's own `onTraceSpan` is not revisable here — it is a
-   * separate observer channel fixed at construction; the shared head
-   * channel moves via `setTraceSpanCallback` (EB-416). In-flight open
+   * The tail's own `onTraceSpan` does not move here — it is a
+   * separate observer channel, revised live via `setTailSpanCallback`
+   * (EB-418) — while the shared head channel moves via
+   * `setTraceSpanCallback` (EB-416). In-flight open
    * traces are untouched:
    * already-buffered spans stay buffered, and the new values govern
    * from the next decision onward — the next trace decision samples at
@@ -24082,6 +24115,139 @@ export class EventBus {
         oldMaxSpansPerTrace: current.maxSpansPerTrace,
         bufferSize,
         oldBufferSize: current.bufferSize,
+      },
+    });
+  }
+
+  /**
+   * Replaces the tail sampler's own span observer callback live
+   * (EB-418) without restarting the bus: `setTailSpanCallback(handler,
+   * actor = 'system')` swaps the `onTraceSpan` hook every tail-kept
+   * span is handed to (see `EventBusOptions.tailSampling.onTraceSpan`,
+   * EB-181) — repoint tail observation from the shared head channel
+   * (the old collector receiving every span) to an independent sink
+   * that sees only the tail's kept error / ack-timeout / dead-letter
+   * traces, or withdraw tail observation for a drill while the ring
+   * buffer keeps recording, with no restart and no loss of the live
+   * subscriptions, replay positions, consumer-group assignments, or
+   * rate-limit and dedup state a restart would drop.
+   *
+   * Only the tail's own observer channel moves. The four numeric
+   * bounds keep their live values (they still move via
+   * `setTailSampling`, EB-296), the head channel is untouched (it
+   * still moves via `setTraceSpanCallback`, EB-416), and the ring is
+   * never rebuilt: a span already emitted is never re-delivered, and
+   * the buffered spans stay buffered. `null` clears the tail's own
+   * callback back to no observer — the ring keeps recording every
+   * kept span. The new callback governs from the next kept span
+   * onward; an open tail trace already buffered is not re-judged,
+   * and its spans are delivered to the new callback when the trace
+   * is decided.
+   *
+   * Installing a callback of the tail's own splits the tail off the
+   * shared head channel for good (`tailSharesTraceSpanChannel` flips
+   * to `false`): from the split on, `setTraceSpanCallback` retargets
+   * only the head recorder, so a head swap can no longer redirect
+   * tail-kept spans, and `null` clears back to no observer without
+   * rejoining the shared channel — only a restart restores it. The
+   * split has one knock-on effect to know about: the tail's own
+   * callback is installed raw, without the OTLP exporter and archive
+   * journal riders that ride the composed shared closure, so after
+   * the split tail-kept spans no longer reach OTLP export or the
+   * archive journal (head spans keep flowing to both); before the
+   * split, a shared tail's kept spans flow through the composed
+   * closure exactly like head spans.
+   *
+   * Fail-closed: a bus that never enabled `tailSampling`, a closed
+   * bus, an illegal actor, and an illegal callback all throw
+   * `RangeError` with the live channel and the audit log untouched.
+   * The gate is `tailSampling` being configured, not a callback
+   * already existing — a shared tail (no callback of its own) can
+   * gain one. Validation reuses the construction-time rule
+   * (`resolveTailSamplingOptions`: a callback must be a function)
+   * by a direct `typeof` check — the merged resolver is not used,
+   * since it would force the four numeric bounds — so a value that
+   * could not be set at construction cannot be installed later
+   * either. A throwing callback is still swallowed by the tail's
+   * `emit`: observation never breaks the publish/commit path.
+   * Re-installing the live callback (the same reference, including
+   * `null` against a tail with no callback of its own) is a no-op
+   * with no audit — and a `null` against a shared tail leaves the
+   * shared channel untouched. The callback function itself is never
+   * written to the audit log or any log — only whether one is
+   * installed is recorded — and it never enters a config snapshot:
+   * the revision is live-only, a restart restores the
+   * construction-time callback. Audited as
+   * `tail_span_callback_revised` (`{ hasHandler, oldHasHandler }`).
+   *
+   * Orthogonal to EB-181 (that is the tail sampling mechanism itself
+   * — this its missing own-callback replacement entry), to EB-296
+   * (that retunes the four numeric bounds — its docs named the
+   * observer channel as fixed, and this fills exactly that named
+   * gap), to EB-416 (that replaces the shared head channel — this
+   * the tail's own channel; the two are the two sides of the split,
+   * and a split tail is never retargeted by a head swap), to EB-414
+   * (that replaces the head sampling decision function — this the
+   * tail observation channel), to EB-45/311 (those are head tracing
+   * — this tail), and to EB-167/315 (those are the archive journal
+   * — this the tail channel; the split stops tail-kept spans from
+   * reaching the journal, which is this item's stated knock-on
+   * effect, not an archive revision).
+   *
+   * Throws `RangeError` when tail sampling is not enabled, when the
+   * bus is closed, for an illegal actor, or for an illegal callback.
+   */
+  setTailSpanCallback(handler: ((span: TraceSpan) => void) | null, actor = 'system'): void {
+    assertValidActor(actor, 'setTailSpanCallback');
+    const sampler = this.tailSampler;
+    if (sampler === undefined) {
+      throw new RangeError('setTailSpanCallback: tailSampling is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live tail left to
+    // retune.
+    if (this.closed) {
+      throw new RangeError('setTailSpanCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined` (the resolver's "no
+    // callback" state) before the no-op check; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live channel untouched. The check is a direct
+    // `typeof` (along EB-417), not the merged resolver — the resolver
+    // would force the four numeric bounds.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setTailSpanCallback: handler must be a function or null');
+    }
+    const next = handler ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a tail with no callback of its own) is a
+    // no-op: no split, no audit. In particular a `null` against a
+    // shared tail leaves the shared channel untouched — the flag stays
+    // `true` and the next head swap still retargets the tail.
+    if (next === this.tailSpanUserHook) {
+      return;
+    }
+    const oldHasHandler = this.tailSpanUserHook !== undefined;
+    this.tailSpanUserHook = next;
+    // Installing any callback of the tail's own splits it off the
+    // shared head channel for good: from here on `setTraceSpanCallback`
+    // retargets only the head recorder, and `null` clears back to no
+    // observer without rejoining the shared channel (only a restart
+    // restores the shared channel). The split applies to every
+    // non-no-op call — a first install, a replacement, and a clear
+    // alike — so the flag is flipped unconditionally here.
+    this.tailSharesTraceSpanChannel = false;
+    // The tail's own callback is installed raw, with no riders: the
+    // OTLP exporter and archive journal ride only the composed head
+    // closure, never the tail's own channel.
+    sampler.setSpanCallback(next);
+    this.auditSubscription({
+      action: 'tail_span_callback_revised',
+      actor,
+      detail: {
+        hasHandler: next !== undefined,
+        oldHasHandler,
       },
     });
   }
@@ -24352,7 +24518,8 @@ export class EventBus {
    * EB-414 (that replaces the head sampling decision function — this
    * the observation channel), to EB-296 (that retunes tail sampling —
    * this the shared observation channel itself; a tail with its own
-   * callback is a separate channel, left for another item), to EB-167
+   * callback is a separate channel, revised live via
+   * `setTailSpanCallback`, EB-418), to EB-167
    * (that is the archive journal — this the callback riding on top of
    * it), and to EB-105/406/409/412 (those are the OTLP exporter and
    * its revisions — this reuses their fan-out composition point but
@@ -59622,6 +59789,7 @@ export class EventBus {
       traceHasCustomSampler: this.trace?.current().hasSampler ?? false,
       traceHasSpanHandler: this.traceSpanUserHook !== undefined,
       tailSampledSpans: this.tailSampler?.snapshot() ?? [],
+      tailHasSpanCallback: this.tailSpanUserHook !== undefined,
       // OTLP span export (EB-105): present only when configured — the
       // field stays absent otherwise so unconfigured buses keep
       // byte-identical stats.

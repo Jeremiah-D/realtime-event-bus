@@ -2861,8 +2861,15 @@ library.
   the next open enforces the live open-trace budget (tightening it
   force-decides the oldest open traces), and shrinking `bufferSize`
   trims the ring to the newest spans at once. The tail's own
-  `onTraceSpan` is not revisable (the shared head channel moves via
-  `setTraceSpanCallback`, EB-416). Only a bus that enabled `tailSampling` can be revised
+  `onTraceSpan` moves live via `setTailSpanCallback(handler, actor?)`
+  (EB-418): installing a callback of the tail's own splits the tail
+  off the shared head channel for good (a later head swap via
+  `setTraceSpanCallback` can no longer redirect tail-kept spans, and
+  `null` clears back to no observer without rejoining the shared
+  channel — only a restart restores it), and the tail's own callback
+  is installed raw, so after the split tail-kept spans no longer
+  reach OTLP export or the archive journal while head spans keep
+  flowing to both. Only a bus that enabled `tailSampling` can be revised
   (otherwise `RangeError`); illegal values fail closed with the live
   tuning untouched; an identical or empty revision is a no-op with no
   audit. Audited as `tail_sampling_revised` (old and new values).

@@ -98,9 +98,9 @@ export interface ResolvedTailSamplingOptions {
 /**
  * Revision for the bus-level tail-sampling tuning (see
  * `EventBus.setTailSampling`, EB-296). Only the fields provided move;
- * the rest keep their live values. `onTraceSpan` is not revisable here
- * — it is the observer channel fixed at construction; re-subscribing
- * the callback means rebuilding the bus.
+ * the rest keep their live values. `onTraceSpan` does not move here
+ * — it is a separate observer channel, revised live via
+ * `EventBus.setTailSpanCallback` (EB-418).
  */
 export interface TailSamplingRevision {
   /**
@@ -217,10 +217,11 @@ export class TailSampler {
   // Live-tuned by `retune` (EB-296): the decision and admission sites
   // read these fields on every call, so a revision governs from the next
   // decision without draining or rebuilding any trace. `now` stays
-  // fixed for the sampler's lifetime; `onTraceSpan` moves only when
-  // the tail shares the head channel, via `setSpanCallback` (EB-416) —
-  // a tail with its own callback is a separate channel and is never
-  // retargeted by the bus.
+  // fixed for the sampler's lifetime; `onTraceSpan` moves when the tail
+  // shares the head channel, via `setSpanCallback` (EB-416), and moves
+  // as the tail's own channel via `setTailSpanCallback` (EB-418) — a
+  // tail with its own callback is a separate channel and is never
+  // retargeted by `setTraceSpanCallback`.
   private successSampleRate: number;
   private onTraceSpan: ((span: TraceSpan) => void) | undefined;
   private maxOpenTraces: number;
