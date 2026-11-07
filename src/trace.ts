@@ -159,8 +159,9 @@ export interface ResolvedTraceOptions {
 
 /**
  * Bus-level revision for head-based trace tuning (EB-311). Only the two
- * numeric bounds move — `sampler`, `onTraceSpan`, and `archive` are
- * fixed at construction and are not revisable here.
+ * numeric bounds move — `onTraceSpan` and `archive` are fixed at
+ * construction and are not revisable here. The `sampler` moves
+ * separately, via `setTraceSampler` (EB-414).
  */
 export interface TraceRevision {
   /**
@@ -317,12 +318,13 @@ export interface SampledTraceContext {
  * allocation-free.
  */
 export class TraceRecorder {
-  // Live-tuned by `retune` (EB-311): the sampling decision and the ring
-  // write read these fields on every call, so a revision governs from
-  // the next sample / next span without draining or rebuilding anything.
-  // `sampler` and `onTraceSpan` stay fixed for the recorder's lifetime.
+  // Live-tuned by `retune` (EB-311) and `setSampler` (EB-414): the
+  // sampling decision and the ring write read these fields on every
+  // call, so a revision governs from the next sample / next span
+  // without draining or rebuilding anything. `onTraceSpan` stays fixed
+  // for the recorder's lifetime.
   private sampleRate: number;
-  private readonly sampler: TraceSampler | undefined;
+  private sampler: TraceSampler | undefined;
   private readonly onTraceSpan: ((span: TraceSpan) => void) | undefined;
   private readonly traces = new WeakMap<object, MessageTraceState>();
   private readonly ring: TraceSpan[] = [];
@@ -336,9 +338,36 @@ export class TraceRecorder {
     this.capacity = resolved.bufferSize;
   }
 
-  /** The two live tuning values, for bus-level revision (EB-311). */
-  current(): { sampleRate: number; bufferSize: number } {
-    return { sampleRate: this.sampleRate, bufferSize: this.capacity };
+  /**
+   * The two live tuning values, for bus-level revision (EB-311), plus
+   * whether a custom head sampler is installed (EB-414). The sampler
+   * function itself is never exposed — only its presence.
+   */
+  current(): { sampleRate: number; bufferSize: number; hasSampler: boolean } {
+    return {
+      sampleRate: this.sampleRate,
+      bufferSize: this.capacity,
+      hasSampler: this.sampler !== undefined,
+    };
+  }
+
+  /** The live head sampler, for the bus-level same-reference no-op check. */
+  currentSampler(): TraceSampler | undefined {
+    return this.sampler;
+  }
+
+  /**
+   * Replaces the head sampler live (EB-414). The caller must have
+   * validated `sampler` through `resolveTraceOptions` first — this
+   * method applies unconditionally, like `retune`. The new decision
+   * function governs from the next `sample()` call, which reads the
+   * live field on every decision; `undefined` clears back to the
+   * rate decision. In-flight trace records (the `WeakMap` of open
+   * publishes) are untouched: a publish already sampled keeps its
+   * trace, and no already-decided publish is ever re-judged.
+   */
+  setSampler(sampler: TraceSampler | undefined): void {
+    this.sampler = sampler;
   }
 
   /**

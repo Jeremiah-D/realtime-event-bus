@@ -7956,6 +7956,15 @@ export interface BusStats {
    */
   traceSpans: TraceSpan[];
   /**
+   * Whether a custom head sampler is installed on the trace recorder
+   * (see `EventBusOptions.trace.sampler` and `setTraceSampler`,
+   * EB-414): `true` when the next admission-time sampling decision
+   * runs a caller-supplied decision function instead of the fixed
+   * `sampleRate`. `false` when tracing is disabled or no sampler is
+   * installed — the sampler function itself is never exposed.
+   */
+  traceHasCustomSampler: boolean;
+  /**
    * Tail-sampled delivery-trace spans (see `EventBusOptions.tailSampling`
    * and `src/tail-sampling.ts`, EB-181), oldest first: every span of
    * every kept trace since the bus was created, in completion order,
@@ -24014,17 +24023,18 @@ export class EventBus {
    * `EventBusOptions.trace`, EB-45).
    *
    * Only the fields provided move; the rest keep their live values.
-   * `sampler`, `onTraceSpan`, and `archive` are not revisable here —
-   * they are the sampling decision, the observer channel, and the
-   * journal identity fixed at construction. In-flight trace records
-   * are untouched: a publish already sampled keeps its trace, and the
-   * new values govern from the next decision onward — the next
-   * `sample()` reads the live `sampleRate`, and the next span write
-   * wraps at the live `bufferSize`. Shrinking `bufferSize` does not
-   * trim the ring at retune time — the buffered spans stay buffered
-   * until the next span covers the excess down to the live bound, so
-   * the next append evicts the oldest under the new bound — while
-   * growing it keeps every buffered span in chronological order.
+   * `onTraceSpan` and `archive` are not revisable here — they are the
+   * observer channel and the journal identity fixed at construction.
+   * `sampler` moves separately via `setTraceSampler` (EB-414).
+   * In-flight trace records are untouched: a publish already sampled
+   * keeps its trace, and the new values govern from the next decision
+   * onward — the next `sample()` reads the live `sampleRate`, and the
+   * next span write wraps at the live `bufferSize`. Shrinking
+   * `bufferSize` does not trim the ring at retune time — the buffered
+   * spans stay buffered until the next span covers the excess down to
+   * the live bound, so the next append evicts the oldest under the
+   * new bound — while growing it keeps every buffered span in
+   * chronological order.
    *
    * Fail-closed: a bus that never enabled `trace`, a non-object
    * revision, and an illegal value all throw `RangeError` with the live
@@ -24084,6 +24094,104 @@ export class EventBus {
         oldSampleRate: current.sampleRate,
         bufferSize,
         oldBufferSize: current.bufferSize,
+      },
+    });
+  }
+
+  /**
+   * Replaces the bus-level head sampler live (EB-414) without
+   * restarting the bus: `setTraceSampler(sampler, actor = 'system')`
+   * swaps the custom head-sampling decision function the next
+   * admission-time `sample()` call consults (see
+   * `EventBusOptions.trace.sampler`, EB-45) — switch a fixed rate to
+   * a "trace only errors / a topic allowlist" decision during an
+   * incident, or drop a custom sampler back to the plain rate in a
+   * sampling storm, with no restart and no loss of the live
+   * subscriptions, replay positions, consumer-group assignments, or
+   * rate-limit and dedup state a restart would drop.
+   *
+   * Only the sampler moves. `sampleRate` / `bufferSize` keep their
+   * live values (they still move via `setTrace`, EB-311), `onTraceSpan`
+   * and `archive` are untouched, and the ring is never rebuilt: a
+   * publish already sampled keeps its trace — `sample()` decides once
+   * at admission, so an already-decided publish is never re-judged —
+   * and the buffered spans stay buffered. `null` clears the sampler
+   * back to the rate decision (`Math.random() < sampleRate`, the live
+   * rate effective immediately). The new sampler governs from the next
+   * admission-time decision onward. The sampler function itself is
+   * never written to the audit log or any log — only whether one is
+   * installed is recorded — and it never enters a config snapshot:
+   * the revision is live-only, a restart restores the
+   * construction-time sampler.
+   *
+   * Fail-closed: a bus that never enabled `trace`, a closed bus, an
+   * illegal actor, and an illegal sampler all throw `RangeError` with
+   * the live sampler and the audit log untouched. Validation reuses
+   * the construction-time rule (`resolveTraceOptions`: a sampler must
+   * be a function) against the merged values — the sampler takes the
+   * new value, `sampleRate` / `bufferSize` take their live values —
+   * so a value that could not be set at construction cannot be
+   * installed later either. A throwing sampler propagates to the
+   * publish call, like a throwing content filter or schema validator
+   * (trace.ts), and the recorder itself is unharmed. Re-installing
+   * the live sampler (the same reference, including `null` against a
+   * bus with no sampler) is a no-op with no audit. Audited as
+   * `trace_sampler_revised` (`{ hasSampler, oldHasSampler }`).
+   *
+   * Orthogonal to EB-45 (that is the tracing mechanism itself — this
+   * its missing sampler-replacement entry), to EB-311 (that retunes
+   * the two numeric bounds — its docs name the sampler as fixed, and
+   * this fills exactly that named gap), to EB-296 (that retunes tail
+   * sampling — this the head-based sampler), and to EB-167 (that is
+   * the trace span archive journal — this the sampling decision).
+   *
+   * Throws `RangeError` when trace is not enabled, when the bus is
+   * closed, for an illegal actor, or for an illegal sampler.
+   */
+  setTraceSampler(sampler: TraceSampler | null, actor = 'system'): void {
+    assertValidActor(actor, 'setTraceSampler');
+    const recorder = this.trace;
+    if (recorder === undefined) {
+      throw new RangeError('setTraceSampler: trace is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setOtlpServiceName`):
+    // close() already flushed once — there is no live sampling left
+    // to retune.
+    if (this.closed) {
+      throw new RangeError('setTraceSampler: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to the
+    // rate decision, so it normalizes to `undefined` (the resolver's
+    // "no sampler" state) before the merged validation; anything that
+    // is neither a function nor `null` is rejected outright, and a
+    // failed call leaves the live sampler untouched.
+    if (sampler !== null && typeof sampler !== 'function') {
+      throw new RangeError('setTraceSampler: sampler must be a function or null');
+    }
+    const current = recorder.current();
+    const resolved = resolveTraceOptions(
+      {
+        sampleRate: current.sampleRate,
+        bufferSize: current.bufferSize,
+        sampler: sampler ?? undefined,
+      },
+      'setTraceSampler',
+    );
+    if (resolved === undefined) {
+      throw new RangeError('setTraceSampler: trace is not enabled on this bus');
+    }
+    // Re-installing the live sampler (the same reference, including
+    // clearing a bus with no sampler) is a no-op: no swap, no audit.
+    if (resolved.sampler === recorder.currentSampler()) {
+      return;
+    }
+    recorder.setSampler(resolved.sampler);
+    this.auditSubscription({
+      action: 'trace_sampler_revised',
+      actor,
+      detail: {
+        hasSampler: resolved.sampler !== undefined,
+        oldHasSampler: current.hasSampler,
       },
     });
   }
@@ -59035,6 +59143,7 @@ export class EventBus {
         hashFunctions: this.dedupBloom?.hashes ?? 0,
       },
       traceSpans: this.trace?.snapshot() ?? [],
+      traceHasCustomSampler: this.trace?.current().hasSampler ?? false,
       tailSampledSpans: this.tailSampler?.snapshot() ?? [],
       // OTLP span export (EB-105): present only when configured — the
       // field stays absent otherwise so unconfigured buses keep

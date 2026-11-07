@@ -2817,8 +2817,14 @@ library.
   with `setTrace({ sampleRate?, bufferSize? })` (EB-311): only the fields
   provided move, the rest keep their live values, and the new values
   govern from the next decision — the next publish samples at the live
-  rate and the next span write wraps at the live capacity. `sampler`,
-  `onTraceSpan`, and `archive` are not revisable. Shrinking `bufferSize`
+  rate and the next span write wraps at the live capacity.
+  `onTraceSpan` and `archive` are not revisable. Swap the head sampler
+  live with `setTraceSampler(sampler | null)` (EB-414): the new decision
+  function governs from the next admission-time sample, `null` clears
+  back to the live rate, already-sampled publishes are never re-judged,
+  and the audit records only whether a sampler is installed
+  (`{ hasSampler, oldHasSampler }`, audited as `trace_sampler_revised`).
+  Shrinking `bufferSize`
   keeps the buffered spans until the next span covers the excess down to
   the live bound; growing keeps every buffered span in chronological
   order. Only a bus that enabled `trace` can be revised (otherwise
