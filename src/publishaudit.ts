@@ -149,10 +149,17 @@ function archivedName(day: string, n: number): string {
 }
 
 function isArchivedAuditFile(name: string): boolean {
+  // EB-420: the day segment carries dashes (`2026-10-16`) — `utcDay`
+  // above returns `YYYY-MM-DD` and `archivedName` writes exactly that
+  // form — so the pattern matches the dashed form. The old `\d{8}`
+  // never matched a name this module actually writes, and `recover()`
+  // silently skipped every archived file (only the live file came
+  // back); see `src/tracearchive.ts` `isArchivedSpanFile` for the
+  // same dashed shape.
   return (
     name.startsWith('__publish_audit.') &&
     name.endsWith('.jsonl') &&
-    /^__publish_audit\.\d{8}\.\d+\.jsonl$/.test(name)
+    /^__publish_audit\.\d{4}-\d{2}-\d{2}\.\d+\.jsonl$/.test(name)
   );
 }
 

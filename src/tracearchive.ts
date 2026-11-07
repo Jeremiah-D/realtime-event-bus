@@ -118,10 +118,10 @@ function archivedName(day: string, n: number): string {
 
 function isArchivedSpanFile(name: string): boolean {
   // NOTE (EB-167): the day segment carries dashes (`2026-10-20`), so the
-  // pattern matches the dashed form — unlike the EB-138 publish-audit
-  // regex, whose `\d{8}` never matches the dashed names that module
-  // actually writes (archived files are silently skipped on recovery
-  // there; logged as a future backlog candidate, not fixed here).
+  // pattern matches the dashed form — the EB-138 publish-audit regex had
+  // the same dashed names but a `\d{8}` pattern that never matched them
+  // (archived files were silently skipped on recovery there); EB-420
+  // fixed that side to this same dashed shape.
   return (
     name.startsWith('__trace_spans.') &&
     name.endsWith('.jsonl') &&

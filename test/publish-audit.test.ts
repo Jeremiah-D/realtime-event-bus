@@ -206,6 +206,154 @@ test('publish audit: UTC-day rollover rotates the live file (archived, never del
   bus.destroy?.();
 });
 
+test('publish audit: EB-420 — rotated archive is recovered after a restart', async () => {
+  const dir = tempDir('pubaudit-');
+  const clock = controllableClock(Date.UTC(2026, 9, 16, 23, 59, 0));
+  const bus = new EventBus({ durableLogDir: dir, publishAudit: true, now: clock.now });
+  bus.subscribe('**', () => {});
+  bus.publish('d.a', {});
+  clock.nowMs = Date.UTC(2026, 9, 17, 0, 1, 0);
+  bus.publish('d.b', {});
+  await flush();
+  bus.destroy?.();
+
+  // Before EB-420 the dashed archive name never matched the recovery
+  // filter (`\d{8}`), so a restarted bus silently lost the archived entry.
+  const bus2 = new EventBus({ durableLogDir: dir, publishAudit: true });
+  const entries = bus2.getPublishAudit();
+  assert.equal(entries.length, 2);
+  assert.deepEqual(
+    entries.map((e) => e.topic),
+    ['d.a', 'd.b'],
+  );
+  bus2.destroy?.();
+});
+
+test('publish audit: EB-420 — recovered view keeps live + archived order and count', async () => {
+  const dir = tempDir('pubaudit-');
+  const clock = controllableClock(Date.UTC(2026, 9, 16, 23, 59, 0));
+  const bus = new EventBus({ durableLogDir: dir, publishAudit: true, now: clock.now });
+  bus.subscribe('**', () => {});
+  bus.publish('d', {});
+  clock.nowMs = Date.UTC(2026, 9, 17, 0, 1, 0);
+  bus.publish('d', {});
+  bus.publish('d', {});
+  await flush();
+  bus.destroy?.();
+
+  const bus2 = new EventBus({ durableLogDir: dir, publishAudit: true });
+  const entries = bus2.getPublishAudit();
+  assert.equal(entries.length, 3);
+  // Archived first, live last, oldest-first — the per-topic sequence
+  // space survives the rebuild.
+  assert.deepEqual(
+    entries.map((e) => e.seq),
+    [1, 2, 3],
+  );
+  bus2.destroy?.();
+});
+
+test('publish audit: EB-420 — hash chain verifies across a restart including archived entries', async () => {
+  const dir = tempDir('pubaudit-');
+  const clock = controllableClock(Date.UTC(2026, 9, 16, 23, 59, 0));
+  const bus = new EventBus({ durableLogDir: dir, publishAudit: true, now: clock.now });
+  bus.subscribe('**', () => {});
+  bus.publish('d.a', {});
+  clock.nowMs = Date.UTC(2026, 9, 17, 0, 1, 0);
+  bus.publish('d.b', {});
+  await flush();
+  bus.destroy?.();
+
+  const bus2 = new EventBus({ durableLogDir: dir, publishAudit: true });
+  // `checked` covers the archived entry too — before EB-420 it was
+  // silently absent from the recovered view.
+  assert.deepEqual(bus2.verifyPublishAuditChain(), { ok: true, checked: 2 });
+  // The chain continues: the next record links to the recovered head.
+  bus2.subscribe('**', () => {});
+  bus2.publish('d.c', {});
+  assert.deepEqual(bus2.verifyPublishAuditChain(), { ok: true, checked: 3 });
+  bus2.destroy?.();
+});
+
+test('publish audit: EB-420 — corrupt lines inside an archived file are skipped and counted', async () => {
+  const dir = tempDir('pubaudit-');
+  const clock = controllableClock(Date.UTC(2026, 9, 16, 23, 59, 0));
+  const bus = new EventBus({ durableLogDir: dir, publishAudit: true, now: clock.now });
+  bus.subscribe('**', () => {});
+  bus.publish('d.a', {});
+  clock.nowMs = Date.UTC(2026, 9, 17, 0, 1, 0);
+  bus.publish('d.b', {});
+  await flush();
+  bus.destroy?.();
+
+  // Corrupt the archived file (not the live one): garbage around the
+  // good line — a non-JSON line and a wrong-version record.
+  const archived = join(dir, '__publish_audit.2026-10-16.0.jsonl');
+  const good = readFileSync(archived, 'utf8');
+  writeFileSync(archived, `not json\n${good}{"v":999,"outcome":"admitted"}\n`, 'utf8');
+
+  const log = new PublishAuditLog(dir);
+  assert.equal(log.query().length, 2);
+  assert.equal(log.corruptLineCount(), 2);
+  // The bus-level view agrees: both good entries survive, bad lines gone.
+  const bus2 = new EventBus({ durableLogDir: dir, publishAudit: true });
+  assert.deepEqual(
+    bus2.getPublishAudit().map((e) => e.topic),
+    ['d.a', 'd.b'],
+  );
+  bus2.destroy?.();
+});
+
+test('publish audit: EB-420 — maxEntries still bounds the recovered view', async () => {
+  const dir = tempDir('pubaudit-');
+  const clock = controllableClock(Date.UTC(2026, 9, 16, 23, 59, 0));
+  const bus = new EventBus({
+    durableLogDir: dir,
+    publishAudit: { maxEntries: 2 },
+    now: clock.now,
+  });
+  bus.subscribe('**', () => {});
+  bus.publish('d.a', {});
+  clock.nowMs = Date.UTC(2026, 9, 17, 0, 1, 0);
+  bus.publish('d.b', {});
+  bus.publish('d.c', {});
+  await flush();
+  bus.destroy?.();
+
+  const bus2 = new EventBus({ durableLogDir: dir, publishAudit: { maxEntries: 2 } });
+  const entries = bus2.getPublishAudit();
+  // Disk holds all three; the recovered view keeps only the newest two.
+  assert.equal(entries.length, 2);
+  assert.deepEqual(
+    entries.map((e) => e.topic),
+    ['d.b', 'd.c'],
+  );
+  bus2.destroy?.();
+});
+
+test('publish audit: EB-420 — repeated same-day rotations keep distinct archives', async () => {
+  const dir = tempDir('pubaudit-');
+  const bus = new EventBus({ durableLogDir: dir, publishAudit: { maxBytes: 200 } });
+  bus.subscribe('**', () => {});
+  bus.publish('s.a', {});
+  bus.publish('s.b', {});
+  bus.publish('s.c', {});
+  bus.publish('s.d', {});
+  await flush();
+  bus.destroy?.();
+
+  const files = readdirSync(dir).sort();
+  const archived = files.filter(
+    (f) => f.startsWith('__publish_audit.') && f !== PUBLISH_AUDIT_LIVE_NAME,
+  );
+  assert.ok(archived.length >= 2, `files: ${files}`);
+  // Sequence numbers never collide: no archive overwrote another.
+  assert.equal(new Set(archived).size, archived.length);
+  const bus2 = new EventBus({ durableLogDir: dir, publishAudit: true });
+  assert.equal(bus2.getPublishAudit().length, 4);
+  bus2.destroy?.();
+});
+
 test('publish audit: live-file byte budget rotates (EB-61 archive convention)', () => {
   const dir = tempDir('pubaudit-');
   const bus = new EventBus({

@@ -5632,13 +5632,18 @@ Details:
   'publisher-rate-limit' | 'duplicate' | 'alias-retired' |
   'topic-paused' | 'circuit-breaker' | 'sampled'`).
 - **Rotation** — the live file rotates (renamed, never deleted — the
-  EB-61 archive convention) to `__publish_audit.<YYYYMMDD>.<n>.jsonl` on
+  EB-61 archive convention) to `__publish_audit.<YYYY-MM-DD>.<n>.jsonl` on
   UTC-day rollover or past the live-file byte budget (default 64 MiB,
   `maxBytes` tunes it).
 - **Recovery** — on construction the bounded in-memory read view
   (default 10000 entries, `maxEntries` tunes it) back-fills from the
   on-disk files, skipping corrupt lines; a damaged journal directory
-  never prevents the bus from starting.
+  never prevents the bus from starting. Archived files are recovered
+  too (EB-420): the day segment in an archived name carries dashes
+  (`__publish_audit.2026-10-16.0.jsonl`), and the recovery filter
+  matches exactly that dashed form, so entries written before a
+  rotation stay queryable — and stay in the hash chain — after a
+  restart.
 - **Best-effort** — a failed append or rotation never throws into the
   publish path; it is counted in
   `getStats().publishAuditWriteErrors` instead.
