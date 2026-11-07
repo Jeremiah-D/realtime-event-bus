@@ -130,6 +130,8 @@ export interface ResolvedOtlpMetricsExporterOptions {
 export interface OtlpMetricsExportStats {
   /** The configured endpoint, as a string. */
   endpoint: string;
+  /** Live `service.name` resource attribute (revisable via `setOtlpMetricsServiceName`, EB-413). */
+  serviceName: string;
   /** Metric data points successfully POSTed to the collector. */
   exportedMetrics: number;
   /** Export POSTs that failed (best-effort: the snapshot was dropped). */
@@ -148,8 +150,8 @@ export interface OtlpMetricsExportStats {
  * Revision for the bus-level OTLP metrics export tuning (see
  * `EventBus.setOtlpMetrics`, EB-374). Only the fields provided move;
  * the rest keep their live values. `serviceName` is not revisable
- * here — it is the export identity fixed at construction. `headers`
- * are not revisable here either — they move via
+ * here — it moves via `EventBus.setOtlpMetricsServiceName` (EB-413).
+ * `headers` are not revisable here either — they move via
  * `EventBus.setOtlpMetricsHeaders` (EB-410). The `endpoint` is not
  * revisable here either — it moves via
  * `EventBus.setOtlpMetricsEndpoint` (EB-407). `perTopic: false`
@@ -574,11 +576,11 @@ function histogramPoint(
  */
 export class OtlpMetricsExporter {
   private endpoint: URL;
-  private readonly serviceName: string;
+  private serviceName: string;
   private flushIntervalMs: number;
   private timeoutMs: number;
-  // Moves only via `setHeaders` (EB-410); `serviceName` stays fixed
-  // for the exporter's lifetime.
+  // `serviceName` moves only via `setServiceName` (EB-413);
+  // `headers` move only via `setHeaders` (EB-410).
   private headers: Record<string, string>;
   private perTopic: { enabled: boolean; maxTopics: number };
   private readonly collect: () => BusStats;
@@ -643,7 +645,8 @@ export class OtlpMetricsExporter {
    * revised `flushIntervalMs` rebuilds the flush timer at the new
    * interval (the old timer is cleared first, so a tick never fires
    * twice and no tick is lost — the new cadence governs from the
-   * next tick). `serviceName` is never moved here. `headers` are
+   * next tick). `serviceName` is never moved here — it moves via
+   * `setServiceName` (EB-413). `headers` are
    * never moved here either — they move via `setHeaders` (EB-410).
    * The `endpoint` is never moved here either — it moves via
    * `setEndpoint` (EB-407). A retune after `shutdown()` moves the values but
@@ -703,6 +706,29 @@ export class OtlpMetricsExporter {
    */
   setHeaders(headers: Record<string, string>): void {
     this.headers = { ...headers };
+  }
+
+  /**
+   * Renames the export identity live (EB-413). Only the service name
+   * moves: `current()` and `getStats()` read it on every call, so
+   * they report the new name at once, and the flush timer is
+   * untouched — the next export POST carries the new `service.name`.
+   * A POST already in flight keeps the name it started with:
+   * `flushInner` encodes `this.serviceName` when the request body
+   * is built and holds that body for the request's lifetime. Metrics
+   * are snapshots, not a buffered stream, so there is nothing to
+   * re-send or drop — unlike the span exporter (EB-412), no buffered
+   * content changes identity at the rename point; the next snapshot
+   * simply carries the new name. The counters
+   * (`exportedMetrics`/`failedExports`/`lastExportAtMs`) and the Sum
+   * `startTimeUnixNano` are retained — a rename never restarts the
+   * cumulative series, so the collector-side rate computation is
+   * uninterrupted. The caller must have validated `serviceName`
+   * through `resolveOtlpMetricsOptions` first — this method applies
+   * unconditionally.
+   */
+  setServiceName(serviceName: string): void {
+    this.serviceName = serviceName;
   }
 
   /**
@@ -769,6 +795,7 @@ export class OtlpMetricsExporter {
   getStats(): OtlpMetricsExportStats {
     return {
       endpoint: this.endpoint.toString(),
+      serviceName: this.serviceName,
       exportedMetrics: this.exportedMetrics,
       failedExports: this.failedExports,
       lastExportAtMs: this.lastExportAtMs,

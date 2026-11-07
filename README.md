@@ -6839,11 +6839,12 @@ Semantics notes:
   approximation of the bus start, since `getStats()` counters
   accumulate over the process lifetime. Resource attributes carry only
   `service.name`, matching the span exporter.
-- `getStats().otlpMetrics` (`{ endpoint, exportedMetrics,
-  failedExports, lastExportAtMs, flushIntervalMs, timeoutMs,
-  perTopic }`) is present only when export is configured; without it
-  the stats shape is byte-identical to before. The trailing three
-  fields report the live tuning (EB-374, below).
+- `getStats().otlpMetrics` (`{ endpoint, serviceName,
+  exportedMetrics, failedExports, lastExportAtMs, flushIntervalMs,
+  timeoutMs, perTopic }`) is present only when export is configured;
+  without it the stats shape is byte-identical to before. The
+  trailing three fields report the live tuning (EB-374, below);
+  `serviceName` reports the live export identity (EB-413, below).
 - `bus.flushOtlpMetrics()` exports the latest snapshot
   deterministically — the hook for tests and graceful shutdown.
   `close()` awaits it for one final export, then stops the exporter's
@@ -6862,9 +6863,10 @@ cumulative series, and an in-flight flush is untouched. A revised
 the next tick; a revised `timeoutMs` governs the next POST; a
 revised `perTopic` (`false` disables every per-topic series, `true`
 re-enables them at the live cap, `{ maxTopics }` moves the cap)
-governs the next export. `serviceName` stays fixed at construction;
-`headers` move via `setOtlpMetricsHeaders` (EB-410, below) and the
-endpoint via `setOtlpMetricsEndpoint` (below). Illegal values fail closed with
+governs the next export. `serviceName` moves via
+`setOtlpMetricsServiceName` (EB-413, below); `headers` move via
+`setOtlpMetricsHeaders` (EB-410, below) and the endpoint via
+`setOtlpMetricsEndpoint` (below). Illegal values fail closed with
 `RangeError` and leave the live tuning untouched; an identical (or
 empty) revision is a no-op with no audit. Audited as
 `otlp_metrics_revised` (`{ flushIntervalMs, oldFlushIntervalMs,
@@ -6903,6 +6905,23 @@ started with; the counters and the Sum `startTimeUnixNano` are
 retained, so a rotation never restarts the cumulative series; the
 flush timer is not rebuilt and the three numeric bounds, the endpoint,
 and `serviceName` are untouched.
+
+**Renaming the metrics export identity live (EB-413).**
+`bus.setOtlpMetricsServiceName(serviceName, actor = 'system')`
+renames the export identity live without restarting the bus — only a
+bus that already enabled `otlpMetrics` can be renamed (a never-enabled
+bus and a closed bus throw `RangeError`); an illegal name fails closed
+with the live name untouched; an identical name is a no-op with no
+audit (audited as `otlp_metrics_service_name_revised` with
+`{ serviceName, oldServiceName }`). A POST already in flight keeps
+the name it started with; the counters and the Sum
+`startTimeUnixNano` are retained, so a rename never restarts the
+cumulative series; the flush timer is not rebuilt and the three
+numeric bounds, the endpoint, and `headers` are untouched.
+`getStats().otlpMetrics.serviceName` reports the live name. Unlike
+the span exporter (EB-412), metrics are snapshots, not a buffered
+stream, so no buffered content changes identity at the rename point —
+the next snapshot simply carries the new name.
 
 ## Trace span archive journal (EB-167)
 
