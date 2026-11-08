@@ -5589,6 +5589,23 @@ Details:
   loses the history. On startup the index back-fills from existing files,
   skipping corrupt lines — a damaged audit directory never prevents the
   bus from starting.
+- **Migrate the directory live.** `setSubscriptionAuditDir(dir, actor?)`
+  (EB-423) moves the disk sink without restarting the bus: future appends
+  land under the new directory, while the in-memory index and the hash
+  chain head stay exactly as they are — entries recorded before the move
+  stay queryable and the chain keeps verifying. Files already in the new
+  directory are *not* back-filled into the live view (they become visible
+  only after a restart); the old directory simply stops receiving new
+  appends and its files are left exactly as they are. A bus built without
+  a directory gains disk landing on the first migration (the migration
+  event itself is the first append under the new directory). A closed bus,
+  an illegal actor, and a non-string or empty `dir` fail closed with the
+  live log untouched; migrating to the current directory is a no-op with
+  no audit. The migration is live-only — a restart restores the
+  construction-time directory. Audited as
+  `subscription_audit_dir_revised` (`{ oldDir, dir }` — only the
+  directories, never any bound; `oldDir` is `null` when the bus was built
+  without a `subscriptionAuditDir`).
 - **Error isolation** — a failed disk append is counted, never thrown
   into the subscribe/unsubscribe path; a throwing audit hook cannot
   exist, because there is no hook — only the log.

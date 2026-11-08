@@ -5251,7 +5251,8 @@ export interface EventBusOptions {
    * works either way — but a restart loses the history. Disabled by
    * default; when enabled, every audited change pays one synchronous
    * file append (error-isolated: a failed write is counted, never
-   * thrown into the subscribe path).
+   * thrown into the subscribe path). Move it live with
+   * `setSubscriptionAuditDir(dir, actor?)` (EB-423).
    */
   subscriptionAuditDir?: string;
   /**
@@ -25469,7 +25470,8 @@ export class EventBus {
    * `EventBusOptions.subscriptionAuditMaxEntries`, EB-78).
    *
    * Only the bound moves — the audit chain itself is untouched:
-   * `dir` / `now` and the hash chain head are unchanged, and the
+   * `now` and the hash chain head are unchanged (the directory moves
+   * separately via `setSubscriptionAuditDir`, EB-423), and the
    * entries already recorded are retained, never cleared or
    * rewritten. The subscription audit log is always on — the bus
    * always constructs it — so there is no never-enabled bus to
@@ -25534,6 +25536,88 @@ export class EventBus {
       detail: {
         maxEntries,
         oldMaxEntries: currentMaxEntries,
+      },
+    });
+  }
+
+  /**
+   * Migrates the subscription audit log's disk sink directory live
+   * (EB-423) without restarting the bus:
+   * `setSubscriptionAuditDir(dir, actor = 'system')` moves the
+   * directory future appends land under — the audit volume filled up,
+   * or the bus was built without a `subscriptionAuditDir` and disk
+   * landing should start somewhere now — with no restart and no loss
+   * of the live subscriptions, replay positions, consumer-group
+   * assignments, or rate-limit and dedup state a restart would drop.
+   *
+   * Only the disk sink moves — deliberately unlike the journal
+   * migrations (EB-421/EB-422), this never re-recovers and never
+   * replaces the read view. The subscription audit's in-memory index
+   * *is* the live log, and `recover()` pushes lines into it and
+   * advances the `headHash`, so re-running it mid-life would fork the
+   * EB-198 chain: the index and the chain head therefore stay exactly
+   * as they are, entries recorded before the move stay queryable, and
+   * `verifySubscriptionAuditChain` keeps passing over the same view.
+   * Files already in the new directory are *not* back-filled into the
+   * live view — they become visible only after a restart, when the
+   * constructor `recover()` reads them. The old directory simply stops
+   * receiving new appends; its files are left exactly as they are
+   * (never deleted, along the EB-61 archive convention). A bus built
+   * without a directory gains disk landing on the first migration, and
+   * the migration event itself is the first append under the new
+   * directory. The retention bound keeps its live value (it still
+   * moves via `setSubscriptionAudit`, EB-321), and the clock is the
+   * bus clock. Migrating to the current directory is a no-op with no
+   * audit.
+   *
+   * Fail-closed: a closed bus, an illegal actor, and a non-string or
+   * empty `dir` all throw `RangeError` with the live log untouched.
+   * There is no never-enabled bus to refuse — the subscription audit
+   * log is always constructed. The migration is live-only — a restart
+   * restores the construction-time `subscriptionAuditDir` — and it
+   * never enters a config snapshot. Audited as
+   * `subscription_audit_dir_revised` (`{ oldDir, dir }` — only the
+   * directories, never any bound; `oldDir` is `null` when the bus was
+   * built without a `subscriptionAuditDir`).
+   *
+   * Orthogonal to EB-78 (that is the subscription audit mechanism
+   * itself — this its missing disk-sink migration), to EB-321 (that
+   * retunes the retention bound — this the directory), to EB-198 (that
+   * is the chain math — this does not move the chain head or the
+   * in-memory index), and to EB-421/EB-422 (those two journals'
+   * object-replacement migrations — this only moves the sink, the
+   * same migration family with a different journal's different
+   * semantics).
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor,
+   * or for a non-string or empty `dir`.
+   */
+  setSubscriptionAuditDir(dir: string, actor = 'system'): void {
+    assertValidActor(actor, 'setSubscriptionAuditDir');
+    // Fail-fast on a closed bus (EB-154, along `setTraceArchiveDir`):
+    // close() already flushed once — there is no live log left to
+    // retarget anywhere.
+    if (this.closed) {
+      throw new RangeError('setSubscriptionAuditDir: bus is closed');
+    }
+    if (typeof dir !== 'string' || dir.length === 0) {
+      throw new RangeError('setSubscriptionAuditDir: dir must be a non-empty string');
+    }
+    // Migrating to the current directory moves nothing: no retarget,
+    // no audit.
+    const oldDir = this.subAudit.currentDir();
+    if (dir === oldDir) {
+      return;
+    }
+    this.subAudit.retargetDir(dir);
+    // The revision event is itself appended after the retarget, so it
+    // is the first event under the new directory.
+    this.auditSubscription({
+      action: 'subscription_audit_dir_revised',
+      actor,
+      detail: {
+        oldDir: oldDir ?? null,
+        dir,
       },
     });
   }

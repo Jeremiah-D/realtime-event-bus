@@ -218,6 +218,7 @@ export type SubscriptionAuditAction =
   | 'pull_buffer_revised'
   | 'fan_out_chunk_size_revised'
   | 'subscription_audit_revised'
+  | 'subscription_audit_dir_revised'
   | 'durable_log_max_entries_revised'
   | 'delayed_capacity_revised'
   | 'topic_delayed_capacity_revised'
@@ -347,7 +348,8 @@ export type SubscriptionAuditAction =
  * - `drop_journal_revised`: `{ maxEntries, oldMaxEntries }` — the bus-level drop journal retention bound was revised (EB-318; the drop journal is always on — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidDropJournalMaxEntries`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the drop determination itself is untouched, drops are still decided by each queue path — and the rows already recorded are retained, never cleared or rewritten: shrinking does not evict immediately (the next record evicts the oldest rows down to the live bound) while a widened bound simply retains more, and lifetime totals (`total` / `byReason`) are unaffected by the revision; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
  * - `pull_buffer_revised`: `{ pullBufferSize, oldPullBufferSize }` — the bus-level pull buffer bound was revised (EB-319; pull is always on — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidPullBufferSize`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the pull mechanism itself is untouched, offsets stay caller-owned, long-poll waiters keep re-reading from their own `fromOffset`, and pull stays independent of push-ACK — and the entries already buffered are retained, never cleared or rewritten: shrinking does not evict immediately (the next publish on a topic truncates that topic's ring down to the live bound) while a widened bound simply retains more; only buses without `durableLogDir` are affected in what `pull()` returns — with a durable log `pull()` reads the log, not the ring; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
  * - `fan_out_chunk_size_revised`: `{ fanOutChunkSize, oldFanOutChunkSize }` (`null` when fully-synchronous) — the bus-level fan-out chunk size was revised (EB-320; chunking is always available — there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidFanOutChunkSize`: a positive integer, or `Infinity` for the fully-synchronous default), so a failed call leaves the live size untouched; only the size moves — the fan-out itself is untouched, matching, filtering, signing, backpressure, and per-subscriber FIFO are unchanged, and barrier control messages still bypass chunking — and the new size governs from the next publish: the fan-out captures the live size at publish start, so a chain already in flight keeps the size it started with and runs its scheduled microtask chunks to completion at that size; a revision that provides no field, and a revision identical to the current size (including `Infinity` against the fully-synchronous default), are both no-ops with no audit)
- * - `subscription_audit_revised`: `{ maxEntries, oldMaxEntries }` — the bus-level subscription audit retention bound was revised (EB-321; the subscription audit log is always on — the bus always constructs it, so there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidSubscriptionAuditMaxEntries`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the audit chain itself is untouched (`dir` / `now` and the hash chain head are unchanged) — and the entries already recorded are retained, never cleared or rewritten: shrinking does not evict immediately at the log level (the next `append` evicts the oldest rows down to the live bound) while a widened bound simply retains more, and the revision event itself is appended to the same log under the new bound, so a shrink is already reflected in the in-memory index when the call returns — the revision event is the record that evicts the oldest rows down to the new bound; evicted rows only leave the in-memory view (the on-disk files are never rewritten, and restart recovery still truncates at the live bound) and the hash chain stays valid — the oldest retained event is the segment anchor; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
+ * - `subscription_audit_revised`: `{ maxEntries, oldMaxEntries }` — the bus-level subscription audit retention bound was revised (EB-321; the subscription audit log is always on — the bus always constructs it, so there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`assertValidSubscriptionAuditMaxEntries`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the audit chain itself is untouched (`now` and the hash chain head are unchanged; the directory moves separately via `setSubscriptionAuditDir`, EB-423) — and the entries already recorded are retained, never cleared or rewritten: shrinking does not evict immediately at the log level (the next `append` evicts the oldest rows down to the live bound) while a widened bound simply retains more, and the revision event itself is appended to the same log under the new bound, so a shrink is already reflected in the in-memory index when the call returns — the revision event is the record that evicts the oldest rows down to the new bound; evicted rows only leave the in-memory view (the on-disk files are never rewritten, and restart recovery still truncates at the live bound) and the hash chain stays valid — the oldest retained event is the segment anchor; a revision that provides no field, and a revision identical to the current bound, are both no-ops with no audit)
+ * - `subscription_audit_dir_revised`: `{ oldDir, dir }` — the subscription audit log's disk sink directory was migrated live (EB-423; the subscription audit log is always on — the bus always constructs it, so there is no never-enabled bus to refuse — and a closed bus refuses; an illegal actor or a non-string / empty `dir` refuses with the live log untouched; migrating to the current directory is a no-op with no audit; only the disk sink moves — future appends land under the new directory while the in-memory index and the hash chain head stay exactly as they are, entries recorded before the move stay queryable and the chain verifies, and files already in the new directory are *not* back-filled into the live view (they become visible only after a restart, when the constructor `recover()` reads them); the old directory simply stops receiving new appends and its files are left exactly as they are (never deleted); a bus built without a directory gains disk landing on the first migration, and the migration event itself is the first append under the new directory; the migration is live-only — a restart restores the construction-time directory — and only the directories are recorded, never any bound; `oldDir` is `null` when the bus was built without a `subscriptionAuditDir`)
  * - `durable_log_max_entries_revised`: `{ maxEntriesPerTopic, oldMaxEntriesPerTopic }` — the bus-level durable-log per-topic entry budget was revised (EB-322; only a bus with `durableLogDir` can be revised — a bus without one refuses with `RangeError`, since it holds no durable log at all (unlike the construction-time option, which is silently ignored without a dir); the new value reuses the construction-time validation (`assertValidDurableLogMaxEntriesPerTopic`: a positive integer), so a failed call leaves the live bound untouched; only the bound moves — the retention mechanism itself is untouched (the amortized 2x compact trigger, the keyed-compaction rule, and the offset/dedup journal guards all keep reading the bound live) — and the records already persisted are retained, never cleared or rewritten: tightening does not force an immediate compact (the next append past twice the new bound rewrites the file down to the newest entries) while a widened bound simply allows more capacity; the revision fans out to the root log and every namespace child log, and a namespace registered later opens its child log with the live bus bound; a revision identical to the current bound is a no-op with no audit)
  * - `delayed_capacity_revised`: `{ maxEntries, oldMaxEntries }` (`null` when a bound is unlimited, since JSON has no `undefined`) — the bus-wide delayed-delivery capacity budget was revised (EB-384; the budget is always present — `undefined` means unlimited — so there is no never-enabled bus to refuse; the new value reuses the construction-time validation (`maxDelayedEntries`: a non-negative integer), so a failed call leaves the live budget untouched; only the bound moves — the pending schedules themselves are untouched, tightening never evicts them (they drain naturally and new schedules are admitted again once the pending count drops below the new bound) while loosening governs from the very next schedule attempt — and the revision itself is live-only (a restart restores the construction-time option value, and restart recovery rebuilds persisted schedules without consulting the budget); a revision identical to the current budget (including clearing an already-unlimited budget) is a no-op with no audit)
  * - `topic_delayed_capacity_revised`: `{ topic, maxEntries, oldMaxEntries }` (`null` when a bound is unlimited, since JSON has no `undefined`) — the per-topic delayed-delivery capacity budget for one concrete topic was revised (EB-385; the revision itself is live-only — a restart clears every per-topic budget, unlike the bus-wide budget which restores its construction-time option value — and restart recovery rebuilds persisted schedules without consulting any budget; tightening never evicts the topic's pending schedules (they drain naturally and new schedules are admitted again once the topic's pending count drops below the new budget) while loosening governs from the very next schedule attempt; a revision identical to the current budget for the topic (including clearing an already-unlimited topic) is a no-op with no audit)
@@ -756,6 +758,7 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'pull_buffer_revised',
   'fan_out_chunk_size_revised',
   'subscription_audit_revised',
+  'subscription_audit_dir_revised',
   'durable_log_max_entries_revised',
   'delayed_capacity_revised',
   'topic_delayed_capacity_revised',
@@ -859,7 +862,10 @@ export function assertValidSubscriptionAuditMaxEntries(value: unknown): void {
 }
 
 export class SubscriptionAuditLog {
-  private readonly dir: string | undefined;
+  // Not readonly: `retargetDir` (EB-423) moves the disk sink live — the
+  // in-memory index and the hash chain head are never touched by a
+  // migration, only the directory future appends land under.
+  private dir: string | undefined;
   private maxEntries: number;
   private readonly now: () => number;
   private readonly entries: SubscriptionAuditEvent[] = [];
@@ -891,13 +897,14 @@ export class SubscriptionAuditLog {
 
   /**
    * Retunes the in-memory retention bound live (EB-321). Only the
-   * bound moves — the audit chain itself is untouched (`dir` / `now`
-   * and the hash chain head are unchanged), and the entries already
-   * recorded are retained, never cleared or rewritten: shrinking does
-   * not evict immediately — the next `append` evicts the oldest rows
-   * down to the live bound — while a widened bound simply retains
-   * more. Validates fail-fast with the construction-time rule, so an
-   * illegal value leaves the live bound exactly as it was.
+   * bound moves — the audit chain itself is untouched (`now` and the
+   * hash chain head are unchanged; `dir` moves only via `retargetDir`,
+   * EB-423), and the entries already recorded are retained, never
+   * cleared or rewritten: shrinking does not evict immediately — the
+   * next `append` evicts the oldest rows down to the live bound —
+   * while a widened bound simply retains more. Validates fail-fast
+   * with the construction-time rule, so an illegal value leaves the
+   * live bound exactly as it was.
    */
   retune(maxEntries: number): void {
     assertValidSubscriptionAuditMaxEntries(maxEntries);
@@ -907,6 +914,43 @@ export class SubscriptionAuditLog {
   /** The current retention bound — the live value `retune` moves. */
   current(): number {
     return this.maxEntries;
+  }
+
+  /** The directory new appends land under — `undefined` when disk landing is off. */
+  currentDir(): string | undefined {
+    return this.dir;
+  }
+
+  /**
+   * Moves the disk sink live (EB-423): future `append`s land under
+   * `dir`, and only the sink moves — deliberately unlike the journal
+   * migrations (EB-421/EB-422), this never re-recovers and never
+   * replaces the read view. `recover()` pushes lines into `entries`
+   * and advances `headHash`, so re-running it mid-life would fork the
+   * EB-198 chain; the in-memory index and the chain head therefore
+   * stay exactly as they are, entries recorded before the move stay
+   * queryable, and files already in the new directory are *not*
+   * back-filled into the live view (they become visible only after a
+   * restart, when the constructor `recover()` reads them). The old
+   * directory simply stops receiving new appends; its files are left
+   * exactly as they are (never deleted). The directory is created when
+   * missing (best-effort: a failure to create it is left for the next
+   * append to count as a disk write error, as the constructor's
+   * silent recovery does). Validates fail-fast with the
+   * construction-time rule, so an illegal value leaves the live
+   * directory exactly as it was.
+   */
+  retargetDir(dir: string): void {
+    if (typeof dir !== 'string' || dir.length === 0) {
+      throw new RangeError('subscriptionAuditDir must be a non-empty string');
+    }
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      // A failed mkdir is not fatal here: the next append counts it
+      // as a disk write error instead of throwing into the caller.
+    }
+    this.dir = dir;
   }
 
   /**
