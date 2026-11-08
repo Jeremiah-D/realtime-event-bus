@@ -5954,8 +5954,9 @@ export interface EventBusOptions {
    * topic's watermark. The message is still delivered normally — this is
    * the observability signal, not a gate. The callback is error-isolated:
    * a throwing hook is swallowed so a broken observer can never disturb
-   * the publish path. Default: unset (no hook — fully backward
-   * compatible).
+   * the publish path. Replaceable live via `setLateMessageCallback`
+   * (EB-427); `null` clears back to no observer. Default: unset (no hook
+   * — fully backward compatible).
    */
   onLate?: LateMessageCallback;
   /**
@@ -16223,9 +16224,12 @@ export class EventBus {
   private allowedLatenessMs: number;
   /**
    * Bus-level late-message hook (see `EventBusOptions.onLate`), fired
-   * error-isolated once per late publish.
+   * error-isolated once per late publish. Mutable:
+   * `setLateMessageCallback` (EB-427) replaces it live —
+   * `observeEventTime` reads this field on every lateness judgment, so
+   * the new hook governs from the next late message onward.
    */
-  private readonly onLate?: LateMessageCallback;
+  private onLate?: LateMessageCallback;
   /**
    * Bus-level watermark idle-advance hook (see
    * `EventBusOptions.onWatermarkIdle`), fired error-isolated once per
@@ -21110,6 +21114,85 @@ export class EventBus {
       detail: { from: previous, to: allowedLatenessMs },
     });
   }
+
+  /**
+   * Replaces the late-message hook live (EB-427) without restarting the
+   * bus: `setLateMessageCallback(handler)` swaps the `onLate` observer
+   * every late event-time publish is handed to (see
+   * `EventBusOptions.onLate`).
+   *
+   * There is no enable gate: the hook itself has no feature switch, so
+   * any open bus can install one — on a bus with no event-time publishes
+   * it simply never fires. `null` clears back to no observer. The new
+   * hook governs from the next lateness judgment onward — a message
+   * already judged late is never re-delivered — and the counters
+   * (`TopicStats.lateMessages`, `BusStats.lateMessages`) move regardless
+   * of whether a hook is installed. A throwing hook is still swallowed by
+   * `observeEventTime`: observation never breaks the publish path. Only
+   * the observer channel moves — the watermark mechanism, the allowed
+   * lateness (bus default and per-topic overrides), and the late judgment
+   * itself are untouched.
+   *
+   * Fail-closed: an illegal actor, a closed bus, and an illegal callback
+   * all throw `RangeError` with the live hook and the audit log untouched.
+   * Validation reuses the construction-time rule (a callback must be a
+   * function, `null` clears back to no observer), so a value that could
+   * not be set at construction cannot be installed later either. (The
+   * constructor's own `onLate` check throws `TypeError`; the setter
+   * follows the callback-revision family and throws `RangeError`, like
+   * `setAuthzDeniedCallback` / `setUnregisteredTopicCallback`.)
+   * Re-installing the live callback (the same reference, including
+   * `null` against a bus with no callback) is a no-op with no audit.
+   * Audited as `late_message_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself is
+   * never written to the audit log).
+   *
+   * Orthogonal to EB-59 (that is the event-time watermark and lateness
+   * judgment itself — this its missing live hook-redirection entry), to
+   * EB-189 (that is watermark idle advancement — this the late-message
+   * observer), to EB-324 (that is the bus-level default lateness value —
+   * this the observer), and to EB-415/416/417/418/425/426 (those replace
+   * six other callbacks — this the seventh, the late-message channel).
+   * The revision is live-only — a restart restores the
+   * construction-time callback.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal callback.
+   */
+  setLateMessageCallback(handler: LateMessageCallback | null, actor = 'system'): void {
+    assertValidActor(actor, 'setLateMessageCallback');
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setLateMessageCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live hook untouched.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setLateMessageCallback: handler must be a function or null');
+    }
+    const next = handler ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === this.onLate) {
+      return;
+    }
+    const oldHasCallback = this.onLate !== undefined;
+    this.onLate = next;
+    this.auditSubscription({
+      action: 'late_message_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
 
   /**
    * Opts a topic into event-time watermark idle advancement (EB-189):

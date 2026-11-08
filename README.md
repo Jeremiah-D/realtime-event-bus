@@ -2922,6 +2922,11 @@ library.
   delivery); they are counted (`TopicStats.lateMessages`,
   `BusStats.lateMessages`) and reported once each on the bus-level
   `EventBusOptions.onLate` hook (error-isolated, like `onAdmissionRejected`).
+  Redirect it live with `setLateMessageCallback(handler, actor?)` (EB-427):
+  `null` clears back to no observer, re-installing the live callback is a
+  no-op, and the swap is audited as `late_message_callback_revised`
+  (`{ hasCallback, oldHasCallback }`); the watermark and the late judgment
+  are untouched.
   The watermark is orthogonal to the publish-order `seq` (EB-13): `seq`
   orders arrivals, the watermark orders business time — out-of-order
   arrivals with on-time business times are not late. `allowedLatenessMs`
