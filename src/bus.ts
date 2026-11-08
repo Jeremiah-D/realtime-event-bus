@@ -5726,8 +5726,9 @@ export interface EventBusOptions {
    * (`AdmissionRejectionEvent`); the event carries the rejected payload's
    * byte size, never the payload itself. The callback is error-isolated:
    * a throwing hook is swallowed so a broken observer can never disturb
-   * the publish path. Default: unset (no hook — fully backward
-   * compatible).
+   * the publish path. Replaceable live via `setAdmissionRejectedCallback`
+   * (EB-428); `null` clears back to no observer. Default: unset (no hook
+   * — fully backward compatible).
    */
   onAdmissionRejected?: AdmissionRejectionCallback;
   /**
@@ -16573,9 +16574,12 @@ export class EventBus {
   /**
    * Unified publish-side admission-rejection hook
    * (`EventBusOptions.onAdmissionRejected`), or `undefined` when unset —
-   * the bus is then exactly as before (stats counting only).
+   * the bus is then exactly as before (stats counting only). Mutable:
+   * `setAdmissionRejectedCallback` (EB-428) replaces it live —
+   * `emitAdmissionRejected` reads this field on every rejection, so the
+   * new hook governs from the next rejection onward.
    */
-  private readonly onAdmissionRejected: AdmissionRejectionCallback | undefined;
+  private onAdmissionRejected: AdmissionRejectionCallback | undefined;
   /**
    * Authorization-denial audit hook (`EventBusOptions.onAuthzDenied`), or
    * `undefined` when unset. Mutable: `setAuthzDeniedCallback` (EB-425)
@@ -30461,6 +30465,80 @@ export class EventBus {
     this.onUnregisteredTopic = next;
     this.auditSubscription({
       action: 'unregistered_topic_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
+  /**
+   * Replaces the admission-rejection hook live (EB-428) without
+   * restarting the bus: `setAdmissionRejectedCallback(handler)` swaps the
+   * `onAdmissionRejected` observer every publish-side admission
+   * rejection is handed to (see `EventBusOptions.onAdmissionRejected`).
+   *
+   * There is no enable gate: the hook itself has no feature switch, so
+   * any open bus can install one — on a bus whose publishes are all
+   * admitted it simply never fires. `null` clears back to no observer.
+   * The new hook governs from the next rejection onward — a rejection
+   * already emitted is never re-delivered — and the rejection counters
+   * (`getStats().rejectedMessages` / `rateLimitedMessages` /
+   * `duplicateMessages`) move regardless of whether a hook is installed.
+   * A throwing hook is still swallowed by `emitAdmissionRejected`:
+   * observation never breaks the publish path. Only the observer channel
+   * moves — the admission gates (schema, ACL, rate-limit, webhook,
+   * message size) are untouched, and verdicts are unchanged.
+   *
+   * Fail-closed: an illegal actor, a closed bus, and an illegal callback
+   * all throw `RangeError` with the live hook and the audit log untouched.
+   * Validation reuses the construction-time rule (a callback must be a
+   * function, `null` clears back to no observer), so a value that could
+   * not be set at construction cannot be installed later either — the
+   * constructor throws `RangeError` for a non-function, and the setter
+   * does the same. Re-installing the live callback (the same reference,
+   * including `null` against a bus with no callback) is a no-op with no
+   * audit. Audited as `admission_rejected_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself is
+   * never written to the audit log).
+   *
+   * Orthogonal to EB-39 (that is the unified admission-rejection channel
+   * itself — this its missing live hook-redirection entry), to EB-157
+   * (that is the admission webhook verdict — this the rejection-event
+   * observer), and to EB-425/426/427 (those replace three other callbacks
+   * — this the eighth, the admission-rejection channel). The revision is
+   * live-only — a restart restores the construction-time callback.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal callback.
+   */
+  setAdmissionRejectedCallback(handler: AdmissionRejectionCallback | null, actor = 'system'): void {
+    assertValidActor(actor, 'setAdmissionRejectedCallback');
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setAdmissionRejectedCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live hook untouched.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setAdmissionRejectedCallback: handler must be a function or null');
+    }
+    const next = handler ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === this.onAdmissionRejected) {
+      return;
+    }
+    const oldHasCallback = this.onAdmissionRejected !== undefined;
+    this.onAdmissionRejected = next;
+    this.auditSubscription({
+      action: 'admission_rejected_callback_revised',
       actor,
       detail: {
         hasCallback: next !== undefined,

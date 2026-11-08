@@ -1948,8 +1948,11 @@ library.
   hook events reconcile exactly with `getStats()`. The hook fires after the
   counters move, carries the rejected payload's byte size (never the payload
   itself), and is error-isolated — a throwing hook is swallowed so it can
-  never disturb the publish path. Unset by default (stats counting only —
-  fully backward compatible).
+  never disturb the publish path. `setAdmissionRejectedCallback(handler |
+  null)` (EB-428) redirects the hook live — any open bus can install one,
+  `null` clears it, and every real swap is audited as
+  `admission_rejected_callback_revised` (`{ hasCallback, oldHasCallback }`).
+  Unset by default (stats counting only — fully backward compatible).
 - **Admission dead-letter topics** (in `src/bus.ts`, via
   `setTopicDeadLetterTopic(topicPattern, dlqTopic, { retentionMs })` /
   `clearTopicDeadLetterTopic(topicPattern)`): opt-in dead-lettering for
