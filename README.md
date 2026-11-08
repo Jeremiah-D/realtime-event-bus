@@ -1484,7 +1484,11 @@ library.
   and never keeps the process alive; `unsubscribe()` clears it, so no
   phantom expiry can fire afterwards. `EventBusOptions.onIdleExpired`
   fires once per expiry (error-isolated — a throwing hook is swallowed)
-  and `getStats().idleExpired` counts expiries. A subscriber may hold
+  and `getStats().idleExpired` counts expiries. `setIdleExpiredCallback(handler | null)`
+  (EB-430) redirects the hook live — any open bus can install one, `null`
+  clears it, and every real swap is audited as
+  `idle_expired_callback_revised` (`{ hasCallback, oldHasCallback }`).
+  A subscriber may hold
   both `leaseMs` and `maxIdleMs`: the two are independent opt-ins and
   whichever fires first wins, the other being cleared by the shared
   unsubscribe path. Works per member for consumer-group members
