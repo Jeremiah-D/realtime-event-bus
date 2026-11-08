@@ -5755,7 +5755,9 @@ export interface EventBusOptions {
    * counted in `getStats().unregisteredTopicPublishes`, with or without
    * the hook. Error-isolated like `onAdmissionRejected`: a throwing hook
    * is swallowed so a broken observer can never disturb the publish path.
-   * Default: unset (counting only — fully backward compatible).
+   * Replaceable live via `setUnregisteredTopicCallback` (EB-426); `null`
+   * clears back to no observer. Default: unset (counting only — fully
+   * backward compatible).
    */
   onUnregisteredTopic?: UnregisteredTopicCallback;
   /**
@@ -17661,9 +17663,12 @@ export class EventBus {
   /**
    * Unregistered-topic publish hook (`EventBusOptions.onUnregisteredTopic`),
    * or `undefined` when unset — the bus is then exactly as before (stats
-   * counting only).
+   * counting only). Mutable: `setUnregisteredTopicCallback` (EB-426)
+   * replaces it live — `checkTopicRegistered` reads this field on every
+   * unregistered publish, so the new hook governs from the next
+   * unregistered publish onward.
    */
-  private readonly onUnregisteredTopic: UnregisteredTopicCallback | undefined;
+  private onUnregisteredTopic: UnregisteredTopicCallback | undefined;
   /**
    * Total publishes to topics with no live registration
    * (`getStats().unregisteredTopicPublishes`). Counted with or without
@@ -30307,6 +30312,80 @@ export class EventBus {
       },
     });
   }
+
+  /**
+   * Replaces the unregistered-topic publish hook live (EB-426) without
+   * restarting the bus: `setUnregisteredTopicCallback(handler)` swaps the
+   * `onUnregisteredTopic` observer every publish to an unregistered topic
+   * is handed to (see `EventBusOptions.onUnregisteredTopic`).
+   *
+   * There is no enable gate: the hook itself has no feature switch, so
+   * any open bus can install one — on a bus whose topics are all
+   * registered it simply never fires. `null` clears back to no observer.
+   * The new hook governs from the next unregistered publish onward — an
+   * unregistered publish already surfaced is never re-delivered — and the
+   * counter (`getStats().unregisteredTopicPublishes`) moves regardless of
+   * whether a hook is installed. A throwing hook is still swallowed by
+   * `checkTopicRegistered`: observation never breaks the publish path.
+   * Only the observer channel moves — the topic registry itself
+   * (`registerTopic` / `deregisterTopic`) is untouched, and the advisory
+   * counting is unchanged.
+   *
+   * Fail-closed: an illegal actor, a closed bus, and an illegal callback
+   * all throw `RangeError` with the live hook and the audit log untouched.
+   * Validation reuses the construction-time rule (a callback must be a
+   * function, `null` clears back to no observer), so a value that could
+   * not be set at construction cannot be installed later either.
+   * Re-installing the live callback (the same reference, including
+   * `null` against a bus with no callback) is a no-op with no audit.
+   * Audited as `unregistered_topic_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself is
+   * never written to the audit log).
+   *
+   * Orthogonal to EB-77 (that is the unregistered-topic advisory
+   * mechanism itself — this its missing live hook-redirection entry),
+   * to EB-415/416/417/418/425 (those replace five other callbacks —
+   * this the sixth, the unregistered-topic channel), and to EB-78 (that
+   * is the subscription audit channel). The revision is live-only — a
+   * restart restores the construction-time callback.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal callback.
+   */
+  setUnregisteredTopicCallback(handler: UnregisteredTopicCallback | null, actor = 'system'): void {
+    assertValidActor(actor, 'setUnregisteredTopicCallback');
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setUnregisteredTopicCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live hook untouched.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setUnregisteredTopicCallback: handler must be a function or null');
+    }
+    const next = handler ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === this.onUnregisteredTopic) {
+      return;
+    }
+    const oldHasCallback = this.onUnregisteredTopic !== undefined;
+    this.onUnregisteredTopic = next;
+    this.auditSubscription({
+      action: 'unregistered_topic_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
 
   /**
    * ACL verdict for a concrete publish topic: the first rule (in

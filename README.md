@@ -4648,6 +4648,10 @@ exposition) and surfaced per occurrence on the opt-in
 producer that forgot to register shows up in monitoring instead of
 silently flowing. The hook is error-isolated like `onAdmissionRejected`:
 a throwing observer is swallowed and can never disturb the publish path.
+Redirect the hook live with `setUnregisteredTopicCallback(handler, actor?)`
+(EB-426): `null` clears back to no observer, re-installing the live callback
+is a no-op, and the swap is audited as `unregistered_topic_callback_revised`
+(`{ hasCallback, oldHasCallback }`); the registry itself is untouched.
 
 Details:
 
