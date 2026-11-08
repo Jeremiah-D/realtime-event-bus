@@ -5972,7 +5972,8 @@ export interface EventBusOptions {
    * Edge-triggered — one call per idle episode; a new event-time
    * publish re-arms the timer. The callback is error-isolated: a
    * throwing hook is swallowed so a broken observer can never disturb
-   * the publish path. Default: unset (no hook — fully backward
+   * the publish path. Replaceable live via `setWatermarkIdleCallback`
+   * (EB-431); `null` clears back to no observer. Default: unset (no hook — fully backward
    * compatible).
    */
   onWatermarkIdle?: WatermarkIdleCallback;
@@ -16247,9 +16248,12 @@ export class EventBus {
   /**
    * Bus-level watermark idle-advance hook (see
    * `EventBusOptions.onWatermarkIdle`), fired error-isolated once per
-   * idle episode.
+   * idle episode. Mutable: `setWatermarkIdleCallback` (EB-431) replaces
+   * it live — `armWatermarkIdleTimer` reads this field on every idle
+   * advancement, so the new hook governs from the next advancement
+   * onward.
    */
-  private readonly onWatermarkIdle?: WatermarkIdleCallback;
+  private onWatermarkIdle?: WatermarkIdleCallback;
   /**
    * Per-topic allowed-lateness overrides, keyed by the exact string passed
    * to `setTopicAllowedLateness` — either a concrete topic name or a
@@ -30707,6 +30711,85 @@ export class EventBus {
       },
     });
   }
+
+  /**
+   * Replaces the watermark idle-advance hook live (EB-431) without
+   * restarting the bus: `setWatermarkIdleCallback(handler)` swaps the
+   * `onWatermarkIdle` observer every idle watermark advancement is
+   * handed to (see `EventBusOptions.onWatermarkIdle`).
+   *
+   * There is no enable gate: the hook itself has no feature switch, so
+   * any open bus can install one — on a bus with no watermark idle
+   * rule it simply never fires. `null` clears back to no observer.
+   * The new hook governs from the next idle advancement onward — an
+   * advancement already fired is never re-delivered — and the
+   * advancement counters (`getStats().topics[].watermarkIdle.advances`)
+   * move regardless of whether a hook is installed. A throwing hook is
+   * still swallowed by `armWatermarkIdleTimer`: observation never
+   * breaks the publish path. Only the observer channel moves — the
+   * idle-timeout rules, the advancement judgment, and the edge-triggered
+   * arming are untouched.
+   *
+   * Fail-closed: an illegal actor, a closed bus, and an illegal callback
+   * all throw `RangeError` with the live hook and the audit log untouched.
+   * Validation reuses the construction-time rule (a callback must be a
+   * function, `null` clears back to no observer) — the constructor
+   * throws `TypeError` for a non-function where this setter throws
+   * `RangeError`, following the callback-redirection family; a value
+   * that could not be set at construction cannot be installed later
+   * either. Re-installing the live callback (the same reference,
+   * including `null` against a bus with no callback) is a no-op with
+   * no audit. Audited as `watermark_idle_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself is
+   * never written to the audit log).
+   *
+   * Orthogonal to EB-189 (that is the watermark idle-advancement
+   * mechanism itself — this its missing live hook-redirection entry),
+   * to EB-324 (that is the bus-level default allowed lateness — this
+   * the idle-advance observer), to EB-427 (that is the per-message
+   * late judgment hook — this the watermark advance after stream
+   * silence), and to EB-425/426/428/429/430 (those replace five other
+   * callbacks — this the eleventh, the watermark idle-advance
+   * channel). The revision is live-only — a restart restores the
+   * construction-time callback.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal callback.
+   */
+  setWatermarkIdleCallback(handler: WatermarkIdleCallback | null, actor = 'system'): void {
+    assertValidActor(actor, 'setWatermarkIdleCallback');
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setWatermarkIdleCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live hook untouched.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setWatermarkIdleCallback: handler must be a function or null');
+    }
+    const next = handler ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === this.onWatermarkIdle) {
+      return;
+    }
+    const oldHasCallback = this.onWatermarkIdle !== undefined;
+    this.onWatermarkIdle = next;
+    this.auditSubscription({
+      action: 'watermark_idle_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
 
   /**
    * ACL verdict for a concrete publish topic: the first rule (in

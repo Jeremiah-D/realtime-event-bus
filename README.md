@@ -2972,7 +2972,10 @@ library.
   advances the watermark to the highest observed event time (allowed
   lateness still deducted) and fires the bus-level
   `EventBusOptions.onWatermarkIdle` hook once per idle episode
-  (error-isolated). The watermark value itself is unchanged — it is
+  (error-isolated). `setWatermarkIdleCallback(handler | null)` (EB-431)
+  redirects the hook live — any open bus can install one, `null` clears
+  it, and every real swap is audited as `watermark_idle_callback_revised`
+  (`{ hasCallback, oldHasCallback }`). The watermark value itself is unchanged — it is
   already `maxEventTime − allowedLatenessMs` — but the idle episode is
   now explicit, so downstream consumers can stop waiting and close
   their windows. Only event-time publishes count as activity; a new
