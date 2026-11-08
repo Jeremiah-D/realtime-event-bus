@@ -2004,7 +2004,13 @@ library.
   subscribe throws `AclDeniedError` before anything registers (also
   audited — the hook is its only audit channel, since nothing is returned).
   `setAclRules` replaces the rule list with immediate effect — no cached
-  verdicts, no restart; `getAclRules` returns a copy. `getStats().authzDenied`
+  verdicts, no restart; `getAclRules` returns a copy. `setAclPolicies({
+  defaultPolicy?, anonymousPolicy? })` (EB-424) revises the two policies
+  live — the verdict when no rule decides, and the anonymous-publish
+  verdict under a publisher-constrained allow rule — also with immediate
+  effect; a same-value revision is a no-op, and every real revision is
+  audited as `acl_policies_revised` (`{ previous, current }`).
+  `getStats().authzDenied`
   counts every denied publish and subscribe — the security-relevant counter
   to alert on. Invalid rules throw `RangeError` at configuration time.
 - **Topic aliases with zero-downtime migration** (in `src/bus.ts`, via

@@ -5769,7 +5769,9 @@ export interface EventBusOptions {
    * pattern matches, before any fall-through. Unauthorized publishes
    * return 0 and are counted as rejections (reason `'acl'`);
    * unauthorized subscribes throw `AclDeniedError`. Rule changes via
-   * `setAclRules` take effect immediately. Default: unset (no ACL — the
+   * `setAclRules` take effect immediately, and the two policies
+   * (`defaultPolicy` / `anonymousPolicy`) move live via
+   * `setAclPolicies` (EB-424). Default: unset (no ACL — the
    * bus behaves exactly as before).
    */
   acl?: AclOptions;
@@ -12823,7 +12825,7 @@ export interface AclOptions {
   /**
    * Verdict when no rule decides an action. Default `'allow'` (a bus
    * without ACL behaves exactly as before); `'deny'` turns the rule set
-   * into a whitelist.
+   * into a whitelist. Revisable live via `setAclPolicies` (EB-424).
    */
   defaultPolicy?: AclDecision;
   /**
@@ -12834,6 +12836,24 @@ export interface AclOptions {
    * anonymous producers, is refused). Applies only when a rule's
    * pattern matched and the rule names publishers; publishes that match
    * no rule still fall through to `defaultPolicy` unchanged.
+   * Revisable live via `setAclPolicies` (EB-424).
+   */
+  anonymousPolicy?: AclDecision;
+}
+
+/**
+ * Live revision patch for the two ACL policies (`setAclPolicies`,
+ * EB-424): the verdict when no rule decides an action
+ * (`defaultPolicy`) and the verdict for anonymous publishes under a
+ * publisher-constrained allow rule (`anonymousPolicy`). Only the
+ * fields provided move; a patch with neither field is refused.
+ */
+export interface AclPoliciesRevision {
+  /** Verdict when no rule decides an action (`'allow'` | `'deny'`). */
+  defaultPolicy?: AclDecision;
+  /**
+   * Verdict for anonymous publishes under a publisher-constrained
+   * allow rule (`'allow'` | `'deny'`).
    */
   anonymousPolicy?: AclDecision;
 }
@@ -30090,8 +30110,8 @@ export class EventBus {
    * take effect immediately: the very next `publish`/`subscribe` is judged
    * by them — no cached verdicts, no restart needed. This is the runtime
    * half of the ACL; the initial list comes from `EventBusOptions.acl`
-   * (note: `defaultPolicy` is set once via the constructor options and is
-   * not changed here).
+   * (the two policies — `defaultPolicy` / `anonymousPolicy` — move live
+   * via `setAclPolicies`, EB-424, not here).
    *
    * Rules are evaluated in array order; the first rule whose pattern
    * matches — with an explicit decision for the action — wins. Publish
@@ -30115,6 +30135,100 @@ export class EventBus {
       ...(rule.subscribe !== undefined ? { subscribe: rule.subscribe } : {}),
       ...(rule.publishers !== undefined ? { publishers: [...rule.publishers] } : {}),
     }));
+  }
+
+  /**
+   * Revises the two ACL policies live (EB-424) without restarting the bus:
+   * `setAclPolicies({ defaultPolicy?, anonymousPolicy? })` moves the
+   * verdict when no rule decides an action (`defaultPolicy`, default
+   * `'allow'`) and the verdict for anonymous publishes under a
+   * publisher-constrained allow rule (`anonymousPolicy`, default
+   * `'deny'`, EB-165). The initial values come from
+   * `EventBusOptions.acl`; `setAclRules` only replaces the rule list —
+   * the two policies move only here.
+   *
+   * Only the fields provided move; the rest keep their live values. The
+   * verdict sites (`aclAllowsPublish` / `aclAllowsSubscribe`) already
+   * read the live fields, so the new policies govern from the very next
+   * verdict — a publish or subscribe already judged keeps the verdict it
+   * was judged with, and no cached verdicts exist to flush. In-flight
+   * deliveries and already-established subscriptions are unaffected:
+   * flipping `defaultPolicy` to `'deny'` blocks only new publishes and
+   * subscribes, never evicting existing subscribers.
+   *
+   * Fail-closed: an illegal actor, a closed bus, a non-object patch, a
+   * patch with neither field, and an illegal policy value all throw
+   * `RangeError` with the live policies and the audit log untouched.
+   * Validation reuses the construction-time rule (each policy `'allow'`
+   * | `'deny'`), so a value that could not be set at construction cannot
+   * be installed later either — and a failed call changes nothing at
+   * all: an illegal value in any field leaves every live value exactly
+   * as it was. A revision identical to the live policies is a no-op with
+   * no audit. Audited as `acl_policies_revised`
+   * (`{ previous: { defaultPolicy, anonymousPolicy }, current:
+   * { defaultPolicy, anonymousPolicy } }`).
+   *
+   * Orthogonal to `setAclRules` (that replaces the rule list — this the
+   * two policies the rules fall through to), to EB-165 (that is the
+   * publisher-constrained allow rule — this the anonymous policy that
+   * rule consults), and to EB-78 (that is the subscription audit channel
+   * — this the audited revision event itself). The revision is live-only
+   * — a restart restores the construction-time policies — and it never
+   * enters a config snapshot.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal patch.
+   */
+  setAclPolicies(patch: AclPoliciesRevision, actor = 'system'): void {
+    assertValidActor(actor, 'setAclPolicies');
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live ACL left to retune.
+    if (this.closed) {
+      throw new RangeError('setAclPolicies: bus is closed');
+    }
+    // Validate before touching anything: the patch must be an object
+    // naming at least one policy, and every named policy must be
+    // 'allow' | 'deny' — the construction-time rule — so a failed call
+    // leaves the live policies exactly as they were.
+    if (patch === null || typeof patch !== 'object') {
+      throw new RangeError('setAclPolicies: patch must be an object with at least one policy');
+    }
+    const hasDefault = patch.defaultPolicy !== undefined;
+    const hasAnonymous = patch.anonymousPolicy !== undefined;
+    if (!hasDefault && !hasAnonymous) {
+      throw new RangeError('setAclPolicies: patch must provide at least one policy');
+    }
+    if (hasDefault && patch.defaultPolicy !== 'allow' && patch.defaultPolicy !== 'deny') {
+      throw new RangeError("setAclPolicies: defaultPolicy must be 'allow' or 'deny'");
+    }
+    if (hasAnonymous && patch.anonymousPolicy !== 'allow' && patch.anonymousPolicy !== 'deny') {
+      throw new RangeError("setAclPolicies: anonymousPolicy must be 'allow' or 'deny'");
+    }
+    const previous = {
+      defaultPolicy: this.aclDefault,
+      anonymousPolicy: this.aclAnonymousPolicy,
+    };
+    const current = {
+      defaultPolicy: hasDefault ? (patch.defaultPolicy as AclDecision) : this.aclDefault,
+      anonymousPolicy: hasAnonymous
+        ? (patch.anonymousPolicy as AclDecision)
+        : this.aclAnonymousPolicy,
+    };
+    // A revision identical to the live policies moves nothing: no swap,
+    // no audit.
+    if (
+      current.defaultPolicy === previous.defaultPolicy &&
+      current.anonymousPolicy === previous.anonymousPolicy
+    ) {
+      return;
+    }
+    this.aclDefault = current.defaultPolicy;
+    this.aclAnonymousPolicy = current.anonymousPolicy;
+    this.auditSubscription({
+      action: 'acl_policies_revised',
+      actor,
+      detail: { previous, current },
+    });
   }
 
   /**
