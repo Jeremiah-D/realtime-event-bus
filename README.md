@@ -2010,7 +2010,10 @@ library.
   verdict under a publisher-constrained allow rule — also with immediate
   effect; a same-value revision is a no-op, and every real revision is
   audited as `acl_policies_revised` (`{ previous, current }`).
-  `getStats().authzDenied`
+  `setAuthzDeniedCallback(handler | null)` (EB-425) redirects the denial
+  hook live — any open bus can install one, `null` clears it, and every
+  real swap is audited as `authz_denied_callback_revised`
+  (`{ hasCallback, oldHasCallback }`). `getStats().authzDenied`
   counts every denied publish and subscribe — the security-relevant counter
   to alert on. Invalid rules throw `RangeError` at configuration time.
 - **Topic aliases with zero-downtime migration** (in `src/bus.ts`, via

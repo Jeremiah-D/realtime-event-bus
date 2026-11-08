@@ -5784,7 +5784,9 @@ export interface EventBusOptions {
    * reconcilable with the rejection counters); subscribe denials throw
    * `AclDeniedError`, so this hook is their only audit channel. The
    * callback is error-isolated: a throwing hook is swallowed so a broken
-   * observer can never disturb the publish/subscribe path. Default: unset.
+   * observer can never disturb the publish/subscribe path. Replaceable
+   * live via `setAuthzDeniedCallback` (EB-425); `null` clears back to no
+   * observer. Default: unset.
    */
   onAuthzDenied?: AuthzDeniedCallback;
   /**
@@ -16570,9 +16572,11 @@ export class EventBus {
   private readonly onAdmissionRejected: AdmissionRejectionCallback | undefined;
   /**
    * Authorization-denial audit hook (`EventBusOptions.onAuthzDenied`), or
-   * `undefined` when unset.
+   * `undefined` when unset. Mutable: `setAuthzDeniedCallback` (EB-425)
+   * replaces it live — `emitAuthzDenied` reads this field on every
+   * denial, so the new hook governs from the next denial onward.
    */
-  private readonly onAuthzDenied: AuthzDeniedCallback | undefined;
+  private onAuthzDenied: AuthzDeniedCallback | undefined;
   /**
    * Delivery-trace recorder (`EventBusOptions.trace`), or `undefined`
    * when tracing is disabled — every instrumentation site checks this one
@@ -30228,6 +30232,79 @@ export class EventBus {
       action: 'acl_policies_revised',
       actor,
       detail: { previous, current },
+    });
+  }
+
+  /**
+   * Replaces the authorization-denial audit hook live (EB-425) without
+   * restarting the bus: `setAuthzDeniedCallback(handler)` swaps the
+   * `onAuthzDenied` observer every ACL denial is handed to (see
+   * `EventBusOptions.onAuthzDenied`).
+   *
+   * There is no enable gate: the hook itself has no feature switch, so
+   * any open bus can install one — on a bus without ACL configured it
+   * simply never fires. `null` clears back to no observer. The new hook
+   * governs from the next denial onward — a denial already emitted is
+   * never re-delivered — and the denial counter
+   * (`getStats().authzDenied`) moves regardless of whether a hook is
+   * installed. A throwing hook is still swallowed by `emitAuthzDenied`:
+   * observation never breaks the publish/subscribe path. Only the
+   * observer channel moves — the ACL rules and the two policies
+   * (`setAclRules` / `setAclPolicies`) are untouched, and verdicts are
+   * unchanged.
+   *
+   * Fail-closed: an illegal actor, a closed bus, and an illegal callback
+   * all throw `RangeError` with the live hook and the audit log untouched.
+   * Validation reuses the construction-time rule (a callback must be a
+   * function, `null` clears back to no observer), so a value that could
+   * not be set at construction cannot be installed later either.
+   * Re-installing the live callback (the same reference, including
+   * `null` against a bus with no callback) is a no-op with no audit.
+   * Audited as `authz_denied_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself is
+   * never written to the audit log).
+   *
+   * Orthogonal to EB-415/416/417/418 (those replace four other callbacks
+   * — this the fifth, the authorization-denial channel), to `setAclRules`
+   * / `setAclPolicies` (those move the verdicts themselves — this only
+   * where a denial is reported), and to EB-78 (that is the subscription
+   * audit channel). The revision is live-only — a restart restores the
+   * construction-time callback.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal callback.
+   */
+  setAuthzDeniedCallback(handler: AuthzDeniedCallback | null, actor = 'system'): void {
+    assertValidActor(actor, 'setAuthzDeniedCallback');
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setAuthzDeniedCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live hook untouched.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setAuthzDeniedCallback: handler must be a function or null');
+    }
+    const next = handler ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === this.onAuthzDenied) {
+      return;
+    }
+    const oldHasCallback = this.onAuthzDenied !== undefined;
+    this.onAuthzDenied = next;
+    this.auditSubscription({
+      action: 'authz_denied_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
     });
   }
 
