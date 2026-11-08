@@ -5799,8 +5799,9 @@ export interface EventBusOptions {
    * so the subscription is gone and `getStats().expiredLeases` has
    * already been incremented. The callback is error-isolated: a throwing
    * hook is swallowed so a broken observer can never disturb the
-   * unsubscribe path. Default: unset (no hook — fully backward
-   * compatible).
+   * unsubscribe path. Replaceable live via `setLeaseExpiredCallback`
+   * (EB-429); `null` clears back to no observer. Default: unset (no hook
+   * — fully backward compatible).
    */
   onLeaseExpired?: LeaseExpiredCallback;
   /**
@@ -15591,8 +15592,13 @@ export class EventBus {
    * unsubscribe path, and renewed via `renewLease`.
    */
   private readonly leases: LeaseManager;
-  /** Observer hook for expired leases (`EventBusOptions.onLeaseExpired`). */
-  private readonly onLeaseExpired?: LeaseExpiredCallback;
+  /**
+   * Observer hook for expired leases (`EventBusOptions.onLeaseExpired`).
+   * Mutable: `setLeaseExpiredCallback` (EB-429) replaces it live —
+   * `handleLeaseExpiry` reads this field on every expiry, so the new
+   * hook governs from the next lease expiry onward.
+   */
+  private onLeaseExpired?: LeaseExpiredCallback;
   /**
    * Idle windows that expired and auto-unsubscribed their subscriber
    * (see `src/idle.ts`, EB-72). Surfaced as `getStats().idleExpired`.
@@ -30539,6 +30545,80 @@ export class EventBus {
     this.onAdmissionRejected = next;
     this.auditSubscription({
       action: 'admission_rejected_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
+  /**
+   * Replaces the lease-expiry hook live (EB-429) without restarting the
+   * bus: `setLeaseExpiredCallback(handler)` swaps the `onLeaseExpired`
+   * observer every expired subscription lease is handed to (see
+   * `EventBusOptions.onLeaseExpired`).
+   *
+   * There is no enable gate: the hook itself has no feature switch, so
+   * any open bus can install one — on a bus with no leased subscriptions
+   * it simply never fires. `null` clears back to no observer. The new
+   * hook governs from the next lease expiry onward — an expiry already
+   * fired is never re-delivered — and the expiry counter
+   * (`getStats().expiredLeases`) moves regardless of whether a hook is
+   * installed. A throwing hook is still swallowed by
+   * `handleLeaseExpiry`: observation never breaks the unsubscribe path.
+   * Only the observer channel moves — the lease mechanism, the expiry
+   * timers, and the unsubscribe path are untouched.
+   *
+   * Fail-closed: an illegal actor, a closed bus, and an illegal callback
+   * all throw `RangeError` with the live hook and the audit log untouched.
+   * Validation reuses the construction-time rule (a callback must be a
+   * function, `null` clears back to no observer), so a value that could
+   * not be set at construction cannot be installed later either.
+   * Re-installing the live callback (the same reference, including
+   * `null` against a bus with no callback) is a no-op with no audit.
+   * Audited as `lease_expired_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself is
+   * never written to the audit log).
+   *
+   * Orthogonal to EB-69 (that is the subscription-lease mechanism itself
+   * — this its missing live hook-redirection entry), to EB-348
+   * (`setSubscriptionLease` arms/retunes/clears per-subscription leases
+   * — this the bus-level expiry observer), to EB-72 (that is the idle
+   * expiry hook — this the lease-expiry channel), and to EB-425/426/427/
+   * 428 (those replace four other callbacks — this the ninth, the
+   * lease-expiry channel). The revision is live-only — a restart
+   * restores the construction-time callback.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal callback.
+   */
+  setLeaseExpiredCallback(handler: LeaseExpiredCallback | null, actor = 'system'): void {
+    assertValidActor(actor, 'setLeaseExpiredCallback');
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setLeaseExpiredCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live hook untouched.
+    if (handler !== null && typeof handler !== 'function') {
+      throw new RangeError('setLeaseExpiredCallback: handler must be a function or null');
+    }
+    const next = handler ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === this.onLeaseExpired) {
+      return;
+    }
+    const oldHasCallback = this.onLeaseExpired !== undefined;
+    this.onLeaseExpired = next;
+    this.auditSubscription({
+      action: 'lease_expired_callback_revised',
       actor,
       detail: {
         hasCallback: next !== undefined,

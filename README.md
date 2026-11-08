@@ -1455,7 +1455,10 @@ library.
   `unref()`'d, so a pending lease never keeps the process alive.
   `EventBusOptions.onLeaseExpired` fires once per expiry (error-isolated —
   a throwing hook is swallowed) and `getStats().expiredLeases` counts
-  expiries. Works for consumer-group members too (`subscribeToGroup` passes
+  expiries. `setLeaseExpiredCallback(handler | null)` (EB-429) redirects
+  the hook live — any open bus can install one, `null` clears it, and
+  every real swap is audited as `lease_expired_callback_revised`
+  (`{ hasCallback, oldHasCallback }`). Works for consumer-group members too (`subscribeToGroup` passes
   the option through). Non-positive-integer `leaseMs` (including `NaN`)
   throws `RangeError` at subscribe time. Disabled by default — fully
   backward compatible.
