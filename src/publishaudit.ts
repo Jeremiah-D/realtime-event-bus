@@ -239,8 +239,11 @@ export class PublishAuditLog {
   private readonly dir: string;
   // Live-tuned by `retune` (EB-309): the record and rotation sites
   // read these fields on every call, so a revision governs from the
-  // next record without draining or rebuilding the journal. `dir` and
-  // `now` stay fixed for the log's lifetime.
+  // next record without draining or rebuilding the journal. `now`
+  // stays fixed for the log's lifetime; `dir` moves only when the bus
+  // swaps in a fresh journal under a new directory
+  // (`EventBus.setPublishAuditDir`, EB-422) — this object itself is
+  // never re-pointed.
   private maxEntries: number;
   private maxBytes: number;
   private readonly now: () => number;
@@ -283,6 +286,11 @@ export class PublishAuditLog {
   /** The two live tuning values, for bus-level revision (EB-309). */
   current(): PublishAuditTuning {
     return { maxEntries: this.maxEntries, maxBytes: this.maxBytes };
+  }
+
+  /** The directory this journal appends under (EB-422). */
+  currentDir(): string {
+    return this.dir;
   }
 
   /**

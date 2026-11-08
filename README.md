@@ -5668,6 +5668,23 @@ untouched; an identical or empty revision is a no-op with no audit.
 Audited as `publish_audit_revised` (`{ maxEntries, oldMaxEntries,
 maxBytes, oldMaxBytes }`).
 
+Migrate the directory live with `bus.setPublishAuditDir(dir, actor?)`
+(EB-422): a fresh journal is built under the new directory with the
+live journal's current `maxEntries` / `maxBytes` and the bus clock,
+and the bus swaps to it — new records land in the new directory from
+the next record onward, entries already in the new directory are
+recovered into the read view at once (and the chain verifies over the
+new view), while entries recorded under the old directory leave the
+live read view and the old directory's files are left exactly as they
+are (never deleted). Only a bus that already enabled `publishAudit`
+can migrate (otherwise `RangeError`); a closed bus, an illegal actor,
+and a non-string or empty `dir` also fail closed with the live journal
+untouched; migrating to the current directory is a no-op with no
+audit. The migration is live-only — a restart restores the
+construction-time directory (`durableLogDir`). Audited as
+`publish_audit_dir_revised` (`{ oldDir, dir }` — only the directories,
+never any bound).
+
 ## Subscriber-queue drop journal (EB-225)
 
 Aggregate counters (`getStats().droppedMessages`) say how many

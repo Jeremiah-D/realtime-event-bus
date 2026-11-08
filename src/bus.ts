@@ -17601,8 +17601,11 @@ export class EventBus {
    * Publish audit journal (EB-138): opt-in via `EventBusOptions.publishAudit`
    * (requires `durableLogDir`). Undefined when disabled — the publish path
    * then pays a single undefined-check per admission and nothing else.
+   * Not readonly: `setPublishAuditDir` (EB-422) swaps in a fresh journal
+   * under a new directory, and the publish path always reads the live
+   * reference.
    */
-  private readonly publishAudit: PublishAuditLog | undefined;
+  private publishAudit: PublishAuditLog | undefined;
   /**
    * Subscriber-queue drop journal (EB-225): always on, bounded by
    * `EventBusOptions.dropJournalMaxEntries`. Records per-message drops
@@ -27808,11 +27811,12 @@ export class EventBus {
    * before it rotates (see `EventBusOptions.publishAudit`, EB-138).
    *
    * Only the fields provided move; the rest keep their live values.
-   * The journal directory and the clock are not revisable here — they
-   * are fixed at construction. The log object itself is never
-   * replaced: the revision retunes its two bounds in place, and the
-   * record and rotation sites already read those bounds live, so the
-   * new values govern from the next record onward. In-flight entries
+   * The journal directory moves separately via `setPublishAuditDir`
+   * (EB-422), which swaps in a fresh journal under the new directory;
+   * the clock is fixed at construction. The log object itself is never
+   * replaced by this method: the revision retunes its two bounds in
+   * place, and the record and rotation sites already read those bounds
+   * live, so the new values govern from the next record onward. In-flight entries
    * are retained, never cleared or rewritten: shrinking `maxEntries`
    * does not evict immediately — the next record evicts down to the
    * live bound — and a revised `maxBytes` is honored by the next
@@ -27875,6 +27879,103 @@ export class EventBus {
         oldMaxEntries: current.maxEntries,
         maxBytes,
         oldMaxBytes: current.maxBytes,
+      },
+    });
+  }
+
+  /**
+   * Migrates the publish audit journal's directory live (EB-422)
+   * without restarting the bus: `setPublishAuditDir(dir, actor =
+   * 'system')` moves the directory the journal is built under — the
+   * audit volume filled up, or the bus should archive under a new
+   * volume — with no restart and no loss of the live subscriptions,
+   * replay positions, consumer-group assignments, or rate-limit and
+   * dedup state a restart would drop.
+   *
+   * Only the directory moves. A fresh `PublishAuditLog` is built under
+   * the new directory with the live journal's current `maxEntries` /
+   * `maxBytes` (they still move via `setPublishAudit`, EB-309) and the
+   * bus clock, and the bus reference is swapped to it, so the new
+   * journal governs from the next record onward — the publish path
+   * always reads the live reference. The new journal's constructor
+   * `recover()` back-fills the in-memory read view from the new
+   * directory's files, so entries already there are queryable through
+   * `getPublishAudit()` at once, and the new journal's `headHash`
+   * advances from that recovered history, so `verifyPublishAuditChain`
+   * passes over the new view. Entries recorded under the old directory
+   * leave the live read view (the old directory's files are left
+   * exactly as they are — never deleted, along the EB-61 archive
+   * convention — and remain queryable on disk or after a restart under
+   * the construction-time directory). The old live entries are never
+   * re-sent or copied.
+   *
+   * The two numeric bounds keep their live values (they still move via
+   * `setPublishAudit`, EB-309), the clock is the bus clock, and the
+   * journal is never rebuilt in place. Migrating to the current
+   * directory is a no-op with no audit.
+   *
+   * Fail-closed: a bus that never enabled `publishAudit`, a closed bus,
+   * an illegal actor, and a non-string or empty `dir` all throw
+   * `RangeError` with the live journal and the audit log untouched.
+   * The migration is live-only — a restart restores the
+   * construction-time directory (`durableLogDir`) — and it never enters
+   * a config snapshot. Audited as `publish_audit_dir_revised`
+   * (`{ oldDir, dir }` — only the directories, never any bound;
+   * `oldDir` is the construction-time `durableLogDir` on the first
+   * migration). This overturns the EB-309 exclusion (the directory
+   * "is not revisable"), along the EB-421 precedent of overturning an
+   * EB-419 exclusion.
+   *
+   * Orthogonal to EB-138 (that is the publish audit journal itself —
+   * this its missing live directory migration), to EB-309 (that retunes
+   * the two numeric bounds — this the directory), to EB-198 (that is
+   * the chain math — this only swaps the journal carrier, and the new
+   * view's chain is self-consistent), to EB-420 (that is the archive
+   * recovery predicate — this migration does not change the recovery
+   * predicate), and to EB-421 (that is the trace archive journal —
+   * same shape, different journal).
+   *
+   * Throws `RangeError` when the publish audit is not enabled, when
+   * the bus is closed, for an illegal actor, or for a non-string or
+   * empty `dir`.
+   */
+  setPublishAuditDir(dir: string, actor = 'system'): void {
+    assertValidActor(actor, 'setPublishAuditDir');
+    const log = this.publishAudit;
+    if (log === undefined) {
+      throw new RangeError('setPublishAuditDir: publishAudit is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setTraceArchiveDir`):
+    // close() already flushed once — there is no live journal left to
+    // migrate anywhere.
+    if (this.closed) {
+      throw new RangeError('setPublishAuditDir: bus is closed');
+    }
+    if (typeof dir !== 'string' || dir.length === 0) {
+      throw new RangeError('setPublishAuditDir: dir must be a non-empty string');
+    }
+    // Migrating to the current directory moves nothing: no rebuild, no
+    // audit.
+    const oldDir = log.currentDir();
+    if (dir === oldDir) {
+      return;
+    }
+    // Carry the live bounds forward; the clock is always the bus clock.
+    // The constructor `recover()` back-fills from the new directory, so
+    // entries already there are queryable at once, and the new
+    // journal's chain head advances from that recovered history.
+    const current = log.current();
+    this.publishAudit = new PublishAuditLog(dir, {
+      maxEntries: current.maxEntries,
+      maxBytes: current.maxBytes,
+      now: this.now,
+    });
+    this.auditSubscription({
+      action: 'publish_audit_dir_revised',
+      actor,
+      detail: {
+        oldDir,
+        dir,
       },
     });
   }
