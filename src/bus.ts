@@ -337,6 +337,10 @@ import {
   stickyPartitionAssignor,
   type PartitionAssignor,
 } from './assignor.ts';
+import {
+  nextPartitionGeneration,
+  type PartitionFencingStamp,
+} from './partition-fencing.ts';
 import { PublishRateTable, HOT_TOPICS_LIMIT, type HotTopic, type TopicRates } from './rates.ts';
 import {
   computeScalingSignal,
@@ -4517,6 +4521,16 @@ export interface PartitionRebalanceInfo {
    * rendezvous recomputation or a custom placement.
    */
   strategy: string;
+  /**
+   * Fencing generation of this assignment (EB-441): the monotonic
+   * generation the assignment table was produced under — 1 on the
+   * group's first assignment, +1 on every rebalance/revocation that
+   * recomputes the table. Deliveries stamped with an older generation
+   * are fenced off (dropped at the drain gate, per-partition commits
+   * rejected), so a member can tell a live assignment from a revoked
+   * one by comparing this against the generation it was served under.
+   */
+  generation: number;
 }
 
 /**
@@ -4541,6 +4555,15 @@ export interface GroupAssignmentSnapshot {
   members: string[];
   /** Partition -> owner roster key, in ascending partition order. */
   assignments: Array<{ partition: number; memberId: string }>;
+  /**
+   * Live fencing generation of this assignment (EB-441): 1 on the
+   * group's first assignment, +1 on every rebalance/revocation. `0`
+   * when the group never had a partitioned assignment (classic
+   * round-robin groups carry no generation). A member presents this
+   * value on per-partition `commitOffset` calls — the bus rejects a
+   * commit whose generation no longer matches.
+   */
+  generation: number;
 }
 
 /**
@@ -17351,6 +17374,44 @@ export class EventBus {
    * partitions to departed members.
    */
   private previousPartitionAssignment = new Map<string, Map<number, string>>();
+  /**
+   * Inputs fingerprint of the last produced assignment per competing
+   * set (EB-441): the sorted roster, partition count, and assignor
+   * identity the live generation was produced from. `partitionAssignment`
+   * bumps the fencing generation only when these inputs changed — the
+   * join/leave path computes the table twice per rebalance (once for
+   * the pre-change baseline, once for the live assignment) with the
+   * same inputs, and the baseline computation must not consume a
+   * generation. Deleted when the group fully drains, so a recreated
+   * group always starts a new generation.
+   */
+  private partitionAssignmentInputs = new Map<
+    string,
+    { members: string; partitions: number; assignor: PartitionAssignor }
+  >();
+  /**
+   * Live fencing generation per competing set (EB-441): groupKey ->
+   * the monotonic generation the assignment table was last produced
+   * under. First assignment is generation 1; every rebalance or
+   * revocation that recomputes the table bumps it by one (see
+   * `partitionAssignment`). Retained after the last member leaves so
+   * a recreated group continues the sequence — a stale generation
+   * from the dead generation can never pass as fresh. Memory-only:
+   * a restart reassigns from scratch.
+   */
+  private groupPartitionGenerations = new Map<string, number>();
+  /**
+   * Fencing stamps on queued partitioned-group deliveries (EB-441):
+   * message -> assignee subscription id -> the stamp the bus put on
+   * the delivery at enqueue time. Keyed per subscriber because one
+   * message object can fan out to several partitioned groups with
+   * different generations. The drain gate reads the stamp for the
+   * subscriber being drained and drops the delivery when its
+   * generation no longer matches the live one. Weakly held: entries
+   * die with the message object, so a dropped or delivered message
+   * leaves nothing behind.
+   */
+  private partitionFencingStamps = new WeakMap<BusMessage, Map<string, PartitionFencingStamp>>();
   /**
    * Partition assignor per competing set
    * (`groupKey(groupId, pattern)`), for groups that opted into
@@ -40445,6 +40506,7 @@ export class EventBus {
         assignment: Object.fromEntries(after),
         migrated,
         strategy: this.groupAssignorName(oldKey),
+        generation: this.livePartitionGeneration(oldKey) ?? 0,
       };
       const oldStaticSubs = this.groupStaticSubs.get(oldKey);
       for (const m of migrated) {
@@ -40480,6 +40542,7 @@ export class EventBus {
         assignment: Object.fromEntries(after),
         migrated,
         strategy: this.groupAssignorName(newKey),
+        generation: this.livePartitionGeneration(newKey) ?? 0,
       };
       for (const m of migrated) {
         if (m.to === rosterKey) this.replayPartitionBacklog(subscriber, newKey, m.partition);
@@ -41556,6 +41619,7 @@ export class EventBus {
           assignment: Object.fromEntries(after),
           migrated,
           strategy: this.groupAssignorName(key),
+          generation: this.livePartitionGeneration(key) ?? 0,
         };
         // Automatic watermark replay: partitions the newcomer just took over
         // get their uncommitted backlog `(committed, watermark]` from the
@@ -41671,6 +41735,7 @@ export class EventBus {
               assignment: Object.fromEntries(after),
               migrated,
               strategy: this.groupAssignorName(key),
+              generation: this.livePartitionGeneration(key) ?? 0,
             };
             for (const m of migrated) {
               const owner = this.subscribers.get(m.to);
@@ -41849,6 +41914,7 @@ export class EventBus {
         assignment: Object.fromEntries(after),
         migrated,
         strategy: this.groupAssignorName(key),
+        generation: this.livePartitionGeneration(key) ?? 0,
       };
       const staticSubs = this.groupStaticSubs.get(key);
       for (const m of migrated) {
@@ -42234,6 +42300,7 @@ export class EventBus {
         assignment: Object.fromEntries(after),
         migrated,
         strategy: this.groupAssignorName(groupKey),
+        generation: this.livePartitionGeneration(groupKey) ?? 0,
       };
     }
     this.emitRebalance(
@@ -42530,6 +42597,10 @@ export class EventBus {
       // teardown when the last member leaves.
       const empty = new Map<number, string>();
       this.partitionAssignmentCache.set(groupKey, empty);
+      // No assignment is produced: forget the inputs fingerprint, so a
+      // recreated group starts a new generation on its next assignment
+      // (the generation counter itself is retained and continues).
+      this.partitionAssignmentInputs.delete(groupKey);
       return empty;
     }
     const assignment = assignor.assign(
@@ -42542,6 +42613,29 @@ export class EventBus {
     // copy: the cached map is shared with readers, the prev map must
     // stay a pristine snapshot of this generation.
     this.previousPartitionAssignment.set(groupKey, new Map(assignment));
+    // Fencing generation (EB-441): bump exactly once per distinct
+    // input state — a new roster, partition count, or assignor. The
+    // cache above is what makes a re-read free; the fingerprint below
+    // is what makes the join/leave path's two computations per
+    // rebalance (pre-change baseline, then live assignment) cost one
+    // generation instead of two. The degenerate branch above never
+    // bumps: a drained group has no live assignment to fence.
+    const fingerprint = [...members].sort().join('\0');
+    const lastInputs = this.partitionAssignmentInputs.get(groupKey);
+    if (
+      lastInputs === undefined ||
+      lastInputs.members !== fingerprint ||
+      lastInputs.partitions !== partitions ||
+      lastInputs.assignor !== assignor
+    ) {
+      this.groupPartitionGenerations.set(
+        groupKey,
+        // No recorded generation yet means "before the first": 0
+        // advances to generation 1 through the same helper.
+        nextPartitionGeneration(this.groupPartitionGenerations.get(groupKey) ?? 0),
+      );
+    }
+    this.partitionAssignmentInputs.set(groupKey, { members: fingerprint, partitions, assignor });
     this.partitionAssignmentCache.set(groupKey, assignment);
     return assignment;
   }
@@ -42549,6 +42643,17 @@ export class EventBus {
   /** Drops the cached assignment for a competing set (join/leave). */
   private invalidatePartitionAssignment(groupKey: string): void {
     this.partitionAssignmentCache.delete(groupKey);
+  }
+
+  /**
+   * Live fencing generation for a competing set (EB-441), or
+   * `undefined` when no partitioned assignment was ever computed for
+   * it. Reported on `GroupAssignmentSnapshot` and on every
+   * `PartitionRebalanceInfo`; `0` at the public surface means "no
+   * generation" (classic round-robin groups never produce one).
+   */
+  private livePartitionGeneration(groupKey: string): number | undefined {
+    return this.groupPartitionGenerations.get(groupKey);
   }
 
   /**
@@ -42953,16 +43058,26 @@ export class EventBus {
    * checkpoint — group lag (`getGroupOffsets` minus `getCommittedOffsets`)
    * still tracks group-level commits.
    *
+   * With `opts.generation` (EB-441, partitioned groups only), the commit
+   * is fenced: the presented generation must equal the live generation
+   * of the group's assignment table, or the commit is rejected with
+   * `RangeError` (audited as `stale_partition_generation`) and the
+   * committed offset does not move. A member reads the live generation
+   * from `getGroupAssignment` or from the `partitionRebalance` on its
+   * `onRebalance` events. Omitting `generation` keeps the legacy
+   * unchecked behavior, so existing callers are unaffected.
+   *
    * Throws `RangeError` on an empty groupId/topic, a non-positive
    * non-integer seq, a partition for a non-partitioned group, a
-   * partition index outside the group's partition count, or an empty
-   * instanceId.
+   * partition index outside the group's partition count, an empty
+   * instanceId, a non-positive-integer generation, or a generation
+   * that no longer matches the live one.
    */
   commitOffset(
     groupId: string,
     topic: string,
     seq: number,
-    opts?: { partition?: number; instanceId?: string },
+    opts?: { partition?: number; instanceId?: string; generation?: number },
   ): void {
     if (groupId.length === 0) {
       throw new RangeError('groupId must be a non-empty string');
@@ -42986,6 +43101,39 @@ export class EventBus {
       const n = this.groupPartitions.get(groupKey) ?? 0;
       if (partition >= n) {
         throw new RangeError(`partition ${partition} out of range for a ${n}-partition group`);
+      }
+      // Fencing check (EB-441): a member that presents the generation
+      // it was served under must still hold the partition — a stale
+      // generation means a rebalance moved the partition on, so the
+      // commit is refused before anything is written and audited as
+      // `stale_partition_generation`. Unknown group/partition already
+      // threw above; a group with no live generation at all (never
+      // computed) refuses with `live_generation: null` in the audit.
+      const presentedGeneration = opts?.generation;
+      if (presentedGeneration !== undefined) {
+        if (!Number.isInteger(presentedGeneration) || presentedGeneration < 1) {
+          throw new RangeError('generation must be a positive integer');
+        }
+        const liveGeneration = this.livePartitionGeneration(groupKey);
+        if (liveGeneration === undefined || liveGeneration !== presentedGeneration) {
+          const sep = groupKey.indexOf('\0');
+          this.auditSubscription({
+            action: 'stale_partition_generation',
+            actor: 'system',
+            groupId,
+            pattern: groupKey.slice(sep + 1),
+            topic,
+            detail: {
+              group: groupId,
+              partition,
+              presented_generation: presentedGeneration,
+              live_generation: liveGeneration ?? null,
+            },
+          });
+          throw new RangeError(
+            `stale partition generation ${presentedGeneration} for group "${groupId}" partition ${partition}: live generation is ${liveGeneration ?? 'none'}`,
+          );
+        }
       }
       let byPartition: Map<number, Map<string, number>> | undefined;
       if (instanceId === undefined) {
@@ -44185,6 +44333,7 @@ export class EventBus {
       assignment: Object.fromEntries(after),
       migrated,
       strategy: this.groupAssignorName(key),
+      generation: this.livePartitionGeneration(key) ?? 0,
     };
     if (this.groupMembers.get(key) == null) {
       // Fully drained group: only the retained count changes — the
@@ -44461,6 +44610,7 @@ export class EventBus {
       groupId,
       pattern: resolvedPattern,
       strategy: this.groupAssignorName(key),
+      generation: this.livePartitionGeneration(key) ?? 0,
       members,
       assignments,
     };
@@ -44762,6 +44912,7 @@ export class EventBus {
         assignment: Object.fromEntries(after),
         migrated,
         strategy: this.groupAssignorName(key),
+        generation: this.livePartitionGeneration(key) ?? 0,
       };
       // Cooperative handoff for partitions the new assignor moved: the
       // new owner replays the partition's uncommitted backlog
@@ -44913,6 +45064,7 @@ export class EventBus {
         assignment: Object.fromEntries(after),
         migrated: this.diffPartitionAssignment(key, before, after),
         strategy: this.groupAssignorName(key),
+        generation: this.livePartitionGeneration(key) ?? 0,
       };
     }
     // Operator-initiated: bypass the membership-change debounce, audit
@@ -60718,6 +60870,56 @@ export class EventBus {
   }
 
   /**
+   * Fencing gate (EB-441): drops queued partitioned-group deliveries
+   * whose stamp predates the live assignment generation. Called on the
+   * dequeued batch in both drain paths (plain and batched) — after
+   * dequeue, before any per-delivery accounting, handler invocation,
+   * or credit consumption — so a stale in-flight delivery never
+   * reaches the handler and never moves an offset. Unstamped messages
+   * (plain subscribers, other groups' traffic, replays, messages the
+   * pause buffer re-admitted through a fresh fan-out) pass through
+   * untouched: only a delivery the bus itself stamped under a
+   * superseded generation is fenced. Each drop is audited as
+   * `stale_partition_generation` with the group, partition, presented
+   * and live generations; the new owner replays the partition's
+   * uncommitted backlog from the watermark, so the drop loses nothing.
+   * Returns the deliveries that may proceed, in order.
+   */
+  private gateFencedDeliveries(subscriber: Subscriber, messages: BusMessage[]): BusMessage[] {
+    const kept: BusMessage[] = [];
+    for (const msg of messages) {
+      const stamp = this.partitionFencingStamps.get(msg)?.get(subscriber.id);
+      if (stamp === undefined) {
+        kept.push(msg);
+        continue;
+      }
+      const live = this.livePartitionGeneration(stamp.groupKey);
+      if (live !== undefined && live === stamp.generation) {
+        kept.push(msg);
+        continue;
+      }
+      // Stale stamp — or the group holds no live generation at all
+      // (fully drained since the stamp was put on): drop at the gate.
+      const groupId = stamp.groupKey.slice(0, stamp.groupKey.indexOf('\0'));
+      this.auditSubscription({
+        action: 'stale_partition_generation',
+        actor: 'system',
+        subId: subscriber.id,
+        groupId,
+        pattern: subscriber.pattern,
+        topic: msg.topic,
+        detail: {
+          group: groupId,
+          partition: stamp.partition,
+          presented_generation: stamp.generation,
+          live_generation: live ?? null,
+        },
+      });
+    }
+    return kept;
+  }
+
+  /**
    * EB-150: delivers one consumer-group competing set — the old post-scan
    * group loop body of `deliverMatched`, extracted unchanged so the
    * synchronous path and the chunked execute phase share it. Returns true
@@ -60757,6 +60959,22 @@ export class EventBus {
         (ownerSubId === undefined
           ? undefined
           : hit.members.find((m) => m.id === ownerSubId)) ?? hit.members[0];
+      // Fencing stamp (EB-441): the delivery carries the generation
+      // live when the bus assigned it, so the drain gate can tell a
+      // pre-rebalance in-flight delivery from a live one. Stamped per
+      // subscriber: the same message object can fan out to several
+      // partitioned groups with different generations. The generation
+      // is defined here — `partitionAssignment` above just produced
+      // (or read) the live assignment.
+      const liveGeneration = this.livePartitionGeneration(key);
+      if (liveGeneration !== undefined) {
+        let bySubscriber = this.partitionFencingStamps.get(msg);
+        if (bySubscriber === undefined) {
+          bySubscriber = new Map();
+          this.partitionFencingStamps.set(msg, bySubscriber);
+        }
+        bySubscriber.set(assignee.id, { groupKey: key, partition, generation: liveGeneration });
+      }
       if (keyed !== undefined) {
         for (const member of hit.members) {
           if (member !== assignee) this.skipKeySeq(member, keyed.key, keyed.keySeq, epoch);
@@ -62561,6 +62779,7 @@ export class EventBus {
             assignment: Object.fromEntries(after),
             migrated,
             strategy: this.groupAssignorName(key),
+            generation: this.livePartitionGeneration(key) ?? 0,
           },
           0,
           true,
@@ -65093,7 +65312,7 @@ export class EventBus {
       );
       const countPredicate =
         credits == null ? undefined : (msg: BusMessage) => !this.isReplayBypass(msg);
-      const { live, expired } =
+      const { live: drainedLive, expired } =
         fair === undefined
           ? // EDF (EB-204): deadline-carrying messages drain
             // earliest-deadline-first within their lane — lanes still win
@@ -65107,6 +65326,11 @@ export class EventBus {
               fair.deficits,
               countPredicate,
             );
+      // Fencing gate (EB-441): a delivery queued before the latest
+      // rebalance is dropped here — before fair-scheduling counts,
+      // per-delivery accounting, and the handler — so the old owner's
+      // in-flight work never executes under a revoked assignment.
+      const live = this.gateFencedDeliveries(subscriber, drainedLive);
       if (fair !== undefined) {
         // The scheduler's per-topic dequeue counts — "scheduled", not
         // "delivered" (see `BusStats.topicFairness`).
@@ -65609,8 +65833,14 @@ export class EventBus {
     const pending = batch.pending;
     batch.pending = [];
     if (pending.length === 0) return;
+    // Fencing gate (EB-441): a message collected into the batch before
+    // the latest rebalance is dropped at hand-off, exactly like an
+    // expired one below — it never reaches the handler and never moves
+    // an offset. Runs before the expiry filter so a stale delivery is
+    // reported as fenced, not merely expired.
+    const unfenced = this.gateFencedDeliveries(subscriber, pending);
     const live: BusMessage[] = [];
-    for (const msg of pending) {
+    for (const msg of unfenced) {
       const deadline = this.messageDeadlines.get(msg);
       if (deadline !== undefined && nowMs >= deadline) {
         this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);

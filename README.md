@@ -360,7 +360,22 @@ library.
   An unknown groupId, a group that never opted into partitions, or an ambiguous groupId throws `RangeError`;
   switching to the running assignor is a no-op with no audit. Audited as `group_assignor_revised`
   (`{ assignor, oldAssignor }`). A fully drained group records the switch by the audit entry alone, and the
-  next generation's first member re-fixes the assignor under the first-member-fixes rule. **Manual rebalance
+  next generation's first member re-fixes the assignor under the first-member-fixes rule. **Partition fencing
+  token** (EB-441): every (re)computation of a partitioned group's assignment table produces a monotonically
+  increasing fencing generation — 1 on the first assignment, +1 on every rebalance or revocation that recomputes
+  the table — reported on `partitionRebalance.generation` in `onRebalance` events and on
+  `getGroupAssignment(groupId, pattern).generation` (`0` for a classic round-robin group, which carries no
+  generation). The bus stamps every partitioned group delivery with the generation live at enqueue time: a
+  delivery still queued when its partition moves is dropped at the drain gate instead of reaching the old owner's
+  handler — the new owner replays the partition's uncommitted backlog from the watermark, so the drop loses
+  nothing — and each drop is audited as `stale_partition_generation` (`{ group, partition, presented_generation,
+  live_generation }`). The same fence guards per-partition checkpoints: `commitOffset(group, topic, seq,
+  { partition, generation })` presents the generation the member was served under, and a commit whose generation
+  no longer matches the live one is rejected with `RangeError` (audited the same way) and the committed offset
+  does not move — so a revoked member's late checkpoint can never land on top of the new owner's. Omitting
+  `generation` keeps the legacy unchecked commit. Generations live only in the assignment table's memory state
+  (a restart reassigns from scratch); a fully drained group's counter is retained, so a recreated group continues
+  the sequence and a stale generation from the dead generation can never pass as fresh. **Manual rebalance
   trigger** (EB-351): `triggerGroupRebalance(groupId, pattern?, actor = 'system')` fires a consumer-group
   rebalance on demand — the operator's "rebalance now" — without touching the roster, the partition count, or
   the assignor. The rebalance debounce is bypassed, so the event fires immediately (`trigger: 'operator'`,
