@@ -2827,6 +2827,24 @@ library.
   `key_hotspot_auto_mitigate_revised`
   (`{ enabled: <boolean>, recoverDepth: <number> | null,
   oldEnabled: <boolean>, oldRecoverDepth: <number> | null }`).
+  The alert callbacks themselves are revisable the same way (EB-433, via
+  `setKeyHotspotCallbacks(subId, { onKeyHotspot?, onHotKeyMitigated? })`):
+  only a subscription that opted into `keyHotspot` at subscribe time can be
+  retuned — a never-monitored subscription throws `RangeError`. `onKeyHotspot`
+  can be replaced or cleared with `null` (cleared means stats-only alerting:
+  depths are still reported in `getStats().hotKeys` and the gauge, just never
+  alerted); `onHotKeyMitigated` can likewise be replaced or cleared, but only
+  while auto-mitigation is enabled — a detection-only subscription throws
+  `RangeError`, along the EB-294 gate. Only the callbacks move: the threshold,
+  the recovery depth, and the alert / mitigation latches are untouched, so an
+  already-alerted key stays alerted and the new callbacks govern from the next
+  keyed-delivery evaluation. A patch that provides neither field, and an
+  illegal callback value, both throw `RangeError` with the live callbacks
+  untouched, and a same-value revision is a no-op with no audit. Every success
+  is audited as `key_hotspot_callbacks_revised`
+  (`{ onKeyHotspot: 'set' | 'cleared' | 'unchanged', oldOnKeyHotspot: 'set' |
+  'absent', onHotKeyMitigated: 'set' | 'cleared' | 'unchanged',
+  oldOnHotKeyMitigated: 'set' | 'absent' }`).
   (Real-time systems: key-hotspot governance.) Disabled by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
   `new EventBus({ trace: true })`): one trace per sampled publish, threading
@@ -4326,6 +4344,17 @@ npm test
   keeps firing, a revision before promotion keeping the sample and arming the new callback,
   re-registering still discarding the baseline, same-value revisions as no-ops with no audit,
   and the audit presence exact.
+- `test/keyhotspot-callbacks-revision.test.ts` — key-hotspot alert callback revision
+  (EB-433): `setKeyHotspotCallbacks` fail-closed preconditions (unknown / empty /
+  unmonitored / detection-only subscriber, empty or non-object patch, non-function
+  callbacks, a mixed patch refused whole) with the live callbacks, the threshold,
+  the mitigation configuration, the latches, and the audit log untouched, revising
+  `onKeyHotspot` routing the next excursion to the new callback, revising
+  `onHotKeyMitigated` routing the next engagement to the new callback, clearing
+  `onKeyHotspot` with `null` silencing alerts while stats keep reporting, clearing
+  `onHotKeyMitigated` keeping mitigation engaging silently, the revision leaving
+  the alert latch, the threshold, and the recovery depth untouched, same-value
+  revisions as no-ops with no audit, and the audit presence exact.
 - `test/deduplicate-messages-revision.test.ts` — subscriber dedup window revision (EB-295):
   `setDeduplicateMessages` fail-closed preconditions (unknown / empty / non-dedup subscriber,
   non-object revision, invalid `windowMs` / `maxEntries`, one illegal field vetoing the whole

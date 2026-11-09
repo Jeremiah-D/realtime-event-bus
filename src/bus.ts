@@ -132,7 +132,9 @@ import {
   HOT_KEYS_LIMIT,
   resolveKeyHotspotOptions,
   type HotKeyMitigateOptions,
+  type HotKeyMitigatedEvent,
   type HotKeyStat,
+  type KeyHotspotEvent,
   type KeyHotspotOptions,
   type SubscriberKeyHotspotState,
 } from './keyhotspot.ts';
@@ -35282,6 +35284,173 @@ export class EventBus {
         recoverDepth: next?.recoverDepth ?? null,
         oldEnabled,
         oldRecoverDepth,
+      },
+    });
+  }
+
+  /**
+   * Revises one key-hotspot-monitored subscriber's alert callbacks
+   * (EB-433) without re-subscribing: `setKeyHotspotCallbacks(subId,
+   * patch)` swaps `onKeyHotspot` and/or `onHotKeyMitigated` in place
+   * (see `SubscribeOptions.keyHotspot`, EB-47 / EB-115).
+   *
+   * Only the callbacks move: `checkKeyHotspot` reads the live
+   * `keyHotspot.onKeyHotspot` and `keyHotspot.mitigate.onHotKeyMitigated`
+   * on every keyed-delivery evaluation (`deliverKeyed` growth and
+   * `cascadeKeyExpected` shrink), so the new callbacks govern from the
+   * next evaluation — a swapped alert callback fires on the next
+   * excursion, a swapped mitigation callback on the next engagement —
+   * with no drain, re-registration, or replay. That is the whole point
+   * of this entry: the alert callbacks are subscribe-time values today,
+   * so changing the alert recipient means re-subscribing and losing the
+   * queue, the lease, and the offset state. `onKeyHotspot` can be
+   * replaced or cleared with an explicit `null` (cleared means
+   * stats-only alerting: depths are still reported in
+   * `getStats().hotKeys` and the gauge, just never alerted);
+   * `onHotKeyMitigated` can likewise be replaced or cleared, but only
+   * while auto-mitigation is enabled — a detection-only subscription
+   * refuses that half of the patch, along the EB-294 gate. A field left
+   * out of the patch keeps its live value. A patch that provides
+   * neither field is refused.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `keyHotspot` monitoring, a detection-only subscription
+   * asked to revise `onHotKeyMitigated`, a non-object patch, a patch
+   * with neither field, and an illegal callback value (a non-function
+   * non-`null` callback) all throw `RangeError` with the live callbacks,
+   * the threshold, the mitigation configuration, the latches, and the
+   * audit log untouched — the revision reuses the subscribe-time
+   * validation (`resolveKeyHotspotOptions`: callbacks must be functions),
+   * so a callback that could not be set at subscribe time cannot be
+   * revised in later either. A revision identical to the live callbacks —
+   * the same function references, including clearing a callback that was
+   * never set — is a no-op with no audit. Audited as
+   * `key_hotspot_callbacks_revised` (`{ onKeyHotspot: 'set' | 'cleared' |
+   * 'unchanged', oldOnKeyHotspot: 'set' | 'absent', onHotKeyMitigated:
+   * 'set' | 'cleared' | 'unchanged', oldOnHotKeyMitigated: 'set' |
+   * 'absent' }` — the callbacks themselves are functions and are never
+   * serialized into the audit record, only their set/cleared state).
+   *
+   * Orthogonal to EB-47 (that is the hotspot mechanism itself — this its
+   * callback revision), to EB-115 (that is auto-mitigation — this which
+   * callback receives its engagement), to EB-289 / EB-294 (those retune
+   * the threshold / recovery depth — this the callback identities), and
+   * to EB-338 (that retunes the mitigation switch — this the callbacks,
+   * and enabling mitigation here is still refused: first enable the
+   * switch, then revise its callback).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, a detection-only subscriber asked to revise the
+   * mitigation callback, an illegal patch, or an illegal callback value.
+   */
+  setKeyHotspotCallbacks(
+    subId: string,
+    patch: {
+      onKeyHotspot?: (event: KeyHotspotEvent) => void | null;
+      onHotKeyMitigated?: (event: HotKeyMitigatedEvent) => void | null;
+    },
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setKeyHotspotCallbacks: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setKeyHotspotCallbacks: unknown subscriber: ${subId}`);
+    }
+    const keyHotspot = subscriber.keyHotspot;
+    if (keyHotspot === undefined) {
+      throw new RangeError('setKeyHotspotCallbacks: subscriber has no keyHotspot monitoring set');
+    }
+    // Validate before touching anything: a non-object patch, a patch
+    // that provides neither callback, and an illegal callback value
+    // all fail closed — `undefined` is not a value, so a field left
+    // out keeps its live value, exactly like the other revision
+    // entries; `null` clears back to stats-only alerting (or to no
+    // mitigation callback).
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        'setKeyHotspotCallbacks: patch must be an object with onKeyHotspot and/or onHotKeyMitigated',
+      );
+    }
+    if (patch.onKeyHotspot === undefined && patch.onHotKeyMitigated === undefined) {
+      throw new RangeError(
+        'setKeyHotspotCallbacks: patch must provide onKeyHotspot and/or onHotKeyMitigated',
+      );
+    }
+    if (
+      patch.onKeyHotspot !== undefined &&
+      patch.onKeyHotspot !== null &&
+      typeof patch.onKeyHotspot !== 'function'
+    ) {
+      throw new RangeError('setKeyHotspotCallbacks: onKeyHotspot must be a function or null');
+    }
+    if (
+      patch.onHotKeyMitigated !== undefined &&
+      patch.onHotKeyMitigated !== null &&
+      typeof patch.onHotKeyMitigated !== 'function'
+    ) {
+      throw new RangeError(
+        'setKeyHotspotCallbacks: onHotKeyMitigated must be a function or null',
+      );
+    }
+    // The mitigation callback can only be revised while mitigation is
+    // enabled (EB-294's gate): a detection-only subscription has no
+    // live callback to swap.
+    if (patch.onHotKeyMitigated !== undefined && keyHotspot.mitigate === undefined) {
+      throw new RangeError(
+        'setKeyHotspotCallbacks: subscriber has no keyHotspot auto-mitigation enabled',
+      );
+    }
+    const nextOnKeyHotspot =
+      patch.onKeyHotspot === undefined
+        ? keyHotspot.onKeyHotspot
+        : (patch.onKeyHotspot ?? undefined);
+    const oldMitigate = keyHotspot.mitigate;
+    const nextOnHotKeyMitigated =
+      patch.onHotKeyMitigated === undefined
+        ? oldMitigate?.onHotKeyMitigated
+        : (patch.onHotKeyMitigated ?? undefined);
+    // Re-affirming the live callbacks is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (
+      nextOnKeyHotspot === keyHotspot.onKeyHotspot &&
+      nextOnHotKeyMitigated === oldMitigate?.onHotKeyMitigated
+    ) {
+      return;
+    }
+    const oldOnKeyHotspot = keyHotspot.onKeyHotspot === undefined ? 'absent' : 'set';
+    const oldOnHotKeyMitigated =
+      oldMitigate?.onHotKeyMitigated === undefined ? 'absent' : 'set';
+    const onKeyHotspotPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onKeyHotspot === undefined
+        ? 'unchanged'
+        : patch.onKeyHotspot === null
+          ? 'cleared'
+          : 'set';
+    const onHotKeyMitigatedPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onHotKeyMitigated === undefined
+        ? 'unchanged'
+        : patch.onHotKeyMitigated === null
+          ? 'cleared'
+          : 'set';
+    // Only the callbacks move; the threshold, the mitigation
+    // configuration (including recoverDepth), and the alert /
+    // mitigation latches are untouched, and every keyed-delivery
+    // evaluation reads the live values from here on.
+    keyHotspot.onKeyHotspot = nextOnKeyHotspot;
+    if (oldMitigate !== undefined) {
+      oldMitigate.onHotKeyMitigated = nextOnHotKeyMitigated;
+    }
+    this.auditSubscription({
+      action: 'key_hotspot_callbacks_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        onKeyHotspot: onKeyHotspotPresence,
+        oldOnKeyHotspot,
+        onHotKeyMitigated: onHotKeyMitigatedPresence,
+        oldOnHotKeyMitigated,
       },
     });
   }
