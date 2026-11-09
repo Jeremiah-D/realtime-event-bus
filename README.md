@@ -1788,7 +1788,23 @@ library.
   bumps `getStats().schemaDrifts`. Array length is not structural
   (`{items:[1,2]}` and `{items:[1,2,3]}` share a fingerprint); only the
   field set matters. Re-registering resets to sampling;
-  `clearTopicSchemaFingerprint(pattern)` removes the watcher. Orthogonal
+  `clearTopicSchemaFingerprint(pattern)` removes the watcher. The alert
+  callbacks are revisable without re-registering (EB-432, via
+  `reviseTopicSchemaFingerprintCallbacks(pattern, { onDrift?,
+  onOversize? })`): only the callbacks move — the armed baseline and
+  the latest sample are untouched, so the new `onDrift` fires on the
+  very next drift and the new `onOversize` on the next oversize skip,
+  where re-registering would have discarded the baseline and left
+  drift detection blind until the next promotion. `onDrift` can only
+  be replaced with a function (never cleared), `onOversize` can be
+  replaced or cleared with `null`, a field left out keeps its live
+  value, and an unregistered pattern, an empty patch, or an illegal
+  value throws `RangeError` with the live callbacks untouched. A
+  same-value revision is a no-op with no audit. Every success is
+  audited as `schema_fingerprint_callbacks_revised`
+  (`{ onDrift: 'set' | 'unchanged', oldOnDrift: 'set', onOversize:
+  'set' | 'cleared' | 'unchanged', oldOnOversize: 'set' | 'absent' }`).
+  Orthogonal
   to EB-86/EB-95 (those admit/reject; this only observes). The options
   object also accepts an optional `onOversize` callback (EB-208 linkage):
   fired (error-isolated) whenever a subscriber skips an oversize message
@@ -4300,6 +4316,16 @@ npm test
   as no-ops with no audit, disabling an engaged mitigation clearing the latch and releasing at
   once with stats never stale, disabling keeping the threshold and the alert callback, and
   enabling never touching the alert latch.
+- `test/schema-fingerprint-callbacks-revision.test.ts` — fingerprint watcher callback revision
+  (EB-432): `reviseTopicSchemaFingerprintCallbacks` fail-closed preconditions (unregistered /
+  empty pattern, empty or non-object patch, non-function `onDrift`, `null` `onDrift`,
+  non-function non-`null` `onOversize`) with the live callbacks, the baseline, the sample, and
+  the audit log untouched, revising `onDrift` after promotion routing the next drift to the new
+  callback with the armed baseline intact, revising `onOversize` routing the next oversize skip
+  to the new callback, clearing `onOversize` with `null` silencing oversize alerts while drift
+  keeps firing, a revision before promotion keeping the sample and arming the new callback,
+  re-registering still discarding the baseline, same-value revisions as no-ops with no audit,
+  and the audit presence exact.
 - `test/deduplicate-messages-revision.test.ts` — subscriber dedup window revision (EB-295):
   `setDeduplicateMessages` fail-closed preconditions (unknown / empty / non-dedup subscriber,
   non-object revision, invalid `windowMs` / `maxEntries`, one illegal field vetoing the whole

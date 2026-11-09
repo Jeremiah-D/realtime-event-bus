@@ -28590,6 +28590,135 @@ export class EventBus {
     return this.schemaFingerprintRules.delete(topicPattern);
   }
 
+  /**
+   * Revises the alert callbacks of one registered fingerprint watcher
+   * (EB-432) without re-registering it:
+   * `reviseTopicSchemaFingerprintCallbacks(topicPattern, patch)`
+   * swaps `onDrift` and/or `onOversize` in place (see
+   * `setTopicSchemaFingerprint`, EB-200 / EB-208).
+   *
+   * Only the callbacks move: the watcher keeps its compiled matcher,
+   * its armed baseline, and its latest sample — a revision never
+   * re-arms sampling, never discards the baseline, and never resets
+   * the alert state, so the new `onDrift` fires on the very next
+   * drift after promotion exactly as the old one would have. The
+   * publish path (`observePayloadFingerprint`) and the oversize path
+   * (`countSubscriberOversizeDropped`) both read the live rule on
+   * every event, so the new callbacks govern from the next drift /
+   * oversize skip with no re-registration, no drain, and no replay.
+   * That is the whole point of this entry: re-registering the same
+   * pattern replaces the callback but resets the watcher to sampling
+   * mode (the old baseline is discarded), leaving drift detection
+   * blind until the next promotion — a revision keeps the armed
+   * baseline intact.
+   *
+   * `onDrift` can only be replaced with a function — it can never be
+   * cleared, because a watcher without `onDrift` is not a watcher
+   * (the registration-time gate). `onOversize` can be replaced or
+   * cleared with an explicit `null` (a watcher that only cares about
+   * structural drift omits it, exactly as at registration time); a
+   * field left out of the patch keeps its live value. A patch that
+   * provides neither field is refused.
+   *
+   * Fail-closed: an unregistered pattern, a non-object patch, a patch
+   * with neither field, and an illegal callback value (a non-function
+   * `onDrift`, a non-function non-`null` `onOversize`) all throw
+   * `RangeError` with the live callbacks, the baseline, the sample,
+   * and the audit log untouched — the revision reuses the
+   * registration-time validation (`setTopicSchemaFingerprint`), so a
+   * callback that could not be registered cannot be revised in later
+   * either. A revision identical to the live callbacks — the same
+   * function references, including clearing an `onOversize` that was
+   * never set — is a no-op with no audit. Audited as
+   * `schema_fingerprint_callbacks_revised` (`{ onDrift: 'set' |
+   * 'unchanged', oldOnDrift: 'set', onOversize: 'set' | 'cleared' |
+   * 'unchanged', oldOnOversize: 'set' | 'absent' }` — the callbacks
+   * themselves are functions and are never serialized into the audit
+   * record, only their set/cleared state; the `pattern` field carries
+   * the topic pattern).
+   *
+   * Orthogonal to EB-200 (that is the watcher mechanism itself —
+   * registration / sampling / promotion — this its callback revision),
+   * to EB-208 (that is the oversize linkage — this which callback
+   * receives it), to `promoteTopicSchemaFingerprint` (that arms the
+   * baseline — this never touches it), and to
+   * `clearTopicSchemaFingerprint` (that removes the watcher).
+   *
+   * Throws `RangeError` for an unregistered pattern, an illegal patch,
+   * or an illegal callback value.
+   */
+  reviseTopicSchemaFingerprintCallbacks(
+    topicPattern: string,
+    patch: { onDrift?: FingerprintDriftCallback; onOversize?: FingerprintOversizeCallback | null },
+  ): void {
+    if (typeof topicPattern !== 'string' || topicPattern.length === 0) {
+      throw new RangeError(
+        'reviseTopicSchemaFingerprintCallbacks: topicPattern must be a non-empty string',
+      );
+    }
+    const rule = this.schemaFingerprintRules.get(topicPattern);
+    if (rule === undefined) {
+      throw new RangeError(
+        `reviseTopicSchemaFingerprintCallbacks: no fingerprint watcher registered for "${topicPattern}"`,
+      );
+    }
+    // Validate before touching anything: a non-object patch, a patch
+    // that provides neither callback, and an illegal callback value
+    // all fail closed — `undefined` is not a value, so a field left
+    // out keeps its live value, exactly like the other revision
+    // entries; `null` clears `onOversize` but never `onDrift`, which
+    // the registration-time gate requires to stay a function.
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        'reviseTopicSchemaFingerprintCallbacks: patch must be an object with onDrift and/or onOversize',
+      );
+    }
+    if (patch.onDrift === undefined && patch.onOversize === undefined) {
+      throw new RangeError(
+        'reviseTopicSchemaFingerprintCallbacks: patch must provide onDrift and/or onOversize',
+      );
+    }
+    if (patch.onDrift !== undefined && typeof patch.onDrift !== 'function') {
+      throw new RangeError('reviseTopicSchemaFingerprintCallbacks: onDrift must be a function');
+    }
+    if (
+      patch.onOversize !== undefined &&
+      patch.onOversize !== null &&
+      typeof patch.onOversize !== 'function'
+    ) {
+      throw new RangeError(
+        'reviseTopicSchemaFingerprintCallbacks: onOversize must be a function or null',
+      );
+    }
+    const nextOnDrift = patch.onDrift ?? rule.onDrift;
+    const nextOnOversize =
+      patch.onOversize === undefined ? rule.onOversize : (patch.onOversize ?? undefined);
+    // Re-affirming the live callbacks is a no-op: no swap, no audit —
+    // including clearing an `onOversize` that was never set.
+    if (nextOnDrift === rule.onDrift && nextOnOversize === rule.onOversize) {
+      return;
+    }
+    const oldOnOversize = rule.onOversize === undefined ? 'absent' : 'set';
+    const onOversizePresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onOversize === undefined ? 'unchanged' : patch.onOversize === null ? 'cleared' : 'set';
+    // Only the callbacks move; the matcher, the armed baseline, and
+    // the latest sample are untouched, and every publish / oversize
+    // event reads the live rule from here on.
+    rule.onDrift = nextOnDrift;
+    rule.onOversize = nextOnOversize;
+    this.auditSubscription({
+      action: 'schema_fingerprint_callbacks_revised',
+      actor: 'system',
+      pattern: topicPattern,
+      detail: {
+        onDrift: patch.onDrift === undefined ? 'unchanged' : 'set',
+        oldOnDrift: 'set',
+        onOversize: onOversizePresence,
+        oldOnOversize,
+      },
+    });
+  }
+
   /* ------------------------------------------------------------------ */
   /* JSON Patch incremental publish (EB-202)                             */
   /* ------------------------------------------------------------------ */
