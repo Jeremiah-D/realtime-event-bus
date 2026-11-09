@@ -41960,21 +41960,28 @@ export class EventBus {
       if (subscriber?.rebalanceListener != null && partitionRebalance != null) {
         this.fireRebalanceListener(groupId, trigger, memberId, rosterKey, subscriber, partitionRebalance);
       }
-      subscriber?.onRebalance?.({
-        groupId,
-        pattern,
-        members: [...members],
-        trigger,
-        memberId,
-        ...(debounced ? { suppressedRebalances: suppressed } : {}),
-        ...(linger == null
-          ? {}
-          : {
-              lingerUntil: linger.until,
-              lingering: linger.windows.map((w) => ({ topic: w.topic, fromSeq: w.fromSeq, toSeq: w.toSeq })),
-            }),
-        ...(partitionRebalance == null ? {} : { partitionRebalance }),
-      });
+      // A throwing observer never blocks the remaining members'
+      // notifications or the `rebalance` audit below (EB-439): the
+      // callback is an observer, not part of the rebalance path.
+      try {
+        subscriber?.onRebalance?.({
+          groupId,
+          pattern,
+          members: [...members],
+          trigger,
+          memberId,
+          ...(debounced ? { suppressedRebalances: suppressed } : {}),
+          ...(linger == null
+            ? {}
+            : {
+                lingerUntil: linger.until,
+                lingering: linger.windows.map((w) => ({ topic: w.topic, fromSeq: w.fromSeq, toSeq: w.toSeq })),
+              }),
+          ...(partitionRebalance == null ? {} : { partitionRebalance }),
+        });
+      } catch {
+        // Swallowed: observation never breaks the rebalance.
+      }
     }
     // Subscription lifecycle audit (EB-78): one entry per rebalance, not
     // per notified member — the group roster change is a single fact. For
@@ -42023,6 +42030,97 @@ export class EventBus {
     if (this.groupPartitions.get(key) !== undefined && (debounced || bypassDebounce)) {
       this.rebounceBaselines.set(key, new Map(this.partitionAssignment(key)));
     }
+  }
+
+  /**
+   * Revises one consumer-group member's rebalance callback (EB-439)
+   * without re-subscribing: `setRebalanceCallback(subId, cb)` swaps
+   * `onRebalance` in place (see `GroupSubscribeOptions.onRebalance`,
+   * EB-16) — the only group-membership revision surface the join/leave
+   * path left uncovered: the roster moves on its own, this one moves
+   * who hears about the move.
+   *
+   * Only the callback moves: `emitRebalance` reads the live
+   * `subscriber.onRebalance` for every member on every membership
+   * change, so the new callback governs from the next join or leave —
+   * no rejoin, no seat loss, no offset state touched. `null` clears the
+   * callback back to audit-only reporting: the rebalance still happens
+   * and is still audited as `rebalance`, just with no operator
+   * callback fired. The roster, the assignment, the debounce window,
+   * the linger windows, and the member-level partition listener
+   * (EB-209, which fires before the group-level notification) are
+   * untouched.
+   *
+   * A throwing callback is swallowed by `emitRebalance`: the callback
+   * is an observer, not part of the rebalance path, so a throwing
+   * observer never blocks the remaining members' notifications or the
+   * `rebalance` audit entry.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that is not
+   * a consumer-group member (`subscriber.groupId` is unset), and an
+   * illegal callback value (anything but a function or an explicit
+   * `null` — `undefined` is not a value) all throw `RangeError` with
+   * the live callback, the roster, and the audit log untouched. A
+   * revision identical to the live callback — the same function
+   * reference, including clearing a callback that was never set — is a
+   * no-op with no audit. Audited as `rebalance_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-38 (that is the consumer-group mechanism itself,
+   * this its rebalance-callback revision), to EB-169 (that is the
+   * rebalance debounce window — this which callback hears about a
+   * rebalance), to EB-209 (that is the member-level partition listener
+   * — this the group-level roster hook), and to EB-435
+   * (`setDegradedCallback`, that revises the health-probe degraded
+   * callback — this the rebalance callback, a different hook of the
+   * same family).
+   *
+   * Throws `RangeError` for an unknown subscriber, a non-member
+   * subscriber, or an illegal callback value.
+   */
+  setRebalanceCallback(
+    subId: string,
+    cb: ((event: GroupRebalanceEvent) => void) | null,
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setRebalanceCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setRebalanceCallback: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.groupId === undefined) {
+      throw new RangeError('setRebalanceCallback: subscriber is not a consumer-group member');
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to
+    // audit-only reporting.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setRebalanceCallback: cb must be a function or null');
+    }
+    const nextCallback = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextCallback === subscriber.onRebalance) {
+      return;
+    }
+    const oldHasCallback = subscriber.onRebalance !== undefined;
+    const hasCallback = nextCallback !== undefined;
+    // Only the callback moves; the roster, the assignment, the
+    // debounce window, the linger windows, and the partition listener
+    // are untouched, and the next membership change reads the live
+    // value from here on.
+    subscriber.onRebalance = nextCallback;
+    this.auditSubscription({
+      action: 'rebalance_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { hasCallback, oldHasCallback },
+    });
   }
 
   /**

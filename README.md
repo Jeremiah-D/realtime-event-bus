@@ -234,7 +234,18 @@ library.
   drop policy applies. Membership changes rebalance implicitly
   (`onRebalance` fires on affected members with the new roster); opt-in
   `rebalanceDebounceMs` (EB-169) merges a burst of membership changes
-  into one rebalance event for storm protection. The bus
+  into one rebalance event for storm protection. The rebalance callback
+  itself is live-revisable (EB-439, via `setRebalanceCallback(subId, cb |
+  null)`): only a group member can be retuned — a plain subscription
+  throws `RangeError` — and `null` clears it back to audit-only
+  reporting (the rebalance still happens and is still audited as
+  `rebalance`, just with no operator callback fired). The roster, the
+  assignment, the debounce window, the linger windows, and the
+  member-level partition listener (EB-209) are untouched. A same-value
+  revision is a no-op with no audit, and every success is audited as
+  `rebalance_callback_revised` (`{ hasCallback: <boolean>,
+  oldHasCallback: <boolean> }`). A throwing callback is swallowed, so
+  observation never blocks the rebalance. The bus
   tracks the per-group assignment watermark (`getGroupOffsets`: highest
   per-topic `seq` handed to any member) and consumer checkpoints
   (`commitOffset` / `getCommittedOffsets`); `getStats().consumerGroups`
