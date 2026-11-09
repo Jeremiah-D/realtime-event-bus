@@ -37278,6 +37278,156 @@ export class EventBus {
   }
 
   /**
+   * Revises one reliable subscriber's dead-letter callbacks
+   * (EB-434) without re-subscribing:
+   * `reviseSubscriberDeadLetterCallbacks(subId, patch)` swaps
+   * `onDeadLetter` and/or `onPoisoned` in place (see
+   * `ReliableSubscribeOptions.deadLetter`, EB-28 / EB-134).
+   *
+   * Only the callbacks move: the DLQ move reads the live
+   * `deadLetter.onDeadLetter` on every dead-lettering and the poison
+   * isolation reads the live `deadLetter.onPoisoned` on every
+   * poisoning, so the new callbacks govern from the next
+   * dead-lettering / poisoning — a swapped operator callback fires
+   * on the next poison message, a swapped poison callback on the
+   * next exhausted auto-replay — with no drain, re-registration, or
+   * replay. That is the whole point of this entry: the dead-letter
+   * callbacks are subscribe-time values today, so changing the alert
+   * recipient means re-subscribing and losing the ACK state, the
+   * redelivery budget, and the DLQ contents. `onDeadLetter` can be
+   * replaced or cleared with an explicit `null` (cleared means
+   * diagnostics-only alerting: the DLQ move and the diagnostic-topic
+   * fan-out still happen, just never alerted); `onPoisoned` can
+   * likewise be replaced or cleared. A field left out of the patch
+   * keeps its live value. A patch that provides neither field is
+   * refused.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable
+   * subscriber, a reliable subscriber with no `deadLetter`
+   * configured, a non-object patch, a patch with neither field, and
+   * an illegal callback value (a non-function non-`null` callback)
+   * all throw `RangeError` with the live callbacks, the budget, the
+   * DLQ entries, and the audit log untouched — the revision reuses
+   * the subscribe-time validation (`normalizeDeadLetterOptions`:
+   * callbacks must be functions), so a callback that could not be
+   * set at subscribe time cannot be revised in later either. A
+   * revision identical to the live callbacks — the same function
+   * references, including clearing a callback that was never set —
+   * is a no-op with no audit. Audited as
+   * `subscriber_dead_letter_callbacks_revised`
+   * (`{ onDeadLetter: 'set' | 'cleared' | 'unchanged',
+   * oldOnDeadLetter: 'set' | 'absent', onPoisoned: 'set' | 'cleared' |
+   * 'unchanged', oldOnPoisoned: 'set' | 'absent' }` — the callbacks
+   * themselves are functions and are never serialized into the audit
+   * record, only their set/cleared state).
+   *
+   * Orthogonal to EB-28 (that is the DLQ mechanism itself — this its
+   * callback revision), to EB-49 (that is the poison-message
+   * diagnostic fields — this which callback receives the isolation),
+   * to EB-57 (that is the centralized diagnostic topic — this the
+   * per-subscriber callback), and to EB-433 (that revises the
+   * key-hotspot callbacks — this the dead-letter callbacks, same
+   * family, different hook).
+   *
+   * Throws `RangeError` for an unknown / non-reliable / DLQ-less
+   * subscriber, an illegal patch, or an illegal callback value.
+   */
+  reviseSubscriberDeadLetterCallbacks(
+    subId: string,
+    patch: {
+      onDeadLetter?: (event: DeadLetterEvent) => void | null;
+      onPoisoned?: (event: PoisonedMessageEvent) => void | null;
+    },
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('reviseSubscriberDeadLetterCallbacks: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`reviseSubscriberDeadLetterCallbacks: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.reliable == null) {
+      throw new RangeError(
+        'reviseSubscriberDeadLetterCallbacks: subscriber is not a reliable (subscribeReliable) subscription',
+      );
+    }
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) {
+      throw new RangeError('reviseSubscriberDeadLetterCallbacks: subscriber has no deadLetter configured');
+    }
+    // Validate before touching anything: a non-object patch, a patch
+    // that provides neither callback, and an illegal callback value
+    // all fail closed — `undefined` is not a value, so a field left
+    // out keeps its live value, exactly like the other revision
+    // entries; `null` clears back to diagnostics-only alerting.
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        'reviseSubscriberDeadLetterCallbacks: patch must be an object with onDeadLetter and/or onPoisoned',
+      );
+    }
+    if (patch.onDeadLetter === undefined && patch.onPoisoned === undefined) {
+      throw new RangeError(
+        'reviseSubscriberDeadLetterCallbacks: patch must provide onDeadLetter and/or onPoisoned',
+      );
+    }
+    if (
+      patch.onDeadLetter !== undefined &&
+      patch.onDeadLetter !== null &&
+      typeof patch.onDeadLetter !== 'function'
+    ) {
+      throw new RangeError('reviseSubscriberDeadLetterCallbacks: onDeadLetter must be a function or null');
+    }
+    if (
+      patch.onPoisoned !== undefined &&
+      patch.onPoisoned !== null &&
+      typeof patch.onPoisoned !== 'function'
+    ) {
+      throw new RangeError('reviseSubscriberDeadLetterCallbacks: onPoisoned must be a function or null');
+    }
+    const nextOnDeadLetter =
+      patch.onDeadLetter === undefined ? dlq.onDeadLetter : (patch.onDeadLetter ?? undefined);
+    const nextOnPoisoned =
+      patch.onPoisoned === undefined ? dlq.onPoisoned : (patch.onPoisoned ?? undefined);
+    // Re-affirming the live callbacks is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextOnDeadLetter === dlq.onDeadLetter && nextOnPoisoned === dlq.onPoisoned) {
+      return;
+    }
+    const oldOnDeadLetter = dlq.onDeadLetter === undefined ? 'absent' : 'set';
+    const oldOnPoisoned = dlq.onPoisoned === undefined ? 'absent' : 'set';
+    const onDeadLetterPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onDeadLetter === undefined
+        ? 'unchanged'
+        : patch.onDeadLetter === null
+          ? 'cleared'
+          : 'set';
+    const onPoisonedPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onPoisoned === undefined
+        ? 'unchanged'
+        : patch.onPoisoned === null
+          ? 'cleared'
+          : 'set';
+    // Only the callbacks move; the budget, the retry ladder, the
+    // auto-replay config, the DLQ entries, and the diagnostic topic
+    // are untouched, and every dead-lettering / poisoning reads the
+    // live values from here on.
+    dlq.onDeadLetter = nextOnDeadLetter;
+    dlq.onPoisoned = nextOnPoisoned;
+    this.auditSubscription({
+      action: 'subscriber_dead_letter_callbacks_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        onDeadLetter: onDeadLetterPresence,
+        oldOnDeadLetter,
+        onPoisoned: onPoisonedPresence,
+        oldOnPoisoned,
+      },
+    });
+  }
+
+  /**
    * Revises the sliding-window delivery rate limit of one
    * rate-limited subscriber (EB-271): a subscriber that opted into
    * `rateLimit` can retune its hard ceiling without re-subscribing.

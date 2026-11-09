@@ -128,6 +128,26 @@ library.
   armed with and still fires once after a clear. Revisions are audited
   as `dead_letter_auto_replay_revised` (actor `system`, new value `null`
   on a clear); passing the current values is a no-op with no audit.
+  The dead-letter callbacks themselves are live-revisable the same way
+  (EB-434, via `reviseSubscriberDeadLetterCallbacks(subId,
+  { onDeadLetter?, onPoisoned? })`): only a reliable subscription that
+  opted into `deadLetter` at subscribe time can be retuned — a
+  non-reliable subscription, and a reliable one with no DLQ configured,
+  both throw `RangeError`. Either callback can be replaced or cleared
+  with `null` (cleared means diagnostics-only alerting: the DLQ move
+  and the diagnostic-topic fan-out still happen, just never alerted).
+  Only the callbacks move: the budget, the retry ladder, the auto-replay
+  config, the DLQ entries, and the diagnostic topic are untouched, so
+  entries already dead-lettered keep their content and the new callbacks
+  govern from the next dead-lettering / poisoning. A patch that provides
+  neither field, and an illegal callback value, both throw `RangeError`
+  with the live callbacks untouched, and a same-value revision is a
+  no-op with no audit. Every success is audited as
+  `subscriber_dead_letter_callbacks_revised`
+  (`{ onDeadLetter: 'set' | 'cleared' | 'unchanged',
+  oldOnDeadLetter: 'set' | 'absent', onPoisoned: 'set' | 'cleared' |
+  'unchanged', oldOnPoisoned: 'set' | 'absent' }`).
+  (Real-time systems / backend engineering: dead-letter observability.)
   High-throughput in-order consumers can call
   `ackUpTo(subId, seq)` (EB-76) to cumulatively acknowledge every
   outstanding delivery with `seq <= seq` in one call instead of acking
