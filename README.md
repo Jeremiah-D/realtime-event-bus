@@ -8152,6 +8152,21 @@ Semantics:
   otherwise); unknown subscriber ids throw, matching
   `pauseSubscriber` / `resumeSubscriber`.
 
+The exhaustion callback itself is live-revisable (EB-438, via
+`setCreditExhaustedCallback(subId, cb | null)`): only a
+credit-granted subscription can be retuned — a subscription that
+never received a grant throws `RangeError` — and `null` clears it
+back to pause-only reporting (the balance still hits zero, delivery
+still pauses, the latch still sets, and granting credit still
+re-arms it, just with no operator callback fired). The balance, the
+latch, and the `grantCredits` semantics are untouched, so clearing
+during an exhausted episode never re-arms the latch. A same-value
+revision is a no-op with no audit, and every success is audited as
+`credit_exhausted_callback_revised` (`{ hasCallback: <boolean>,
+oldHasCallback: <boolean> }`). A throwing callback is swallowed, so
+observation never breaks delivery. (Real-time systems: credit flow
+control.)
+
 `getStats().creditExhaustedSubscribers` counts live exhausted
 subscriptions and the Prometheus exposition carries
 `eventbus_credit_exhausted_subscribers`.

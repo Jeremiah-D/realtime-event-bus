@@ -35864,6 +35864,97 @@ export class EventBus {
   }
 
   /**
+   * Revises one credit-granted subscriber's exhaustion callback
+   * (EB-438) without re-subscribing: `setCreditExhaustedCallback(subId,
+   * cb)` swaps `onCreditExhausted` in place (see
+   * `SubscribeOptions.onCreditExhausted`, EB-117) — the only credit
+   * revision surface `grantCredits` left uncovered: it moves the
+   * balance, this one moves who hears about the balance hitting zero.
+   *
+   * Only the callback moves: `fireCreditExhausted` reads the live
+   * `subscriber.onCreditExhausted` on every exhaustion edge, so the new
+   * callback governs from the next episode — no drain, re-registration,
+   * or replay. `null` clears the callback back to pause-only
+   * reporting: the balance still hits zero, delivery still pauses, the
+   * latch still sets, and granting credit still re-arms it — just with
+   * no operator callback fired. The balance, the `exhaustedLatch`, and
+   * the `grantCredits` semantics are untouched: clearing during an
+   * exhausted episode does not re-arm the latch — after re-installing,
+   * the balance must be topped up and drained to zero again before the
+   * new callback fires, along the existing edge logic.
+   *
+   * A throwing callback is swallowed by `fireCreditExhausted`: the
+   * callback is an observer, not part of the delivery path, so a
+   * throwing observer never breaks the drain or the flush loop — the
+   * latch is already set before the call, so the episode is still
+   * recorded exactly once.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * received a credit grant (`subscriber.credits` is undefined — the
+   * state only `grantCredits` creates), and an illegal callback value
+   * (anything but a function or an explicit `null` — `undefined` is
+   * not a value) all throw `RangeError` with the live callback, the
+   * balance, the latch, and the audit log untouched. A revision
+   * identical to the live callback — the same function reference,
+   * including clearing a callback that was never set — is a no-op with
+   * no audit. Audited as `credit_exhausted_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-117 (that is the credit mechanism itself, this
+   * its exhaustion-callback revision), to EB-435 (`setDegradedCallback`,
+   * that revises the health-probe degraded callback — this the
+   * credit-exhaustion callback, a different hook of the same family),
+   * and to EB-440 (`setThrottledCallback`, that revises the throttle
+   * engagement callback — this the credit-exhaustion callback).
+   *
+   * Throws `RangeError` for an unknown subscriber, an ungranted
+   * subscriber, or an illegal callback value.
+   */
+  setCreditExhaustedCallback(
+    subId: string,
+    cb: ((event: CreditExhaustedEvent) => void) | null,
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setCreditExhaustedCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setCreditExhaustedCallback: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.credits === undefined) {
+      throw new RangeError('setCreditExhaustedCallback: subscriber has never been granted credit');
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to
+    // pause-only reporting.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setCreditExhaustedCallback: cb must be a function or null');
+    }
+    const nextCallback = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextCallback === subscriber.onCreditExhausted) {
+      return;
+    }
+    const oldHasCallback = subscriber.onCreditExhausted !== undefined;
+    const hasCallback = nextCallback !== undefined;
+    // Only the callback moves; the balance, the latch, and the
+    // `grantCredits` semantics are untouched, and the next exhaustion
+    // edge reads the live value from here on.
+    subscriber.onCreditExhausted = nextCallback;
+    this.auditSubscription({
+      action: 'credit_exhausted_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { hasCallback, oldHasCallback },
+    });
+  }
+
+  /**
    * Revises the bus-level processing-latency SLO alert switch live
    * (EB-331) without restarting the bus:
    * `setProcessingLatencySloAlert(enabled)` arms or disarms SLO-miss
@@ -64109,17 +64200,25 @@ export class EventBus {
   /**
    * Fires `onCreditExhausted` once per exhaustion episode (EB-117):
    * edge-triggered on the balance reaching zero through deliveries; the
-   * latch re-arms on the next `grantCredits` call.
+   * latch re-arms on the next `grantCredits` call. A throwing callback
+   * is swallowed (EB-438): the callback is an observer, not part of
+   * the delivery path, so a throwing observer never breaks the drain
+   * or the flush loop around it — the latch is already set before the
+   * call, so the episode is still recorded exactly once.
    */
   private fireCreditExhausted(subscriber: Subscriber): void {
     const credits = subscriber.credits;
     if (credits == null || credits.exhaustedLatch) return;
     credits.exhaustedLatch = true;
-    subscriber.onCreditExhausted?.({
-      subscriberId: subscriber.id,
-      pattern: subscriber.pattern,
-      pendingMessages: subscriber.queue.size,
-    });
+    try {
+      subscriber.onCreditExhausted?.({
+        subscriberId: subscriber.id,
+        pattern: subscriber.pattern,
+        pendingMessages: subscriber.queue.size,
+      });
+    } catch {
+      // Swallowed: observation never breaks delivery.
+    }
   }
 
   /**
