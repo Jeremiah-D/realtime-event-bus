@@ -37016,6 +37016,99 @@ export class EventBus {
   }
 
   /**
+   * Revises one throttled subscriber's engagement callback (EB-440)
+   * without re-subscribing: `setThrottledCallback(subId, cb)` swaps
+   * `onThrottled` in place (see `SubscribeOptions.onThrottled`,
+   * EB-14) — the only throttle revision surface `setThrottle` left
+   * uncovered: it moves the three rates, this one moves who hears
+   * about the throttle engaging.
+   *
+   * Only the callback moves: `engageThrottle` reads the live
+   * `subscriber.onThrottled` on every engagement, so the new callback
+   * governs from the next excursion — no drain, re-registration, or
+   * replay. `null` clears the callback back to silent engagement: the
+   * throttle still engages, the rate still adapts, the drops still
+   * count — just with no operator callback fired. Disengagement needs
+   * no event either way: the existing `onDrained` still signals the
+   * return to full speed. The bucket, the enforced rate, the observed
+   * drain rate, and the drop count are untouched, so an excursion in
+   * progress keeps its bucket and its rate until it ends, and the
+   * drain rate measured when it ends still seeds the next engagement.
+   *
+   * A throwing callback is swallowed by `engageThrottle`: the callback
+   * is an observer, not part of the throttle path, so a throwing
+   * observer never breaks the engagement or the publish that crossed
+   * the high-water mark — the throttle is already engaged before the
+   * call, so the excursion is still recorded exactly once.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `throttle` (`subscriber.throttle` is undefined — the
+   * same gate `setThrottle` applies, EB-268), and an illegal callback
+   * value (anything but a function or an explicit `null` — `undefined`
+   * is not a value) all throw `RangeError` with the live callback, the
+   * bucket, the rates, the drop count, and the audit log untouched. A
+   * revision identical to the live callback — the same function
+   * reference, including clearing a callback that was never set — is a
+   * no-op with no audit. Audited as `throttled_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-14 (that is the throttle mechanism itself, this
+   * its engagement-callback revision), to `setThrottle` (EB-268, that
+   * revises the three rates — this the callback), to EB-435
+   * (`setDegradedCallback`, that revises the health-probe degraded
+   * callback — this the throttle-engagement callback, a different hook
+   * of the same family), and to EB-438 (`setCreditExhaustedCallback`,
+   * that revises the credit-exhaustion callback — this the throttle
+   * valve, not the credit valve).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unthrottled
+   * subscriber, or an illegal callback value.
+   */
+  setThrottledCallback(
+    subId: string,
+    cb: ((event: ThrottleEvent) => void) | null,
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setThrottledCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setThrottledCallback: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.throttle == null) {
+      throw new RangeError('setThrottledCallback: subscriber has no throttle set');
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to silent
+    // engagement.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setThrottledCallback: cb must be a function or null');
+    }
+    const nextCallback = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextCallback === subscriber.onThrottled) {
+      return;
+    }
+    const oldHasCallback = subscriber.onThrottled !== undefined;
+    const hasCallback = nextCallback !== undefined;
+    // Only the callback moves; the bucket, the enforced rate, the
+    // observed drain rate, and the drop count are untouched, and the
+    // next engagement reads the live value from here on.
+    subscriber.onThrottled = nextCallback;
+    this.auditSubscription({
+      action: 'throttled_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { hasCallback, oldHasCallback },
+    });
+  }
+
+  /**
    * Revises the batch-delivery parameters of one batched subscriber
    * (EB-269): a batched subscriber can retune its micro-batch
    * collection without re-subscribing. The revision is partial: a
@@ -64404,14 +64497,20 @@ export class EventBus {
     throttle.throttled = true;
     throttle.backpressureAtMs = this.now();
     throttle.sizeAtBackpressure = size;
-    subscriber.onThrottled?.({
-      subscriberId: subscriber.id,
-      pattern: subscriber.pattern,
-      ratePerSec: throttle.ratePerSec,
-      queueSize: size,
-      capacity,
-      adapted,
-    });
+    try {
+      subscriber.onThrottled?.({
+        subscriberId: subscriber.id,
+        pattern: subscriber.pattern,
+        ratePerSec: throttle.ratePerSec,
+        queueSize: size,
+        capacity,
+        adapted,
+      });
+    } catch {
+      // Swallowed (EB-440): observation never breaks the throttle
+      // path — the throttle is already engaged, so the excursion is
+      // still recorded exactly once.
+    }
   }
 
   /**

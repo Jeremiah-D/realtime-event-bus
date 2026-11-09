@@ -1290,8 +1290,20 @@ library.
   is, and a revision after a clear is refused until the subscriber opts
   in again at subscribe time), and every success is audited as
   `throttle_revised` (`{ throttle: { minRatePerSec, maxRatePerSec,
-  initialRatePerSec } | null, oldThrottle: { ... } }`). (Real-time
-  systems: subscription governance.)
+  initialRatePerSec } | null, oldThrottle: { ... } }`). The engagement
+  callback itself is live-revisable (EB-440, via
+  `setThrottledCallback(subId, cb | null)`): only a throttled
+  subscription can be retuned — a subscription that never opted into
+  throttling throws `RangeError` — and `null` clears it back to silent
+  engagement (the throttle still engages, the rate still adapts, the
+  drops still count, just with no operator callback fired). The bucket,
+  the enforced rate, the observed drain rate, and the drop count are
+  untouched, so swapping mid-excursion keeps the excursion's bucket and
+  rate until it ends. A same-value revision is a no-op with no audit,
+  and every success is audited as `throttled_callback_revised`
+  (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }`). A throwing
+  callback is swallowed, so observation never breaks the throttle path.
+  (Real-time systems: subscription governance.)
 - **`src/reconnect.ts` — `ReconnectController`**: connection state machine
   (`idle → connecting → connected → backoff → connecting …`) with an
   injectable `BackoffStrategy` (`ReconnectOptions.strategy`). The default is
