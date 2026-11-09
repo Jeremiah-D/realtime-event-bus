@@ -2426,7 +2426,9 @@ export interface SubscribeOptions {
    * Error-isolated like `onAdmissionRejected`: a throwing hook is
    * swallowed so a broken observer can never disturb replay. The same
    * progress is always visible in `getStats().replayProgress`, even
-   * without this callback.
+   * without this callback. Live-revisable with
+   * `setReplayProgressCallback` (EB-443): a swap governs from the next
+   * pass — the pass in flight keeps the observer it started with.
    *
    * Requires a resume cursor: passing it without `resumeFromSeq` /
    * `resumeFromTime` throws `RangeError` instead of silently never
@@ -37208,6 +37210,103 @@ export class EventBus {
     subscriber.onThrottled = nextCallback;
     this.auditSubscription({
       action: 'throttled_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { hasCallback, oldHasCallback },
+    });
+  }
+
+  /**
+   * Revises one replayed subscriber's progress observer (EB-443)
+   * without re-subscribing: `setReplayProgressCallback(subId, cb)`
+   * swaps `onReplayProgress` in place (see
+   * `SubscribeOptions.onReplayProgress`, EB-71) — the only way to
+   * move the observer after subscribe time: today a seek or a gap
+   * repair runs another progress-tracked replay, and the only way to
+   * change who hears about it is unsubscribe+resubscribe, which loses
+   * the queue, the offsets, and the trust state.
+   *
+   * Only the callback moves: `admitReplayRecords` reads the live
+   * `subscriber.onReplayProgress` into a local at each pass start, so
+   * the new callback governs from the next pass — the next `seek`,
+   * `seekGroupOffsets`, or `requestMissingReplay` replay — with no
+   * drain, re-registration, or replay of its own. A swap mid-pass
+   * does not disturb the pass in flight: it keeps the observer it
+   * started with, including its completion event. `null` clears the
+   * callback back to silent replay: the pass still runs, the counters
+   * still move, and `getStats().replayProgress` still updates — just
+   * with no operator callback fired. `progressInterval` is untouched
+   * (a separate item owns it).
+   *
+   * A throwing callback is swallowed by `admitReplayRecords`: the
+   * callback is an observer, not part of the replay path, so a
+   * throwing observer never breaks the replay or the publish that
+   * triggered it.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * ran a progress-tracked replay (`subscriber.replayProgress` is
+   * undefined — the same gate EB-435's health-probe revision applies,
+   * a subscription that only ever replayed unobserved still qualifies
+   * once its first tracked pass has run, since the state row exists
+   * whether or not an observer was installed), and an illegal callback
+   * value (anything but a function or an explicit `null` — `undefined`
+   * is not a value) all throw `RangeError` with the live callback,
+   * the replay state, and the audit log untouched. A revision
+   * identical to the live callback — the same function reference,
+   * including clearing a callback that was never set — is a no-op with
+   * no audit. Audited as `replay_progress_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-71 (that is the observation mechanism itself,
+   * this its callback revision), to EB-164 (replay throttling — the
+   * pacing never moves here), to `seek` / `seekGroupOffsets` (EB-130 /
+   * EB-376, that own the trigger — this who hears about the replay),
+   * to `requestMissingReplay` (EB-201, the gap-repair trigger), and to
+   * EB-435 / EB-437 / EB-438 / EB-440 (sibling subscription-level
+   * callback revisions — this the replay-progress observer, a
+   * different hook of the same family).
+   *
+   * Throws `RangeError` for an unknown subscriber, a never-replayed
+   * subscriber, or an illegal callback value.
+   */
+  setReplayProgressCallback(
+    subId: string,
+    cb: ((event: ReplayProgressEvent) => void) | null,
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setReplayProgressCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setReplayProgressCallback: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.replayProgress === undefined) {
+      throw new RangeError('setReplayProgressCallback: subscriber has never run a progress-tracked replay');
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to silent
+    // replay.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setReplayProgressCallback: cb must be a function or null');
+    }
+    const nextCallback = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextCallback === subscriber.onReplayProgress) {
+      return;
+    }
+    const oldHasCallback = subscriber.onReplayProgress !== undefined;
+    const hasCallback = nextCallback !== undefined;
+    // Only the callback moves; the replay state, the progress
+    // interval, and the queue are untouched, and the next pass reads
+    // the live value from here on.
+    subscriber.onReplayProgress = nextCallback;
+    this.auditSubscription({
+      action: 'replay_progress_callback_revised',
       actor: 'system',
       subId: subscriber.id,
       pattern: subscriber.pattern,

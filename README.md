@@ -893,7 +893,19 @@ library.
   it fires at most every `progressInterval` processed entries (default
   100) plus exactly once on completion (`done: true`) or abort
   (`failed: true`), and is error-isolated — a throwing observer can
-  never disturb replay. Opt-in segment
+  never disturb replay. The observer is live-revisable with
+  `setReplayProgressCallback(subId, cb)` (EB-443): a subscription that
+  has run at least one progress-tracked replay can swap its observer
+  without re-subscribing — the new callback governs from the next
+  pass (the next `seek`, group seek, or gap-repair replay), while a
+  pass already in flight keeps the observer it started with;
+  `null` clears back to silent replay with `getStats().replayProgress`
+  still updating, and a revision identical to the live callback is a
+  no-op. Fail-closed: an unknown subscriber, a never-replayed
+  subscription, or a non-function non-`null` value throws `RangeError`
+  with the live callback untouched; every success is audited as
+  `replay_progress_callback_revised` (`{ hasCallback,
+  oldHasCallback }`). Opt-in segment
   rotation (`durableLogSegmentRotation: { maxEntriesPerSegment?,
   maxSegmentAgeMs? }`, validated `RangeError`): the per-topic live file
   holds the current segment, and when an append reaches the entry budget
