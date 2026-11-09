@@ -7839,6 +7839,67 @@ with no audit. Audited as `ops_alert_sink_revised`
 log). Unlike the key rotation above, a sink swap never re-signs; unlike
 the tuning revision, it moves the destination, not the bounds.
 
+## Delivery failure-rate regime detection (EB-442)
+
+`EventBusOptions.failureRegime` opts into per-topic failure-rate
+regime detection — a complement to the fixed-threshold alerting above,
+which only fires after a rate crosses a hard line. A downstream can
+degrade *below* that line for a long time: a slow creep from 1% to 8%
+failures never reaches a 10% alert line, yet it is exactly the
+degradation an operator wants to hear about early. The detector
+watches the per-topic delivery-outcome stream with a two-sided
+Page-Hinkley test (`src/failure-regime.ts`, the same shape as the
+webhook-relay changepoint detector, WR-177) and fires
+`onFailureRateRegimeChange` when the *distribution* shifts — topic,
+direction (`increase` / `decrease`), detection time, and before/after
+failure rates with sample counts. A timeout counts as a failure.
+
+```ts
+const bus = new EventBus({
+  failureRegime: {
+    onFailureRateRegimeChange: (change) => {
+      console.log(
+        `${change.topic}: failure rate ${change.direction}d ` +
+          `${(change.before.failureRate * 100).toFixed(1)}% -> ` +
+          `${(change.after.failureRate * 100).toFixed(1)}%`,
+      );
+    },
+  },
+});
+
+// Report outcomes from the operator, a monitoring sidecar, or a
+// bridge to an external log — the bus cannot observe downstream
+// delivery health itself:
+bus.reportDeliveryOutcome('orders', 'success');
+bus.reportDeliveryOutcome('orders', 'failure');
+bus.reportDeliveryOutcome('orders', 'timeout'); // counts as a failure
+```
+
+Semantics:
+
+- **Reported in, like partition health (EB-217).** Outcomes are
+  observations, not bus operations: they are not audited, and the
+  only effect is the callback. `reportDeliveryOutcome` throws
+  `RangeError` on a bus that never enabled `failureRegime`, on an
+  empty topic, or on an outcome outside
+  `'success' | 'failure' | 'timeout'`. Topics resolve through live
+  alias links, exactly like the publish path.
+- **Fixed baseline, re-baselined on alarm.** The baseline rate is the
+  mean of a warmup window (default 50 samples) and then stays fixed
+  — a running average would chase a slow creep and absorb exactly the
+  shift this exists to catch. After an alarm the detector settles
+  over a full window of post-alarm samples before detecting again,
+  so a steady new regime never re-alarms.
+- **Burst-tolerant.** The alarm threshold (default λ = 5) doubles as
+  burst tolerance: one failure contributes roughly 1 to the
+  cumulative sum, so a lone spike cannot trip it; a sustained shift
+  of at least δ (default 0.05, five points) alarms — a jump to 50%
+  in about a dozen samples, a 1% → 8% creep in about a hundred.
+- **Alert-only.** It never pauses, isolates, or reroutes a topic —
+  disposition stays with quarantine and the operator. No stats
+  fields, no Prometheus series, no revision method: only the
+  callback. A bus without the option pays nothing.
+
 ## Manual subscriber pause/resume (EB-113)
 
 `bus.pauseSubscriber(subId, { reason? })` / `bus.resumeSubscriber(subId)`

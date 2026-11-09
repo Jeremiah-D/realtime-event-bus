@@ -261,6 +261,13 @@ import {
   type PartitionHealthRow,
 } from './partitionhealth.ts';
 import {
+  FailureRateRegimeMonitor,
+  assertValidDeliveryOutcome,
+  resolveFailureRegimeOptions,
+  type DeliveryOutcome,
+  type FailureRegimeOptions,
+} from './failure-regime.ts';
+import {
   resolveMirrorRules,
   validateMirrorThrottle,
   type MirrorHandle,
@@ -543,6 +550,11 @@ export type {
   ScheduleSkewSummaryStats,
 } from './scheduleskew.ts';
 export type { PartitionHealthOptions, PartitionHealthRow } from './partitionhealth.ts';
+export type {
+  DeliveryOutcome,
+  FailureRateRegimeChange,
+  FailureRegimeOptions,
+} from './failure-regime.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
 export type {
   LagForecastEvent,
@@ -5252,6 +5264,22 @@ export interface EventBusOptions {
    * `reportPartition*` APIs throw `RangeError`.
    */
   partitionHealth?: PartitionHealthOptions;
+  /**
+   * EB-442: opt-in per-topic delivery failure-rate regime detection.
+   * A present (even empty) options object arms a
+   * `FailureRateRegimeMonitor` (`src/failure-regime.ts`): reported
+   * delivery outcomes feed a two-sided Page-Hinkley test per topic,
+   * and `onFailureRateRegimeChange` fires when a topic's failure rate
+   * *shifts* — a slow creep from 1% to 8% alarms even though it never
+   * crosses a fixed 10% alert line. A timeout counts as a failure.
+   * Absent means detection is off entirely: no monitor, no state, and
+   * `reportDeliveryOutcome` throws `RangeError`. The detector only
+   * alerts — it never pauses, isolates, or reroutes a topic. Validated
+   * fail-fast by the resolver, so a bad config never half-wires a bus.
+   * The clock is the bus's own (`EventBusOptions.now`): a caller-passed
+   * `nowMs` is ignored, so `detectedAtMs` always reads on bus time.
+   */
+  failureRegime?: FailureRegimeOptions;
   /**
    * EB-96: pluggable persistence for the durable topic log. When set,
    * every object the log keeps — the per-topic live log, archived
@@ -16004,6 +16032,13 @@ export class EventBus {
    */
   private readonly partitionHealthTracker: PartitionHealthTracker | undefined;
   /**
+   * Per-topic delivery failure-rate regime detection (EB-442, see
+   * `EventBusOptions.failureRegime`). Present only when the option is
+   * passed — an absent option means no monitor at all: reporting
+   * throws `RangeError` and the bus pays nothing.
+   */
+  private readonly failureRegimeMonitor: FailureRateRegimeMonitor | undefined;
+  /**
    * Unhealthy-skip counters (EB-217): publishes rerouted away from an
    * unhealthy (topic, partition) pair, keyed by concrete topic then by
    * the *skipped* partition. Feeds `eventbus_partition_skipped_unhealthy_total`
@@ -18047,6 +18082,17 @@ export class EventBus {
     const partitionHealthOptions = resolvePartitionHealthOptions(options?.partitionHealth);
     this.partitionHealthTracker =
       partitionHealthOptions === undefined ? undefined : new PartitionHealthTracker(partitionHealthOptions);
+    // EB-442: opt-in per-topic failure-rate regime detection. A present
+    // (even empty) options object arms the monitor; an absent option
+    // disables everything — no monitor, no state. Validated fail-fast
+    // by the resolver, so a bad config never half-wires a bus. The
+    // detector's clock is forced to the bus clock (`this.now()`), so
+    // `detectedAtMs` always reads on bus time.
+    const failureRegimeOptions = resolveFailureRegimeOptions(options?.failureRegime);
+    this.failureRegimeMonitor =
+      failureRegimeOptions === undefined
+        ? undefined
+        : new FailureRateRegimeMonitor({ ...failureRegimeOptions, nowMs: () => this.now() });
     // EB-182: opt-in publish-side admission latency sampling. A present
     // (even empty) options object arms the tracker; an absent option
     // disables everything — no sampling, zeroed stats, no Prometheus
@@ -44477,6 +44523,41 @@ export class EventBus {
   /** See {@link EventBus.reportPartitionFailure}. */
   reportPartitionSuccess(topic: string, partition: number): void {
     this.reportPartitionOutcome(topic, partition, 'success');
+  }
+
+  /**
+   * Reports a delivery outcome for a topic (EB-442, real-time
+   * systems): one observed result on the topic's delivery stream.
+   * The outcomes feed the per-topic failure-rate regime detector —
+   * see `src/failure-regime.ts` — which fires
+   * `onFailureRateRegimeChange` when the topic's failure rate
+   * *shifts* (a slow creep alarms even though it never crosses a
+   * fixed alert line). A timeout counts as a failure.
+   *
+   * The outcome is *reported in* because an in-memory bus cannot
+   * observe downstream delivery health itself: the operator, a
+   * monitoring sidecar, or a bridge to an external log is the honest
+   * source. It is not audited (it is an observation, not a bus
+   * operation) — the effect is observable only through the callback.
+   *
+   * `topic` is resolved through live alias links, exactly like the
+   * publish path. Throws `RangeError` when regime detection is not
+   * enabled (`EventBusOptions.failureRegime`), when `topic` is empty,
+   * or when `outcome` is not one of `'success' | 'failure' | 'timeout'`.
+   */
+  reportDeliveryOutcome(topic: string, outcome: DeliveryOutcome): void {
+    const monitor = this.failureRegimeMonitor;
+    if (monitor === undefined) {
+      throw new RangeError('reportDeliveryOutcome requires EventBusOptions.failureRegime to be set');
+    }
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    assertValidDeliveryOutcome(outcome, 'reportDeliveryOutcome');
+    // Alias-resolved, exactly like the publish path — the monitor is
+    // keyed by the concrete topic `resolvePartition` sees.
+    const resolved = this.resolveLiveTopic(topic);
+    monitor.observe(resolved, outcome);
   }
 
   private reportPartitionOutcome(
