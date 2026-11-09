@@ -35766,6 +35766,104 @@ export class EventBus {
   }
 
   /**
+   * Revises one latency-SLO-tracked subscriber's miss callback
+   * (EB-437) without re-subscribing: `setLatencySloMissCallback(subId,
+   * cb)` swaps `onLatencySloMiss` in place (see
+   * `SubscribeOptions.latencySlo`, EB-53) — the only `latencySlo`
+   * revision surface EB-290 (threshold) and EB-368 (window size) left
+   * uncovered: both retune the evaluation, this one retunes who hears
+   * about a miss.
+   *
+   * Only the callback moves: `checkProcessingLatencySlo` reads the
+   * live `latencySlo.onLatencySloMiss` at each sampling evaluation —
+   * on the plain and batched invocation path
+   * (`invocationLatencySlo`) and on `ack()` completion for reliable
+   * subscriptions — so the new callback governs from the next
+   * over-threshold evaluation, with no drain, re-registration, or
+   * replay. `null` clears the callback back to latch-and-ops-alert
+   * only: a p99 over the threshold still sets the `alerted` latch
+   * and still counts the miss (and still emits the
+   * `processing-latency-slo-breach` ops alert when phase attribution
+   * is armed), just with no callback fired. The threshold, the
+   * tracker window and its samples, and the `alerted` latch are
+   * untouched: clearing during an over-threshold excursion does not
+   * re-arm the latch — after re-installing, the p99 must fall back
+   * to or below the threshold and exceed it again before the new
+   * callback fires, along the existing check logic.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `latencySlo` monitoring, and an illegal callback value
+   * (anything but a function or an explicit `null` — `undefined` is
+   * not a value) all throw `RangeError` with the live callback, the
+   * threshold, the samples, the latch, and the audit log untouched —
+   * the revision reuses the subscribe-time validation
+   * (`resolveLatencySloOptions`: `onLatencySloMiss` must be a
+   * function), so a callback that could not be set at subscribe time
+   * cannot be revised in later either. A revision identical to the
+   * live callback — the same function reference, including clearing a
+   * callback that was never set — is a no-op with no audit. Audited
+   * as `latency_slo_miss_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-53 (that is the SLO mechanism itself, this its
+   * miss-callback revision), to EB-290 (`setLatencySloThreshold`,
+   * that revises the p99 threshold — this which callback hears about
+   * a miss, a different field of the same state), to EB-368
+   * (`setLatencySloWindowSize`, that revises the sample window —
+   * this the callback), to EB-133 (that is the phase attribution
+   * itself — this only which callback receives the miss), and to
+   * EB-331 (that is the bus-level attribution arming switch — this a
+   * per-subscriber callback).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unmonitored
+   * subscriber, or an illegal callback value.
+   */
+  setLatencySloMissCallback(
+    subId: string,
+    cb: ((event: LatencySloMissEvent) => void) | null,
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setLatencySloMissCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setLatencySloMissCallback: unknown subscriber: ${subId}`);
+    }
+    const latencySlo = subscriber.latencySlo;
+    if (latencySlo === undefined) {
+      throw new RangeError('setLatencySloMissCallback: subscriber has no latencySlo monitoring set');
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to
+    // latch-and-ops-alert-only reporting.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setLatencySloMissCallback: cb must be a function or null');
+    }
+    const nextCallback = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextCallback === latencySlo.onLatencySloMiss) {
+      return;
+    }
+    const oldHasCallback = latencySlo.onLatencySloMiss !== undefined;
+    const hasCallback = nextCallback !== undefined;
+    // Only the callback moves; the threshold, the tracker window and
+    // its samples, and the alert latch are untouched, and the next
+    // sample evaluation reads the live value from here on.
+    latencySlo.onLatencySloMiss = nextCallback;
+    this.auditSubscription({
+      action: 'latency_slo_miss_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { hasCallback, oldHasCallback },
+    });
+  }
+
+  /**
    * Revises the bus-level processing-latency SLO alert switch live
    * (EB-331) without restarting the bus:
    * `setProcessingLatencySloAlert(enabled)` arms or disarms SLO-miss

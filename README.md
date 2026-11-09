@@ -2724,7 +2724,20 @@ library.
   (it re-arms only on the next sample evaluation), and when phase attribution is armed the three phase
   trackers resize to the same bound. A revision identical to the current window is a no-op with no
   audit. Every success is audited as `latency_slo_window_size_revised`
-  (`{ windowSize: <number>, oldWindowSize: <number> }`). (Real-time systems: latency SLO
+  (`{ windowSize: <number>, oldWindowSize: <number> }`). The miss callback itself is likewise
+  revisable without re-subscribing (EB-437, via `setLatencySloMissCallback(subId, cb)`): only the
+  callback moves — `checkProcessingLatencySlo` reads the live `onLatencySloMiss` at each sampling
+  evaluation, so the new callback governs from the next over-threshold evaluation on both paths
+  (plain/batched invocation sampling and reliable `ack()`-completion sampling); `null` clears it back
+  to latch-and-ops-alert-only reporting (a p99 over the threshold still sets the `alerted` latch and
+  still counts the miss, just with no callback fired). The threshold, the tracker window and its
+  samples, and the latch are untouched, so clearing during an over-threshold excursion never re-arms
+  the latch — after re-installing, the p99 must fall back to or below the threshold and exceed it again
+  before the new callback fires. An unknown subscriber, a never-monitored subscription, or a non-function
+  non-`null` value throws `RangeError` with the live callback untouched; a revision identical to the live
+  callback (same reference, including clearing a never-set callback) is a no-op with no audit. Every
+  success is audited as `latency_slo_miss_callback_revised`
+  (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }`). (Real-time systems: latency SLO
   governance.) Disabled by default.
 - **SLO-miss phase attribution** (in `src/bus.ts`, opt-in via
   `new EventBus({ processingLatencySloAlert: true })`): when a
