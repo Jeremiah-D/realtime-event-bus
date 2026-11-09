@@ -1345,7 +1345,16 @@ library.
   clear, only `null` is, and a revision after a clear is refused until
   the subscriber opts in again at subscribe time), and every success is
   audited as `health_probe_revised` (`{ healthProbe: { ... } | null,
-  oldHealthProbe: { ... } }`). (Real-time systems: subscription
+  oldHealthProbe: { ... } }`). The degraded callback itself is
+  live-revisable (EB-435, via `setDegradedCallback(subId, cb |
+  null)`): only a probed subscription can be retuned — a subscription
+  that never opted into `healthProbe` throws `RangeError` — and `null`
+  clears it back to pause-only alerting (the auto-pause, the
+  consecutive-failure counter, and the degraded flag are untouched,
+  only the operator stops hearing about it). A same-value revision is
+  a no-op with no audit, and every success is audited as
+  `subscriber_degraded_callback_revised` (`{ onDegraded: 'set' |
+  'cleared', oldOnDegraded: 'set' | 'absent' }`). (Real-time systems: subscription
   governance.)
 - **Slow-handler offload** (in `src/bus.ts`, opt-in via
   `subscribe(..., { slowHandler: { thresholdMs } })`, EB-191): the bus times

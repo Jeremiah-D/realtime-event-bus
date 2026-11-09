@@ -37428,6 +37428,98 @@ export class EventBus {
   }
 
   /**
+   * Revises one health-probed subscriber's degraded callback (EB-435)
+   * without re-subscribing: `setDegradedCallback(subId, cb)` swaps
+   * `onDegraded` in place (see `SubscribeOptions.healthProbe` /
+   * `SubscribeOptions.onDegraded`, EB-18).
+   *
+   * Only the callback moves: `reportDegraded` reads the live
+   * `subscriber.onDegraded` on every degradation, so the new callback
+   * governs from the next auto-pause — a swapped operator callback
+   * fires on the next degradation — with no drain, re-registration,
+   * or replay. That is the whole point of this entry: the degraded
+   * callback is a subscribe-time value today, so changing the alert
+   * recipient means re-subscribing and losing the health counter and
+   * the degraded state. `onDegraded` can be replaced or cleared with
+   * an explicit `null` (cleared means pause-only alerting: the
+   * auto-pause, the consecutive-failure counter, and the degraded
+   * flag still move exactly as before, just never alerted).
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into `healthProbe` (there is no degradation mechanism to
+   * alert on — a revision after a probe clear is refused until the
+   * subscriber opts in again at subscribe time, along the EB-267
+   * gate), and an illegal callback value (a non-function non-`null`
+   * callback) all throw `RangeError` with the live callback, the
+   * counter, the degraded flag, and the audit log untouched — the
+   * revision reuses the subscribe-time validation (callbacks must be
+   * functions), so a callback that could not be set at subscribe time
+   * cannot be revised in later either. A revision identical to the
+   * live callback — the same function reference, including clearing a
+   * callback that was never set — is a no-op with no audit. Audited
+   * as `subscriber_degraded_callback_revised` (`{ onDegraded: 'set' |
+   * 'cleared', oldOnDegraded: 'set' | 'absent' }` — the callback
+   * itself is a function and is never serialized into the audit
+   * record, only its set/cleared state).
+   *
+   * Orthogonal to EB-18 (that is the health-probing mechanism itself
+   * — this its callback revision), to EB-267 (that retunes the probe
+   * thresholds — this which callback receives the degradation), to
+   * EB-433 (that revises the key-hotspot callbacks — this the
+   * degraded callback, same family, different hook), and to EB-434
+   * (that revises the dead-letter callbacks — this the degraded
+   * callback, same family, different hook).
+   *
+   * Throws `RangeError` for an unknown subscriber, an unprobed
+   * subscriber, or an illegal callback value.
+   */
+  setDegradedCallback(
+    subId: string,
+    cb: ((event: DegradedEvent) => void) | null,
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDegradedCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDegradedCallback: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.health == null) {
+      throw new RangeError('setDegradedCallback: subscriber has no healthProbe configured');
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to
+    // pause-only alerting.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setDegradedCallback: cb must be a function or null');
+    }
+    const nextOnDegraded = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextOnDegraded === subscriber.onDegraded) {
+      return;
+    }
+    const oldOnDegraded = subscriber.onDegraded === undefined ? 'absent' : 'set';
+    const onDegradedPresence: 'set' | 'cleared' = cb === null ? 'cleared' : 'set';
+    // Only the callback moves; the probe thresholds, the
+    // consecutive-failure counter, the degraded flag, and any armed
+    // auto-resume timer are untouched, and the next degradation reads
+    // the live value from here on.
+    subscriber.onDegraded = nextOnDegraded;
+    this.auditSubscription({
+      action: 'subscriber_degraded_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        onDegraded: onDegradedPresence,
+        oldOnDegraded,
+      },
+    });
+  }
+
+  /**
    * Revises the sliding-window delivery rate limit of one
    * rate-limited subscriber (EB-271): a subscriber that opted into
    * `rateLimit` can retune its hard ceiling without re-subscribing.
