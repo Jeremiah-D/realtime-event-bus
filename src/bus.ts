@@ -170,7 +170,7 @@ import {
   type RemediationActionResult,
   type RemediationReport,
 } from './remediate.ts';
-import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type ReadbackCacheLimits, type SegmentOffloadOptions, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
+import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type ReadbackCacheLimits, type SegmentChecksumFailure, type SegmentOffloadOptions, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
 import { exportTopicData as exportTopicDataFromLog, importTopicData as importTopicDataIntoLog, type ImportTopicDataResult } from './topic-data-export.ts';
 import {
   OutboxRelay,
@@ -5456,6 +5456,22 @@ export interface EventBusOptions {
    * be enabled after the fact.
    */
   durableLogSegmentRotation?: SegmentRotationOptions;
+  /**
+   * Segment-checksum-failure hook for the durable log (EB-94, EB-436):
+   * called once per archived segment that fails checksum verification
+   * and is isolated (see `SegmentChecksumFailure` in
+   * `src/durablelog.ts`) — the segment is skipped, never fatal, and
+   * counted in `getStats().durableLog.corruptSegments` whether or not
+   * a hook is installed. The hook is error-isolated: a throwing hook
+   * is swallowed so a broken observer can never disturb the
+   * read/recovery path. The audit event (`segment_checksum_failed`)
+   * fires regardless of whether a hook is installed. Replaceable live
+   * via `setSegmentChecksumFailedCallback` (EB-436); `null` clears back
+   * to audit-only. Default: unset (audit-only — fully backward
+   * compatible). Only meaningful with `durableLogDir` and
+   * `durableLogSegmentRotation` (only sealed segments carry checksums).
+   */
+  onSegmentChecksumFailed?: (info: SegmentChecksumFailure) => void;
   /**
    * Opt-in S3 offload of sealed (archived) durable-log segments (EB-361;
    * see `SegmentOffloadOptions` in `src/durablelog.ts`): closed segments
@@ -16257,6 +16273,16 @@ export class EventBus {
    */
   private onWatermarkIdle?: WatermarkIdleCallback;
   /**
+   * Bus-level segment-checksum-failure hook (see
+   * `EventBusOptions.onSegmentChecksumFailed`), fired error-isolated
+   * once per isolated segment. Mutable:
+   * `setSegmentChecksumFailedCallback` (EB-436) replaces it live —
+   * `reportSegmentChecksumFailed` reads this field on every failure,
+   * so the new hook governs from the next checksum failure onward.
+   * The root log and every namespace child log share this one cell.
+   */
+  private segmentChecksumFailedCallback?: (info: SegmentChecksumFailure) => void;
+  /**
    * Per-topic allowed-lateness overrides, keyed by the exact string passed
    * to `setTopicAllowedLateness` — either a concrete topic name or a
    * wildcard pattern. Match resolution mirrors the TTL and rate-limit
@@ -18072,6 +18098,11 @@ export class EventBus {
       throw new TypeError('onWatermarkIdle must be a function');
     }
     this.onWatermarkIdle = onWatermarkIdle;
+    const onSegmentChecksumFailed = options?.onSegmentChecksumFailed;
+    if (onSegmentChecksumFailed !== undefined && typeof onSegmentChecksumFailed !== 'function') {
+      throw new TypeError('onSegmentChecksumFailed must be a function');
+    }
+    this.segmentChecksumFailedCallback = onSegmentChecksumFailed;
     // Deterministic fault-injection harness (EB-103): validated here,
     // fail-fast — an invalid scenario must never half-arm a bus. Absent
     // or empty means no injector at all (zero overhead, zero behavior
@@ -18293,13 +18324,9 @@ export class EventBus {
         // operator can see exactly which history was quarantined.
         // Construction-time recoveries run before the audit log exists;
         // those segments are still counted in stats().corruptSegments.
-        onSegmentChecksumFailed: (info) =>
-          this.auditSubscription({
-            action: 'segment_checksum_failed',
-            actor: 'system',
-            topic: info.topic,
-            detail: { path: info.path, segmentId: info.segmentId },
-          }),
+        // EB-436: one shared fan-out — the audit event plus the live
+        // operator callback, read from the bus cell on every failure.
+        onSegmentChecksumFailed: (info) => this.reportSegmentChecksumFailed(info),
       });
       this.durableLog = log;
       // Remembered for namespace child logs (EB-52): children open with
@@ -21208,6 +21235,118 @@ export class EventBus {
     this.onLate = next;
     this.auditSubscription({
       action: 'late_message_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
+  /**
+   * Fan-out for one checksum-failed archived segment (EB-94, EB-436):
+   * the audit event first (`segment_checksum_failed`, one per segment,
+   * so an operator can see exactly which history was quarantined),
+   * then the live operator callback, if one is installed (see
+   * `EventBusOptions.onSegmentChecksumFailed` /
+   * `setSegmentChecksumFailedCallback`). The operator callback is
+   * error-isolated — a throwing callback is swallowed here, so a broken
+   * observer can never disturb the read/recovery path (the log's own
+   * `noteChecksumFailure` already swallows hook errors; this second
+   * guard keeps the bus-side fan-out safe even if the log ever stops
+   * swallowing). The root log and every namespace child log share this
+   * one fan-out, and it reads the live cell on every failure, so a
+   * revision governs the next failure on every log. The `corruptSegments`
+   * count moves regardless of whether a callback is installed.
+   */
+  private reportSegmentChecksumFailed(info: SegmentChecksumFailure): void {
+    this.auditSubscription({
+      action: 'segment_checksum_failed',
+      actor: 'system',
+      topic: info.topic,
+      detail: { path: info.path, segmentId: info.segmentId },
+    });
+    const cb = this.segmentChecksumFailedCallback;
+    if (cb !== undefined) {
+      try {
+        cb(info);
+      } catch {
+        // The callback is an observer, not part of the read path.
+      }
+    }
+  }
+
+  /**
+   * Replaces the segment-checksum-failure hook live (EB-436) without
+   * restarting the bus: `setSegmentChecksumFailedCallback(cb)` swaps the
+   * `onSegmentChecksumFailed` observer every isolated segment is handed
+   * to (see `EventBusOptions.onSegmentChecksumFailed`).
+   *
+   * There is no enable gate: the hook itself has no feature switch, so
+   * any open bus can install one — on a bus with no rotation it simply
+   * never fires. `null` clears back to audit-only. The new hook governs
+   * from the next checksum failure onward — a segment already isolated
+   * is never re-reported — and the `corruptSegments` counter moves
+   * regardless of whether a hook is installed. A throwing hook is still
+   * swallowed by `reportSegmentChecksumFailed`: observation never breaks
+   * the read/recovery path. Only the observer channel moves — the
+   * checksum verification, the segment isolation/skip semantics, and the
+   * `corruptSegments` count are untouched.
+   *
+   * Fail-closed: an illegal actor, a closed bus, and an illegal callback
+   * all throw `RangeError` with the live hook and the audit log untouched.
+   * Validation reuses the construction-time rule (a callback must be a
+   * function, `null` clears back to audit-only), so a value that could
+   * not be set at construction cannot be installed later either. (The
+   * constructor's own `onSegmentChecksumFailed` check throws `TypeError`;
+   * the setter follows the callback-revision family and throws
+   * `RangeError`, like `setLateMessageCallback`.) Re-installing the live
+   * callback (the same reference, including `null` against a bus with no
+   * callback) is a no-op with no audit. Audited as
+   * `segment_checksum_failed_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself is
+   * never written to the audit log).
+   *
+   * Orthogonal to EB-94 (that is the segment checksum isolation
+   * mechanism itself — this its missing live hook-redirection entry),
+   * to EB-118 (that is the segment-chain anchoring — this which callback
+   * receives a checksum failure), and to EB-427 (that revises the
+   * late-message callback — this the checksum-failure channel, same
+   * family, different hook). The revision is live-only — a restart
+   * restores the construction-time callback.
+   *
+   * Throws `RangeError` when the bus is closed, for an illegal actor, or
+   * for an illegal callback.
+   */
+  setSegmentChecksumFailedCallback(
+    cb: ((info: SegmentChecksumFailure) => void) | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setSegmentChecksumFailedCallback');
+    // Fail-fast on a closed bus (EB-154, along `setLateMessageCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setSegmentChecksumFailedCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to
+    // audit-only, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live hook untouched.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setSegmentChecksumFailedCallback: cb must be a function or null');
+    }
+    const next = cb ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === this.segmentChecksumFailedCallback) {
+      return;
+    }
+    const oldHasCallback = this.segmentChecksumFailedCallback !== undefined;
+    this.segmentChecksumFailedCallback = next;
+    this.auditSubscription({
+      action: 'segment_checksum_failed_callback_revised',
       actor,
       detail: {
         hasCallback: next !== undefined,
@@ -31696,14 +31835,9 @@ export class EventBus {
         segmentRotation: this.durableLogSegmentRotation,
         encryptor: this.durableLogEncryptor,
         // EB-94: namespace child logs report checksum failures to the
-        // same audit trail as the root log.
-        onSegmentChecksumFailed: (info) =>
-          this.auditSubscription({
-            action: 'segment_checksum_failed',
-            actor: 'system',
-            topic: info.topic,
-            detail: { path: info.path, segmentId: info.segmentId },
-          }),
+        // same audit trail as the root log. EB-436: the same shared
+        // fan-out — a revision governs the child log's next failure too.
+        onSegmentChecksumFailed: (info) => this.reportSegmentChecksumFailed(info),
       });
       this.namespaceLogs.set(prefix, child);
       // EB-388: a namespace registered after a per-topic age-retention

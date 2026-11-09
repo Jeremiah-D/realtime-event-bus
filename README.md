@@ -897,7 +897,16 @@ library.
   mismatch isolates the segment — skipped, never fatal, counted in
   `getStats().durableLog.corruptSegments` — and fires one
   `segment_checksum_failed` subscription-audit event
-  (`getSubscriptionAudit()`). Segments archived before checksums (no
+  (`getSubscriptionAudit()`). Redirect the failure hook live with
+  `setSegmentChecksumFailedCallback(cb, actor?)` (EB-436) —
+  `EventBusOptions.onSegmentChecksumFailed` installs it at construction,
+  `null` clears back to audit-only, re-installing the live callback is a
+  no-op, and the swap is audited as
+  `segment_checksum_failed_callback_revised`
+  (`{ hasCallback, oldHasCallback }`); the root log and every namespace
+  child log share the one live hook, a throwing hook is swallowed, and the
+  checksum verification, the isolation, and the `corruptSegments` count
+  are untouched. Segments archived before checksums (no
   sidecar) read exactly as before. Segment hash chaining (EB-118): every
   archived segment additionally appends one line to the versioned chain
   manifest (`__segment_chain.jsonl`, line format `v: 2`) —
