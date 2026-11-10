@@ -1243,6 +1243,29 @@ library.
   the revision must not move `dropPolicy`), and every success is
   audited as `backpressure_tier_revised`
   (`{ backpressure: <tier>, oldBackpressure: <tier> }`).
+  The observation callbacks themselves are revisable without
+  re-subscribing (EB-455, via
+  `setBackpressureCallbacks(subId, { onBackpressure?, onDrained? })`):
+  tier revision and callback revision are orthogonal — one moves the
+  full-queue behavior, the other moves who hears about the queue
+  filling up and draining again. Either callback can be replaced or
+  cleared with an explicit `null` (cleared means silent observation:
+  the excursion latch still arms, the `'block'` tier still refuses
+  arrivals, the throttle still engages and disengages, and the drain
+  still clears the latch — just with nobody receiving); a replacement
+  governs from the next excursion or drain, which reads the live
+  callback. The two halves have different gates: `onDrained` is
+  always revisable, while `onBackpressure` is revisable only when the
+  queue's high-water-mark hook already exists (a subscribe-time
+  `onBackpressure` or a `throttle` was present) — otherwise the
+  revision is refused and the subscriber must re-subscribe to opt in.
+  A patch that provides neither field is refused, and a revision
+  identical to the live callbacks is a no-op with no audit. Every
+  success is audited as `backpressure_callbacks_revised`
+  (`{ onBackpressure: 'set' | 'cleared' | 'unchanged',
+  oldOnBackpressure: 'set' | 'absent', onDrained: 'set' | 'cleared' |
+  'unchanged', oldOnDrained: 'set' | 'absent' }` — the callbacks
+  themselves are never serialized, only their set/cleared state).
   Orthogonal to the capacity (EB-281, that revises `queueSize`,
   this revises the full-queue behavior). (Real-time systems:
   delivery governance.)

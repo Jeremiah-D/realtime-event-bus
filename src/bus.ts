@@ -1848,6 +1848,7 @@ export interface SubscribeOptions {
    * mark (80% of capacity). Fires once per excursion and re-arms after the
    * queue drains below the mark — use it to shed load upstream, alert an
    * operator, or degrade gracefully instead of silently dropping messages.
+   * Revisable live via `setBackpressureCallbacks` (EB-455).
    */
   onBackpressure?: (event: BackpressureEvent) => void;
   /**
@@ -1856,7 +1857,7 @@ export interface SubscribeOptions {
    * may resume full speed. Fires once per excursion, mirroring
    * `onBackpressure`, and re-arms together with it. Also fires synchronously
    * if `setHighWaterMarkRatio` moves the mark above the current queue size
-   * mid-excursion.
+   * mid-excursion. Revisable live via `setBackpressureCallbacks` (EB-455).
    */
   onDrained?: (event: DrainedEvent) => void;
   /**
@@ -8872,6 +8873,30 @@ interface Subscriber {
    * `blockedMessages` stat, and included in `droppedCount(subId)`.
    */
   blockedCount: number;
+  /**
+   * Backpressure excursion observer (see `SubscribeOptions.onBackpressure`,
+   * EB-83): fires when the queue reaches the high-water mark. Stored live
+   * on the subscriber (EB-455) so `setBackpressureCallbacks` can swap it
+   * without re-subscribing — the queue's `onHighWaterMark` wrapper reads
+   * this field at call time, never a subscribe-time capture.
+   */
+  onBackpressure?: (event: BackpressureEvent) => void;
+  /**
+   * Queue-drain observer (see `SubscribeOptions.onDrained`, EB-83 /
+   * EB-285): fires when the queue recedes below the high-water mark
+   * after an excursion. Same live-field treatment as `onBackpressure`
+   * above — the queue's `onDrained` wrapper reads this at call time.
+   */
+  onDrained?: (event: DrainedEvent) => void;
+  /**
+   * Whether the queue's `onHighWaterMark` hook was installed at subscribe
+   * time (EB-455): true exactly when a subscribe-time `onBackpressure` or
+   * a `throttle` was present. The hook is the gate for revising
+   * `onBackpressure` — a subscription that never opted into either can
+   * only gain the observer by re-subscribing. `onDrained` needs no gate:
+   * its hook is installed for every subscription (EB-285).
+   */
+  backpressureHookInstalled: boolean;
   /** The queue's count capacity, for saturation checks at enqueue time. */
   queueCapacity: number;
   /**
@@ -32995,7 +33020,13 @@ export class EventBus {
               if (throttle != null) {
                 this.engageThrottle(subscriber, size, subscriber.queueCapacity);
               }
-              onBackpressure?.({
+              // EB-455: the callback is read live off the subscriber, so
+              // a `setBackpressureCallbacks` revision governs from the
+              // next excursion — the subscribe-time capture is never
+              // consulted here. With no callback installed the wrapper
+              // still fires for the throttle above: the excursion signal
+              // is independent of the observer.
+              subscriber.onBackpressure?.({
                 // The subscriber's live pattern, not the registration-time
                 // capture: `updateSubscriptionPattern` (EB-74) rewrites it
                 // in place, and events must name the pattern the
@@ -33032,7 +33063,11 @@ export class EventBus {
         if (throttle != null) {
           this.releaseThrottle(subscriber, size);
         }
-        onDrained?.({
+        // EB-455: read live off the subscriber, like `onBackpressure`
+        // above — a revised callback governs from the next drain, and a
+        // cleared callback leaves the latch clear and the throttle
+        // release above running with nobody receiving.
+        subscriber.onDrained?.({
           // Live pattern (see onBackpressure above): a hot pattern
           // update must not leave events naming a stale pattern.
           // Likewise the live capacity: `setQueueSize` (EB-281)
@@ -33091,6 +33126,18 @@ export class EventBus {
       backpressure,
       blocked: false,
       blockedCount: 0,
+      // Backpressure observation callbacks (EB-455): stored live on the
+      // subscriber so `setBackpressureCallbacks` can swap them without
+      // re-subscribing — the queue wrappers above read these fields at
+      // call time, never the subscribe-time captures.
+      onBackpressure,
+      onDrained,
+      // The `onHighWaterMark` hook exists exactly when a subscribe-time
+      // `onBackpressure` or a `throttle` was present — the gate
+      // `setBackpressureCallbacks` applies to `onBackpressure`. The
+      // `onDrained` hook needs no gate: it is installed for every
+      // subscription (EB-285).
+      backpressureHookInstalled: onBackpressure != null || throttle != null,
       queueCapacity: capacity,
       queueMaxBytes,
       // Subscriber labels (EB-213): the subscriber owns a fresh copy —
@@ -40587,6 +40634,175 @@ export class EventBus {
       detail: {
         backpressure: tier,
         oldBackpressure,
+      },
+    });
+  }
+
+  /**
+   * Revises one subscriber's backpressure observation callbacks
+   * (EB-455) without re-subscribing: `setBackpressureCallbacks(subId,
+   * patch)` swaps `onBackpressure` and/or `onDrained` in place (see
+   * `SubscribeOptions.onBackpressure` / `onDrained`, EB-83 / EB-285) —
+   * the only backpressure revision surface `setBackpressureTier` left
+   * uncovered: it moves the full-queue behavior, this one moves who
+   * hears about the queue filling up and draining again.
+   *
+   * Only the callbacks move: the queue wrappers read the live
+   * `subscriber.onBackpressure` / `subscriber.onDrained` on every
+   * excursion / drain, so the new callbacks govern from the next
+   * excursion — with no drain, re-registration, or replay. That is the
+   * whole point of this entry: the observation hooks are subscribe-time
+   * values today, so changing the alert recipient means re-subscribing
+   * and losing the queue, the in-flight messages, and the blocked
+   * latch. Either field can be replaced or cleared with an explicit
+   * `null` (cleared means silent observation: the excursion latch
+   * still arms, the `'block'` tier still refuses arrivals, the
+   * throttle still engages and disengages, and the drain still clears
+   * the latch — just with nobody receiving). A field left out of the
+   * patch keeps its live value. A patch that provides neither field is
+   * refused.
+   *
+   * The two fields have different gates. `onDrained` is always
+   * revisable: its hook is installed for every subscription (EB-285),
+   * so a subscription that never installed a drain callback can gain
+   * one after the fact. `onBackpressure` is revisable only when the
+   * queue's `onHighWaterMark` hook already exists — a subscribe-time
+   * `onBackpressure` or a `throttle` was present
+   * (`subscriber.backpressureHookInstalled`) — otherwise the revision
+   * is refused and the subscriber must re-subscribe to opt in, along
+   * the `setThrottle` no-opt-in-no-revision gate. A subscription whose
+   * hook exists only because of `throttle` can gain an
+   * `onBackpressure` observer this way: the wrapper was already
+   * installed for the throttle's excursion signal.
+   *
+   * Fail-closed: an unknown subscriber id, a non-object patch, a patch
+   * with neither field, an illegal callback value (a non-function
+   * non-`null` callback), and an `onBackpressure` revision on a
+   * subscription with no `onHighWaterMark` hook all throw `RangeError`
+   * with the live callbacks, the tier, the queue, the `'block'` latch,
+   * the throttle state, and the audit log untouched — the revision
+   * reuses the subscribe-time validation (callbacks must be
+   * functions), so a callback that could not be set at subscribe time
+   * cannot be revised in later either. A revision identical to the
+   * live callbacks — the same function references, including clearing
+   * a callback that was never set — is a no-op with no audit. Audited
+   * as `backpressure_callbacks_revised` (`{ onBackpressure: 'set' |
+   * 'cleared' | 'unchanged', oldOnBackpressure: 'set' | 'absent',
+   * onDrained: 'set' | 'cleared' | 'unchanged', oldOnDrained: 'set' |
+   * 'absent' }` — the callbacks themselves are functions and are never
+   * serialized into the audit record, only their set/cleared state).
+   *
+   * Orthogonal to EB-83 (that is the backpressure mechanism itself —
+   * this its observation hooks), to EB-281 (that revises `queueSize` —
+   * this the callbacks), to EB-285 (that revises the tier — this who
+   * hears about the excursion, and the tier revision's latch semantics
+   * are untouched by a callback revision in either direction), to
+   * `setThrottle` (EB-268, that revises the rates — this the
+   * observers, and a throttle engaging with no callback installed
+   * still engages, still adapts, and still sheds), and to EB-437 /
+   * EB-440 / EB-443 / EB-454 (sibling subscription-level callback
+   * revisions — this the backpressure observers, a different hook of
+   * the same family).
+   *
+   * Throws `RangeError` for an unknown subscriber, an illegal patch,
+   * an illegal callback value, or an `onBackpressure` revision on a
+   * subscription with no backpressure hook.
+   */
+  setBackpressureCallbacks(
+    subId: string,
+    patch: {
+      onBackpressure?: (event: BackpressureEvent) => void | null;
+      onDrained?: (event: DrainedEvent) => void | null;
+    },
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setBackpressureCallbacks: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setBackpressureCallbacks: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: a non-object patch, a patch
+    // that provides neither callback, and an illegal callback value
+    // all fail closed — `undefined` is not a value, so a field left
+    // out keeps its live value, exactly like the other revision
+    // entries; `null` clears back to silent observation.
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        'setBackpressureCallbacks: patch must be an object with onBackpressure and/or onDrained',
+      );
+    }
+    if (patch.onBackpressure === undefined && patch.onDrained === undefined) {
+      throw new RangeError(
+        'setBackpressureCallbacks: patch must provide onBackpressure and/or onDrained',
+      );
+    }
+    if (
+      patch.onBackpressure !== undefined &&
+      patch.onBackpressure !== null &&
+      typeof patch.onBackpressure !== 'function'
+    ) {
+      throw new RangeError('setBackpressureCallbacks: onBackpressure must be a function or null');
+    }
+    if (
+      patch.onDrained !== undefined &&
+      patch.onDrained !== null &&
+      typeof patch.onDrained !== 'function'
+    ) {
+      throw new RangeError('setBackpressureCallbacks: onDrained must be a function or null');
+    }
+    // The `onBackpressure` half can only be revised while the queue's
+    // `onHighWaterMark` hook exists (EB-285's sibling gate, along
+    // `setThrottle`): a subscription that never opted into a
+    // backpressure observer or a throttle has no wrapper to retarget.
+    // `onDrained` needs no gate — its hook is installed for every
+    // subscription.
+    if (patch.onBackpressure !== undefined && !subscriber.backpressureHookInstalled) {
+      throw new RangeError(
+        'setBackpressureCallbacks: subscriber has no backpressure hook installed — re-subscribe with onBackpressure or throttle to opt in',
+      );
+    }
+    const nextOnBackpressure =
+      patch.onBackpressure === undefined
+        ? subscriber.onBackpressure
+        : (patch.onBackpressure ?? undefined);
+    const nextOnDrained =
+      patch.onDrained === undefined ? subscriber.onDrained : (patch.onDrained ?? undefined);
+    // Re-affirming the live callbacks is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextOnBackpressure === subscriber.onBackpressure && nextOnDrained === subscriber.onDrained) {
+      return;
+    }
+    const oldOnBackpressure = subscriber.onBackpressure === undefined ? 'absent' : 'set';
+    const oldOnDrained = subscriber.onDrained === undefined ? 'absent' : 'set';
+    const onBackpressurePresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onBackpressure === undefined
+        ? 'unchanged'
+        : patch.onBackpressure === null
+          ? 'cleared'
+          : 'set';
+    const onDrainedPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onDrained === undefined
+        ? 'unchanged'
+        : patch.onDrained === null
+          ? 'cleared'
+          : 'set';
+    // Only the callbacks move; the tier, the queue size, the byte
+    // budget, the high-water-mark ratio, the `'block'` latch, and the
+    // throttle state are untouched, and every excursion / drain reads
+    // the live values from here on.
+    subscriber.onBackpressure = nextOnBackpressure;
+    subscriber.onDrained = nextOnDrained;
+    this.auditSubscription({
+      action: 'backpressure_callbacks_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        onBackpressure: onBackpressurePresence,
+        oldOnBackpressure,
+        onDrained: onDrainedPresence,
+        oldOnDrained,
       },
     });
   }
