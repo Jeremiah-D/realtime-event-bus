@@ -505,7 +505,18 @@ library.
   `partitions`: round-robin groups have no partitions, so the listener
   never fires there — use `onRebalance` (EB-16) for roster join/leave
   notification. Must be an object with function callbacks; anything else
-  throws `RangeError` at registration.
+  throws `RangeError` at registration. The listener itself is
+  live-revisable (EB-444, via `reviseRebalanceListener(subId, patch)`):
+  each callback can be replaced or cleared with `null` independently —
+  a field left out keeps its live value, a patch with neither field
+  throws `RangeError` — and the new listener governs from the next
+  rebalance. This is the member-level hook (which partitions this
+  member gained or lost); the group-level roster callback `onRebalance`
+  is a different level of the same event and is revised separately
+  (EB-439, via `setRebalanceCallback`). A same-value revision is a
+  no-op with no audit, and every success is audited as
+  `rebalance_listener_callbacks_revised` (per-callback `set` /
+  `cleared` / `unchanged` with the old `set` / `absent` state).
   `subscribe()` also accepts an opt-in content `filter`
   predicate: a message the filter rejects never enters that subscriber's
   queue — no backpressure budget consumed, no adaptive-throttle token

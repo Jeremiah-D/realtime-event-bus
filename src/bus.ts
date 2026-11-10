@@ -42428,6 +42428,183 @@ export class EventBus {
   }
 
   /**
+   * Revises one consumer-group member's partition listener (EB-444)
+   * without re-subscribing: `reviseRebalanceListener(subId, patch)`
+   * swaps `onPartitionsAssigned` and/or `onPartitionsRevoked` in
+   * place (see `GroupSubscribeOptions.rebalanceListener`, EB-209) —
+   * the member-level partition-assignment hook, distinct from the
+   * group-level roster notification `onRebalance` (EB-16, revised
+   * live by `setRebalanceCallback`, EB-439): that one says who joined
+   * or left, this one says which partitions this member gained or
+   * lost. Today changing who hears about a partition move means
+   * unsubscribe+resubscribe, which loses the group seat and the
+   * offset-commit state.
+   *
+   * Only the listener moves: `fireRebalanceListener` reads the live
+   * `subscriber.rebalanceListener` on every rebalance, so the new
+   * listener governs from the next join or leave — no rejoin, no seat
+   * loss, no offset state touched. A field left out of the patch
+   * keeps its live value; `null` clears that one callback back to
+   * silent for its direction (the rebalance still reassigns and is
+   * still audited as `rebalance`, just with no callback fired for
+   * that direction). The revoke hook `commitOffsetsSync` keeps
+   * working under the revised listener — it checkpoints through the
+   * same `commitOffset` path, so it is idempotent with auto-commit
+   * (EB-127). A patch that provides neither field is refused.
+   *
+   * A throwing listener is swallowed by `fireRebalanceListener`: the
+   * listener is an observer, not part of the rebalance path, so a
+   * throwing observer never blocks the rebalance and only increments
+   * `getStats().rebalanceListenerErrors`.
+   *
+   * Fail-closed: a closed bus, an unknown subscriber id, a
+   * subscription that is not a consumer-group member
+   * (`subscriber.groupId` is unset), a non-object patch, a patch
+   * that provides neither callback, and an illegal callback value
+   * (anything but a function or an explicit `null` — `undefined` is
+   * not a value) all throw `RangeError` with the live listener, the
+   * roster, the assignment, and the audit log untouched — the
+   * revision reuses the subscribe-time validation
+   * (`rebalanceListener` must be an object with function callbacks),
+   * so a callback that could not be set at subscribe time cannot be
+   * revised in later either. A revision identical to the live
+   * listener — the same function references, including clearing a
+   * callback that was never set — is a no-op with no audit. Audited
+   * as `rebalance_listener_callbacks_revised`
+   * (`{ onPartitionsAssigned: 'set' | 'cleared' | 'unchanged',
+   * oldOnPartitionsAssigned: 'set' | 'absent',
+   * onPartitionsRevoked: 'set' | 'cleared' | 'unchanged',
+   * oldOnPartitionsRevoked: 'set' | 'absent' }` — the callbacks
+   * themselves are functions and are never serialized into the audit
+   * record, only their set/cleared state).
+   *
+   * Orthogonal to EB-209 (that is the listener mechanism itself,
+   * this its live revision), to EB-439 (that is the group-level
+   * `onRebalance` callback — this the member-level partition
+   * listener, the same event at a different level), to EB-351 (that
+   * is the manual rebalance trigger — this which listener hears
+   * about a rebalance), to EB-169 (that is the rebalance debounce
+   * window — this the listener), and to EB-441 (that is the
+   * partition-ownership fencing generation — this the listener
+   * identity).
+   *
+   * Throws `RangeError` for a closed bus, an unknown subscriber, a
+   * non-member subscriber, an illegal patch, or an illegal callback
+   * value.
+   */
+  reviseRebalanceListener(
+    subId: string,
+    patch: {
+      onPartitionsAssigned?: ((member: string, partitions: number[]) => void) | null;
+      onPartitionsRevoked?:
+        | ((member: string, partitions: number[], ctx: RebalanceRevokeContext) => void)
+        | null;
+    },
+  ): void {
+    // Fail-fast on a closed bus (EB-154, along `setLateMessageCallback`):
+    // close() already flushed once — there is no live listener left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('reviseRebalanceListener: bus is closed');
+    }
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('reviseRebalanceListener: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`reviseRebalanceListener: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.groupId === undefined) {
+      throw new RangeError('reviseRebalanceListener: subscriber is not a consumer-group member');
+    }
+    // Validate before touching anything: a non-object patch, a patch
+    // that provides neither callback, and an illegal callback value
+    // all fail closed — `undefined` is not a value, so a field left
+    // out keeps its live value, exactly like the other revision
+    // entries; `null` clears that one callback.
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        'reviseRebalanceListener: patch must be an object with onPartitionsAssigned and/or onPartitionsRevoked',
+      );
+    }
+    if (patch.onPartitionsAssigned === undefined && patch.onPartitionsRevoked === undefined) {
+      throw new RangeError(
+        'reviseRebalanceListener: patch must provide onPartitionsAssigned and/or onPartitionsRevoked',
+      );
+    }
+    if (
+      patch.onPartitionsAssigned !== undefined &&
+      patch.onPartitionsAssigned !== null &&
+      typeof patch.onPartitionsAssigned !== 'function'
+    ) {
+      throw new RangeError('reviseRebalanceListener: onPartitionsAssigned must be a function or null');
+    }
+    if (
+      patch.onPartitionsRevoked !== undefined &&
+      patch.onPartitionsRevoked !== null &&
+      typeof patch.onPartitionsRevoked !== 'function'
+    ) {
+      throw new RangeError('reviseRebalanceListener: onPartitionsRevoked must be a function or null');
+    }
+    const live = subscriber.rebalanceListener;
+    const nextOnPartitionsAssigned =
+      patch.onPartitionsAssigned === undefined
+        ? live?.onPartitionsAssigned
+        : (patch.onPartitionsAssigned ?? undefined);
+    const nextOnPartitionsRevoked =
+      patch.onPartitionsRevoked === undefined
+        ? live?.onPartitionsRevoked
+        : (patch.onPartitionsRevoked ?? undefined);
+    // Re-affirming the live listener is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (
+      nextOnPartitionsAssigned === live?.onPartitionsAssigned &&
+      nextOnPartitionsRevoked === live?.onPartitionsRevoked
+    ) {
+      return;
+    }
+    const oldOnPartitionsAssigned = live?.onPartitionsAssigned === undefined ? 'absent' : 'set';
+    const oldOnPartitionsRevoked = live?.onPartitionsRevoked === undefined ? 'absent' : 'set';
+    const onPartitionsAssignedPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onPartitionsAssigned === undefined
+        ? 'unchanged'
+        : patch.onPartitionsAssigned === null
+          ? 'cleared'
+          : 'set';
+    const onPartitionsRevokedPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onPartitionsRevoked === undefined
+        ? 'unchanged'
+        : patch.onPartitionsRevoked === null
+          ? 'cleared'
+          : 'set';
+    // Only the listener moves; the roster, the assignment, the
+    // debounce window, the linger windows, and the group-level
+    // onRebalance callback are untouched, and the next rebalance
+    // reads the live value from here on. A listener with both
+    // callbacks cleared is stored as undefined, so the rebalance
+    // path keeps its cheap `== null` early-out.
+    subscriber.rebalanceListener =
+      nextOnPartitionsAssigned === undefined && nextOnPartitionsRevoked === undefined
+        ? undefined
+        : {
+            onPartitionsAssigned: nextOnPartitionsAssigned,
+            onPartitionsRevoked: nextOnPartitionsRevoked,
+          };
+    this.auditSubscription({
+      action: 'rebalance_listener_callbacks_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        onPartitionsAssigned: onPartitionsAssignedPresence,
+        oldOnPartitionsAssigned,
+        onPartitionsRevoked: onPartitionsRevokedPresence,
+        oldOnPartitionsRevoked,
+      },
+    });
+  }
+
+  /**
    * Emits the merged rebalance event when a debounce window ends
    * (EB-169). The event is built from the then-current roster; its
    * trigger/memberId/linger come from the latest absorbed change, and
