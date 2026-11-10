@@ -2445,6 +2445,9 @@ export interface SubscribeOptions {
    * positive integer; defaults to 100. The completion/failure event
    * always fires exactly once, regardless of the interval. Requires
    * `onReplayProgress` — passing it alone throws `RangeError`.
+   * Live-revisable with `setReplayProgressInterval` (EB-447): the new
+   * interval governs from the next pass — the pass in flight keeps the
+   * interval it started with.
    */
   progressInterval?: number;
   /**
@@ -37315,6 +37318,95 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { hasCallback, oldHasCallback },
+    });
+  }
+
+  /**
+   * Revises one replay-observed subscriber's progress interval
+   * (EB-447) without re-subscribing: `setReplayProgressInterval(subId,
+   * progressInterval)` retunes how many processed replay entries pass
+   * between `onReplayProgress` fires (see
+   * `SubscribeOptions.progressInterval`, EB-71) — the only way to move
+   * the observation granularity after subscribe time: today a long
+   * replay (tens of thousands of entries) that wants coarser
+   * observation mid-migration, or finer observation around a critical
+   * seek, can only get it by unsubscribe+resubscribe, which loses the
+   * queue, the offsets, and the trust state.
+   *
+   * Only the interval moves: `admitReplayRecords` reads the live
+   * `subscriber.progressInterval` into a local at each pass start, so
+   * the new interval governs from the next pass — the next `seek`,
+   * `seekGroupOffsets`, or `requestMissingReplay` replay — with no
+   * drain, re-registration, or replay of its own. A revision mid-pass
+   * does not disturb the pass in flight: it keeps the interval it
+   * started with (including its completion event, which always fires
+   * exactly once regardless of the interval). The observer identity
+   * (EB-443) and the replay state are untouched.
+   *
+   * Fail-closed: a closed bus (EB-154), an unknown subscriber id, a
+   * subscription that never opted into `onReplayProgress` (without an
+   * observer, tuning the interval is meaningless — the mirror of the
+   * subscribe-time rule "progressInterval requires onReplayProgress"),
+   * and an illegal interval (anything but a positive integer — 0,
+   * negative, non-integer, non-number) all throw `RangeError` with the
+   * live interval, the replay state, and the audit log untouched.
+   * Unlike EB-443's callback gate, no tracked replay needs to have
+   * run yet: subscribing with `onReplayProgress` forces a resume
+   * cursor, so the first tracked pass already exists, and the interval
+   * is a tuning knob for the next pass either way. A revision
+   * identical to the live interval is a no-op with no audit. Audited
+   * as `replay_progress_interval_revised`
+   * (`{ progressInterval: <number>, oldProgressInterval: <number> }`).
+   *
+   * Orthogonal to EB-71 (that is the observation mechanism itself,
+   * this its interval), to EB-443 (that the observer identity — this
+   * the interval of the same observer), to EB-164 (replay throttling —
+   * the pacing never moves here), and to `seek` / `seekGroupOffsets` /
+   * `requestMissingReplay` (that own the trigger — this the
+   * observation granularity).
+   *
+   * Throws `RangeError` for a closed bus, an unknown subscriber, a
+   * subscription with no replay progress observer, or an illegal
+   * interval value.
+   */
+  setReplayProgressInterval(subId: string, progressInterval: number): void {
+    // Fail-fast on a closed bus (EB-154, along `setLateMessageCallback`):
+    // close() already flushed once — there is no live replay left to
+    // retune.
+    if (this.closed) {
+      throw new RangeError('setReplayProgressInterval: bus is closed');
+    }
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setReplayProgressInterval: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setReplayProgressInterval: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.onReplayProgress === undefined) {
+      throw new RangeError('setReplayProgressInterval: subscriber has no replay progress observer');
+    }
+    // Validate before touching anything: the new interval reuses the
+    // subscribe-time validation (`progressInterval` a positive
+    // integer), so a failed call leaves the live interval untouched.
+    if (!Number.isInteger(progressInterval) || progressInterval < 1) {
+      throw new RangeError('setReplayProgressInterval: progressInterval must be a positive integer');
+    }
+    // Re-affirming the live interval is a no-op: no swap, no audit.
+    if (progressInterval === subscriber.progressInterval) {
+      return;
+    }
+    const oldProgressInterval = subscriber.progressInterval;
+    // Only the interval moves; the observer, the replay state, and
+    // the queue are untouched, and the next pass reads the live value
+    // from here on.
+    subscriber.progressInterval = progressInterval;
+    this.auditSubscription({
+      action: 'replay_progress_interval_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { progressInterval, oldProgressInterval },
     });
   }
 

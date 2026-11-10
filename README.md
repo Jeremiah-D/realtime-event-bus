@@ -916,7 +916,17 @@ library.
   subscription, or a non-function non-`null` value throws `RangeError`
   with the live callback untouched; every success is audited as
   `replay_progress_callback_revised` (`{ hasCallback,
-  oldHasCallback }`). Opt-in segment
+  oldHasCallback }`). The interval is live-revisable with
+  `setReplayProgressInterval(subId, progressInterval)` (EB-447): any
+  subscription that opted into `onReplayProgress` can retune its
+  observation granularity without re-subscribing — the new interval
+  governs from the next pass, while a pass already in flight keeps the
+  interval it started with; a revision identical to the live interval
+  is a no-op. Fail-closed: an unknown subscriber, a subscription with
+  no replay progress observer, or a non-positive-integer interval
+  throws `RangeError` with the live interval untouched; every success
+  is audited as `replay_progress_interval_revised`
+  (`{ progressInterval, oldProgressInterval }`). Opt-in segment
   rotation (`durableLogSegmentRotation: { maxEntriesPerSegment?,
   maxSegmentAgeMs? }`, validated `RangeError`): the per-topic live file
   holds the current segment, and when an append reaches the entry budget
