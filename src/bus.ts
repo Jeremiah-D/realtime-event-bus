@@ -2471,6 +2471,9 @@ export interface SubscribeOptions {
    * Live fan-out is unaffected. Requires a resume cursor: passing it
    * without `resumeFromSeq` / `resumeFromTime` throws `RangeError`
    * instead of silently never engaging. Disabled by default.
+   * Live-revisable with `setReplayThrottle` (EB-448): the new rate
+   * governs from the next pass — the pass in flight keeps the bucket
+   * it started with.
    */
   replayThrottle?: boolean | ReplayThrottleOptions;
   /**
@@ -37407,6 +37410,132 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { progressInterval, oldProgressInterval },
+    });
+  }
+
+  /**
+   * Revises one throttled subscriber's durable-log replay throttle
+   * (EB-448) without re-subscribing: `setReplayThrottle(subId,
+   * throttle, actor?)` retunes the admission rate of the next replay
+   * pass (see `SubscribeOptions.replayThrottle`, EB-164) — the only
+   * way to move the pacing after subscribe time: today a large seek /
+   * cold-start replay that wants tightening (a downstream slowing
+   * down, to avoid flooding it) or loosening (a downstream recovered,
+   * to catch up) can only get it by unsubscribe+resubscribe, which
+   * loses the queue, the offsets, and the trust state.
+   *
+   * The patch is partial: a field left out keeps its current value.
+   * Only the rate moves: `admitReplayRecords` reads the live
+   * `subscriber.replayThrottleCfg` into a fresh `TokenBucket` at each
+   * pass start, so the new throttle governs from the next pass — the
+   * next `seek`, `seekGroupOffsets`, or `requestMissingReplay` replay
+   * — with no drain, re-registration, or replay of its own. A
+   * revision mid-pass does not disturb the pass in flight: it keeps
+   * the bucket it started with (including its armed refill timer).
+   * Passing `null` clears the throttle back to unpaced replay: later
+   * passes admit freely, and `getStats().replayThrottled` keeps
+   * counting only the passes that actually paused while throttled.
+   * The progress observer (EB-443), the progress interval (EB-447),
+   * and the replay state are untouched.
+   *
+   * Fail-closed: a closed bus (EB-154), an unknown subscriber id, a
+   * subscription that never opted into `replayThrottle` (enabling
+   * throttling on a never-throttled subscription is a different
+   * decision — this revision only retunes an existing throttle), and
+   * an illegal patch (anything but an object with at least one of
+   * `messagesPerSec` / `burst`, or a merged value that fails the
+   * subscribe-time gate — `messagesPerSec` a finite number > 0,
+   * `burst` a finite number >= 1) all throw `RangeError` with the
+   * live throttle, the replay state, and the audit log untouched. A
+   * revision identical to the live throttle is a no-op with no audit.
+   * Audited as `replay_throttle_revised`
+   * (`{ throttle: { messagesPerSec, burst } | null,
+   * oldThrottle: { messagesPerSec, burst } }`).
+   *
+   * Orthogonal to EB-164 (that is the throttling mechanism itself,
+   * this its live revision), to EB-443 (that the progress observer —
+   * this the pacing of the same replay), to EB-447 (that the progress
+   * interval — this the rate), to EB-71 (progress observation), and
+   * to `seek` / `seekGroupOffsets` / `requestMissingReplay` (that own
+   * the trigger — this the pacing of the pass they start).
+   *
+   * Throws `RangeError` for a closed bus, an unknown subscriber, a
+   * subscription with no replay throttle, or an illegal patch value.
+   */
+  setReplayThrottle(
+    subId: string,
+    throttle: { messagesPerSec?: number; burst?: number } | null,
+    actor = 'system',
+  ): void {
+    // Fail-fast on a closed bus (EB-154, along
+    // `setReplayProgressInterval`): close() already flushed once —
+    // there is no live replay left to retune.
+    if (this.closed) {
+      throw new RangeError('setReplayThrottle: bus is closed');
+    }
+    assertValidActor(actor, 'setReplayThrottle');
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setReplayThrottle: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setReplayThrottle: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.replayThrottleCfg === undefined) {
+      throw new RangeError('setReplayThrottle: subscriber has no replay throttle configured');
+    }
+    // Validate before touching anything: `null` clears back to
+    // unpaced replay; anything else must be an object with at least
+    // one field, and the merged values reuse the subscribe-time gate
+    // (messagesPerSec a finite number > 0, burst a finite number >=
+    // 1), so a failed call leaves the live throttle untouched.
+    const oldThrottle = subscriber.replayThrottleCfg;
+    if (throttle === null) {
+      // Re-affirming an already-cleared throttle is impossible here:
+      // the gate above refuses a subscriber with no throttle at all,
+      // so a clear is always a real change.
+      subscriber.replayThrottleCfg = undefined;
+      this.auditSubscription({
+        action: 'replay_throttle_revised',
+        actor,
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { throttle: null, oldThrottle: { ...oldThrottle } },
+      });
+      return;
+    }
+    if (typeof throttle !== 'object') {
+      throw new RangeError('setReplayThrottle: throttle must be an object with at least one of messagesPerSec / burst, or null');
+    }
+    const hasRate = throttle.messagesPerSec !== undefined;
+    const hasBurst = throttle.burst !== undefined;
+    if (!hasRate && !hasBurst) {
+      throw new RangeError('setReplayThrottle: throttle must set at least one of messagesPerSec / burst');
+    }
+    const next: { messagesPerSec: number; burst: number } = {
+      messagesPerSec: throttle.messagesPerSec ?? oldThrottle.messagesPerSec,
+      burst: throttle.burst ?? oldThrottle.burst,
+    };
+    if (!Number.isFinite(next.messagesPerSec) || next.messagesPerSec <= 0) {
+      throw new RangeError('setReplayThrottle: messagesPerSec must be a finite number > 0');
+    }
+    if (!Number.isFinite(next.burst) || next.burst < 1) {
+      throw new RangeError('setReplayThrottle: burst must be a finite number >= 1');
+    }
+    // Re-affirming the live throttle is a no-op: no swap, no audit.
+    if (next.messagesPerSec === oldThrottle.messagesPerSec && next.burst === oldThrottle.burst) {
+      return;
+    }
+    // Only the throttle moves; the observer, the interval, the replay
+    // state, and the queue are untouched, and the next pass reads the
+    // live value from here on.
+    subscriber.replayThrottleCfg = next;
+    this.auditSubscription({
+      action: 'replay_throttle_revised',
+      actor,
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { throttle: { ...next }, oldThrottle: { ...oldThrottle } },
     });
   }
 

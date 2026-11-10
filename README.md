@@ -775,7 +775,12 @@ library.
   observer keeps its throttled reporting across the pause. `replayThrottle:
   true` paces at 1000 msgs/sec; it requires a resume cursor (passing it
   without one throws `RangeError`); invalid rates throw `RangeError` at
-  `subscribe` time. Hot topics
+  `subscribe` time. Live-revisable with `setReplayThrottle(subId, patch |
+  null, actor?)` (EB-448): a partial patch retunes the rate / burst for
+  the next pass — the pass in flight keeps the bucket it started with —
+  and `null` clears back to unpaced replay; only subscriptions that
+  opted into `replayThrottle` can be revised, and a revision is audited
+  as `replay_throttle_revised`. Hot topics
   compact automatically (`durableLogMaxEntriesPerTopic`, default 10000,
   amortized rewrite at 2x). Opt-in time-based retention
   (`durableLogMaxAgeMs`, EB-85): records older than `now - maxAgeMs` (bus
