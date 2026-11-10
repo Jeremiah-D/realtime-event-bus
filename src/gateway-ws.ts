@@ -471,7 +471,11 @@ export interface GatewayOptions {
    * `bus.noteGatewayDisconnect()` to feed the ops alert outlet's
    * disconnect-storm detector. Failed handshakes never fire it (they
    * are auth/protocol errors, counted separately). Throwing hooks are
-   * swallowed: teardown must not fail.
+   * swallowed: teardown must not fail. Revisable live with
+   * `setDisconnectCallback` (EB-451): the replacement is total — the
+   * new hook does not automatically chain
+   * `bus.noteGatewayDisconnect()`, so chain it yourself when the
+   * storm detector must keep seeing disconnects.
    */
   onDisconnect?: (event: GatewayDisconnectEvent) => void;
   /**
@@ -845,7 +849,8 @@ export class GatewayServer {
   private maxSubscriptionsPerConnection: number | undefined;
   /** Mutable live via `setGatewayClientPressure` (EB-326) — see that method. */
   private clientPressureRecoveryWatermarkBytes: number;
-  private readonly onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
+  /** Mutable live via `setDisconnectCallback` (EB-451) — see that method. */
+  private onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
   /** Resolved permessage-deflate config (EB-206); undefined = disabled. Mutable live via `setGatewayDeflate` (EB-330) — see that method. */
   private deflateOpts: ResolvedPerMessageDeflate | undefined;
   private server: TcpServer | null = null;
@@ -1253,6 +1258,58 @@ export class GatewayServer {
     }
     this.authToken = next;
     this.bus.noteGatewayAuthTokenRevised('ws', token === null ? 'cleared' : 'rotated');
+  }
+
+  /**
+   * Replaces or clears the gateway's disconnect hook live (EB-451)
+   * without restarting the server: `setDisconnectCallback(cb)`
+   * installs `cb` as the `onDisconnect` hook, and
+   * `setDisconnectCallback(null)` clears it back to no hook.
+   *
+   * The replacement is total — the new hook does not automatically
+   * chain `bus.noteGatewayDisconnect()`. The canonical wiring is
+   * `onDisconnect: () => bus.noteGatewayDisconnect()`; if the new
+   * hook does not call it, the EB-132 disconnect-storm detector goes
+   * blind (the detector itself is untouched — it simply stops
+   * receiving disconnects). Wire the detector yourself when the new
+   * hook must keep feeding it.
+   *
+   * The trigger rule is unchanged: only the teardown of an
+   * already-handshook connection fires the live hook
+   * (`destroyConnection` reads the field per teardown, so the new
+   * hook governs from the very next teardown on every connection,
+   * existing ones included), a throwing hook is swallowed, and
+   * teardown continues to unsubscribe. Failed handshakes never fire
+   * it — they are auth/protocol errors, counted separately.
+   *
+   * The revision is audited as `gateway_disconnect_callback_revised`
+   * (`bus.getSubscriptionAudit()`) with `{ gateway: 'ws', changed:
+   * 'set' | 'cleared' }` — the hook function itself is never
+   * recorded. A revision identical to the current hook — including
+   * clearing a gateway that holds no hook — is a no-op with no audit.
+   *
+   * Fail-closed: a non-function, non-null value throws `RangeError`
+   * with the live hook untouched. Validation reuses the
+   * construction-time rule (a function, or `null` to clear) — so a
+   * value that could not be set at construction cannot be revised in
+   * later either.
+   *
+   * There is deliberately no getter exposing the live hook: the
+   * function reference stays private.
+   *
+   * Throws `RangeError` for a non-function, non-null callback.
+   */
+  setDisconnectCallback(cb: ((event: GatewayDisconnectEvent) => void) | null): void {
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setDisconnectCallback: callback must be a function or null');
+    }
+    const next = cb === null ? undefined : cb;
+    // Re-installing the live hook is a no-op — no audit.
+    if (next === this.onDisconnect) {
+      return;
+    }
+    this.onDisconnect = next;
+    this.bus.noteGatewayDisconnectCallbackRevised(cb === null ? 'cleared' : 'set');
   }
 
   /**

@@ -6451,6 +6451,19 @@ Semantics:
   every rotation is audited as `auth_token_revised` (the token value
   itself is never logged). `gw.getStats().authEnabled` reports whether
   auth is currently armed.
+- **Disconnect hook (live-revisable).** `GatewayServer`'s `onDisconnect`
+  hook can be swapped live with `setDisconnectCallback(cb)` (EB-451) —
+  a function installs it, `null` clears back to no hook, and only the
+  next teardown of an already-handshook connection fires it (a throwing
+  hook is swallowed, teardown still unsubscribes). Replacement is total:
+  the new hook does not automatically chain
+  `bus.noteGatewayDisconnect()`, so a hook that does not call it leaves
+  the EB-132 disconnect-storm detector blind — chain it yourself when
+  the detector must keep seeing disconnects. Re-installing the same hook
+  reference (including `null` on a gateway with no hook) is a no-op with
+  no audit; every real change is audited as
+  `gateway_disconnect_callback_revised` (`{ gateway: 'ws', changed:
+  'set' | 'cleared' }`, the function itself never logged).
 - **Backpressure.** While a connection's socket buffer is past
   `sendHighWaterMarkBytes` (default 256 KiB) the gateway pauses pushing
   frames and queues them locally, bounded by `maxPendingBytes` (default

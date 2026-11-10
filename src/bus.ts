@@ -23232,6 +23232,26 @@ export class EventBus {
   }
 
   /**
+   * Records one gateway disconnect-hook revision in the subscription
+   * audit log (EB-451): a `GatewayServer` had its live `onDisconnect`
+   * hook replaced (`'set'`) or cleared (`'cleared'`) by
+   * `setDisconnectCallback`. Audited as
+   * `gateway_disconnect_callback_revised` with `{ gateway: 'ws',
+   * changed: 'set' | 'cleared' }` — the hook function itself is never
+   * recorded, only whether one was installed or cleared (clearing
+   * stops the EB-132 storm detector's feed, so the event is the
+   * record that the feed went off). Fully error-isolated like every
+   * audit site: a broken audit log can never disturb the revision.
+   */
+  noteGatewayDisconnectCallbackRevised(changed: 'set' | 'cleared'): void {
+    this.auditSubscription({
+      action: 'gateway_disconnect_callback_revised',
+      actor: 'system',
+      detail: { gateway: 'ws', changed },
+    });
+  }
+
+  /**
    * Receives one forwarded message from another bus's forward rule
    * (EB-56) — the destination-side half of `forward()`. INTERNAL USE
    * ONLY: only forward and mirror registrations call this; producers
