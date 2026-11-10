@@ -1861,6 +1861,19 @@ export interface SubscribeOptions {
    */
   onDrained?: (event: DrainedEvent) => void;
   /**
+   * Called when this subscriber's queue drops a message — a shed
+   * eviction, a refused newcomer, or a drain-time TTL / hard-deadline
+   * expiry (EB-456). The event carries the drop journal row's identity
+   * fields (topic, subscriber id, sequence number, reason, timestamp)
+   * plus the subscription's live pattern — never the payload. Opt-in:
+   * without it, drops are only counted (`droppedCount`) and journaled
+   * (`getDropJournal`). Revisable live via `setDroppedCallback`
+   * (EB-456). Reliable subscriptions and shadow mirrors never fire it:
+   * their loss path is the DLQ/ack machinery and the shadow counters,
+   * not the plain queue (same scope as the drop journal, EB-225).
+   */
+  onDropped?: (event: DroppedEvent) => void;
+  /**
    * High-water-mark ratio for this subscriber's queue (fraction of
    * `queueSize`, default 0.8). Must be in (0, 1]. Adjustable at runtime via
    * `EventBus.setHighWaterMarkRatio`.
@@ -5025,6 +5038,28 @@ export interface BackpressureEvent {
   capacity: number;
   /** Total messages dropped for this subscriber so far (same as `droppedCount`). */
   dropped: number;
+}
+
+/**
+ * Snapshot delivered to `onDropped` when a subscriber's queue drops a
+ * message (EB-456). Identity only, exactly the drop journal row's fields
+ * (see `DropJournalEntry`, EB-225) plus the subscription's live pattern —
+ * never the payload, so large or sensitive payloads stay out of the
+ * observation channel exactly as they stay out of the journal.
+ */
+export interface DroppedEvent {
+  /** The subscriber whose queue dropped the message. */
+  subscriberId: string;
+  /** The topic pattern the dropping subscriber registered (live value). */
+  pattern: string;
+  /** The concrete topic the message was published to (never a pattern). */
+  topic: string;
+  /** Per-topic sequence number of the dropped message. */
+  seq: number;
+  /** Why the queue dropped the message (see `DropReason`). */
+  reason: DropReason;
+  /** Bus-clock milliseconds of the drop — the same instant the journal row carries. */
+  at: number;
 }
 
 /** Snapshot delivered to `onDrained` when a subscriber's queue recovers. */
@@ -8897,6 +8932,24 @@ interface Subscriber {
    * its hook is installed for every subscription (EB-285).
    */
   backpressureHookInstalled: boolean;
+  /**
+   * Queue-drop observer (see `SubscribeOptions.onDropped`, EB-456):
+   * fires when the queue drops a message, with the journal row's
+   * identity fields plus the live pattern. Stored live on the
+   * subscriber so `setDroppedCallback` can swap it without
+   * re-subscribing — `noteSubscriberDrop` reads this field at call
+   * time, never a subscribe-time capture.
+   */
+  onDropped?: (event: DroppedEvent) => void;
+  /**
+   * Whether the subscription opted into drop observation at subscribe
+   * time (EB-456): true exactly when a subscribe-time `onDropped` was
+   * present. The gate for revising `onDropped` — a subscription that
+   * never opted in can only gain the observer by re-subscribing, along
+   * the `setExpiringSoonCallback` / `setBackpressureCallbacks`
+   * no-opt-in-no-revision gates.
+   */
+  droppedHookInstalled: boolean;
   /** The queue's count capacity, for saturation checks at enqueue time. */
   queueCapacity: number;
   /**
@@ -32798,6 +32851,7 @@ export class EventBus {
     validateSubscriberLabels(labels, 'subscribe');
     const onBackpressure = opts?.onBackpressure;
     const onDrained = opts?.onDrained;
+    const onDropped = opts?.onDropped;
     const onThrottled = opts?.onThrottled;
     const onCreditExhausted = opts?.onCreditExhausted;
     const hwmRatio = opts?.highWaterMarkRatio ?? 0.8;
@@ -33132,12 +33186,21 @@ export class EventBus {
       // call time, never the subscribe-time captures.
       onBackpressure,
       onDrained,
+      // Queue-drop observation callback (EB-456): stored live on the
+      // subscriber so `setDroppedCallback` can swap it without
+      // re-subscribing — `noteSubscriberDrop` reads this field at call
+      // time, never the subscribe-time capture.
+      onDropped,
       // The `onHighWaterMark` hook exists exactly when a subscribe-time
       // `onBackpressure` or a `throttle` was present — the gate
       // `setBackpressureCallbacks` applies to `onBackpressure`. The
       // `onDrained` hook needs no gate: it is installed for every
       // subscription (EB-285).
       backpressureHookInstalled: onBackpressure != null || throttle != null,
+      // The `onDropped` gate (EB-456): true exactly when a subscribe-time
+      // `onDropped` was present — a subscription that never opted in can
+      // only gain the observer by re-subscribing.
+      droppedHookInstalled: onDropped != null,
       queueCapacity: capacity,
       queueMaxBytes,
       // Subscriber labels (EB-213): the subscriber owns a fresh copy —
@@ -40804,6 +40867,103 @@ export class EventBus {
         onDrained: onDrainedPresence,
         oldOnDrained,
       },
+    });
+  }
+
+  /**
+   * Revises one drop-observing subscriber's `onDropped` callback
+   * (EB-456) without re-subscribing: `setDroppedCallback(subId, cb)`
+   * swaps the per-message drop observer in place (see
+   * `SubscribeOptions.onDropped`) — the only drop-observation surface
+   * the journal left uncovered: the journal records every drop after
+   * the fact, this one hears about it at drop time, with the same
+   * identity fields the journal row carries.
+   *
+   * Only the callback moves: `noteSubscriberDrop` reads the live
+   * `subscriber.onDropped` on every drop, so the new callback governs
+   * from the next drop — no drain, re-registration, or replay. `null`
+   * clears the callback back to silent observation: the drop still
+   * counts (`droppedCount`) and still journals (`getDropJournal`) —
+   * just with nobody receiving. The tier, the drop policy, the queue
+   * size, the byte budget, and the high-water-mark ratio are untouched
+   * (EB-285 / EB-375 / EB-281 / EB-282 remain their only revision
+   * entries).
+   *
+   * A throwing callback is swallowed by `noteSubscriberDrop`: the
+   * callback is an observer, not part of the enqueue/drain path, so a
+   * throwing observer never breaks the publish that shed the message
+   * or the drain that expired it — the drop is already counted and
+   * journaled exactly once before the call.
+   *
+   * Fail-closed: an unknown subscriber id, a subscription that never
+   * opted into drop observation (`subscriber.droppedHookInstalled` is
+   * false — the same no-opt-in-no-revision gate `setExpiringSoonCallback`
+   * and `setBackpressureCallbacks` apply, EB-454 / EB-455), and an
+   * illegal callback value (anything but a function or an explicit
+   * `null` — `undefined` is not a value) all throw `RangeError` with
+   * the live callback, the queue, the counters, the journal, and the
+   * audit log untouched. A revision identical to the live callback —
+   * the same function reference, including clearing a callback that
+   * was already cleared — is a no-op with no audit. Audited as
+   * `dropped_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-225 (that is the drop journal itself — this who
+   * hears about each drop as it happens), to EB-455 (that revises the
+   * backpressure excursion observers — this the per-message drop
+   * observer, a different hook of the same family), and to EB-437 /
+   * EB-440 / EB-454 (sibling subscription-level callback revisions).
+   *
+   * Throws `RangeError` for an unknown subscriber, a subscription
+   * with no drop hook installed, or an illegal callback value.
+   */
+  setDroppedCallback(
+    subId: string,
+    cb: ((event: DroppedEvent) => void) | null,
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDroppedCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDroppedCallback: unknown subscriber: ${subId}`);
+    }
+    // The gate (EB-454 / EB-455): only a subscription that installed
+    // `onDropped` at subscribe time may be revised — the drop hook is
+    // the opt-in, and a subscription that never opted in must
+    // re-subscribe to gain the observer.
+    if (!subscriber.droppedHookInstalled) {
+      throw new RangeError(
+        'setDroppedCallback: subscriber has no dropped-message hook installed — re-subscribe with onDropped to opt in',
+      );
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to silent
+    // observation.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setDroppedCallback: cb must be a function or null');
+    }
+    const nextCallback = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was already cleared.
+    if (nextCallback === subscriber.onDropped) {
+      return;
+    }
+    const oldHasCallback = subscriber.onDropped !== undefined;
+    const hasCallback = nextCallback !== undefined;
+    // Only the callback moves; the tier, the drop policy, the queue,
+    // the counters, and the journal are untouched, and the next drop
+    // reads the live value from here on.
+    subscriber.onDropped = nextCallback;
+    this.auditSubscription({
+      action: 'dropped_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { hasCallback, oldHasCallback },
     });
   }
 
@@ -58090,17 +58250,46 @@ export class EventBus {
    * (EB-225): identity only, never the payload. Reliable subscribers
    * are out of scope — their loss path is the dead-letter / ack
    * machinery, not the plain queue — and shadow mirrors keep their own
-   * counters, so neither is journaled here.
+   * counters, so neither is journaled here. The same scope bounds the
+   * `onDropped` observer (EB-456): the callback fires here, at the one
+   * convergence point every drop reason flows through (enqueue
+   * eviction, drain expiry, admission refusal), with the journal row's
+   * identity fields plus the subscription's live pattern — the row and
+   * the event share one timestamp, so the event matches the row
+   * exactly. A throwing callback is swallowed: observation never
+   * breaks the drop path.
    */
   private noteSubscriberDrop(subscriber: Subscriber, msg: BusMessage, reason: DropReason): void {
     if (subscriber.reliable != null || subscriber.shadow !== undefined) return;
+    const at = this.now();
     this.dropJournal.record({
       topic: msg.topic,
       subscriberId: subscriber.id,
       seq: msg.seq,
       reason,
-      at: this.now(),
+      at,
     });
+    // EB-456: read live off the subscriber, like `onBackpressure` — a
+    // `setDroppedCallback` revision governs from the next drop, and a
+    // cleared callback leaves the count and the journal running with
+    // nobody receiving.
+    const onDropped = subscriber.onDropped;
+    if (onDropped === undefined) return;
+    try {
+      onDropped({
+        // Live pattern (see onBackpressure above): a hot pattern update
+        // must not leave events naming a stale pattern.
+        subscriberId: subscriber.id,
+        pattern: subscriber.pattern,
+        topic: msg.topic,
+        seq: msg.seq,
+        reason,
+        at,
+      });
+    } catch {
+      // Error isolation (EB-456): swallow — a drop observer must never
+      // break the enqueue / drain path that dropped the message.
+    }
   }
 
   private noteDrainedExpired(msg: BusMessage, lane?: MessageLane, subscriber?: Subscriber): void {

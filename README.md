@@ -1269,6 +1269,29 @@ library.
   Orthogonal to the capacity (EB-281, that revises `queueSize`,
   this revises the full-queue behavior). (Real-time systems:
   delivery governance.)
+  The per-message drop observer itself is revisable without
+  re-subscribing (EB-456, via
+  `setDroppedCallback(subId, cb)`): `SubscribeOptions.onDropped`
+  fires at drop time — a shed eviction, a refused newcomer, or a
+  drain-time TTL / hard-deadline expiry — with the drop journal
+  row's identity fields (topic, subscriber id, sequence number,
+  reason, timestamp) plus the subscription's live pattern, never
+  the payload. The callback can be replaced or cleared with an
+  explicit `null` (cleared means silent observation: the drop
+  still counts in `droppedCount` and still journals in
+  `getDropJournal` — just with nobody receiving); a replacement
+  governs from the next drop, which reads the live callback. Only
+  a subscription that installed `onDropped` at subscribe time may
+  be revised — otherwise the revision is refused and the subscriber
+  must re-subscribe to opt in — and a revision identical to the
+  live callback is a no-op with no audit. A throwing callback is
+  swallowed: observation never breaks the drop path. Reliable
+  subscriptions and shadow mirrors never fire it, the same scope
+  as the drop journal. Every success is audited as
+  `dropped_callback_revised`
+  (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+  callback itself is never serialized, only its set/cleared
+  state). (Real-time systems: delivery governance.)
   Revisable after subscribe (EB-375, via
   `setDropPolicy(subId, policy)`): a subscription's queue shed
   policy can be retuned without re-subscribing — and there is no
