@@ -8171,6 +8171,45 @@ subscriber's delivery-shaping bucket — same `retune` primitive, a
 different owner): mirror-rule buckets govern the cross-instance
 receive path, shaping buckets govern local delivery.
 
+## Live mirror rule destination revision (EB-450)
+
+A live rule's destination topic template can be revised without
+re-registering the mirror: `dst.reviseMirrorRule(srcPattern,
+{ rename }, actor?)` retargets every live rule carrying that source
+pattern (each records its own `mirror_rule_revised` audit event,
+`{ srcPattern, rename: string | null, oldRename: string | null }`,
+template strings only — never message content). `rename: null`
+clears the template back to the source topic verbatim.
+`getStats().mirrors` and the handle's `rules()` report each rule's
+current template (`dstTemplate`) immediately. The new template reuses
+the construction-time validation (`resolveMirrorRule`): `$1`..`$n`
+expand the pattern's wildcard captures, `$$` is a literal dollar, and
+a reference to a capture the pattern does not produce throws at
+revision time with the live template untouched. An unknown
+`srcPattern`, a patch that is not an object or lacks a `rename`
+field, and a revision identical to a rule's current template (a
+no-op with no audit) all follow the `setMirrorThrottle` (EB-337)
+conventions; the source pattern itself is the rule's identity and
+never moves — changing the source is a different subscription
+(`close()` + `mirror()`).
+
+Two things make the revision safe to do live. First, the
+destination-template function lives in a mutable holder on the
+registration entry, and the subscription callback reads the holder —
+never a captured `apply`. Swapping only the entry's field would have
+left live traffic on the old template (the EB-445/WR-372 capture
+trap, fixed the same way the EB-337 throttle holder was). Second,
+the template is resolved when the mirror callback processes a frame:
+the next frame takes the new destination, a frame already admitted
+on this bus keeps the topic it was admitted with, and the per-rule
+counters (`mirrored`, `loopsPrevented`, `mirroredThrottled`) and the
+throttle bucket carry over untouched — retargeting is not a
+re-registration, so no frame is lost in between and nothing resets.
+Per-key LWW arbitration (EB-131) keys off the alias-resolved
+destination topic, so after a retarget the same application key is
+arbitrated at the new destination: a write the old destination
+already recorded no longer suppresses the same key at the new one.
+
 ## Publish circuit breaker (EB-116)
 
 `bus.setPublishCircuitBreaker(topic, opts?)` arms an opt-in publish-side

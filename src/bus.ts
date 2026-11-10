@@ -270,6 +270,7 @@ import {
   type FailureRegimeParamsRevision,
 } from './failure-regime.ts';
 import {
+  resolveMirrorRule,
   resolveMirrorRules,
   validateMirrorThrottle,
   type MirrorHandle,
@@ -16853,7 +16854,16 @@ export class EventBus {
     rules: Array<{
       info: MirrorRuleInfo;
       sub: Subscription;
-      apply: (topic: string) => string | null;
+      /**
+       * Live destination-template state (EB-450): the `apply` function
+       * the mirror callback resolves the destination topic through.
+       * `reviseMirrorRule` swaps it in place; the holder — not a
+       * captured function — is what the callback reads, so a revision
+       * moves live traffic (the EB-445/WR-372 capture trap: swapping
+       * only the entry's field would leave the callback closing over
+       * the old template).
+       */
+      apply: { apply: (topic: string) => string | null };
       /**
        * Live per-rule throttle state (EB-337): the token bucket the
        * mirror callback gates on. `setMirrorThrottle` retunes,
@@ -22797,6 +22807,11 @@ export class EventBus {
       // registration entry, so `setMirrorThrottle` can retune, replace,
       // or drop it live — the subscription callback reads the holder,
       // never a captured bucket.
+      // EB-450: the destination-template function lives in a mutable
+      // holder on the registration entry too, so `reviseMirrorRule`
+      // can swap it live — the subscription callback reads the holder,
+      // never a captured `apply`.
+      const applyHolder: { apply: (topic: string) => string | null } = { apply: rule.apply };
       const throttle: { bucket?: TokenBucket } = {
         bucket:
           rule.throttle === undefined
@@ -22817,7 +22832,7 @@ export class EventBus {
         if (isLoop) {
           info.loopsPrevented += 1;
         }
-        const dstTopic = rule.apply(msg.topic);
+        const dstTopic = applyHolder.apply(msg.topic);
         // Defensive: the subscription matched, so the rule must match
         // too — a null here would mean the two matchers disagreed.
         if (dstTopic === null) return;
@@ -22885,7 +22900,7 @@ export class EventBus {
                 },
         });
       });
-      return { info, sub, apply: rule.apply, throttle };
+      return { info, sub, apply: applyHolder, throttle };
     });
     const registration = { source, rules: entries };
     this.mirrorRegistrations.push(registration);
@@ -23010,6 +23025,108 @@ export class EventBus {
         entry.info.throttle = { ...resolved };
       }
       this.auditMirrorThrottleRevised(srcPattern, resolved, oldThrottle);
+    }
+  }
+
+  /**
+   * Revises the destination topic template of every live mirror rule
+   * for one source pattern (EB-450) without re-registering the mirror:
+   * `reviseMirrorRule(srcPattern, { rename }, actor?)` swaps the
+   * template the mirror callback resolves the destination topic
+   * through (see `mirror`, EB-37).
+   *
+   * Only the template moves: the rule's source pattern, its
+   * subscription, its counters, and its throttle holder are untouched,
+   * and no frame is dropped or reordered by the revision. The source
+   * pattern is the rule's identity — changing the source is a
+   * different subscription (`close()` + `mirror()`), never a revision.
+   *
+   * The new template reuses the construction-time validation
+   * (`resolveMirrorRule`): `$1`..`$n` expand the pattern's wildcard
+   * captures, `$$` is a literal dollar, and a reference to a capture
+   * the pattern does not produce throws at revision time — a broken
+   * template fails fast with the live template untouched, exactly as
+   * `mirror()` refuses a broken rule at registration time. Passing
+   * `rename: null` clears the template back to the source topic
+   * verbatim. The template is resolved when the mirror callback
+   * processes a frame (the callback reads the entry's live `apply`
+   * holder, EB-450 — never a captured function): the next frame the
+   * callback processes takes the new destination, while a frame
+   * already admitted on this bus keeps the topic it was admitted
+   * with. Counters keep counting across the revision — a retarget
+   * neither resets `mirrored` / `loopsPrevented` /
+   * `mirroredThrottled` nor touches the throttle bucket.
+   *
+   * Per-key LWW arbitration (EB-131) keys off the alias-resolved
+   * destination topic, so after a retarget the same application key
+   * is arbitrated at the new destination: a write the old
+   * destination already recorded no longer suppresses the same key
+   * at the new one — the register is per `(topic, key)`, and the
+   * topic moved.
+   *
+   * Fail-closed: an empty `srcPattern`, an unknown `srcPattern` (no
+   * live rule carries it — a closed mirror's rules are gone), a patch
+   * that is not an object or lacks a `rename` field, a `rename` that
+   * is neither a string nor `null`, and an illegal template all throw
+   * `RangeError` with every live template and the audit log untouched.
+   * A revision identical to a rule's current template (comparing the
+   * template strings, so clearing an already-unrenamed rule is the
+   * same kind of no-op) is a no-op for that rule: no swap, no audit.
+   * When several live rules share the pattern, all of them are
+   * revised and each records its own audit event. Audited as
+   * `mirror_rule_revised`
+   * (`{ srcPattern, rename: string | null, oldRename: string | null }`,
+   * template strings only — never message content) per revised rule.
+   * `getStats().mirrors` and the handle's `rules()` report the live
+   * template (`dstTemplate`) immediately.
+   *
+   * Orthogonal to EB-337 (that revises the same registry entry's
+   * throttle — this revises its destination template, a different
+   * field), to EB-172 (that is the throttle mechanism itself), and to
+   * `setTopicAlias` (that resolves a local alias at publish time —
+   * this retargets where a mirror lands).
+   *
+   * Throws `RangeError` for an empty / unknown `srcPattern`, a
+   * malformed patch, or an illegal template.
+   */
+  reviseMirrorRule(
+    srcPattern: string,
+    patch: { rename?: string | null },
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'reviseMirrorRule');
+    if (typeof srcPattern !== 'string' || srcPattern.length === 0) {
+      throw new RangeError('reviseMirrorRule: srcPattern must be a non-empty string');
+    }
+    if (typeof patch !== 'object' || patch === null || !('rename' in patch)) {
+      throw new RangeError('reviseMirrorRule: patch must be an object containing a rename field');
+    }
+    const { rename } = patch;
+    if (rename !== null && typeof rename !== 'string') {
+      throw new RangeError('reviseMirrorRule: rename must be a string or null');
+    }
+    const matches = this.mirrorRegistrations.flatMap((registration) =>
+      registration.rules.filter((entry) => entry.info.srcPattern === srcPattern),
+    );
+    if (matches.length === 0) {
+      throw new RangeError(`reviseMirrorRule: unknown srcPattern: ${srcPattern}`);
+    }
+    // Validate the new template against the pattern's capture count
+    // before anything is touched — a reference to a capture the
+    // pattern does not produce throws with the live template intact.
+    const resolved = resolveMirrorRule(
+      rename === null ? { srcPattern } : { srcPattern, rename },
+      'reviseMirrorRule',
+    );
+    for (const entry of matches) {
+      const oldRename =
+        entry.info.dstTemplate === '(source topic)' ? null : entry.info.dstTemplate;
+      // Re-affirming the current template is a no-op for this rule:
+      // no swap, no audit.
+      if (rename === oldRename) continue;
+      entry.apply.apply = resolved.apply;
+      entry.info.dstTemplate = resolved.dstTemplate;
+      this.auditMirrorRuleRevised(srcPattern, rename, oldRename, actor);
     }
   }
 
@@ -55844,6 +55961,28 @@ export class EventBus {
       actor: 'system',
       pattern: srcPattern,
       detail: { srcPattern, throttle, oldThrottle },
+    });
+  }
+
+  /**
+   * Records one `mirror_rule_revised` audit event (EB-450): a live
+   * mirror rule's destination topic template was revised
+   * (`reviseMirrorRule`) — retargeted or cleared back to the source
+   * topic verbatim. The detail carries template strings only, never
+   * message content. Fully error-isolated like all audit emission: a
+   * revision must never throw for observability.
+   */
+  private auditMirrorRuleRevised(
+    srcPattern: string,
+    rename: string | null,
+    oldRename: string | null,
+    actor: string,
+  ): void {
+    this.auditSubscription({
+      action: 'mirror_rule_revised',
+      actor,
+      pattern: srcPattern,
+      detail: { srcPattern, rename, oldRename },
     });
   }
 
