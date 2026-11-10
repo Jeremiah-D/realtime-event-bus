@@ -107,6 +107,28 @@ export const DEFAULT_FAILURE_REGIME_LAMBDA = 5;
 export const DEFAULT_FAILURE_REGIME_WARMUP_SAMPLES = 50;
 export const DEFAULT_FAILURE_REGIME_WINDOW_SAMPLES = 50;
 
+/**
+ * The four live detection parameters of a failure-rate regime
+ * detector, with construction defaults resolved (EB-446).
+ */
+export interface FailureRegimeParams {
+  delta: number;
+  lambda: number;
+  warmupSamples: number;
+  windowSamples: number;
+}
+
+/**
+ * Partial live revision of {@link FailureRegimeParams} (EB-446):
+ * at least one field; fields left out keep their live value.
+ */
+export type FailureRegimeParamsRevision = {
+  delta?: number;
+  lambda?: number;
+  warmupSamples?: number;
+  windowSamples?: number;
+};
+
 /** Validates a delivery outcome. Throws `RangeError` on anything else. */
 export function assertValidDeliveryOutcome(
   outcome: unknown,
@@ -230,10 +252,20 @@ interface TrackedSample {
  */
 export class FailureRateRegimeDetector {
   private readonly topic: string;
-  private readonly delta: number;
-  private readonly lambda: number;
-  private readonly warmupSamples: number;
-  private readonly windowSamples: number;
+  /**
+   * The four detection parameters. Deliberately *not* readonly
+   * (EB-446): `reviseParams` retunes them live, so an already-built
+   * detector hears about the retune without being rebuilt —
+   * rebuilding would lose its baseline, warmup, and settling state.
+   * Every parameter is a live read point inside `observe()` (the
+   * sample cap, the warmup gates, the settling gate, `delta / 2`,
+   * `lambda`, the snapshot window), so new values govern from the
+   * next observed outcome.
+   */
+  private delta: number;
+  private lambda: number;
+  private warmupSamples: number;
+  private windowSamples: number;
   /**
    * The regime-change alert callback. Deliberately *not* readonly
    * (EB-445): `FailureRateRegimeMonitor.setOnChange` redirects it
@@ -250,6 +282,14 @@ export class FailureRateRegimeDetector {
   private seq = 0;
   /** Samples seen during warmup — the baseline is fixed after this. */
   private n = 0;
+  /**
+   * Whether the baseline has been fixed. Deliberately separate from
+   * `n < warmupSamples` (EB-446): `warmupSamples` is live-retunable,
+   * and raising it on an already-warmed detector must not throw the
+   * detector back into warmup — the live baseline stays fixed and
+   * the new value only governs detectors built later.
+   */
+  private warmed = false;
   private mean = 0;
   private sumInc = 0;
   private sumDec = 0;
@@ -299,7 +339,7 @@ export class FailureRateRegimeDetector {
       this.samples.splice(0, this.samples.length - cap);
     }
 
-    if (this.n < this.warmupSamples) {
+    if (!this.warmed) {
       // Baseline estimation: no detection yet.
       this.warmup.push(x);
       this.n += 1;
@@ -310,6 +350,7 @@ export class FailureRateRegimeDetector {
         const bad = this.warmup.reduce((a, b) => a + b, 0);
         this.mean = bad / this.warmup.length;
         this.warmup = [];
+        this.warmed = true;
       }
       return undefined;
     }
@@ -406,6 +447,59 @@ export class FailureRateRegimeDetector {
     this.onChange = cb;
   }
 
+  /**
+   * Live-retunes the detection parameters (EB-446). The caller
+   * (`FailureRateRegimeMonitor.reviseParams`) has already merged the
+   * patch over the live values and validated it against the
+   * construction-time rules, so this applies only the fields the
+   * patch provides and never throws.
+   *
+   * Only the parameters move: the baseline, the settling counter,
+   * the sums, and any already-raised change points stay exactly as
+   * they were — nothing is re-reported, and a revision inside the
+   * settling window does not reset the settling count. The new
+   * values govern from the next `observe()` call, which reads them
+   * live.
+   *
+   * Warmup boundary: a detector still in warmup (`n <` the old
+   * `warmupSamples`) whose new `warmupSamples` is at or below the
+   * already-sampled count finalizes its baseline immediately from
+   * the sampled mean — otherwise the mean would stay 0 and
+   * detection would stall until the (never-reached) warmup end. A
+   * larger new `warmupSamples` just extends warmup. An
+   * already-warmed detector changing `warmupSamples` leaves its
+   * live baseline alone; the new value only governs detectors built
+   * later.
+   */
+  reviseParams(patch: FailureRegimeParamsRevision): void {
+    if (patch.warmupSamples !== undefined) {
+      const next = patch.warmupSamples;
+      if (!this.warmed && next <= this.n) {
+        // Still warming up, and the new warmup is already satisfied
+        // by the samples in hand: finalize the baseline now from
+        // their mean, exactly as the warmup branch does on its last
+        // sample. (When `n` is 0 the new warmup is at least 1, so
+        // this never fires on an empty warmup.) An already-warmed
+        // detector never reaches this branch: its baseline stays
+        // fixed and the new value only governs detectors built later.
+        const bad = this.warmup.reduce((a, b) => a + b, 0);
+        this.mean = this.warmup.length === 0 ? 0 : bad / this.warmup.length;
+        this.warmup = [];
+        this.warmed = true;
+      }
+      this.warmupSamples = next;
+    }
+    if (patch.delta !== undefined) {
+      this.delta = patch.delta;
+    }
+    if (patch.lambda !== undefined) {
+      this.lambda = patch.lambda;
+    }
+    if (patch.windowSamples !== undefined) {
+      this.windowSamples = patch.windowSamples;
+    }
+  }
+
   private buildChange(direction: FailureRegimeDirection): {
     event: FailureRateRegimeChange;
     afterSeqStart: number;
@@ -453,7 +547,15 @@ export class FailureRateRegimeDetector {
  */
 export class FailureRateRegimeMonitor {
   private readonly detectors = new Map<string, FailureRateRegimeDetector>();
-  private readonly options: FailureRegimeOptions;
+  /**
+   * The stored options for detectors built later. Deliberately *not*
+   * readonly (EB-445/EB-446): `setOnChange` and `reviseParams` update
+   * it in place for later-built topics, and fan the same change out
+   * to every already-built detector — the detectors capture their
+   * values at construction, so updating only this object would leave
+   * them behind (the WR-372 tracker-capture trap).
+   */
+  private options: FailureRegimeOptions;
 
   constructor(options: FailureRegimeOptions = {}) {
     this.options = options;
@@ -494,6 +596,73 @@ export class FailureRateRegimeMonitor {
   /** The currently installed alert callback, if any. */
   getOnChange(): ((change: FailureRateRegimeChange) => void) | undefined {
     return this.options.onFailureRateRegimeChange;
+  }
+
+  /**
+   * The live four-parameter snapshot, with construction defaults
+   * resolved (EB-446). This is the monitor's own stored tuning —
+   * the values a detector built from now on is constructed with.
+   */
+  getParams(): FailureRegimeParams {
+    return {
+      delta: this.options.delta ?? DEFAULT_FAILURE_REGIME_DELTA,
+      lambda: this.options.lambda ?? DEFAULT_FAILURE_REGIME_LAMBDA,
+      warmupSamples: this.options.warmupSamples ?? DEFAULT_FAILURE_REGIME_WARMUP_SAMPLES,
+      windowSamples: this.options.windowSamples ?? DEFAULT_FAILURE_REGIME_WINDOW_SAMPLES,
+    };
+  }
+
+  /**
+   * Live-retunes the detection parameters (EB-446) for every
+   * detector — already-built and later ones. The patch is merged
+   * over the live values and validated with the construction-time
+   * rules (`resolveFailureRegimeOptions`: `delta` in (0, 1),
+   * `lambda` > 0, `warmupSamples` an integer ≥ 1, `windowSamples`
+   * an integer ≥ 2) *before* anything moves, so an illegal value,
+   * an empty patch, or an unknown field throws `RangeError` with
+   * the live parameters, every detector's state, and the audit
+   * exactly as they were. On success the merged values are stored
+   * for detectors built later and fanned out to every live detector
+   * (`FailureRateRegimeDetector.reviseParams`, same shape as
+   * EB-445's `setOnChange` fan-out), and the post-revision
+   * snapshot is returned. The callback identity is untouched —
+   * EB-445 remains the only callback entry.
+   */
+  reviseParams(patch: FailureRegimeParamsRevision): FailureRegimeParams {
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError('reviseFailureRegimeParams: patch must be an object');
+    }
+    const known = ['delta', 'lambda', 'warmupSamples', 'windowSamples'];
+    const keys = Object.keys(patch);
+    if (keys.length === 0) {
+      throw new RangeError(
+        'reviseFailureRegimeParams: patch must provide at least one parameter',
+      );
+    }
+    for (const key of keys) {
+      if (!known.includes(key)) {
+        throw new RangeError(`reviseFailureRegimeParams: unknown field '${key}'`);
+      }
+    }
+    const live = this.getParams();
+    const merged: FailureRegimeOptions = {
+      ...this.options,
+      delta: patch.delta ?? live.delta,
+      lambda: patch.lambda ?? live.lambda,
+      warmupSamples: patch.warmupSamples ?? live.warmupSamples,
+      windowSamples: patch.windowSamples ?? live.windowSamples,
+    };
+    // Reuse the construction-time validation: an illegal merged
+    // value throws here, before any stored or live value moves.
+    resolveFailureRegimeOptions(merged);
+    this.options.delta = merged.delta;
+    this.options.lambda = merged.lambda;
+    this.options.warmupSamples = merged.warmupSamples;
+    this.options.windowSamples = merged.windowSamples;
+    for (const detector of this.detectors.values()) {
+      detector.reviseParams(patch);
+    }
+    return this.getParams();
   }
 
   /** Topics with a live detector. */

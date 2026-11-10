@@ -7936,6 +7936,32 @@ Semantics:
   audited as `failure_rate_regime_change_callback_revised`
   (`{ hasCallback, oldHasCallback }`). `reportDeliveryOutcome`
   itself is still not audited.
+- **Live-retunable detection parameters (EB-446).**
+  `reviseFailureRegimeParams(patch, actor = 'system')` retunes
+  `delta` / `lambda` / `warmupSamples` / `windowSamples` without
+  restarting, and returns the post-revision four-parameter snapshot
+  (a partial patch keeps the fields it leaves out): the retune fans
+  out to every already-built per-topic detector and is stored for
+  topics built later, so the new values govern from the next
+  observed outcome on any topic. Only the parameters move — the
+  alert callback (EB-445 remains the only callback entry), the
+  per-topic baselines, the settling counters, the sums, and any
+  already-raised change points are untouched, and a revision inside
+  the settling window does not reset the settling count. Warmup
+  boundary: a detector still in warmup whose new `warmupSamples`
+  is at or below its already-sampled count finalizes its baseline
+  immediately from the sampled mean; a larger new `warmupSamples`
+  extends warmup; an already-warmed detector changing
+  `warmupSamples` keeps its live baseline. An empty patch, an
+  unknown field, or an illegal value (the construction-time rules:
+  `delta` in (0, 1), `lambda` > 0, `warmupSamples` an integer ≥ 1,
+  `windowSamples` an integer ≥ 2) throws `RangeError` with the live
+  parameters untouched; a bus that never enabled `failureRegime`
+  throws `Error` (enabling it needs a restart); a same-value
+  revision is a no-op with no audit; every success is audited as
+  `failure_rate_regime_params_revised`
+  (`{ params: { delta, lambda, warmupSamples, windowSamples },
+  oldParams: { ... } }`).
 
 ## Manual subscriber pause/resume (EB-113)
 

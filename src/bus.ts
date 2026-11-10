@@ -266,6 +266,8 @@ import {
   resolveFailureRegimeOptions,
   type DeliveryOutcome,
   type FailureRegimeOptions,
+  type FailureRegimeParams,
+  type FailureRegimeParamsRevision,
 } from './failure-regime.ts';
 import {
   resolveMirrorRules,
@@ -554,6 +556,8 @@ export type {
   DeliveryOutcome,
   FailureRateRegimeChange,
   FailureRegimeOptions,
+  FailureRegimeParams,
+  FailureRegimeParamsRevision,
 } from './failure-regime.ts';
 export type { LagEvent, LagMonitorOptions, LagSummaryStats } from './lag.ts';
 export type {
@@ -44939,6 +44943,113 @@ export class EventBus {
         oldHasCallback,
       },
     });
+  }
+
+  /**
+   * Live-retunes the failure-rate regime detection parameters
+   * (EB-446) without restarting the bus:
+   * `reviseFailureRegimeParams(patch, actor = 'system')` moves
+   * `delta` / `lambda` / `warmupSamples` / `windowSamples` in place
+   * (see `EventBusOptions.failureRegime`, EB-442) and returns the
+   * post-revision four-parameter snapshot — the only way to move
+   * detection sensitivity after construction: today a noisy topic
+   * that needs a higher `delta`, or a burst tolerance that needs a
+   * higher `lambda`, can only be retuned by restarting the bus,
+   * which loses every subscription and every armed detection
+   * baseline.
+   *
+   * Only the parameters move: the monitor fans the retune out to
+   * every already-built per-topic detector
+   * (`FailureRateRegimeMonitor.reviseParams`) and stores it for
+   * topics built later, so the new values govern from the next
+   * observed outcome on any topic — every parameter is a live read
+   * point inside `observe()` (the sample cap, the warmup gates,
+   * the settling gate, `delta / 2`, `lambda`, the snapshot window).
+   * The alert callback identity is untouched (EB-445 remains the
+   * only callback entry), and the per-topic baselines, the settling
+   * counters, the sums, and any already-raised change points stay
+   * exactly as they were: nothing is re-reported, and a revision
+   * inside the settling window does not reset the settling count.
+   *
+   * Warmup boundary: a detector still in warmup whose new
+   * `warmupSamples` is at or below its already-sampled count
+   * finalizes its baseline immediately from the sampled mean —
+   * otherwise the mean would stay 0 and detection would stall. A
+   * larger new `warmupSamples` extends warmup. An already-warmed
+   * detector changing `warmupSamples` keeps its live baseline; the
+   * new value only governs detectors built later. Growing
+   * `windowSamples` lengthens settling; shrinking it tightens the
+   * sample cap on the next push.
+   *
+   * Fail-closed: a closed bus throws `RangeError` (EB-154), and a
+   * bus that never enabled `failureRegime` throws `Error` — there
+   * is no monitor at all, so enabling detection needs a restart
+   * (along the WR-365 circuit-breaker gate wording). An empty
+   * patch, an unknown field, or an illegal merged value (the
+   * construction-time rules: `delta` in (0, 1), `lambda` > 0,
+   * `warmupSamples` an integer ≥ 1, `windowSamples` an integer
+   * ≥ 2) throws `RangeError` with the live parameters, every
+   * detector's state, and the audit log untouched. A revision
+   * identical to the live parameters is a no-op with no audit.
+   * Audited as `failure_rate_regime_params_revised`
+   * (`{ params: { delta, lambda, warmupSamples, windowSamples },
+   * oldParams: { ... } }` — the `lag_forecast_revised` snapshot
+   * shape).
+   *
+   * Orthogonal to EB-442 (that is the regime detection itself, this
+   * its parameters' live revision), to EB-445 (that is the alert
+   * callback's redirection — this the parameters, the detector's
+   * other revision face), to WR-177 (that is the outbound latency
+   * changepoint — this the failure-rate one, a different stream in
+   * the other repo), to the fixed-threshold alerting (`lag.ts` /
+   * `grouplag.ts` / `ops-alert` EB-132 — those alert on levels,
+   * this on distribution shifts), and to EB-425 / EB-426 / EB-427 /
+   * EB-428 / EB-429 / EB-430 / EB-431 / EB-436 (sibling bus-level
+   * hook revisions — this the regime-detection channel).
+   *
+   * Throws `Error` when `failureRegime` was never configured, and
+   * `RangeError` for a closed bus, an empty or malformed patch, an
+   * unknown field, or an illegal parameter value.
+   */
+  reviseFailureRegimeParams(
+    patch: FailureRegimeParamsRevision,
+    actor = 'system',
+  ): FailureRegimeParams {
+    assertValidActor(actor, 'reviseFailureRegimeParams');
+    // Fail-fast on a closed bus (EB-154, along
+    // `setFailureRateRegimeChangeCallback`): close() already flushed
+    // once — there is no live detector left to retune.
+    if (this.closed) {
+      throw new RangeError('reviseFailureRegimeParams: bus is closed');
+    }
+    const monitor = this.failureRegimeMonitor;
+    if (monitor === undefined) {
+      throw new Error(
+        'reviseFailureRegimeParams: failureRegime is not configured — enabling it requires a restart',
+      );
+    }
+    const oldParams = monitor.getParams();
+    // Merge + validate + fan out, before anything is audited: an
+    // illegal patch throws here with the live parameters untouched.
+    const params = monitor.reviseParams(patch);
+    // Re-affirming the live parameters is a no-op: no retune, no audit.
+    if (
+      params.delta === oldParams.delta &&
+      params.lambda === oldParams.lambda &&
+      params.warmupSamples === oldParams.warmupSamples &&
+      params.windowSamples === oldParams.windowSamples
+    ) {
+      return params;
+    }
+    this.auditSubscription({
+      action: 'failure_rate_regime_params_revised',
+      actor,
+      detail: {
+        params: { ...params },
+        oldParams: { ...oldParams },
+      },
+    });
+    return params;
   }
 
   private reportPartitionOutcome(
