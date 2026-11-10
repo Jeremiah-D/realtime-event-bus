@@ -46534,6 +46534,94 @@ export class EventBus {
   }
 
   /**
+   * Revises the cluster link's status callback live (EB-449) without
+   * reconnecting: `setClusterLinkStatusCallback(cb, actor?)` swaps the
+   * `onStatusChange` observer every status transition is handed to
+   * (see `ClusterConnectOptions.onStatusChange`, EB-37).
+   *
+   * Only the observer channel moves: the link itself, the cached route
+   * table, the hub epoch, the heartbeat interval, and the reconnect
+   * policy are untouched, and `clusterStatus()` / `getStatus()` report
+   * exactly as before — an operator that stops listening still has a
+   * live link. The new callback governs from the next status
+   * transition onward — a status already emitted is never replayed —
+   * and `emitStatus` reads the live callback on every transition, so
+   * a swap made while connected reaches the very next disconnect or
+   * route update. `null` clears back to silent (no observer). A
+   * throwing callback is swallowed by `emitStatus`, so a broken
+   * observer can never break the link.
+   *
+   * Fail-closed: a bus with no cluster link (never connected, or
+   * already disconnected via `disconnectCluster()`), a closed bus
+   * (EB-154), an illegal actor, and an illegal callback (anything but
+   * a function or `null`) all throw `RangeError` with the live
+   * callback and the audit log untouched. Validation reuses the
+   * connect-time rule (a callback must be a function, `null` clears
+   * back to no observer), so a value that could not be set at connect
+   * time cannot be installed later either. Re-installing the live
+   * callback (the same reference, including `null` against a link with
+   * no callback) is a no-op with no audit. Audited as
+   * `cluster_link_status_callback_revised`
+   * (`{ hasCallback, oldHasCallback }` — the callback function itself
+   * is never written to the audit log).
+   *
+   * Orthogonal to EB-37 (that is the federation itself — this its
+   * missing live status-callback redirection entry), to EB-339 (that
+   * retunes the heartbeat cadence — this the status observer), to
+   * EB-340/EB-395 (those retune the reconnect backoff/jitter — this
+   * the status observer), to EB-352/356 (those are hub-side timeouts
+   * — this the node-side observer), and to EB-425/426/427 (those
+   * replace three other callbacks — this the cluster-link status
+   * channel). `onGiveUp` is out of scope (ReconnectController
+   * internals). The revision is live-only — a restart restores the
+   * connect-time callback.
+   *
+   * Throws `RangeError` for a missing cluster link, a closed bus, an
+   * illegal actor, or an illegal callback.
+   */
+  setClusterLinkStatusCallback(
+    cb: ((status: ClusterLinkStatus) => void) | null,
+    actor = 'system',
+  ): void {
+    const link = this.clusterLink;
+    if (link == null) {
+      throw new RangeError('setClusterLinkStatusCallback: no cluster link — call connectToHub() first');
+    }
+    assertValidActor(actor, 'setClusterLinkStatusCallback');
+    // Fail-fast on a closed bus (EB-154, along `setLateMessageCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect. (close() leaves the link itself connected; the gate
+    // here is the bus, not the link.)
+    if (this.closed) {
+      throw new RangeError('setClusterLinkStatusCallback: bus is closed');
+    }
+    // Validate before touching anything: `null` clears back to no
+    // observer; anything that is neither a function nor `null` is
+    // rejected outright, and a failed call leaves the live callback
+    // untouched.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setClusterLinkStatusCallback: cb must be a function or null');
+    }
+    const next = cb ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a link with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === link.getOnStatusChange()) {
+      return;
+    }
+    const oldHasCallback = link.getOnStatusChange() !== undefined;
+    link.setOnStatusChange(cb);
+    this.auditSubscription({
+      action: 'cluster_link_status_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
+  /**
    * Delivers one hub-forwarded message to this node's matching
    * subscribers. Runs the same matching/filter/backpressure/group path
    * as local publishes (`deliverMatched`); the message keeps the hub's

@@ -635,7 +635,24 @@ library.
   are both no-ops with no audit. Every success is audited as
   `cluster_link_reconnect_backoff_revised` (`{ baseDelayMs, maxDelayMs,
   maxAttempts, jitterMs, oldBaseDelayMs, oldMaxDelayMs, oldMaxAttempts,
-  oldJitterMs }`). The hub's
+  oldJitterMs }`). The status callback itself is likewise revisable live
+  (EB-449, via `bus.setClusterLinkStatusCallback(cb, actor?)`): it swaps
+  the `onStatusChange` observer every status transition is handed to, so
+  an operator can redirect link-status alerts to a new handler (or clear
+  them with `null`, back to silent) without reconnecting — the new
+  callback governs from the next status transition onward (a disconnect
+  or a route update), already-emitted statuses are never replayed, and
+  the link, the cached route table, the hub epoch, the heartbeat
+  interval, and the reconnect policy are untouched. A throwing callback
+  is swallowed by `emitStatus`, so a broken observer can never break
+  the link. A bus with no cluster link, a closed bus, an illegal actor,
+  and anything but a function or `null` all throw `RangeError` with the
+  live callback untouched; re-installing the live callback (the same
+  reference, including clearing a link with no callback) is a no-op
+  with no audit. Every success is audited as
+  `cluster_link_status_callback_revised`
+  (`{ hasCallback, oldHasCallback }` — the callback itself is never
+  written to the audit log). The hub's
   `heartbeatTimeoutMs` is untouched and unvalidated, so a retuned backoff
   that waits longer than the hub's silence bound can still get the node
   swept on the next drop. The hub-side silence bound itself is revisable

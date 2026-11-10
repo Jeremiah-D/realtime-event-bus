@@ -885,7 +885,7 @@ export class ClusterLink {
   private heartbeatMs: number;
   private readonly onMessage: (msg: ClusterMessage) => boolean;
   private readonly getPatterns: () => string[];
-  private readonly onStatusChange?: (status: ClusterLinkStatus) => void;
+  private onStatusChange?: (status: ClusterLinkStatus) => void;
   private routes: CachedRoutes = { version: 0, hubEpoch: null, members: [] };
   private advertised: string[] | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -1419,6 +1419,32 @@ export class ClusterLink {
       throw new RangeError('retuneReconnectBackoff: no reconnect policy — the link was built with reconnect: false');
     }
     controller.retuneBackoff(revision);
+  }
+
+  /**
+   * The live status-change observer (EB-449): the `onStatusChange`
+   * callback the link hands every status transition to, or
+   * `undefined` when none is installed. Revised by
+   * `setOnStatusChange`; `getOnStatusChange` reads it back.
+   */
+  getOnStatusChange(): ((status: ClusterLinkStatus) => void) | undefined {
+    return this.onStatusChange;
+  }
+
+  /**
+   * Revises the status-change observer live (EB-449) without
+   * reconnecting, re-syncing routes, or changing the connection
+   * state: a function installs it, `null` clears back to silent.
+   * The new callback governs from the next status transition
+   * onward — `emitStatus` reads the live field on every transition,
+   * and already-emitted statuses are never replayed. A throwing
+   * callback is swallowed by `emitStatus`, so a broken observer can
+   * never break the link. The link itself, the cached route table,
+   * the hub epoch, the heartbeat interval, and the reconnect policy
+   * are untouched.
+   */
+  setOnStatusChange(cb: ((status: ClusterLinkStatus) => void) | null): void {
+    this.onStatusChange = cb ?? undefined;
   }
 
   private startHeartbeat(): void {
