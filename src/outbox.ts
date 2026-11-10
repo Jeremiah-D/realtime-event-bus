@@ -259,6 +259,38 @@ export interface OutboxRelayRevision {
 }
 
 /**
+ * Revision for the attached outbox relay's observation hooks (see
+ * `EventBus.setOutboxRelayCallbacks`, EB-452). Only the fields
+ * provided move; the rest keep their live values. `null` clears the
+ * hook back to no hook.
+ */
+export interface OutboxRelayCallbacksRevision {
+  /**
+   * Called when a drain cycle's `publishAtomic` rejects or the store
+   * throws. Must be a function when provided — the construction-time
+   * rule — or `null` to clear the hook.
+   */
+  onRelayError?: ((err: unknown, records: OutboxRecord[]) => void) | null;
+  /**
+   * Called after a drain cycle successfully committed a batch. Must
+   * be a function when provided — the construction-time rule — or
+   * `null` to clear the hook.
+   */
+  onRelayed?: ((records: OutboxRecord[], result: AtomicPublishResult) => void) | null;
+}
+
+/**
+ * Per-hook outcome of a callbacks revision: whether each hook was
+ * installed (`'set'`), cleared (`'cleared'`), or left alone
+ * (`'unchanged'`). The hook functions themselves are never exposed —
+ * only their set/cleared state, which is what the audit records.
+ */
+export interface OutboxRelayCallbacksDetail {
+  onRelayError: 'set' | 'cleared' | 'unchanged';
+  onRelayed: 'set' | 'cleared' | 'unchanged';
+}
+
+/**
  * Validates `OutboxRelayOptions` fail-fast, applying the
  * construction-time defaults (`pollIntervalMs` 100, `batchSize` 100,
  * `probeLimit` 10000). Used by the constructor and by
@@ -330,8 +362,13 @@ export class OutboxRelay {
   private readonly now: () => number;
   private readonly setTimerFn: (fn: () => void, ms: number) => unknown;
   private readonly clearTimerFn: (handle: unknown) => void;
-  private readonly onRelayError?: (err: unknown, records: OutboxRecord[]) => void;
-  private readonly onRelayed?: (records: OutboxRecord[], result: AtomicPublishResult) => void;
+  // Mutable live via `reviseCallbacks` (EB-452) — see that method.
+  // The drain paths read the fields per cycle, so a replacement
+  // governs from the very next drain; a throwing hook is swallowed
+  // at the call site, so the relay never dies on a monitoring
+  // callback.
+  private onRelayError?: (err: unknown, records: OutboxRecord[]) => void;
+  private onRelayed?: (records: OutboxRecord[], result: AtomicPublishResult) => void;
   private cursor = 0;
   private relayed = 0;
   private timer: unknown = undefined;
@@ -389,6 +426,96 @@ export class OutboxRelay {
       this.disarmTimer();
       this.armTimer();
     }
+  }
+
+  /**
+   * Replaces or clears the relay's observation hooks live (EB-452)
+   * without restarting or re-attaching the relay: `reviseCallbacks({
+   * onRelayError?, onRelayed? })` swaps the hook a failed drain
+   * reports on and/or the hook a successful commit reports on.
+   *
+   * Only the hooks provided move; the rest keep their live values.
+   * `null` clears a hook back to no hook. The replacement is total —
+   * the new hook does not chain the old one. The drain paths read the
+   * fields per cycle (`reportError` on every failure, `onRelayed`
+   * after every successful commit), so a replacement governs from the
+   * very next drain on a running relay, and a stopped relay picks the
+   * new hooks up at the next `start()`. The trigger semantics are
+   * unchanged: a rejected or throwing batch still reports on
+   * `onRelayError` with the cursor unmoved and the poison record
+   * still blocking, a throwing hook is still swallowed, and
+   * `onRelayed` still fires only after a successful commit. The
+   * cursor, the relayed count, and the poll timer are untouched.
+   *
+   * Returns the per-hook outcome (`'set' | 'cleared' |
+   * 'unchanged'`) so the bus can audit the revision as
+   * `outbox_relay_callbacks_revised` — the hook functions themselves
+   * are never exposed or recorded. A revision identical to the live
+   * hooks — including clearing a hook that was never set — returns an
+   * all-`'unchanged'` detail, and the bus records no audit for it.
+   *
+   * Fail-closed: a non-object patch and an illegal hook value (a
+   * non-function, non-`null` value) throw `RangeError` with the live
+   * hooks untouched. Validation reuses the construction-time rule (a
+   * function, or `null` to clear) — so a value that could not be set
+   * at construction cannot be revised in later either. `undefined`
+   * is not a value: a field left out keeps its live hook.
+   *
+   * There is deliberately no getter exposing the live hooks: the
+   * function references stay private.
+   *
+   * Throws `RangeError` for a non-object patch or for an illegal
+   * `onRelayError` / `onRelayed`.
+   */
+  reviseCallbacks(patch: OutboxRelayCallbacksRevision): OutboxRelayCallbacksDetail {
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        'reviseCallbacks: patch must be an object with onRelayError and/or onRelayed',
+      );
+    }
+    if (
+      patch.onRelayError !== undefined &&
+      patch.onRelayError !== null &&
+      typeof patch.onRelayError !== 'function'
+    ) {
+      throw new RangeError('reviseCallbacks: onRelayError must be a function or null');
+    }
+    if (
+      patch.onRelayed !== undefined &&
+      patch.onRelayed !== null &&
+      typeof patch.onRelayed !== 'function'
+    ) {
+      throw new RangeError('reviseCallbacks: onRelayed must be a function or null');
+    }
+    const nextOnRelayError =
+      patch.onRelayError === undefined ? this.onRelayError : (patch.onRelayError ?? undefined);
+    const nextOnRelayed =
+      patch.onRelayed === undefined ? this.onRelayed : (patch.onRelayed ?? undefined);
+    // Re-affirming the live hooks is a no-op — including clearing a
+    // hook that was never set.
+    if (nextOnRelayError === this.onRelayError && nextOnRelayed === this.onRelayed) {
+      return { onRelayError: 'unchanged', onRelayed: 'unchanged' };
+    }
+    const detail: OutboxRelayCallbacksDetail = {
+      onRelayError:
+        patch.onRelayError === undefined
+          ? 'unchanged'
+          : patch.onRelayError === null
+            ? 'cleared'
+            : 'set',
+      onRelayed:
+        patch.onRelayed === undefined
+          ? 'unchanged'
+          : patch.onRelayed === null
+            ? 'cleared'
+            : 'set',
+    };
+    // Only the hooks move; the cursor, the relayed count, and the
+    // poll timer are untouched, and every drain reads the live hooks
+    // from here on.
+    this.onRelayError = nextOnRelayError;
+    this.onRelayed = nextOnRelayed;
+    return detail;
   }
 
   /**

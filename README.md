@@ -6786,6 +6786,8 @@ revised (otherwise `RangeError`); illegal values fail closed with the
 live tuning untouched; an identical or empty revision is a no-op with no
 audit. Audited as `outbox_relay_revised` (old and new values).
 
+Swap the relay's observation hooks live with `bus.setOutboxRelayCallbacks({ onRelayError?, onRelayed? }, actor?)` (EB-452): only the hooks provided move, the rest keep their live values — `null` clears a hook back to no hook, and the replacement is total (the new hook does not chain the old one). The trigger semantics are unchanged: a rejected or throwing batch still reports on `onRelayError` with the cursor unmoved and the poison record still blocking, a throwing hook is still swallowed, and `onRelayed` still fires only after a successful commit. A new hook governs from the very next drain (a stopped relay picks it up at the next `start()`); the cursor, the relayed count, and the poll timer are untouched. Only a bus with an attached relay can be revised (otherwise `RangeError`); illegal hook values fail closed with the live hooks untouched; an identical or empty revision is a no-op with no audit. Audited as `outbox_relay_callbacks_revised` (`{ onRelayError: 'set' | 'cleared' | 'unchanged', onRelayed: 'set' | 'cleared' | 'unchanged' }` — the hook functions themselves are never recorded). This is orthogonal to the numeric revision above: EB-302 retunes `pollIntervalMs`/`batchSize`/`probeLimit`, this swaps the two observation hooks.
+
 SQL shape for a Postgres-backed store:
 
 ```sql

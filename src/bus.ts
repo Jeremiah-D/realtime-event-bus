@@ -175,6 +175,7 @@ import { exportTopicData as exportTopicDataFromLog, importTopicData as importTop
 import {
   OutboxRelay,
   resolveOutboxRelayOptions,
+  type OutboxRelayCallbacksRevision,
   type OutboxRelayOptions,
   type OutboxRelayRevision,
   type OutboxStore,
@@ -27407,6 +27408,65 @@ export class EventBus {
         probeLimit,
         oldProbeLimit: current.probeLimit,
       },
+    });
+  }
+
+  /**
+   * Replaces or clears the attached outbox relay's observation hooks
+   * live (EB-452) without restarting the bus or re-attaching the
+   * relay: `setOutboxRelayCallbacks({ onRelayError?, onRelayed? },
+   * actor?)` swaps the hook a failed drain reports on
+   * (`onRelayError`) and/or the hook a successful commit reports on
+   * (`onRelayed`) — see `attachOutboxRelay`, EB-102.
+   *
+   * Only the hooks provided move; the rest keep their live values.
+   * `null` clears a hook back to no hook. The replacement is total:
+   * the new hook does not chain the old one. The trigger semantics
+   * are unchanged: a rejected or throwing batch still reports on
+   * `onRelayError` with the cursor unmoved and the poison record
+   * still blocking, a throwing hook is still swallowed, and
+   * `onRelayed` still fires only after a successful commit. The
+   * cursor, the relayed count, and the poll timer are untouched, and
+   * a stopped relay takes the new hooks up at the next `start()`.
+   *
+   * Fail-closed: a bus with no outbox relay attached, a bad actor, a
+   * non-object patch, and an illegal hook value (a non-function,
+   * non-`null` value) all throw `RangeError` with the live hooks and
+   * the audit log untouched. A patch that provides neither hook, and
+   * a revision identical to the live hooks — including clearing a
+   * hook that was never set — are both no-ops with no audit. Audited
+   * as `outbox_relay_callbacks_revised` (`{ onRelayError: 'set' |
+   * 'cleared' | 'unchanged', onRelayed: 'set' | 'cleared' |
+   * 'unchanged' }` — the hook functions themselves are never
+   * recorded).
+   *
+   * Orthogonal to EB-102 (that is the outbox relay mechanism itself)
+   * and to EB-302 (that revises the same relay's three numeric tuning
+   * fields — this its two observation hooks).
+   *
+   * Throws `RangeError` when no outbox relay is attached, for a bad
+   * actor, for a non-object patch, or for an illegal `onRelayError` /
+   * `onRelayed`.
+   */
+  setOutboxRelayCallbacks(patch: OutboxRelayCallbacksRevision, actor = 'system'): void {
+    assertValidActor(actor, 'setOutboxRelayCallbacks');
+    const relay = this.outboxRelay;
+    if (relay === undefined) {
+      throw new RangeError('setOutboxRelayCallbacks: no outbox relay is attached to this bus');
+    }
+    // An absent revision asks nothing to move.
+    if (patch == null) {
+      return;
+    }
+    const detail = relay.reviseCallbacks(patch);
+    // A revision identical to the live hooks is a no-op: no audit.
+    if (detail.onRelayError === 'unchanged' && detail.onRelayed === 'unchanged') {
+      return;
+    }
+    this.auditSubscription({
+      action: 'outbox_relay_callbacks_revised',
+      actor,
+      detail,
     });
   }
 
