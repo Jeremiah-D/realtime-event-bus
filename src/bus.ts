@@ -35239,6 +35239,8 @@ export class EventBus {
    * threshold does not re-fire when the threshold widens — the
    * latch still clears only when the queue drains empty — and a
    * fresh backlog after the drain is judged by the new threshold.
+   * The callback itself is revisable separately, via
+   * `setExpiringSoonCallback` (EB-454).
    * Already-delivered and already-expired messages are untouched;
    * the threshold only changes when the *next* head enters the
    * window.
@@ -35296,6 +35298,105 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { expiringSoonMs, oldExpiringSoonMs },
+    });
+  }
+
+  /**
+   * Revises one expiring-soon-monitored subscriber's warning callback
+   * (EB-454) without re-subscribing: `setExpiringSoonCallback(subId,
+   * cb)` swaps `onExpiringSoon` in place (see
+   * `SubscribeOptions.expiringSoon`, EB-110) — the only callback
+   * revision surface `setExpiringSoonThreshold` left uncovered: it
+   * moves the threshold, this one moves who hears about the warning.
+   *
+   * Only the callback moves: `checkExpiringSoon` reads the live
+   * `expiring.onExpiringSoon` on every enqueue/drain evaluation, so
+   * the new callback governs from the next warning — no drain,
+   * re-registration, or replay. A backlog that already warned is not
+   * re-sent: the `alerted` latch still clears only when the queue
+   * drains empty, so the new callback first hears the next backlog's
+   * warning. `null` clears the callback back to silent alerting: the
+   * threshold judgment and the `expiringSoonAlerts` count still run,
+   * the latch still sets and re-arms — just with nobody receiving.
+   * The `expiringSoonMs` threshold is untouched (EB-288 remains its
+   * only revision entry).
+   *
+   * A throwing callback is swallowed by `checkExpiringSoon`: the
+   * callback is an observer, not part of the publish/drain path, so a
+   * throwing observer never breaks the publish that crossed the
+   * window or the drain that follows — the warning is already
+   * recorded exactly once before the call.
+   *
+   * Fail-closed: a closed bus, an unknown subscriber id, a
+   * subscription that never opted into `expiringSoon` monitoring
+   * (`subscriber.expiring` is undefined — the same gate
+   * `setExpiringSoonThreshold` applies, EB-288), and an illegal
+   * callback value (anything but a function or an explicit `null` —
+   * `undefined` is not a value) all throw `RangeError` with the live
+   * callback, the latch, the threshold, and the audit log untouched.
+   * A revision identical to the live callback — the same function
+   * reference, including clearing a callback that was already cleared
+   * — is a no-op with no audit. Audited as
+   * `expiring_soon_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-110 (that is the warning mechanism itself, this
+   * its callback revision), to `setExpiringSoonThreshold` (EB-288,
+   * that revises the threshold — this the callback, the other field
+   * of the same state object), and to EB-437/EB-438/EB-440 (the same
+   * single-callback revision family for other hooks — this the TTL
+   * warning hook).
+   *
+   * Throws `RangeError` for a closed bus, an unknown subscriber, an
+   * unmonitored subscriber, or an illegal callback value.
+   */
+  setExpiringSoonCallback(
+    subId: string,
+    cb: ((event: ExpiringSoonEvent) => void) | null,
+  ): void {
+    // Fail-fast on a closed bus (EB-154): close() already flushed
+    // once — there is no live monitoring left to retune.
+    if (this.closed) {
+      throw new RangeError('setExpiringSoonCallback: bus is closed');
+    }
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setExpiringSoonCallback: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setExpiringSoonCallback: unknown subscriber: ${subId}`);
+    }
+    const expiring = subscriber.expiring;
+    if (expiring === undefined) {
+      throw new RangeError('setExpiringSoonCallback: subscriber has no expiringSoon monitoring set');
+    }
+    // Validate before touching anything: an illegal callback value
+    // fails closed — `undefined` is not a value, so only a function
+    // or an explicit `null` is accepted; `null` clears back to silent
+    // alerting.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setExpiringSoonCallback: cb must be a function or null');
+    }
+    const nextCallback = cb ?? undefined;
+    // Re-affirming the live callback is a no-op: no swap, no audit —
+    // including clearing a callback that was already cleared.
+    if (nextCallback === expiring.onExpiringSoon) {
+      return;
+    }
+    const oldHasCallback = expiring.onExpiringSoon !== undefined;
+    const hasCallback = nextCallback !== undefined;
+    // Only the callback moves; the threshold, the alerted latch, and
+    // the alert count are untouched, and the next warning reads the
+    // live value from here on.
+    expiring.onExpiringSoon = nextCallback;
+    this.auditSubscription({
+      action: 'expiring_soon_callback_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { hasCallback, oldHasCallback },
     });
   }
 
@@ -58508,7 +58609,11 @@ export class EventBus {
       expiring.alerted = true;
       this.totalExpiringSoonAlerts += 1;
       try {
-        expiring.onExpiringSoon({
+        // The callback is optional since EB-454 (`null` clears it):
+        // the `?.` guard keeps a cleared callback on the silent path
+        // instead of throwing a TypeError into the swallow-errors
+        // branch below — the count and the latch above already ran.
+        expiring.onExpiringSoon?.({
           subscriberId: subscriber.id,
           pattern: subscriber.pattern,
           remainingMs,

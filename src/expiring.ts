@@ -80,7 +80,16 @@ export interface ExpiringSoonEvent {
 /** Per-subscriber expiring-soon monitoring state. */
 export interface SubscriberExpiringState {
   expiringSoonMs: number;
-  onExpiringSoon: (event: ExpiringSoonEvent) => void;
+  /**
+   * The warning callback, live-revisable via
+   * `EventBus.setExpiringSoonCallback` (EB-454). `undefined` means the
+   * callback was cleared with an explicit `null`: the threshold
+   * judgment, the `expiringSoonAlerts` count, and the `alerted` latch
+   * still run — the warning just has nobody to receive it. Subscribe
+   * time still requires a function (`resolveExpiringSoonOptions`
+   * below); only a later revision can clear it.
+   */
+  onExpiringSoon?: (event: ExpiringSoonEvent) => void;
   /**
    * Latch: set when the warning fires, cleared when the queue drains
    * empty. While set, further evaluations do not re-fire — one warning

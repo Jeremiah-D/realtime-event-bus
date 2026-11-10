@@ -7535,6 +7535,19 @@ the next enqueue/drain evaluation. A revision identical to the current
 threshold is a no-op with no audit. Every success is audited as
 `expiring_soon_threshold_revised`
 (`{ expiringSoonMs: <number>, oldExpiringSoonMs: <number> }`).
+
+The warning callback itself is revisable without re-subscribing
+(EB-454, via `setExpiringSoonCallback(subId, cb)`): threshold
+revision and callback revision are orthogonal — one moves the
+window, the other moves who hears about it. Passing `null` clears
+the callback back to silent alerting (the threshold judgment and
+the `expiringSoonAlerts` count still run, the latch still sets and
+re-arms, just with nobody receiving); a replacement callback
+governs from the next warning, and a backlog that already warned
+is not re-sent. A throwing callback is swallowed, as at subscribe
+time. Every success is audited as `expiring_soon_callback_revised`
+(`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+callback itself is never serialized, only its presence).
 (Real-time systems: subscription governance.)
 
 ## Per-message TTL (EB-149)
