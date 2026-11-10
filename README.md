@@ -11419,6 +11419,18 @@ const report = await bus.replayRange('market.ticks', { from: 1, to: 10_000, spee
   `subscribe('t', handler, { catchUpOnReplay: true })` pause their live
   drain for the replay's duration; the live backlog stays queued and
   drains when the replay finishes, so catch-up is lossless and seamless.
+  **Live revision (EB-457).** The switch is revisable without
+  re-subscribing via `setCatchUpOnReplay(subId, enabled)`: there is no
+  opt-in gate — every subscription always carries the switch (default
+  `false`) — and the next `replayRange` start reads the live value, so
+  a revision landing mid-replay never touches the replay already
+  running (opening it does not pause the in-progress replay's live
+  drain; closing it does not early-release an already-paused
+  subscriber). An unknown subscriber or a non-boolean value throws
+  `RangeError` with the live switch untouched, and a revision
+  identical to the live switch is a no-op with no audit. Every success
+  is audited as `catch_up_on_replay_revised`
+  (`{ catchUpOnReplay: <boolean>, oldCatchUpOnReplay: <boolean> }`).
 - **Clean stats.** Replayed messages carry `replayed: true`: they never
   move the sequence-gap baseline and never pollute `sequenceGaps`, are
   never re-appended to the durable log, and skip reliable-delivery ack

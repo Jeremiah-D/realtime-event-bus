@@ -2499,7 +2499,8 @@ export interface SubscribeOptions {
    * backpressure policy, untouched by the drain — and resume when the
    * replay finishes, so catch-up is lossless and seamless. Without it a
    * replay's history interleaves with the live stream at the handler.
-   * Disabled by default; must be a boolean when given.
+   * Disabled by default; must be a boolean when given. Revisable live
+   * via `setCatchUpOnReplay` (EB-457).
    */
   catchUpOnReplay?: boolean;
   /**
@@ -9484,6 +9485,8 @@ interface Subscriber {
    * Catch-up opt-in (EB-203): mirrors `SubscribeOptions.catchUpOnReplay`
    * at registration time. `true` means `replayRange` pauses this
    * subscriber's live drain while it replays history to the handler.
+   * Revisable live via `setCatchUpOnReplay` (EB-457): the next
+   * `replayRange` start reads the live value.
    */
   catchUpOnReplay: boolean;
   /**
@@ -40964,6 +40967,85 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { hasCallback, oldHasCallback },
+    });
+  }
+
+  /**
+   * Revises one subscriber's time-travel replay catch-up switch
+   * (EB-457) without re-subscribing: `setCatchUpOnReplay(subId,
+   * enabled)` flips whether `replayRange` pauses this subscriber's
+   * live drain while it replays history (see
+   * `SubscribeOptions.catchUpOnReplay`, EB-203).
+   *
+   * There is no opt-in gate: every subscription always carries the
+   * switch — `catchUpOnReplay`, default `false` — so there is no
+   * "unset" state and no revision is ever refused for lacking one,
+   * along `setQueueSize` (EB-281) and `setDropPolicy` (EB-375), and
+   * unlike the callback revisions (EB-454 / EB-455 / EB-456) whose
+   * hooks must already exist.
+   *
+   * Only the switch moves: `replayRange` reads the live
+   * `subscriber.catchUpOnReplay` once, at the start of the next
+   * replay, and snapshots the paused set there — an in-progress
+   * replay is untouched by a revision landing mid-replay. Opening
+   * the switch mid-replay does not pause the live drain of the
+   * replay already running (its paused set was fixed at its start),
+   * and closing it mid-replay does not early-release a
+   * `replayPaused` already set — the re-drain still happens on the
+   * replay's own end path. The replay semantics themselves (range,
+   * speed, key filter, the two-replays fail-fast), the
+   * `replayPaused` set/clear timing, and the resume cursor are all
+   * untouched.
+   *
+   * Fail-closed: an unknown subscriber id and a non-boolean value
+   * both throw `RangeError` with the live switch and the audit log
+   * untouched — the revision reuses the subscribe-time validation
+   * (the switch must be a boolean), so a value that could not be
+   * set at subscribe time cannot be revised in later either. A
+   * revision identical to the live switch is a no-op with no audit.
+   * Audited as `catch_up_on_replay_revised`
+   * (`{ catchUpOnReplay: <boolean>, oldCatchUpOnReplay: <boolean> }`).
+   *
+   * Orthogonal to EB-203 (that is the catch-up mechanism itself —
+   * this its live revision), to EB-455 (that revises the backpressure
+   * observation callbacks — this the replay strategy, and a
+   * catch-up revision never touches the callbacks), and to EB-375
+   * (that revises the shed policy — this the replay strategy, and a
+   * catch-up revision never touches which message is dropped when
+   * the queue is full).
+   *
+   * Throws `RangeError` for an unknown subscriber or a non-boolean
+   * value.
+   */
+  setCatchUpOnReplay(subId: string, enabled: boolean): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setCatchUpOnReplay: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setCatchUpOnReplay: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: a non-boolean value fails
+    // closed, so an illegal revision never moves the live switch —
+    // the same subscribe-time boolean gate as `subscribe` applies.
+    if (typeof enabled !== 'boolean') {
+      throw new RangeError('setCatchUpOnReplay: enabled must be a boolean');
+    }
+    const oldCatchUpOnReplay = subscriber.catchUpOnReplay;
+    // Re-affirming the live switch is a no-op: no swap, no audit.
+    if (enabled === oldCatchUpOnReplay) {
+      return;
+    }
+    // Only the switch moves; `replayRange` reads the live value once
+    // at the start of the next replay, so an in-progress replay keeps
+    // the paused set it snapshotted at its own start.
+    subscriber.catchUpOnReplay = enabled;
+    this.auditSubscription({
+      action: 'catch_up_on_replay_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { catchUpOnReplay: enabled, oldCatchUpOnReplay },
     });
   }
 
