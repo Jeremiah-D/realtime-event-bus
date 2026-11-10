@@ -44836,6 +44836,111 @@ export class EventBus {
     monitor.observe(resolved, outcome);
   }
 
+  /**
+   * Live-redirects the failure-rate regime-change alert callback
+   * (EB-445) without restarting the bus:
+   * `setFailureRateRegimeChangeCallback(cb, actor = 'system')` swaps
+   * `onFailureRateRegimeChange` in place (see
+   * `EventBusOptions.failureRegime`, EB-442) — the only way to move
+   * the alert recipient after construction: today a creep or jump
+   * alarm goes to the construction-time callback, and changing who
+   * hears about a downstream degrading means restarting the bus,
+   * which loses every subscription and every armed detection
+   * baseline.
+   *
+   * Only the callback moves: the monitor fans the swap out to every
+   * already-built per-topic detector (`FailureRateRegimeMonitor.
+   * setOnChange`) and stores it for topics built later, so the new
+   * callback governs from the next regime-change alert on any topic
+   * — a topic whose detector was built before the swap alarms on the
+   * new callback exactly like a topic first reported after it. The
+   * detection parameters (`delta` / `lambda` / `warmupSamples` /
+   * `windowSamples`), the per-topic baselines, the warmup state, and
+   * the settling state are untouched: a swap mid-settling does not
+   * reset the settling count, and an already-alarmed change is never
+   * re-fired. `null` clears the callback back to audit-only:
+   * detection keeps running — baselines still re-estimate, settling
+   * still completes — just with no operator callback fired (the
+   * outcomes themselves are never audited, so a cleared bus reports
+   * nothing until a callback is re-installed).
+   *
+   * A throwing callback is swallowed at the detector's firing site:
+   * the callback is an observer, not part of the detection path, so
+   * a throwing observer never breaks the outcome stream or the
+   * `reportDeliveryOutcome` call that delivered the alarming outcome.
+   *
+   * Fail-closed: a closed bus and an illegal callback value
+   * (anything but a function or an explicit `null` — `undefined` is
+   * not a value) throw `RangeError` with the live callback, the
+   * baselines, and the audit log untouched; a bus that never enabled
+   * `failureRegime` throws `Error` — there is no monitor at all, so
+   * enabling detection needs a restart (along the WR-365
+   * circuit-breaker gate wording). A revision identical to the live
+   * callback — the same function reference, including clearing a
+   * callback that was never set — is a no-op with no audit. Audited
+   * as `failure_rate_regime_change_callback_revised`
+   * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
+   * callback itself is a function and is never serialized into the
+   * audit record, only its presence).
+   *
+   * Orthogonal to EB-442 (that is the regime detection itself, this
+   * its alert-callback redirection), to WR-177 (that is the outbound
+   * latency changepoint — this the failure-rate one, a different
+   * stream in the other repo), to the fixed-threshold alerting
+   * (`lag.ts` / `grouplag.ts` / `ops-alert` EB-132 — those alert on
+   * levels, this on distribution shifts), and to EB-425 / EB-426 /
+   * EB-427 / EB-428 / EB-429 / EB-430 / EB-431 / EB-436 (sibling
+   * bus-level hook redirections — this the regime-detection channel).
+   *
+   * Throws `Error` when `failureRegime` was never configured, and
+   * `RangeError` for a closed bus or an illegal callback value.
+   */
+  setFailureRateRegimeChangeCallback(
+    cb: ((change: FailureRateRegimeChange) => void) | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setFailureRateRegimeChangeCallback');
+    // Fail-fast on a closed bus (EB-154, along `setLateMessageCallback`):
+    // close() already flushed once — there is no live hook left to
+    // redirect.
+    if (this.closed) {
+      throw new RangeError('setFailureRateRegimeChangeCallback: bus is closed');
+    }
+    const monitor = this.failureRegimeMonitor;
+    if (monitor === undefined) {
+      throw new Error(
+        'setFailureRateRegimeChangeCallback: failureRegime is not configured — enabling it requires a restart',
+      );
+    }
+    // Validate before touching anything: `null` clears back to
+    // audit-only, so it normalizes to `undefined`; anything that is
+    // neither a function nor `null` is rejected outright, and a failed
+    // call leaves the live callback untouched.
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setFailureRateRegimeChangeCallback: cb must be a function or null');
+    }
+    const next = cb ?? undefined;
+    // Re-installing the live callback (the same raw reference,
+    // including clearing a bus with no callback) is a no-op: no swap,
+    // no audit.
+    if (next === monitor.getOnChange()) {
+      return;
+    }
+    const oldHasCallback = monitor.getOnChange() !== undefined;
+    // Only the callback moves: the monitor fans the swap out to every
+    // already-built detector and stores it for later topics, and the
+    // next alarm on any topic reads the new value.
+    monitor.setOnChange(next);
+    this.auditSubscription({
+      action: 'failure_rate_regime_change_callback_revised',
+      actor,
+      detail: {
+        hasCallback: next !== undefined,
+        oldHasCallback,
+      },
+    });
+  }
+
   private reportPartitionOutcome(
     topic: string,
     partition: number,

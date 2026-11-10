@@ -234,7 +234,17 @@ export class FailureRateRegimeDetector {
   private readonly lambda: number;
   private readonly warmupSamples: number;
   private readonly windowSamples: number;
-  private readonly onChange?: (change: FailureRateRegimeChange) => void;
+  /**
+   * The regime-change alert callback. Deliberately *not* readonly
+   * (EB-445): `FailureRateRegimeMonitor.setOnChange` redirects it
+   * live, so an already-built detector hears about the swap without
+   * being rebuilt — rebuilding would lose its baseline, warmup, and
+   * settling state. The detector captures the callback at
+   * construction, so swapping only the monitor's stored options
+   * would leave already-built detectors on the old callback (the
+   * WR-372 tracker-capture trap); the fan-out below is the fix.
+   */
+  private onChange?: (change: FailureRateRegimeChange) => void;
   private readonly nowMs: () => number;
 
   private seq = 0;
@@ -371,8 +381,29 @@ export class FailureRateRegimeDetector {
     this.settlingBad = 0;
     this.samples = this.samples.filter((s) => s.seq >= change.afterSeqStart);
 
-    this.onChange?.(change.event);
+    // A throwing callback is swallowed here: the callback is an
+    // observer, not part of the detection path, so a broken observer
+    // never breaks the outcome stream or the reporting caller
+    // (EB-445, along the `fireRebalanceListener` / `emitRebalance`
+    // family rule). The change is still returned to the caller.
+    try {
+      this.onChange?.(change.event);
+    } catch {
+      // Observation never breaks detection.
+    }
     return change.event;
+  }
+
+  /**
+   * Live-redirects the regime-change alert callback (EB-445): the
+   * next alarm fires the new callback; the baseline, warmup, and
+   * settling state are untouched. `undefined` clears back to
+   * audit-only — detection keeps running, just with no callback
+   * fired. Called by `FailureRateRegimeMonitor.setOnChange`, which
+   * fans the swap out to every already-built detector.
+   */
+  setOnChange(cb: ((change: FailureRateRegimeChange) => void) | undefined): void {
+    this.onChange = cb;
   }
 
   private buildChange(direction: FailureRegimeDirection): {
@@ -439,6 +470,30 @@ export class FailureRateRegimeMonitor {
       this.detectors.set(topic, d);
     }
     return d.observe(outcome);
+  }
+
+  /**
+   * Live-redirects the regime-change alert callback (EB-445) for
+   * every detector — already-built and later ones. The callback is
+   * captured per-detector at construction, so swapping only the
+   * monitor's stored options would leave already-built detectors on
+   * the old callback (the WR-372 tracker-capture trap): this stores
+   * the swap for detectors built later and fans it out to every
+   * live detector now. Baselines, warmup, and settling state are
+   * untouched on every detector; `undefined` clears back to
+   * audit-only — detection keeps running, just with no callback
+   * fired.
+   */
+  setOnChange(cb: ((change: FailureRateRegimeChange) => void) | undefined): void {
+    this.options.onFailureRateRegimeChange = cb;
+    for (const detector of this.detectors.values()) {
+      detector.setOnChange(cb);
+    }
+  }
+
+  /** The currently installed alert callback, if any. */
+  getOnChange(): ((change: FailureRateRegimeChange) => void) | undefined {
+    return this.options.onFailureRateRegimeChange;
   }
 
   /** Topics with a live detector. */

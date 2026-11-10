@@ -7920,8 +7920,22 @@ Semantics:
   in about a dozen samples, a 1% → 8% creep in about a hundred.
 - **Alert-only.** It never pauses, isolates, or reroutes a topic —
   disposition stays with quarantine and the operator. No stats
-  fields, no Prometheus series, no revision method: only the
-  callback. A bus without the option pays nothing.
+  fields, no Prometheus series: only the callback. A bus without the
+  option pays nothing.
+- **Live-redirectable alert callback (EB-445).**
+  `setFailureRateRegimeChangeCallback(cb | null, actor = 'system')`
+  moves the alert recipient without restarting: the swap fans out to
+  every already-built per-topic detector (and is stored for topics
+  built later), so the new callback governs from the next
+  regime-change alert on any topic; baselines, warmup, and settling
+  state are untouched, and a swap mid-settling does not reset the
+  settling count. `null` clears back to audit-only — detection keeps
+  running, just with no callback fired. A bus that never enabled
+  `failureRegime` throws `Error` (enabling it needs a restart); a
+  same-reference reinstall is a no-op with no audit; every success is
+  audited as `failure_rate_regime_change_callback_revised`
+  (`{ hasCallback, oldHasCallback }`). `reportDeliveryOutcome`
+  itself is still not audited.
 
 ## Manual subscriber pause/resume (EB-113)
 
