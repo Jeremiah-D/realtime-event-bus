@@ -10575,6 +10575,19 @@ Semantics notes:
   are *unkeyed* — they can never feed back into the store (the key rides
   in the payload instead) — but are otherwise ordinary admitted publishes
   (counted, logged, fanned out).
+- Retune the changelog destination live with
+  `setStateStoreChangelogTopic(topic, actor?)` (EB-463): only the
+  destination moves — rows, `version`, `seq`, and `maxKeys` are untouched,
+  records already fanned out stay on the old topic, and the new topic
+  governs from the next update. A store with no changelog topic can opt
+  in live; passing `null` clears the topic so updates still land in the
+  table but no changelog record is fanned out. A bus whose state store is
+  not enabled throws `RangeError`, as does a non-string or empty topic;
+  an identical revision is a no-op with no audit. Audited as
+  `state_store_changelog_topic_revised`
+  (`{ changelogTopic, oldChangelogTopic }`, `null` on either side meaning
+  "no topic"). `getStateStoreChangelogTopic()` returns the live topic
+  (or `undefined`).
 - Restart recovery: with `durableLogDir`, `enableStateStore` rebuilds the
   table from the log's latest per-(topic, key) records (live segments
   only — archived segments predate them; TTL-expired records stay dead;

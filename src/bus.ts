@@ -22371,6 +22371,93 @@ export class EventBus {
   }
 
   /**
+   * Revises the materialized state store's changelog topic at runtime
+   * (EB-463): `setStateStoreChangelogTopic(topic, actor?)` retargets
+   * where the next state update's changelog record is fanned out
+   * (see `StateStoreOptions.changelogTopic`, EB-171).
+   *
+   * Only the topic moves: `observeAdmittedPublish` reads the live
+   * `stateStoreChangelogTopic` on every state update, so the new topic
+   * governs from the next update with no drain, re-registration, or
+   * replay. That is the whole point of this entry: the changelog topic
+   * is an enable-time value today, so switching the CDC destination
+   * means rebuilding the bus and losing every live subscription, queue,
+   * replay position — and the store itself.
+   * - A store with no topic yet can opt in: passing a non-empty string
+   *   where none was configured starts changelog fan-out on the next
+   *   state update (along the EB-460 "no topic can opt in" precedent).
+   * - Passing `null` clears the topic: updates still land in the table,
+   *   only the changelog fan-out stops.
+   * - Records already fanned out stay on the old topic: the fan-out
+   *   happens once, at update time.
+   * - The store rows, `version`, `seq`, and `maxKeys` are untouched by
+   *   the revision.
+   * - Changelog fan-out stays error-isolated (the existing try/catch in
+   *   `observeAdmittedPublish`).
+   *
+   * Fail-closed: a bus whose state store is not enabled has no topic to
+   * retarget and throws `RangeError` — unlike the construction-time
+   * option, which is silently inert without `enableStateStore`, a
+   * revision explicitly refuses. An illegal value — the topic must be a
+   * non-empty string or `null`, reusing the construction-time
+   * `validateStateStoreOptions` rule — also throws `RangeError` with the
+   * live topic and the audit log untouched. Passing the current topic
+   * (including clearing a store that has no topic) is a no-op with no
+   * audit. Audited as `state_store_changelog_topic_revised`
+   * (`{ changelogTopic, oldChangelogTopic }`, `null` on either side
+   * meaning "no topic") on success.
+   *
+   * Orthogonal to EB-171 (the state-store mechanism itself — this
+   * revises its changelog destination live), to EB-329 (that retunes
+   * the `maxKeys` capacity bound — that is capacity, this is
+   * destination; its doc says the changelog topic is untouched), to
+   * EB-460 (the dead-letter diagnostic topic — same "redirect the
+   * destination" shape, different subsystem), to EB-411 (the ops-alert
+   * sink — same shape, different channel), and to EB-399 (the S3
+   * offload client — same shape, different subsystem).
+   *
+   * Throws `RangeError` for a bad actor, for an illegal topic value, or
+   * when the state store is not enabled.
+   */
+  setStateStoreChangelogTopic(topic: string | null, actor = 'system'): void {
+    assertValidActor(actor, 'setStateStoreChangelogTopic');
+    if (this.stateStore === undefined) {
+      throw new RangeError(
+        'setStateStoreChangelogTopic: the state store is not enabled (call enableStateStore first)',
+      );
+    }
+    if (topic !== null && (typeof topic !== 'string' || topic.length === 0)) {
+      throw new RangeError(
+        'setStateStoreChangelogTopic: topic must be a non-empty string, or null to clear it',
+      );
+    }
+    const oldChangelogTopic = this.stateStoreChangelogTopic ?? null;
+    if (topic === oldChangelogTopic) {
+      return;
+    }
+    this.stateStoreChangelogTopic = topic ?? undefined;
+    this.auditSubscription({
+      action: 'state_store_changelog_topic_revised',
+      actor,
+      detail: {
+        changelogTopic: topic,
+        oldChangelogTopic,
+      },
+    });
+  }
+
+  /**
+   * Returns the state store's live changelog topic (EB-463) —
+   * `undefined` when the store is disabled or no changelog topic is
+   * configured. The topic is the live value
+   * `setStateStoreChangelogTopic` moves; `getStats()` carries no
+   * changelog-topic row.
+   */
+  getStateStoreChangelogTopic(): string | undefined {
+    return this.stateStoreChangelogTopic;
+  }
+
+  /**
    * Reads the latest materialized value for (topic, key) — `undefined`
    * when the store is disabled or the key was never published. The topic
    * is matched exactly (the alias-resolved concrete topic, as published).
