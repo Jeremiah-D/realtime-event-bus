@@ -7633,6 +7633,18 @@ bus.publish('orders.eu', quote, { ttlMs: 500 }); // this message: 500ms, rule ig
 bus.publish('orders.eu', quote); // this one: the 30s topic rule
 ```
 
+- **Bus-level default (EB-464).** `setDefaultTtlMs(ttlMs)` installs the
+  lifetime a publish falls back to when it carries no per-message
+  `ttlMs` and no topic rule matches — the priority chain is
+  per-message > topic rule > bus default > never expire. The factory
+  default is unset (`undefined` = messages never expire, exactly the
+  previous behavior); passing `undefined` clears it back. The default
+  is live-only (a restart restores the unset default), has no
+  construction-time option, and never enters a config snapshot.
+  Delayed schedules stamp their deadline at schedule time from the
+  default then in effect; a revision never moves an already-stamped
+  deadline.
+
 Semantics:
 
 - **Stamped at admission.** The deadline is `now + ttlMs`, stamped once

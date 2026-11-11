@@ -15555,6 +15555,15 @@ export class EventBus {
    */
   private defaultAckTimeoutMs = DEFAULT_ACK_TIMEOUT_MS;
   /**
+   * Live bus-level default message TTL (EB-464): the lifetime a publish
+   * falls back to when it carries no per-message `ttlMs` and no topic
+   * rule matches. Starts unset (`undefined` = messages never expire,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultTtlMs` — there is no construction-time option, and a
+   * restart restores the unset default.
+   */
+  private defaultTtlMs?: number;
+  /**
    * Live bus-level default drain timeout for graceful drains
    * (EB-405): the value `unsubscribe({ drain: true })` and `close()`
    * fall back to when the caller omits `drainTimeoutMs`. Starts at the
@@ -19173,6 +19182,86 @@ export class EventBus {
   }
 
   /**
+   * Revises the bus-level default message TTL live (EB-464) without
+   * restarting the bus: `setDefaultTtlMs(ttlMs)` installs the lifetime
+   * a publish falls back to when it carries no per-message `ttlMs` and
+   * no topic rule matches. The priority chain is per-message TTL >
+   * topic rule (`setTopicTtl`) > bus default > never expire.
+   *
+   * The factory default is unset (`undefined` = messages never
+   * expire, exactly the previous behavior). Passing `undefined`
+   * clears the default back to unset. The new value reuses the
+   * per-message TTL validation (`validateTtlMs`: a non-negative
+   * integer; `0` means the message expires immediately, matching
+   * `setTopicTtl`), so an illegal value throws `RangeError` with the
+   * live default untouched.
+   *
+   * Only future publishes are governed: a delayed schedule stamps its
+   * deadline at schedule time from the default then in effect, and a
+   * revision never moves an already-stamped deadline; live publishes
+   * read the default at fan-out time, and already-queued messages
+   * keep the deadline they were admitted with. Routed forwards carry
+   * the source message's deadline verbatim, and pause-admission and
+   * admission-DLQ deadlines keep their priority over the TTL chain.
+   *
+   * There is no construction-time option for this default (along
+   * `setRpcDefaultTimeoutMs`, EB-462, and `setDefaultAckTimeout`,
+   * EB-404): a deployment that wants a non-factory default sets it
+   * once after startup. The default is live-only — a restart restores
+   * the unset default — and it never enters a config snapshot (the
+   * snapshot still reports only the explicit topic rules).
+   *
+   * A revision identical to the current default (including clearing
+   * an already-unset default) is a no-op with no audit. Audited as
+   * `default_ttl_revised` (`{ previous_ttl_ms, ttl_ms }`, `null` when
+   * the default is unset).
+   *
+   * Orthogonal to EB-149 (that is the per-message TTL mechanism
+   * itself — this its bus-level default), to `setTopicTtl` /
+   * `clearTopicTtl` (those are the topic-level rules — this the bus
+   * fallback beneath them), to EB-177's absolute `deadlineAt` (the
+   * earlier of the two deadlines wins; this never moves it), to
+   * EB-204's EDF scheduling deadline (that only orders, never
+   * expires), to EB-247's `extendDelayedTtl` (that extends an
+   * already-scheduled message — this sets the default for
+   * not-yet-scheduled ones), to EB-221's key TTL (that is a
+   * durable-log compaction dimension), to EB-378's retained TTL (that
+   * only shortens snapshot freshness, never a message deadline), and
+   * to EB-110's expiring-soon observation (that only observes).
+   *
+   * Throws `RangeError` for an illegal actor or TTL value.
+   */
+  setDefaultTtlMs(ttlMs: number | undefined, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultTtlMs');
+    validateTtlMs(ttlMs, 'setDefaultTtlMs');
+    const previousTtlMs = this.defaultTtlMs;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previousTtlMs === ttlMs) {
+      return;
+    }
+    this.defaultTtlMs = ttlMs;
+    this.auditSubscription({
+      action: 'default_ttl_revised',
+      actor,
+      detail: {
+        previous_ttl_ms: previousTtlMs ?? null,
+        ttl_ms: ttlMs ?? null,
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default message TTL (EB-464): the
+   * lifetime a publish falls back to when it carries no per-message
+   * `ttlMs` and no topic rule matches — `undefined` before any
+   * revision (messages never expire), then whatever
+   * `setDefaultTtlMs` last installed.
+   */
+  getDefaultTtlMs(): number | undefined {
+    return this.defaultTtlMs;
+  }
+
+  /**
    * Retains the most recent admitted messages per matching topic in a
    * bounded in-memory ring buffer (EB-176), so a late-joining subscriber
    * immediately receives recent history without a durable log on disk.
@@ -20506,7 +20595,10 @@ export class EventBus {
   /**
    * Returns the TTL in milliseconds that applies to `topic`, or `undefined`
    * when no rule matches. An exact-topic rule wins over patterns; between
-   * patterns the earliest-registered matching rule wins.
+   * patterns the earliest-registered matching rule wins. When no rule
+   * matches, the bus-level default (`setDefaultTtlMs`, EB-464) applies
+   * as the last resort — `undefined` there means the message never
+   * expires.
    */
   private ttlForTopic(topic: string): number | undefined {
     const exact = this.ttlRules.get(topic);
@@ -20519,7 +20611,7 @@ export class EventBus {
       }
       if (matcher.test(topic)) return ttlMs;
     }
-    return undefined;
+    return this.defaultTtlMs;
   }
 
   /**
