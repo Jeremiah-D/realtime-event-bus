@@ -422,7 +422,15 @@ library.
   raised at runtime via `setGroupMaxMembers(groupId, pattern, n)` (never
   below the current member count); a stale limit from a dead generation
   is dropped when the group is recreated. `getStats().consumerGroups`
-  rows report the active limit as `memberLimit`. This is consumer-group
+  rows report the active limit as `memberLimit`. Bus-level default
+  (EB-467, via `setGroupDefaultMaxMembers(n | null)`): a new group
+  whose first member omits `maxMembers` takes the live bus default
+  instead of running uncapped — `null` clears it back to unset. An
+  explicit value always wins, a live group keeps the limit it was
+  recorded with, and a drained group recreated later takes the
+  default then in effect. Audited as
+  `group_default_max_members_revised` (`{ previous, maxMembers }`,
+  `null` when unset). This is consumer-group
   scale governance: it bounds the roster the rebalance and routing tables
   must handle, so a runaway autoscaler cannot drag a group into a
   rebalance storm. **Consumer-group auto.offset.reset** (EB-207):
