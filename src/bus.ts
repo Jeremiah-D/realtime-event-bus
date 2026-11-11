@@ -17693,6 +17693,16 @@ export class EventBus {
    */
   private groupDefaultMaxMembers?: number;
   /**
+   * Bus-level terminal group auto-commit default (EB-468): the
+   * `intervalMs` a new group falls back to when a joining member
+   * omits its own `autoCommit` (EB-127) and the group holds no
+   * recorded interval. Starts unset (`undefined` — no default, no
+   * auto-commit, exactly the previous behavior) and moves only via
+   * `setGroupDefaultAutoCommit`; there is no construction-time
+   * option, and a restart restores the unset default.
+   */
+  private groupDefaultAutoCommit?: number;
+  /**
    * Per-group static-membership session-timeout defaults (EB-403):
    * groupKey -> sessionTimeoutMs, set live via
    * `setGroupDefaultSessionTimeout` for future static members that
@@ -43215,6 +43225,16 @@ export class EventBus {
     // member-explicit option always wins (EB-207 semantics unchanged);
     // the group default only fills in when the member omits the option.
     const resetPolicy = autoOffsetReset ?? this.groupAutoOffsetReset.get(key) ?? this.groupDefaultAutoOffsetReset;
+    // Consumer-group offset auto-commit bus default (EB-468): a member
+    // that omits its own `autoCommit` falls back to the live bus
+    // default only when the group holds no recorded interval — a group
+    // with an interval keeps it, and a member that does not opt in
+    // joins freely. An explicit interval always wins, and a new
+    // generation (the last armed member left, so the dead interval was
+    // dropped) takes the default in effect at its first join.
+    const effectiveAutoCommitIntervalMs =
+      autoCommitIntervalMs ??
+      (this.groupAutoCommitIntervals.has(groupId) ? undefined : this.groupDefaultAutoCommit);
     // Partition mode is fixed by the group's first member; a disagreeing
     // joiner fails fast here, rolling back the just-registered subscriber
     // so no half-joined member is left behind.
@@ -43239,7 +43259,7 @@ export class EventBus {
       // fixes the group's interval and a later member that opts in with
       // a different one fails here, rolling back the just-registered
       // subscriber; a member that does not opt in joins freely.
-      this.checkAutoCommitConfig(groupId, autoCommitIntervalMs);
+      this.checkAutoCommitConfig(groupId, effectiveAutoCommitIntervalMs);
     } catch (err) {
       sub.unsubscribe();
       throw err;
@@ -43475,9 +43495,10 @@ export class EventBus {
     // Offset auto-commit (EB-127): arm the member's commit timer after the
     // join rebalance above flushed the group's pending checkpoints. Keyed
     // by roster key so a static rejoin re-arms in place instead of leaking
-    // a timer.
-    if (autoCommitIntervalMs !== undefined) {
-      this.armAutoCommitTimer(rosterKey, groupId, autoCommitIntervalMs);
+    // a timer. EB-468: a member that took the bus default arms at the
+    // effective interval, exactly like an explicit opt-in.
+    if (effectiveAutoCommitIntervalMs !== undefined) {
+      this.armAutoCommitTimer(rosterKey, groupId, effectiveAutoCommitIntervalMs);
     }
     return groupSubscription;
   }
@@ -47727,6 +47748,88 @@ export class EventBus {
    */
   getGroupDefaultMaxMembers(): number | undefined {
     return this.groupDefaultMaxMembers;
+  }
+
+  /**
+   * Sets the live bus-level terminal group auto-commit default
+   * (EB-468) without touching any live group:
+   * `setGroupDefaultAutoCommit(intervalMs, actor = 'system')`
+   * decides how often each armed member's commit timer checkpoints
+   * the group's pending offsets in a future consumer group whose
+   * joining member omits its own `autoCommit` (see
+   * `GroupSubscribeOptions.autoCommit`, EB-127) — `15` to commit
+   * new groups fleet-wide every 15ms with one call, `null` to
+   * clear the default back to no auto-commit.
+   *
+   * Only the default moves: the roster, the partition assignment,
+   * the committed offsets, and every live group are untouched, and
+   * no rebalance fires for the revision itself. The priority chain
+   * is member-explicit > bus default (the bus default is the
+   * terminal fallback — there is nothing below it). A group that
+   * took the default at creation keeps the interval it was
+   * recorded with: a later revision never moves a live group's
+   * interval, and `setGroupAutoCommit` still revises one live
+   * group at a time without touching the bus default. A group
+   * that drains fully and is recreated takes the default in
+   * effect at its recreation, like any new group — the stale
+   * interval from the dead generation is dropped, exactly as
+   * `disarmAutoCommitTimer` already drops it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * groups that have not joined yet, so it applies to every future
+   * group. The default is runtime state: it never enters a config
+   * snapshot and does not survive a restart, like the bus's other
+   * live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a finite
+   * number of milliseconds > 0 (`null` to clear) throws
+   * `RangeError` with the live default and the audit log
+   * untouched. A revision identical to the current default
+   * (including clearing an already-unset default) is a no-op with
+   * no audit. Audited as `group_default_auto_commit_revised`
+   * (`{ previous, intervalMs }`, `null` when the default is unset
+   * — unset means no auto-commit, exactly the previous behavior).
+   *
+   * Orthogonal to EB-127 (that is the auto-commit mechanism itself
+   * — this its missing bus-level terminal default), to
+   * `setGroupAutoCommit` (that revises one live group's interval —
+   * this the default new groups fall back to), to EB-465 (that
+   * revises the bus auto.offset.reset default — same "bus default"
+   * shape, a different knob), and to EB-467 (that revises the bus
+   * max-members default — same shape, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a finite number of milliseconds > 0 (or `null` to clear).
+   */
+  setGroupDefaultAutoCommit(intervalMs: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setGroupDefaultAutoCommit');
+    if (intervalMs !== null && (!Number.isFinite(intervalMs) || intervalMs <= 0)) {
+      throw new RangeError(
+        'setGroupDefaultAutoCommit: intervalMs must be a finite number of milliseconds > 0, or null to clear it',
+      );
+    }
+    const previous = this.groupDefaultAutoCommit ?? null;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === intervalMs) {
+      return;
+    }
+    this.groupDefaultAutoCommit = intervalMs ?? undefined;
+    this.auditSubscription({
+      action: 'group_default_auto_commit_revised',
+      actor,
+      detail: { previous, intervalMs },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal group auto-commit default
+   * (EB-468) — the interval new groups fall back to when a joining
+   * member omits its own `autoCommit` — `undefined` before any
+   * revision (no default, no auto-commit), then whatever
+   * `setGroupDefaultAutoCommit` last installed.
+   */
+  getGroupDefaultAutoCommit(): number | undefined {
+    return this.groupDefaultAutoCommit;
   }
 
   /**

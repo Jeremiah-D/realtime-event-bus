@@ -290,7 +290,15 @@ library.
   is a no-op with no audit. Audited as `group_auto_commit_revised`
   (`{ intervalMs, oldIntervalMs }`); `getGroupAutoCommit(groupId)`
   reports the live interval, or `undefined` when the group never opted
-  in. Opt-in `partitions` on `subscribeToGroup` switches a
+  in. Bus-level default (EB-468, via
+  `setGroupDefaultAutoCommit(intervalMs | null, actor = 'system')`): a
+  new group whose joining member omits `autoCommit` takes the live bus
+  default instead of running with no auto-commit — `null` clears it
+  back to unset. An explicit interval always wins, a live group keeps
+  the interval it was recorded with, and a drained group recreated
+  later takes the default then in effect. Audited as
+  `group_default_auto_commit_revised` (`{ previous, intervalMs }`,
+  `null` when unset). Opt-in `partitions` on `subscribeToGroup` switches a
   competing set from per-message round-robin to Kafka-style partition
   assignment: the key space is divided into N logical partitions, each owned
   exclusively by one member. A keyed message's partition is
