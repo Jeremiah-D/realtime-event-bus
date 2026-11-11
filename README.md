@@ -11391,6 +11391,25 @@ bus.subscribePatch('state.devices', 'thermostat-1', (snapshot, msg) => {
   `rebuildPatchSnapshot(topic, key)` replays the log and restores the
   snapshot after a restart. Only the RFC 6902 subset `add` / `remove` /
   `replace` is supported (`move`, `copy`, `test` are rejected).
+- **Live revision (EB-458).** The observation callbacks are revisable
+  without re-subscribing via `revisePatchCallbacks(subId, patch)`:
+  either of `onPatchGap` / `onPatchApplyError` can be replaced or
+  cleared with an explicit `null`, and a patch subscription that
+  installed no callback can gain one after the fact — the new
+  callbacks govern from the next gap / apply failure, while the
+  tracker's version count, snapshot, and `applyErrors` are untouched
+  (a cleared callback leaves the gap skipped and the apply failure
+  counted, just with nobody receiving). The gate is the subscription
+  kind: a plain `subscribe` has no patch holder and is refused with
+  `RangeError` until it re-subscribes via `subscribePatch` to opt in.
+  An unknown subscriber, a patch with neither field, or a non-function
+  non-`null` callback also throws `RangeError` with the live callbacks
+  untouched, and a revision identical to the live callbacks is a
+  no-op with no audit. Every success is audited as
+  `patch_callbacks_revised` (`{ onPatchGap: 'set' | 'cleared' |
+  'unchanged', oldOnPatchGap: 'set' | 'absent', onPatchApplyError:
+  'set' | 'cleared' | 'unchanged', oldOnPatchApplyError: 'set' |
+  'absent' }`).
 
 ## Durable-log time-travel accelerated replay (EB-203)
 

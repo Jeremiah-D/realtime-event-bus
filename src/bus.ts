@@ -9490,6 +9490,22 @@ interface Subscriber {
    */
   catchUpOnReplay: boolean;
   /**
+   * JSON Patch observation callbacks (EB-202): the live `onPatchGap` /
+   * `onPatchApplyError` observers for a `subscribePatch` subscription,
+   * held in one mutable object so `revisePatchCallbacks` (EB-458) can
+   * swap them without re-subscribing — the patch `wrapped` handler
+   * reads this holder at call time, never a subscribe-time capture.
+   * Present only on `subscribePatch` subscriptions; a plain
+   * `subscribe` has no holder, which is the gate that refuses a
+   * revision on it until it re-subscribes via `subscribePatch` to opt
+   * in. A patch subscription that installed no callback can gain one
+   * after the fact — the holder exists with both fields unset.
+   */
+  patchCallbacks?: {
+    onPatchGap?: (event: PatchGapEvent) => void;
+    onPatchApplyError?: (event: PatchApplyErrorEvent) => void;
+  };
+  /**
    * Credit-based pull-style flow control (see `EventBus.grantCredits`,
    * EB-117). Opt-in: absent means the subscriber has unlimited delivery
    * credit — zero behavior change until the first `grantCredits` call
@@ -29472,7 +29488,9 @@ export class EventBus {
    * 6902 patch would corrupt state, so the gap must be repaired (see
    * `rebuildPatchSnapshot`). Stale redeliveries are ignored silently.
    * Patch apply failures fire `onPatchApplyError`. Both callbacks are
-   * error-isolated: a throwing callback never breaks delivery.
+   * error-isolated: a throwing callback never breaks delivery. Both
+   * are revisable live via `revisePatchCallbacks` (EB-458) without
+   * re-subscribing.
    *
    * The subscription itself is a plain (non-reliable) subscription;
    * batch handlers are not supported.
@@ -29495,8 +29513,16 @@ export class EventBus {
       throw new RangeError('subscribePatch: batch handlers are not supported');
     }
     const tracker = new PatchVersionTracker();
-    const onPatchGap = opts?.onPatchGap;
-    const onPatchApplyError = opts?.onPatchApplyError;
+    // Live callback holder (EB-458): `wrapped` reads these at call
+    // time, never the subscribe-time captures, so `revisePatchCallbacks`
+    // can swap the observers without re-subscribing. The holder is
+    // attached to the subscriber record below so the revision entry
+    // can locate it; a patch subscription that installed no callback
+    // can gain one after the fact.
+    const patchCallbacks: NonNullable<Subscriber['patchCallbacks']> = {
+      onPatchGap: opts?.onPatchGap,
+      onPatchApplyError: opts?.onPatchApplyError,
+    };
     const wrapped: MessageHandler = (msg) => {
       const headers = msg.headers;
       if (headers?.[PATCH_HEADER] === '1' && isPatchEnvelope(msg.payload) && msg.payload.key === key) {
@@ -29504,7 +29530,7 @@ export class EventBus {
         if (!Number.isInteger(version) || version < 1) {
           tracker.applyErrors += 1;
           try {
-            onPatchApplyError?.({
+            patchCallbacks.onPatchApplyError?.({
               topic: msg.topic,
               key,
               version: Number.NaN,
@@ -29522,7 +29548,7 @@ export class EventBus {
           verdict = tracker.consumeRemote(version, msg.payload.ops);
         } catch (error) {
           try {
-            onPatchApplyError?.({ topic: msg.topic, key, version, error: error as Error });
+            patchCallbacks.onPatchApplyError?.({ topic: msg.topic, key, version, error: error as Error });
           } catch {
             // Error-isolated.
           }
@@ -29532,7 +29558,7 @@ export class EventBus {
           handler(tracker.snapshot, msg);
         } else if (verdict === 'gap') {
           try {
-            onPatchGap?.({
+            patchCallbacks.onPatchGap?.({
               topic: msg.topic,
               key,
               expectedVersion: tracker.version + 1,
@@ -29562,7 +29588,14 @@ export class EventBus {
       }
       handler(tracker.snapshot, msg);
     };
-    return this.subscribe(topicPattern, wrapped, opts);
+    const subscription = this.subscribe(topicPattern, wrapped, opts);
+    // Attach the holder to the subscriber record so
+    // `revisePatchCallbacks` can locate it (EB-458).
+    const record = this.subscribers.get(subscription.id);
+    if (record !== undefined) {
+      record.patchCallbacks = patchCallbacks;
+    }
+    return subscription;
   }
 
   /* ------------------------------------------------------------------ */
@@ -41046,6 +41079,154 @@ export class EventBus {
       subId: subscriber.id,
       pattern: subscriber.pattern,
       detail: { catchUpOnReplay: enabled, oldCatchUpOnReplay },
+    });
+  }
+
+  /**
+   * Revises one JSON Patch subscriber's observation callbacks (EB-458)
+   * without re-subscribing: `revisePatchCallbacks(subId, patch)` swaps
+   * `onPatchGap` and/or `onPatchApplyError` in place (see
+   * `SubscribePatchOptions.onPatchGap` / `onPatchApplyError`, EB-202) —
+   * the observation hooks are subscribe-time values today, so changing
+   * the gap / apply-error recipient means re-subscribing and losing
+   * the `PatchVersionTracker`'s version count and snapshot baseline
+   * (the rebuilt subscription must wait for the next full publish to
+   * re-establish its snapshot).
+   *
+   * Only the callbacks move: the patch `wrapped` handler reads the
+   * live holder on every patch envelope, so the new callbacks govern
+   * from the next gap / apply failure — with no re-registration, no
+   * version reset, and no snapshot rebuild. Either field can be
+   * replaced or cleared with an explicit `null` (cleared means silent
+   * observation: the gap is still skipped, the apply failure still
+   * counts into `tracker.applyErrors`, and the snapshot still stands
+   * — just with nobody receiving). A field left out of the patch
+   * keeps its live value. A patch that provides neither field is
+   * refused. A patch subscription that installed no callback at
+   * subscribe time can gain one after the fact — the holder exists
+   * for every `subscribePatch` subscription, with the callbacks
+   * unset.
+   *
+   * Fail-closed: an unknown subscriber id, a non-object patch, a
+   * patch with neither field, an illegal callback value (a
+   * non-function non-`null` callback), and a revision on a plain
+   * `subscribe` subscription (which has no patch holder — the patch
+   * observation hooks are the `subscribePatch` kind itself) all
+   * throw `RangeError` with the live callbacks, the tracker, the
+   * snapshot, and the audit log untouched. A revision identical to
+   * the live callbacks — the same function references, including
+   * clearing a callback that was never set — is a no-op with no
+   * audit. Audited as `patch_callbacks_revised` (`{ onPatchGap:
+   * 'set' | 'cleared' | 'unchanged', oldOnPatchGap: 'set' | 'absent',
+   * onPatchApplyError: 'set' | 'cleared' | 'unchanged',
+   * oldOnPatchApplyError: 'set' | 'absent' }` — the callbacks
+   * themselves are functions and are never serialized into the audit
+   * record, only their set/cleared state).
+   *
+   * Orthogonal to EB-202 (that is the patch mechanism itself — this
+   * its observation hooks), to EB-455 / EB-456 (sibling
+   * subscription-level callback revisions — this the patch observers,
+   * a different hook of the same family), and to
+   * `rebuildPatchSnapshot` (that repairs the snapshot — this who
+   * hears about the gap / apply failure).
+   *
+   * Throws `RangeError` for an unknown subscriber, an illegal patch,
+   * an illegal callback value, or a revision on a non-patch
+   * subscription.
+   */
+  revisePatchCallbacks(
+    subId: string,
+    patch: {
+      onPatchGap?: (event: PatchGapEvent) => void | null;
+      onPatchApplyError?: (event: PatchApplyErrorEvent) => void | null;
+    },
+  ): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('revisePatchCallbacks: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`revisePatchCallbacks: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: a non-object patch, a patch
+    // that provides neither callback, and an illegal callback value
+    // all fail closed — `undefined` is not a value, so a field left
+    // out keeps its live value, exactly like the other revision
+    // entries; `null` clears back to silent observation.
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        'revisePatchCallbacks: patch must be an object with onPatchGap and/or onPatchApplyError',
+      );
+    }
+    if (patch.onPatchGap === undefined && patch.onPatchApplyError === undefined) {
+      throw new RangeError(
+        'revisePatchCallbacks: patch must provide onPatchGap and/or onPatchApplyError',
+      );
+    }
+    if (
+      patch.onPatchGap !== undefined &&
+      patch.onPatchGap !== null &&
+      typeof patch.onPatchGap !== 'function'
+    ) {
+      throw new RangeError('revisePatchCallbacks: onPatchGap must be a function or null');
+    }
+    if (
+      patch.onPatchApplyError !== undefined &&
+      patch.onPatchApplyError !== null &&
+      typeof patch.onPatchApplyError !== 'function'
+    ) {
+      throw new RangeError('revisePatchCallbacks: onPatchApplyError must be a function or null');
+    }
+    // The gate is the subscription kind itself: only `subscribePatch`
+    // installs the holder. A plain `subscribe` has no patch hooks to
+    // retarget, so it must re-subscribe via `subscribePatch` to opt in.
+    const holder = subscriber.patchCallbacks;
+    if (holder === undefined) {
+      throw new RangeError(
+        'revisePatchCallbacks: subscriber is not a patch subscription — re-subscribe with subscribePatch to opt in',
+      );
+    }
+    const nextOnPatchGap =
+      patch.onPatchGap === undefined ? holder.onPatchGap : (patch.onPatchGap ?? undefined);
+    const nextOnPatchApplyError =
+      patch.onPatchApplyError === undefined
+        ? holder.onPatchApplyError
+        : (patch.onPatchApplyError ?? undefined);
+    // Re-affirming the live callbacks is a no-op: no swap, no audit —
+    // including clearing a callback that was never set.
+    if (nextOnPatchGap === holder.onPatchGap && nextOnPatchApplyError === holder.onPatchApplyError) {
+      return;
+    }
+    const oldOnPatchGap = holder.onPatchGap === undefined ? 'absent' : 'set';
+    const oldOnPatchApplyError = holder.onPatchApplyError === undefined ? 'absent' : 'set';
+    const onPatchGapPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onPatchGap === undefined
+        ? 'unchanged'
+        : patch.onPatchGap === null
+          ? 'cleared'
+          : 'set';
+    const onPatchApplyErrorPresence: 'set' | 'cleared' | 'unchanged' =
+      patch.onPatchApplyError === undefined
+        ? 'unchanged'
+        : patch.onPatchApplyError === null
+          ? 'cleared'
+          : 'set';
+    // Only the callbacks move; the tracker's version count, snapshot,
+    // and `applyErrors` are untouched, and every patch envelope reads
+    // the live values from here on.
+    holder.onPatchGap = nextOnPatchGap;
+    holder.onPatchApplyError = nextOnPatchApplyError;
+    this.auditSubscription({
+      action: 'patch_callbacks_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        onPatchGap: onPatchGapPresence,
+        oldOnPatchGap,
+        onPatchApplyError: onPatchApplyErrorPresence,
+        oldOnPatchApplyError,
+      },
     });
   }
 
