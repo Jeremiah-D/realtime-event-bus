@@ -10288,6 +10288,17 @@ Semantics notes:
   <number> | null, oldWindowMs: <number> | null }`, `null` when the
   group is undebounced; `groupId` / `pattern` ride on the event
   itself, like `rebalance`).
+- Bus-level default (EB-469, via
+  `setGroupDefaultRebalanceDebounce(windowMs | null, actor =
+  'system')`): a new group whose joining member omits
+  `rebalanceDebounceMs` takes the live bus default instead of
+  running with immediate rebalances — `null` (or `0`, the "no
+  debounce" spelling) clears it back to unset. An explicit window
+  always wins, including explicit `0`; a live group keeps the window
+  it was configured with, and a drained group recreated later takes
+  the default then in effect. Audited as
+  `group_default_rebalance_debounce_revised` (`{ previous, windowMs
+  }`, `null` when unset).
 - If the group fully drains mid-window, the pending window is dropped
   without flushing — a window never fires into the next generation's
   roster. The membership facts remain in the per-change

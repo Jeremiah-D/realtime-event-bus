@@ -17703,6 +17703,16 @@ export class EventBus {
    */
   private groupDefaultAutoCommit?: number;
   /**
+   * Bus-level terminal group rebalance-debounce default (EB-469): the
+   * `windowMs` a new group falls back to when a joining member omits
+   * its own `rebalanceDebounceMs` (EB-169) and the group holds no
+   * window yet. Starts unset (`undefined` — no default, immediate
+   * rebalances, exactly the previous behavior) and moves only via
+   * `setGroupDefaultRebalanceDebounce`; there is no construction-time
+   * option, and a restart restores the unset default.
+   */
+  private groupDefaultRebalanceDebounce?: number;
+  /**
    * Per-group static-membership session-timeout defaults (EB-403):
    * groupKey -> sessionTimeoutMs, set live via
    * `setGroupDefaultSessionTimeout` for future static members that
@@ -43241,7 +43251,20 @@ export class EventBus {
     try {
       this.checkPartitionConfig(key, partitions);
       this.checkAssignmentConfig(key, assignment, assignor);
-      this.checkDebounceConfig(key, rebalanceDebounceMs > 0 ? rebalanceDebounceMs : undefined);
+      // Rebalance debounce bus default (EB-469): a member that omits
+      // `rebalanceDebounceMs` falls back to the live bus default only
+      // when the group holds no window yet — a group with a window
+      // keeps it (the omitting member inherits it), and a new
+      // generation (no live roster, so its stale window is re-fixed)
+      // takes the default in effect at its first join. An explicit
+      // value always wins, including explicit 0 ("no debounce").
+      const effectiveDebounceMs =
+        opts?.rebalanceDebounceMs !== undefined
+          ? rebalanceDebounceMs
+          : (!this.groupMembers.has(key) || this.rebalancer.getWindowMs(key) === undefined
+              ? (this.groupDefaultRebalanceDebounce ?? 0)
+              : 0);
+      this.checkDebounceConfig(key, effectiveDebounceMs > 0 ? effectiveDebounceMs : undefined);
       // Pluggable assignor fail-fast (EB-106): a custom assignor's result
       // is validated against the post-join roster before the roster is
       // touched, so an invalid assignment throws here with nothing to
@@ -47830,6 +47853,96 @@ export class EventBus {
    */
   getGroupDefaultAutoCommit(): number | undefined {
     return this.groupDefaultAutoCommit;
+  }
+
+  /**
+   * Sets the live bus-level terminal group rebalance-debounce default
+   * (EB-469) without touching any live group:
+   * `setGroupDefaultRebalanceDebounce(windowMs, actor = 'system')`
+   * decides how long a burst of membership changes is merged into
+   * one rebalance event in a future consumer group whose joining
+   * member omits its own `rebalanceDebounceMs` (see
+   * `GroupSubscribeOptions.rebalanceDebounceMs`, EB-169) — `500`
+   * to steady a flapping fleet with one call, `null`
+   * to clear the default back to immediate rebalances.
+   *
+   * Only the default moves: the roster, the partition assignment,
+   * the assignor, and every live group are untouched, and no
+   * rebalance fires for the revision itself. The priority chain is
+   * member-explicit > bus default (the bus default is the terminal
+   * fallback — there is nothing below it). A group that took the
+   * default at creation keeps the window it was configured with: a
+   * later revision never moves a live group's window, and
+   * `setGroupRebalanceDebounce` still retunes one live group at a
+   * time without touching the bus default. A window already armed
+   * keeps the timer it was armed with and flushes at the old value.
+   * A group that drains fully and is recreated takes the default in
+   * effect at its recreation, like any new group — the stale window
+   * from the dead generation is re-fixed, exactly as
+   * `checkDebounceConfig` already re-fixes it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * groups that have not joined yet, so it applies to every future
+   * group. The default is runtime state: it never enters a config
+   * snapshot and does not survive a restart, like the bus's other
+   * live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a finite
+   * number of milliseconds >= 0 (`null` to clear) throws
+   * `RangeError` with the live default and the audit log untouched.
+   * `0` is the construction-time "no debounce" spelling and is
+   * normalized to `null` (clear), like `setGroupRebalanceDebounce`.
+   * A revision identical to the current default (including clearing
+   * an already-unset default) is a no-op with no audit. Audited as
+   * `group_default_rebalance_debounce_revised`
+   * (`{ previous, windowMs }`, `null` when the default is unset —
+   * unset means immediate rebalances, exactly the previous
+   * behavior).
+   *
+   * Orthogonal to EB-169 (that is the debounce mechanism itself —
+   * this its missing bus-level terminal default), to
+   * `setGroupRebalanceDebounce` (that retunes one live group's
+   * window — this the default new groups fall back to), to EB-465
+   * (that revises the bus auto.offset.reset default — same "bus
+   * default" shape, a different knob), and to EB-468 (that revises
+   * the bus auto-commit default — same shape, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a finite number of milliseconds >= 0 (or `null` to clear).
+   */
+  setGroupDefaultRebalanceDebounce(windowMs: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setGroupDefaultRebalanceDebounce');
+    if (windowMs !== null && (!Number.isFinite(windowMs) || windowMs < 0)) {
+      throw new RangeError(
+        'setGroupDefaultRebalanceDebounce: windowMs must be a finite number of milliseconds >= 0, or null to clear it',
+      );
+    }
+    // 0 is the construction-time "no debounce" spelling: normalize it
+    // to null (clear), like `setGroupRebalanceDebounce`.
+    const next = windowMs === 0 ? null : windowMs;
+    const previous = this.groupDefaultRebalanceDebounce ?? null;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === next) {
+      return;
+    }
+    this.groupDefaultRebalanceDebounce = next ?? undefined;
+    this.auditSubscription({
+      action: 'group_default_rebalance_debounce_revised',
+      actor,
+      detail: { previous, windowMs: next },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal group rebalance-debounce
+   * default (EB-469) — the window new groups fall back to when a
+   * joining member omits its own `rebalanceDebounceMs` —
+   * `undefined` before any revision (no default, immediate
+   * rebalances), then whatever `setGroupDefaultRebalanceDebounce`
+   * last installed.
+   */
+  getGroupDefaultRebalanceDebounce(): number | undefined {
+    return this.groupDefaultRebalanceDebounce;
   }
 
   /**
