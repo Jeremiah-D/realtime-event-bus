@@ -457,6 +457,15 @@ library.
   actor = 'system')` drops it (returning whether one was stored), and
   `getStats().consumerGroups` rows report it as `autoOffsetReset`. Audited
   as `group_auto_offset_reset_revised` / `group_auto_offset_reset_cleared`.
+  The bus-level terminal default can be revised live via
+  `setGroupDefaultAutoOffsetReset(policy, actor = 'system')` (EB-465):
+  it fills in only when a joining member omits its own `autoOffsetReset`
+  and its group holds no stored group default — member-explicit > group
+  default > bus default. The factory default is `'earliest'` (the
+  previous hard-coded terminal value); restoring it is
+  `setGroupDefaultAutoOffsetReset('earliest')`, there is no clear method.
+  The revision is live-only (a restart restores `'earliest'`), touches no
+  live member or committed offset, and fires no rebalance.
   **Consumer-group offset seek** (EB-376):
   `seekGroupOffsets(groupId, pattern, targets, { actor = 'system' })` is the Kafka-style operator seek —
   it repositions a group's committed offsets at runtime and replays the live members from the new positions,

@@ -17665,6 +17665,16 @@ export class EventBus {
    */
   private groupAutoOffsetReset = new Map<string, 'earliest' | 'latest'>();
   /**
+   * Bus-level terminal auto.offset.reset default (EB-465): the policy
+   * a joining member falls back to when it omits its own
+   * `autoOffsetReset` and its group holds no stored group default
+   * (EB-400). Starts at `'earliest'` — the previous hard-coded
+   * terminal value, so behavior is unchanged — and moves only via
+   * `setGroupDefaultAutoOffsetReset`; there is no construction-time
+   * option, and a restart restores `'earliest'`.
+   */
+  private groupDefaultAutoOffsetReset: 'earliest' | 'latest' = 'earliest';
+  /**
    * Per-group static-membership session-timeout defaults (EB-403):
    * groupKey -> sessionTimeoutMs, set live via
    * `setGroupDefaultSessionTimeout` for future static members that
@@ -43182,7 +43192,7 @@ export class EventBus {
     // Consumer-group auto.offset.reset group default (EB-400): the
     // member-explicit option always wins (EB-207 semantics unchanged);
     // the group default only fills in when the member omits the option.
-    const resetPolicy = autoOffsetReset ?? this.groupAutoOffsetReset.get(key) ?? 'earliest';
+    const resetPolicy = autoOffsetReset ?? this.groupAutoOffsetReset.get(key) ?? this.groupDefaultAutoOffsetReset;
     // Partition mode is fixed by the group's first member; a disagreeing
     // joiner fails fast here, rolling back the just-registered subscriber
     // so no half-joined member is left behind.
@@ -47441,6 +47451,91 @@ export class EventBus {
       detail: { previous_policy: previousPolicy },
     });
     return true;
+  }
+
+  /**
+   * Sets the live bus-level terminal auto.offset.reset default (EB-465)
+   * without re-subscribing anyone:
+   * `setGroupDefaultAutoOffsetReset(policy, actor = 'system')` decides
+   * where future members of any group start when they omit their own
+   * `autoOffsetReset` and their group holds no stored group default
+   * (see `GroupSubscribeOptions.autoOffsetReset`, EB-207, and
+   * `setGroupAutoOffsetReset`, EB-400) — `'latest'` to skip the
+   * backlog fleet-wide after an incident, `'earliest'` to replay it
+   * after a fix.
+   *
+   * Only the default moves: the roster, the partition assignment, the
+   * committed offsets, and every live member are untouched, and no
+   * rebalance fires for the revision itself. The priority chain is
+   * member-explicit > group default > bus default (the bus default is
+   * the terminal fallback — there is nothing below it). An explicit
+   * `resumeFromSeq` / `resumeFromTime` still wins over the policy
+   * (EB-207); a static rejoin inside its session window never resets.
+   * The resetOnlyOnce gate is unchanged: once any committed offset
+   * exists for the group, a joining member takes the normal
+   * committed-offset recovery path and the default never fires.
+   *
+   * There is no existence gate and no group scoping — the default
+   * exists precisely for groups that have not joined yet, so it
+   * applies to every group, including ones created after the
+   * revision. The default is runtime state: it never enters a config
+   * snapshot and does not survive a restart, like the group's other
+   * live revisions.
+   *
+   * Fail-closed: an illegal actor or a policy other than `'earliest'` /
+   * `'latest'` throws `RangeError` with the live default and the audit
+   * log untouched. A revision identical to the current default is a
+   * no-op with no audit. Audited as
+   * `group_default_auto_offset_reset_revised`
+   * (`{ previous_policy, policy }`, both always present — restoring
+   * the factory default is `setGroupDefaultAutoOffsetReset('earliest')`;
+   * there is no clear method, unlike the group-level
+   * `clearGroupAutoOffsetReset`, because the bus default is always a
+   * value).
+   *
+   * Orthogonal to EB-207 (that is the positioning mechanism itself —
+   * this its missing bus-level terminal default), to EB-400 (that
+   * revises the group's default — this the bus fallback beneath it;
+   * a stored group default always wins over this one), to EB-403
+   * (that revises the group's session-timeout default — same "group
+   * default" shape, a different knob), to EB-363 (that revises the
+   * group's lag threshold default — same shape, a different knob),
+   * to EB-376 (that seeks live members and checkpoints — this only
+   * positions future joins with no committed offset), and to EB-32
+   * (offset storage — this reads that storage's policy).
+   *
+   * Throws `RangeError` for an illegal actor or a policy other than
+   * `'earliest'` / `'latest'`.
+   */
+  setGroupDefaultAutoOffsetReset(policy: 'earliest' | 'latest', actor = 'system'): void {
+    assertValidActor(actor, 'setGroupDefaultAutoOffsetReset');
+    if (policy !== 'earliest' && policy !== 'latest') {
+      throw new RangeError(
+        "setGroupDefaultAutoOffsetReset: policy must be 'earliest' or 'latest'",
+      );
+    }
+    const previousPolicy = this.groupDefaultAutoOffsetReset;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previousPolicy === policy) {
+      return;
+    }
+    this.groupDefaultAutoOffsetReset = policy;
+    this.auditSubscription({
+      action: 'group_default_auto_offset_reset_revised',
+      actor,
+      detail: { previous_policy: previousPolicy, policy },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal auto.offset.reset default
+   * (EB-465) — the policy future members fall back to when they omit
+   * their own `autoOffsetReset` and their group holds no stored group
+   * default — `'earliest'` before any revision, then whatever
+   * `setGroupDefaultAutoOffsetReset` last installed.
+   */
+  getGroupDefaultAutoOffsetReset(): 'earliest' | 'latest' {
+    return this.groupDefaultAutoOffsetReset;
   }
 
   /**
