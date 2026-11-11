@@ -10948,6 +10948,21 @@ Semantics:
   log correlation. A request whose publish is not admitted (schema
   rejection, rate-limit shed, …) rejects fast with the admission reason
   instead of waiting out the timeout.
+- **Bus-level default timeout.** `timeoutMs` (and the whole `opts`
+  object) is optional: a bare `requestResponse(topic, payload)` waits
+  the live bus default — 5000ms at factory, readable via
+  `getRpcDefaultTimeoutMs()` and live-revisable via
+  `setRpcDefaultTimeoutMs(timeoutMs, actor = 'system')` (EB-462). A
+  revision takes effect only for calls started after it — a request
+  already pending keeps the timer it was armed with — and a
+  caller-explicit `timeoutMs` always wins over the bus default, in
+  both directions. The error of a timed-out call carries the effective
+  timeout (the resolved value, per-call or default). There is no
+  construction-time option — a restart restores 5000 — and restoring
+  the factory default is `setRpcDefaultTimeoutMs(5000)`; a revision
+  identical to the current default is a silent no-op. Every real
+  change is audited as `rpc_default_timeout_revised`
+  (`{ previous_timeout_ms, timeout_ms }`).
 - **Manual handshake.** `publish` accepts `correlationId` / `replyTo`
   directly (`PublishOptions`), stamped on `BusMessage.correlationId` /
   `BusMessage.replyTo` for hand-rolled RPC. The lenient `messageId`

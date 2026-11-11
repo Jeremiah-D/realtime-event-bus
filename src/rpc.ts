@@ -88,8 +88,12 @@ export interface RequestResponseOptions {
   /**
    * How long to wait for the first response before rejecting with
    * `RequestTimeoutError`. Must be a finite number greater than 0.
+   * Optional since EB-462: omitted, `requestResponse` falls back to
+   * the bus-level default (`getRpcDefaultTimeoutMs()`, 5000ms at
+   * factory) — a caller-explicit value always wins over the default,
+   * and the resolved value is what the error carries.
    */
-  timeoutMs: number;
+  timeoutMs?: number;
   /**
    * Caller-supplied correlation id. Must be a non-empty string when
    * given; a duplicate of an already-pending request's id throws

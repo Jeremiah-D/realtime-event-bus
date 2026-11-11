@@ -14383,6 +14383,17 @@ const DEFAULT_STATIC_SESSION_TIMEOUT_MS = 30_000;
  */
 const DEFAULT_ACK_TIMEOUT_MS = 5000;
 
+/**
+ * Default request–reply RPC response-wait timeout (EB-462): how long
+ * `requestResponse` waits for the first response when the caller omits
+ * `timeoutMs`. 5s — the same factory value as the reliable ack default
+ * above: short enough that a dead responder is noticed quickly, long
+ * enough for a normal handler to answer. The bus-level default is
+ * live-revisable via `setRpcDefaultTimeoutMs`; a caller-explicit
+ * `timeoutMs` always wins over it.
+ */
+const DEFAULT_RPC_TIMEOUT_MS = 5000;
+
 /** Resolved (validated, defaulted) form of `CompressionAutoTrainOptions`. */
 interface ResolvedAutoTrainOptions {
   sampleCount: number;
@@ -15525,6 +15536,15 @@ export class EventBus {
    */
   private rpcSettledRingSize = RPC_SETTLED_RING_SIZE;
   private rpcSettledTtlMs = RPC_SETTLED_TTL_MS;
+  /**
+   * Live bus-level default RPC response-wait timeout (EB-462): the
+   * value `requestResponse` falls back to when the caller omits
+   * `timeoutMs`. Starts at the module default
+   * (`DEFAULT_RPC_TIMEOUT_MS`) and moves only via
+   * `setRpcDefaultTimeoutMs` — there is no construction-time option,
+   * and a restart restores the default.
+   */
+  private rpcDefaultTimeoutMs = DEFAULT_RPC_TIMEOUT_MS;
   /**
    * Live bus-level default ack timeout for reliable subscriptions
    * (EB-404): the value `subscribeReliable` falls back to when the
@@ -49209,12 +49229,22 @@ export class EventBus {
    * `getStats().rpc.discardedResponses`.
    *
    * Resolves with the response message's `payload`. Rejects with
-   * `RequestTimeoutError` (carrying `correlationId` and `timeoutMs`)
-   * when nothing arrives within `timeoutMs`, or fast — without waiting
-   * — when the request publish itself is not admitted (the rejection
-   * reason is in the error message). A duplicate of an already-pending
-   * `correlationId` throws `RangeError`; a non-positive `timeoutMs`
-   * throws `RangeError`.
+   * `RequestTimeoutError` (carrying `correlationId` and the effective
+   * `timeoutMs` — the caller-explicit value, or the live bus default
+   * when the call omits it) when nothing arrives within `timeoutMs`,
+   * or fast — without waiting — when the request publish itself is
+   * not admitted (the rejection reason is in the error message). A
+   * duplicate of an already-pending `correlationId` throws
+   * `RangeError`; a non-positive `timeoutMs` throws `RangeError`.
+   *
+   * The `opts` object itself is optional since EB-462, as is its
+   * `timeoutMs`: a bare `requestResponse(topic, payload)` waits the
+   * live bus default (`getRpcDefaultTimeoutMs()`, 5000ms at factory,
+   * live-revisable via `setRpcDefaultTimeoutMs`). The default is
+   * resolved at call time, so only calls started after a revision see
+   * it — a request already pending keeps the timer it was armed with.
+   * A caller-explicit `timeoutMs` always wins over the bus default,
+   * in both directions.
    *
    * The router subscription is created on the first call and shared by
    * every request; `reliable: true` (or `{ ackTimeoutMs }`) makes it a
@@ -49231,12 +49261,16 @@ export class EventBus {
   requestResponse(
     topic: string,
     payload: unknown,
-    opts: RequestResponseOptions & { publishOptions?: PublishOptions },
+    opts?: RequestResponseOptions & { publishOptions?: PublishOptions },
   ): Promise<unknown> {
     // 'publish' is the honest action label: the call's fallible new work
     // is publishing the request (the reply subscription is lazy).
     this.assertNotClosed('publish', topic);
-    const timeoutMs = opts?.timeoutMs;
+    // EB-462: the per-call value wins; omitted, the live bus default
+    // stands in. The resolved value reuses the existing gate below, so
+    // an illegal explicit value still throws RangeError with the live
+    // default untouched.
+    const timeoutMs = opts?.timeoutMs ?? this.rpcDefaultTimeoutMs;
     if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw new RangeError('requestResponse: timeoutMs must be a finite number greater than 0');
     }
@@ -49472,6 +49506,88 @@ export class EventBus {
    */
   getRpcSettledRetention(): RpcSettledRetention {
     return { ringSize: this.rpcSettledRingSize, ttlMs: this.rpcSettledTtlMs };
+  }
+
+  /**
+   * Revises the bus-level default RPC response-wait timeout live
+   * (EB-462) without restarting the bus:
+   * `setRpcDefaultTimeoutMs(timeoutMs, actor = 'system')` retunes how
+   * long `requestResponse` waits for the first response when the
+   * caller omits `timeoutMs` (see `src/rpc.ts`:
+   * `RequestResponseOptions`, EB-178).
+   *
+   * Only the default moves: the revision takes effect from the next
+   * `requestResponse` — a call started after the revision arms its
+   * timer at the new default — while a request already pending keeps
+   * the timer it was armed with (the resolved value is captured at
+   * call time, so tightening the default never shortens a deadline
+   * already counting down and widening it never extends one). A slow
+   * responder that needs the wait widened from 5s to 30s gets it for
+   * all future calls without dropping any live connection; a
+   * caller-explicit `timeoutMs` still wins over the bus default, in
+   * both directions.
+   *
+   * There is no construction-time option for this default (along
+   * `setRpcSettledRetention`, EB-391, and `setDefaultAckTimeout`,
+   * EB-404): a deployment that wants a non-factory default sets it
+   * once after startup. The default is live-only — a restart restores
+   * 5000 — and it never enters a config snapshot. The
+   * `RequestTimeoutError` of a call that times out carries the
+   * effective timeout — the resolved value, whether per-call or the
+   * live default at call time.
+   *
+   * Fail-closed: a non-positive / non-finite `timeoutMs` and an
+   * illegal actor throw `RangeError` with the live default and the
+   * audit log untouched (the request-time validation, EB-178's same
+   * gate). A revision identical to the current default is a no-op
+   * with no audit. Audited as `rpc_default_timeout_revised`
+   * (`{ previous_timeout_ms, timeout_ms }`, both always numbers).
+   * There is no clear method — restoring the factory default is
+   * `setRpcDefaultTimeoutMs(5000)` (the default is always a number,
+   * never `undefined`, unlike EB-400's clearable group default).
+   *
+   * Orthogonal to EB-178 (that is the request–reply mechanism itself
+   * — this its missing bus-level wait default), to EB-391 (that
+   * revises the RPC settled-ring retention — same live-only bus-level
+   * revision shape, a different knob: that one governs how long a
+   * settled id stays recognizable, this how long a live request is
+   * waited on), to EB-404 (that revises the reliable subscription ack
+   * timeout default — same "default" shape, a different timer: that
+   * one arms the router's reliable subscription via `ensureRpcRouter`,
+   * this arms the caller's response wait), and to EB-405 (that
+   * revises the drain default — same bus-level default shape, a
+   * different knob).
+   *
+   * Throws `RangeError` for an illegal actor or timeout value.
+   */
+  setRpcDefaultTimeoutMs(timeoutMs: number, actor = 'system'): void {
+    assertValidActor(actor, 'setRpcDefaultTimeoutMs');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError(
+        'setRpcDefaultTimeoutMs: timeoutMs must be a positive finite number of milliseconds',
+      );
+    }
+    const previousTimeoutMs = this.rpcDefaultTimeoutMs;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previousTimeoutMs === timeoutMs) {
+      return;
+    }
+    this.rpcDefaultTimeoutMs = timeoutMs;
+    this.auditSubscription({
+      action: 'rpc_default_timeout_revised',
+      actor,
+      detail: { previous_timeout_ms: previousTimeoutMs, timeout_ms: timeoutMs },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default RPC response-wait timeout
+   * (EB-462): the timeout `requestResponse` falls back to when the
+   * caller omits `timeoutMs` — 5000 before any revision, then whatever
+   * `setRpcDefaultTimeoutMs` last installed.
+   */
+  getRpcDefaultTimeoutMs(): number {
+    return this.rpcDefaultTimeoutMs;
   }
 
   /**
