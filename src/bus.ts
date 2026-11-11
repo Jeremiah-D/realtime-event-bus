@@ -833,6 +833,14 @@ interface RecurringJob {
   /** Set by cancel; the heap skips marked jobs lazily. */
   cancelled: boolean;
   /**
+   * Set by `setRecurringJobPaused` (EB-461): while true the sweep skips
+   * the job without firing and without advancing `nextTriggerMs`, and the
+   * shared timer is armed past it. Resuming recomputes `nextTriggerMs`
+   * from the resume moment — triggers missed during the pause are
+   * skipped, never backfilled.
+   */
+  paused: boolean;
+  /**
    * Rebuilt from the durable log without a payload factory (see
    * `recoverRecurring`): informational only — no timer, never fires.
    */
@@ -1009,6 +1017,12 @@ export interface RecurringJobInfo {
   triggerCount: number;
   /** Skipped triggers: the factory threw, or the publish threw. */
   errorCount: number;
+  /**
+   * Present and true while the job is paused via `setRecurringJobPaused`
+   * (EB-461): the sweep skips it without firing, and
+   * `getStats().recurringJobs.active` excludes it.
+   */
+  paused?: boolean;
   /**
    * Present and true for jobs rebuilt from the durable log after a
    * restart: the payload factory is in-process state and could not be
@@ -7763,7 +7777,7 @@ export interface BusStats {
    * from the durable log (no factory, no timer — informational only).
    */
   recurringJobs: {
-    /** Live jobs with armed timers (excludes dormant entries). */
+    /** Live jobs with armed timers (excludes dormant entries and paused jobs). */
     active: number;
     /** One row per job: live jobs in schedule order, then dormant ones. */
     jobs: RecurringJobInfo[];
@@ -54354,6 +54368,7 @@ export class EventBus {
       triggerCount: 0,
       errorCount: 0,
       cancelled: false,
+      paused: false,
       dormant: false,
     };
     // The schedule record is best-effort audit state (unlike
@@ -54513,6 +54528,88 @@ export class EventBus {
   }
 
   /**
+   * Pauses or resumes a live cron recurring job by its id (EB-461) — the
+   * id shown in `getStats().recurringJobs` — without cancelling it: the
+   * job keeps its id, its topic, its cron, its payload factory, and its
+   * `triggerCount`/`errorCount` history.
+   *
+   * - Pausing parks the job in place: it stays in `recurringById` and in
+   *   the trigger heap, the sweep skips it without firing and without
+   *   advancing `nextTriggerMs`, and a paused heap-top never starves the
+   *   live jobs behind it (the sweep pops it aside and pushes it back
+   *   untouched). The shared timer is re-armed past it, so a paused job
+   *   never holds — or spins — the timer.
+   * - Resuming recomputes `nextTriggerMs` from the resume moment via
+   *   `nextCronOccurrence`: triggers missed during the pause are skipped,
+   *   never backfilled (along EB-371's "at most one fire per sweep" and
+   *   WR-80's missed-skipped rule). The timer is re-armed for the new
+   *   earliest trigger.
+   * - `getStats().recurringJobs` shows the pause: the row carries
+   *   `paused: true` and `active` counts only live, unpaused jobs.
+   *
+   * Fail-closed: an unknown id (a cancelled job is gone from the map, so
+   * cancelling is terminal — pausing it is refused), a dormant
+   * post-restart entry, and a non-boolean `paused` all throw `RangeError`
+   * with the live job untouched. Setting the current state is a no-op
+   * with no audit. Audited as `recurring_job_paused` /
+   * `recurring_job_resumed` (`{ id, topic, cron }`, along
+   * `recurring_job_cancelled`) on success. Pausing is pure live state:
+   * no durable-log record is written (a restart rebuilds the job dormant
+   * anyway), and a paused job can still be cancelled — cancelling after a
+   * pause works, and pausing a cancelled job is refused.
+   *
+   * Orthogonal to EB-371 (`reviseRecurringJob` — that changes the cron /
+   * factory, this is the pause switch), to EB-124 (`scheduleRecurring`
+   * — that is the schedule mechanism itself), to `cancelRecurringJob`
+   * (that is terminal, this is reversible), to WR-80 (that pauses
+   * webhook-relay-ts's `ScheduledDeliveryQueue` — a different repo's
+   * timed delivery), and to EB-154 (a closed bus refuses new schedules
+   * — this pauses a live job).
+   *
+   * Throws `RangeError` for an unknown / cancelled / dormant job id or a
+   * non-boolean `paused`.
+   */
+  setRecurringJobPaused(id: string, paused: boolean): void {
+    if (typeof paused !== 'boolean') {
+      throw new RangeError('setRecurringJobPaused: paused must be a boolean');
+    }
+    const job = this.recurringById.get(id);
+    if (job == null || job.cancelled) {
+      throw new RangeError(`setRecurringJobPaused: unknown recurring job id ${JSON.stringify(id)}`);
+    }
+    if (job.dormant) {
+      throw new RangeError(
+        `setRecurringJobPaused: recurring job ${id} is dormant (restart recovery has no live timer or payload factory)`,
+      );
+    }
+    if (job.paused === paused) {
+      return;
+    }
+    const { topic, cronExpr: cron } = job;
+    if (paused) {
+      job.paused = true;
+      this.armRecurringTimer();
+      this.auditSubscription({
+        action: 'recurring_job_paused',
+        actor: 'system',
+        topic,
+        detail: { id, topic, cron },
+      });
+      return;
+    }
+    job.paused = false;
+    job.nextTriggerMs = nextCronOccurrence(job.schedule, this.now());
+    this.recurringHeap.reheapify();
+    this.armRecurringTimer();
+    this.auditSubscription({
+      action: 'recurring_job_resumed',
+      actor: 'system',
+      topic,
+      detail: { id, topic, cron },
+    });
+  }
+
+  /**
    * One `getStats().recurringJobs` row for a job: the same shape
    * `reviseRecurringJob` returns, so a revision's result reads exactly
    * like the stats row.
@@ -54525,6 +54622,7 @@ export class EventBus {
       nextTriggerMs: job.nextTriggerMs,
       triggerCount: job.triggerCount,
       errorCount: job.errorCount,
+      ...(job.paused ? { paused: true as const } : {}),
       ...(job.dormant ? { dormant: true as const } : {}),
     };
   }
@@ -54563,6 +54661,10 @@ export class EventBus {
    */
   private sweepRecurring(nowMs: number = this.now(), trailingFlush = true): void {
     let fired = false;
+    // EB-461: paused jobs are popped aside so a paused heap-top cannot
+    // starve the live jobs behind it, then pushed back untouched — a
+    // pause never advances the trigger time.
+    const paused: RecurringJob[] = [];
     for (;;) {
       const top = this.recurringHeap.peek();
       if (top == null) break;
@@ -54571,6 +54673,10 @@ export class EventBus {
         // by `cancelRecurring`; just discard the heap node. (Dormant jobs
         // never enter the heap — the guard is defensive.)
         this.recurringHeap.pop();
+        continue;
+      }
+      if (top.paused) {
+        paused.push(this.recurringHeap.pop()!);
         continue;
       }
       if (top.nextTriggerMs > nowMs) break;
@@ -54584,6 +54690,7 @@ export class EventBus {
         this.recurringHeap.push(top);
       }
     }
+    for (const job of paused) this.recurringHeap.push(job);
     if (fired && trailingFlush) this.scheduleFlush();
     this.armRecurringTimer();
   }
@@ -54633,12 +54740,29 @@ export class EventBus {
       clearTimeout(this.recurringTimer);
       this.recurringTimer = undefined;
     }
+    // EB-461: a paused job never fires while paused, so it must not arm
+    // the shared timer — arming on its (possibly already past) trigger
+    // time would spin the timer. Look past cancelled and paused heap-tops
+    // for the earliest live job: cancelled nodes are discarded as before,
+    // paused jobs are pushed back with their trigger times intact. When
+    // no live job remains, no timer is armed — resuming re-arms it.
+    const skipped: RecurringJob[] = [];
+    let next: RecurringJob | undefined;
     for (;;) {
       const top = this.recurringHeap.peek();
-      if (top == null || !top.cancelled) break;
-      this.recurringHeap.pop();
+      if (top == null) break;
+      if (top.cancelled) {
+        this.recurringHeap.pop();
+        continue;
+      }
+      if (top.paused) {
+        skipped.push(this.recurringHeap.pop()!);
+        continue;
+      }
+      next = top;
+      break;
     }
-    const next = this.recurringHeap.peek();
+    for (const job of skipped) this.recurringHeap.push(job);
     if (next == null) return;
     const delayMs = Math.max(0, next.nextTriggerMs - this.now());
     // `setTimeout` saturates past 2^31-1 ms (~24.8 days); longer waits
@@ -54769,6 +54893,7 @@ export class EventBus {
         triggerCount: 0,
         errorCount: 0,
         cancelled: false,
+        paused: false,
         dormant: true,
       };
       this.recurringById.set(jobId, dormant);
@@ -64191,7 +64316,7 @@ export class EventBus {
       jitteredDelayed: this.totalJitteredDelayed,
       delayedScheduleSkew: this.scheduleSkew?.tracker.summary() ?? emptyScheduleSkewSummary(),
       recurringJobs: {
-        active: [...this.recurringById.values()].filter((j) => !j.dormant).length,
+        active: [...this.recurringById.values()].filter((j) => !j.dormant && !j.paused).length,
         jobs: [...this.recurringById.values()].map((j) => this.recurringJobInfo(j)),
       },
       deliveryLatency,

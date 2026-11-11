@@ -86,6 +86,8 @@ export type SubscriptionAuditAction =
   | 'delayed_ttl_extended'
   | 'recurring_job_cancelled'
   | 'recurring_job_revised'
+  | 'recurring_job_paused'
+  | 'recurring_job_resumed'
   | 'ack_deadline_extended'
   | 'ack_timeout_revised'
   | 'default_ack_timeout_revised'
@@ -453,6 +455,8 @@ export type SubscriptionAuditAction =
  * - `delayed_cancelled`: `{ cancelled: <count>, delayIds: <string[]>, topicPattern: <string> }`
  * - `recurring_job_cancelled`: `{ id, topic, cron }` — one live cron recurring job was cancelled by id (EB-371; the `topic` field carries the job's topic)
  * - `recurring_job_revised`: `{ id, previous_cron, cron, payloadFactoryReplaced }` — one live cron recurring job's schedule and/or payload factory was revised by id (EB-371; the `topic` field carries the job's topic)
+ * - `recurring_job_paused`: `{ id, topic, cron }` — one live cron recurring job was paused by id (EB-461; the `topic` field carries the job's topic; the job stays in the map and the heap, the sweep skips it without firing or advancing its next trigger, and the shared timer is re-armed past it)
+ * - `recurring_job_resumed`: `{ id, topic, cron }` — one paused cron recurring job was resumed by id (EB-461; the `topic` field carries the job's topic; the next trigger is recomputed from the resume moment, so triggers missed during the pause are skipped, never backfilled)
  * - `publish_circuit_breaker_revised`: `{ topic, previous, current }` — one topic's publish circuit breaker thresholds were revised live (EB-372; `previous` / `current` each hold `{ consecutiveShedPublishes, halfOpenProbeIntervalMs }`; only the two thresholds move — the breaker's state, `consecutiveBlocked`, `openedAtMs`, and `rejectedMessages` are untouched, so an open breaker stays open and is not re-timed; a revision identical to the live thresholds is a no-op with no audit)
  * - `subscriber_breaker_revised`: `{ previous, current }` — the subscriber-side circuit breaker rule was revised live (EB-373; `previous` / `current` each hold `{ maxConsecutiveFailures, onTripped }` where `onTripped` is whether a callback is set; only the rule moves — every subscriber's streak and tripped flag are untouched, so an already-tripped subscriber stays tripped; a revision identical to the live rule is a no-op with no audit)
  * - `delayed_topic_held`: `{ topicPattern: <string> }` — the delayed-delivery sweep was held for the pattern (EB-250; the `pattern` field carries the rule key)
@@ -700,6 +704,8 @@ const ALL_ACTIONS: ReadonlySet<string> = new Set<string>([
   'delayed_ttl_extended',
   'recurring_job_cancelled',
   'recurring_job_revised',
+  'recurring_job_paused',
+  'recurring_job_resumed',
   'ack_deadline_extended',
   'ack_timeout_revised',
   'default_ack_timeout_revised',

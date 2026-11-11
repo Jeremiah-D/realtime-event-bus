@@ -8964,7 +8964,7 @@ re-registering the same (topic, cron) supersedes the dormant entry so
 dormant generations do not accumulate.
 
 `getStats().recurringJobs` reports `{ active, jobs: [{ id, topic, cron,
-nextTriggerMs, triggerCount, errorCount, dormant? }] }`. The shared
+nextTriggerMs, triggerCount, errorCount, paused?, dormant? }] }`. The shared
 wake-up timer is unref'd (a pending job never keeps the process alive), and
 due sweeps also run at the start of every flush, so advancing an injected
 clock past a trigger time and then publishing anything fires
@@ -8991,6 +8991,21 @@ handle — ops tooling, embedded hosts:
   audits `recurring_job_revised` (`{ id, previous_cron, cron }`). Only
   live jobs can be revised: an unknown id or a dormant entry throws
   `RangeError`, and a closed bus refuses with `BusClosedError`.
+- `bus.setRecurringJobPaused(id, paused)` (EB-461) pauses or resumes a
+  live job without cancelling it: a paused job stays in the map and the
+  heap, the sweep skips it without firing or advancing `nextTriggerMs`,
+  and a paused heap-top never starves the live jobs behind it; the
+  shared timer is re-armed past it, so a paused job never spins the
+  timer. Resuming recomputes `nextTriggerMs` from the resume moment —
+  triggers missed during the pause are skipped, never backfilled. The
+  id, topic, cron, factory, and `triggerCount`/`errorCount` history are
+  unchanged, the stats row carries `paused: true` while paused, and
+  `active` counts only live, unpaused jobs. An unknown, cancelled, or
+  dormant id, or a non-boolean `paused`, throws `RangeError`; setting
+  the current state is a no-op with no audit. Pauses and resumes audit
+  `recurring_job_paused` / `recurring_job_resumed` (`{ id, topic, cron
+  }`); pausing writes no durable-log record (pure live state), and a
+  paused job can still be cancelled.
 
 ## Topic lifecycle management (EB-126)
 
