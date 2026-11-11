@@ -2680,7 +2680,16 @@ library.
   cap and the audit log untouched; `undefined` is not a clear,
   only `null` is), and every success is audited as
   `max_inflight_revised` (`{ maxInflight, oldMaxInflight }`,
-  `null` for a clear).
+  `null` for a clear). Bus-level default (EB-466, via
+  `setDefaultMaxInFlight(max | null)`): future subscribers that
+  omit `maxInflight` take the live bus default instead of running
+  uncapped — `null` clears it back to unset. An explicit value
+  always wins, a subscriber keeps the cap it was baked with (a
+  later revision never moves a live cap), and the default also
+  feeds the EB-159 concurrency default, so a default-derived cap
+  doubles as the concurrency default unless `maxConcurrentDeliveries`
+  is given explicitly. Audited as `default_max_inflight_revised`
+  (`{ previous, maxInflight }`, `null` when unset).
 - **Per-subscriber handler-concurrency cap** (in `src/bus.ts`, via
   `subscribe(..., { maxConcurrentDeliveries: N })`, EB-159): caps how many
   handler invocations may *execute* at once per subscriber. Defaults to 1 —

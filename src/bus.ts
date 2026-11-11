@@ -17675,6 +17675,15 @@ export class EventBus {
    */
   private groupDefaultAutoOffsetReset: 'earliest' | 'latest' = 'earliest';
   /**
+   * Bus-level terminal max in-flight default (EB-466): the cap a
+   * subscriber falls back to when it omits its own `maxInflight`
+   * (EB-67). Starts unset (`undefined` — no default, no cap, exactly
+   * the previous behavior) and moves only via
+   * `setDefaultMaxInFlight`; there is no construction-time option,
+   * and a restart restores the unset default.
+   */
+  private defaultMaxInFlight?: number;
+  /**
    * Per-group static-membership session-timeout defaults (EB-403):
    * groupKey -> sessionTimeoutMs, set live via
    * `setGroupDefaultSessionTimeout` for future static members that
@@ -33200,7 +33209,11 @@ export class EventBus {
     );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
-    const maxInflight = resolveMaxInflightOptions(opts?.maxInflight);
+    // EB-466: a subscriber that omits maxInflight falls back to the
+    // live bus default, if one is installed — the bus default is the
+    // terminal fallback, below the explicit option. An explicit value
+    // always wins.
+    const maxInflight = resolveMaxInflightOptions(opts?.maxInflight ?? this.defaultMaxInFlight);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     // EB-159: an explicit maxInflight already opts the subscriber into
@@ -47536,6 +47549,90 @@ export class EventBus {
    */
   getGroupDefaultAutoOffsetReset(): 'earliest' | 'latest' {
     return this.groupDefaultAutoOffsetReset;
+  }
+
+  /**
+   * Sets the live bus-level terminal max in-flight default (EB-466)
+   * without re-subscribing anyone:
+   * `setDefaultMaxInFlight(max, actor = 'system')` decides how many
+   * handler invocations may be unsettled at once for future
+   * subscribers that omit their own `maxInflight` (see
+   * `SubscribeOptions.maxInflight`, EB-67) — `8` to bound a fleet's
+   * unsettled work with one call, `null` to clear the default back
+   * to unlimited.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched, and no flush fires for the revision
+   * itself. The priority chain is subscriber-explicit > bus default
+   * (the bus default is the terminal fallback — there is nothing
+   * below it). A subscriber that took the default at subscribe time
+   * keeps the cap it was baked with: a later revision never moves
+   * an already-subscribed cap, and `setMaxInflight` (EB-264) still
+   * revises such a subscriber one at a time without touching the
+   * bus default. The bus default also feeds the EB-159 rule: a
+   * subscriber whose `maxInflight` came from the bus default takes
+   * that value as its `maxConcurrentDeliveries` default too, exactly
+   * as an explicit `maxInflight` would — an explicit
+   * `maxConcurrentDeliveries` always wins. The `maxInflight` +
+   * `batch` combination refusal (subscribe time) applies to a
+   * default-derived cap exactly as to an explicit one.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to
+   * the current default (including clearing an already-unset
+   * default) is a no-op with no audit. Audited as
+   * `default_max_inflight_revised`
+   * (`{ previous, maxInflight }`, `null` when the default is unset
+   * — unset means no cap, exactly the previous behavior).
+   *
+   * Orthogonal to EB-67 (that is the cap mechanism itself — this
+   * its missing bus-level terminal default), to EB-264 (that revises
+   * one live subscriber's cap — this the default future subscribers
+   * fall back to), to EB-159 (that derives the concurrency default
+   * from `maxInflight` — this gives `maxInflight` a bus-level
+   * source), and to EB-464 (that revises the bus TTL default —
+   * same "bus default" shape, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * an integer >= 1 (or `null` to clear).
+   */
+  setDefaultMaxInFlight(max: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxInFlight');
+    if (max !== null && (!Number.isInteger(max) || max < 1)) {
+      throw new RangeError(
+        'setDefaultMaxInFlight: maxInflight must be an integer >= 1, or null to clear it',
+      );
+    }
+    const previous = this.defaultMaxInFlight ?? null;
+    const next = max ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === max) {
+      return;
+    }
+    this.defaultMaxInFlight = next;
+    this.auditSubscription({
+      action: 'default_max_inflight_revised',
+      actor,
+      detail: { previous, maxInflight: max },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal max in-flight default
+   * (EB-466) — the cap future subscribers fall back to when they
+   * omit their own `maxInflight` — `undefined` before any revision
+   * (no default, no cap), then whatever `setDefaultMaxInFlight`
+   * last installed.
+   */
+  getDefaultMaxInFlight(): number | undefined {
+    return this.defaultMaxInFlight;
   }
 
   /**
