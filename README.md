@@ -103,7 +103,14 @@ library.
   original payload plus `{ subscriberId, pattern, seq, lastError,
   redeliveries, traceId, deadLetteredAt }` metadata — so operators consume
   and alert on every poison message from a single topic instead of polling
-  per-subscriber DLQs. Opt-in `deadLetter.autoReplay` (EB-134) re-enqueues
+  per-subscriber DLQs. The topic is live-revisable per subscriber without
+  re-subscribing — `setDeadLetterDiagnosticTopic(subId, topic)` (EB-460)
+  retargets the next dead-lettering's diagnostic event (a subscriber with
+  no topic can opt in; passing `null` clears it so only the fan-out stops);
+  entries already dead-lettered never re-emit, and the DLQ entries, budget,
+  retry ladder, auto-replay, approval gate, and callbacks are untouched.
+  Revisions are audited as `dead_letter_diagnostic_topic_revised` (actor
+  `system`); passing the current topic is a no-op with no audit. Opt-in `deadLetter.autoReplay` (EB-134) re-enqueues
   dead-lettered messages automatically after an exponential backoff
   (`initialDelayMs` default 1000, `maxDelayMs` default 60000,
   `backoffMultiplier` default 2) instead of waiting for a manual
@@ -4292,6 +4299,16 @@ npm test
   cut), diagnostics go through normal admission (ACL denial suppresses
   without affecting the DLQ move), admission-time counting, and the
   `eventbus_diagnostic_events_total` exposition series.
+- `test/deadletter-diagnostic-topic-revision.test.ts` — live revision of the
+  dead-letter diagnostic topic (EB-460): `setDeadLetterDiagnosticTopic`
+  retargets the next dead-lettering (exact diagnostic metadata on the new
+  topic, nothing further on the old), a topic-less subscriber can opt in,
+  clearing keeps the DLQ move and `onDeadLetter` while stopping fan-out,
+  unknown/non-reliable/DLQ-less/illegal values throw `RangeError` with the
+  live topic untouched, same-value revisions are no-ops with no audit, the
+  audit event carries old and new topics, already dead-lettered entries
+  never re-emit, auto-replay and the approval gate are unaffected, and an
+  admission-rejected diagnostic still leaves the DLQ move unaffected.
 - `test/deadletter-replay-topic.test.ts` — dead-letter replay to a repair
   topic (EB-240): retarget republishes as a normal publish (target-topic
   admission and sequence number, original `messageId`/`key`/trace id and

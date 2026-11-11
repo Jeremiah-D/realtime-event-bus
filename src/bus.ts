@@ -38396,6 +38396,90 @@ export class EventBus {
   }
 
   /**
+   * Revises the dead-letter diagnostic topic of one reliable subscriber
+   * (EB-460) without re-subscribing: `setDeadLetterDiagnosticTopic(subId,
+   * topic)` retargets where the next dead-lettering's diagnostic event is
+   * fanned out (see `DeadLetterOptions.diagnosticTopic`, EB-57).
+   *
+   * Only the topic moves: the DLQ move reads the live
+   * `deadLetter.diagnosticTopic` on every dead-lettering, so the new topic
+   * governs from the next dead-lettering with no drain, re-registration,
+   * or replay. That is the whole point of this entry: the diagnostic topic
+   * is a subscribe-time value today, so switching the centralized alerting
+   * destination means re-subscribing and losing the ACK state, the
+   * redelivery budget, the DLQ contents, the retry-ladder position, and
+   * the auto-replay timers.
+   * - A subscriber with no topic yet can opt in: passing a non-empty
+   *   string where none was configured starts fan-out on the next
+   *   dead-lettering (along the `setDeadLetterBudget` `maxAgeMs` null →
+   *   value precedent).
+   * - Passing `null` clears the topic: the DLQ move, `onDeadLetter`, and
+   *   `onPoisoned` still fire, only the diagnostic fan-out stops.
+   * - Entries already dead-lettered never re-emit a diagnostic under the
+   *   new topic: the fan-out happens once, at dead-lettering time.
+   * - The DLQ entries, budget, retry ladder, auto-replay config, approval
+   *   gate, and callbacks are untouched by the revision.
+   * - A diagnostic rejected at admission still leaves the DLQ move
+   *   unaffected (EB-57), whichever topic is live.
+   *
+   * Fail-closed: an unknown subscriber id, a non-reliable subscriber, a
+   * reliable subscriber with no `deadLetter` configured, and an illegal
+   * value — the topic must be a non-empty string or `null`, reusing the
+   * construction-time `normalizeDeadLetterOptions` rule — all throw
+   * `RangeError` with the live topic and the audit log untouched.
+   * Passing the current topic (including clearing a subscriber that has
+   * no topic) is a no-op with no audit. Audited as
+   * `dead_letter_diagnostic_topic_revised` (`{ diagnosticTopic,
+   * oldDiagnosticTopic }`, `null` on either side meaning "no topic") on
+   * success.
+   *
+   * Orthogonal to EB-57 (the diagnostic-topic mechanism itself — this
+   * revises its destination live), to EB-139 (the admission-stage
+   * dead-letter topic — that is the admission dimension, this is the
+   * delivery-stage per-subscriber DLQ diagnostic topic), to EB-434 (the
+   * dead-letter callbacks — those are the hooks, this is the diagnostic
+   * destination), and to EB-365 (the dead-letter budget — those are the
+   * numbers, this is the topic).
+   *
+   * Throws `RangeError` for an unknown / non-reliable / DLQ-less
+   * subscriber or an illegal topic value.
+   */
+  setDeadLetterDiagnosticTopic(subId: string, topic: string | null): void {
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setDeadLetterDiagnosticTopic: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setDeadLetterDiagnosticTopic: unknown subscriber: ${subId}`);
+    }
+    if (subscriber.reliable == null) {
+      throw new RangeError('setDeadLetterDiagnosticTopic: subscriber is not a reliable (subscribeReliable) subscription');
+    }
+    const dlq = subscriber.deadLetter;
+    if (dlq == null) {
+      throw new RangeError('setDeadLetterDiagnosticTopic: subscriber has no deadLetter configured');
+    }
+    if (topic !== null && (typeof topic !== 'string' || topic.length === 0)) {
+      throw new RangeError('setDeadLetterDiagnosticTopic: topic must be a non-empty string, or null to clear it');
+    }
+    const oldDiagnosticTopic = dlq.diagnosticTopic ?? null;
+    if (topic === oldDiagnosticTopic) {
+      return;
+    }
+    dlq.diagnosticTopic = topic ?? undefined;
+    this.auditSubscription({
+      action: 'dead_letter_diagnostic_topic_revised',
+      actor: 'system',
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: {
+        diagnosticTopic: topic,
+        oldDiagnosticTopic,
+      },
+    });
+  }
+
+  /**
    * Revises the dead-letter replay approval gate of one reliable
    * subscriber (EB-377): whether operator replays need approval
    * (`requireApproval`) and the bound on the pending-approval queue
