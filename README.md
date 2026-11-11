@@ -2273,6 +2273,12 @@ library.
   messages forward (a throwing predicate propagates to the publish caller,
   like a throwing schema validator). Re-registering a `src` replaces its
   route (and resets its count); `clearTopicRoute(src)` removes it.
+  Live revision: `reviseTopicRoutePredicate(src, predicate)` swaps the
+  route's predicate in place — `null` clears it back to full forwarding —
+  with `dst` and the `forwarded` count untouched and no cycle re-check
+  (a predicate cannot change the route graph); an unknown `src` or a
+  non-function non-`null` predicate throws `RangeError` with the live
+  table untouched, and re-affirming the live predicate is a no-op.
   `getStats().routes` exposes the table (`{ src, dst, predicate,
   forwarded }`), with `forwarded` counting every forward attempt —
   including attempts the destination's admission gates then rejected.

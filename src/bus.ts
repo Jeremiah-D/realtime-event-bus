@@ -22760,6 +22760,71 @@ export class EventBus {
   }
 
   /**
+   * Revises one registered topic route's admission predicate live
+   * (EB-459) without re-registering: `reviseTopicRoutePredicate(src,
+   * predicate)` swaps the route's `RoutePredicate` in place (see
+   * `setTopicRoute`, EB-50) — the only path to change a route's
+   * filter today is re-registration, which resets the route's
+   * `forwarded` count, re-runs the cycle check, and forces the
+   * destination to be restated.
+   *
+   * Only the predicate moves: the route entry is read live at every
+   * fan-out, so the new predicate governs from the next publish —
+   * already-forwarded messages are unaffected — while `dst` is
+   * untouched, the `forwarded` count keeps running, and no cycle
+   * check re-runs (a predicate cannot change the route graph).
+   * Passing `null` clears the predicate, restoring full forwarding.
+   * Predicate-throw semantics are unchanged: a throwing predicate
+   * still propagates to the publish caller (see `RoutePredicate`).
+   *
+   * Fail-closed: an unknown `src`, a non-string or empty `src`, and
+   * an illegal predicate (anything other than a function or `null` —
+   * `undefined` is not a value here) all throw `RangeError` with the
+   * live route table untouched. A revision identical to the live
+   * predicate — the same function reference, including clearing a
+   * route that never had a predicate — is a silent no-op.
+   * `getStats().routes` exposes the live table, so the predicate
+   * flag flipping is the revision's evidence. Like `setTopicRoute`
+   * and `clearTopicRoute` this is a bus-level operation with no
+   * audit action.
+   *
+   * Orthogonal to EB-50 (that is route registration itself — this
+   * its predicate, revised live), to EB-56 (that is cross-bus
+   * forwarding — this the same-bus route's predicate), to EB-265 /
+   * EB-287 (those revise subscription-level filter predicates —
+   * this the route level), and to EB-277 (that revises delivery
+   * concurrency — this the route predicate).
+   *
+   * Throws `RangeError` for an unknown `src` or an illegal
+   * predicate.
+   */
+  reviseTopicRoutePredicate(src: string, predicate: RoutePredicate | null): void {
+    if (typeof src !== 'string' || src.length === 0) {
+      throw new RangeError('reviseTopicRoutePredicate: src must be a non-empty string');
+    }
+    const route = this.topicRoutes.get(src);
+    if (route === undefined) {
+      throw new RangeError(`reviseTopicRoutePredicate: unknown topic route: ${src}`);
+    }
+    // Validate before touching anything: only a function or an
+    // explicit null (clear) is a value — `undefined` is not a value,
+    // so it is refused rather than silently clearing.
+    if (predicate !== null && typeof predicate !== 'function') {
+      throw new RangeError('reviseTopicRoutePredicate: predicate must be a function or null');
+    }
+    const nextPredicate = predicate ?? undefined;
+    // Re-affirming the live predicate is a no-op — including
+    // clearing a route that never had one.
+    if (nextPredicate === route.predicate) {
+      return;
+    }
+    // Only the predicate moves; `dst`, the `forwarded` count, and
+    // the route graph are untouched, and the fan-out path reads the
+    // live entry, so the new predicate governs from the next publish.
+    route.predicate = nextPredicate;
+  }
+
+  /**
    * Registers a cross-bus forward rule (EB-56): every admitted,
    * non-routed message on this bus whose alias-resolved topic matches
    * `srcPattern` is additionally forwarded to `dstBus` — on topic
