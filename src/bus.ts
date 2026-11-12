@@ -17730,6 +17730,16 @@ export class EventBus {
    */
   private defaultMaxIdleMs?: number;
   /**
+   * Bus-level terminal drop-policy default (EB-475): the shed policy a
+   * subscriber falls back to when it omits its own `dropPolicy` under
+   * the 'block' backpressure tier (EB-83). Starts unset (`undefined` —
+   * no default, the 'block' tier sheds per the historical
+   * 'drop-oldest', exactly the previous behavior) and moves only via
+   * `setDefaultDropPolicy`; there is no construction-time option, and
+   * a restart restores the unset default.
+   */
+  private defaultDropPolicy?: DropPolicy;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33637,12 +33647,13 @@ export class EventBus {
     const backpressure = resolveBackpressurePolicy(opts?.backpressure, opts?.dropPolicy);
     // The queue-level shed policy: an explicit drop tier selects it
     // directly; the 'block' tier sheds per the subscriber's own
-    // `dropPolicy` on first saturation (the historical default behavior).
+    // `dropPolicy` on first saturation, falling back to the live bus
+    // default (EB-475) and then to the historical 'drop-oldest'.
     // The shadow queue mirrors the production shed policy unless the
     // shadow overrides it independently.
     const queuePolicy: DropPolicy =
       shadowOpts?.dropPolicy ??
-      (backpressure === 'block' ? (opts?.dropPolicy ?? 'drop-oldest') : backpressure);
+      (backpressure === 'block' ? (opts?.dropPolicy ?? this.defaultDropPolicy ?? 'drop-oldest') : backpressure);
     // Per-topic priority lanes (EB-122): the subscriber's queue is a
     // `LaneQueue` — three FIFO lanes (urgent / normal / bulk) over the one
     // capacity budget, drained in weighted round-robin order. Lanes are a
@@ -48241,6 +48252,92 @@ export class EventBus {
    */
   getDefaultMaxIdleMs(): number | undefined {
     return this.defaultMaxIdleMs;
+  }
+
+  /**
+   * Sets the live bus-level terminal drop-policy default (EB-475)
+   * without re-subscribing anyone:
+   * `setDefaultDropPolicy(policy, actor = 'system')` decides the queue
+   * shed policy for future subscribers that omit their own `dropPolicy`
+   * under the 'block' backpressure tier (see `SubscribeOptions.dropPolicy`,
+   * EB-83) — `'drop-newest'` to shed fresh arrivals fleet-wide with one
+   * call, `null` to clear the default back to the historical
+   * `'drop-oldest'`.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is subscriber-explicit
+   * > bus default > `'drop-oldest'` (the bus default is the terminal
+   * fallback for the 'block' branch — there is nothing below it but the
+   * historical default). An explicit drop tier ('drop-oldest' /
+   * 'drop-newest') is the policy itself and always beats the bus
+   * default, and an explicit `dropPolicy` always wins. A subscriber
+   * that took the default at subscribe time keeps the policy it was
+   * baked with: a later revision never moves an already-subscribed
+   * policy, and `setDropPolicy` (EB-375) still revises such a
+   * subscriber one at a time without touching the bus default. A
+   * shadow queue that omits `dropPolicy` takes the same derived policy
+   * (one LaneQueue object, like the EB-470 capacity chain); an explicit
+   * shadow value still wins. Already-queued messages are never
+   * re-shed by the revision.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value outside
+   * `'drop-oldest' | 'drop-newest'` (`null` to clear) throws
+   * `RangeError` with the live default and the audit log untouched —
+   * `'block'` is a tier, not a policy. A revision identical to the
+   * current default (including clearing an already-unset default) is
+   * a no-op with no audit. Audited as `default_drop_policy_revised`
+   * (`{ previous, dropPolicy }`, `null` when the default is unset
+   * — unset means new 'block'-tier subscribers shed per the historical
+   * `'drop-oldest'`, exactly the previous behavior).
+   *
+   * Orthogonal to EB-83 (that is the backpressure mechanism itself —
+   * this its missing bus-level terminal default), to EB-375 (that
+   * revises one live subscriber's policy — this the default future
+   * subscribers fall back to), to EB-285 (that revises the
+   * block-vs-drop tier — this the shed policy inside the 'block'
+   * branch), to EB-281/282 (that revise the capacity and the byte
+   * budget the policy sheds within — this which message is shed),
+   * and to EB-470/474 (that revise the bus queue-size and byte-budget
+   * defaults — same "bus default" shape, different knobs).
+   *
+   * Throws `RangeError` for an illegal actor or a value outside
+   * `'drop-oldest' | 'drop-newest'` (or `null` to clear).
+   */
+  setDefaultDropPolicy(policy: DropPolicy | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDropPolicy');
+    if (policy !== null) {
+      assertValidDropPolicy(policy, 'setDefaultDropPolicy');
+    }
+    const previous = this.defaultDropPolicy ?? null;
+    const next = policy ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === policy) {
+      return;
+    }
+    this.defaultDropPolicy = next;
+    this.auditSubscription({
+      action: 'default_drop_policy_revised',
+      actor,
+      detail: { previous, dropPolicy: policy },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal drop-policy default
+   * (EB-475) — the shed policy future 'block'-tier subscribers fall
+   * back to when they omit their own `dropPolicy` — `undefined`
+   * before any revision (no default, new subscribers shed per the
+   * historical `'drop-oldest'`), then whatever `setDefaultDropPolicy`
+   * last installed.
+   */
+  getDefaultDropPolicy(): DropPolicy | undefined {
+    return this.defaultDropPolicy;
   }
 
   /**

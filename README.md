@@ -1360,6 +1360,23 @@ library.
   Orthogonal to the tier (EB-285, that revises block-vs-drop
   when full, this revises which message is dropped). (Real-time
   systems: backpressure governance.)
+- **Bus-level default drop policy**
+  (`setDefaultDropPolicy(policy | null, actor?)`, EB-475): future
+  subscribers that omit `dropPolicy` under the `'block'` backpressure
+  tier fall back to the live bus default — `'drop-newest'` to shed
+  fresh arrivals fleet-wide with one call, `null` to clear back to
+  the historical `'drop-oldest'`. The priority chain is
+  subscriber-explicit > bus default > `'drop-oldest'` for the
+  `'block'` branch; an explicit drop tier is the policy itself and
+  always beats the bus default. A subscriber keeps the policy it was
+  baked with, and `setDropPolicy(subId, policy)` still revises one
+  subscriber at a time without touching the bus default. A shadow
+  queue that omits `dropPolicy` takes the same derived policy. There
+  is no construction-time option and the revision is live-only (a
+  restart restores the unset default); a revision identical to the
+  current default is a no-op with no audit. Audited as
+  `default_drop_policy_revised` (`{ previous, dropPolicy }`).
+  (Real-time systems: delivery governance.)
   Revisable after subscribe (EB-281, via
   `setQueueSize(subId, size | null)`): a subscriber's queue count
   capacity can be retuned without re-subscribing — every subscription
