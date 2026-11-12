@@ -943,7 +943,15 @@ library.
   and a revision identical to the current window is a no-op with no
   audit. Every success is audited as `group_handoff_linger_revised`
   (`{ handoffLingerMs: <number>, oldHandoffLingerMs: <number> }`;
-  `subId` / `groupId` ride on the event itself). Every resume
+  `subId` / `groupId` ride on the event itself). A bus-level default
+  (EB-471, via `setGroupDefaultHandoffLinger(windowMs)` /
+  `getGroupDefaultHandoffLinger()`): members joining without their own
+  `handoffLingerMs` take the bus default, filled in per member at join
+  time — a later revision never moves an already-joined member's window
+  or an already-armed window's `until`. An explicit `0` still means "no
+  linger" and never takes the default; `null` clears the default back to
+  no window. Audited as `group_default_handoff_linger_revised`
+  (`{ previous, handoffLingerMs }`, `null` when unset). Every resume
   replay is observable per subscriber: `getStats().replayProgress` carries
   one row per subscription that replayed — `{ subscriberId, pattern,
   total, replayed, skipped, done, failed, error? }` — counting is

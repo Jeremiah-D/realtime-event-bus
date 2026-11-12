@@ -4786,10 +4786,13 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * replayable again — the leaver is presumed dead and at-least-once
    * delivery resumes.
    *
-   * `0` (default) disables the window. Only meaningful with
-   * `EventBusOptions.durableLogDir`: without a durable log there is
-   * nothing to replay, so the linger is inert. Must be a finite number
-   * `>= 0`; anything else throws `RangeError`.
+   * `0` (default) disables the window. A member that omits the
+   * option falls back to the bus-level default installed by
+   * `setGroupDefaultHandoffLinger` (EB-471) — an explicit `0`
+   * still means "no linger" and never takes the default. Only
+   * meaningful with `EventBusOptions.durableLogDir`: without a
+   * durable log there is nothing to replay, so the linger is inert.
+   * Must be a finite number `>= 0`; anything else throws `RangeError`.
    *
    * Operational recipe: `commitOffset` before leaving — committed work
    * needs no handoff window. The linger only covers what the leaver did
@@ -17712,6 +17715,16 @@ export class EventBus {
    * option, and a restart restores the unset default.
    */
   private groupDefaultRebalanceDebounce?: number;
+  /**
+   * Bus-level terminal group handoff-linger default (EB-471): the
+   * `handoffLingerMs` a joining member falls back to when it omits
+   * its own `handoffLingerMs` (EB-32). Starts unset (`undefined` —
+   * no default, no window, exactly the previous behavior) and moves
+   * only via `setGroupDefaultHandoffLinger`; there is no
+   * construction-time option, and a restart restores the unset
+   * default.
+   */
+  private groupDefaultHandoffLinger?: number;
   /**
    * Per-group static-membership session-timeout defaults (EB-403):
    * groupKey -> sessionTimeoutMs, set live via
@@ -43104,8 +43117,10 @@ export class EventBus {
       throw new RangeError('subscribeToGroup: shadow cannot be combined with consumer groups');
     }
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const handoffLingerMs = opts?.handoffLingerMs ?? 0;
+    // half-registered subscriber behind. A member that omits its own
+    // window falls back to the bus-level default (EB-471) — an
+    // explicit 0 still means "no linger" and never takes the default.
+    const handoffLingerMs = opts?.handoffLingerMs ?? this.groupDefaultHandoffLinger ?? 0;
     if (!Number.isFinite(handoffLingerMs) || handoffLingerMs < 0) {
       throw new RangeError('handoffLingerMs must be a finite number of milliseconds >= 0');
     }
@@ -47943,6 +47958,95 @@ export class EventBus {
    */
   getGroupDefaultRebalanceDebounce(): number | undefined {
     return this.groupDefaultRebalanceDebounce;
+  }
+
+  /**
+   * Sets the live bus-level terminal group handoff-linger default
+   * (EB-471) without touching any live member:
+   * `setGroupDefaultHandoffLinger(windowMs, actor = 'system')`
+   * decides how long a leaving member's assigned-but-uncommitted
+   * backlog stays covered in a future consumer group whose joining
+   * member omits its own `handoffLingerMs` (see
+   * `GroupSubscribeOptions.handoffLingerMs`, EB-32) — `30_000` to
+   * give every new member a 30s graceful handoff with one call,
+   * `null` to clear the default back to no window.
+   *
+   * Only the default moves: the roster, the partition assignment,
+   * the committed offsets, and every live member are untouched, and
+   * no rebalance fires for the revision itself. The priority chain
+   * is member-explicit > bus default (the bus default is the
+   * terminal fallback — there is nothing below it). An explicit `0`
+   * still means "no linger" and never takes the default: `??`
+   * distinguishes an omitted option from an explicit `0`, exactly
+   * as EB-469 does for its window. A member that took the default
+   * at join time keeps the window it was filled in with: a later
+   * revision never moves a live member's window, and
+   * `setGroupHandoffLinger` (EB-335) still retunes one live member
+   * at a time without touching the bus default. A window already
+   * armed keeps the `until` it was stamped with — the default is
+   * filled in per member at join time, so there is no group-level
+   * window to re-fix. A default-derived window behaves exactly like
+   * an explicit one afterwards: `beginLingerHandoff` reads the
+   * member value live at leave time.
+   *
+   * There is no existence gate — the default exists precisely for
+   * members that have not joined yet, so it applies to every future
+   * member. The default is runtime state: it never enters a config
+   * snapshot and does not survive a restart, like the bus's other
+   * live revisions. It is lazily inert without
+   * `EventBusOptions.durableLogDir`: without a durable log there is
+   * nothing to replay, so the linger never arms — exactly as an
+   * explicit `handoffLingerMs` would be.
+   *
+   * Fail-closed: an illegal actor or a value other than a finite
+   * number of milliseconds >= 0 (`null` to clear) throws
+   * `RangeError` with the live default and the audit log untouched.
+   * A revision identical to the current default (including clearing
+   * an already-unset default) is a no-op with no audit. Audited as
+   * `group_default_handoff_linger_revised`
+   * (`{ previous, handoffLingerMs }`, `null` when the default is
+   * unset — unset means no window, exactly the previous behavior).
+   *
+   * Orthogonal to EB-32 (that is the linger mechanism itself —
+   * this its missing bus-level terminal default), to
+   * `setGroupHandoffLinger` (that retunes one live member's window
+   * — this the default new members fall back to), to EB-469 (that
+   * revises the bus rebalance-debounce default — same "bus default"
+   * shape, a different knob), and to EB-468 (that revises the bus
+   * auto-commit default — same shape, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a finite number of milliseconds >= 0 (or `null` to clear).
+   */
+  setGroupDefaultHandoffLinger(windowMs: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setGroupDefaultHandoffLinger');
+    if (windowMs !== null && (!Number.isFinite(windowMs) || windowMs < 0)) {
+      throw new RangeError(
+        'setGroupDefaultHandoffLinger: windowMs must be a finite number of milliseconds >= 0, or null to clear it',
+      );
+    }
+    const previous = this.groupDefaultHandoffLinger ?? null;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === windowMs) {
+      return;
+    }
+    this.groupDefaultHandoffLinger = windowMs ?? undefined;
+    this.auditSubscription({
+      action: 'group_default_handoff_linger_revised',
+      actor,
+      detail: { previous, handoffLingerMs: windowMs },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal group handoff-linger
+   * default (EB-471) — the window new members fall back to when
+   * they omit their own `handoffLingerMs` — `undefined` before any
+   * revision (no default, no window), then whatever
+   * `setGroupDefaultHandoffLinger` last installed.
+   */
+  getGroupDefaultHandoffLinger(): number | undefined {
+    return this.groupDefaultHandoffLinger;
   }
 
   /**
