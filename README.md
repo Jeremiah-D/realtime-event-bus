@@ -2980,6 +2980,27 @@ library.
   queue-dwell sampling, this revises the accepted→ack full-round-trip
   sampling) and to the sampling mechanism itself (EB-40, that sets it
   at subscribe time, this revises it).
+  Bus-level default SLO (EB-479, via
+  `setDefaultAckSloMs(ms | null, actor = 'system')` +
+  `getDefaultAckSloMs()`): the `ackSloMs` future ack-latency-enabled
+  subscribers fall back to when they omit their own — `100` to score
+  every new sampler's `withinSlo` / `sloAttainment` and
+  `onAckSloMiss` against one fleet-wide budget with one call, `null`
+  to clear back to no default. The resolution chain is
+  subscriber-explicit > bus default > 30000ms, and the default never
+  enables sampling: a subscriber that does not opt into `ackLatency`
+  gets no tracker, and the default never triggers the
+  `ackSloMs/onAckSloMiss require ackLatency` gate. The revision only
+  affects subscribers that join after it; an already-subscribed
+  sampler keeps the SLO it was baked with and its recorded samples,
+  and `setAckLatency` still retunes one sampler at a time without
+  touching the bus default. Out of the box there is no default
+  (omitting `ackSloMs` scores against 30000ms, as before); there is
+  no construction-time option, the default never enters a config
+  snapshot, and a restart restores the unset default. A revision
+  identical to the current default is a no-op with no audit, and
+  every success is audited as `default_ack_slo_ms_revised`
+  (`{ previous, ackSloMs }`, `null` when the default is unset).
 - **Per-subscriber handler processing-latency p99 SLO alerting** (in
   `src/latency.ts` + `src/bus.ts`, opt-in via
   `subscribe(..., { latencySlo: { p99ThresholdMs: 50 } })`): measures each

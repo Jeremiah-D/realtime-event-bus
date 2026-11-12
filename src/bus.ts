@@ -11665,7 +11665,10 @@ export interface AckLatencyRevisionOptions {
  * `undefined` when sampling is disabled. Throws `RangeError` for an
  * invalid window size, an invalid SLO, or SLO options provided without
  * the opt-in (a value that could never take effect); throws `TypeError`
- * for a non-function `onAckSloMiss`.
+ * for a non-function `onAckSloMiss`. The bus-level default SLO
+ * (`defaultAckSloMs`, EB-479) is the terminal fallback below an
+ * explicit `ackSloMs` — it never satisfies the opt-in gate, which
+ * reads only the subscriber's explicit value.
  */
 function resolveAckLatencyOptions(
   opt: boolean | AckLatencyOptions | undefined,
@@ -11674,6 +11677,7 @@ function resolveAckLatencyOptions(
   subscriberId: string,
   pattern: string,
   now: () => number,
+  defaultAckSloMs?: number,
 ): SubscriberAckLatencyState | undefined {
   if (ackSloMs !== undefined && (!Number.isFinite(ackSloMs) || ackSloMs <= 0)) {
     throw new RangeError('ackSloMs must be a positive finite number of milliseconds');
@@ -11695,12 +11699,12 @@ function resolveAckLatencyOptions(
   return {
     tracker: new AckLatencyTracker({
       windowSize,
-      sloMs: ackSloMs ?? 30000,
+      sloMs: ackSloMs ?? defaultAckSloMs ?? 30000,
       now,
       onSloMiss: (event) =>
         onAckSloMiss?.({ subscriberId, pattern, ...event }),
     }),
-    sloMs: ackSloMs ?? 30000,
+    sloMs: ackSloMs ?? defaultAckSloMs ?? 30000,
     onAckSloMiss,
   };
 }
@@ -17768,6 +17772,16 @@ export class EventBus {
    * a restart restores the unset default.
    */
   private defaultLeaseMs?: number;
+  /**
+   * Bus-level terminal ack-latency SLO default (EB-479): the `ackSloMs`
+   * a subscriber falls back to when it enables `ackLatency` sampling
+   * (EB-40) but omits its own `ackSloMs`. Starts unset (`undefined` —
+   * no default, new subscribers score against the historical 30000ms,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultAckSloMs`; there is no construction-time option, and
+   * a restart restores the unset default.
+   */
+  private defaultAckSloMs?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33565,6 +33579,11 @@ export class EventBus {
       id,
       topicPattern,
       this.now,
+      // EB-479: the bus default is the terminal fallback below an
+      // explicit ackSloMs; the opt-in gate inside still reads only the
+      // subscriber's explicit value, so the default never enables
+      // sampling on its own.
+      this.defaultAckSloMs,
     );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -48700,6 +48719,99 @@ export class EventBus {
    */
   getDefaultLeaseMs(): number | undefined {
     return this.defaultLeaseMs;
+  }
+
+  /**
+   * Sets the live bus-level terminal ack-latency SLO default (EB-479)
+   * without re-subscribing anyone:
+   * `setDefaultAckSloMs(ms, actor = 'system')` decides the `ackSloMs`
+   * for future ack-latency-enabled subscribers that omit their own
+   * (see `SubscribeOptions.ackSloMs`, EB-40) — `100` to score every
+   * new sampler's `withinSlo` / `sloAttainment` and `onAckSloMiss`
+   * against one fleet-wide budget with one call, `null` to clear the
+   * default back to no default (new subscribers score against
+   * 30000ms again).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 30000ms (the bus default is
+   * the terminal fallback below the explicit option — there is
+   * nothing below it but the historical 30000ms). A subscriber that
+   * took the default at subscribe time keeps the SLO it was baked
+   * with and its already-recorded samples: a later revision never
+   * moves an already-subscribed SLO, and `setAckLatency` still
+   * revises such a subscriber one at a time without touching the bus
+   * default.
+   *
+   * The default never enables sampling: a subscriber that does not
+   * opt into `ackLatency` gets no tracker, no matter what default is
+   * installed, and the default never triggers the
+   * `ackSloMs/onAckSloMiss require ackLatency` gate — that gate
+   * reads only the subscriber's explicit value, so passing an
+   * explicit `ackSloMs` (or `onAckSloMiss`) without `ackLatency`
+   * still throws exactly as before.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * finite number (`null` to clear) throws `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default (including clearing an already-unset
+   * default) is a no-op with no audit. Audited as
+   * `default_ack_slo_ms_revised` (`{ previous, ackSloMs }`, `null`
+   * when the default is unset — unset means new subscribers score
+   * against 30000ms, exactly the previous behavior).
+   *
+   * Orthogonal to EB-40 (that is the ack-latency sampling mechanism
+   * itself — this its missing bus-level terminal SLO default), to
+   * EB-279 (that revises one live sampler's parameters, including
+   * its `ackSloMs`, in place with its samples re-scored — this the
+   * default future samplers fall back to; a per-subscriber revision
+   * never touches the bus default), to EB-290 (that revises the
+   * handler processing-latency SLO threshold — this the
+   * accepted→ack full-round-trip SLO), to EB-276 (that revises the
+   * enqueue→hand-off delivery-latency sampling — this the
+   * accepted→ack sampling's SLO), and to EB-404 (that sets the bus
+   * default ack timeout — same "bus default" shape, a different
+   * knob: the confirmation deadline, not the SLO scoring line).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive finite number of milliseconds (or `null` to clear).
+   */
+  setDefaultAckSloMs(ms: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultAckSloMs');
+    if (ms !== null && (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0)) {
+      throw new RangeError(
+        'setDefaultAckSloMs: ackSloMs must be a positive finite number of milliseconds, or null to clear it',
+      );
+    }
+    const previous = this.defaultAckSloMs ?? null;
+    const next = ms ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === ms) {
+      return;
+    }
+    this.defaultAckSloMs = next;
+    this.auditSubscription({
+      action: 'default_ack_slo_ms_revised',
+      actor,
+      detail: { previous, ackSloMs: ms },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal ack-latency SLO default
+   * (EB-479) — the `ackSloMs` future ack-latency-enabled subscribers
+   * fall back to when they omit their own — `undefined` before any
+   * revision (no default, new subscribers score against 30000ms),
+   * then whatever `setDefaultAckSloMs` last installed.
+   */
+  getDefaultAckSloMs(): number | undefined {
+    return this.defaultAckSloMs;
   }
 
   /**
