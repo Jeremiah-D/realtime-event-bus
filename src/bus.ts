@@ -17712,6 +17712,15 @@ export class EventBus {
    */
   private defaultQueueSize?: number;
   /**
+   * Bus-level terminal queue byte-budget default (EB-474): the byte
+   * budget a subscriber falls back to when it omits its own
+   * `queueMaxBytes` (EB-83). Starts unset (`undefined` — no default,
+   * no byte dimension, exactly the previous behavior) and moves only
+   * via `setDefaultQueueMaxBytes`; there is no construction-time
+   * option, and a restart restores the unset default.
+   */
+  private defaultQueueMaxBytes?: number;
+  /**
    * Bus-level terminal max-idle default (EB-472): the window a
    * subscriber falls back to when it omits its own `maxIdleMs`
    * (EB-72). Starts unset (`undefined` — no default, no idle
@@ -33351,7 +33360,12 @@ export class EventBus {
     // between the explicit option and the documented 100. A shadow
     // queueSize always wins first; an explicit value always wins.
     const capacity = shadowOpts?.queueSize ?? opts?.queueSize ?? this.defaultQueueSize ?? 100;
-    const queueMaxBytes = opts?.queueMaxBytes;
+    // EB-474: a subscriber that omits queueMaxBytes falls back to the
+    // live bus default, if one is installed — the bus default sits
+    // between the explicit option and no byte dimension. An explicit
+    // value always wins. A shadow queue takes the same derived budget
+    // (one LaneQueue object, like the EB-470 capacity chain above).
+    const queueMaxBytes = opts?.queueMaxBytes ?? this.defaultQueueMaxBytes;
     if (queueMaxBytes !== undefined && (!Number.isFinite(queueMaxBytes) || queueMaxBytes <= 0)) {
       throw new RangeError('subscribe: queueMaxBytes must be a positive finite number of bytes');
     }
@@ -41065,7 +41079,9 @@ export class EventBus {
    * revised — the budget is opt-in, so a subscription without one has
    * no byte dimension to retune, and a revision after a clear is
    * refused until the subscriber opts in again at subscribe time (the
-   * EB-279/EB-280 precedent). Only the budget moves, in place: the
+   * EB-279/EB-280 precedent) — unless the clear resolved to a bus
+   * default (EB-474, below), in which case the re-armed budget stays
+   * revisable. Only the budget moves, in place: the
    * queue object, its already-queued messages and their buffered-byte
    * accounting, the count capacity, `dropPolicy`,
    * `highWaterMarkRatio`, and the backpressure tier are untouched.
@@ -41084,11 +41100,15 @@ export class EventBus {
    * budget set, a non-positive-finite budget (0, negative, `NaN`,
    * `Infinity`, or a non-number), and `undefined` — only an explicit
    * `null` clears — all throw `RangeError` with the live budget, the
-   * queue, and the audit log untouched. A revision identical to the
+   * queue, and the audit log untouched. Passing `null` clears back to
+   * the bus default in effect at the revision moment (EB-474) — no
+   * byte dimension when none is installed. A revision identical to the
    * current budget is a no-op with no audit. Audited as
    * `queue_max_bytes_revised` (`{ queueMaxBytes: <number> | null,
    * oldQueueMaxBytes: <number> }`, `null` meaning the budget was
-   * cleared back to no byte dimension).
+   * cleared back to no byte dimension — when a bus default is
+   * installed, `null` resolves to that default and the audit names
+   * the resolved budget).
    *
    * Orthogonal to `setQueueSize` (EB-281, that revises the
    * message-count capacity, this revises the byte budget) and to the
@@ -41120,7 +41140,13 @@ export class EventBus {
       throw new RangeError('setQueueMaxBytes: subscriber has no queue byte budget set');
     }
     const oldQueueMaxBytes = subscriber.queueMaxBytes;
-    const newQueueMaxBytes = bytes === null ? undefined : bytes;
+    // EB-474: `null` means "back to default" — when a bus default is
+    // installed the subscriber is re-armed with it (the audit names
+    // the resolved budget, and a later revision still works on the
+    // re-armed budget); with no default installed this is the old
+    // clear, and the EB-279/EB-280 rule still refuses later revisions
+    // until re-subscribe.
+    const newQueueMaxBytes = bytes === null ? this.defaultQueueMaxBytes : bytes;
     // Identical budget: a no-op — no audit, and no queue state moves.
     if (newQueueMaxBytes === oldQueueMaxBytes) {
       return;
@@ -48043,6 +48069,91 @@ export class EventBus {
    */
   getDefaultQueueSize(): number | undefined {
     return this.defaultQueueSize;
+  }
+
+  /**
+   * Sets the live bus-level terminal queue byte-budget default (EB-474)
+   * without re-subscribing anyone:
+   * `setDefaultQueueMaxBytes(bytes, actor = 'system')` decides the byte
+   * budget for future subscribers that omit their own `queueMaxBytes`
+   * (see `SubscribeOptions.queueMaxBytes`, EB-83) — `1024` to bound a
+   * fleet's per-subscriber buffered bytes with one call, `null` to
+   * clear the default back to no byte dimension.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched, and no flush fires for the revision
+   * itself. The priority chain is subscriber-explicit > bus default >
+   * no byte dimension (the bus default is the terminal fallback —
+   * there is nothing below it). A subscriber that took the default at
+   * subscribe time keeps the budget it was baked with: a later
+   * revision never moves an already-subscribed budget, and
+   * `setQueueMaxBytes` (EB-282) still revises such a subscriber one
+   * at a time without touching the bus default — while
+   * `setQueueMaxBytes(subId, null)` now clears to the bus default in
+   * effect at revision time (no byte dimension when unset), so `null`
+   * means "back to default", never "no budget" — and a later revision
+   * still works on the re-armed budget. A shadow queue that omits
+   * `queueMaxBytes` takes the same derived budget (one LaneQueue
+   * object, like the EB-470 capacity chain). The `queueSize` count
+   * capacity is untouched — this only supplies the byte dimension.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * finite number of bytes (`null` to clear) throws `RangeError` with
+   * the live default and the audit log untouched. A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit. Audited as
+   * `default_queue_max_bytes_revised`
+   * (`{ previous, queueMaxBytes }`, `null` when the default is unset
+   * — unset means new subscribers get no byte dimension, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-83 (that is the budget mechanism itself — this
+   * its missing bus-level terminal default), to EB-282 (that revises
+   * one live subscriber's budget — this the default future
+   * subscribers fall back to), to EB-281 (that revises the count
+   * capacity — this the byte budget default), and to EB-470 (that
+   * revises the bus queue-size default — same "bus default" shape, a
+   * different dimension).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than a
+   * positive finite number of bytes (or `null` to clear).
+   */
+  setDefaultQueueMaxBytes(bytes: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultQueueMaxBytes');
+    if (bytes !== null && (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0)) {
+      throw new RangeError(
+        'setDefaultQueueMaxBytes: queueMaxBytes must be a positive finite number of bytes, or null to clear it',
+      );
+    }
+    const previous = this.defaultQueueMaxBytes ?? null;
+    const next = bytes ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === bytes) {
+      return;
+    }
+    this.defaultQueueMaxBytes = next;
+    this.auditSubscription({
+      action: 'default_queue_max_bytes_revised',
+      actor,
+      detail: { previous, queueMaxBytes: bytes },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal queue byte-budget default
+   * (EB-474) — the budget future subscribers fall back to when they
+   * omit their own `queueMaxBytes` — `undefined` before any revision
+   * (no default, new subscribers get no byte dimension), then whatever
+   * `setDefaultQueueMaxBytes` last installed.
+   */
+  getDefaultQueueMaxBytes(): number | undefined {
+    return this.defaultQueueMaxBytes;
   }
 
   /**

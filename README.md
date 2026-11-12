@@ -1399,9 +1399,10 @@ library.
   subscriptions that already carry one (`queueMaxBytes` is opt-in),
   so a never-set budget, and a budget cleared by an earlier revision,
   both throw `RangeError` until the subscriber opts in again at
-  subscribe time. `null` clears back to no byte dimension, never to a
-  default — only the message-count capacity constrains admission
-  afterwards. Only the budget moves, in place: the queue object, its
+  subscribe time. `null` clears back to the bus default in effect at
+  the revision moment (EB-474, below); with no default installed it
+  clears back to no byte dimension — only the message-count capacity
+  constrains admission afterwards. Only the budget moves, in place: the queue object, its
   already-queued messages and their buffered-byte accounting, the
   count capacity, `dropPolicy`, `highWaterMarkRatio`, and the
   backpressure tier are untouched, so shrinking below the current
@@ -1419,6 +1420,22 @@ library.
   (`{ queueMaxBytes: <number> | null, oldQueueMaxBytes: <number> }`).
   Orthogonal to the count capacity (EB-281, that revises `queueSize`,
   this revises the byte budget). (Real-time systems: delivery
+  governance.)
+- **Bus-level default queue byte budget**
+  (`setDefaultQueueMaxBytes(bytes | null, actor?)`, EB-474): future
+  subscribers that omit `queueMaxBytes` fall back to the live bus
+  default — `1024` to bound a fleet's per-subscriber buffered bytes
+  with one call, `null` to clear back to no byte dimension. The
+  priority chain is subscriber-explicit > bus default > no byte
+  dimension; a subscriber keeps the budget it was baked with, and
+  `setQueueMaxBytes(subId, null)` clears to the bus default in effect
+  at revision time (no byte dimension when unset), so `null` means
+  "back to default". A shadow queue that omits `queueMaxBytes` takes
+  the same derived budget. There is no construction-time option and
+  the revision is live-only (a restart restores the unset default); a
+  revision identical to the current default is a no-op with no audit.
+  Audited as `default_queue_max_bytes_revised`
+  (`{ previous, queueMaxBytes }`). (Real-time systems: delivery
   governance.)
 - **`src/throttle.ts` — `TokenBucket` + adaptive publish-side throttling**:
   opt-in per subscriber via `subscribe(..., { throttle: true })`. When the
