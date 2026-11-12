@@ -1780,6 +1780,23 @@ export interface SubscribeOptions {
    */
   subscriberMaxPayloadBytes?: number;
   /**
+   * Opt-in per-subscriber message TTL cap, in milliseconds (EB-480):
+   * the longest a message may sit in this subscriber's queue. At
+   * enqueue time the message's effective deadline becomes
+   * `min(its existing deadline, enqueueTime + subscriberTtlMs)` —
+   * a freshness-sensitive subscriber (a market-data board, a
+   * real-time alert sink) can demand a shorter life than the topic
+   * rule grants, while a cap longer than the message's own deadline
+   * never extends it. Expiry still runs the existing TTL path: the
+   * message is dropped before delivery and counted as `expired`.
+   * `expiringSoon` (EB-110) judges the capped deadline. Revisable
+   * live via `setSubscriberTtl` — a revision governs only messages
+   * enqueued after it; already-queued messages keep the deadline
+   * they were admitted with. Must be a positive integer when given
+   * — anything else throws `RangeError` at subscribe time.
+   */
+  subscriberTtlMs?: number;
+  /**
    * Opt-in key-range subscription (EB-232): the subscriber only
    * receives keyed messages (`PublishOptions.key`, EB-36) whose key
    * falls in `[start, end)` under string lexicographic comparison
@@ -9110,6 +9127,28 @@ interface Subscriber {
    * the gate is inert.
    */
   subscriberMaxPayloadBytes?: number;
+  /**
+   * Per-subscriber message TTL cap in milliseconds (see
+   * `SubscribeOptions.subscriberTtlMs`, EB-480). Undefined means no
+   * cap — the message keeps the deadline it was admitted with.
+   * Read live by `enqueueMessage` on every admission and revisable
+   * via `setSubscriberTtl`.
+   */
+  subscriberTtlMs?: number;
+  /**
+   * Effective TTL deadlines recorded at enqueue time for this
+   * subscriber (EB-480): `min(shared deadline, enqueueTime +
+   * subscriberTtlMs)` whenever a cap was in force at admission, so
+   * `checkExpiringSoon` and the redelivery hand-offs judge the
+   * same live deadline the queue enforces — never the shared
+   * `messageDeadlines` value a cap shortened. A re-enqueue
+   * overwrites the entry with the fresh cap; an enqueue with no cap
+   * in force deletes any stale entry, so a cleared cap never haunts
+   * a later redelivery. A message admitted before any cap was set
+   * has no entry and keeps its original deadline. WeakMap: the
+   * entry dies with the message.
+   */
+  subscriberTtlDeadlines?: WeakMap<BusMessage, number>;
   /**
    * Key range for this subscription (see
    * `SubscribeOptions.keyRange`, EB-232). Undefined means no range
@@ -33437,6 +33476,16 @@ export class EventBus {
     ) {
       throw new RangeError('subscribe: subscriberMaxPayloadBytes must be a positive integer number of bytes');
     }
+    // Per-subscriber message TTL cap (EB-480): validated before
+    // anything registers, so a throw leaves no half-registered
+    // subscriber behind.
+    const subscriberTtlMs = opts?.subscriberTtlMs;
+    if (
+      subscriberTtlMs !== undefined &&
+      (!Number.isInteger(subscriberTtlMs) || subscriberTtlMs <= 0)
+    ) {
+      throw new RangeError('subscribe: subscriberTtlMs must be a positive integer number of milliseconds');
+    }
     // Key-range subscription (EB-232): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const keyRange = opts?.keyRange;
@@ -33900,6 +33949,12 @@ export class EventBus {
       // cap; when absent the delivery gate inherits the topic's EB-120
       // payload cap at delivery time.
       subscriberMaxPayloadBytes,
+      // Per-subscriber message TTL cap (EB-480): the opt-in cap;
+      // when absent the message keeps the deadline it was admitted
+      // with. `enqueueMessage` reads the live field on every
+      // admission, so `setSubscriberTtl` governs from the next
+      // enqueue with no drain or re-registration.
+      subscriberTtlMs,
       // Key-range subscription (EB-232): the resolved range, stored
       // as given — the caller-owned object is never aliased, so later
       // mutations of `opts.keyRange` cannot change the subscription.
@@ -41381,6 +41436,94 @@ export class EventBus {
       pattern: subscriber.pattern,
       detail: { subscriberMaxPayloadBytes: newCap ?? null, oldSubscriberMaxPayloadBytes },
     });
+  }
+
+  /**
+   * Revises one subscriber's per-subscriber message TTL cap (EB-480)
+   * without re-subscribing: `setSubscriberTtl(subId, ms)` installs
+   * the longest a message may sit in that subscriber's queue, and
+   * `setSubscriberTtl(subId, null)` clears it back to no cap.
+   *
+   * Only the cap moves: `enqueueMessage` reads the live field on
+   * every admission, so the new cap governs from the next enqueue —
+   * the effective deadline is `min(the message's existing deadline,
+   * enqueueTime + ms)` — with no drain, re-registration, or replay.
+   * Already-queued messages keep the deadline they were admitted
+   * with; a re-enqueue (nack redelivery, ladder rung, DLQ replay)
+   * re-records the fresh cap. A cap longer than a message's own
+   * deadline never extends it. Expiry still runs the existing TTL
+   * path: the message is dropped before delivery and counted as
+   * `expired`, `expiringSoon` (EB-110) judges the capped deadline,
+   * and the redelivery hand-offs never resurrect a message that
+   * passed its capped deadline while parked.
+   *
+   * Fail-closed: a closed bus refuses with `BusClosedError` (EB-154,
+   * checked first — close tears subscriptions down, so the refusal
+   * must not depend on the subscriber still being registered), an
+   * unknown subscriber id, an empty id, and an illegal cap (0,
+   * negative, fractional, `NaN`, `Infinity`, a non-number, or
+   * `undefined` — only an explicit `null` clears) all throw
+   * `RangeError` with the live cap and the audit log untouched. A
+   * revision identical to the current cap (including clearing an
+   * already-unset cap) is a no-op with no audit. Audited as
+   * `subscriber_ttl_revised` (`{ ttl_ms: <number> | null,
+   * previous_ttl_ms: <number> | null }`, `null` meaning the cap was
+   * cleared back to no cap). The cap is live-only — it never enters
+   * a config snapshot and a restart restores the subscribe-time cap.
+   *
+   * Orthogonal to `setTopicTtl` / `setDefaultTtlMs` (those set the
+   * deadlines the cap shortens, this shortens them per subscriber),
+   * to EB-149 (that is the per-message TTL mechanism itself, this
+   * its subscriber-level ceiling), and to EB-110/EB-288 (those only
+   * observe the deadline, this moves it).
+   *
+   * Throws `BusClosedError` for a closed bus and `RangeError` for
+   * an unknown subscriber or an illegal cap.
+   */
+  setSubscriberTtl(subId: string, ms: number | null, actor = 'system'): void {
+    // EB-154: a closed bus never takes new configuration — refusing
+    // the revision fail-fast keeps the shutdown terminal.
+    this.assertNotClosed('subscribe', subId);
+    assertValidActor(actor, 'setSubscriberTtl');
+    if (typeof subId !== 'string' || subId.length === 0) {
+      throw new RangeError('setSubscriberTtl: subId must be a non-empty string');
+    }
+    const subscriber = this.subscribers.get(subId);
+    if (subscriber == null) {
+      throw new RangeError(`setSubscriberTtl: unknown subscriber: ${subId}`);
+    }
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` clears — and a non-positive-integer
+    // never moves the live cap (the subscribe-time validation is
+    // integer, like `setSubscriberMaxPayloadBytes`).
+    if (ms !== null && (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0)) {
+      throw new RangeError('setSubscriberTtl: ms must be a positive integer number of milliseconds, or null to clear it');
+    }
+    const previousTtlMs = subscriber.subscriberTtlMs;
+    const nextTtlMs = ms === null ? undefined : ms;
+    // Re-affirming the current cap is a no-op: no swap, no audit —
+    // including clearing an already-unset cap.
+    if (previousTtlMs === nextTtlMs) {
+      return;
+    }
+    subscriber.subscriberTtlMs = nextTtlMs;
+    this.auditSubscription({
+      action: 'subscriber_ttl_revised',
+      actor,
+      subId: subscriber.id,
+      pattern: subscriber.pattern,
+      detail: { ttl_ms: nextTtlMs ?? null, previous_ttl_ms: previousTtlMs ?? null },
+    });
+  }
+
+  /**
+   * Returns one subscriber's live per-subscriber message TTL cap
+   * (EB-480) in milliseconds — `undefined` when the subscriber has
+   * no cap (messages keep the deadline they were admitted with), or
+   * when `subId` names no live subscription.
+   */
+  getSubscriberTtl(subId: string): number | undefined {
+    return this.subscribers.get(subId)?.subscriberTtlMs;
   }
 
   /**
@@ -61195,12 +61338,40 @@ export class EventBus {
       normal: queue.droppedByLane('normal'),
       bulk: queue.droppedByLane('bulk'),
     };
+    // Per-subscriber TTL cap (EB-480): the effective deadline is the
+    // earlier of the message's existing deadline and `now +
+    // subscriberTtlMs` — a slow subscriber's queue never holds a
+    // message past its freshness window, however long the topic TTL
+    // runs. The cap is read live on every enqueue, so a revision
+    // governs from the next admission; already-queued entries keep
+    // the deadline they were admitted with (the queue stores it per
+    // entry, and `subscriberTtlDeadlines` mirrors it for the
+    // observers that judge expiry outside the drain). A cap longer
+    // than the existing deadline never extends it — `min` only
+    // shortens — and with no cap the deadline passes through
+    // untouched, exactly as before.
+    const subscriberTtlMs = subscriber.subscriberTtlMs;
+    let effectiveDeadline = deadline;
+    if (subscriberTtlMs !== undefined) {
+      const capDeadline = this.now() + subscriberTtlMs;
+      effectiveDeadline =
+        deadline === undefined ? capDeadline : Math.min(deadline, capDeadline);
+      if (subscriber.subscriberTtlDeadlines === undefined) {
+        subscriber.subscriberTtlDeadlines = new WeakMap();
+      }
+      subscriber.subscriberTtlDeadlines.set(msg, effectiveDeadline);
+    } else {
+      // No cap in force: drop any stale record from an earlier cap,
+      // so a cleared cap never haunts a later re-enqueue of the
+      // same message (a redelivery re-admits under the live rules).
+      subscriber.subscriberTtlDeadlines?.delete(msg);
+    }
     // Priority lanes (EB-122): the message queues in its stamped lane —
     // absent means `normal`, so priority-unaware traffic behaves exactly
     // as before. Urgent still respects the backpressure policy: a full
     // queue sheds per the lane shed precedence (bulk first, urgent last).
     const lane: MessageLane = msg.lane ?? 'normal';
-    const result = queue.push(msg, lane, deadline);
+    const result = queue.push(msg, lane, effectiveDeadline);
     let shed = 0;
     for (const shedLane of MESSAGE_LANES) {
       const shedInLane = queue.droppedByLane(shedLane) - droppedBefore[shedLane];
@@ -61532,6 +61703,19 @@ export class EventBus {
   }
 
   /**
+   * The TTL deadline `checkExpiringSoon` and the redelivery hand-offs
+   * judge for one subscriber's message (EB-480): the per-subscriber
+   * effective deadline recorded at enqueue time — `min(shared
+   * deadline, enqueueTime + subscriberTtlMs)` — when the subscriber
+   * had a cap in force then, else the shared `messageDeadlines`
+   * value. A later revision never moves an already-recorded
+   * deadline; a re-enqueue re-records it under the live cap.
+   */
+  private effectiveDeadlineFor(subscriber: Subscriber, msg: BusMessage): number | undefined {
+    return subscriber.subscriberTtlDeadlines?.get(msg) ?? this.messageDeadlines.get(msg);
+  }
+
+  /**
    * Evaluates an expiring-soon-monitored subscriber's queue head against
    * its warning threshold (see `SubscribeOptions.expiringSoon`, EB-110).
    * Fires `onExpiringSoon` once per excursion — when the head message's
@@ -61552,7 +61736,7 @@ export class EventBus {
       expiring.alerted = false;
       return;
     }
-    const deadline = this.messageDeadlines.get(head);
+    const deadline = this.effectiveDeadlineFor(subscriber, head);
     const remainingMs = deadline === undefined ? Infinity : deadline - nowMs;
     if (remainingMs <= expiring.expiringSoonMs && !expiring.alerted) {
       expiring.alerted = true;
@@ -67100,7 +67284,7 @@ export class EventBus {
     }
     // EB-155: judge TTL expiry at the hand-off — an expired message is
     // dropped as expired, never resurrected by the ladder.
-    const deadline = this.messageDeadlines.get(msg);
+    const deadline = this.effectiveDeadlineFor(subscriber, msg);
     if (deadline !== undefined && this.now() >= deadline) {
       pending.timer.cancel();
       dlq.pendingLadders.delete(msg);
@@ -67150,7 +67334,7 @@ export class EventBus {
     reliable.pendingRedeliveryBackoffs.delete(msg);
     // EB-220: judge TTL expiry at the hand-off — an expired message is
     // dropped as expired, never resurrected by the backoff.
-    const deadline = this.messageDeadlines.get(msg);
+    const deadline = this.effectiveDeadlineFor(subscriber, msg);
     if (deadline !== undefined && this.now() >= deadline) {
       this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
       this.checkDrainComplete(subscriber);
@@ -69998,7 +70182,7 @@ export class EventBus {
     const unfenced = this.gateFencedDeliveries(subscriber, pending);
     const live: BusMessage[] = [];
     for (const msg of unfenced) {
-      const deadline = this.messageDeadlines.get(msg);
+      const deadline = this.effectiveDeadlineFor(subscriber, msg);
       if (deadline !== undefined && nowMs >= deadline) {
         this.noteDrainedExpired(msg, msg.lane ?? 'normal', subscriber);
       } else {

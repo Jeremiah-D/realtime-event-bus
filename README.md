@@ -7836,6 +7836,21 @@ bus.publish('orders.eu', quote); // this one: the 30s topic rule
   default then in effect; a revision never moves an already-stamped
   deadline.
 
+- **Per-subscriber cap (EB-480).** `SubscribeOptions.subscriberTtlMs`
+  caps how long a message may sit in one subscriber's queue: at
+  enqueue time its effective deadline becomes `min(its existing
+  deadline, enqueueTime + subscriberTtlMs)` — a freshness-sensitive
+  subscriber (a market-data board, a real-time alert sink) can demand
+  a shorter life than the topic rule grants, while a cap longer than
+  the message's own deadline never extends it. Expiry still runs the
+  existing TTL path (dropped before delivery, counted as `expired`),
+  and `expiringSoon` judges the capped deadline. `setSubscriberTtl(subId,
+  ms | null, actor?)` revises the cap live (`null` clears back to no
+  cap; a revision identical to the current cap is a no-op with no
+  audit, audited as `subscriber_ttl_revised`); a revision governs
+  only messages enqueued after it — already-queued messages keep the
+  deadline they were admitted with.
+
 Semantics:
 
 - **Stamped at admission.** The deadline is `now + ttlMs`, stamped once
