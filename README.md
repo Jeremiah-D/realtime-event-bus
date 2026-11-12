@@ -2199,6 +2199,24 @@ library.
   delivery payload cap) and to the topic cap (EB-120, that revises the
   topic cap, this revises the subscriber's explicit cap). (Real-time
   systems: delivery governance.)
+- **Bus-level default subscriber payload cap**
+  (`setDefaultSubscriberMaxPayloadBytes(bytes | null, actor?)`,
+  EB-477): future subscribers that omit `subscriberMaxPayloadBytes`
+  fall back to the live bus default — `64` to bound every new
+  subscriber's single-message payload fleet-wide with one call,
+  `null` to clear back to topic-cap inheritance. The priority chain
+  is subscriber-explicit > bus default > topic cap > no cap; the
+  stored field is the derived value, so `subscriberPayloadCapFor`
+  still reports source `'subscriber'` for a default-derived cap. A
+  subscriber keeps the cap it was baked with, and
+  `setSubscriberMaxPayloadBytes(subId, null)` now clears to the bus
+  default in effect at revision time (topic-cap inheritance when
+  unset). There is no construction-time option and the revision is
+  live-only (a restart restores the unset default); a revision
+  identical to the current default is a no-op with no audit. Audited
+  as `default_subscriber_max_payload_bytes_revised`
+  (`{ previous, subscriberMaxPayloadBytes }`). (Real-time systems:
+  delivery governance.)
 - **Per-topic sensitive-field redaction** (in `src/bus.ts`, via
   `setTopicRedaction(pattern, fields)`): admission-time masking of
   sensitive payload fields for PII/secret hygiene (backend/real-time

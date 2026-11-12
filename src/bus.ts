@@ -17740,6 +17740,16 @@ export class EventBus {
    */
   private defaultHighWaterMarkRatio?: number;
   /**
+   * Bus-level terminal subscriber payload-cap default (EB-477): the
+   * per-subscriber payload cap a subscriber falls back to when it
+   * omits its own `subscriberMaxPayloadBytes` (EB-208). Starts unset
+   * (`undefined` — no default, new subscribers inherit the topic's
+   * EB-120 cap, exactly the previous behavior) and moves only via
+   * `setDefaultSubscriberMaxPayloadBytes`; there is no
+   * construction-time option, and a restart restores the unset default.
+   */
+  private defaultSubscriberMaxPayloadBytes?: number;
+  /**
    * Bus-level terminal drop-policy default (EB-475): the shed policy a
    * subscriber falls back to when it omits its own `dropPolicy` under
    * the 'block' backpressure tier (EB-83). Starts unset (`undefined` —
@@ -33391,7 +33401,13 @@ export class EventBus {
     }
     // Per-subscriber payload-size cap (EB-208): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
-    const subscriberMaxPayloadBytes = opts?.subscriberMaxPayloadBytes;
+    // EB-477: a subscriber that omits subscriberMaxPayloadBytes falls
+    // back to the live bus default, if one is installed — the bus
+    // default sits between the explicit option and the topic-cap
+    // inheritance. An explicit value always wins. The stored value is
+    // the derived one, so `subscriberPayloadCapFor` is untouched.
+    const subscriberMaxPayloadBytes =
+      opts?.subscriberMaxPayloadBytes ?? this.defaultSubscriberMaxPayloadBytes;
     if (
       subscriberMaxPayloadBytes !== undefined &&
       (!Number.isInteger(subscriberMaxPayloadBytes) || subscriberMaxPayloadBytes <= 0)
@@ -41201,7 +41217,11 @@ export class EventBus {
    * `subscriberMaxPayloadBytes` can be revised — the cap is opt-in,
    * so a subscription without one has no explicit cap to retune, and
    * a revision after a clear is refused until the subscriber opts in
-   * again at subscribe time (the EB-279/EB-280/EB-282 precedent).
+   * again at subscribe time (the EB-279/EB-280/EB-282 precedent) —
+   * unless the clear resolved to a bus default (EB-477, below), in
+   * which case the re-armed cap stays revisable. A subscription
+   * whose cap came from the bus default is likewise revisable: the
+   * gate only asks whether the field is defined.
    * Only the subscriber field moves: unlike `queueMaxBytes` there is
    * no second aggregate object to update, because
    * `subscriberPayloadCapFor` reads the live field on every delivery
@@ -41221,15 +41241,16 @@ export class EventBus {
    * fractional, `NaN`, `Infinity`, or a non-number), and
    * `undefined` — only an explicit `null` clears — all throw
    * `RangeError` with the live cap and the audit log untouched.
-   * Clearing removes the explicit cap, so the delivery gate falls
-   * back to the topic's EB-120 payload cap resolved for the
-   * message's topic at delivery time, or to no cap when the topic
-   * has none. A revision identical to the current cap is a no-op
+   * Passing `null` clears back to the bus default in effect at the
+   * revision moment (EB-477) — topic-cap inheritance when none is
+   * installed. A revision identical to the current cap is a no-op
    * with no audit. Audited as
    * `subscriber_max_payload_bytes_revised`
    * (`{ subscriberMaxPayloadBytes: <number> | null,
    * oldSubscriberMaxPayloadBytes: <number> }`, `null` meaning the
-   * explicit cap was cleared back to inheritance).
+   * explicit cap was cleared back to inheritance — when a bus
+   * default is installed, `null` resolves to that default and the
+   * audit names the resolved cap).
    *
    * Orthogonal to `setQueueMaxBytes` (EB-282, that revises the
    * queue byte budget, this revises the delivery payload cap), to
@@ -41263,7 +41284,13 @@ export class EventBus {
       throw new RangeError('setSubscriberMaxPayloadBytes: subscriber has no explicit payload cap set');
     }
     const oldSubscriberMaxPayloadBytes = subscriber.subscriberMaxPayloadBytes;
-    const newCap = bytes === null ? undefined : bytes;
+    // EB-477: `null` means "back to default" — when a bus default is
+    // installed the subscriber is re-armed with it (the audit names
+    // the resolved cap, and a later revision still works on the
+    // re-armed cap); with no default installed this is the old
+    // clear, and the EB-279/EB-280 rule still refuses later revisions
+    // until re-subscribe.
+    const newCap = bytes === null ? this.defaultSubscriberMaxPayloadBytes : bytes;
     // Identical cap: a no-op — no audit, and no delivery state moves.
     if (newCap === oldSubscriberMaxPayloadBytes) {
       return;
@@ -48353,6 +48380,94 @@ export class EventBus {
    */
   getDefaultHighWaterMarkRatio(): number | undefined {
     return this.defaultHighWaterMarkRatio;
+  }
+
+  /**
+   * Sets the live bus-level terminal subscriber payload-cap default
+   * (EB-477) without re-subscribing anyone:
+   * `setDefaultSubscriberMaxPayloadBytes(bytes, actor = 'system')`
+   * decides the per-subscriber payload cap for future subscribers
+   * that omit their own `subscriberMaxPayloadBytes` (see
+   * `SubscribeOptions.subscriberMaxPayloadBytes`, EB-208) — `64` to
+   * bound every new subscriber's single-message payload fleet-wide
+   * with one call, `null` to clear the default back to topic-cap
+   * inheritance.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > topic cap > no cap (the bus
+   * default is the terminal fallback below the explicit option — the
+   * topic cap still applies beneath it). A subscriber that took the
+   * default at subscribe time keeps the cap it was baked with: a
+   * later revision never moves an already-subscribed cap, and
+   * `setSubscriberMaxPayloadBytes` still revises such a subscriber
+   * one at a time without touching the bus default — while
+   * `setSubscriberMaxPayloadBytes(subId, null)` now clears to the
+   * bus default in effect at revision time (topic-cap inheritance
+   * when unset), so `null` means "back to default", never "no cap".
+   * The stored field is the derived value, so
+   * `subscriberPayloadCapFor` needs no change and still reports
+   * source `'subscriber'` for a default-derived cap.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to the
+   * current default (including clearing an already-unset default) is
+   * a no-op with no audit. Audited as
+   * `default_subscriber_max_payload_bytes_revised`
+   * (`{ previous, subscriberMaxPayloadBytes }`, `null` when the
+   * default is unset — unset means new subscribers inherit the
+   * topic cap, exactly the previous behavior).
+   *
+   * Orthogonal to EB-208 (that is the per-subscriber cap mechanism
+   * itself — this its missing bus-level terminal default), to
+   * EB-120 (that revises the topic cap — this the subscriber-side
+   * default; a default-derived cap still wins over the topic cap),
+   * to EB-282 (that revises the queue byte budget — this the
+   * single-message delivery cap), and to EB-470/474 (that revise
+   * the bus queue-size and byte-budget defaults — same "bus
+   * default" shape, different knobs).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer number of bytes (or `null` to clear).
+   */
+  setDefaultSubscriberMaxPayloadBytes(bytes: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultSubscriberMaxPayloadBytes');
+    if (bytes !== null && (!Number.isInteger(bytes) || bytes <= 0)) {
+      throw new RangeError(
+        'setDefaultSubscriberMaxPayloadBytes: subscriberMaxPayloadBytes must be a positive integer number of bytes, or null to clear it',
+      );
+    }
+    const previous = this.defaultSubscriberMaxPayloadBytes ?? null;
+    const next = bytes ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === bytes) {
+      return;
+    }
+    this.defaultSubscriberMaxPayloadBytes = next;
+    this.auditSubscription({
+      action: 'default_subscriber_max_payload_bytes_revised',
+      actor,
+      detail: { previous, subscriberMaxPayloadBytes: bytes },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal subscriber payload-cap
+   * default (EB-477) — the cap future subscribers fall back to when
+   * they omit their own `subscriberMaxPayloadBytes` — `undefined`
+   * before any revision (no default, new subscribers inherit the
+   * topic cap), then whatever
+   * `setDefaultSubscriberMaxPayloadBytes` last installed.
+   */
+  getDefaultSubscriberMaxPayloadBytes(): number | undefined {
+    return this.defaultSubscriberMaxPayloadBytes;
   }
 
   /**
