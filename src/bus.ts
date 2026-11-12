@@ -17760,6 +17760,15 @@ export class EventBus {
    */
   private defaultDropPolicy?: DropPolicy;
   /**
+   * Bus-level terminal subscription-lease default (EB-478): the
+   * lease duration a subscriber falls back to when it omits its own
+   * `leaseMs` (EB-69). Starts unset (`undefined` — no default, no
+   * lease, exactly the previous behavior) and moves only via
+   * `setDefaultLeaseMs`; there is no construction-time option, and
+   * a restart restores the unset default.
+   */
+  private defaultLeaseMs?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33437,7 +33446,10 @@ export class EventBus {
     }
     // Subscription lease (EB-69): validated before anything registers, so
     // a throw leaves no half-registered subscriber behind.
-    const leaseMs = opts?.leaseMs;
+    // EB-478: a subscriber that omits leaseMs falls back to the live
+    // bus default, if one is installed — the bus default sits between
+    // the explicit option and no lease. An explicit value always wins.
+    const leaseMs = opts?.leaseMs ?? this.defaultLeaseMs;
     if (leaseMs !== undefined && (!Number.isInteger(leaseMs) || leaseMs <= 0)) {
       throw new RangeError('subscribe: leaseMs must be a positive integer number of milliseconds');
     }
@@ -34423,9 +34435,16 @@ export class EventBus {
    *   re-arms an existing lease from the revision moment, the
    *   `renewLease` from-now semantics: re-affirming the current
    *   duration still re-arms the timer and is audited.
-   * - `null` clears the lease: the subscription keeps running with no
-   *   lease expiry. Clearing a subscription that holds no lease is a
-   *   no-op with no audit.
+   * - `null` clears the lease back to the bus default in effect at
+   *   the revision moment (EB-478): when a bus default is installed
+   *   (`setDefaultLeaseMs`), the subscription is re-armed with that
+   *   default from the revision moment, so `null` means "back to
+   *   default", never "no lease" — and a later revision still works
+   *   on the re-armed lease. When no bus default is set, `null`
+   *   clears the lease: the subscription keeps running with no lease
+   *   expiry. Clearing a lease-less subscription when no default is
+   *   installed is a no-op with no audit; with a default installed
+   *   the same call arms the default instead.
    *
    * Returns `true` when the subscription exists (including a no-op
    * clear), `false` for an unknown subscription id — the `renewLease`
@@ -34442,9 +34461,11 @@ export class EventBus {
    * Orthogonal to EB-69 (that is the lease mechanism itself — this
    * its live arm/retune/clear), to EB-72 (that is idle auto-reclamation
    * — this is the fixed-duration lease), to EB-82 (that migrates a
-   * subscription's remaining lease — this arms one in place), and to
+   * subscription's remaining lease — this arms one in place), to
    * EB-335 (that retunes the group handoff linger — this retunes a
-   * subscription lease).
+   * subscription lease), and to EB-478 (that sets the bus-level
+   * default lease — this revises one live lease; `null` here clears
+   * to that default).
    *
    * Throws `RangeError` for an illegal `ms` or actor.
    */
@@ -34461,16 +34482,52 @@ export class EventBus {
     if (subscriber === undefined) return false;
     const previous = this.leases.current(subId);
     if (ms === null) {
-      // Clearing a lease-less subscription is a no-op: the requested
-      // end state (no lease) already holds, and nothing is audited.
-      if (previous === undefined) return true;
-      this.leases.clear(subId);
+      // EB-478: `null` means "back to default" — when a bus default
+      // is installed the lease is re-armed with it (the audit names
+      // the resolved duration, and the timer restarts from the
+      // revision moment, exactly like a non-null revision); with no
+      // default installed this is the old clear.
+      const fallback = this.defaultLeaseMs;
+      if (fallback === undefined) {
+        // Clearing a lease-less subscription is a no-op: the requested
+        // end state (no lease) already holds, and nothing is audited.
+        if (previous === undefined) return true;
+        this.leases.clear(subId);
+        this.auditSubscription({
+          action: 'subscription_lease_revised',
+          actor,
+          subId: subscriber.id,
+          pattern: subscriber.pattern,
+          detail: { previous_lease_ms: previous, lease_ms: null },
+        });
+        return true;
+      }
+      // Clearing back to the very lease already armed is a no-op:
+      // no re-arm, no audit, and the pending timer keeps its
+      // original fire time.
+      if (fallback === previous) {
+        return true;
+      }
+      if (previous !== undefined) {
+        // Re-arm from the revision moment — the renewLease semantics.
+        this.leases.renew(subId, fallback);
+      } else {
+        // Arm the default on a subscription that never opted in,
+        // through its outermost teardown (group leave / ack-tracker
+        // clear included); `teardown` is recorded for every live
+        // subscriber at subscribe time, so a missing one can only
+        // mean an internal invariant break — fail closed rather than
+        // arming a half lease.
+        const teardown = subscriber.teardown;
+        if (teardown === undefined) return false;
+        this.leases.arm(subId, fallback, subscriber.pattern, teardown);
+      }
       this.auditSubscription({
         action: 'subscription_lease_revised',
         actor,
         subId: subscriber.id,
         pattern: subscriber.pattern,
-        detail: { previous_lease_ms: previous, lease_ms: null },
+        detail: { previous_lease_ms: previous ?? null, lease_ms: fallback },
       });
       return true;
     }
@@ -48554,6 +48611,95 @@ export class EventBus {
    */
   getDefaultDropPolicy(): DropPolicy | undefined {
     return this.defaultDropPolicy;
+  }
+
+  /**
+   * Sets the live bus-level terminal subscription-lease default
+   * (EB-478) without re-subscribing anyone:
+   * `setDefaultLeaseMs(ms, actor = 'system')` decides the lease
+   * duration for future subscribers that omit their own `leaseMs`
+   * (see `SubscribeOptions.leaseMs`, EB-69) — `30000` to bound every
+   * new subscriber's lifetime fleet-wide with one call, `null` to
+   * clear the default back to no lease.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > no lease (the bus default is
+   * the terminal fallback below the explicit option — there is
+   * nothing below it but no lease). A subscriber that took the
+   * default at subscribe time keeps the lease it was baked with and
+   * its expiry moment: a later revision never moves an
+   * already-subscribed lease, and `setSubscriptionLease` still
+   * revises such a subscriber one at a time without touching the bus
+   * default — while `setSubscriptionLease(subId, null)` now clears
+   * to the bus default in effect at revision time (no lease when
+   * unset), so `null` means "back to default", never "no lease".
+   * A snapshot import carrying an explicit remaining lease
+   * (EB-82) still wins over the default: the import arms its own
+   * remaining time, and only an import with no remaining lease
+   * falls back to the default like any new subscriber.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to the
+   * current default (including clearing an already-unset default) is
+   * a no-op with no audit. Audited as `default_lease_ms_revised`
+   * (`{ previous, leaseMs }`, `null` when the default is unset —
+   * unset means new subscribers get no lease, exactly the previous
+   * behavior).
+   *
+   * Orthogonal to EB-69 (that is the lease mechanism itself — this
+   * its missing bus-level terminal default), to EB-348 (that arms /
+   * retunes / clears one live subscriber's lease — this the default
+   * future subscribers fall back to; `null` there clears to this
+   * default), to EB-72/EB-472 (that are the idle-reclamation window
+   * and its bus default — this the fixed lifetime; the two defaults
+   * coexist and whichever fires first wins), to EB-82 (that migrates
+   * a subscription's remaining lease — this the default for new
+   * subscribers; an import's explicit lease always wins), and to
+   * EB-464/466/470 (that revise the bus TTL, max-in-flight, and
+   * queue-size defaults — same "bus default" shape, different
+   * knobs).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer number of milliseconds (or `null` to clear).
+   */
+  setDefaultLeaseMs(ms: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultLeaseMs');
+    if (ms !== null && (!Number.isInteger(ms) || ms <= 0)) {
+      throw new RangeError(
+        'setDefaultLeaseMs: leaseMs must be a positive integer number of milliseconds, or null to clear it',
+      );
+    }
+    const previous = this.defaultLeaseMs ?? null;
+    const next = ms ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === ms) {
+      return;
+    }
+    this.defaultLeaseMs = next;
+    this.auditSubscription({
+      action: 'default_lease_ms_revised',
+      actor,
+      detail: { previous, leaseMs: ms },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal subscription-lease default
+   * (EB-478) — the lease duration future subscribers fall back to
+   * when they omit their own `leaseMs` — `undefined` before any
+   * revision (no default, new subscribers get no lease), then
+   * whatever `setDefaultLeaseMs` last installed.
+   */
+  getDefaultLeaseMs(): number | undefined {
+    return this.defaultLeaseMs;
   }
 
   /**

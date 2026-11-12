@@ -1735,6 +1735,23 @@ library.
   the option through). Non-positive-integer `leaseMs` (including `NaN`)
   throws `RangeError` at subscribe time. Disabled by default — fully
   backward compatible.
+- **Bus-level default subscription lease** (EB-478):
+  `setDefaultLeaseMs(ms | null)` installs a live bus-level default lease
+  duration for future subscribers that omit their own `leaseMs` —
+  `setDefaultLeaseMs(30_000)` bounds every new subscriber's lifetime
+  fleet-wide with one call, `null` clears the default back to no lease.
+  The priority chain is subscriber-explicit > bus default > no lease; a
+  subscriber that took the default at subscribe time keeps the lease it
+  was baked with and its expiry moment, a later revision never moves an
+  already-subscribed lease, and `setSubscriptionLease(subId, null)` now
+  clears to the bus default in effect at revision time (no lease when
+  unset), so `null` means "back to default". A snapshot import carrying
+  an explicit remaining lease still wins over the default. Illegal values
+  throw `RangeError` with the live default untouched, a same-value revision
+  is a no-op with no audit, and every applied revision is audited as
+  `default_lease_ms_revised` with `{ previous, leaseMs }` (either side
+  `null` when unset). Live-only: no construction-time option, never in a
+  config snapshot, a restart restores the unset default.
 - **Idle subscriber auto-reclamation** (in `src/idle.ts`, opt-in via
   `subscribe(..., { maxIdleMs, idleActivity })`): the complement of the
   fixed-duration lease — an inactivity bound instead of a lifetime bound.
