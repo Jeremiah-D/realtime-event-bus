@@ -1241,6 +1241,21 @@ library.
   `onDrained` callback fires once when the queue recedes below the mark after
   an excursion — or immediately if the mark is lowered below the current size
   mid-excursion.
+- **Bus-level default high-water-mark ratio**
+  (`setDefaultHighWaterMarkRatio(ratio | null, actor?)`, EB-476): future
+  subscribers that omit `highWaterMarkRatio` fall back to the live bus
+  default — `0.5` to make a fleet's backpressure line twice as sensitive
+  with one call, `null` to clear back to the documented 0.8. The priority
+  chain is subscriber-explicit > bus default > 0.8; the merged ratio feeds
+  both the throttle threshold and the queue mark at subscribe time, so the
+  two never fork. A subscriber keeps the ratio it was baked with, and
+  `setHighWaterMarkRatio(subId, ratio)` still revises one subscriber at a
+  time without touching the bus default. There is no construction-time
+  option and the revision is live-only (a restart restores the unset
+  default); a revision identical to the current default is a no-op with
+  no audit. Audited as `default_high_water_mark_ratio_revised`
+  (`{ previous, highWaterMarkRatio }`). (Real-time systems: backpressure
+  governance.)
   **Slow-consumer backpressure tiers** (`SubscribeOptions.backpressure`,
   default `'block'`): what the bus does when a subscriber's queue is full at
   enqueue time. `'drop-oldest'` sheds the oldest entry to admit the newcomer;

@@ -17730,6 +17730,16 @@ export class EventBus {
    */
   private defaultMaxIdleMs?: number;
   /**
+   * Bus-level terminal high-water-mark ratio default (EB-476): the
+   * fraction of capacity a subscriber's queue falls back to when it
+   * omits its own `highWaterMarkRatio` (EB-83). Starts unset
+   * (`undefined` — no default, new subscribers fall back to the
+   * documented 0.8, exactly the previous behavior) and moves only
+   * via `setDefaultHighWaterMarkRatio`; there is no
+   * construction-time option, and a restart restores the unset default.
+   */
+  private defaultHighWaterMarkRatio?: number;
+  /**
    * Bus-level terminal drop-policy default (EB-475): the shed policy a
    * subscriber falls back to when it omits its own `dropPolicy` under
    * the 'block' backpressure tier (EB-83). Starts unset (`undefined` —
@@ -33465,7 +33475,12 @@ export class EventBus {
     const onDropped = opts?.onDropped;
     const onThrottled = opts?.onThrottled;
     const onCreditExhausted = opts?.onCreditExhausted;
-    const hwmRatio = opts?.highWaterMarkRatio ?? 0.8;
+    // EB-476: a subscriber that omits highWaterMarkRatio falls back to
+    // the live bus default, if one is installed — the bus default sits
+    // between the explicit option and the documented 0.8. An explicit
+    // value always wins. The merged ratio feeds both the throttle
+    // threshold below and the LaneQueue mark, so the two never fork.
+    const hwmRatio = opts?.highWaterMarkRatio ?? this.defaultHighWaterMarkRatio ?? 0.8;
     const throttle = resolveThrottleOptions(opts?.throttle, capacity, hwmRatio, this.now);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -33666,7 +33681,7 @@ export class EventBus {
       // via `ShadowSubscribeOptions`; otherwise the subscription's own
       // `dropPolicy` applies, exactly as for a production subscriber.
       policy: queuePolicy,
-      highWaterMarkRatio: opts?.highWaterMarkRatio,
+      highWaterMarkRatio: hwmRatio,
       ...(queueMaxBytes === undefined
         ? {}
         : {
@@ -48252,6 +48267,92 @@ export class EventBus {
    */
   getDefaultMaxIdleMs(): number | undefined {
     return this.defaultMaxIdleMs;
+  }
+
+  /**
+   * Sets the live bus-level terminal high-water-mark ratio default
+   * (EB-476) without re-subscribing anyone:
+   * `setDefaultHighWaterMarkRatio(ratio, actor = 'system')` decides
+   * the fraction of capacity at which future subscribers that omit
+   * their own `highWaterMarkRatio` (see
+   * `SubscribeOptions.highWaterMarkRatio`, EB-83) trip their
+   * slow-consumer throttle and fire `onBackpressure` / `onDrained` —
+   * `0.5` to make a fleet's backpressure line twice as sensitive
+   * with one call, `null` to clear the default back to the
+   * documented 0.8.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 0.8 (the bus default is the
+   * terminal fallback — there is nothing below it but the documented
+   * ratio). A subscriber that took the default at subscribe time
+   * keeps the ratio it was baked with: a later revision never moves
+   * an already-subscribed ratio or an excursion already in flight,
+   * and `setHighWaterMarkRatio` still revises such a subscriber one
+   * at a time without touching the bus default. The merged ratio
+   * feeds both the throttle threshold (`resolveThrottleOptions`) and
+   * the LaneQueue mark at subscribe time — one parse point, so the
+   * two can never fork.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value outside (0, 1] (`null`
+   * to clear) throws `RangeError` with the live default and the
+   * audit log untouched. A revision identical to the current default
+   * (including clearing an already-unset default) is a no-op with no
+   * audit. Audited as `default_high_water_mark_ratio_revised`
+   * (`{ previous, highWaterMarkRatio }`, `null` when the default is
+   * unset — unset means new subscribers fall back to 0.8, exactly
+   * the previous behavior).
+   *
+   * Orthogonal to EB-83 (that is the backpressure mechanism itself —
+   * this its missing bus-level terminal default), to EB-281 (that
+   * revises one live subscriber's capacity — the mark follows the new
+   * capacity automatically, the ratio itself unmoved), to EB-285
+   * (that revises the backpressure tier — this the mark that trips
+   * it), to EB-375 (that revises the shed policy — this when the
+   * queue counts as full), and to EB-470 (that revises the bus
+   * queue-size default — same "bus default" shape, a different knob;
+   * mark = capacity x ratio, the two defaults compose).
+   *
+   * Throws `RangeError` for an illegal actor or a value outside
+   * (0, 1] (or `null` to clear).
+   */
+  setDefaultHighWaterMarkRatio(ratio: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultHighWaterMarkRatio');
+    if (ratio !== null && (!Number.isFinite(ratio) || ratio <= 0 || ratio > 1)) {
+      throw new RangeError(
+        'setDefaultHighWaterMarkRatio: highWaterMarkRatio must be a finite number in (0, 1], or null to clear it',
+      );
+    }
+    const previous = this.defaultHighWaterMarkRatio ?? null;
+    const next = ratio ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === ratio) {
+      return;
+    }
+    this.defaultHighWaterMarkRatio = next;
+    this.auditSubscription({
+      action: 'default_high_water_mark_ratio_revised',
+      actor,
+      detail: { previous, highWaterMarkRatio: ratio },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal high-water-mark ratio
+   * default (EB-476) — the fraction of capacity future subscribers
+   * fall back to when they omit their own `highWaterMarkRatio` —
+   * `undefined` before any revision (no default, new subscribers
+   * fall back to 0.8), then whatever `setDefaultHighWaterMarkRatio`
+   * last installed.
+   */
+  getDefaultHighWaterMarkRatio(): number | undefined {
+    return this.defaultHighWaterMarkRatio;
   }
 
   /**
