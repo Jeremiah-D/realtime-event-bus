@@ -1386,6 +1386,30 @@ library.
   the byte budget (EB-282, that revises `queueMaxBytes`, this revises
   the message-count capacity). (Real-time systems: delivery
   governance.)
+  Bus-level default (EB-470, via
+  `setDefaultQueueSize(size | null, actor = 'system')`): the queue
+  count capacity future subscribers fall back to when they omit
+  their own `queueSize` — `50` to bound a fleet's per-subscriber
+  backlog with one call, `null` to clear the default back to 100.
+  The priority chain is subscriber-explicit > bus default > 100, so
+  an explicit `queueSize` always wins in either direction, and a
+  subscriber baked from the default keeps that capacity when the
+  default later moves; `setQueueSize` still revises one subscriber
+  at a time, while `setQueueSize` with `null` now clears back to
+  the bus default in effect at revision time (100 when no default
+  is set). A shadow that omits its own `queueSize` takes the bus
+  default too, and the high-water mark follows automatically
+  (`queueSize * highWaterMarkRatio`). A revision identical to the
+  current default — including clearing an already-unset default —
+  is a no-op with no audit. It is fail-closed (a non-positive-integer
+  size, or an illegal actor, throws `RangeError` with the live
+  default and the audit log untouched), and every success is audited
+  as `default_queue_size_revised`
+  (`{ previous: <number | null>, queueSize: <number | null> }`).
+  There is no construction-time option and the revision is
+  live-only — a restart restores the unset default. Orthogonal to
+  the byte budget (EB-282) and the backpressure tier (EB-285).
+  (Real-time systems: backpressure governance.)
   Revisable after subscribe (EB-282, via
   `setQueueMaxBytes(subId, bytes | null)`): a subscriber's queue byte
   budget can be retuned without re-subscribing — but only
