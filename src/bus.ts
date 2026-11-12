@@ -17687,6 +17687,15 @@ export class EventBus {
    */
   private defaultMaxInFlight?: number;
   /**
+   * Bus-level terminal queue-size default (EB-470): the capacity a
+   * subscriber falls back to when it omits its own `queueSize`
+   * (EB-83). Starts unset (`undefined` — no default, new subscribers
+   * fall back to the documented 100, exactly the previous behavior)
+   * and moves only via `setDefaultQueueSize`; there is no
+   * construction-time option, and a restart restores the unset default.
+   */
+  private defaultQueueSize?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33143,7 +33152,11 @@ export class EventBus {
         }
       }
     }
-    const capacity = shadowOpts?.queueSize ?? opts?.queueSize ?? 100;
+    // EB-470: a subscriber that omits queueSize falls back to the
+    // live bus default, if one is installed — the bus default sits
+    // between the explicit option and the documented 100. A shadow
+    // queueSize always wins first; an explicit value always wins.
+    const capacity = shadowOpts?.queueSize ?? opts?.queueSize ?? this.defaultQueueSize ?? 100;
     const queueMaxBytes = opts?.queueMaxBytes;
     if (queueMaxBytes !== undefined && (!Number.isFinite(queueMaxBytes) || queueMaxBytes <= 0)) {
       throw new RangeError('subscribe: queueMaxBytes must be a positive finite number of bytes');
@@ -40726,7 +40739,11 @@ export class EventBus {
    * default 100 — so, unlike the opt-in revisions (EB-279/EB-280),
    * there is no "unset" state and no opt-in gate: any known
    * subscriber can be revised, and `null` clears back to the
-   * documented default 100 rather than to "no capacity". Only the
+   * documented default 100 rather than to "no capacity" — since
+   * EB-470 the clear target is the live bus default
+   * (`getDefaultQueueSize()`, 100 when no default is set), so a
+   * subscriber cleared while a bus default is installed takes that
+   * default instead. Only the
    * capacity moves, in place: the queue object, its already-queued
    * messages, and every other subscriber option — `dropPolicy`,
    * `highWaterMarkRatio`, `queueMaxBytes`, the backpressure tier —
@@ -40753,7 +40770,7 @@ export class EventBus {
    * all throw `RangeError` with the live capacity, the queue, and
    * the audit log untouched. A revision identical to the current
    * effective capacity — including `null` when the subscriber is
-   * already at the default 100 — is a no-op with no audit. Audited as
+   * already at the bus default — is a no-op with no audit. Audited as
    * `queue_size_revised` (`{ queueSize: <number>, oldQueueSize:
    * <number> }`).
    *
@@ -40776,10 +40793,10 @@ export class EventBus {
     // only an explicit `null` clears — and a non-number never moves
     // the live capacity.
     if (size !== null && (typeof size !== 'number' || !Number.isInteger(size) || size <= 0)) {
-      throw new RangeError('setQueueSize: size must be a positive integer, or null to clear it to the default 100');
+      throw new RangeError('setQueueSize: size must be a positive integer, or null to clear it to the bus default');
     }
     const oldQueueSize = subscriber.queueCapacity;
-    const newQueueSize = size === null ? 100 : size;
+    const newQueueSize = size === null ? (this.defaultQueueSize ?? 100) : size;
     // Identical capacity: a no-op — no audit, and no queue state moves.
     if (newQueueSize === oldQueueSize) {
       return;
@@ -47706,6 +47723,91 @@ export class EventBus {
    */
   getDefaultMaxInFlight(): number | undefined {
     return this.defaultMaxInFlight;
+  }
+
+  /**
+   * Sets the live bus-level terminal queue-size default (EB-470)
+   * without re-subscribing anyone:
+   * `setDefaultQueueSize(n, actor = 'system')` decides the queue
+   * count capacity for future subscribers that omit their own
+   * `queueSize` (see `SubscribeOptions.queueSize`, EB-83) — `3` to
+   * bound a fleet's per-subscriber backlog with one call, `null` to
+   * clear the default back to the documented 100.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched, and no flush fires for the revision
+   * itself. The priority chain is shadow-explicit > subscriber-
+   * explicit > bus default > 100 (the bus default is the terminal
+   * fallback above the hard-coded 100 — there is nothing below it).
+   * A subscriber that took the default at subscribe time keeps the
+   * capacity it was baked with: a later revision never moves an
+   * already-subscribed capacity, and `setQueueSize` (EB-281) still
+   * revises such a subscriber one at a time without touching the
+   * bus default — while `setQueueSize(subId, null)` now clears to
+   * the bus default in effect at revision time (100 when unset), so
+   * `null` means "back to default", never "no capacity". The
+   * high-water mark follows the capacity automatically
+   * (`queueSize * highWaterMarkRatio`, the ratio itself unmoved), so
+   * a default-derived capacity arms the excursion latch exactly as
+   * an explicit one would.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to
+   * the current default (including clearing an already-unset
+   * default) is a no-op with no audit. Audited as
+   * `default_queue_size_revised`
+   * (`{ previous, queueSize }`, `null` when the default is unset
+   * — unset means new subscribers fall back to 100, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-83 (that is the capacity mechanism itself —
+   * this its missing bus-level terminal default), to EB-281 (that
+   * revises one live subscriber's capacity — this the default future
+   * subscribers fall back to), to EB-282 (that revises the byte
+   * budget — this the count capacity default), and to EB-466 (that
+   * revises the bus max-in-flight default — same "bus default"
+   * shape, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * an integer >= 1 (or `null` to clear).
+   */
+  setDefaultQueueSize(n: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultQueueSize');
+    if (n !== null && (!Number.isInteger(n) || n < 1)) {
+      throw new RangeError(
+        'setDefaultQueueSize: queueSize must be an integer >= 1, or null to clear it',
+      );
+    }
+    const previous = this.defaultQueueSize ?? null;
+    const next = n ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === n) {
+      return;
+    }
+    this.defaultQueueSize = next;
+    this.auditSubscription({
+      action: 'default_queue_size_revised',
+      actor,
+      detail: { previous, queueSize: n },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal queue-size default
+   * (EB-470) — the capacity future subscribers fall back to when they
+   * omit their own `queueSize` — `undefined` before any revision
+   * (no default, new subscribers fall back to 100), then whatever
+   * `setDefaultQueueSize` last installed.
+   */
+  getDefaultQueueSize(): number | undefined {
+    return this.defaultQueueSize;
   }
 
   /**

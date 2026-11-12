@@ -1382,7 +1382,14 @@ library.
   `undefined` — only an explicit `null` clears — throws `RangeError`
   with the live capacity, the queue, and the audit log untouched),
   and every success is audited as `queue_size_revised`
-  (`{ queueSize: <number>, oldQueueSize: <number> }`). Orthogonal to
+  (`{ queueSize: <number>, oldQueueSize: <number> }`). Bus default
+  (EB-470, via `setDefaultQueueSize(n | null)`): new subscribers that
+  omit `queueSize` take the live bus default instead of 100 — the
+  subscribe-time chain is shadow `queueSize` > `queueSize` > bus
+  default > 100 — and `setQueueSize(subId, null)` clears back to the
+  bus default in effect at revision time (100 when unset); a revision
+  never moves an already-subscribed capacity, and a same-value set is
+  a no-op with no audit. Orthogonal to
   the byte budget (EB-282, that revises `queueMaxBytes`, this revises
   the message-count capacity). (Real-time systems: delivery
   governance.)
