@@ -1727,8 +1727,11 @@ library.
   expiry after the revision reports the new `maxIdleMs` on the
   `onIdleExpired` event; the `idleActivity` mode and the lease (if any)
   are untouched. Passing `null` clears the window (the subscriber keeps
-  running with no idle expiry), and a later revision is refused until
-  the subscriber opts in again at subscribe time. It is fail-closed (an
+  running with no idle expiry) when no bus default is set — with a bus
+  default installed it clears back to that default instead (see the
+  bus-default bullet below) — and, after a clear with no default, a
+  later revision is refused until the subscriber opts in again at
+  subscribe time. It is fail-closed (an
   unknown subscriber, a subscriber that never opted into `maxIdleMs` —
   or whose window was already cleared — or a non-positive-integer value
   throws `RangeError` with the live window, its timer, and the audit log
@@ -1748,7 +1751,22 @@ library.
   `RangeError` with the live mode untouched), and a revision identical
   to the current mode is a no-op with no audit. Every success is
   audited as `idle_activity_revised` (`{ idleActivity: <mode>,
-  oldIdleActivity: <mode> }`). (Real-time systems / backend engineering: subscriber
+  oldIdleActivity: <mode> }`). A bus-level default window is also
+  revisable live (EB-472, via `setDefaultMaxIdleMs(ms | null, actor?)`):
+  future subscribers that omit their own `maxIdleMs` fall back to the
+  bus default (explicit value always wins; unset by default, so
+  omitting `maxIdleMs` still means no idle expiry), and an
+  `idleActivity` given without `maxIdleMs` opts in exactly when a
+  default is installed. The revision only affects subscribers that
+  join after it — already-subscribed windows never move — and
+  `setIdleWindow(subId, null)` now clears back to the bus default in
+  effect at revision time (no idle expiry when unset), so `null`
+  means "back to default". It is fail-closed (an illegal actor or a
+  non-positive-integer value throws `RangeError` with the live
+  default untouched), a revision identical to the current default is
+  a no-op with no audit, and every success is audited as
+  `default_max_idle_ms_revised` (`{ previous, maxIdleMs }`, `null`
+  when unset). (Real-time systems / backend engineering: subscriber
   lifecycle governance.)
   Disabled by default — fully backward compatible.
 - **Graceful drain-on-unsubscribe** (opt-in via

@@ -17696,6 +17696,15 @@ export class EventBus {
    */
   private defaultQueueSize?: number;
   /**
+   * Bus-level terminal max-idle default (EB-472): the window a
+   * subscriber falls back to when it omits its own `maxIdleMs`
+   * (EB-72). Starts unset (`undefined` — no default, no idle
+   * expiry, exactly the previous behavior) and moves only via
+   * `setDefaultMaxIdleMs`; there is no construction-time option,
+   * and a restart restores the unset default.
+   */
+  private defaultMaxIdleMs?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33210,8 +33219,13 @@ export class EventBus {
     }
     // Idle subscriber auto-reclamation (EB-72): validated before
     // anything registers, so a throw leaves no half-registered
-    // subscriber behind.
-    const maxIdleMs = opts?.maxIdleMs;
+    // subscriber behind. EB-472: a subscriber that omits maxIdleMs
+    // falls back to the live bus default, if one is installed — the
+    // bus default is the terminal fallback, below the explicit
+    // option. An explicit value always wins. The idleActivity gate
+    // below reads the merged value, so `idleActivity` alone opts in
+    // exactly when a default is installed.
+    const maxIdleMs = opts?.maxIdleMs ?? this.defaultMaxIdleMs;
     if (maxIdleMs !== undefined && (!Number.isInteger(maxIdleMs) || maxIdleMs <= 0)) {
       throw new RangeError('subscribe: maxIdleMs must be a positive integer number of milliseconds');
     }
@@ -37465,7 +37479,13 @@ export class EventBus {
    * `idleActivity` mode is untouched: which events count as activity
    * stays exactly as subscribed. The lease, if any, is untouched too
    * — the two opt-ins stay independent, whichever fires first still
-   * wins. Passing `null` clears the window: the subscriber keeps
+   * wins. Passing `null` clears back to the bus default in effect
+   * at the revision moment (EB-472): when a bus default is
+   * installed (`setDefaultMaxIdleMs`), the subscriber is re-armed
+   * with that default instead of losing its window, so `null`
+   * means "back to default", never "no expiry" — and a later
+   * revision still works on the re-armed window. When no bus
+   * default is set, `null` clears the window: the subscriber keeps
    * running with no idle expiry at all, and a later revision is
    * refused until the subscriber opts in again at subscribe time
    * (the EB-267 clear rule). A revision identical to the current
@@ -37482,7 +37502,9 @@ export class EventBus {
    * of milliseconds), so a failed call leaves the live window
    * untouched. Audited as `idle_window_revised`
    * (`{ maxIdleMs: <number> | null, oldMaxIdleMs: <number> }`,
-   * `null` for a clear) on success.
+   * `null` for a clear when no bus default is set — when one is
+   * installed, `null` resolves to that default and the audit names
+   * the resolved window).
    *
    * Orthogonal to the subscribe-time window of EB-72 (this revises
    * it, that sets it), to `renewLease` (a fixed lifetime from
@@ -37505,17 +37527,41 @@ export class EventBus {
       throw new RangeError('setIdleWindow: subscriber has no idle window set');
     }
     if (maxIdleMs === null) {
-      // Clearing drops the timer with the window: the subscriber
-      // keeps running, and `recordIdleActivity` keeps calling
-      // `activity()` on a missing entry, which no-ops — the mode is
-      // preserved but can never fire again until re-subscribe.
-      this.idleReclaimer.clear(subId);
+      // EB-472: `null` means "back to default" — when a bus default
+      // is installed the subscriber is re-armed with it (the audit
+      // names the resolved window, and the pending timer restarts
+      // from the revision moment, exactly like a non-null revision);
+      // with no default installed this is the old clear, and the
+      // EB-267 rule still refuses later revisions until re-subscribe.
+      const fallback = this.defaultMaxIdleMs;
+      if (fallback === undefined) {
+        // Clearing drops the timer with the window: the subscriber
+        // keeps running, and `recordIdleActivity` keeps calling
+        // `activity()` on a missing entry, which no-ops — the mode is
+        // preserved but can never fire again until re-subscribe.
+        this.idleReclaimer.clear(subId);
+        this.auditSubscription({
+          action: 'idle_window_revised',
+          actor: 'system',
+          subId: subscriber.id,
+          pattern: subscriber.pattern,
+          detail: { maxIdleMs: null, oldMaxIdleMs },
+        });
+        return;
+      }
+      // Clearing back to the very window already armed is a no-op:
+      // no retune, no audit, and the pending timer keeps its
+      // original fire time.
+      if (fallback === oldMaxIdleMs) {
+        return;
+      }
+      this.idleReclaimer.retune(subId, fallback);
       this.auditSubscription({
         action: 'idle_window_revised',
         actor: 'system',
         subId: subscriber.id,
         pattern: subscriber.pattern,
-        detail: { maxIdleMs: null, oldMaxIdleMs },
+        detail: { maxIdleMs: fallback, oldMaxIdleMs },
       });
       return;
     }
@@ -42636,14 +42682,18 @@ export class EventBus {
         cap.inFlight = Math.max(0, cap.inFlight - 1);
         this.scheduleFlush();
       },
-      // EB-72: ack-settle activity for idle reclamation, recorded only
-      // when the subscriber opted into maxIdleMs. The hook is always
+      // EB-72: ack-settle activity for idle reclamation. The hook is always
       // allocated: it also carries the graceful-drain completion check
       // (EB-128) — an ack settle is final (acks never requeue), so a
       // drain whose last outstanding delivery just acked can complete
       // right here instead of waiting for the next flush.
+      // `recordIdleActivity` gates on the subscriber record's
+      // `idleActivity`, which subscribe sets exactly when a window is
+      // armed — explicit or bus-default-derived (EB-472) — so no
+      // option check is needed here, and a default-derived window
+      // re-arms on acks exactly like an explicit one.
       onAck: () => {
-        if (opts?.maxIdleMs !== undefined) this.recordIdleActivity(subscriber, 'ack');
+        this.recordIdleActivity(subscriber, 'ack');
         this.checkDrainComplete(subscriber);
       },
       onRedeliver: (msg, reason) => {
@@ -47808,6 +47858,93 @@ export class EventBus {
    */
   getDefaultQueueSize(): number | undefined {
     return this.defaultQueueSize;
+  }
+
+  /**
+   * Sets the live bus-level terminal max-idle default (EB-472)
+   * without re-subscribing anyone:
+   * `setDefaultMaxIdleMs(ms, actor = 'system')` decides the idle
+   * reclamation window for future subscribers that omit their own
+   * `maxIdleMs` (see `SubscribeOptions.maxIdleMs`, EB-72) — `5000`
+   * to reclaim a fleet's idle subscribers with one call, `null` to
+   * clear the default back to no idle expiry.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched, and no timer fires for the revision
+   * itself. The priority chain is subscriber-explicit > bus default
+   * > no expiry (the bus default is the terminal fallback — there
+   * is nothing below it). A subscriber that took the default at
+   * subscribe time keeps the window it was baked with: a later
+   * revision never moves an already-subscribed window, and
+   * `setIdleWindow` (EB-334) still revises such a subscriber one at
+   * a time without touching the bus default — while
+   * `setIdleWindow(subId, null)` now clears to the bus default in
+   * effect at revision time (no idle expiry when unset), so `null`
+   * means "back to default", never "no window". An `idleActivity`
+   * given without `maxIdleMs` opts in exactly when a default is
+   * installed (the subscribe-time gate reads the merged value);
+   * with no default installed it still throws, exactly as before.
+   * The `idleActivity` mode default (`'any'`) is untouched — this
+   * only supplies the window size.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to
+   * the current default (including clearing an already-unset
+   * default) is a no-op with no audit. Audited as
+   * `default_max_idle_ms_revised`
+   * (`{ previous, maxIdleMs }`, `null` when the default is unset
+   * — unset means new subscribers get no idle expiry, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-72 (that is the reclamation mechanism itself —
+   * this its missing bus-level terminal default), to EB-334 (that
+   * revises one live subscriber's window — this the default future
+   * subscribers fall back to), to EB-341 (that revises the activity
+   * mode — this the window size default), to EB-69/`renewLease` (a
+   * fixed lifetime from subscribe, not an activity-re-armed window),
+   * and to EB-470 (that revises the bus queue-size default — same
+   * "bus default" shape, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer number of milliseconds (or `null` to clear).
+   */
+  setDefaultMaxIdleMs(ms: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxIdleMs');
+    if (ms !== null && (!Number.isInteger(ms) || ms < 1)) {
+      throw new RangeError(
+        'setDefaultMaxIdleMs: maxIdleMs must be a positive integer number of milliseconds, or null to clear it',
+      );
+    }
+    const previous = this.defaultMaxIdleMs ?? null;
+    const next = ms ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === ms) {
+      return;
+    }
+    this.defaultMaxIdleMs = next;
+    this.auditSubscription({
+      action: 'default_max_idle_ms_revised',
+      actor,
+      detail: { previous, maxIdleMs: ms },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal max-idle default
+   * (EB-472) — the window future subscribers fall back to when they
+   * omit their own `maxIdleMs` — `undefined` before any revision
+   * (no default, new subscribers get no idle expiry), then whatever
+   * `setDefaultMaxIdleMs` last installed.
+   */
+  getDefaultMaxIdleMs(): number | undefined {
+    return this.defaultMaxIdleMs;
   }
 
   /**
