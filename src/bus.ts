@@ -16849,10 +16849,26 @@ export class EventBus {
   private onAuthzDenied: AuthzDeniedCallback | undefined;
   /**
    * Delivery-trace recorder (`EventBusOptions.trace`), or `undefined`
-   * when tracing is disabled — every instrumentation site checks this one
-   * field first, which is what keeps the disabled path allocation-free.
+   * when tracing was never enabled — every instrumentation site checks
+   * this one field first, which is what keeps the disabled path
+   * allocation-free. Mutable (EB-473): `setTraceEnabled(true)`
+   * installs a recorder live on a bus that never enabled tracing; the
+   * recorder is never removed afterwards — disabling only pauses
+   * sampling (see `tracePaused`), so the ring stays queryable while
+   * paused.
    */
-  private readonly trace: TraceRecorder | undefined;
+  private trace: TraceRecorder | undefined;
+  /**
+   * Whether head-based trace sampling is paused (EB-473): `true`
+   * after `setTraceEnabled(false)` until a re-enable. The recorder
+   * and its ring stay in place while paused — `getStats().traceSpans`
+   * keeps reporting the buffered spans, and a publish already sampled
+   * keeps its trace — only the admission-time sampling decision
+   * consults this flag, so no new trace starts while it is set.
+   * `false` when tracing was never enabled (there is no recorder to
+   * pause) and while sampling runs.
+   */
+  private tracePaused = false;
   /**
    * The operator-supplied `onTraceSpan` callback, unwrapped (EB-416):
    * the recorder holds the composed copy (user hook, then the OTLP
@@ -25292,7 +25308,10 @@ export class EventBus {
    *
    * Fail-closed: a bus that never enabled `trace`, a non-object
    * revision, and an illegal value all throw `RangeError` with the live
-   * tuning and the audit log untouched. Validation reuses the
+   * tuning and the audit log untouched. A bus that never enabled
+   * `trace` gains a recorder live via `setTraceEnabled(true)` (EB-473),
+   * after which this works — including on a paused recorder, whose
+   * retune takes effect when sampling resumes. Validation reuses the
    * construction-time rule (`resolveTraceOptions`: the rate a finite
    * number in [0, 1], the buffer a positive integer) against the
    * merged values, so a value that could not be set at construction
@@ -25350,6 +25369,172 @@ export class EventBus {
         oldBufferSize: current.bufferSize,
       },
     });
+  }
+
+  /**
+   * Switches bus-level head-based delivery tracing on or off live
+   * (EB-473) without restarting the bus: `setTraceEnabled(enabled,
+   * opts?, actor = 'system')` is the master switch for
+   * `EventBusOptions.trace` (EB-45) — enable tracing on a bus that
+   * was built without it, pause sampling on a live bus during an
+   * incident, and resume it again, with no restart and no loss of
+   * the live subscriptions, replay positions, consumer-group
+   * assignments, or rate-limit and dedup state a restart would drop.
+   *
+   * Enabling a bus that never enabled tracing builds a recorder
+   * live (`opts` takes only `sampleRate` / `bufferSize`, the
+   * `TraceRevision` shape; omitted fields fall back to the
+   * construction-time defaults — rate 1, buffer 1024) and the next
+   * admitted publish starts sampling at once; the sampler, the span
+   * observer, and the archive journal are not installed by this
+   * call — they still move via their own live entries
+   * (`setTraceSampler`, `setTraceSpanCallback`,
+   * `setTraceArchiveEnabled`). Disabling pauses sampling only: the
+   * recorder and its ring stay in place, `getStats().traceSpans`
+   * keeps reporting the spans buffered before the pause (frozen,
+   * queryable, never dropped), a publish already sampled keeps its
+   * trace and finishes its spans, and an attached archive journal
+   * stays attached (no new spans means no new archive records until
+   * the re-enable). Re-enabling resumes sampling with the tuning
+   * the recorder held before the pause — or with `opts` when given,
+   * which retunes the retained recorder first. While paused,
+   * `setTrace` / `setTraceSampler` / `setTraceSpanCallback` still
+   * retune the retained recorder (their changes take effect on
+   * re-enable); the tail sampler is untouched — disabling the head
+   * never touches tail sampling (EB-181/EB-296).
+   *
+   * Fail-closed: a bus that never enabled tracing, a closed bus (on
+   * enable), an illegal actor, a non-boolean `enabled`, and illegal
+   * `opts` all throw `RangeError` with the live state and the audit
+   * log untouched. Validation reuses the construction-time rule
+   * (`resolveTraceOptions`: the rate a finite number in [0, 1], the
+   * buffer a positive integer) against the merged values, so a value
+   * that could not be set at construction cannot be enabled with
+   * later either. Enabling an already-enabled bus, and disabling an
+   * already-disabled one, are same-state no-ops: no retune, no
+   * audit — and on a repeat enable the `opts` are ignored (the
+   * tuning still moves via `setTrace`). The switch is live-only — a
+   * restart restores the construction-time trace choice — and it
+   * never enters a config snapshot. Audited as
+   * `trace_enabled_revised` (`{ enabled, oldEnabled, sampleRate?,
+   * bufferSize? }` — the two tuning fields only when the enabling
+   * call carried them).
+   *
+   * Orthogonal to EB-45 (that is the tracing mechanism itself —
+   * this its missing master switch), to EB-311 (that retunes the
+   * two numeric bounds of an already-enabled recorder — its first
+   * line refuses a never-enabled bus, and this fills exactly that
+   * named gap), to EB-414/EB-416 (those are the sampler and the
+   * observer callback — this the switch itself), to EB-419 (that is
+   * the archive journal's attach switch — this the recorder switch
+   * underneath it; the journal stays mounted across a pause), and
+   * to EB-181/EB-296 (those are tail sampling — this the head
+   * switch; disabling the head never touches the tail).
+   *
+   * Throws `RangeError` when trace is not enabled (on disable), when
+   * the bus is closed (on enable), for an illegal actor, for a
+   * non-boolean `enabled`, or for illegal `opts`.
+   */
+  setTraceEnabled(enabled: boolean, opts?: TraceRevision, actor = 'system'): void {
+    assertValidActor(actor, 'setTraceEnabled');
+    if (typeof enabled !== 'boolean') {
+      throw new RangeError('setTraceEnabled: enabled must be a boolean');
+    }
+    const recorder = this.trace;
+    // Disabling a bus that never enabled tracing has nothing to stop.
+    if (!enabled && recorder === undefined) {
+      throw new RangeError('setTraceEnabled: trace is not enabled on this bus');
+    }
+    // Fail-fast on a closed bus (EB-154, along `setTraceSpanCallback`):
+    // close() already flushed once — there is no live sampling left to
+    // switch on. Disabling a closed bus is still allowed: it only
+    // freezes the ring, which stays queryable.
+    if (enabled && this.closed) {
+      throw new RangeError('setTraceEnabled: bus is closed');
+    }
+    // Validate before touching anything: `opts` takes only the two
+    // numeric bounds (the `TraceRevision` shape), missing fields fall
+    // back to the live tuning (or the construction-time defaults on a
+    // first enable), and a non-object `opts` is rejected outright.
+    // Validation runs before the same-state no-op check, along the
+    // EB-419 precedent.
+    let sampleRate: number | undefined;
+    let bufferSize: number | undefined;
+    if (opts !== undefined && opts !== null) {
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setTraceEnabled: opts must be a TraceRevision object with sampleRate and/or bufferSize',
+        );
+      }
+      const current = recorder?.current();
+      sampleRate = opts.sampleRate ?? current?.sampleRate ?? 1;
+      bufferSize = opts.bufferSize ?? current?.bufferSize ?? 1024;
+      const resolved = resolveTraceOptions({ sampleRate, bufferSize }, 'setTraceEnabled');
+      if (resolved === undefined) {
+        throw new RangeError('setTraceEnabled: trace is not enabled on this bus');
+      }
+    }
+    // Enabling an enabled bus, and disabling a disabled one, are
+    // same-state no-ops: no retune, no audit — and on a repeat enable
+    // the `opts` are ignored (the tuning still moves via `setTrace`).
+    const oldEnabled = recorder !== undefined && !this.tracePaused;
+    if (enabled === oldEnabled) {
+      return;
+    }
+    if (enabled) {
+      if (recorder === undefined) {
+        // A first enable builds the recorder live, with the
+        // construction-time defaults for any bound `opts` left out —
+        // the sampler, the span observer, and the archive journal are
+        // not installed here; they still move via their own entries.
+        const resolved = resolveTraceOptions(
+          { sampleRate: sampleRate ?? 1, bufferSize: bufferSize ?? 1024 },
+          'setTraceEnabled',
+        );
+        if (resolved === undefined) {
+          throw new RangeError('setTraceEnabled: trace is not enabled on this bus');
+        }
+        resolved.onTraceSpan = this.composeTraceSpanHook(resolved.onTraceSpan);
+        this.trace = new TraceRecorder(resolved);
+      } else {
+        // A re-enable retunes the retained recorder first when the
+        // call carried tuning, then unpauses — the ring, the in-flight
+        // records, and the archive journal are untouched either way.
+        if (sampleRate !== undefined && bufferSize !== undefined) {
+          recorder.retune({ sampleRate, bufferSize });
+        }
+        this.tracePaused = false;
+      }
+    } else {
+      // Pausing keeps the recorder and its ring in place: the buffered
+      // spans stay queryable, in-flight traces finish, and the next
+      // admitted publish simply takes no new sample.
+      this.tracePaused = true;
+    }
+    const detail: {
+      enabled: boolean;
+      oldEnabled: boolean;
+      sampleRate?: number;
+      bufferSize?: number;
+    } = { enabled, oldEnabled };
+    if (enabled && opts?.sampleRate !== undefined) detail.sampleRate = opts.sampleRate;
+    if (enabled && opts?.bufferSize !== undefined) detail.bufferSize = opts.bufferSize;
+    this.auditSubscription({
+      action: 'trace_enabled_revised',
+      actor,
+      detail,
+    });
+  }
+
+  /**
+   * Returns whether head-based delivery tracing is live (EB-473) —
+   * `true` while the bus samples admitted publishes, `false` when
+   * tracing was never enabled or is paused via
+   * `setTraceEnabled(false)`. A paused bus still holds its recorder
+   * and ring: use `getStats().traceSpans` to read the frozen spans.
+   */
+  getTraceEnabled(): boolean {
+    return this.trace !== undefined && !this.tracePaused;
   }
 
   /**
@@ -63289,7 +63474,9 @@ export class EventBus {
     // the verdict. `beginPublish` registers the trace record before
     // fan-out, so the enqueue spans below can find it.
     let openTrace: ReturnType<TraceRecorder['beginPublish']> | undefined;
-    if (tracer !== undefined) {
+    // EB-473: a paused recorder takes no new samples — the flag is the
+    // only gate; in-flight traces keep their records and finish.
+    if (tracer !== undefined && !this.tracePaused) {
       const sampled = tracer.sample(topic, traceparent);
       if (sampled !== undefined) {
         openTrace = tracer.beginPublish(msg, topic, msg.seq, sampled, fanOutStart);

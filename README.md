@@ -3155,11 +3155,27 @@ library.
   tail shares the channel — the tail sampler, and the audit records
   only whether a callback is installed (`{ hasHandler, oldHasHandler }`,
   audited as `trace_span_callback_revised`).
+  Switch tracing on or off live with
+  `setTraceEnabled(enabled, opts?, actor?)` (EB-473): a bus that never
+  enabled `trace` gains a recorder on the first enable — `opts` takes
+  only `sampleRate` / `bufferSize`, defaulting to 1 / 1024 — and the
+  next admitted publish starts sampling; disabling pauses sampling
+  only — the recorder and its ring stay in place, so
+  `getStats().traceSpans` keeps reporting the frozen spans, a publish
+  already sampled finishes its spans, and an attached archive journal
+  stays attached; re-enabling resumes with the retained tuning (or the
+  `opts` given); while paused, `setTrace` / `setTraceSampler` /
+  `setTraceSpanCallback` still retune the retained recorder; enabling
+  an enabled bus and disabling a disabled one are no-ops with no audit.
+  Audited as `trace_enabled_revised`
+  (`{ enabled, oldEnabled, sampleRate?, bufferSize? }` — the two tuning
+  fields only when the enabling call carried them).
   Shrinking `bufferSize`
   keeps the buffered spans until the next span covers the excess down to
   the live bound; growing keeps every buffered span in chronological
   order. Only a bus that enabled `trace` can be revised (otherwise
-  `RangeError`); illegal values fail closed with the live tuning
+  `RangeError`) — a bus that never enabled it gains a recorder live via
+  `setTraceEnabled(true)` (EB-473); illegal values fail closed with the live tuning
   untouched; an identical or empty revision is a no-op with no audit.
   Audited as `trace_revised` (old and new values).
 - **Tail-based delivery-pipeline trace sampling** (in `src/tail-sampling.ts`,
@@ -7436,6 +7452,9 @@ attach is a no-op and `opts` is ignored (the bounds still move via
 `setTraceArchive`). The clock is never revisable; the directory moves
 live via `setTraceArchiveDir` (EB-421, below).
 Audited as `trace_archive_enabled_revised` (`{ enabled, oldEnabled }`).
+The journal still requires `trace` to be enabled: a bus that never
+enabled it gains a recorder live via `setTraceEnabled(true)` (EB-473),
+after which the journal can attach.
 
 Migrate the journal's directory live with
 `bus.setTraceArchiveDir(dir, actor?)` (EB-421): when a journal is
