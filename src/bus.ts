@@ -18155,6 +18155,22 @@ export class EventBus {
    */
   private defaultKeyHotspot?: KeyHotspotOptions;
   /**
+   * Bus-level terminal delivery-sample-rate default (EB-499): the
+   * `deliverySampleRate` divisor a new subscriber falls back to when
+   * it passes no explicit value (see `SubscribeOptions.deliverySampleRate`,
+   * EB-152). Starts unset (`undefined` — no default, omitting the
+   * value still means 1, keep everything, exactly the previous
+   * behavior) and moves only via `setDefaultDeliverySampleRate`;
+   * there is no construction-time option, and a restart restores the
+   * unset default. Unlike the EB-491/493/498 defaults this one has
+   * no opt-in form to fill in: `deliverySampleRate` is a plain
+   * per-subscriber number, so the default applies to ALL new
+   * subscribers that pass no explicit value — one call is a
+   * fleet-wide delivery-narrowing policy, not a fill-in for
+   * already-opted-in subscribers.
+   */
+  private defaultDeliverySampleRate?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33858,8 +33874,22 @@ export class EventBus {
     }
     // Subscriber-side delivery sampling (EB-152): validated before
     // anything registers, so a throw leaves no half-registered
-    // subscriber behind.
-    const deliverySampleRate = opts?.deliverySampleRate;
+    // subscriber behind. EB-499: a subscriber that omits
+    // deliverySampleRate falls back to the live bus default, if one
+    // is installed — the bus default sits between the explicit
+    // option and 1 (keep everything). An explicit value always wins.
+    // Only an absent (`undefined`) value falls back: an explicit
+    // `null` is still an illegal rate and throws via the validator
+    // below (a bare `??` would swallow it, since `??` treats `null`
+    // as missing). Unlike the EB-491/493/498 defaults there is no
+    // opt-in form here, so the default applies to every new
+    // subscriber that passes no explicit value. The resolved rate is
+    // frozen into the subscriber record below; a later default
+    // revision never moves it.
+    const deliverySampleRate =
+      opts?.deliverySampleRate !== undefined
+        ? opts.deliverySampleRate
+        : this.defaultDeliverySampleRate;
     validateDeliverySampleRate(deliverySampleRate, 'subscribe');
     // Time-travel replay catch-up (EB-203): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
@@ -51630,6 +51660,112 @@ export class EventBus {
         ? { autoMitigate: { ...d.autoMitigate } }
         : {}),
     };
+  }
+
+  /**
+   * Sets the live bus-level default delivery-sample rate (EB-499)
+   * without re-subscribing anyone:
+   * `setDefaultDeliverySampleRate(n, actor = 'system')` decides the
+   * `deliverySampleRate` divisor for future subscribers that pass no
+   * explicit value (see `SubscribeOptions.deliverySampleRate`,
+   * EB-152) — `10` to admit only every tenth message (`seq % 10 === 0`)
+   * to every new subscriber with one call, `null` to clear the
+   * default back to no default (new subscribers go back to 1, keep
+   * everything).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 1 — the bus default is the
+   * terminal fallback below the explicit option. Unlike the
+   * EB-491/493/498 defaults this one has no opt-in form to fill in:
+   * `deliverySampleRate` is a plain per-subscriber number, so the
+   * default applies to ALL new subscribers that pass no explicit
+   * value — one call is a fleet-wide delivery-narrowing policy, and
+   * a subscriber that never asked for sampling still gets sampled.
+   * A subscriber that took the default at subscribe time keeps the
+   * divisor it was baked with: a later revision never moves an
+   * already-subscribed rate (the `seq % N` contract is fixed at
+   * subscribe time), and the per-subscriber `setDeliverySampleRate`
+   * still revises such a subscriber one at a time without touching
+   * the bus default. The sampled subscribers keep the EB-152 skip
+   * semantics unchanged: skipped messages are never enqueued (no
+   * backpressure / throttle / credit budget), carry no ack
+   * obligation, never reach the DLQ, and the gap baseline advances
+   * over them.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a non-positive-integer rate
+   * throws `RangeError` with the live default and the audit log
+   * untouched — the rate check reuses the subscribe-time
+   * `validateDeliverySampleRate`, so the bounds are exactly the
+   * subscribe-time ones (`undefined` is not a rate here — it throws
+   * too; only `null` clears). A revision identical to the current
+   * default (including clearing an already-unset default) is a
+   * no-op with no audit. Audited as
+   * `default_delivery_sample_rate_revised`
+   * (`{ previous, deliverySampleRate }`, `null` when the default is
+   * unset — unset means new subscribers go back to 1, keep
+   * everything, exactly the previous behavior).
+   *
+   * Orthogonal to EB-152 (that owns the sampling gate itself — this
+   * sets the default a new subscriber's omitted rate falls back to),
+   * to EB-491/493/498 (those set the delivery-latency / latency-SLO /
+   * key-hotspot defaults — the same "bus default" shape, but each
+   * fills in an omitted field of an opt-in option, while this one
+   * narrows delivery for every new subscriber without an explicit
+   * value), and to EB-38 (that owns publish-side adaptive sampling —
+   * this narrows delivery per subscriber after fan-out).
+   *
+   * Throws `RangeError` for an illegal actor or a non-positive-integer
+   * rate.
+   */
+  setDefaultDeliverySampleRate(n: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDeliverySampleRate');
+    // `undefined` is not a value here — unlike at subscribe time,
+    // where an absent rate means "no explicit value", the setter
+    // takes a rate or `null` to clear, so `undefined` throws.
+    if ((n as unknown) === undefined) {
+      throw new RangeError(
+        'setDefaultDeliverySampleRate: deliverySampleRate must be a positive integer, or null to clear it',
+      );
+    }
+    // Reuse the subscribe-time gate so the bounds are exactly the
+    // subscribe-time ones; `null` clears and is not validated.
+    if (n !== null) {
+      validateDeliverySampleRate(n, 'setDefaultDeliverySampleRate');
+    }
+    const next: number | undefined = n === null ? undefined : n;
+    const previous: number | undefined = this.defaultDeliverySampleRate;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === next) {
+      return;
+    }
+    this.defaultDeliverySampleRate = next;
+    this.auditSubscription({
+      action: 'default_delivery_sample_rate_revised',
+      actor,
+      detail: {
+        previous: previous ?? null,
+        deliverySampleRate: next ?? null,
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default delivery-sample rate
+   * (EB-499) — the `deliverySampleRate` divisor future subscribers
+   * fall back to when they pass no explicit value — `undefined`
+   * before any revision (no default, new subscribers still take 1,
+   * keep everything), then whatever `setDefaultDeliverySampleRate`
+   * last installed.
+   */
+  getDefaultDeliverySampleRate(): number | undefined {
+    return this.defaultDeliverySampleRate;
   }
 
   /**

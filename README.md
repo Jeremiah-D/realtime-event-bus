@@ -10376,6 +10376,32 @@ Semantics:
   and throwing `RangeError` for an illegal rate. Every change is recorded
   in the subscription audit log as `delivery_sample_rate_updated` with
   `{ from, to }`.
+- **Bus-level default.** A live bus-level default (EB-499, via
+  `setDefaultDeliverySampleRate(n | null, actor = 'system')` +
+  `getDefaultDeliverySampleRate()`) decides the divisor new
+  subscribers fall back to when they pass no explicit
+  `deliverySampleRate` — `10` to admit only every tenth message to
+  every new subscriber with one call, `null` to clear back to no
+  default (new subscribers go back to 1, keep everything). The
+  resolution chain is subscriber-explicit > bus default > 1, and an
+  explicit `1` still opts a subscriber back out of sampling
+  entirely. Unlike the EB-491/493/498 defaults, which fill in an
+  omitted field of an opt-in option, this default has no opt-in form
+  to fill in: it applies to ALL new subscribers that pass no
+  explicit value, so one call is a fleet-wide delivery-narrowing
+  policy — a subscriber that never asked for sampling still gets
+  sampled. The revision only affects subscribers that join after it;
+  an already-subscribed rate is frozen at subscribe time, and
+  `setDeliverySampleRate` still retunes one subscriber at a time
+  without touching the bus default. Out of the box there is no
+  default; there is no construction-time option, the default never
+  enters a config snapshot, and a restart restores the unset
+  default. An invalid rate throws `RangeError` with the live default
+  untouched, a same-value revision is a silent no-op with no audit,
+  and every success is audited as
+  `default_delivery_sample_rate_revised`
+  (`{ previous, deliverySampleRate }`, `null` when the default is
+  unset).
 - **Pipeline position.** The gate runs at fan-out, after signature
   verification and before the content `filter` / `filterExpr` / composite
   narrowing. A skipped message is a deliberate skip with filter-like
