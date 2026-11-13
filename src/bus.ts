@@ -3684,19 +3684,23 @@ export interface ThrottleOptions {
   /**
    * Floor of the enforced publish rate while throttled. Must be a positive
    * finite number. Default 1 — a throttled subscriber is slowed, never
-   * fully stalled.
+   * fully stalled — or the live bus default installed via
+   * `setDefaultThrottle` (EB-488) when one is set.
    */
   minRatePerSec?: number;
   /**
    * Ceiling of the enforced publish rate while throttled. Must be positive;
-   * `Infinity` (the default) means no ceiling.
+   * `Infinity` (the default) means no ceiling — or the live bus default
+   * installed via `setDefaultThrottle` (EB-488) when one is set.
    */
   maxRatePerSec?: number;
   /**
    * Rate enforced on the first backpressure excursion, before any drain rate
    * has been observed for this subscriber. Must be a positive finite number.
    * Defaults to one high-water-mark worth of messages per second
-   * (`queueSize * highWaterMarkRatio`, at least 1).
+   * (`queueSize * highWaterMarkRatio`, at least 1) — or the live bus
+   * default installed via `setDefaultThrottle` (EB-488) when one is set,
+   * which is an absolute rate that replaces the capacity-derived value.
    */
   initialRatePerSec?: number;
 }
@@ -10854,11 +10858,21 @@ function unionPatternMatchers(matchers: RegExp[]): RegExp {
  * throttle state. Returns `undefined` when throttling is disabled. Throws
  * `RangeError` for invalid rates.
  */
+/**
+ * Validates `SubscribeOptions.throttle` and builds the initial
+ * per-subscriber throttle state. Returns `undefined` when throttling is
+ * disabled. Throws `RangeError` for invalid bounds. EB-488: `defaults`
+ * is the live bus default installed via `setDefaultThrottle` — it
+ * fills in a field the subscriber omits, field by field, and never
+ * relaxes validation: the bus default's `initialRatePerSec` is an
+ * absolute rate that replaces the capacity-derived fallback.
+ */
 function resolveThrottleOptions(
   opt: boolean | ThrottleOptions | undefined,
   capacity: number,
   hwmRatio: number,
   now: () => number,
+  defaults?: ThrottleOptions,
 ): ThrottleState | undefined {
   if (opt == null || opt === false) return undefined;
   const o: ThrottleOptions = opt === true ? {} : opt;
@@ -10869,12 +10883,13 @@ function resolveThrottleOptions(
     }
     return value;
   };
-  const minRatePerSec = checkRate('minRatePerSec', o.minRatePerSec, 1);
+  const minRatePerSec = checkRate('minRatePerSec', o.minRatePerSec ?? defaults?.minRatePerSec, 1);
   let maxRatePerSec: number;
-  if (o.maxRatePerSec === undefined) {
+  const maxOpt = o.maxRatePerSec ?? defaults?.maxRatePerSec;
+  if (maxOpt === undefined) {
     maxRatePerSec = Infinity;
-  } else if (o.maxRatePerSec === Infinity || (Number.isFinite(o.maxRatePerSec) && o.maxRatePerSec > 0)) {
-    maxRatePerSec = o.maxRatePerSec;
+  } else if (maxOpt === Infinity || (Number.isFinite(maxOpt) && maxOpt > 0)) {
+    maxRatePerSec = maxOpt;
   } else {
     throw new RangeError('throttle.maxRatePerSec must be a positive number of messages/sec');
   }
@@ -10883,7 +10898,7 @@ function resolveThrottleOptions(
   }
   const initialRatePerSec = checkRate(
     'initialRatePerSec',
-    o.initialRatePerSec,
+    o.initialRatePerSec ?? defaults?.initialRatePerSec,
     Math.max(1, Math.floor(capacity * hwmRatio)),
   );
   const clampedInitial = Math.min(Math.max(initialRatePerSec, minRatePerSec), maxRatePerSec);
@@ -17934,6 +17949,19 @@ export class EventBus {
    * subscriber that does not opt into `rateLimit` is untouched by it.
    */
   private defaultRateLimit?: RateLimitOptions;
+  /**
+   * Bus-level terminal backpressure-throttle default (EB-488): the
+   * `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec` a new
+   * subscriber falls back to when it opts into `throttle` but omits a
+   * field. Starts unset (`undefined` — no default, omitting a field
+   * means 1 / `Infinity` / one high-water-mark worth per second,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultThrottle`; there is no construction-time option, and a
+   * restart restores the unset default. The default never enables
+   * throttling: a subscriber that does not opt into `throttle` is
+   * untouched by it.
+   */
+  private defaultThrottle?: ThrottleOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33692,7 +33720,13 @@ export class EventBus {
     // value always wins. The merged ratio feeds both the throttle
     // threshold below and the LaneQueue mark, so the two never fork.
     const hwmRatio = opts?.highWaterMarkRatio ?? this.defaultHighWaterMarkRatio ?? 0.8;
-    const throttle = resolveThrottleOptions(opts?.throttle, capacity, hwmRatio, this.now);
+    // EB-488: a subscriber that opts into `throttle` but omits a field
+    // falls back to the live bus default, if one is installed — the bus
+    // default sits between the explicit option and the documented
+    // 1 / Infinity / one-high-water-mark-worth. An explicit value always
+    // wins, and the default never enables throttling on its own: a
+    // subscriber that passes no `throttle` is untouched.
+    const throttle = resolveThrottleOptions(opts?.throttle, capacity, hwmRatio, this.now, this.defaultThrottle);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
@@ -49804,6 +49838,150 @@ export class EventBus {
    */
   getDefaultRateLimit(): RateLimitOptions | undefined {
     return this.defaultRateLimit === undefined ? undefined : { ...this.defaultRateLimit };
+  }
+
+  /**
+   * Sets the live bus-level default backpressure-throttle rate bounds
+   * (EB-488) without re-subscribing anyone:
+   * `setDefaultThrottle(opts, actor = 'system')` decides the
+   * `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec` for future
+   * subscribers that opt into `throttle` but omit a field (see
+   * `ThrottleOptions`) —
+   * `{ minRatePerSec: 2, maxRatePerSec: 8, initialRatePerSec: 4 }` to
+   * bound every new opt-in subscriber's throttle at 2–8 messages/sec
+   * starting at 4, `null` to clear the default back to no default
+   * (new opt-in subscribers go back to 1 / `Infinity` / one
+   * high-water-mark worth per second).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > documented built-ins (1 /
+   * `Infinity` / `max(1, floor(queueSize * highWaterMarkRatio))`) —
+   * the bus default is the terminal fallback below the explicit
+   * option, resolved field by field: an explicit `initialRatePerSec`
+   * still takes the default `minRatePerSec` / `maxRatePerSec`, and
+   * vice versa. `true` opts a subscriber in and takes all three
+   * default fields. A subscriber that took the default at subscribe
+   * time keeps the rates it was baked with and its bucket and
+   * enforced rate: a later revision never moves an already-subscribed
+   * throttle, and `setThrottle` still revises such a subscriber one
+   * at a time without touching the bus default — its partial revision
+   * still takes the live value for an omitted field, and its `null`
+   * still clears the whole subscriber back to unthrottled publish
+   * without the default re-applying. The default never enables
+   * throttling: a subscriber that does not opt into `throttle` is
+   * untouched by it, exactly as the rate-limit default never enables
+   * rate limiting (EB-487).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-positive-finite `minRatePerSec` /
+   * `initialRatePerSec`, a non-positive `maxRatePerSec` (`Infinity`
+   * allowed), or a `minRatePerSec` above `maxRatePerSec` throws
+   * `RangeError` with the live default and the audit log untouched.
+   * `{}` is accepted and installs no field coverage (equivalent to
+   * unset). A revision identical to the current default (including
+   * clearing an already-unset default) is a no-op with no audit —
+   * fields are compared one by one, with `undefined` counting as
+   * missing. Audited as `default_throttle_revised`
+   * (`{ previous, throttle }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to the
+   * documented built-ins, exactly the previous behavior).
+   *
+   * Orthogonal to EB-271 (that revises one subscriber's ceiling at a
+   * time — this sets the default a new opt-in subscriber's omitted
+   * fields fall back to), to EB-484 (that sets the delivery-shaping
+   * default — the same "default never enables an opt-in capability"
+   * shape, resolved field by field), to EB-486 (that sets the
+   * slow-start default), and to EB-487 (that sets the sliding-window
+   * rate-limit default — a hard cap, while this sets the adaptive
+   * backpressure throttle's rate bounds).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), a non-positive-finite
+   * `minRatePerSec` / `initialRatePerSec`, a non-positive
+   * `maxRatePerSec`, or a `minRatePerSec` above `maxRatePerSec`.
+   */
+  setDefaultThrottle(opts: ThrottleOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultThrottle');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultThrottle: throttle must be an object with minRatePerSec and/or maxRatePerSec and/or initialRatePerSec, or null to clear it',
+      );
+    }
+    const minRatePerSec = opts?.minRatePerSec;
+    const maxRatePerSec = opts?.maxRatePerSec;
+    const initialRatePerSec = opts?.initialRatePerSec;
+    if (minRatePerSec !== undefined && (!Number.isFinite(minRatePerSec) || minRatePerSec <= 0)) {
+      throw new RangeError('throttle.minRatePerSec must be a positive finite number of messages/sec');
+    }
+    if (
+      maxRatePerSec !== undefined &&
+      !(maxRatePerSec === Infinity || (Number.isFinite(maxRatePerSec) && maxRatePerSec > 0))
+    ) {
+      throw new RangeError('throttle.maxRatePerSec must be a positive number of messages/sec');
+    }
+    if (
+      minRatePerSec !== undefined &&
+      maxRatePerSec !== undefined &&
+      minRatePerSec > maxRatePerSec
+    ) {
+      throw new RangeError('throttle.minRatePerSec must not exceed throttle.maxRatePerSec');
+    }
+    if (
+      initialRatePerSec !== undefined &&
+      (!Number.isFinite(initialRatePerSec) || initialRatePerSec <= 0)
+    ) {
+      throw new RangeError('throttle.initialRatePerSec must be a positive finite number of messages/sec');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: ThrottleOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(minRatePerSec !== undefined ? { minRatePerSec } : {}),
+            ...(maxRatePerSec !== undefined ? { maxRatePerSec } : {}),
+            ...(initialRatePerSec !== undefined ? { initialRatePerSec } : {}),
+          };
+    const previous: ThrottleOptions | null =
+      this.defaultThrottle === undefined ? null : { ...this.defaultThrottle };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.minRatePerSec ?? undefined) === (next?.minRatePerSec ?? undefined) &&
+      (previous?.maxRatePerSec ?? undefined) === (next?.maxRatePerSec ?? undefined) &&
+      (previous?.initialRatePerSec ?? undefined) === (next?.initialRatePerSec ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultThrottle = next;
+    this.auditSubscription({
+      action: 'default_throttle_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        throttle: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default backpressure-throttle rate
+   * bounds (EB-488) — the `ThrottleOptions` future opt-in subscribers
+   * fall back to when they omit a field — `undefined` before any
+   * revision (no default, new opt-in subscribers use 1 / `Infinity` /
+   * one high-water-mark worth per second), then whatever
+   * `setDefaultThrottle` last installed. Returns a copy, so mutating
+   * the result never moves the live default.
+   */
+  getDefaultThrottle(): ThrottleOptions | undefined {
+    return this.defaultThrottle === undefined ? undefined : { ...this.defaultThrottle };
   }
 
   /**

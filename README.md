@@ -1502,7 +1502,30 @@ library.
   is, and a revision after a clear is refused until the subscriber opts
   in again at subscribe time), and every success is audited as
   `throttle_revised` (`{ throttle: { minRatePerSec, maxRatePerSec,
-  initialRatePerSec } | null, oldThrottle: { ... } }`). The engagement
+  initialRatePerSec } | null, oldThrottle: { ... } }`). Bus-level
+  default (EB-488, via
+  `setDefaultThrottle(opts | null, actor = 'system')`): the
+  `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec` a new
+  subscriber falls back to when it opts into `throttle` but omits a
+  field — the priority chain is subscriber-explicit > bus default >
+  documented built-ins (1 / `Infinity` / one high-water-mark worth per
+  second), so `setDefaultThrottle({ minRatePerSec: 2,
+  maxRatePerSec: 8, initialRatePerSec: 4 })` bounds every later opt-in
+  subscriber's throttle at 2–8 messages/sec starting at 4 unless it
+  sets its own fields, `true` takes all three default fields, and
+  `null` clears the default back to the built-ins. The bus default's
+  `initialRatePerSec` is an absolute rate that replaces the
+  capacity-derived fallback. The default never enables throttling: a
+  subscriber that does not opt into `throttle` is untouched by it,
+  and a revision never moves an already-subscribed subscriber's baked
+  rates, bucket, or enforced rate. `setThrottle` keeps its own
+  semantics — a partial revision still takes the live value for an
+  omitted field, `null` still clears to unthrottled publish without
+  the default re-applying. Every success is audited as
+  `default_throttle_revised`
+  (`{ previous, throttle }`, `null` when the default is unset).
+  There is no construction-time option and the revision is
+  live-only. The engagement
   callback itself is live-revisable (EB-440, via
   `setThrottledCallback(subId, cb | null)`): only a throttled
   subscription can be retuned — a subscription that never opted into
