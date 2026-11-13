@@ -200,38 +200,64 @@ export const DEFAULT_KEY_HOTSPOT_THRESHOLD_DEPTH = 100;
  * validated the same way: `true` enables defaults, an object tunes
  * `recoverDepth` (non-negative integer `<= thresholdDepth`) and
  * `onHotKeyMitigated` (function).
+ *
+ * A live bus default installed via `setDefaultKeyHotspot` (EB-498) may
+ * cover an omitted field: the default is the terminal fallback below an
+ * explicit field, resolved field by field — `true` takes the whole
+ * default, `{}` opts in and takes it too, and an explicit value always
+ * wins. `autoMitigate` merges a second level down: a subscriber that
+ * omits it entirely takes the default's `autoMitigate` whole, while a
+ * subscriber that passes an object keeps its explicit fields and falls
+ * back to the default's object for the rest; the `recoverDepth <=
+ * thresholdDepth` gate is re-checked on the merged values, so a
+ * default `recoverDepth` above a subscriber's explicitly tightened
+ * threshold throws at subscribe time instead of silently clamping.
+ * The default never satisfies the opt-in gate: it only fills fields
+ * of a subscriber that already opted in.
  */
 export function resolveKeyHotspotOptions(
   opt: boolean | KeyHotspotOptions | undefined,
+  defaults?: KeyHotspotOptions,
 ): SubscriberKeyHotspotState | undefined {
   if (opt == null || opt === false) return undefined;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError('keyHotspot must be true or a KeyHotspotOptions object');
   }
-  const o: KeyHotspotOptions = opt === true ? {} : opt;
-  const thresholdDepth = o.thresholdDepth ?? DEFAULT_KEY_HOTSPOT_THRESHOLD_DEPTH;
+  const o: KeyHotspotOptions = opt === true ? { ...defaults } : opt;
+  const thresholdDepth = o.thresholdDepth ?? defaults?.thresholdDepth ?? DEFAULT_KEY_HOTSPOT_THRESHOLD_DEPTH;
   if (!Number.isInteger(thresholdDepth) || thresholdDepth <= 0) {
     throw new RangeError('keyHotspot.thresholdDepth must be a positive integer');
   }
-  const onKeyHotspot = o.onKeyHotspot;
+  const onKeyHotspot = o.onKeyHotspot ?? defaults?.onKeyHotspot;
   if (onKeyHotspot !== undefined && typeof onKeyHotspot !== 'function') {
     throw new TypeError('keyHotspot.onKeyHotspot must be a function');
   }
   const autoMitigate = o.autoMitigate;
   let mitigate: SubscriberKeyHotspotState['mitigate'];
-  if (autoMitigate !== undefined && autoMitigate !== false) {
-    if (autoMitigate !== true && (typeof autoMitigate !== 'object' || autoMitigate === null)) {
+  // The default's autoMitigate object, if it is one, is the
+  // field-level fallback for a subscriber that passes an object or
+  // `true` of its own; a subscriber that omits autoMitigate entirely
+  // takes the default's value whole (including `true` / `false`).
+  const defaultsAutoMitigate =
+    defaults?.autoMitigate !== undefined &&
+    typeof defaults.autoMitigate === 'object' &&
+    defaults.autoMitigate !== null
+      ? defaults.autoMitigate
+      : undefined;
+  const amRaw = autoMitigate === undefined ? defaults?.autoMitigate : autoMitigate;
+  if (amRaw !== undefined && amRaw !== false) {
+    if (amRaw !== true && (typeof amRaw !== 'object' || amRaw === null)) {
       throw new TypeError('keyHotspot.autoMitigate must be true or a HotKeyMitigateOptions object');
     }
-    const m: HotKeyMitigateOptions = autoMitigate === true ? {} : autoMitigate;
-    const recoverDepth = m.recoverDepth ?? thresholdDepth;
+    const m: HotKeyMitigateOptions = amRaw === true ? {} : amRaw;
+    const recoverDepth = m.recoverDepth ?? defaultsAutoMitigate?.recoverDepth ?? thresholdDepth;
     if (!Number.isInteger(recoverDepth) || recoverDepth < 0) {
       throw new RangeError('keyHotspot.autoMitigate.recoverDepth must be a non-negative integer');
     }
     if (recoverDepth > thresholdDepth) {
       throw new RangeError('keyHotspot.autoMitigate.recoverDepth must not exceed thresholdDepth');
     }
-    const onHotKeyMitigated = m.onHotKeyMitigated;
+    const onHotKeyMitigated = m.onHotKeyMitigated ?? defaultsAutoMitigate?.onHotKeyMitigated;
     if (onHotKeyMitigated !== undefined && typeof onHotKeyMitigated !== 'function') {
       throw new TypeError('keyHotspot.autoMitigate.onHotKeyMitigated must be a function');
     }

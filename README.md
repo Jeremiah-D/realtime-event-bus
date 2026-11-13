@@ -3419,6 +3419,37 @@ library.
   (`{ onKeyHotspot: 'set' | 'cleared' | 'unchanged', oldOnKeyHotspot: 'set' |
   'absent', onHotKeyMitigated: 'set' | 'cleared' | 'unchanged',
   oldOnHotKeyMitigated: 'set' | 'absent' }`).
+  A live bus-level default (EB-498, via
+  `setDefaultKeyHotspot(opts | null, actor = 'system')` /
+  `getDefaultKeyHotspot()`) decides the `thresholdDepth` /
+  `onKeyHotspot` / `autoMitigate` a new subscriber falls back to when
+  it opts into `keyHotspot` but omits a field — the priority chain is
+  subscriber-explicit > bus default > built-in (thresholdDepth 100, no
+  callback, detection only). `true` takes the whole default, and `{}`
+  opts in and takes the whole default too. `autoMitigate` merges a
+  second level down: a subscriber that omits it entirely takes the
+  default's `autoMitigate` whole, while a subscriber that passes an
+  object keeps its explicit fields and falls back to the default's
+  object for the rest; the `recoverDepth <= thresholdDepth` gate is
+  re-checked on the merged values, so a default `recoverDepth` above a
+  subscriber's explicitly tightened threshold makes that subscribe
+  throw instead of silently clamping. The revision only affects
+  subscribers that join after it; an already-subscribed monitor keeps
+  the threshold, the callbacks, the mitigation config, and the alert /
+  mitigation latches it was baked with, and the per-subscriber
+  revisions (`setKeyHotspotThreshold` / `setKeyHotspotRecoverDepth` /
+  `setKeyHotspotAutoMitigate` / `setKeyHotspotCallbacks`) still revise
+  such a subscriber one at a time without touching the bus default —
+  their field-level revisions never consult the bus default, so the
+  default never re-applies to them. The default never enables
+  monitoring: a subscriber that does not opt into `keyHotspot` is
+  untouched by it. Out of the box there is no default; there is no
+  construction-time option, the default never enters a config snapshot,
+  and a restart restores the unset default. Every success is audited as
+  `default_key_hotspot_revised` (`{ previous, keyHotspot }`, `null`
+  when the default is unset; callbacks by presence only, the nested
+  `autoMitigate` as `{ recoverDepth: <number> | null,
+  onHotKeyMitigated: 'set'? }`).
   (Real-time systems: key-hotspot governance.) Disabled by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
   `new EventBus({ trace: true })`): one trace per sampled publish, threading

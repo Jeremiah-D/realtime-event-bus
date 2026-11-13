@@ -18142,6 +18142,19 @@ export class EventBus {
    */
   private defaultSlowHandler?: SlowHandlerOptions;
   /**
+   * Bus-level terminal key-hotspot default (EB-498): the
+   * `thresholdDepth` / `onKeyHotspot` / `autoMitigate` a new
+   * subscriber falls back to when it opts into `keyHotspot` but
+   * omits a field. Starts unset (`undefined` — no default,
+   * omitting a field still means 100 / no callback / detection
+   * only, exactly the previous behavior) and moves only via
+   * `setDefaultKeyHotspot`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables monitoring: a subscriber that does not opt into
+   * `keyHotspot` is untouched by it.
+   */
+  private defaultKeyHotspot?: KeyHotspotOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -34049,8 +34062,14 @@ export class EventBus {
     // half-registered subscriber behind.
     const expiring = resolveExpiringSoonOptions(opts?.expiringSoon, 'subscribe');
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const keyHotspot = resolveKeyHotspotOptions(opts?.keyHotspot);
+    // half-registered subscriber behind. EB-498: a subscriber that
+    // opts into `keyHotspot` but omits a field falls back to the live
+    // bus default, if one is installed — the bus default sits between
+    // the explicit option and the documented 100 / no callback /
+    // detection only. An explicit value always wins, `true` takes the
+    // whole default, and the default never enables monitoring on its
+    // own: a subscriber that passes no `keyHotspot` is untouched.
+    const keyHotspot = resolveKeyHotspotOptions(opts?.keyHotspot, this.defaultKeyHotspot);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const causal = resolveCausalOptions(opts?.causal);
@@ -51385,6 +51404,232 @@ export class EventBus {
    */
   getDefaultSlowHandler(): SlowHandlerOptions | undefined {
     return this.defaultSlowHandler === undefined ? undefined : { ...this.defaultSlowHandler };
+  }
+
+  /**
+   * Sets the live bus-level default key-hotspot monitoring (EB-498)
+   * without re-subscribing anyone:
+   * `setDefaultKeyHotspot(opts, actor = 'system')` decides the
+   * `thresholdDepth` / `onKeyHotspot` / `autoMitigate` for future
+   * subscribers that opt into `keyHotspot` but omit a field (see
+   * `KeyHotspotOptions`) — `{ thresholdDepth: 10 }` to tighten every
+   * new opt-in monitor's alert depth with one call,
+   * `{ onKeyHotspot }` to arm every new opt-in monitor's callback
+   * with one call, `{ autoMitigate: true }` to arm fleet-wide
+   * auto-mitigation with one call, `null` to clear the default back
+   * to no default (new opt-in subscribers go back to the documented
+   * 100 / no callback / detection only).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > built-in (thresholdDepth
+   * 100, no callback, detection only) — the bus default is the
+   * terminal fallback below the explicit option, resolved field by
+   * field: an explicit `thresholdDepth` still takes the default
+   * `onKeyHotspot`, and vice versa. `true` takes the whole default,
+   * and `{}` opts a subscriber in and takes the whole default too.
+   * `autoMitigate` merges a second level down: a subscriber that
+   * omits it entirely takes the default's `autoMitigate` whole,
+   * while a subscriber that passes an object keeps its explicit
+   * fields and falls back to the default's object for the rest
+   * (`recoverDepth` and `onHotKeyMitigated` each fall back
+   * separately); the `recoverDepth <= thresholdDepth` gate is
+   * re-checked on the merged values, so a default `recoverDepth`
+   * above a subscriber's explicitly tightened threshold makes that
+   * subscribe throw instead of silently clamping. A subscriber that
+   * took the default at subscribe time keeps the threshold, the
+   * callbacks, the mitigation config, and the alert / mitigation
+   * latches it was baked with: a later revision never moves an
+   * already-subscribed threshold, recovery depth, callback, or
+   * latch, and the per-subscriber revisions (`setKeyHotspotThreshold`,
+   * `setKeyHotspotRecoverDepth`, `setKeyHotspotAutoMitigate`,
+   * `setKeyHotspotCallbacks`) still revise such a subscriber one at
+   * a time without touching the bus default — their field-level
+   * revisions never consult the bus default, so the default never
+   * re-applies to them. The default never enables monitoring: a
+   * subscriber that does not opt into `keyHotspot` is untouched by
+   * it, exactly as the slow-handler default never enables the
+   * offload (EB-497).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-positive-integer `thresholdDepth`, a non-function
+   * callback, or a `recoverDepth` that is negative, non-integer, or
+   * above the (explicit or built-in) threshold throws with the live
+   * default and the audit log untouched — the threshold and callback
+   * failures keep the resolver's own error kinds (`RangeError` for
+   * the bounds, `TypeError` for the callbacks). `{}` is accepted and
+   * installs no field coverage (equivalent to unset). A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — fields are
+   * compared one by one, with `undefined` counting as missing and
+   * callbacks compared by reference, and `autoMitigate: true` counts
+   * the same as `autoMitigate: {}`. Audited as
+   * `default_key_hotspot_revised`
+   * (`{ previous, keyHotspot }`, `null` when the default is unset
+   * — unset means new opt-in subscribers go back to the documented
+   * 100 / no callback / detection only, exactly the previous
+   * behavior; the callbacks are recorded by presence only, never
+   * serialized, and the nested `autoMitigate` is recorded as
+   * `{ recoverDepth: <number> | null, onHotKeyMitigated: 'set'? }`).
+   *
+   * Orthogonal to EB-47 (that owns the hotspot detection mechanism
+   * itself — this sets the default a new opt-in subscriber's omitted
+   * fields fall back to), to EB-115 (that owns auto-mitigation itself
+   * — this sets its default), to EB-289 / EB-294 / EB-338 / EB-433
+   * (those revise one subscriber's threshold / recovery depth /
+   * mitigation switch / callbacks at a time — this sets the
+   * bus-level default), to EB-36 (that owns keyed delivery ordering
+   * itself — this observes its reorder-buffer depth), to EB-494 /
+   * EB-495 (those set the lag-monitor / lag-forecast defaults — the
+   * consumer-side lag defaults, this the keyed reorder-buffer depth
+   * default), and to EB-496 (that sets the health-probe default —
+   * the subscriber health fuse, this the per-key buffer hotspot).
+   *
+   * Throws `RangeError` for an illegal actor, a non-positive-integer
+   * `thresholdDepth`, or an illegal `recoverDepth`; `TypeError` for
+   * a non-object value (other than `null` to clear) or a non-function
+   * callback.
+   */
+  setDefaultKeyHotspot(opts: KeyHotspotOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultKeyHotspot');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new TypeError(
+        'setDefaultKeyHotspot: keyHotspot must be a KeyHotspotOptions object, or null to clear it',
+      );
+    }
+    // Validate through the subscribe-time gate so the bounds are
+    // exactly the subscribe-time ones; the resolver's own error
+    // kinds (RangeError for the bounds, TypeError for the callbacks)
+    // propagate unchanged.
+    if (opts !== null) {
+      resolveKeyHotspotOptions(opts);
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    // The nested autoMitigate object is copied too, so a caller
+    // mutating it afterwards never moves the live default.
+    const next: KeyHotspotOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(opts.thresholdDepth !== undefined ? { thresholdDepth: opts.thresholdDepth } : {}),
+            ...(opts.onKeyHotspot !== undefined ? { onKeyHotspot: opts.onKeyHotspot } : {}),
+            ...(opts.autoMitigate !== undefined
+              ? {
+                  autoMitigate:
+                    typeof opts.autoMitigate === 'object' && opts.autoMitigate !== null
+                      ? { ...opts.autoMitigate }
+                      : opts.autoMitigate,
+                }
+              : {}),
+          };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing and
+    // callbacks compared by reference; `autoMitigate: true` counts
+    // the same as `autoMitigate: {}` (both enable with the defaults).
+    const canonicalAutoMitigate = (
+      am: boolean | HotKeyMitigateOptions | undefined,
+    ): boolean | { recoverDepth?: number; onHotKeyMitigated?: (event: HotKeyMitigatedEvent) => void } | undefined =>
+      am === undefined || typeof am === 'boolean' ? am : { ...am };
+    const autoMitigateEqual = (
+      a: boolean | HotKeyMitigateOptions | undefined,
+      b: boolean | HotKeyMitigateOptions | undefined,
+    ): boolean => {
+      const ca = canonicalAutoMitigate(a);
+      const cb = canonicalAutoMitigate(b);
+      if (ca === undefined || cb === undefined) return ca === cb;
+      if (typeof ca === 'boolean' || typeof cb === 'boolean') {
+        // `true` and `{}` are homomorphic: both enable with defaults.
+        if (ca === true && typeof cb === 'object') {
+          return cb.recoverDepth === undefined && cb.onHotKeyMitigated === undefined;
+        }
+        if (cb === true && typeof ca === 'object') {
+          return ca.recoverDepth === undefined && ca.onHotKeyMitigated === undefined;
+        }
+        return ca === cb;
+      }
+      return ca.recoverDepth === cb.recoverDepth && ca.onHotKeyMitigated === cb.onHotKeyMitigated;
+    };
+    const previous: KeyHotspotOptions | undefined = this.defaultKeyHotspot;
+    if (
+      (previous?.thresholdDepth ?? undefined) === (next?.thresholdDepth ?? undefined) &&
+      (previous?.onKeyHotspot ?? undefined) === (next?.onKeyHotspot ?? undefined) &&
+      autoMitigateEqual(previous?.autoMitigate, next?.autoMitigate)
+    ) {
+      return;
+    }
+    // The audit records the callbacks by presence only, never
+    // serialized, and the nested autoMitigate as its recoverDepth
+    // (null when it takes the threshold) plus the mitigation
+    // callback's presence — the same shape the per-subscriber
+    // `key_hotspot_auto_mitigate_revised` audit uses.
+    const snapshotAutoMitigate = (
+      am: boolean | HotKeyMitigateOptions | undefined,
+    ): { recoverDepth: number | null; onHotKeyMitigated?: 'set' } | null => {
+      if (am === undefined || am === false) return null;
+      if (am === true) return { recoverDepth: null };
+      return {
+        recoverDepth: am.recoverDepth ?? null,
+        ...(am.onHotKeyMitigated !== undefined ? { onHotKeyMitigated: 'set' as const } : {}),
+      };
+    };
+    const snapshot = (
+      d: KeyHotspotOptions | undefined,
+    ):
+      | {
+          thresholdDepth?: number;
+          onKeyHotspot?: 'set';
+          autoMitigate?: { recoverDepth: number | null; onHotKeyMitigated?: 'set' };
+        }
+      | null =>
+      d === undefined
+        ? null
+        : {
+            ...(d.thresholdDepth !== undefined ? { thresholdDepth: d.thresholdDepth } : {}),
+            ...(d.onKeyHotspot !== undefined ? { onKeyHotspot: 'set' as const } : {}),
+            ...(d.autoMitigate !== undefined && d.autoMitigate !== false
+              ? { autoMitigate: snapshotAutoMitigate(d.autoMitigate) ?? undefined }
+              : {}),
+          };
+    const detail = {
+      previous: snapshot(this.defaultKeyHotspot),
+      keyHotspot: snapshot(next),
+    };
+    this.defaultKeyHotspot = next;
+    this.auditSubscription({
+      action: 'default_key_hotspot_revised',
+      actor,
+      detail,
+    });
+  }
+
+  /**
+   * Returns the live bus-level default key-hotspot monitoring
+   * (EB-498) — the `KeyHotspotOptions` future opt-in subscribers
+   * fall back to when they omit a field — `undefined` before any
+   * revision (no default, new opt-in subscribers still take the
+   * documented 100 / no callback / detection only), then whatever
+   * `setDefaultKeyHotspot` last installed. Returns a copy, including
+   * a copy of the nested `autoMitigate` object, so mutating the
+   * result never moves the live default.
+   */
+  getDefaultKeyHotspot(): KeyHotspotOptions | undefined {
+    if (this.defaultKeyHotspot === undefined) return undefined;
+    const d = this.defaultKeyHotspot;
+    return {
+      ...d,
+      ...(d.autoMitigate !== undefined &&
+      typeof d.autoMitigate === 'object' &&
+      d.autoMitigate !== null
+        ? { autoMitigate: { ...d.autoMitigate } }
+        : {}),
+    };
   }
 
   /**
