@@ -2191,7 +2191,11 @@ export interface SubscribeOptions {
    *
    * Pass `true` for the defaults (1024-sample rolling window per
    * subscriber), or an `AckLatencyOptions` object to tune the window.
-   * Invalid values throw `RangeError` from `subscribe`.
+   * A live bus default installed via `setDefaultAckLatency` (EB-492)
+   * fills in an omitted `windowSize` — `true` takes the whole
+   * default — and an explicit value always wins; the default never
+   * enables sampling on its own. Invalid values throw `RangeError` from
+   * `subscribe`.
    */
   ackLatency?: boolean | AckLatencyOptions;
   /**
@@ -11771,7 +11775,13 @@ export interface AckLatencyRevisionOptions {
  * for a non-function `onAckSloMiss`. The bus-level default SLO
  * (`defaultAckSloMs`, EB-479) is the terminal fallback below an
  * explicit `ackSloMs` — it never satisfies the opt-in gate, which
- * reads only the subscriber's explicit value.
+ * reads only the subscriber's explicit value. The live bus default
+ * installed via `setDefaultAckLatency` (EB-492) is the terminal
+ * fallback below an explicit `windowSize` — `true` takes the whole
+ * default and a partial object falls back field by field — but it
+ * never satisfies the opt-in gate either, and the `ackSloMs` linkage
+ * still reads only the subscriber's own `ackSloMs` plus the SLO
+ * default, never the window default.
  */
 function resolveAckLatencyOptions(
   opt: boolean | AckLatencyOptions | undefined,
@@ -11781,6 +11791,7 @@ function resolveAckLatencyOptions(
   pattern: string,
   now: () => number,
   defaultAckSloMs?: number,
+  defaults?: AckLatencyOptions,
 ): SubscriberAckLatencyState | undefined {
   if (ackSloMs !== undefined && (!Number.isFinite(ackSloMs) || ackSloMs <= 0)) {
     throw new RangeError('ackSloMs must be a positive finite number of milliseconds');
@@ -11794,8 +11805,8 @@ function resolveAckLatencyOptions(
     }
     return undefined;
   }
-  const o: AckLatencyOptions = opt === true ? {} : opt;
-  const windowSize = o.windowSize ?? 1024;
+  const o: AckLatencyOptions = opt === true ? { ...defaults } : opt;
+  const windowSize = o.windowSize ?? defaults?.windowSize ?? 1024;
   if (!Number.isInteger(windowSize) || windowSize <= 0) {
     throw new RangeError('ackLatency.windowSize must be a positive integer');
   }
@@ -17977,6 +17988,18 @@ export class EventBus {
    * `deliveryLatency` is untouched by it.
    */
   private defaultDeliveryLatency?: DeliveryLatencyOptions;
+  /**
+   * Bus-level terminal ack-latency window default (EB-492): the
+   * `windowSize` a new subscriber falls back to when it opts into
+   * `ackLatency` but omits the field. Starts unset
+   * (`undefined` — no default, omitting the field still means 1024,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultAckLatency`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables sampling: a subscriber that does not opt into
+   * `ackLatency` is untouched by it.
+   */
+  private defaultAckLatency?: AckLatencyOptions;
   /**
    * Bus-level terminal backpressure-throttle default (EB-488): the
    * `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec` a new
@@ -33887,6 +33910,12 @@ export class EventBus {
       // subscriber's explicit value, so the default never enables
       // sampling on its own.
       this.defaultAckSloMs,
+      // EB-492: the bus default window is the terminal fallback below
+      // an explicit windowSize — `true` takes the whole default, a
+      // partial object falls back field by field, an explicit value
+      // always wins — and the ackSloMs linkage above still reads only
+      // the subscriber's own ackSloMs, never this default.
+      this.defaultAckLatency,
     );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -50024,6 +50053,109 @@ export class EventBus {
    */
   getDefaultDeliveryLatency(): DeliveryLatencyOptions | undefined {
     return this.defaultDeliveryLatency === undefined ? undefined : { ...this.defaultDeliveryLatency };
+  }
+
+  /**
+   * Sets the live bus-level default ack-latency sampling window
+   * (EB-492) without re-subscribing anyone:
+   * `setDefaultAckLatency(opts, actor = 'system')` decides the
+   * `windowSize` for future subscribers that opt into `ackLatency`
+   * but omit the field (see `AckLatencyOptions`) —
+   * `{ windowSize: 3 }` to cap every new opt-in sampler's window at 3
+   * samples with one call, `null` to clear the default back to no
+   * default (new opt-in subscribers go back to the documented 1024).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 1024 — the bus default is the
+   * terminal fallback below the explicit option: an explicit
+   * `windowSize` still wins, `true` takes the whole default, and `{}`
+   * opts a subscriber in and takes the default window. A subscriber
+   * that took the default at subscribe time keeps the window, the SLO,
+   * and the samples it was baked with: a later revision never moves
+   * an already-subscribed window, and `setAckLatency` still revises
+   * such a subscriber one at a time without touching the bus default
+   * — its partial revision still takes the live values for omitted
+   * fields, and its `null` still clears the whole subscriber back to
+   * no sampling without the default re-applying. The default never
+   * enables sampling: a subscriber that does not opt into `ackLatency`
+   * is untouched by it, exactly as the delivery-latency default never
+   * enables sampling (EB-491). The `ackSloMs` linkage is untouched:
+   * the SLO still resolves subscriber-explicit > `defaultAckSloMs`
+   * (EB-479) > 30000ms, and this default never triggers the
+   * `ackSloMs/onAckSloMiss require ackLatency` gate.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-integer / <= 0 `windowSize` throws `RangeError`
+   * with the live default and the audit log untouched. `{}` is
+   * accepted and installs no field coverage (equivalent to unset). A
+   * revision identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — the single
+   * field is compared with `undefined` counting as missing. Audited
+   * as `default_ack_latency_revised`
+   * (`{ previous, ackLatency }`, `null` when the default is unset —
+   * unset means new opt-in subscribers go back to the documented
+   * 1024, exactly the previous behavior).
+   *
+   * Orthogonal to EB-279 (that revises one subscriber's window, SLO,
+   * and miss callback at a time — this sets the default a new opt-in
+   * subscriber's omitted field falls back to), to EB-479 (that sets
+   * the ack SLO default — the threshold, this sets the distribution
+   * window), and to EB-491 (that sets the delivery-latency window
+   * default — the sister item on the enqueue→delivery side).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or a non-integer / <= 0 `windowSize`.
+   */
+  setDefaultAckLatency(opts: AckLatencyOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultAckLatency');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultAckLatency: ackLatency must be an object with windowSize, or null to clear it',
+      );
+    }
+    const windowSize = opts?.windowSize;
+    if (windowSize !== undefined && (!Number.isInteger(windowSize) || windowSize <= 0)) {
+      throw new RangeError('ackLatency.windowSize must be a positive integer');
+    }
+    // Normalize to the known field only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: AckLatencyOptions | undefined =
+      opts === null ? undefined : { ...(windowSize !== undefined ? { windowSize } : {}) };
+    const previous: AckLatencyOptions | null =
+      this.defaultAckLatency === undefined ? null : { ...this.defaultAckLatency };
+    // Re-affirming the current default is a no-op: no audit.
+    if ((previous?.windowSize ?? undefined) === (next?.windowSize ?? undefined)) {
+      return;
+    }
+    this.defaultAckLatency = next;
+    this.auditSubscription({
+      action: 'default_ack_latency_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        ackLatency: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default ack-latency sampling window
+   * (EB-492) — the `AckLatencyOptions` future opt-in subscribers fall
+   * back to when they omit `windowSize` — `undefined` before any
+   * revision (no default, new opt-in subscribers still take the
+   * documented 1024), then whatever `setDefaultAckLatency` last
+   * installed. Returns a copy, so mutating the result never moves
+   * the live default.
+   */
+  getDefaultAckLatency(): AckLatencyOptions | undefined {
+    return this.defaultAckLatency === undefined ? undefined : { ...this.defaultAckLatency };
   }
 
   /**

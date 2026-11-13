@@ -3112,6 +3112,23 @@ library.
   identical to the current default is a no-op with no audit, and
   every success is audited as `default_ack_slo_ms_revised`
   (`{ previous, ackSloMs }`, `null` when the default is unset).
+  Bus-level default window (EB-492, via
+  `setDefaultAckLatency(opts | null, actor = 'system')` +
+  `getDefaultAckLatency()`): the `windowSize` future opt-in
+  subscribers fall back to when they omit it — `{ windowSize: 3 }` to
+  cap every new sampler's window at 3 with one call, `null` to clear
+  back to no default. The resolution chain is subscriber-explicit >
+  bus default > 1024, and the default never enables sampling: a
+  subscriber that does not opt into `ackLatency` gets no tracker.
+  The revision only affects subscribers that join after it; an
+  already-subscribed sampler keeps the window it was baked with and
+  its recorded samples, and `setAckLatency` still retunes one sampler
+  at a time without touching the bus default. The `ackSloMs` linkage
+  is untouched: the SLO still resolves subscriber-explicit >
+  `defaultAckSloMs` (EB-479) > 30000ms. Out of the box there is no
+  default (omitting `windowSize` means 1024, as before); there is no
+  construction-time option, the default never enters a config
+  snapshot, and a restart restores the unset default.
 - **Per-subscriber handler processing-latency p99 SLO alerting** (in
   `src/latency.ts` + `src/bus.ts`, opt-in via
   `subscribe(..., { latencySlo: { p99ThresholdMs: 50 } })`): measures each
