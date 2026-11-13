@@ -8998,6 +8998,24 @@ Semantics:
   success is audited as `topic_fairness_revised`
   (`{ topicFairness: { weights } | null, oldTopicFairness: { weights } }`,
   `null` for a clear). (Real-time systems: delivery governance.)
+- **Bus-level default (EB-489, via
+  `setDefaultTopicFairness(opts | null, actor = 'system')`).** The
+  per-topic weights a new subscriber falls back to when it opts into
+  `topicFairness` but omits a topic — the priority chain is
+  subscriber-explicit > bus default > 1, so
+  `setDefaultTopicFairness({ weights: { hot: 1, cold: 3 } })` drains
+  every later opt-in subscriber one `hot` message per three `cold`
+  ones unless it sets its own weights, `true` takes the whole default
+  map, and `null` clears the default back to `true` meaning all
+  weights 1. The default never enables fair scheduling: a subscriber
+  that does not opt into `topicFairness` is untouched by it, and a
+  revision never moves an already-subscribed subscriber's weights or
+  deficit carryover. `setTopicFairness` keeps its own semantics — a
+  revision still replaces the whole mapping, `null` still clears to
+  plain FIFO without the default re-applying. Every success is audited
+  as `default_topic_fairness_revised`
+  (`{ previous, topicFairness }`, `null` when the default is unset).
+  There is no construction-time option and the revision is live-only.
 
 ## Subscriber drain priority (EB-166)
 

@@ -2116,7 +2116,10 @@ export interface SubscribeOptions {
    * absent from `weights` drains at weight 1. Every weight must be a
    * positive integer — anything else throws `RangeError` from
    * `subscribe`. Cannot be combined with `shadow` (throws `RangeError`).
-   * Disabled by default.
+   * Disabled by default. A live bus default installed via
+   * `setDefaultTopicFairness` (EB-489) fills in the weights a
+   * subscriber omits — `true` takes the whole default map — and never
+   * enables fair scheduling on its own.
    */
   topicFairness?: boolean | TopicFairnessOptions;
   /**
@@ -17963,6 +17966,18 @@ export class EventBus {
    */
   private defaultThrottle?: ThrottleOptions;
   /**
+   * Bus-level terminal topic-fairness default (EB-489): the
+   * per-topic weights a new subscriber falls back to when it opts
+   * into `topicFairness` but omits a topic. Starts unset
+   * (`undefined` — no default, `true` means all weights 1, exactly
+   * the previous behavior) and moves only via
+   * `setDefaultTopicFairness`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables fair scheduling: a subscriber that does not opt into
+   * `topicFairness` is untouched by it.
+   */
+  private defaultTopicFairness?: TopicFairnessOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33780,7 +33795,18 @@ export class EventBus {
     const rateLimit = resolveRateLimitOptions(opts?.rateLimit, this.defaultRateLimit);
     // Topic-level fair scheduling (EB-135): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
-    const topicFairness = resolveTopicFairnessOptions(opts?.topicFairness, 'subscribe');
+    // EB-489: a subscriber that opts into `topicFairness` but omits a
+    // topic falls back to the live bus default weight for it, if one
+    // is installed — the bus default sits between the explicit
+    // weights and weight 1. An explicit entry always wins, `true`
+    // takes the whole default map, and the default never enables
+    // fair scheduling on its own: a subscriber that passes no
+    // `topicFairness` is untouched.
+    const topicFairness = resolveTopicFairnessOptions(
+      opts?.topicFairness,
+      'subscribe',
+      this.defaultTopicFairness,
+    );
     // Subscriber drain priority (EB-166): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const deliveryPriority = resolveDeliveryPriority(opts?.deliveryPriority, 'subscribe');
@@ -49982,6 +50008,129 @@ export class EventBus {
    */
   getDefaultThrottle(): ThrottleOptions | undefined {
     return this.defaultThrottle === undefined ? undefined : { ...this.defaultThrottle };
+  }
+
+  /**
+   * Sets the live bus-level default topic-fairness weights (EB-489)
+   * without re-subscribing anyone:
+   * `setDefaultTopicFairness(opts, actor = 'system')` decides the
+   * per-topic weights for future subscribers that opt into
+   * `topicFairness` but omit a topic (see `TopicFairnessOptions`) —
+   * `{ weights: { hot: 1, cold: 3 } }` to drain every new opt-in
+   * subscriber one `hot` message per three `cold` ones, `null` to
+   * clear the default back to no default (new opt-in subscribers go
+   * back to `true` meaning all weights 1).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 1 — the bus default is the
+   * terminal fallback below the explicit weights, resolved per topic:
+   * an explicit `hot` weight still takes the default `cold` weight,
+   * and vice versa. `true` opts a subscriber in and takes the whole
+   * default map. A subscriber that took the default at subscribe
+   * time keeps the weights it was baked with and its deficit
+   * carryover: a later revision never moves an already-subscribed
+   * subscriber's weights, and `setTopicFairness` still revises such
+   * a subscriber one at a time without touching the bus default —
+   * its revision replaces the whole mapping, and its `null` still
+   * clears the whole subscriber back to plain FIFO without the
+   * default re-applying. The default never enables fair scheduling:
+   * a subscriber that does not opt into `topicFairness` is untouched
+   * by it, exactly as the rate-limit default never enables rate
+   * limiting (EB-487).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-object `weights`, an empty topic key, or a
+   * non-positive-integer weight throws `RangeError` with the live
+   * default and the audit log untouched. `{}` is accepted and
+   * installs no topic coverage (equivalent to unset). A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — weights are
+   * compared topic by topic, with a topic absent from the map
+   * counting as weight 1, so `{ weights: { hot: 1 } }` and `{}` are
+   * the same revision. Audited as `default_topic_fairness_revised`
+   * (`{ previous, topicFairness }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to `true`
+   * meaning all weights 1, exactly the previous behavior).
+   *
+   * Orthogonal to EB-135 (that owns the DRR fair-scheduling
+   * mechanism itself — this sets the default a new opt-in
+   * subscriber's omitted topics fall back to), to EB-359 (that
+   * revises one subscriber's weights at a time — this sets the
+   * default), and to EB-487 (that sets the sliding-window
+   * rate-limit default — the same "default never enables an
+   * opt-in capability" shape, resolved per topic).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), a non-object `weights`, an empty
+   * topic key, or a non-positive-integer weight.
+   */
+  setDefaultTopicFairness(opts: TopicFairnessOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultTopicFairness');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultTopicFairness: topicFairness must be an options object with weights, or null to clear it',
+      );
+    }
+    // Reuse the subscribe-time validation so the gate never forks:
+    // `resolveTopicFairnessOptions` throws on a non-object weights,
+    // an empty topic key, or a non-positive-integer weight.
+    const resolved =
+      opts === null ? undefined : resolveTopicFairnessOptions(opts, 'setDefaultTopicFairness');
+    // Normalize to the validated mapping only, so a missing `weights`
+    // and an explicitly empty one compare equal.
+    const next: TopicFairnessOptions | undefined =
+      resolved === undefined ? undefined : { weights: Object.fromEntries(resolved.weights) };
+    const previous: TopicFairnessOptions | null =
+      this.defaultTopicFairness === undefined
+        ? null
+        : { weights: { ...this.defaultTopicFairness.weights } };
+    // Re-affirming the current default is a no-op: no audit.
+    // Equality is on the effective mapping — a topic absent from the
+    // mapping drains at weight 1 — so `{ weights: { hot: 1 } }` and
+    // `{}` are the same revision.
+    const sameWeights = (
+      a: Record<string, number> | undefined,
+      b: Record<string, number> | undefined,
+    ): boolean => {
+      const keys = new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})]);
+      for (const key of keys) {
+        if ((a?.[key] ?? 1) !== (b?.[key] ?? 1)) return false;
+      }
+      return true;
+    };
+    if (sameWeights(previous?.weights, next?.weights)) {
+      return;
+    }
+    this.defaultTopicFairness = next;
+    this.auditSubscription({
+      action: 'default_topic_fairness_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { weights: { ...previous.weights } },
+        topicFairness: next === undefined ? null : { weights: { ...next.weights } },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default topic-fairness weights
+   * (EB-489) — the `TopicFairnessOptions` future opt-in subscribers
+   * fall back to when they omit a topic — `undefined` before any
+   * revision (no default, `true` still means all weights 1), then
+   * whatever `setDefaultTopicFairness` last installed. Returns a
+   * copy, so mutating the result never moves the live default.
+   */
+  getDefaultTopicFairness(): TopicFairnessOptions | undefined {
+    return this.defaultTopicFairness === undefined
+      ? undefined
+      : { weights: { ...this.defaultTopicFairness.weights } };
   }
 
   /**

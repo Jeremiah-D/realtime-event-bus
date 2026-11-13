@@ -55,17 +55,35 @@ export interface ResolvedTopicFairnessOptions {
  * Fail-fast validation for `SubscribeOptions.topicFairness`. Returns
  * `undefined` when fairness is disabled (`undefined`/`false`), so the
  * non-opt-in path pays a single property check per drain.
+ *
+ * EB-489: `defaults` is the live bus default installed via
+ * `setDefaultTopicFairness` — it fills in what the subscriber omits.
+ * `true` takes the whole default map (or all weights 1 when no default
+ * is installed); an object merges per topic, subscriber-explicit
+ * entries always winning and topics the subscriber omits falling back
+ * to the default weight. The default never enables fairness: a
+ * subscriber that passes no `topicFairness` still gets `undefined`.
  */
 export function resolveTopicFairnessOptions(
   value: boolean | TopicFairnessOptions | undefined,
   where: string,
+  defaults?: TopicFairnessOptions,
 ): ResolvedTopicFairnessOptions | undefined {
   if (value === undefined || value === false) return undefined;
   let weights: Record<string, number> | undefined;
   if (value === true) {
-    weights = undefined;
+    weights = defaults?.weights;
   } else if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-    weights = value.weights;
+    // Validate the subscriber's own weights shape before merging: a
+    // spread would silently swallow a `null` / array `weights` and
+    // let the default paper over an illegal opt-in.
+    const own = value.weights;
+    if (own !== undefined && (own === null || typeof own !== 'object' || Array.isArray(own))) {
+      throw new RangeError(
+        `${where}: topicFairness.weights must be an object mapping topic names to weights`,
+      );
+    }
+    weights = { ...defaults?.weights, ...own };
   } else {
     throw new RangeError(`${where}: topicFairness must be true or an options object`);
   }
