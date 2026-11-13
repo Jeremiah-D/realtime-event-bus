@@ -2699,6 +2699,26 @@ library.
   (`{ deliveryShaping: { messagesPerSec, burst } | null,
   oldDeliveryShaping: { messagesPerSec, burst } }`). (Real-time
   systems: delivery governance.)
+  Bus-level default (EB-484, via
+  `setDefaultDeliveryShaping(opts | null, actor = 'system')`): the
+  `messagesPerSec` / `burst` a new subscriber falls back to when it
+  opts into `deliveryShaping` but omits a field — the priority chain
+  is subscriber-explicit > bus default > 100 / one second's budget,
+  so `setDefaultDeliveryShaping({ messagesPerSec: 50 })` paces every
+  later opt-in subscriber at 50/s with a 50-message burst unless it
+  sets its own rate, and `null` clears the default back to 100 / one
+  second's budget. The default never enables shaping: a subscriber
+  that does not opt into `deliveryShaping` is untouched by it, and a
+  revision never moves an already-subscribed rate, burst, or bucket
+  budget. `setDeliveryShaping` keeps its own semantics — a partial
+  revision still takes the live value (the burst is never recomputed
+  from a new rate), `null` still clears to unshaped delivery without
+  the default re-applying, and a revision after a clear is still
+  refused. Every success is audited as
+  `default_delivery_shaping_revised`
+  (`{ previous, deliveryShaping }`, `null` when the default is
+  unset). There is no construction-time option and the revision is
+  live-only.
 - **Subscriber slow-start** (in `src/slowstart.ts`, opt-in via
   `subscribe(..., { slowStart: true })`): cold-start protection for a fresh
   subscription. After the subscription is created, delivery is paced by a

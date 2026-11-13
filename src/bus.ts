@@ -3707,7 +3707,8 @@ export interface ThrottleOptions {
 export interface DeliveryShapingOptions {
   /**
    * Maximum deliveries per second to the subscriber. Must be a positive
-   * finite number. Default 100.
+   * finite number. Default 100 — or the live bus default installed via
+   * `setDefaultDeliveryShaping` (EB-484) when one is set.
    */
   messagesPerSec?: number;
   /**
@@ -3715,7 +3716,8 @@ export interface DeliveryShapingOptions {
    * accumulated — the token bucket capacity. Must be a positive finite
    * number. Defaults to one second's worth of budget
    * (`max(1, ceil(messagesPerSec))`), the same convention as
-   * `setTopicRateLimit`.
+   * `setTopicRateLimit` — where `messagesPerSec` is the effective rate
+   * after the bus default fills in an omitted field (EB-484).
    */
   burst?: number;
 }
@@ -10960,14 +10962,15 @@ function resolveDeliveryConcurrencyOptions(opt: number | undefined): number {
 function resolveDeliveryShapingOptions(
   opt: boolean | DeliveryShapingOptions | undefined,
   now: () => number,
+  defaults?: DeliveryShapingOptions,
 ): DeliveryShapingState | undefined {
   if (opt == null || opt === false) return undefined;
   const o: DeliveryShapingOptions = opt === true ? {} : opt;
-  const messagesPerSec = o.messagesPerSec ?? 100;
+  const messagesPerSec = o.messagesPerSec ?? defaults?.messagesPerSec ?? 100;
   if (!Number.isFinite(messagesPerSec) || messagesPerSec <= 0) {
     throw new RangeError('deliveryShaping.messagesPerSec must be a positive finite number of messages/sec');
   }
-  const burst = o.burst ?? Math.max(1, Math.ceil(messagesPerSec));
+  const burst = o.burst ?? defaults?.burst ?? Math.max(1, Math.ceil(messagesPerSec));
   if (!Number.isFinite(burst) || burst <= 0) {
     throw new RangeError('deliveryShaping.burst must be a positive finite number of messages');
   }
@@ -17864,6 +17867,19 @@ export class EventBus {
    * does not opt into `batch` is untouched by it.
    */
   private defaultBatchMaxSize?: number;
+  /**
+   * Bus-level delivery-shaping default (EB-484): the
+   * `DeliveryShapingOptions` a new subscriber falls back to when it
+   * opts into `deliveryShaping` but omits a field. Starts unset
+   * (`undefined` — no default, omitting `messagesPerSec` means 100
+   * and omitting `burst` means one second's budget, exactly the
+   * previous behavior) and moves only via
+   * `setDefaultDeliveryShaping`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables shaping: a subscriber that does not opt into
+   * `deliveryShaping` is untouched by it.
+   */
+  private defaultDeliveryShaping?: DeliveryShapingOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33632,7 +33648,7 @@ export class EventBus {
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const faultIsolation = resolveHandlerFaultIsolationOptions(opts?.handlerFaultIsolation);
-    const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now);
+    const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now, this.defaultDeliveryShaping);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind. The ramp targets the shaping
     // cap when shaping is configured, full speed otherwise.
@@ -49273,6 +49289,124 @@ export class EventBus {
    */
   getDefaultBatchMaxSize(): number | undefined {
     return this.defaultBatchMaxSize;
+  }
+
+  /**
+   * Sets the live bus-level default delivery-shaping rate (EB-484)
+   * without re-subscribing anyone:
+   * `setDefaultDeliveryShaping(opts, actor = 'system')` decides the
+   * `messagesPerSec` / `burst` for future subscribers that opt into
+   * `deliveryShaping` but omit a field (see
+   * `DeliveryShapingOptions`) — `{ messagesPerSec: 50 }` to pace
+   * every new opt-in subscriber at 50/s with a 50-message burst,
+   * `null` to clear the default back to no default (new opt-in
+   * subscribers go back to 100 / one second's budget).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 100 / one second's budget
+   * (the bus default is the terminal fallback below the explicit
+   * option, resolved field by field — an explicit `messagesPerSec`
+   * still takes the default `burst`, and vice versa). A subscriber
+   * that took the default at subscribe time keeps the rate and burst
+   * it was baked with and its bucket budget: a later revision never
+   * moves an already-subscribed rate, and `setDeliveryShaping`
+   * still revises such a subscriber one at a time without touching
+   * the bus default — its partial revision still takes the live
+   * value (the burst is never recomputed from a new rate), and its
+   * `null` still clears the whole subscriber back to unshaped
+   * delivery without the default re-applying. The default never
+   * enables shaping: a subscriber that does not opt into
+   * `deliveryShaping` is untouched by it, exactly as the ack SLO
+   * default never enables sampling (EB-479). The slow-start ramp
+   * target follows the effective cap at subscribe time, so a
+   * default-shaped subscriber ramps toward the default rate.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-finite / <= 0 field throws `RangeError` with
+   * the live default and the audit log untouched. `{}` is accepted
+   * and installs no field coverage (equivalent to unset). A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — fields are
+   * compared one by one, with `undefined` counting as missing.
+   * Audited as `default_delivery_shaping_revised`
+   * (`{ previous, deliveryShaping }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to 100 /
+   * one second's budget, exactly the previous behavior).
+   *
+   * Orthogonal to EB-266 (that revises one subscriber's shaping
+   * rate at a time — this sets the default a new opt-in
+   * subscriber's omitted fields fall back to), to EB-483 (that
+   * sets the batch maxSize default — the same "default never
+   * enables an opt-in capability" shape), and to EB-479 (that sets
+   * the ack SLO default).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or a non-finite / <= 0
+   * `messagesPerSec` or `burst`.
+   */
+  setDefaultDeliveryShaping(opts: DeliveryShapingOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDeliveryShaping');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultDeliveryShaping: deliveryShaping must be an object with messagesPerSec and/or burst, or null to clear it',
+      );
+    }
+    const messagesPerSec = opts?.messagesPerSec;
+    const burst = opts?.burst;
+    if (messagesPerSec !== undefined && (!Number.isFinite(messagesPerSec) || messagesPerSec <= 0)) {
+      throw new RangeError('deliveryShaping.messagesPerSec must be a positive finite number of messages/sec');
+    }
+    if (burst !== undefined && (!Number.isFinite(burst) || burst <= 0)) {
+      throw new RangeError('deliveryShaping.burst must be a positive finite number of messages');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: DeliveryShapingOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(messagesPerSec !== undefined ? { messagesPerSec } : {}),
+            ...(burst !== undefined ? { burst } : {}),
+          };
+    const previous: DeliveryShapingOptions | null =
+      this.defaultDeliveryShaping === undefined ? null : { ...this.defaultDeliveryShaping };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.messagesPerSec ?? undefined) === (next?.messagesPerSec ?? undefined) &&
+      (previous?.burst ?? undefined) === (next?.burst ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultDeliveryShaping = next;
+    this.auditSubscription({
+      action: 'default_delivery_shaping_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        deliveryShaping: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default delivery-shaping rate
+   * (EB-484) — the `DeliveryShapingOptions` future opt-in
+   * subscribers fall back to when they omit a field — `undefined`
+   * before any revision (no default, new opt-in subscribers use
+   * 100 / one second's budget), then whatever
+   * `setDefaultDeliveryShaping` last installed. Returns a copy, so
+   * mutating the result never moves the live default.
+   */
+  getDefaultDeliveryShaping(): DeliveryShapingOptions | undefined {
+    return this.defaultDeliveryShaping === undefined ? undefined : { ...this.defaultDeliveryShaping };
   }
 
   /**
