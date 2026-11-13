@@ -179,6 +179,30 @@ export interface ProcessingLatencySloOptions {
 }
 
 /**
+ * Bus-level default processing-latency SLO (EB-493): the `windowSize`
+ * / `p99ThresholdMs` a new subscriber falls back to when it opts into
+ * `latencySlo` but omits a field. Deliberately carries no callback —
+ * `onLatencySloMiss` stays bound to the subscribing identity and can
+ * never be shared fleet-wide, so a subscriber that takes the default
+ * threshold still fires only its own callback (or none, when it passed
+ * none).
+ */
+export interface LatencySloDefaultOptions {
+  /**
+   * How many of the most recent processing-time samples a new opt-in
+   * subscriber keeps when it omits `windowSize`. Must be a positive
+   * integer when present.
+   */
+  windowSize?: number;
+  /**
+   * The p99 SLO in milliseconds a new opt-in subscriber falls back to
+   * when it omits `p99ThresholdMs`. Must be a positive finite number
+   * when present.
+   */
+  p99ThresholdMs?: number;
+}
+
+/**
  * One phase's windowed p50/p99 summary, for SLO-miss attribution (EB-133).
  */
 export interface SloPhaseSummary {

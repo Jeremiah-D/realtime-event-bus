@@ -532,6 +532,7 @@ export type {
 export type {
   DeliveryLatencyOptions,
   DeliveryLatencySummaryStats,
+  LatencySloDefaultOptions,
   LatencySloMissEvent,
   ProcessingLatencySloOptions,
 } from './latency.ts';
@@ -2245,7 +2246,12 @@ export interface SubscribeOptions {
    * `eventbus_subscriber_processing_latency_p99{subscriber,pattern}`.
    * `p99ThresholdMs` is required and must be a positive finite number;
    * invalid values throw `RangeError` from `subscribe` (`TypeError` for a
-   * non-function `onLatencySloMiss`). Disabled by default.
+   * non-function `onLatencySloMiss`). A live bus default installed via
+   * `setDefaultLatencySlo` (EB-493) fills in an omitted `windowSize` or
+   * `p99ThresholdMs` — `{}` opts in and takes the default threshold and
+   * window — and an explicit value always wins; the default never
+   * enables SLO observation on its own, and it carries no callback:
+   * `onLatencySloMiss` stays the subscriber's own. Disabled by default.
    */
   latencySlo?: ProcessingLatencySloOptions;
   /**
@@ -11895,20 +11901,29 @@ interface SubscriberSloPhaseState {
  * or an invalid window size; throws `TypeError` for a non-function
  * `onLatencySloMiss`. Unlike `ackSloMs`, the threshold has no default —
  * an SLO with no threshold could never fire, so omitting it is a
- * configuration error, not a silent opt-out.
+ * configuration error, not a silent opt-out — unless the live bus
+ * default installed via `setDefaultLatencySlo` (EB-493) covers it:
+ * the default is the terminal fallback below an explicit field, so
+ * `{}` opts a subscriber in when the default carries a threshold
+ * (and still throws without one), a partial object falls back field
+ * by field, and an explicit value always wins. The default never
+ * satisfies the opt-in gate — it only fills fields of a subscriber
+ * that already opted in — and it carries no callback: `onLatencySloMiss`
+ * always comes from the subscriber's own options.
  */
 function resolveLatencySloOptions(
   opt: ProcessingLatencySloOptions | undefined,
+  defaults?: LatencySloDefaultOptions,
 ): SubscriberLatencySloState | undefined {
   if (opt == null) return undefined;
   if (typeof opt !== 'object') {
     throw new TypeError('latencySlo must be an options object');
   }
-  const windowSize = opt.windowSize ?? 1024;
+  const windowSize = opt.windowSize ?? defaults?.windowSize ?? 1024;
   if (!Number.isInteger(windowSize) || windowSize <= 0) {
     throw new RangeError('latencySlo.windowSize must be a positive integer');
   }
-  const thresholdMs = opt.p99ThresholdMs;
+  const thresholdMs = opt.p99ThresholdMs ?? defaults?.p99ThresholdMs;
   if (!Number.isFinite(thresholdMs) || thresholdMs <= 0) {
     throw new RangeError(
       'latencySlo.p99ThresholdMs must be a positive finite number of milliseconds',
@@ -18000,6 +18015,19 @@ export class EventBus {
    * `ackLatency` is untouched by it.
    */
   private defaultAckLatency?: AckLatencyOptions;
+  /**
+   * Bus-level terminal processing-latency SLO default (EB-493): the
+   * `windowSize` / `p99ThresholdMs` a new subscriber falls back to
+   * when it opts into `latencySlo` but omits a field. Starts unset
+   * (`undefined` — no default, omitting `p99ThresholdMs` still throws,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultLatencySlo`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables SLO observation: a subscriber that does not opt into
+   * `latencySlo` is untouched by it, and it carries no callback —
+   * `onLatencySloMiss` stays the subscriber's own.
+   */
+  private defaultLatencySlo?: LatencySloDefaultOptions;
   /**
    * Bus-level terminal backpressure-throttle default (EB-488): the
    * `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec` a new
@@ -33918,15 +33946,24 @@ export class EventBus {
       this.defaultAckLatency,
     );
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const latencySlo = resolveLatencySloOptions(opts?.latencySlo);
+    // half-registered subscriber behind. EB-493: a subscriber that
+    // opts into `latencySlo` but omits a field falls back to the live
+    // bus default, if one is installed — the bus default sits between
+    // the explicit option and the documented behavior (`{}` opts in
+    // when the default carries a threshold, and still throws without
+    // one). An explicit value always wins, and the default never
+    // enables SLO observation on its own: a subscriber that passes
+    // no `latencySlo` is untouched, and it carries no callback.
+    const latencySlo = resolveLatencySloOptions(opts?.latencySlo, this.defaultLatencySlo);
     // SLO-miss phase attribution (EB-133): armed only when the subscriber
     // tracks a processing-latency SLO *and* the bus enabled attribution.
     // The phase windows mirror the SLO window size so the attribution
-    // covers the same history the miss was evaluated against.
+    // covers the same history the miss was evaluated against — read
+    // from the resolved tracker, so a window taken from the bus
+    // default (EB-493) is mirrored exactly like an explicit one.
     const sloPhase =
       latencySlo !== undefined && this.processingLatencySloAlert
-        ? resolveSloPhaseState(opts?.latencySlo?.windowSize ?? 1024)
+        ? resolveSloPhaseState(latencySlo.tracker.windowSizeLimit())
         : undefined;
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -50156,6 +50193,136 @@ export class EventBus {
    */
   getDefaultAckLatency(): AckLatencyOptions | undefined {
     return this.defaultAckLatency === undefined ? undefined : { ...this.defaultAckLatency };
+  }
+
+  /**
+   * Sets the live bus-level default processing-latency SLO (EB-493)
+   * without re-subscribing anyone:
+   * `setDefaultLatencySlo(opts, actor = 'system')` decides the
+   * `windowSize` / `p99ThresholdMs` for future subscribers that opt
+   * into `latencySlo` but omit a field (see `LatencySloDefaultOptions`)
+   * — `{ p99ThresholdMs: 50 }` to give every new opt-in SLO tracker a
+   * 50ms p99 threshold with one call, `null` to clear the default back
+   * to no default (new opt-in subscribers go back to the threshold
+   * being required).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > documented behavior (window
+   * 1024, threshold required) — the bus default is the terminal
+   * fallback below the explicit option, resolved field by field: an
+   * explicit `p99ThresholdMs` still takes the default `windowSize`,
+   * and vice versa. `{}` opts a subscriber in and takes the default
+   * threshold and window — but only when the default carries a
+   * threshold; without one, `{}` still throws, exactly the previous
+   * behavior. A subscriber that took the default at subscribe time
+   * keeps the threshold, the window, and the samples it was baked
+   * with: a later revision never moves an already-subscribed SLO, and
+   * `setLatencySloThreshold` / `setLatencySloWindowSize` still revise
+   * such a subscriber one at a time without touching the bus default
+   * — their revisions still take the live values for omitted fields,
+   * and their `null` forms still clear the whole subscriber back to
+   * no SLO observation without the default re-applying. The default
+   * never enables SLO observation: a subscriber that does not opt
+   * into `latencySlo` is untouched by it, exactly as the rate-limit
+   * default never enables rate limiting (EB-487). The default
+   * carries no callback: `onLatencySloMiss` stays the subscriber's
+   * own — a subscriber that takes the default threshold fires only
+   * the callback it passed itself (or none, when it passed none).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-integer / <= 0 `windowSize`, or a non-finite /
+   * <= 0 `p99ThresholdMs` throws `RangeError` with the live default
+   * and the audit log untouched. `{}` is accepted and installs no
+   * field coverage (equivalent to unset). A revision identical to
+   * the current default (including clearing an already-unset
+   * default) is a no-op with no audit — fields are compared one by
+   * one, with `undefined` counting as missing. Audited as
+   * `default_latency_slo_revised`
+   * (`{ previous, latencySlo }`, `null` when the default is unset —
+   * unset means new opt-in subscribers go back to the threshold
+   * being required, exactly the previous behavior).
+   *
+   * Orthogonal to EB-290 (that revises one subscriber's threshold at
+   * a time — this sets the default a new opt-in subscriber's omitted
+   * threshold falls back to), to EB-368 (that revises one
+   * subscriber's window at a time — this sets the default window),
+   * to EB-437 (that revises one subscriber's miss callback — this
+   * default never carries one), and to EB-491/EB-492 (that set the
+   * delivery- and ack-latency window defaults — the sister items on
+   * the queue-dwell and accepted→ack sides).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), a non-integer / <= 0 `windowSize`,
+   * or a non-finite / <= 0 `p99ThresholdMs`.
+   */
+  setDefaultLatencySlo(opts: LatencySloDefaultOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultLatencySlo');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultLatencySlo: latencySlo must be an object with windowSize and/or p99ThresholdMs, or null to clear it',
+      );
+    }
+    const windowSize = opts?.windowSize;
+    const p99ThresholdMs = opts?.p99ThresholdMs;
+    if (windowSize !== undefined && (!Number.isInteger(windowSize) || windowSize <= 0)) {
+      throw new RangeError('latencySlo.windowSize must be a positive integer');
+    }
+    if (
+      p99ThresholdMs !== undefined &&
+      (!Number.isFinite(p99ThresholdMs) || p99ThresholdMs <= 0)
+    ) {
+      throw new RangeError(
+        'latencySlo.p99ThresholdMs must be a positive finite number of milliseconds',
+      );
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: LatencySloDefaultOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(windowSize !== undefined ? { windowSize } : {}),
+            ...(p99ThresholdMs !== undefined ? { p99ThresholdMs } : {}),
+          };
+    const previous: LatencySloDefaultOptions | null =
+      this.defaultLatencySlo === undefined ? null : { ...this.defaultLatencySlo };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.windowSize ?? undefined) === (next?.windowSize ?? undefined) &&
+      (previous?.p99ThresholdMs ?? undefined) === (next?.p99ThresholdMs ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultLatencySlo = next;
+    this.auditSubscription({
+      action: 'default_latency_slo_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        latencySlo: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default processing-latency SLO
+   * (EB-493) — the `LatencySloDefaultOptions` future opt-in
+   * subscribers fall back to when they omit a field — `undefined`
+   * before any revision (no default, new opt-in subscribers must
+   * still pass `p99ThresholdMs`), then whatever
+   * `setDefaultLatencySlo` last installed. Returns a copy, so
+   * mutating the result never moves the live default.
+   */
+  getDefaultLatencySlo(): LatencySloDefaultOptions | undefined {
+    return this.defaultLatencySlo === undefined ? undefined : { ...this.defaultLatencySlo };
   }
 
   /**

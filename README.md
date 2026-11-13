@@ -3190,7 +3190,28 @@ library.
   callback (same reference, including clearing a never-set callback) is a no-op with no audit. Every
   success is audited as `latency_slo_miss_callback_revised`
   (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }`). (Real-time systems: latency SLO
-  governance.) Disabled by default.
+  governance.) Disabled by default. Bus-level default threshold and
+  window (EB-493, via `setDefaultLatencySlo(opts | null, actor =
+  'system')` + `getDefaultLatencySlo()`): the `windowSize` /
+  `p99ThresholdMs` future opt-in subscribers fall back to when they
+  omit a field — `{ p99ThresholdMs: 50 }` to give every new opt-in SLO
+  tracker a 50ms p99 threshold with one call, `null` to clear back to
+  no default. The resolution chain is subscriber-explicit > bus
+  default > documented behavior (window 1024, threshold required), and
+  `{}` opts a subscriber in and takes the default threshold and window
+  — but only when the default carries a threshold; without one, `{}`
+  still throws, as before. The default never enables SLO observation:
+  a subscriber that does not opt into `latencySlo` gets no tracker,
+  and it carries no callback — `onLatencySloMiss` stays the
+  subscriber's own, so a subscriber that takes the default threshold
+  fires only the callback it passed itself. The revision only affects
+  subscribers that join after it; an already-subscribed tracker keeps
+  the threshold, window, and samples it was baked with, and
+  `setLatencySloThreshold` / `setLatencySloWindowSize` still retune one
+  subscriber at a time without touching the bus default. Out of the box
+  there is no default (omitting `p99ThresholdMs` still throws, as
+  before); there is no construction-time option, the default never
+  enters a config snapshot, and a restart restores the unset default.
 - **SLO-miss phase attribution** (in `src/bus.ts`, opt-in via
   `new EventBus({ processingLatencySloAlert: true })`): when a
   `latencySlo` subscriber's p99 breaches, the miss event carries a
