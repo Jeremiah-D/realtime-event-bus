@@ -3732,13 +3732,19 @@ export interface DeliveryShapingOptions {
 export interface RateLimitOptions {
   /**
    * Maximum deliveries in one sliding window. Must be an integer >= 1.
+   * A live bus default installed via `setDefaultRateLimit` (EB-487)
+   * fills in an omitted field when one is set — both fields are
+   * required at subscribe time unless the bus default covers the
+   * missing one.
    */
   maxMessages: number;
   /**
    * Width of the sliding window in milliseconds. Must be a positive finite
    * number. A delivery counts against the window for a full `perWindowMs`
    * after it happens — there is no gradual refill, unlike the
-   * `deliveryShaping` token bucket.
+   * `deliveryShaping` token bucket. A live bus default installed via
+   * `setDefaultRateLimit` (EB-487) fills in an omitted field when one
+   * is set.
    */
   perWindowMs: number;
 }
@@ -11038,18 +11044,24 @@ interface RateWindowState {
 /**
  * Validates `SubscribeOptions.rateLimit` and builds the initial
  * per-subscriber rate-limit state. Returns `undefined` when the limit is
- * disabled. Throws `RangeError` for invalid bounds.
+ * disabled. Throws `RangeError` for invalid bounds. EB-487: `defaults`
+ * is the live bus default installed via `setDefaultRateLimit` — it
+ * fills in a field the subscriber omits, field by field, and never
+ * relaxes validation: a field missing from both still throws.
  */
-function resolveRateLimitOptions(opt: RateLimitOptions | undefined): RateWindowState | undefined {
+function resolveRateLimitOptions(
+  opt: RateLimitOptions | undefined,
+  defaults?: RateLimitOptions,
+): RateWindowState | undefined {
   if (opt == null) return undefined;
   if (typeof opt !== 'object') {
     throw new RangeError('rateLimit must be a RateLimitOptions object with maxMessages and perWindowMs');
   }
-  const maxMessages = opt.maxMessages;
+  const maxMessages = opt.maxMessages ?? defaults?.maxMessages;
   if (!Number.isInteger(maxMessages) || maxMessages < 1) {
     throw new RangeError('rateLimit.maxMessages must be an integer >= 1');
   }
-  const perWindowMs = opt.perWindowMs;
+  const perWindowMs = opt.perWindowMs ?? defaults?.perWindowMs;
   if (!Number.isFinite(perWindowMs) || perWindowMs <= 0) {
     throw new RangeError('rateLimit.perWindowMs must be a positive finite number of milliseconds');
   }
@@ -17911,6 +17923,17 @@ export class EventBus {
    * `slowStart` is untouched by it.
    */
   private defaultSlowStart?: SlowStartOptions;
+  /**
+   * Bus-level terminal sliding-window rate-limit default (EB-487):
+   * the `maxMessages` / `perWindowMs` a new subscriber falls back to
+   * when it opts into `rateLimit` but omits a field. Starts unset
+   * (`undefined` — no default, omitting a field still throws, exactly
+   * the previous behavior) and moves only via `setDefaultRateLimit`;
+   * there is no construction-time option, and a restart restores the
+   * unset default. The default never enables rate limiting: a
+   * subscriber that does not opt into `rateLimit` is untouched by it.
+   */
+  private defaultRateLimit?: RateLimitOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33714,8 +33737,13 @@ export class EventBus {
       opts?.maxConcurrentDeliveries ?? this.defaultMaxConcurrentDeliveries ?? maxInflight,
     );
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const rateLimit = resolveRateLimitOptions(opts?.rateLimit);
+    // half-registered subscriber behind. EB-487: a subscriber that
+    // opts into `rateLimit` but omits a field falls back to the live
+    // bus default, if one is installed — the bus default sits between
+    // the explicit option and the required field. An explicit value
+    // always wins, and the default never enables rate limiting on its
+    // own: a subscriber that passes no `rateLimit` is untouched.
+    const rateLimit = resolveRateLimitOptions(opts?.rateLimit, this.defaultRateLimit);
     // Topic-level fair scheduling (EB-135): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const topicFairness = resolveTopicFairnessOptions(opts?.topicFairness, 'subscribe');
@@ -49657,6 +49685,125 @@ export class EventBus {
    */
   getDefaultSlowStart(): SlowStartOptions | undefined {
     return this.defaultSlowStart === undefined ? undefined : { ...this.defaultSlowStart };
+  }
+
+  /**
+   * Sets the live bus-level default sliding-window rate limit (EB-487)
+   * without re-subscribing anyone:
+   * `setDefaultRateLimit(opts, actor = 'system')` decides the
+   * `maxMessages` / `perWindowMs` for future subscribers that opt
+   * into `rateLimit` but omit a field (see `RateLimitOptions`) —
+   * `{ maxMessages: 2, perWindowMs: 1000 }` to cap every new opt-in
+   * subscriber at 2 deliveries per rolling second, `null` to clear
+   * the default back to no default (new opt-in subscribers go back
+   * to both fields required).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > required (there is no
+   * documented fallback — without a default covering a missing field
+   * the subscribe still throws) — the bus default is the terminal
+   * fallback below the explicit option, resolved field by field: an
+   * explicit `maxMessages` still takes the default `perWindowMs`,
+   * and vice versa. `{}` opts a subscriber in and takes both default
+   * fields. A subscriber that took the default at subscribe time
+   * keeps the window bounds and counts it was baked with and its
+   * armed re-flush timer: a later revision never moves an
+   * already-subscribed window, and `setRateLimit` still revises such
+   * a subscriber one at a time without touching the bus default —
+   * its revision still requires a complete object, and its `null`
+   * still clears the whole subscriber back to unlimited without the
+   * default re-applying. The default never enables rate limiting: a
+   * subscriber that does not opt into `rateLimit` is untouched by
+   * it, exactly as the slow-start default never enables slow-start
+   * (EB-486).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-integer / < 1 `maxMessages` or a non-finite /
+   * <= 0 `perWindowMs` throws `RangeError` with the live default
+   * and the audit log untouched. `{}` is accepted and installs no
+   * field coverage (equivalent to unset). A revision identical to
+   * the current default (including clearing an already-unset
+   * default) is a no-op with no audit — fields are compared one by
+   * one, with `undefined` counting as missing. Audited as
+   * `default_rate_limit_revised`
+   * (`{ previous, rateLimit }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to both
+   * fields required, exactly the previous behavior).
+   *
+   * Orthogonal to EB-271 (that revises one subscriber's ceiling at a
+   * time — this sets the default a new opt-in subscriber's omitted
+   * fields fall back to), to EB-484 (that sets the delivery-shaping
+   * default — the same "default never enables an opt-in capability"
+   * shape, resolved field by field), and to EB-486 (that sets the
+   * slow-start default).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or a non-integer / < 1
+   * `maxMessages` or a non-finite / <= 0 `perWindowMs`.
+   */
+  setDefaultRateLimit(opts: RateLimitOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultRateLimit');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultRateLimit: rateLimit must be an object with maxMessages and/or perWindowMs, or null to clear it',
+      );
+    }
+    const maxMessages = opts?.maxMessages;
+    const perWindowMs = opts?.perWindowMs;
+    if (maxMessages !== undefined && (!Number.isInteger(maxMessages) || maxMessages < 1)) {
+      throw new RangeError('rateLimit.maxMessages must be an integer >= 1');
+    }
+    if (perWindowMs !== undefined && (!Number.isFinite(perWindowMs) || perWindowMs <= 0)) {
+      throw new RangeError('rateLimit.perWindowMs must be a positive finite number of milliseconds');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: RateLimitOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(maxMessages !== undefined ? { maxMessages } : {}),
+            ...(perWindowMs !== undefined ? { perWindowMs } : {}),
+          };
+    const previous: RateLimitOptions | null =
+      this.defaultRateLimit === undefined ? null : { ...this.defaultRateLimit };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.maxMessages ?? undefined) === (next?.maxMessages ?? undefined) &&
+      (previous?.perWindowMs ?? undefined) === (next?.perWindowMs ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultRateLimit = next;
+    this.auditSubscription({
+      action: 'default_rate_limit_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        rateLimit: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default sliding-window rate limit
+   * (EB-487) — the `RateLimitOptions` future opt-in subscribers fall
+   * back to when they omit a field — `undefined` before any revision
+   * (no default, new opt-in subscribers must still pass both
+   * fields), then whatever `setDefaultRateLimit` last installed.
+   * Returns a copy, so mutating the result never moves the live
+   * default.
+   */
+  getDefaultRateLimit(): RateLimitOptions | undefined {
+    return this.defaultRateLimit === undefined ? undefined : { ...this.defaultRateLimit };
   }
 
   /**

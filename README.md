@@ -2828,6 +2828,27 @@ library.
   `rate_limit_revised` (`{ rateLimit: { maxMessages, perWindowMs } |
   null, oldRateLimit: { maxMessages, perWindowMs } }`). (Real-time
   systems: delivery governance.)
+  Bus-level default (EB-487, via
+  `setDefaultRateLimit(opts | null, actor = 'system')`): the
+  `maxMessages` / `perWindowMs` a new subscriber falls back to when
+  it opts into `rateLimit` but omits a field — the priority chain is
+  subscriber-explicit > bus default > required (no documented
+  fallback), so `setDefaultRateLimit({ maxMessages: 2,
+  perWindowMs: 1000 })` caps every later opt-in subscriber at 2
+  deliveries per rolling second unless it sets its own fields, and
+  `{}` opts in and takes both default fields, while `null` clears
+  the default back to both fields required. The default never
+  enables rate limiting: a subscriber that does not opt into
+  `rateLimit` is untouched by it, and a revision never moves an
+  already-subscribed window's bounds or counts or its armed re-flush
+  timer. `setRateLimit` keeps its own semantics — a revision still
+  requires a complete object, `null` still clears to unlimited
+  without the default re-applying, and a revision after a clear is
+  still refused. Every success is audited as
+  `default_rate_limit_revised`
+  (`{ previous, rateLimit }`, `null` when the default is unset).
+  There is no construction-time option and the revision is
+  live-only.
   Disabled by default.
 - **Per-subscriber max in-flight deliveries** (in `src/bus.ts`, opt-in via
   `subscribe(..., { maxInflight: N })`): caps how many handler invocations
