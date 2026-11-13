@@ -7849,7 +7849,15 @@ bus.publish('orders.eu', quote); // this one: the 30s topic rule
   cap; a revision identical to the current cap is a no-op with no
   audit, audited as `subscriber_ttl_revised`); a revision governs
   only messages enqueued after it — already-queued messages keep the
-  deadline they were admitted with.
+  deadline they were admitted with. Bus-level default (EB-481, via
+  `setDefaultSubscriberTtlMs(ms | null)`): future subscribers that
+  omit `subscriberTtlMs` take the live bus default instead of running
+  uncapped — `null` clears it back to unset. An explicit value always
+  wins, a subscriber keeps the cap it was baked with (a later revision
+  never moves a live cap), and `setSubscriberTtl(subId, null)` clears
+  to the bus default in effect at revision time. Audited as
+  `default_subscriber_ttl_ms_revised` (`{ previous, subscriberTtlMs }`,
+  `null` when unset).
 
 Semantics:
 

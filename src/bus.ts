@@ -1792,7 +1792,10 @@ export interface SubscribeOptions {
    * `expiringSoon` (EB-110) judges the capped deadline. Revisable
    * live via `setSubscriberTtl` — a revision governs only messages
    * enqueued after it; already-queued messages keep the deadline
-   * they were admitted with. Must be a positive integer when given
+   * they were admitted with. When omitted, a bus-level default
+   * installed via `setDefaultSubscriberTtlMs` (EB-481) applies
+   * instead; with no default installed the subscriber has no cap.
+   * Must be a positive integer when given
    * — anything else throws `RangeError` at subscribe time.
    */
   subscriberTtlMs?: number;
@@ -17822,6 +17825,15 @@ export class EventBus {
    */
   private defaultAckSloMs?: number;
   /**
+   * Bus-level terminal per-subscriber message TTL cap default (EB-481):
+   * the `subscriberTtlMs` a new subscriber falls back to when it omits
+   * its own (EB-480). Starts unset (`undefined` — no default, omitting
+   * `subscriberTtlMs` means no cap, exactly the previous behavior) and
+   * moves only via `setDefaultSubscriberTtlMs`; there is no
+   * construction-time option, and a restart restores the unset default.
+   */
+  private defaultSubscriberTtlMs?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33478,8 +33490,15 @@ export class EventBus {
     }
     // Per-subscriber message TTL cap (EB-480): validated before
     // anything registers, so a throw leaves no half-registered
-    // subscriber behind.
-    const subscriberTtlMs = opts?.subscriberTtlMs;
+    // subscriber behind. EB-481: a subscriber that omits
+    // subscriberTtlMs falls back to the live bus default, if one
+    // is installed — the bus default is the terminal fallback,
+    // below the explicit option. An explicit value always wins.
+    // Only `undefined` means "omitted": an explicit `null` is still
+    // illegal and throws below (EB-480), so the fallback must not
+    // use `??`, which would swallow it.
+    const subscriberTtlMs =
+      opts?.subscriberTtlMs === undefined ? this.defaultSubscriberTtlMs : opts?.subscriberTtlMs;
     if (
       subscriberTtlMs !== undefined &&
       (!Number.isInteger(subscriberTtlMs) || subscriberTtlMs <= 0)
@@ -41442,7 +41461,9 @@ export class EventBus {
    * Revises one subscriber's per-subscriber message TTL cap (EB-480)
    * without re-subscribing: `setSubscriberTtl(subId, ms)` installs
    * the longest a message may sit in that subscriber's queue, and
-   * `setSubscriberTtl(subId, null)` clears it back to no cap.
+   * `setSubscriberTtl(subId, null)` clears it back to the bus
+   * default in effect at revision time (`defaultSubscriberTtlMs`,
+   * EB-481 — no cap when unset).
    *
    * Only the cap moves: `enqueueMessage` reads the live field on
    * every admission, so the new cap governs from the next enqueue —
@@ -41468,7 +41489,8 @@ export class EventBus {
    * already-unset cap) is a no-op with no audit. Audited as
    * `subscriber_ttl_revised` (`{ ttl_ms: <number> | null,
    * previous_ttl_ms: <number> | null }`, `null` meaning the cap was
-   * cleared back to no cap). The cap is live-only — it never enters
+   * cleared back to the bus default — no cap when the default is
+   * unset). The cap is live-only — it never enters
    * a config snapshot and a restart restores the subscribe-time cap.
    *
    * Orthogonal to `setTopicTtl` / `setDefaultTtlMs` (those set the
@@ -41500,7 +41522,10 @@ export class EventBus {
       throw new RangeError('setSubscriberTtl: ms must be a positive integer number of milliseconds, or null to clear it');
     }
     const previousTtlMs = subscriber.subscriberTtlMs;
-    const nextTtlMs = ms === null ? undefined : ms;
+    // EB-481: `null` clears back to the bus default in effect at
+    // revision time — no cap when the default is unset, exactly the
+    // previous behavior.
+    const nextTtlMs = ms === null ? this.defaultSubscriberTtlMs : ms;
     // Re-affirming the current cap is a no-op: no swap, no audit —
     // including clearing an already-unset cap.
     if (previousTtlMs === nextTtlMs) {
@@ -48955,6 +48980,87 @@ export class EventBus {
    */
   getDefaultAckSloMs(): number | undefined {
     return this.defaultAckSloMs;
+  }
+
+  /**
+   * Sets the live bus-level terminal per-subscriber message TTL cap
+   * default (EB-481) without re-subscribing anyone:
+   * `setDefaultSubscriberTtlMs(ms, actor = 'system')` decides the
+   * `subscriberTtlMs` for future subscribers that omit their own
+   * (see `SubscribeOptions.subscriberTtlMs`, EB-480) — `5000` to cap
+   * every new subscriber's queue life at five seconds with one call,
+   * `null` to clear the default back to no default (new subscribers
+   * run uncapped again).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > no cap (the bus default is
+   * the terminal fallback below the explicit option — there is
+   * nothing below it but no cap). A subscriber that took the default
+   * at subscribe time keeps the cap it was baked with and its
+   * already-queued messages keep the deadline they were admitted
+   * with: a later revision never moves an already-subscribed cap,
+   * and `setSubscriberTtl` still revises such a subscriber one at a
+   * time without touching the bus default, while
+   * `setSubscriberTtl(subId, null)` now clears to the bus default in
+   * effect at revision time (no cap when unset).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default (including clearing an already-unset
+   * default) is a no-op with no audit. Audited as
+   * `default_subscriber_ttl_ms_revised` (`{ previous,
+   * subscriberTtlMs }`, `null` when the default is unset — unset
+   * means new subscribers run uncapped, exactly the previous
+   * behavior).
+   *
+   * Orthogonal to EB-480 (that is the per-subscriber cap mechanism
+   * itself — this its missing bus-level terminal default), to
+   * `setTopicTtl` / `setDefaultTtlMs` (those set the deadlines the
+   * cap shortens, this shortens them per subscriber by default),
+   * and to EB-110/EB-288 (those only observe the deadline, this
+   * moves it).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer number of milliseconds (or `null` to clear).
+   */
+  setDefaultSubscriberTtlMs(ms: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultSubscriberTtlMs');
+    if (ms !== null && (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0)) {
+      throw new RangeError(
+        'setDefaultSubscriberTtlMs: subscriberTtlMs must be a positive integer number of milliseconds, or null to clear it',
+      );
+    }
+    const previous = this.defaultSubscriberTtlMs ?? null;
+    const next = ms ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === ms) {
+      return;
+    }
+    this.defaultSubscriberTtlMs = next;
+    this.auditSubscription({
+      action: 'default_subscriber_ttl_ms_revised',
+      actor,
+      detail: { previous, subscriberTtlMs: ms },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal per-subscriber message TTL
+   * cap default (EB-481) — the `subscriberTtlMs` future subscribers
+   * fall back to when they omit their own — `undefined` before any
+   * revision (no default, new subscribers run uncapped),
+   * then whatever `setDefaultSubscriberTtlMs` last installed.
+   */
+  getDefaultSubscriberTtlMs(): number | undefined {
+    return this.defaultSubscriberTtlMs;
   }
 
   /**
