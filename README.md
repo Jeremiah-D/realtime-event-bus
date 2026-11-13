@@ -2998,6 +2998,21 @@ library.
   `delivery_latency_revised`
   (`{ deliveryLatency: { windowSize } | null, oldDeliveryLatency:
   { windowSize } }`). Disabled by default.
+  Bus-level default window (EB-491, via
+  `setDefaultDeliveryLatency(opts | null, actor = 'system')` +
+  `getDefaultDeliveryLatency()`): the `windowSize` future opt-in
+  subscribers fall back to when they omit it — `{ windowSize: 3 }` to
+  cap every new sampler's window at 3 with one call, `null` to clear
+  back to no default. The resolution chain is subscriber-explicit >
+  bus default > 1024, and the default never enables sampling: a
+  subscriber that does not opt into `deliveryLatency` gets no tracker.
+  The revision only affects subscribers that join after it; an
+  already-subscribed sampler keeps the window it was baked with and
+  its recorded samples, and `setDeliveryLatency` still retunes one
+  sampler at a time without touching the bus default. Out of the box
+  there is no default (omitting `windowSize` means 1024, as before);
+  there is no construction-time option, the default never enters a
+  config snapshot, and a restart restores the unset default.
 - **t-digest quantile sketch** (in `src/tdigest.ts`, `TDigest`, EB-199):
   zero-dependency streaming quantile estimator for high-cardinality
   latency measurement. Where `DeliveryLatencyTracker` keeps an exact

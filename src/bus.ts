@@ -2161,7 +2161,11 @@ export interface SubscribeOptions {
    *
    * Pass `true` for the defaults (1024-sample rolling window per
    * subscriber), or a `DeliveryLatencyOptions` object to tune the window.
-   * Invalid values throw `RangeError` from `subscribe`.
+   * A live bus default installed via `setDefaultDeliveryLatency`
+   * (EB-491) fills in an omitted `windowSize` — `true` takes the whole
+   * default — and an explicit value always wins; the default never
+   * enables sampling on its own. Invalid values throw `RangeError` from
+   * `subscribe`.
    */
   deliveryLatency?: boolean | DeliveryLatencyOptions;
   /**
@@ -11700,14 +11704,20 @@ interface SubscriberLatencyState {
 /**
  * Validates `SubscribeOptions.deliveryLatency` and builds the initial
  * per-subscriber sampling state. Returns `undefined` when sampling is
- * disabled. Throws `RangeError` for an invalid window size.
+ * disabled. The live bus default installed via
+ * `setDefaultDeliveryLatency` (EB-491) is the terminal fallback below
+ * an explicit `windowSize` — `true` takes the whole default and a
+ * partial object falls back field by field — but it never satisfies
+ * the opt-in gate, which reads only the subscriber's explicit value.
+ * Throws `RangeError` for an invalid window size.
  */
 function resolveDeliveryLatencyOptions(
   opt: boolean | DeliveryLatencyOptions | undefined,
+  defaults?: DeliveryLatencyOptions,
 ): SubscriberLatencyState | undefined {
   if (opt == null || opt === false) return undefined;
-  const o: DeliveryLatencyOptions = opt === true ? {} : opt;
-  const windowSize = o.windowSize ?? 1024;
+  const o: DeliveryLatencyOptions = opt === true ? { ...defaults } : opt;
+  const windowSize = o.windowSize ?? defaults?.windowSize ?? 1024;
   if (!Number.isInteger(windowSize) || windowSize <= 0) {
     throw new RangeError('deliveryLatency.windowSize must be a positive integer');
   }
@@ -17955,6 +17965,18 @@ export class EventBus {
    * subscriber that does not opt into `rateLimit` is untouched by it.
    */
   private defaultRateLimit?: RateLimitOptions;
+  /**
+   * Bus-level terminal delivery-latency window default (EB-491): the
+   * `windowSize` a new subscriber falls back to when it opts into
+   * `deliveryLatency` but omits the field. Starts unset
+   * (`undefined` — no default, omitting the field still means 1024,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultDeliveryLatency`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables sampling: a subscriber that does not opt into
+   * `deliveryLatency` is untouched by it.
+   */
+  private defaultDeliveryLatency?: DeliveryLatencyOptions;
   /**
    * Bus-level terminal backpressure-throttle default (EB-488): the
    * `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec` a new
@@ -33840,8 +33862,17 @@ export class EventBus {
       'subscribe',
     );
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
+    // half-registered subscriber behind. EB-491: a subscriber that
+    // opts into `deliveryLatency` but omits `windowSize` falls back to
+    // the live bus default, if one is installed — the bus default sits
+    // between the explicit option and the documented 1024. An explicit
+    // value always wins, `true` takes the whole default, and the
+    // default never enables sampling on its own: a subscriber that
+    // passes no `deliveryLatency` is untouched.
+    const deliveryLatency = resolveDeliveryLatencyOptions(
+      opts?.deliveryLatency,
+      this.defaultDeliveryLatency,
+    );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const ackLatency = resolveAckLatencyOptions(
@@ -49893,6 +49924,106 @@ export class EventBus {
    */
   getDefaultRateLimit(): RateLimitOptions | undefined {
     return this.defaultRateLimit === undefined ? undefined : { ...this.defaultRateLimit };
+  }
+
+  /**
+   * Sets the live bus-level default delivery-latency sampling window
+   * (EB-491) without re-subscribing anyone:
+   * `setDefaultDeliveryLatency(opts, actor = 'system')` decides the
+   * `windowSize` for future subscribers that opt into
+   * `deliveryLatency` but omit the field (see `DeliveryLatencyOptions`)
+   * — `{ windowSize: 3 }` to cap every new opt-in sampler's window at
+   * 3 samples with one call, `null` to clear the default back to no
+   * default (new opt-in subscribers go back to the documented 1024).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 1024 — the bus default is the
+   * terminal fallback below the explicit option: an explicit
+   * `windowSize` still wins, `true` takes the whole default, and `{}`
+   * opts a subscriber in and takes the default window. A subscriber
+   * that took the default at subscribe time keeps the window and the
+   * samples it was baked with: a later revision never moves an
+   * already-subscribed window, and `setDeliveryLatency` still revises
+   * such a subscriber one at a time without touching the bus default
+   * — its revision still takes the live window for an omitted field,
+   * and its `null` still clears the whole subscriber back to no
+   * sampling without the default re-applying. The default never
+   * enables sampling: a subscriber that does not opt into
+   * `deliveryLatency` is untouched by it, exactly as the rate-limit
+   * default never enables rate limiting (EB-487).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-integer / <= 0 `windowSize` throws `RangeError`
+   * with the live default and the audit log untouched. `{}` is
+   * accepted and installs no field coverage (equivalent to unset). A
+   * revision identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — the single
+   * field is compared with `undefined` counting as missing. Audited
+   * as `default_delivery_latency_revised`
+   * (`{ previous, deliveryLatency }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to the
+   * documented 1024, exactly the previous behavior).
+   *
+   * Orthogonal to EB-276 (that revises one subscriber's window at a
+   * time — this sets the default a new opt-in subscriber's omitted
+   * field falls back to), to EB-487 (that sets the rate-limit
+   * default — the same "default never enables an opt-in capability"
+   * shape), and to EB-492 (that sets the ack-latency window default
+   * — the sister item on the accepted→ack side).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or a non-integer / <= 0 `windowSize`.
+   */
+  setDefaultDeliveryLatency(opts: DeliveryLatencyOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDeliveryLatency');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultDeliveryLatency: deliveryLatency must be an object with windowSize, or null to clear it',
+      );
+    }
+    const windowSize = opts?.windowSize;
+    if (windowSize !== undefined && (!Number.isInteger(windowSize) || windowSize <= 0)) {
+      throw new RangeError('deliveryLatency.windowSize must be a positive integer');
+    }
+    // Normalize to the known field only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: DeliveryLatencyOptions | undefined =
+      opts === null ? undefined : { ...(windowSize !== undefined ? { windowSize } : {}) };
+    const previous: DeliveryLatencyOptions | null =
+      this.defaultDeliveryLatency === undefined ? null : { ...this.defaultDeliveryLatency };
+    // Re-affirming the current default is a no-op: no audit.
+    if ((previous?.windowSize ?? undefined) === (next?.windowSize ?? undefined)) {
+      return;
+    }
+    this.defaultDeliveryLatency = next;
+    this.auditSubscription({
+      action: 'default_delivery_latency_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        deliveryLatency: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default delivery-latency sampling
+   * window (EB-491) — the `DeliveryLatencyOptions` future opt-in
+   * subscribers fall back to when they omit `windowSize` —
+   * `undefined` before any revision (no default, new opt-in
+   * subscribers still take the documented 1024), then whatever
+   * `setDefaultDeliveryLatency` last installed. Returns a copy, so
+   * mutating the result never moves the live default.
+   */
+  getDefaultDeliveryLatency(): DeliveryLatencyOptions | undefined {
+    return this.defaultDeliveryLatency === undefined ? undefined : { ...this.defaultDeliveryLatency };
   }
 
   /**
