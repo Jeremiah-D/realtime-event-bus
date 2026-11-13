@@ -3658,7 +3658,9 @@ export interface BatchDeliveryOptions {
   /**
    * Maximum messages per handler invocation. The drain collects at most
    * this many queued messages into one batch; a full batch is delivered
-   * immediately. Must be a positive integer. Default 100.
+   * immediately. Must be a positive integer. Default 100 — or the live
+   * bus default installed via `setDefaultBatchMaxSize` (EB-483) when
+   * one is set.
    */
   maxSize?: number;
   /**
@@ -11133,17 +11135,21 @@ interface BatchDeliveryState {
 /**
  * Validates `SubscribeOptions.batch` and builds the initial batch state.
  * Returns `undefined` when batching is disabled. Throws `RangeError` for
- * invalid sizes or waits.
+ * invalid sizes or waits. `defaultMaxSize` is the live bus default
+ * (EB-483): it fills in an omitted `maxSize` for new batch subscribers
+ * only — callers that already merged live values (see `setBatch`) never
+ * reach it, because their object always carries `maxSize`.
  */
 function resolveBatchDeliveryOptions(
   opt: boolean | BatchDeliveryOptions | undefined,
+  defaultMaxSize?: number,
 ): BatchDeliveryState | undefined {
   if (opt == null || opt === false) return undefined;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError('batch must be true or a BatchDeliveryOptions object');
   }
   const o: BatchDeliveryOptions = opt === true ? {} : opt;
-  const maxSize = o.maxSize ?? 100;
+  const maxSize = o.maxSize ?? defaultMaxSize ?? 100;
   if (!Number.isInteger(maxSize) || maxSize <= 0) {
     throw new RangeError('batch.maxSize must be a positive integer');
   }
@@ -17847,6 +17853,17 @@ export class EventBus {
    * unset default.
    */
   private defaultMaxConcurrentDeliveries?: number;
+  /**
+   * Bus-level terminal batch maxSize default (EB-483): the
+   * `maxSize` a new batch subscriber falls back to when it opts into
+   * batching but omits its own `maxSize`. Starts unset (`undefined`
+   * — no default, omitting `maxSize` means 100, exactly the previous
+   * behavior) and moves only via `setDefaultBatchMaxSize`; there is
+   * no construction-time option, and a restart restores the unset
+   * default. The default never enables batching: a subscriber that
+   * does not opt into `batch` is untouched by it.
+   */
+  private defaultBatchMaxSize?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33706,8 +33723,13 @@ export class EventBus {
     const deliveryWindow =
       deliveryWindowOpts === undefined ? undefined : new DeliveryWindowGate(deliveryWindowOpts);
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const batch = resolveBatchDeliveryOptions(opts?.batch);
+    // half-registered subscriber behind. EB-483: a batch subscriber
+    // that omits `maxSize` falls back to the live bus default, if one
+    // is installed — the bus default is the terminal fallback below
+    // the explicit option. An explicit value always wins, and the
+    // default never enables batching: `undefined`/`false` here still
+    // means no batch state at all.
+    const batch = resolveBatchDeliveryOptions(opts?.batch, this.defaultBatchMaxSize);
     // Tumbling-window aggregation (EB-73): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const window = resolveWindowOptions(opts?.window);
@@ -49170,6 +49192,87 @@ export class EventBus {
    */
   getDefaultMaxConcurrentDeliveries(): number | undefined {
     return this.defaultMaxConcurrentDeliveries;
+  }
+
+  /**
+   * Sets the live bus-level terminal batch maxSize default (EB-483)
+   * without re-subscribing anyone:
+   * `setDefaultBatchMaxSize(n, actor = 'system')` decides the
+   * `maxSize` for future subscribers that opt into batching but omit
+   * their own (see `BatchDeliveryOptions.maxSize`) — `3` to deliver
+   * every new batch subscriber's messages three at a time with one
+   * call, `null` to clear the default back to no default (new batch
+   * subscribers go back to 100).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 100 (the bus default is the
+   * terminal fallback below the explicit option). A subscriber that
+   * took the default at subscribe time keeps the size it was baked
+   * with and its pending batch and linger timer: a later revision
+   * never moves an already-subscribed size, and `setBatch` still
+   * revises such a subscriber one at a time without touching the bus
+   * default — its partial revision still takes the live value, and
+   * its `null` still clears the whole subscriber back to one-at-a-time
+   * delivery. The default never enables batching: a subscriber that
+   * does not opt into `batch` is untouched by it, exactly as the ack
+   * SLO default never enables sampling (EB-479).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future batch subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default (including clearing an already-unset
+   * default) is a no-op with no audit. Audited as
+   * `default_batch_max_size_revised` (`{ previous, batchMaxSize }`,
+   * `null` when the default is unset — unset means new batch
+   * subscribers go back to 100, exactly the previous behavior).
+   *
+   * Orthogonal to EB-269 (that revises one subscriber's batch
+   * parameters at a time — this sets the default a new batch
+   * subscriber's omitted `maxSize` falls back to), to EB-470/474
+   * (those set queue-capacity defaults — this sets per-batch
+   * delivery size), and to EB-479 (that sets the ack SLO default —
+   * the same "default never enables an opt-in capability" shape).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer (or `null` to clear).
+   */
+  setDefaultBatchMaxSize(n: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultBatchMaxSize');
+    if (n !== null && (typeof n !== 'number' || !Number.isInteger(n) || n <= 0)) {
+      throw new RangeError(
+        'setDefaultBatchMaxSize: batchMaxSize must be a positive integer, or null to clear it',
+      );
+    }
+    const previous = this.defaultBatchMaxSize ?? null;
+    const next = n ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === n) {
+      return;
+    }
+    this.defaultBatchMaxSize = next;
+    this.auditSubscription({
+      action: 'default_batch_max_size_revised',
+      actor,
+      detail: { previous, batchMaxSize: n },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal batch maxSize default
+   * (EB-483) — the `maxSize` future batch subscribers fall back to
+   * when they opt into batching but omit their own — `undefined`
+   * before any revision (no default, new batch subscribers use 100),
+   * then whatever `setDefaultBatchMaxSize` last installed.
+   */
+  getDefaultBatchMaxSize(): number | undefined {
+    return this.defaultBatchMaxSize;
   }
 
   /**

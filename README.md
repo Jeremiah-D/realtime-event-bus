@@ -3486,7 +3486,16 @@ library.
   a revision after a clear is refused until the subscriber opts in
   again at subscribe time), and every success is audited as
   `batch_revised` (`{ batch: { maxSize, maxWaitMs } | null, oldBatch:
-  { maxSize, maxWaitMs } }`). (Real-time systems: delivery
+  { maxSize, maxWaitMs } }`). Bus-level default (EB-483, via
+  `setDefaultBatchMaxSize(n | null)`): future subscribers that opt into
+  batching (`batch: true` or an object) without an explicit `maxSize`
+  take the live bus default instead of 100 — `null` clears it back to
+  unset. An explicit `maxSize` always wins, a subscriber keeps the size
+  it was baked with (a later revision never moves a live size or a
+  pending batch), and the default never enables batching — a subscriber
+  that does not opt in still receives one message at a time. Audited as
+  `default_batch_max_size_revised` (`{ previous, batchMaxSize }`,
+  `null` when unset). (Real-time systems: delivery
   governance.)
   Disabled by default. `bench/batch.bench.ts` measures the before/after
   throughput — see [Benchmark](#benchmark).
