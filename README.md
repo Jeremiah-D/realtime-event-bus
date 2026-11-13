@@ -1623,6 +1623,27 @@ library.
   `subscriber_degraded_callback_revised` (`{ onDegraded: 'set' |
   'cleared', oldOnDegraded: 'set' | 'absent' }`). (Real-time systems: subscription
   governance.)
+- **Bus-level default** (EB-496, via
+  `setDefaultHealthProbe(opts | null, actor = 'system')` +
+  `getDefaultHealthProbe()`): the `maxConsecutiveFailures` /
+  `processingTimeoutMs` / `autoResumeAfterMs` future opt-in
+  subscribers fall back to when they omit a field — `{ maxConsecutiveFailures: 2 }`
+  to tighten every new probe's failure budget with one call,
+  `{ processingTimeoutMs: 50, autoResumeAfterMs: 1000 }` to arm every
+  new probe's timeout budget and cooldown with one call, `null` to
+  clear back to no default. The resolution chain is
+  subscriber-explicit > bus default > built-in (maxConsecutiveFailures 5,
+  no timeout budget, manual-only resume), and the default never
+  enables probing: a subscriber that does not opt into `healthProbe`
+  gets no probe. The revision only affects subscribers that join
+  after it; an already-subscribed probe keeps the threshold, timeout
+  budget, cooldown, live counter, and degraded flag it was baked
+  with, and `setHealthProbe(subId, null)` still clears a subscriber
+  back to no probing without the default re-applying. Out of the box
+  there is no default (omitting a field means 5 / no timeout budget /
+  manual-only resume, as before); there is no construction-time
+  option, the default never enters a config snapshot, and a restart
+  restores the unset default.
 - **Slow-handler offload** (in `src/bus.ts`, opt-in via
   `subscribe(..., { slowHandler: { thresholdMs } })`, EB-191): the bus times
   every handler invocation with the bus clock — an invocation whose

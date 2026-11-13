@@ -11964,13 +11964,23 @@ function resolveSloPhaseState(windowSize: number): SubscriberSloPhaseState {
  * Validates `SubscribeOptions.healthProbe` and builds the initial
  * per-subscriber probe state. Returns `undefined` when the probe is
  * disabled. Throws `RangeError` for invalid values.
+ *
+ * A live bus default installed via `setDefaultHealthProbe` (EB-496)
+ * may cover an omitted field: the default is the terminal fallback
+ * below an explicit field, resolved field by field — `true` takes
+ * the whole default, `{}` opts in and takes it too, and an explicit
+ * value always wins. The default never satisfies the opt-in gate: it
+ * only fills fields of a subscriber that already opted in. A
+ * default may install `processingTimeoutMs` / `autoResumeAfterMs`,
+ * fields that are opt-in-closed when absent.
  */
 function resolveHealthProbeOptions(
   opt: boolean | HealthProbeOptions | undefined,
+  defaults?: HealthProbeOptions,
 ): Omit<HealthProbeState, 'consecutiveFailures' | 'degraded' | 'autoResumeTimer'> | undefined {
   if (opt == null || opt === false) return undefined;
-  const o: HealthProbeOptions = opt === true ? {} : opt;
-  const maxConsecutiveFailures = o.maxConsecutiveFailures ?? 5;
+  const o: HealthProbeOptions = opt === true ? { ...defaults } : opt;
+  const maxConsecutiveFailures = o.maxConsecutiveFailures ?? defaults?.maxConsecutiveFailures ?? 5;
   if (!Number.isInteger(maxConsecutiveFailures) || maxConsecutiveFailures < 1) {
     throw new RangeError('healthProbe.maxConsecutiveFailures must be a positive integer');
   }
@@ -11983,8 +11993,14 @@ function resolveHealthProbeOptions(
   };
   return {
     maxConsecutiveFailures,
-    processingTimeoutMs: checkPositiveMs('processingTimeoutMs', o.processingTimeoutMs),
-    autoResumeAfterMs: checkPositiveMs('autoResumeAfterMs', o.autoResumeAfterMs),
+    processingTimeoutMs: checkPositiveMs(
+      'processingTimeoutMs',
+      o.processingTimeoutMs ?? defaults?.processingTimeoutMs,
+    ),
+    autoResumeAfterMs: checkPositiveMs(
+      'autoResumeAfterMs',
+      o.autoResumeAfterMs ?? defaults?.autoResumeAfterMs,
+    ),
   };
 }
 
@@ -18092,6 +18108,19 @@ export class EventBus {
    * `lagForecast` is untouched by it.
    */
   private defaultLagForecast?: LagForecastOptions;
+  /**
+   * Bus-level terminal health-probe default (EB-496): the
+   * `maxConsecutiveFailures` / `processingTimeoutMs` /
+   * `autoResumeAfterMs` a new subscriber falls back to when it opts
+   * into `healthProbe` but omits a field. Starts unset (`undefined` —
+   * no default, omitting a field still means 5 / no timeout budget /
+   * manual-only resume, exactly the previous behavior) and moves only
+   * via `setDefaultHealthProbe`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables probing: a subscriber that does not opt into
+   * `healthProbe` is untouched by it.
+   */
+  private defaultHealthProbe?: HealthProbeOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33859,7 +33888,7 @@ export class EventBus {
     const throttle = resolveThrottleOptions(opts?.throttle, capacity, hwmRatio, this.now, this.defaultThrottle);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
-    const healthProbe = resolveHealthProbeOptions(opts?.healthProbe);
+    const healthProbe = resolveHealthProbeOptions(opts?.healthProbe, this.defaultHealthProbe);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const slowHandler = resolveSlowHandlerOptions(opts?.slowHandler);
@@ -51044,6 +51073,158 @@ export class EventBus {
    */
   getDefaultLagForecast(): LagForecastOptions | undefined {
     return this.defaultLagForecast === undefined ? undefined : { ...this.defaultLagForecast };
+  }
+
+  /**
+   * Sets the live bus-level default health probe (EB-496) without
+   * re-subscribing anyone:
+   * `setDefaultHealthProbe(opts, actor = 'system')` decides the
+   * `maxConsecutiveFailures` / `processingTimeoutMs` /
+   * `autoResumeAfterMs` for future subscribers that opt into
+   * `healthProbe` but omit a field (see `HealthProbeOptions`) —
+   * `{ maxConsecutiveFailures: 2 }` to tighten every new opt-in
+   * probe's failure budget with one call, `{ processingTimeoutMs:
+   * 50, autoResumeAfterMs: 1000 }` to arm every new opt-in probe's
+   * timeout budget and cooldown with one call, `null` to clear the
+   * default back to no default (new opt-in subscribers go back to
+   * the documented 5 / no timeout budget / manual-only resume).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > built-in
+   * (maxConsecutiveFailures 5, no timeout budget, manual-only
+   * resume) — the bus default is the terminal fallback below the
+   * explicit option, resolved field by field: an explicit
+   * `maxConsecutiveFailures` still takes the default
+   * `processingTimeoutMs` and `autoResumeAfterMs`, and vice versa.
+   * `true` takes the whole default, and `{}` opts a subscriber in
+   * and takes the whole default too. A subscriber that took the
+   * default at subscribe time keeps the threshold, the timeout
+   * budget, the cooldown, the live counter, and the degraded flag
+   * it was baked with: a later revision never moves an
+   * already-subscribed threshold, timeout, cooldown, counter, or
+   * degraded flag, and `setHealthProbe` still revises such a
+   * subscriber one at a time without touching the bus default — its
+   * revision still takes the live values for omitted fields, and
+   * its `null` still clears the whole subscriber back to no probing
+   * without the default re-applying. The default never enables
+   * probing: a subscriber that does not opt into `healthProbe` is
+   * untouched by it, exactly as the lag-forecast default never
+   * enables forecasting (EB-495).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-integer / < 1 `maxConsecutiveFailures`, or a
+   * non-positive or non-finite `processingTimeoutMs` /
+   * `autoResumeAfterMs` throws `RangeError` with the live default
+   * and the audit log untouched. `{}` is accepted and installs no
+   * field coverage (equivalent to unset). A revision identical to
+   * the current default (including clearing an already-unset
+   * default) is a no-op with no audit — fields are compared one by
+   * one, with `undefined` counting as missing. Audited as
+   * `default_health_probe_revised`
+   * (`{ previous, healthProbe }`, `null` when the default is unset
+   * — unset means new opt-in subscribers go back to the documented
+   * 5 / no timeout budget / manual-only resume, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-18 (that owns the health probing mechanism
+   * itself — this sets the default a new opt-in subscriber's omitted
+   * fields fall back to), to EB-267 (that revises one subscriber's
+   * probe at a time — this sets the bus-level default), to EB-197
+   * (that isolates a repeatedly-failing handler — this trips the
+   * probe's degraded gate), and to EB-491 (that sets the
+   * delivery-latency sampling default — the sister item on the
+   * historical-distribution side).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), a non-integer / < 1
+   * `maxConsecutiveFailures`, or a non-positive or non-finite
+   * `processingTimeoutMs` / `autoResumeAfterMs`.
+   */
+  setDefaultHealthProbe(opts: HealthProbeOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultHealthProbe');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultHealthProbe: healthProbe must be an object with maxConsecutiveFailures and/or processingTimeoutMs and/or autoResumeAfterMs, or null to clear it',
+      );
+    }
+    // Validate through the subscribe-time gate so the bounds are
+    // exactly the subscribe-time ones.
+    if (opts !== null) {
+      try {
+        resolveHealthProbeOptions(opts);
+      } catch (err) {
+        throw new RangeError(`setDefaultHealthProbe: ${(err as Error).message}`);
+      }
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: HealthProbeOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(opts.maxConsecutiveFailures !== undefined
+              ? { maxConsecutiveFailures: opts.maxConsecutiveFailures }
+              : {}),
+            ...(opts.processingTimeoutMs !== undefined
+              ? { processingTimeoutMs: opts.processingTimeoutMs }
+              : {}),
+            ...(opts.autoResumeAfterMs !== undefined
+              ? { autoResumeAfterMs: opts.autoResumeAfterMs }
+              : {}),
+          };
+    const previous: HealthProbeOptions | null =
+      this.defaultHealthProbe === undefined ? null : { ...this.defaultHealthProbe };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.maxConsecutiveFailures ?? undefined) === (next?.maxConsecutiveFailures ?? undefined) &&
+      (previous?.processingTimeoutMs ?? undefined) === (next?.processingTimeoutMs ?? undefined) &&
+      (previous?.autoResumeAfterMs ?? undefined) === (next?.autoResumeAfterMs ?? undefined)
+    ) {
+      return;
+    }
+    const snapshot = (d: HealthProbeOptions | undefined): HealthProbeOptions | null =>
+      d === undefined
+        ? null
+        : {
+            ...(d.maxConsecutiveFailures !== undefined
+              ? { maxConsecutiveFailures: d.maxConsecutiveFailures }
+              : {}),
+            ...(d.processingTimeoutMs !== undefined
+              ? { processingTimeoutMs: d.processingTimeoutMs }
+              : {}),
+            ...(d.autoResumeAfterMs !== undefined ? { autoResumeAfterMs: d.autoResumeAfterMs } : {}),
+          };
+    const detail = {
+      previous: snapshot(this.defaultHealthProbe),
+      healthProbe: snapshot(next),
+    };
+    this.defaultHealthProbe = next;
+    this.auditSubscription({
+      action: 'default_health_probe_revised',
+      actor,
+      detail,
+    });
+  }
+
+  /**
+   * Returns the live bus-level default health probe (EB-496) — the
+   * `HealthProbeOptions` future opt-in subscribers fall back to when
+   * they omit a field — `undefined` before any revision (no default,
+   * new opt-in subscribers still take the documented 5 / no timeout
+   * budget / manual-only resume), then whatever
+   * `setDefaultHealthProbe` last installed. Returns a copy, so
+   * mutating the result never moves the live default.
+   */
+  getDefaultHealthProbe(): HealthProbeOptions | undefined {
+    return this.defaultHealthProbe === undefined ? undefined : { ...this.defaultHealthProbe };
   }
 
   /**
