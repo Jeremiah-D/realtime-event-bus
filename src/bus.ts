@@ -2025,7 +2025,10 @@ export interface SubscribeOptions {
    * is preserved exactly. (When `maxInflight` is set without this option,
    * the concurrency cap defaults to `maxInflight` instead — an explicit
    * parallelism opt-in is never silently neutered by the new default; an
-   * explicit value here always wins.) Set higher to let keyless messages' handlers
+   * explicit value here always wins.) When omitted, a bus-level default
+   * installed via `setDefaultMaxConcurrentDeliveries` (EB-482) applies
+   * instead of the `maxInflight`-derived value; with no default
+   * installed the `maxInflight` fallback (otherwise 1) stands. Set higher to let keyless messages' handlers
    * overlap: a message whose handler is still executing holds its slot
    * until the invocation settles (a returned promise settles it;
    * otherwise the synchronous return does), and the drain holds later
@@ -17834,6 +17837,17 @@ export class EventBus {
    */
   private defaultSubscriberTtlMs?: number;
   /**
+   * Bus-level terminal handler-concurrency default (EB-482): the
+   * `maxConcurrentDeliveries` a new subscriber falls back to when it
+   * omits its own (EB-159). Starts unset (`undefined` — no default,
+   * omitting `maxConcurrentDeliveries` falls back to the
+   * `maxInflight`-derived value, otherwise 1, exactly the previous
+   * behavior) and moves only via `setDefaultMaxConcurrentDeliveries`;
+   * there is no construction-time option, and a restart restores the
+   * unset default.
+   */
+  private defaultMaxConcurrentDeliveries?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33622,9 +33636,12 @@ export class EventBus {
     // EB-159: an explicit maxInflight already opts the subscriber into
     // that level of parallelism, so it doubles as the concurrency default
     // — the new gate never silently neuters an older opt-in. An explicit
-    // maxConcurrentDeliveries always wins.
+    // maxConcurrentDeliveries always wins. EB-482: a live bus default
+    // installed via `setDefaultMaxConcurrentDeliveries` sits between
+    // the explicit option and the maxInflight-derived value — it is
+    // the more specific knob, so it beats the maxInflight fallback.
     const maxConcurrentDeliveries = resolveDeliveryConcurrencyOptions(
-      opts?.maxConcurrentDeliveries ?? maxInflight,
+      opts?.maxConcurrentDeliveries ?? this.defaultMaxConcurrentDeliveries ?? maxInflight,
     );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -40644,7 +40661,9 @@ export class EventBus {
    * ALWAYS armed for every subscription (default 1), so there is no
    * "only-if-already-set" gate — a subscription that never set
    * `maxConcurrentDeliveries` explicitly can still be revised, and
-   * `null` restores the parse-chain default (the current
+   * `null` restores the bus default in effect at revision time
+   * (EB-482 — the live `defaultMaxConcurrentDeliveries` when one is
+   * installed, otherwise the parse-chain default: the current
    * `maxInflight` cap, otherwise 1) rather than clearing the gate.
    *
    * Only `state.max` ever moves, in place: `inFlight` and
@@ -40684,8 +40703,10 @@ export class EventBus {
       throw new RangeError(`setDeliveryConcurrency: unknown subscriber: ${subId}`);
     }
     // Validate before touching anything: `undefined` is not a
-    // restore — only an explicit `null` restores the parse-chain
-    // default — and the bounds are exactly the subscribe-time ones.
+    // restore — only an explicit `null` restores the bus default in
+    // effect at revision time (EB-482), falling back to the
+    // parse-chain default when no bus default is installed — and
+    // the bounds are exactly the subscribe-time ones.
     if ((max as unknown) === undefined) {
       throw new RangeError('setDeliveryConcurrency: maxConcurrentDeliveries must be an integer >= 1, or null to restore the default');
     }
@@ -40693,7 +40714,9 @@ export class EventBus {
     try {
       resolved =
         max === null
-          ? resolveDeliveryConcurrencyOptions(subscriber.maxInflight?.max)
+          ? resolveDeliveryConcurrencyOptions(
+              this.defaultMaxConcurrentDeliveries ?? subscriber.maxInflight?.max,
+            )
           : resolveDeliveryConcurrencyOptions(max);
     } catch (err) {
       throw new RangeError(`setDeliveryConcurrency: ${(err as Error).message}`);
@@ -49061,6 +49084,92 @@ export class EventBus {
    */
   getDefaultSubscriberTtlMs(): number | undefined {
     return this.defaultSubscriberTtlMs;
+  }
+
+  /**
+   * Sets the live bus-level terminal handler-concurrency default
+   * (EB-482) without re-subscribing anyone:
+   * `setDefaultMaxConcurrentDeliveries(max, actor = 'system')`
+   * decides the `maxConcurrentDeliveries` for future subscribers
+   * that omit their own (see
+   * `SubscribeOptions.maxConcurrentDeliveries`, EB-159) — `4` to let
+   * every new subscriber run up to four handler invocations at once
+   * with one call, `null` to clear the default back to no default
+   * (new subscribers fall back to the `maxInflight`-derived value,
+   * otherwise 1, again).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > `maxInflight` (explicit or
+   * default-derived) > 1 — the bus default is the more specific knob
+   * above the `maxInflight` fallback, below the explicit option. A
+   * subscriber that took the default at subscribe time keeps the cap
+   * it was baked with and its live `inFlight` / `keysInFlight`
+   * counts: a later revision never moves an already-subscribed cap,
+   * and `setDeliveryConcurrency` still revises such a subscriber one
+   * at a time without touching the bus default, while
+   * `setDeliveryConcurrency(subId, null)` now restores to the bus
+   * default in effect at revision time (the `maxInflight`-derived
+   * value, otherwise 1, when unset).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than an integer
+   * >= 1 (`null` to clear) throws `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default (including clearing an already-unset
+   * default) is a no-op with no audit. Audited as
+   * `default_max_concurrent_deliveries_revised` (`{ previous,
+   * maxConcurrentDeliveries }`, `null` when the default is unset —
+   * unset means new subscribers fall back to the
+   * `maxInflight`-derived value, otherwise 1, exactly the previous
+   * behavior).
+   *
+   * Orthogonal to EB-159 (that is the concurrency gate mechanism
+   * itself — this its missing bus-level terminal default), to
+   * EB-466 (that is the `maxInflight` default — the window cap this
+   * default sits above in the priority chain), and to EB-277 (that
+   * revises one subscriber at a time — this sets the default the
+   * `null` restore now targets).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * an integer >= 1 (or `null` to clear).
+   */
+  setDefaultMaxConcurrentDeliveries(max: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxConcurrentDeliveries');
+    if (max !== null && (typeof max !== 'number' || !Number.isInteger(max) || max < 1)) {
+      throw new RangeError(
+        'setDefaultMaxConcurrentDeliveries: maxConcurrentDeliveries must be an integer >= 1, or null to clear it',
+      );
+    }
+    const previous = this.defaultMaxConcurrentDeliveries ?? null;
+    const next = max ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === max) {
+      return;
+    }
+    this.defaultMaxConcurrentDeliveries = next;
+    this.auditSubscription({
+      action: 'default_max_concurrent_deliveries_revised',
+      actor,
+      detail: { previous, maxConcurrentDeliveries: max },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal handler-concurrency
+   * default (EB-482) — the `maxConcurrentDeliveries` future
+   * subscribers fall back to when they omit their own — `undefined`
+   * before any revision (no default, new subscribers fall back to
+   * the `maxInflight`-derived value, otherwise 1),
+   * then whatever `setDefaultMaxConcurrentDeliveries` last installed.
+   */
+  getDefaultMaxConcurrentDeliveries(): number | undefined {
+    return this.defaultMaxConcurrentDeliveries;
   }
 
   /**

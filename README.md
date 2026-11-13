@@ -2846,7 +2846,16 @@ library.
   When `maxInflight` is set without this option, the concurrency cap
   defaults to `maxInflight` instead of 1 — an explicit parallelism opt-in
   is never silently neutered by the new default; an explicit value here
-  always wins.
+  always wins. Bus-level default (EB-482, via
+  `setDefaultMaxConcurrentDeliveries(max | null)`): future subscribers
+  that omit `maxConcurrentDeliveries` take the live bus default instead
+  of the `maxInflight`-derived value — `null` clears it back to unset.
+  An explicit value always wins, the bus default beats the `maxInflight`
+  fallback, a subscriber keeps the cap it was baked with (a later
+  revision never moves a live cap), and `setDeliveryConcurrency(subId,
+  null)` now restores to the bus default in effect at revision time.
+  Audited as `default_max_concurrent_deliveries_revised`
+  (`{ previous, maxConcurrentDeliveries }`, `null` when unset).
   Must be an integer >= 1 — anything else throws `RangeError` from
   `subscribe`. Revisable after subscribe (EB-277, via
   `setDeliveryConcurrency(subId, max | null)`): the cap is always armed
