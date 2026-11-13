@@ -9081,6 +9081,27 @@ Semantics:
   `delivery_priority_revised` (`{ deliveryPriority: { weight, label },
   oldDeliveryPriority: { weight, label } }`, with a `null` restore
   recorded as the default). (Real-time systems: delivery governance.)
+- **Bus-level default (EB-490, via
+  `setDefaultDeliveryPriority(priority | null, actor = 'system')`).**
+  The drain priority new subscribers fall back to when they pass no
+  `deliveryPriority` of their own — the priority chain is
+  subscriber-explicit > bus default > `'normal'`, so
+  `setDefaultDeliveryPriority('high')` serves every later plain
+  subscriber before the `'normal'` ones unless it sets its own
+  priority, a positive integer installs a custom weight, and `null`
+  clears the default back to the documented `'normal'`. This is the
+  one bus default with a factory value: a bus that never installed a
+  default already drains new plain subscribers at `'normal'`, so
+  installing `'normal'` changes nothing observable. A revision never
+  moves an already-subscribed subscriber's weight or deficit
+  carryover. `setDeliveryPriority` keeps its own semantics — a
+  revision still takes the live weight for a label-only change, and
+  `null` still restores the documented default without the bus
+  default re-applying. Every success is audited as
+  `default_delivery_priority_revised`
+  (`{ previous, deliveryPriority }`, `null` when the default is
+  unset). There is no construction-time option and the revision is
+  live-only.
 
 ## Multi-pattern aggregate subscriptions (EB-137)
 

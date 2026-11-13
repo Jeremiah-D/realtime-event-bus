@@ -2140,7 +2140,10 @@ export interface SubscribeOptions {
    *
    * Pass `'low' | 'normal' | 'high'` (weights 1 : 2 : 4) or a positive
    * integer weight. Defaults to `'normal'`. Anything else throws
-   * `RangeError` from `subscribe`. `getStats().subscriberPriority`
+   * `RangeError` from `subscribe`. A live bus default installed via
+   * `setDefaultDeliveryPriority` (EB-490) replaces that `'normal'`
+   * for subscribers that pass no priority of their own — an explicit
+   * value always wins. `getStats().subscriberPriority`
    * reports per-class drain-visit counts, and `src/metrics.ts` renders
    * `eventbus_subscriber_priority_dispatch_total{class}`.
    */
@@ -17978,6 +17981,20 @@ export class EventBus {
    */
   private defaultTopicFairness?: TopicFairnessOptions;
   /**
+   * Bus-level terminal delivery-priority default (EB-490): the
+   * drain priority a new subscriber falls back to when it omits its
+   * own `deliveryPriority`. Starts unset (`undefined` — no default,
+   * omitting the priority means `'normal'`, exactly the previous
+   * behavior) and moves only via `setDefaultDeliveryPriority`;
+   * there is no construction-time option, and a restart restores the
+   * unset default. Unlike the other bus defaults this one has a
+   * documented factory value: `'normal'` is the default whether or
+   * not a bus default is installed. The default never changes what
+   * a subscriber that passes its own priority gets: an explicit
+   * value always wins.
+   */
+  private defaultDeliveryPriority?: 'low' | 'normal' | 'high' | number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33809,7 +33826,19 @@ export class EventBus {
     );
     // Subscriber drain priority (EB-166): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
-    const deliveryPriority = resolveDeliveryPriority(opts?.deliveryPriority, 'subscribe');
+    // EB-490: a subscriber that omits `deliveryPriority` falls back
+    // to the live bus default, if one is installed — the bus default
+    // sits between the explicit option and the documented `'normal'`.
+    // An explicit value always wins, and the default only ever moves
+    // subscribers that pass no priority of their own. The fallback
+    // keys on `undefined` only: an explicit `null` is still illegal
+    // at subscribe time and must reach the resolver to throw.
+    const deliveryPriority = resolveDeliveryPriority(
+      opts?.deliveryPriority === undefined
+        ? (this.defaultDeliveryPriority ?? 'normal')
+        : opts.deliveryPriority,
+      'subscribe',
+    );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const deliveryLatency = resolveDeliveryLatencyOptions(opts?.deliveryLatency);
@@ -50131,6 +50160,127 @@ export class EventBus {
     return this.defaultTopicFairness === undefined
       ? undefined
       : { weights: { ...this.defaultTopicFairness.weights } };
+  }
+
+  /**
+   * Sets the live bus-level default delivery priority (EB-490)
+   * without re-subscribing anyone:
+   * `setDefaultDeliveryPriority(priority, actor = 'system')` decides
+   * the drain priority for future subscribers that pass no
+   * `deliveryPriority` of their own (see `SubscribeOptions`) —
+   * `'high'` to serve every new plain subscriber before the
+   * `'normal'` ones, `3` for a custom weight of 3, `null` to clear
+   * the default back to the documented `'normal'`.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > `'normal'` — the bus default
+   * is the terminal fallback below the explicit option: an explicit
+   * `'low'` still beats a bus default of `'high'`, and vice versa.
+   * This default is the one family member with a documented factory
+   * value: a bus that never installed a default already drains new
+   * plain subscribers at `'normal'` / weight 2, so installing
+   * `'normal'` changes nothing observable. A subscriber that took
+   * the default at subscribe time keeps the weight and label it was
+   * baked with and its deficit carryover: a later revision never
+   * moves an already-subscribed subscriber's weight, and
+   * `setDeliveryPriority` still revises such a subscriber one at a
+   * time without touching the bus default — its revision still takes
+   * the live weight for a label-only change, and its `null` still
+   * restores the default without the bus default re-applying. The
+   * default only ever moves subscribers that pass no priority of
+   * their own.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription without an explicit priority. The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a label, a
+   * positive integer weight, or `null` throws `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default (including setting `'normal'` on a factory
+   * bus, or clearing a bus already at `'normal'`) is a no-op with no
+   * audit — the comparison is on the effective priority, unset
+   * counting as `'normal'`; a label-only change at the same weight
+   * (say `'normal'` to a custom weight of 2) is audited, because the
+   * observability class moves even though the order does not.
+   * Audited as `default_delivery_priority_revised`
+   * (`{ previous, deliveryPriority }`, `null` when the default is
+   * unset — unset means new plain subscribers go back to the
+   * documented `'normal'`, exactly the previous behavior).
+   *
+   * Orthogonal to EB-166 (that owns the DRR drain-visit ordering
+   * mechanism itself — this sets the default a new subscriber
+   * without an explicit priority falls back to), to EB-489 (that
+   * sets the topic-fairness default — topic weights within one
+   * subscriber, while this weights subscribers against each other
+   * in the drain), and to EB-487 (that sets the sliding-window
+   * rate-limit default — the same live-default shape, with a
+   * documented factory fallback instead of a required field).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * `'low' | 'normal' | 'high'`, a positive integer weight, or
+   * `null` to clear.
+   */
+  setDefaultDeliveryPriority(
+    priority: 'low' | 'normal' | 'high' | number | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setDefaultDeliveryPriority');
+    // `null` clears back to the documented 'normal'; anything else
+    // resolves through the subscribe-time gate, reused rather than
+    // restated — a label, or a positive integer weight. `null` maps
+    // to `null` here (not `undefined`) so the guard below only fires
+    // for a genuinely unresolvable value.
+    const resolved =
+      priority === null
+        ? null
+        : resolveDeliveryPriority(priority, 'setDefaultDeliveryPriority');
+    if (resolved === undefined) {
+      // `resolveDeliveryPriority` returns undefined only for an
+      // undefined input, outside the accepted values, but keep the
+      // guard explicit for the type checker.
+      throw new RangeError(
+        "setDefaultDeliveryPriority: deliveryPriority must be 'low', 'normal', 'high' or a positive integer weight, or null to clear it",
+      );
+    }
+    // Store the value as given: a label keeps its label, so a later
+    // 'high' and a custom weight of 4 stay distinct revisions, and
+    // `undefined` keeps meaning the factory 'normal'.
+    const next: 'low' | 'normal' | 'high' | number | undefined =
+      priority === null ? undefined : priority;
+    const previous: 'low' | 'normal' | 'high' | number | null =
+      this.defaultDeliveryPriority ?? null;
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective priority — unset means
+    // 'normal' — so setting 'normal' on a factory bus, or clearing a
+    // bus already at 'normal', audits nothing.
+    if ((previous ?? 'normal') === (next ?? 'normal')) {
+      return;
+    }
+    this.defaultDeliveryPriority = next;
+    this.auditSubscription({
+      action: 'default_delivery_priority_revised',
+      actor,
+      detail: {
+        previous,
+        deliveryPriority: next === undefined ? null : next,
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default delivery priority (EB-490) —
+   * the `'low' | 'normal' | 'high' | number` future subscribers
+   * without an explicit priority fall back to — `undefined` before
+   * any revision (no default installed, new plain subscribers use
+   * the documented `'normal'`), then whatever
+   * `setDefaultDeliveryPriority` last installed.
+   */
+  getDefaultDeliveryPriority(): 'low' | 'normal' | 'high' | number | undefined {
+    return this.defaultDeliveryPriority;
   }
 
   /**
