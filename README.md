@@ -1681,7 +1681,18 @@ library.
   oldSlowHandler: { ... } }`, the callback recorded by presence only).
   (Real-time systems: delivery governance.) Applies to single-message
   drains (batched subscribers collect before they invoke); disabled by
-  default.
+  default. A live bus-level default (EB-497, via
+  `setDefaultSlowHandler(opts | null, actor = 'system')` /
+  `getDefaultSlowHandler()`) fills in the fields a new opt-in
+  subscriber omits — the priority chain is subscriber-explicit > bus
+  default > built-in (thresholdMs 100, no callback); `true` takes the
+  whole default and `{}` opts in and takes it too. The default never
+  opts a subscriber in on its own (omitting `slowHandler`, or passing
+  `false`, still means no offload), and `setSlowHandler(subId, null)`
+  still clears the offload outright without the default re-applying.
+  Audited as `default_slow_handler_revised`
+  (`{ previous, slowHandler }`, `null` when the default is unset, the
+  callback recorded by presence only).
 - **Handler fault isolation** (in `src/bus.ts`, opt-in via
   `subscribe(..., { handlerFaultIsolation: true })`, EB-197):
   per-subscriber consecutive error budget with automatic quarantine. A

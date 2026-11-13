@@ -12030,17 +12030,25 @@ function resolveHandlerFaultIsolationOptions(
  * Validates `SubscribeOptions.slowHandler` and builds the initial
  * per-subscriber offload state (EB-191). Returns `undefined` when the
  * offload is disabled. Throws `RangeError` for invalid values.
+ *
+ * A live bus default installed via `setDefaultSlowHandler` (EB-497)
+ * may cover an omitted field: the default is the terminal fallback
+ * below an explicit field, resolved field by field — `true` takes
+ * the whole default, `{}` opts in and takes it too, and an explicit
+ * value always wins. The default never satisfies the opt-in gate: it
+ * only fills fields of a subscriber that already opted in.
  */
 function resolveSlowHandlerOptions(
   opt: boolean | SlowHandlerOptions | undefined,
+  defaults?: SlowHandlerOptions,
 ): Omit<SlowHandlerState, 'continueArmed'> | undefined {
   if (opt == null || opt === false) return undefined;
-  const o: SlowHandlerOptions = opt === true ? {} : opt;
-  const thresholdMs = o.thresholdMs ?? 100;
+  const o: SlowHandlerOptions = opt === true ? { ...defaults } : opt;
+  const thresholdMs = o.thresholdMs ?? defaults?.thresholdMs ?? 100;
   if (!Number.isFinite(thresholdMs) || thresholdMs <= 0) {
     throw new RangeError('slowHandler.thresholdMs must be a positive finite number of milliseconds');
   }
-  const onSlowHandler = o.onSlowHandler;
+  const onSlowHandler = o.onSlowHandler ?? defaults?.onSlowHandler;
   if (onSlowHandler !== undefined && typeof onSlowHandler !== 'function') {
     throw new RangeError('slowHandler.onSlowHandler must be a function');
   }
@@ -18121,6 +18129,18 @@ export class EventBus {
    * `healthProbe` is untouched by it.
    */
   private defaultHealthProbe?: HealthProbeOptions;
+  /**
+   * Bus-level terminal slow-handler default (EB-497): the
+   * `thresholdMs` / `onSlowHandler` a new subscriber falls back to
+   * when it opts into `slowHandler` but omits a field. Starts unset
+   * (`undefined` — no default, omitting a field still means 100 ms /
+   * no callback, exactly the previous behavior) and moves only via
+   * `setDefaultSlowHandler`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables the offload: a subscriber that does not opt into
+   * `slowHandler` is untouched by it.
+   */
+  private defaultSlowHandler?: SlowHandlerOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33891,7 +33911,7 @@ export class EventBus {
     const healthProbe = resolveHealthProbeOptions(opts?.healthProbe, this.defaultHealthProbe);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
-    const slowHandler = resolveSlowHandlerOptions(opts?.slowHandler);
+    const slowHandler = resolveSlowHandlerOptions(opts?.slowHandler, this.defaultSlowHandler);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const faultIsolation = resolveHandlerFaultIsolationOptions(opts?.handlerFaultIsolation);
@@ -51225,6 +51245,146 @@ export class EventBus {
    */
   getDefaultHealthProbe(): HealthProbeOptions | undefined {
     return this.defaultHealthProbe === undefined ? undefined : { ...this.defaultHealthProbe };
+  }
+
+  /**
+   * Sets the live bus-level default slow-handler offload (EB-497)
+   * without re-subscribing anyone:
+   * `setDefaultSlowHandler(opts, actor = 'system')` decides the
+   * `thresholdMs` / `onSlowHandler` for future subscribers that opt
+   * into `slowHandler` but omit a field (see `SlowHandlerOptions`) —
+   * `{ thresholdMs: 50 }` to tighten every new opt-in offload's
+   * budget with one call, `{ onSlowHandler }` to arm every new
+   * opt-in offload's callback with one call, `null` to clear the
+   * default back to no default (new opt-in subscribers go back to
+   * the documented 100 ms / no callback).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > built-in (thresholdMs 100,
+   * no callback) — the bus default is the terminal fallback below
+   * the explicit option, resolved field by field: an explicit
+   * `thresholdMs` still takes the default `onSlowHandler`, and vice
+   * versa. `true` takes the whole default, and `{}` opts a
+   * subscriber in and takes the whole default too. A subscriber
+   * that took the default at subscribe time keeps the threshold,
+   * the callback, and the `continueArmed` flag it was baked with:
+   * a later revision never moves an already-subscribed threshold,
+   * callback, or armed flag, and `setSlowHandler` still revises
+   * such a subscriber one at a time without touching the bus
+   * default — its revision still takes the live values for omitted
+   * fields, and its `null` still clears the whole subscriber back
+   * to no offload without the default re-applying. The default
+   * never enables the offload: a subscriber that does not opt into
+   * `slowHandler` is untouched by it, exactly as the health-probe
+   * default never enables probing (EB-496).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-positive or non-finite `thresholdMs`, or a
+   * non-function `onSlowHandler` throws `RangeError` with the live
+   * default and the audit log untouched. `{}` is accepted and
+   * installs no field coverage (equivalent to unset). A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — fields are
+   * compared one by one, with `undefined` counting as missing and
+   * callbacks compared by reference. Audited as
+   * `default_slow_handler_revised`
+   * (`{ previous, slowHandler }`, `null` when the default is unset
+   * — unset means new opt-in subscribers go back to the documented
+   * 100 ms / no callback, exactly the previous behavior; the
+   * callback is recorded by presence only, never serialized).
+   *
+   * Orthogonal to EB-191 (that owns the slow-handler offload
+   * mechanism itself — this sets the default a new opt-in
+   * subscriber's omitted fields fall back to), to EB-274 (that
+   * revises one subscriber's offload at a time — this sets the
+   * bus-level default), to EB-496 (that sets the health-probe
+   * default — the sister item on the timing side: the probe times
+   * failures and timeouts for degradation, this times synchronous
+   * slowness for offload), and to EB-488 (that sets the throttle
+   * default — that throttles backpressure, this offloads a slow
+   * drain to a macrotask).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), a non-positive or non-finite
+   * `thresholdMs`, or a non-function `onSlowHandler`.
+   */
+  setDefaultSlowHandler(opts: SlowHandlerOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultSlowHandler');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultSlowHandler: slowHandler must be an object with thresholdMs and/or onSlowHandler, or null to clear it',
+      );
+    }
+    // Validate through the subscribe-time gate so the bounds are
+    // exactly the subscribe-time ones.
+    if (opts !== null) {
+      try {
+        resolveSlowHandlerOptions(opts);
+      } catch (err) {
+        throw new RangeError(`setDefaultSlowHandler: ${(err as Error).message}`);
+      }
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: SlowHandlerOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(opts.thresholdMs !== undefined ? { thresholdMs: opts.thresholdMs } : {}),
+            ...(opts.onSlowHandler !== undefined ? { onSlowHandler: opts.onSlowHandler } : {}),
+          };
+    const previous: SlowHandlerOptions | null =
+      this.defaultSlowHandler === undefined ? null : { ...this.defaultSlowHandler };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing and
+    // callbacks compared by reference.
+    if (
+      (previous?.thresholdMs ?? undefined) === (next?.thresholdMs ?? undefined) &&
+      (previous?.onSlowHandler ?? undefined) === (next?.onSlowHandler ?? undefined)
+    ) {
+      return;
+    }
+    // The audit records the callback by presence only, never
+    // serialized — the same snapshot shape `setSlowHandler` audits.
+    const snapshot = (
+      d: SlowHandlerOptions | undefined,
+    ): { thresholdMs?: number; onSlowHandler?: 'set' } | null =>
+      d === undefined
+        ? null
+        : {
+            ...(d.thresholdMs !== undefined ? { thresholdMs: d.thresholdMs } : {}),
+            ...(d.onSlowHandler !== undefined ? { onSlowHandler: 'set' as const } : {}),
+          };
+    const detail = {
+      previous: snapshot(this.defaultSlowHandler),
+      slowHandler: snapshot(next),
+    };
+    this.defaultSlowHandler = next;
+    this.auditSubscription({
+      action: 'default_slow_handler_revised',
+      actor,
+      detail,
+    });
+  }
+
+  /**
+   * Returns the live bus-level default slow-handler offload (EB-497) — the
+   * `SlowHandlerOptions` future opt-in subscribers fall back to when
+   * they omit a field — `undefined` before any revision (no default,
+   * new opt-in subscribers still take the documented 100 ms / no
+   * callback), then whatever `setDefaultSlowHandler` last installed.
+   * Returns a copy, so mutating the result never moves the live
+   * default.
+   */
+  getDefaultSlowHandler(): SlowHandlerOptions | undefined {
+    return this.defaultSlowHandler === undefined ? undefined : { ...this.defaultSlowHandler };
   }
 
   /**
