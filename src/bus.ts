@@ -3669,7 +3669,8 @@ export interface BatchDeliveryOptions {
    * to this long before delivering the partial batch — the classic
    * micro-batch linger. `0` disables lingering: each flush delivers
    * whatever is queued, up to `maxSize`. Must be a finite number `>= 0`.
-   * Default 10.
+   * Default 10 — or the live bus default installed via
+   * `setDefaultBatchMaxWaitMs` (EB-485) when one is set.
    */
   maxWaitMs?: number;
 }
@@ -11142,10 +11143,15 @@ interface BatchDeliveryState {
  * (EB-483): it fills in an omitted `maxSize` for new batch subscribers
  * only — callers that already merged live values (see `setBatch`) never
  * reach it, because their object always carries `maxSize`.
+ * `defaultMaxWaitMs` is the live bus default (EB-485): it fills in an
+ * omitted `maxWaitMs` the same way — callers that already merged live
+ * values never reach it, because their object always carries
+ * `maxWaitMs`.
  */
 function resolveBatchDeliveryOptions(
   opt: boolean | BatchDeliveryOptions | undefined,
   defaultMaxSize?: number,
+  defaultMaxWaitMs?: number,
 ): BatchDeliveryState | undefined {
   if (opt == null || opt === false) return undefined;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -11156,7 +11162,7 @@ function resolveBatchDeliveryOptions(
   if (!Number.isInteger(maxSize) || maxSize <= 0) {
     throw new RangeError('batch.maxSize must be a positive integer');
   }
-  const maxWaitMs = o.maxWaitMs ?? 10;
+  const maxWaitMs = o.maxWaitMs ?? defaultMaxWaitMs ?? 10;
   if (!Number.isFinite(maxWaitMs) || maxWaitMs < 0) {
     throw new RangeError('batch.maxWaitMs must be a finite number of milliseconds >= 0');
   }
@@ -17880,6 +17886,19 @@ export class EventBus {
    * `deliveryShaping` is untouched by it.
    */
   private defaultDeliveryShaping?: DeliveryShapingOptions;
+  /**
+   * Bus-level terminal batch maxWaitMs default (EB-485): the
+   * `maxWaitMs` a new batch subscriber falls back to when it opts into
+   * batching but omits its own `maxWaitMs`. Starts unset (`undefined`
+   * — no default, omitting `maxWaitMs` means 10, exactly the previous
+   * behavior) and moves only via `setDefaultBatchMaxWaitMs`; there is
+   * no construction-time option, and a restart restores the unset
+   * default. The default never enables batching: a subscriber that
+   * does not opt into `batch` is untouched by it. Unlike the maxSize
+   * default (EB-483), `0` is a legal default here — it disables
+   * lingering for new batch subscribers.
+   */
+  private defaultBatchMaxWaitMs?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33745,7 +33764,7 @@ export class EventBus {
     // the explicit option. An explicit value always wins, and the
     // default never enables batching: `undefined`/`false` here still
     // means no batch state at all.
-    const batch = resolveBatchDeliveryOptions(opts?.batch, this.defaultBatchMaxSize);
+    const batch = resolveBatchDeliveryOptions(opts?.batch, this.defaultBatchMaxSize, this.defaultBatchMaxWaitMs);
     // Tumbling-window aggregation (EB-73): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const window = resolveWindowOptions(opts?.window);
@@ -49407,6 +49426,92 @@ export class EventBus {
    */
   getDefaultDeliveryShaping(): DeliveryShapingOptions | undefined {
     return this.defaultDeliveryShaping === undefined ? undefined : { ...this.defaultDeliveryShaping };
+  }
+
+  /**
+   * Sets the live bus-level terminal batch maxWaitMs default (EB-485)
+   * without re-subscribing anyone:
+   * `setDefaultBatchMaxWaitMs(n, actor = 'system')` decides the
+   * `maxWaitMs` for future subscribers that opt into batching but omit
+   * their own (see `BatchDeliveryOptions.maxWaitMs`) — `50` to let
+   * every new batch subscriber's partial batch linger up to 50 ms,
+   * `0` to disable lingering for new batch subscribers (the partial
+   * batch then delivers on the next timer tick), `null` to clear the
+   * default back to no default (new batch subscribers go back to 10).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 10 (the bus default is the
+   * terminal fallback below the explicit option). A subscriber that
+   * took the default at subscribe time keeps the wait it was baked
+   * with and its pending batch and linger timer: a later revision
+   * never moves an already-subscribed wait or an already-armed
+   * timer, and `setBatch` still revises such a subscriber one at a
+   * time without touching the bus default — its partial revision
+   * still takes the live value, and its `null` still clears the
+   * whole subscriber back to one-at-a-time delivery without the
+   * default re-applying. The default never enables batching: a
+   * subscriber that does not opt into `batch` is untouched by it,
+   * exactly as the ack SLO default never enables sampling (EB-479).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future batch subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a finite
+   * number `>= 0` (`null` to clear) throws `RangeError` with the
+   * live default and the audit log untouched. Unlike the maxSize
+   * default (EB-483), `0` is legal here — it disables lingering. A
+   * revision identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit. Audited as
+   * `default_batch_max_wait_ms_revised`
+   * (`{ previous, batchMaxWaitMs }`, `null` when the default is
+   * unset — unset means new batch subscribers go back to 10,
+   * exactly the previous behavior).
+   *
+   * Orthogonal to EB-483 (that sets the batch maxSize default —
+   * per-batch delivery size, this sets the linger wait; the two
+   * defaults resolve independently), to EB-269 (that revises one
+   * subscriber's batch parameters at a time — this sets the default
+   * a new batch subscriber's omitted `maxWaitMs` falls back to),
+   * and to EB-479 (that sets the ack SLO default — the same
+   * "default never enables an opt-in capability" shape).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a finite number `>= 0` (or `null` to clear).
+   */
+  setDefaultBatchMaxWaitMs(n: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultBatchMaxWaitMs');
+    if (n !== null && (typeof n !== 'number' || !Number.isFinite(n) || n < 0)) {
+      throw new RangeError(
+        'setDefaultBatchMaxWaitMs: batchMaxWaitMs must be a finite number >= 0, or null to clear it',
+      );
+    }
+    const previous = this.defaultBatchMaxWaitMs ?? null;
+    const next = n ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === n) {
+      return;
+    }
+    this.defaultBatchMaxWaitMs = next;
+    this.auditSubscription({
+      action: 'default_batch_max_wait_ms_revised',
+      actor,
+      detail: { previous, batchMaxWaitMs: n },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal batch maxWaitMs default
+   * (EB-485) — the `maxWaitMs` future batch subscribers fall back to
+   * when they opt into batching but omit their own — `undefined`
+   * before any revision (no default, new batch subscribers use 10),
+   * then whatever `setDefaultBatchMaxWaitMs` last installed.
+   */
+  getDefaultBatchMaxWaitMs(): number | undefined {
+    return this.defaultBatchMaxWaitMs;
   }
 
   /**

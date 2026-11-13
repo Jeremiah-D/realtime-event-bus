@@ -3515,6 +3515,17 @@ library.
   pending batch), and the default never enables batching — a subscriber
   that does not opt in still receives one message at a time. Audited as
   `default_batch_max_size_revised` (`{ previous, batchMaxSize }`,
+  `null` when unset). Bus-level default linger wait (EB-485, via
+  `setDefaultBatchMaxWaitMs(n | null)`): future subscribers that opt into
+  batching without an explicit `maxWaitMs` take the live bus default
+  instead of 10 — the chain is explicit > bus default > 10, and `0`
+  disables lingering for new batch subscribers (the partial batch then
+  delivers on the next timer tick). `null` clears it back to unset. An explicit
+  `maxWaitMs` always wins, a subscriber keeps the wait it was baked
+  with (a later revision never moves a live wait or an already-armed
+  linger timer), and the default never enables batching — a subscriber
+  that does not opt in still receives one message at a time. Audited as
+  `default_batch_max_wait_ms_revised` (`{ previous, batchMaxWaitMs }`,
   `null` when unset). (Real-time systems: delivery
   governance.)
   Disabled by default. `bench/batch.bench.ts` measures the before/after
