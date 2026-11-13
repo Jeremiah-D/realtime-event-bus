@@ -3280,6 +3280,24 @@ library.
   and every success is audited as `lag_monitor_revised`
   (`{ lagMonitor: { windowSize, thresholdMs?, onLag: 'set'? } | null,
   oldLagMonitor: { ... } }`, the callback recorded by presence only).
+  Bus-level default monitor (EB-494, via
+  `setDefaultLagMonitor(opts | null, actor = 'system')` +
+  `getDefaultLagMonitor()`): the `windowSize` / `thresholdMs` /
+  `onLag` future opt-in subscribers fall back to when they omit a
+  field — `{ windowSize: 3 }` to cap every new monitor's window at 3
+  with one call, `{ thresholdMs: 50, onLag }` to arm every new
+  monitor's watermark alert with one call, `null` to clear back to no
+  default. The resolution chain is subscriber-explicit > bus default >
+  built-in (windowSize 1024, no threshold, no alert), and the default
+  never enables monitoring: a subscriber that does not opt into
+  `lagMonitor` gets no tracker. The revision only affects subscribers
+  that join after it; an already-subscribed monitor keeps the window,
+  threshold, callback, and samples it was baked with, and
+  `setLagMonitor(subId, null)` still clears a subscriber back to no
+  monitoring without the default re-applying. Out of the box there is
+  no default (omitting a field means 1024 / no threshold / no alert,
+  as before); there is no construction-time option, the default never
+  enters a config snapshot, and a restart restores the unset default.
   (Real-time systems: delivery governance.) Disabled by default.
 - **Per-(subscriber, key) hotspot monitoring** (in `src/keyhotspot.ts`, opt-in
   via `subscribe(..., { keyHotspot: true })`): samples the depth of each of

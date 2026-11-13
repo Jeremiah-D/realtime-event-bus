@@ -208,24 +208,31 @@ export interface SubscriberLagState {
  * per-subscriber monitoring state. Returns `undefined` when monitoring is
  * disabled. Throws `RangeError` for an invalid window size, an invalid
  * threshold, or an `onLag` callback with no `thresholdMs` to arm it.
+ * A live bus default installed via `setDefaultLagMonitor` (EB-494) may
+ * cover an omitted field: the default is the terminal fallback below
+ * an explicit field, resolved field by field — `true` takes the whole
+ * default, `{}` opts in and takes it too, and an explicit value always
+ * wins. The default never satisfies the opt-in gate: it only fills
+ * fields of a subscriber that already opted in.
  */
 export function resolveLagMonitorOptions(
   opt: boolean | LagMonitorOptions | undefined,
+  defaults?: LagMonitorOptions,
 ): SubscriberLagState | undefined {
   if (opt == null || opt === false) return undefined;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError('lagMonitor must be true or a LagMonitorOptions object');
   }
-  const o: LagMonitorOptions = opt === true ? {} : opt;
-  const windowSize = o.windowSize ?? 1024;
+  const o: LagMonitorOptions = opt === true ? { ...defaults } : opt;
+  const windowSize = o.windowSize ?? defaults?.windowSize ?? 1024;
   if (!Number.isInteger(windowSize) || windowSize <= 0) {
     throw new RangeError('lagMonitor.windowSize must be a positive integer');
   }
-  const thresholdMs = o.thresholdMs;
+  const thresholdMs = o.thresholdMs ?? defaults?.thresholdMs;
   if (thresholdMs !== undefined && (!Number.isFinite(thresholdMs) || thresholdMs < 0)) {
     throw new RangeError('lagMonitor.thresholdMs must be a non-negative finite number of milliseconds');
   }
-  const onLag = o.onLag;
+  const onLag = o.onLag ?? defaults?.onLag;
   if (onLag !== undefined && typeof onLag !== 'function') {
     throw new TypeError('lagMonitor.onLag must be a function');
   }

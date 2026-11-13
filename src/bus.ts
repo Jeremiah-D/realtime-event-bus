@@ -18068,6 +18068,18 @@ export class EventBus {
    */
   private defaultDeliveryPriority?: 'low' | 'normal' | 'high' | number;
   /**
+   * Bus-level terminal lag-monitor default (EB-494): the
+   * `windowSize` / `thresholdMs` / `onLag` a new subscriber falls back
+   * to when it opts into `lagMonitor` but omits a field. Starts unset
+   * (`undefined` — no default, omitting a field still means 1024 /
+   * no threshold / no alert, exactly the previous behavior) and moves
+   * only via `setDefaultLagMonitor`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables monitoring: a subscriber that does not opt into
+   * `lagMonitor` is untouched by it.
+   */
+  private defaultLagMonitor?: LagMonitorOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33967,7 +33979,7 @@ export class EventBus {
         : undefined;
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
-    const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor);
+    const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor, this.defaultLagMonitor);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const lagForecast = resolveLagForecastOptions(opts?.lagForecast);
@@ -50711,6 +50723,150 @@ export class EventBus {
    */
   getDefaultDeliveryPriority(): 'low' | 'normal' | 'high' | number | undefined {
     return this.defaultDeliveryPriority;
+  }
+
+  /**
+   * Sets the live bus-level default lag watermark monitor (EB-494)
+   * without re-subscribing anyone:
+   * `setDefaultLagMonitor(opts, actor = 'system')` decides the
+   * `windowSize` / `thresholdMs` / `onLag` for future subscribers that
+   * opt into `lagMonitor` but omit a field (see `LagMonitorOptions`)
+   * — `{ windowSize: 3 }` to cap every new opt-in monitor's window at
+   * 3 samples with one call, `{ thresholdMs: 50, onLag }` to arm every
+   * new opt-in monitor's watermark alert with one call, `null` to
+   * clear the default back to no default (new opt-in subscribers go
+   * back to the documented 1024 / no threshold / no alert).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > built-in (windowSize 1024, no
+   * threshold, no alert) — the bus default is the terminal fallback
+   * below the explicit option, resolved field by field: an explicit
+   * `windowSize` still takes the default `thresholdMs` and `onLag`,
+   * and vice versa. `true` takes the whole default, and `{}` opts a
+   * subscriber in and takes the whole default too. A subscriber that
+   * took the default at subscribe time keeps the window, the
+   * threshold, the callback, and the samples it was baked with: a
+   * later revision never moves an already-subscribed window, threshold,
+   * or callback, and `setLagMonitor` still revises such a subscriber
+   * one at a time without touching the bus default — its revision still
+   * takes the live values for omitted fields, and its `null` still
+   * clears the whole subscriber back to no monitoring without the
+   * default re-applying. The default never enables monitoring: a
+   * subscriber that does not opt into `lagMonitor` is untouched by
+   * it, exactly as the delivery-latency default never enables sampling
+   * (EB-491).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-integer / <= 0 `windowSize`, a negative or
+   * non-finite `thresholdMs`, or an `onLag` callback with no
+   * `thresholdMs` to arm it throws `RangeError` with the live default
+   * and the audit log untouched. `{}` is accepted and installs no
+   * field coverage (equivalent to unset). A revision identical to the
+   * current default (including clearing an already-unset default) is a
+   * no-op with no audit — fields are compared one by one, with
+   * `undefined` counting as missing and callbacks compared by
+   * reference. Audited as `default_lag_monitor_revised`
+   * (`{ previous, lagMonitor }`, `null` when the default is unset —
+   * unset means new opt-in subscribers go back to the documented
+   * 1024 / no threshold / no alert, exactly the previous behavior;
+   * the callback is recorded by presence only, never serialized).
+   *
+   * Orthogonal to EB-35 (that owns the lag monitoring mechanism
+   * itself — this sets the default a new opt-in subscriber's omitted
+   * fields fall back to), to EB-273 (that revises one subscriber's
+   * monitor at a time — this sets the bus-level default), to EB-183
+   * (that predicts a lag crossing — this observes the current
+   * watermark), and to EB-491 (that sets the delivery-latency
+   * sampling default — the sister item on the historical-distribution
+   * side).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), a non-integer / <= 0 `windowSize`,
+   * a negative or non-finite `thresholdMs`, or an `onLag` callback
+   * with no `thresholdMs`.
+   */
+  setDefaultLagMonitor(opts: LagMonitorOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultLagMonitor');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultLagMonitor: lagMonitor must be an object with windowSize and/or thresholdMs and/or onLag, or null to clear it',
+      );
+    }
+    // Validate through the subscribe-time gate so the bounds are
+    // exactly the subscribe-time ones; its TypeError for a
+    // non-function callback is normalized to RangeError here, like
+    // `setLagMonitor` does.
+    if (opts !== null) {
+      try {
+        resolveLagMonitorOptions(opts);
+      } catch (err) {
+        throw new RangeError(`setDefaultLagMonitor: ${(err as Error).message}`);
+      }
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: LagMonitorOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(opts.windowSize !== undefined ? { windowSize: opts.windowSize } : {}),
+            ...(opts.thresholdMs !== undefined ? { thresholdMs: opts.thresholdMs } : {}),
+            ...(opts.onLag !== undefined ? { onLag: opts.onLag } : {}),
+          };
+    const previous: LagMonitorOptions | null =
+      this.defaultLagMonitor === undefined ? null : { ...this.defaultLagMonitor };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing and
+    // callbacks compared by reference.
+    if (
+      (previous?.windowSize ?? undefined) === (next?.windowSize ?? undefined) &&
+      (previous?.thresholdMs ?? undefined) === (next?.thresholdMs ?? undefined) &&
+      (previous?.onLag ?? undefined) === (next?.onLag ?? undefined)
+    ) {
+      return;
+    }
+    // The audit records the callback by presence only, never
+    // serialized — the same snapshot shape `setLagMonitor` audits.
+    const snapshot = (
+      d: LagMonitorOptions | undefined,
+    ): { windowSize?: number; thresholdMs?: number; onLag?: 'set' } | null =>
+      d === undefined
+        ? null
+        : {
+            ...(d.windowSize !== undefined ? { windowSize: d.windowSize } : {}),
+            ...(d.thresholdMs !== undefined ? { thresholdMs: d.thresholdMs } : {}),
+            ...(d.onLag !== undefined ? { onLag: 'set' as const } : {}),
+          };
+    const detail = {
+      previous: snapshot(this.defaultLagMonitor),
+      lagMonitor: snapshot(next),
+    };
+    this.defaultLagMonitor = next;
+    this.auditSubscription({
+      action: 'default_lag_monitor_revised',
+      actor,
+      detail,
+    });
+  }
+
+  /**
+   * Returns the live bus-level default lag watermark monitor (EB-494)
+   * — the `LagMonitorOptions` future opt-in subscribers fall back to
+   * when they omit a field — `undefined` before any revision (no
+   * default, new opt-in subscribers still take the documented 1024 /
+   * no threshold / no alert), then whatever `setDefaultLagMonitor`
+   * last installed. Returns a copy, so mutating the result never
+   * moves the live default.
+   */
+  getDefaultLagMonitor(): LagMonitorOptions | undefined {
+    return this.defaultLagMonitor === undefined ? undefined : { ...this.defaultLagMonitor };
   }
 
   /**
