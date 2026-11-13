@@ -2761,6 +2761,29 @@ library.
   (`{ slowStart: { initialPerSec, rampMs, strategy } | null,
   oldSlowStart: { initialPerSec, rampMs, strategy } }`). (Real-time
   systems: delivery governance.)
+  Bus-level default (EB-486, via
+  `setDefaultSlowStart(opts | null, actor = 'system')`): the
+  `initialPerSec` / `rampMs` / `strategy` a new subscriber falls back
+  to when it opts into `slowStart` but omits a field — the priority
+  chain is subscriber-explicit > bus default > 10 / 1000 /
+  `'linear'`, so `setDefaultSlowStart({ initialPerSec: 2,
+  rampMs: 5000 })` ramps every later opt-in subscriber from 2/s over
+  5s unless it sets its own fields, and `null` clears the default
+  back to 10 / 1000 / `'linear'`. The default never enables
+  slow-start: a subscriber that does not opt into `slowStart` is
+  untouched by it, and a revision never moves an already-subscribed
+  ramp or its armed re-flush timer. `setSlowStart` keeps its own
+  semantics — a partial revision still takes the documented default
+  for an omitted field, `null` still clears to full speed without
+  the default re-applying, and a revision after a clear is still
+  refused. The ramp target follows the effective shaping cap at
+  subscribe time, and the headless-room rule is unchanged: when the
+  resolved `initialPerSec` is already at or above the finite target
+  no gate is built. Every success is audited as
+  `default_slow_start_revised`
+  (`{ previous, slowStart }`, `null` when the default is unset).
+  There is no construction-time option and the revision is
+  live-only.
 - **Per-subscriber sliding-window delivery rate limit** (in
   `src/ratewindow.ts`, opt-in via
   `subscribe(..., { rateLimit: { maxMessages, perWindowMs } })`): a hard

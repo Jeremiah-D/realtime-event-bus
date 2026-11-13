@@ -30,20 +30,29 @@ export interface SlowStartOptions {
    * Delivery rate at the start of the ramp, messages/sec. Must be a
    * positive finite number. Default 10. The first `initialPerSec`
    * messages may go at once (one second of initial budget, the same
-   * burst convention as the shaping token bucket).
+   * burst convention as the shaping token bucket). A live bus default
+   * installed via `EventBus.setDefaultSlowStart` (EB-486) sits
+   * between the explicit value and the 10 — an omitted field falls
+   * back to the bus default when one is set.
    */
   initialPerSec?: number;
   /**
    * How long the ramp lasts, in milliseconds. Must be a positive finite
    * number. Default 1000. When the window elapses the gate is removed
-   * and the subscriber runs at full speed.
+   * and the subscriber runs at full speed. A live bus default
+   * installed via `EventBus.setDefaultSlowStart` (EB-486) sits
+   * between the explicit value and the 1000 — an omitted field falls
+   * back to the bus default when one is set.
    */
   rampMs?: number;
   /**
    * Ramp curve: `'linear'` interpolates the rate linearly from
    * `initialPerSec` to the target; `'exponential'` grows it
    * geometrically (doubling every `rampMs` when there is no finite
-   * target). Default `'linear'`.
+   * target). Default `'linear'`. A live bus default installed via
+   * `EventBus.setDefaultSlowStart` (EB-486) sits between the explicit
+   * value and `'linear'` — an omitted field falls back to the bus
+   * default when one is set.
    */
   strategy?: SlowStartStrategy;
 }
@@ -59,24 +68,31 @@ export interface ResolvedSlowStartOptions {
  * Validates `SubscribeOptions.slowStart` and returns the resolved
  * configuration, or `undefined` when slow-start is disabled. `true` takes
  * the documented defaults. Throws `RangeError` for invalid values.
+ *
+ * `defaults` (EB-486) is the live bus default installed via
+ * `EventBus.setDefaultSlowStart`: a field the subscriber omits falls
+ * back to it field by field, below the explicit value and above the
+ * documented default — the priority chain is subscriber-explicit >
+ * bus default > 10 / 1000 / `'linear'`.
  */
 export function resolveSlowStartOptions(
   opt: boolean | SlowStartOptions | undefined,
+  defaults?: SlowStartOptions,
 ): ResolvedSlowStartOptions | undefined {
   if (opt == null || opt === false) return undefined;
   const o: SlowStartOptions = opt === true ? {} : opt;
   if (typeof o !== 'object' || o === null) {
     throw new RangeError('slowStart must be a boolean or a SlowStartOptions object');
   }
-  const initialPerSec = o.initialPerSec ?? 10;
+  const initialPerSec = o.initialPerSec ?? defaults?.initialPerSec ?? 10;
   if (!Number.isFinite(initialPerSec) || initialPerSec <= 0) {
     throw new RangeError('slowStart.initialPerSec must be a positive finite number of messages/sec');
   }
-  const rampMs = o.rampMs ?? 1000;
+  const rampMs = o.rampMs ?? defaults?.rampMs ?? 1000;
   if (!Number.isFinite(rampMs) || rampMs <= 0) {
     throw new RangeError('slowStart.rampMs must be a positive finite number of milliseconds');
   }
-  const strategy = o.strategy ?? 'linear';
+  const strategy = o.strategy ?? defaults?.strategy ?? 'linear';
   if (strategy !== 'linear' && strategy !== 'exponential') {
     throw new RangeError("slowStart.strategy must be 'linear' or 'exponential'");
   }
@@ -208,13 +224,20 @@ export class SlowStartGate {
  * `targetPerSec` is the ramp's ceiling: the subscriber's
  * `deliveryShaping` cap when configured, otherwise `undefined` for full
  * speed (no finite ceiling).
+ *
+ * `defaults` (EB-486) is the live bus default installed via
+ * `EventBus.setDefaultSlowStart`, passed through to
+ * `resolveSlowStartOptions` — it fills only the fields the subscriber
+ * omits, and never enables slow-start on its own: `opt` must still
+ * opt in (`true` or an object) for a gate to be built at all.
  */
 export function createSlowStartGate(
   opt: boolean | SlowStartOptions | undefined,
   targetPerSec: number | undefined,
   now: () => number,
+  defaults?: SlowStartOptions,
 ): SlowStartGate | undefined {
-  const resolved = resolveSlowStartOptions(opt);
+  const resolved = resolveSlowStartOptions(opt, defaults);
   if (resolved === undefined) return undefined;
   const target = targetPerSec ?? Number.POSITIVE_INFINITY;
   if (resolved.initialPerSec >= target) return undefined;

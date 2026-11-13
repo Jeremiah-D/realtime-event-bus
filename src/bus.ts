@@ -17900,6 +17900,18 @@ export class EventBus {
    */
   private defaultBatchMaxWaitMs?: number;
   /**
+   * Bus-level terminal slow-start default (EB-486): the
+   * `initialPerSec` / `rampMs` / `strategy` a new subscriber falls
+   * back to when it opts into slow-start but omits a field. Starts
+   * unset (`undefined` — no default, omitting a field means 10 /
+   * 1000 / `'linear'`, exactly the previous behavior) and moves only
+   * via `setDefaultSlowStart`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables slow-start: a subscriber that does not opt into
+   * `slowStart` is untouched by it.
+   */
+  private defaultSlowStart?: SlowStartOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33670,11 +33682,17 @@ export class EventBus {
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now, this.defaultDeliveryShaping);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind. The ramp targets the shaping
-    // cap when shaping is configured, full speed otherwise.
+    // cap when shaping is configured, full speed otherwise. EB-486: a
+    // subscriber that opts into slow-start but omits a field falls
+    // back to the live bus default, if one is installed — the bus
+    // default sits between the explicit option and the documented
+    // 10 / 1000 / 'linear'. An explicit value always wins, and the
+    // default never enables slow-start on its own.
     const slowStart = createSlowStartGate(
       opts?.slowStart,
       deliveryShaping?.messagesPerSec,
       this.now,
+      this.defaultSlowStart,
     );
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
@@ -49512,6 +49530,133 @@ export class EventBus {
    */
   getDefaultBatchMaxWaitMs(): number | undefined {
     return this.defaultBatchMaxWaitMs;
+  }
+
+  /**
+   * Sets the live bus-level default slow-start ramp (EB-486)
+   * without re-subscribing anyone:
+   * `setDefaultSlowStart(opts, actor = 'system')` decides the
+   * `initialPerSec` / `rampMs` / `strategy` for future subscribers
+   * that opt into `slowStart` but omit a field (see
+   * `SlowStartOptions`) — `{ initialPerSec: 2, rampMs: 5000 }` to
+   * ramp every new opt-in subscriber from 2/s over 5s, `null` to
+   * clear the default back to no default (new opt-in subscribers go
+   * back to 10 / 1000 / `'linear'`).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 10 / 1000 / `'linear'`
+   * (the bus default is the terminal fallback below the explicit
+   * option, resolved field by field — an explicit `initialPerSec`
+   * still takes the default `rampMs`, and vice versa). A subscriber
+   * that took the default at subscribe time keeps the ramp it was
+   * baked with and its armed re-flush timer: a later revision never
+   * moves an already-subscribed ramp, and `setSlowStart` still
+   * revises such a subscriber one at a time without touching the
+   * bus default — its partial revision still takes the documented
+   * default for an omitted field (never the bus default), and its
+   * `null` still clears the whole subscriber back to full speed
+   * without the default re-applying. The default never enables
+   * slow-start: a subscriber that does not opt into `slowStart` is
+   * untouched by it, exactly as the ack SLO default never enables
+   * sampling (EB-479). The ramp target follows the effective
+   * shaping cap at subscribe time, so a default-ramped subscriber
+   * with a default-shaped cap ramps toward the default rate — and
+   * the headless-room rule is unchanged: when the resolved
+   * `initialPerSec` is already at or above the finite target no
+   * gate is built.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-finite / <= 0 field or an illegal strategy
+   * throws `RangeError` with the live default and the audit log
+   * untouched. `{}` is accepted and installs no field coverage
+   * (equivalent to unset). A revision identical to the current
+   * default (including clearing an already-unset default) is a
+   * no-op with no audit — fields are compared one by one, with
+   * `undefined` counting as missing. Audited as
+   * `default_slow_start_revised`
+   * (`{ previous, slowStart }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to 10 /
+   * 1000 / `'linear'`, exactly the previous behavior).
+   *
+   * Orthogonal to EB-332 (that revises one subscriber's ramp at a
+   * time — this sets the default a new opt-in subscriber's omitted
+   * fields fall back to), to EB-484 (that sets the delivery-shaping
+   * default — the same "default never enables an opt-in capability"
+   * shape; the ramp target follows the effective shaping cap), and
+   * to EB-479 (that sets the ack SLO default).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or a non-finite / <= 0
+   * `initialPerSec` or `rampMs`, or an illegal `strategy`.
+   */
+  setDefaultSlowStart(opts: SlowStartOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultSlowStart');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultSlowStart: slowStart must be an object with initialPerSec and/or rampMs and/or strategy, or null to clear it',
+      );
+    }
+    const initialPerSec = opts?.initialPerSec;
+    const rampMs = opts?.rampMs;
+    const strategy = opts?.strategy;
+    if (initialPerSec !== undefined && (!Number.isFinite(initialPerSec) || initialPerSec <= 0)) {
+      throw new RangeError('slowStart.initialPerSec must be a positive finite number of messages/sec');
+    }
+    if (rampMs !== undefined && (!Number.isFinite(rampMs) || rampMs <= 0)) {
+      throw new RangeError('slowStart.rampMs must be a positive finite number of milliseconds');
+    }
+    if (strategy !== undefined && strategy !== 'linear' && strategy !== 'exponential') {
+      throw new RangeError("slowStart.strategy must be 'linear' or 'exponential'");
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: SlowStartOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(initialPerSec !== undefined ? { initialPerSec } : {}),
+            ...(rampMs !== undefined ? { rampMs } : {}),
+            ...(strategy !== undefined ? { strategy } : {}),
+          };
+    const previous: SlowStartOptions | null =
+      this.defaultSlowStart === undefined ? null : { ...this.defaultSlowStart };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.initialPerSec ?? undefined) === (next?.initialPerSec ?? undefined) &&
+      (previous?.rampMs ?? undefined) === (next?.rampMs ?? undefined) &&
+      (previous?.strategy ?? undefined) === (next?.strategy ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultSlowStart = next;
+    this.auditSubscription({
+      action: 'default_slow_start_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        slowStart: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default slow-start ramp (EB-486) —
+   * the `SlowStartOptions` future opt-in subscribers fall back to
+   * when they omit a field — `undefined` before any revision (no
+   * default, new opt-in subscribers use 10 / 1000 / `'linear'`),
+   * then whatever `setDefaultSlowStart` last installed. Returns a
+   * copy, so mutating the result never moves the live default.
+   */
+  getDefaultSlowStart(): SlowStartOptions | undefined {
+    return this.defaultSlowStart === undefined ? undefined : { ...this.defaultSlowStart };
   }
 
   /**
