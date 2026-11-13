@@ -18080,6 +18080,19 @@ export class EventBus {
    */
   private defaultLagMonitor?: LagMonitorOptions;
   /**
+   * Bus-level terminal lag-forecast default (EB-495): the
+   * `windowSize` / `minSamples` / `thresholdMs` / `forecastHorizonMs` /
+   * `onLagForecast` a new subscriber falls back to when it opts into
+   * `lagForecast` but omits a field. Starts unset (`undefined` — no
+   * default, omitting a field still means 64 / 4 / no threshold / no
+   * alert, exactly the previous behavior) and moves only via
+   * `setDefaultLagForecast`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables forecasting: a subscriber that does not opt into
+   * `lagForecast` is untouched by it.
+   */
+  private defaultLagForecast?: LagForecastOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -33982,7 +33995,7 @@ export class EventBus {
     const lagMonitor = resolveLagMonitorOptions(opts?.lagMonitor, this.defaultLagMonitor);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
-    const lagForecast = resolveLagForecastOptions(opts?.lagForecast);
+    const lagForecast = resolveLagForecastOptions(opts?.lagForecast, this.defaultLagForecast);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const expiring = resolveExpiringSoonOptions(opts?.expiringSoon, 'subscribe');
@@ -50867,6 +50880,170 @@ export class EventBus {
    */
   getDefaultLagMonitor(): LagMonitorOptions | undefined {
     return this.defaultLagMonitor === undefined ? undefined : { ...this.defaultLagMonitor };
+  }
+
+  /**
+   * Sets the live bus-level default lag forecast (EB-495) without
+   * re-subscribing anyone:
+   * `setDefaultLagForecast(opts, actor = 'system')` decides the
+   * `windowSize` / `minSamples` / `thresholdMs` / `forecastHorizonMs` /
+   * `onLagForecast` for future subscribers that opt into
+   * `lagForecast` but omit a field (see `LagForecastOptions`) —
+   * `{ windowSize: 5, minSamples: 3 }` to bound every new opt-in
+   * forecast's window and fit bar with one call, `{ thresholdMs: 1000,
+   * onLagForecast }` to arm every new opt-in forecast's early alert
+   * with one call, `null` to clear the default back to no default
+   * (new opt-in subscribers go back to the documented 64 / 4 / no
+   * threshold / no alert).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > built-in (windowSize 64,
+   * minSamples 4, horizon defaults to `thresholdMs`) — the bus default
+   * is the terminal fallback below the explicit option, resolved field
+   * by field: an explicit `windowSize` still takes the default
+   * `thresholdMs` and `onLagForecast`, and vice versa. `true` takes
+   * the whole default, and `{}` opts a subscriber in and takes the
+   * whole default too. A subscriber that took the default at subscribe
+   * time keeps the window, the minimum-sample bar, the threshold, the
+   * horizon, the callback, and the samples it was baked with: a later
+   * revision never moves an already-subscribed window, threshold, or
+   * callback, and `setLagForecast` still revises such a subscriber
+   * one at a time without touching the bus default — its revision still
+   * takes the live values for omitted fields, and its `null` still
+   * clears the whole subscriber back to no forecasting without the
+   * default re-applying. The default never enables forecasting: a
+   * subscriber that does not opt into `lagForecast` is untouched by
+   * it, exactly as the lag-monitor default never enables monitoring
+   * (EB-494).
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-integer / <= 0 `windowSize`, a `minSamples` below 2
+   * or above the window, a non-positive or non-finite `thresholdMs`
+   * or `forecastHorizonMs`, or an `onLagForecast` callback with no
+   * `thresholdMs` to arm it throws `RangeError` with the live default
+   * and the audit log untouched. `{}` is accepted and installs no
+   * field coverage (equivalent to unset). A revision identical to the
+   * current default (including clearing an already-unset default) is a
+   * no-op with no audit — fields are compared one by one, with
+   * `undefined` counting as missing and callbacks compared by
+   * reference. Audited as `default_lag_forecast_revised`
+   * (`{ previous, lagForecast }`, `null` when the default is unset —
+   * unset means new opt-in subscribers go back to the documented
+   * 64 / 4 / no threshold / no alert, exactly the previous behavior;
+   * the callback is recorded by presence only, never serialized).
+   *
+   * Orthogonal to EB-183 (that owns the lag forecasting mechanism
+   * itself — this sets the default a new opt-in subscriber's omitted
+   * fields fall back to), to EB-278 (that revises one subscriber's
+   * forecast at a time — this sets the bus-level default), to EB-35 /
+   * EB-494 (that observe the current watermark — this predicts a
+   * crossing), and to EB-491 (that sets the delivery-latency sampling
+   * default — the sister item on the historical-distribution side).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), a non-integer / <= 0 `windowSize`,
+   * a `minSamples` below 2 or above the window, a non-positive or
+   * non-finite `thresholdMs` / `forecastHorizonMs`, or an
+   * `onLagForecast` callback with no `thresholdMs`.
+   */
+  setDefaultLagForecast(opts: LagForecastOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultLagForecast');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultLagForecast: lagForecast must be an object with windowSize and/or minSamples and/or thresholdMs and/or forecastHorizonMs and/or onLagForecast, or null to clear it',
+      );
+    }
+    // Validate through the subscribe-time gate so the bounds are
+    // exactly the subscribe-time ones; its TypeError for a
+    // non-function callback is normalized to RangeError here, like
+    // `setLagForecast` does.
+    if (opts !== null) {
+      try {
+        resolveLagForecastOptions(opts);
+      } catch (err) {
+        throw new RangeError(`setDefaultLagForecast: ${(err as Error).message}`);
+      }
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: LagForecastOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(opts.windowSize !== undefined ? { windowSize: opts.windowSize } : {}),
+            ...(opts.minSamples !== undefined ? { minSamples: opts.minSamples } : {}),
+            ...(opts.thresholdMs !== undefined ? { thresholdMs: opts.thresholdMs } : {}),
+            ...(opts.forecastHorizonMs !== undefined
+              ? { forecastHorizonMs: opts.forecastHorizonMs }
+              : {}),
+            ...(opts.onLagForecast !== undefined ? { onLagForecast: opts.onLagForecast } : {}),
+          };
+    const previous: LagForecastOptions | null =
+      this.defaultLagForecast === undefined ? null : { ...this.defaultLagForecast };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing and
+    // callbacks compared by reference.
+    if (
+      (previous?.windowSize ?? undefined) === (next?.windowSize ?? undefined) &&
+      (previous?.minSamples ?? undefined) === (next?.minSamples ?? undefined) &&
+      (previous?.thresholdMs ?? undefined) === (next?.thresholdMs ?? undefined) &&
+      (previous?.forecastHorizonMs ?? undefined) === (next?.forecastHorizonMs ?? undefined) &&
+      (previous?.onLagForecast ?? undefined) === (next?.onLagForecast ?? undefined)
+    ) {
+      return;
+    }
+    // The audit records the callback by presence only, never
+    // serialized — the same snapshot shape `setLagForecast` audits.
+    const snapshot = (
+      d: LagForecastOptions | undefined,
+    ): {
+      windowSize?: number;
+      minSamples?: number;
+      thresholdMs?: number;
+      forecastHorizonMs?: number;
+      onLagForecast?: 'set';
+    } | null =>
+      d === undefined
+        ? null
+        : {
+            ...(d.windowSize !== undefined ? { windowSize: d.windowSize } : {}),
+            ...(d.minSamples !== undefined ? { minSamples: d.minSamples } : {}),
+            ...(d.thresholdMs !== undefined ? { thresholdMs: d.thresholdMs } : {}),
+            ...(d.forecastHorizonMs !== undefined
+              ? { forecastHorizonMs: d.forecastHorizonMs }
+              : {}),
+            ...(d.onLagForecast !== undefined ? { onLagForecast: 'set' as const } : {}),
+          };
+    const detail = {
+      previous: snapshot(this.defaultLagForecast),
+      lagForecast: snapshot(next),
+    };
+    this.defaultLagForecast = next;
+    this.auditSubscription({
+      action: 'default_lag_forecast_revised',
+      actor,
+      detail,
+    });
+  }
+
+  /**
+   * Returns the live bus-level default lag forecast (EB-495) — the
+   * `LagForecastOptions` future opt-in subscribers fall back to when
+   * they omit a field — `undefined` before any revision (no default,
+   * new opt-in subscribers still take the documented 64 / 4 / no
+   * threshold / no alert), then whatever `setDefaultLagForecast`
+   * last installed. Returns a copy, so mutating the result never
+   * moves the live default.
+   */
+  getDefaultLagForecast(): LagForecastOptions | undefined {
+    return this.defaultLagForecast === undefined ? undefined : { ...this.defaultLagForecast };
   }
 
   /**

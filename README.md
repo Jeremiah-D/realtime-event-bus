@@ -11715,6 +11715,26 @@ Semantics:
   oldLagForecast: { ... } }`, the callback recorded by presence only).
   Orthogonal to `setLagMonitor` (EB-273, that revises the
   current-waterlevel monitor, this revises the trend forecast).
+- **Bus-level default** (EB-495, via
+  `setDefaultLagForecast(opts | null, actor = 'system')` +
+  `getDefaultLagForecast()`): the `windowSize` / `minSamples` /
+  `thresholdMs` / `forecastHorizonMs` / `onLagForecast` future opt-in
+  subscribers fall back to when they omit a field — `{ windowSize: 5,
+  minSamples: 3 }` to bound every new forecast's window and fit bar
+  with one call, `{ thresholdMs: 1000, onLagForecast }` to arm every
+  new forecast's early alert with one call, `null` to clear back to no
+  default. The resolution chain is subscriber-explicit > bus default >
+  built-in (windowSize 64, minSamples 4, horizon defaults to
+  `thresholdMs`), and the default never enables forecasting: a
+  subscriber that does not opt into `lagForecast` gets no tracker. The
+  revision only affects subscribers that join after it; an
+  already-subscribed forecast keeps the window, minimum-sample bar,
+  threshold, horizon, callback, and samples it was baked with, and
+  `setLagForecast(subId, null)` still clears a subscriber back to no
+  forecasting without the default re-applying. Out of the box there is
+  no default (omitting a field means 64 / 4 / no threshold / no alert,
+  as before); there is no construction-time option, the default never
+  enters a config snapshot, and a restart restores the unset default.
 - **Orthogonality.** EB-35 (current waterlevel) and EB-48 (group lag)
   observe; this predicts. Sampling costs one clock read per accepted
   enqueue for forecast-enabled subscribers only, and the clock is the

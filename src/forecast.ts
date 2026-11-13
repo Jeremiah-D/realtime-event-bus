@@ -279,37 +279,44 @@ export interface SubscriberLagForecastState {
  * per-subscriber forecasting state. Returns `undefined` when forecasting
  * is disabled. Throws `RangeError`/`TypeError` for invalid options, or
  * for an `onLagForecast` callback with no `thresholdMs` to arm it.
+ * A live bus default installed via `setDefaultLagForecast` (EB-495) may
+ * cover an omitted field: the default is the terminal fallback below
+ * an explicit field, resolved field by field — `true` takes the whole
+ * default, `{}` opts in and takes it too, and an explicit value always
+ * wins. The default never satisfies the opt-in gate: it only fills
+ * fields of a subscriber that already opted in.
  */
 export function resolveLagForecastOptions(
   opt: boolean | LagForecastOptions | undefined,
+  defaults?: LagForecastOptions,
 ): SubscriberLagForecastState | undefined {
   if (opt == null || opt === false) return undefined;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError('lagForecast must be true or a LagForecastOptions object');
   }
-  const o: LagForecastOptions = opt === true ? {} : opt;
-  const windowSize = o.windowSize ?? 64;
+  const o: LagForecastOptions = opt === true ? { ...defaults } : opt;
+  const windowSize = o.windowSize ?? defaults?.windowSize ?? 64;
   if (!Number.isInteger(windowSize) || windowSize <= 0) {
     throw new RangeError('lagForecast.windowSize must be a positive integer');
   }
-  const minSamples = o.minSamples ?? 4;
+  const minSamples = o.minSamples ?? defaults?.minSamples ?? 4;
   if (!Number.isInteger(minSamples) || minSamples < 2) {
     throw new RangeError('lagForecast.minSamples must be an integer >= 2');
   }
   if (minSamples > windowSize) {
     throw new RangeError('lagForecast.minSamples must not exceed lagForecast.windowSize');
   }
-  const thresholdMs = o.thresholdMs;
+  const thresholdMs = o.thresholdMs ?? defaults?.thresholdMs;
   if (thresholdMs !== undefined && (!Number.isFinite(thresholdMs) || thresholdMs <= 0)) {
     throw new RangeError('lagForecast.thresholdMs must be a positive finite number of milliseconds');
   }
-  const forecastHorizonMs = o.forecastHorizonMs ?? thresholdMs;
+  const forecastHorizonMs = o.forecastHorizonMs ?? defaults?.forecastHorizonMs ?? thresholdMs;
   if (forecastHorizonMs !== undefined && (!Number.isFinite(forecastHorizonMs) || forecastHorizonMs <= 0)) {
     throw new RangeError(
       'lagForecast.forecastHorizonMs must be a positive finite number of milliseconds',
     );
   }
-  const onLagForecast = o.onLagForecast;
+  const onLagForecast = o.onLagForecast ?? defaults?.onLagForecast;
   if (onLagForecast !== undefined && typeof onLagForecast !== 'function') {
     throw new TypeError('lagForecast.onLagForecast must be a function');
   }
