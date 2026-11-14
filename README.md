@@ -1744,7 +1744,23 @@ library.
   (`{ handlerFaultIsolation: { maxConsecutiveErrors, onQuarantined: 'set'? }
   | null, oldHandlerFaultIsolation: { ... } }`, the callback recorded by
   presence only).
-  Disabled by default.
+  Disabled by default. A live bus-level default budget (EB-501, via
+  `setDefaultHandlerFaultIsolation(opts | null, actor = 'system')` /
+  `getDefaultHandlerFaultIsolation()`) decides the
+  `maxConsecutiveErrors` a new subscriber falls back to when it opts
+  into `handlerFaultIsolation` but omits the budget — `true` takes the
+  whole default, and `{}` opts in and takes the whole default too. The
+  resolution chain is subscriber-explicit > bus default > 5, and the
+  default deliberately carries no callback — `onQuarantined` stays the
+  subscriber's own. The default never enables isolation: a subscriber
+  that passes no `handlerFaultIsolation` is untouched by it. A
+  subscriber that took the default at subscribe time keeps the budget
+  it was baked with; a later revision never moves it, and
+  `setHandlerFaultIsolation` still revises such a subscriber one at a
+  time without touching the bus default. Every success is audited as
+  `default_handler_fault_isolation_revised`
+  (`{ previous, handlerFaultIsolation }`, `null` when the default is
+  unset — only the budget is recorded, never a callback).
 - **Nack-reason aggregation** (in `src/bus.ts` + `src/metrics.ts`, always
   on for reliable subscriptions): every redelivery is classified into
   exactly one of three mutually-exclusive triggers — `handler_throw` (the

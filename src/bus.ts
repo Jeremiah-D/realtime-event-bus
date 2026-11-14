@@ -3862,6 +3862,24 @@ export interface DegradedEvent {
 }
 
 /**
+ * Bus-level default handler fault isolation (EB-501): the
+ * `maxConsecutiveErrors` a new subscriber falls back to when it opts
+ * into `handlerFaultIsolation` but omits the budget. Deliberately
+ * carries no callback — `onQuarantined` stays bound to the
+ * subscribing identity and can never be shared fleet-wide, so a
+ * subscriber that takes the default budget still fires only its own
+ * callback.
+ */
+export interface HandlerFaultIsolationDefaultOptions {
+  /**
+   * Consecutive handler errors that trip quarantine for a new opt-in
+   * subscriber that omits `maxConsecutiveErrors`. Must be a positive
+   * integer when present.
+   */
+  maxConsecutiveErrors?: number;
+}
+
+/**
  * Tuning for subscriber handler fault isolation
  * (`SubscribeOptions.handlerFaultIsolation`, EB-197).
  */
@@ -12010,13 +12028,24 @@ function resolveHealthProbeOptions(
  * initial per-subscriber isolation config (EB-197). Returns `undefined`
  * when the isolation is disabled. Throws `RangeError` for invalid
  * values.
+ *
+ * A live bus default installed via `setDefaultHandlerFaultIsolation`
+ * (EB-501) may cover an omitted budget: the default is the terminal
+ * fallback below an explicit `maxConsecutiveErrors` — `true` takes
+ * the whole default, `{}` opts in and takes it too, and an explicit
+ * value always wins; without a default the budget is 5, exactly the
+ * previous behavior. The default never satisfies the opt-in gate: it
+ * only fills the budget of a subscriber that already opted in — and
+ * it carries no callback: `onQuarantined` always comes from the
+ * subscriber's own options.
  */
 function resolveHandlerFaultIsolationOptions(
   opt: boolean | HandlerFaultIsolationOptions | undefined,
+  defaults?: HandlerFaultIsolationDefaultOptions,
 ): Omit<HandlerFaultIsolationState, 'consecutiveErrors' | 'quarantined'> | undefined {
   if (opt == null || opt === false) return undefined;
   const o: HandlerFaultIsolationOptions = opt === true ? {} : opt;
-  const maxConsecutiveErrors = o.maxConsecutiveErrors ?? 5;
+  const maxConsecutiveErrors = o.maxConsecutiveErrors ?? defaults?.maxConsecutiveErrors ?? 5;
   if (!Number.isInteger(maxConsecutiveErrors) || maxConsecutiveErrors < 1) {
     throw new RangeError('handlerFaultIsolation.maxConsecutiveErrors must be a positive integer');
   }
@@ -18184,6 +18213,19 @@ export class EventBus {
    * `onExpiringSoon` stays the subscriber's own.
    */
   private defaultExpiringSoon?: ExpiringSoonDefaultOptions;
+  /**
+   * Bus-level terminal handler-fault-isolation default (EB-501): the
+   * `maxConsecutiveErrors` a new subscriber falls back to when it opts
+   * into `handlerFaultIsolation` but omits its own budget. Starts
+   * unset (`undefined` — no default, omitting the budget still means
+   * 5, exactly the previous behavior) and moves only via
+   * `setDefaultHandlerFaultIsolation`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables isolation: a subscriber that does not opt into
+   * `handlerFaultIsolation` is untouched by it, and it carries no
+   * callback — `onQuarantined` stays the subscriber's own.
+   */
+  private defaultHandlerFaultIsolation?: HandlerFaultIsolationDefaultOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33970,8 +34012,18 @@ export class EventBus {
     // half-registered subscriber behind.
     const slowHandler = resolveSlowHandlerOptions(opts?.slowHandler, this.defaultSlowHandler);
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const faultIsolation = resolveHandlerFaultIsolationOptions(opts?.handlerFaultIsolation);
+    // half-registered subscriber behind. EB-501: a subscriber that
+    // opts into `handlerFaultIsolation` but omits the budget falls
+    // back to the live bus default, if one is installed — the bus
+    // default sits between the explicit budget and the documented
+    // 5. An explicit budget always wins, `true` takes the whole
+    // default, and the default never enables isolation on its own: a
+    // subscriber that passes no `handlerFaultIsolation` is untouched,
+    // and it carries no callback.
+    const faultIsolation = resolveHandlerFaultIsolationOptions(
+      opts?.handlerFaultIsolation,
+      this.defaultHandlerFaultIsolation,
+    );
     const deliveryShaping = resolveDeliveryShapingOptions(opts?.deliveryShaping, this.now, this.defaultDeliveryShaping);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind. The ramp targets the shaping
@@ -51909,6 +51961,133 @@ export class EventBus {
    */
   getDefaultExpiringSoon(): ExpiringSoonDefaultOptions | undefined {
     return this.defaultExpiringSoon === undefined ? undefined : { ...this.defaultExpiringSoon };
+  }
+
+  /**
+   * Sets the live bus-level default handler-fault-isolation budget
+   * (EB-501) without re-subscribing anyone:
+   * `setDefaultHandlerFaultIsolation(opts, actor = 'system')` decides
+   * the `maxConsecutiveErrors` for future subscribers that opt into
+   * `handlerFaultIsolation` but omit the budget (see
+   * `HandlerFaultIsolationDefaultOptions`) — `{ maxConsecutiveErrors:
+   * 3 }` to quarantine every new opt-in subscriber after 3
+   * consecutive handler errors with one call, `null` to clear the
+   * default back to no default (new opt-in subscribers go back to
+   * the documented 5).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 5 — the bus default is the
+   * terminal fallback below the explicit option. `true` takes the
+   * whole default, and `{}` opts in and takes the whole default too.
+   * A subscriber that took the default at subscribe time keeps the
+   * budget, the callback, the consecutive-error counter, and the
+   * quarantined latch it was baked with: a later revision never moves
+   * an already-subscribed budget, and `setHandlerFaultIsolation`
+   * (EB-275) still revises such a subscriber one at a time without
+   * touching the bus default — its partial revision still takes the
+   * live values for omitted fields, and its `null` form still clears
+   * the whole subscriber back to no isolation without the default
+   * re-applying. The default never enables isolation: a subscriber
+   * that does not opt into `handlerFaultIsolation` is untouched by
+   * it. The default carries no callback: `onQuarantined` stays the
+   * subscriber's own — a subscriber that takes the default budget
+   * fires only the callback it passed itself.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-integer / < 1 `maxConsecutiveErrors` throws
+   * `RangeError` with the live default and the audit log untouched.
+   * `{}` is accepted and installs no field coverage (equivalent to
+   * unset). A revision identical to the current default (including
+   * clearing an already-unset default) is a no-op with no audit —
+   * fields are compared one by one, with `undefined` counting as
+   * missing. Audited as `default_handler_fault_isolation_revised`
+   * (`{ previous, handlerFaultIsolation }`, `null` when the default
+   * is unset — unset means new opt-in subscribers go back to the
+   * documented 5, exactly the previous behavior; only the budget is
+   * recorded, never a callback — the default carries none).
+   *
+   * Orthogonal to EB-197 (that defines the isolation mechanism
+   * itself — this sets the default a new opt-in subscriber's omitted
+   * budget falls back to), to EB-275 (that revises one subscriber's
+   * budget at a time — this sets the fleet default), to EB-493
+   * (that sets the latency-SLO default — the sister item on the
+   * processing-latency side), and to `setDefaultSlowHandler`
+   * (that sets the slow-handler default — slow calls, this
+   * consecutive-error isolation).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or a non-integer / < 1
+   * `maxConsecutiveErrors`.
+   */
+  setDefaultHandlerFaultIsolation(
+    opts: HandlerFaultIsolationDefaultOptions | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setDefaultHandlerFaultIsolation');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultHandlerFaultIsolation: handlerFaultIsolation must be an object with maxConsecutiveErrors, or null to clear it',
+      );
+    }
+    const maxConsecutiveErrors = opts?.maxConsecutiveErrors;
+    if (
+      maxConsecutiveErrors !== undefined &&
+      (!Number.isInteger(maxConsecutiveErrors) || maxConsecutiveErrors < 1)
+    ) {
+      throw new RangeError(
+        'handlerFaultIsolation.maxConsecutiveErrors must be a positive integer',
+      );
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: HandlerFaultIsolationDefaultOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(maxConsecutiveErrors !== undefined ? { maxConsecutiveErrors } : {}),
+          };
+    const previous: HandlerFaultIsolationDefaultOptions | null =
+      this.defaultHandlerFaultIsolation === undefined
+        ? null
+        : { ...this.defaultHandlerFaultIsolation };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.maxConsecutiveErrors ?? undefined) === (next?.maxConsecutiveErrors ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultHandlerFaultIsolation = next;
+    this.auditSubscription({
+      action: 'default_handler_fault_isolation_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        handlerFaultIsolation: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default handler-fault-isolation
+   * budget (EB-501) — the `HandlerFaultIsolationDefaultOptions`
+   * future opt-in subscribers fall back to when they omit the budget
+   * — `undefined` before any revision (no default, new opt-in
+   * subscribers still take the documented 5), then whatever
+   * `setDefaultHandlerFaultIsolation` last installed. Returns a copy,
+   * so mutating the result never moves the live default.
+   */
+  getDefaultHandlerFaultIsolation(): HandlerFaultIsolationDefaultOptions | undefined {
+    return this.defaultHandlerFaultIsolation === undefined
+      ? undefined
+      : { ...this.defaultHandlerFaultIsolation };
   }
 
   /**
