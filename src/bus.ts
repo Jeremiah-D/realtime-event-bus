@@ -1507,6 +1507,29 @@ export interface DeduplicateMessagesRevision {
 }
 
 /**
+ * Bus-level default subscriber-side dedup (EB-502): the `windowMs` /
+ * `maxEntries` a new subscriber falls back to when it opts into
+ * `deduplicateMessages` but omits a field. Deliberately carries no
+ * `consumerId` — a durable identity can never be shared fleet-wide,
+ * so a subscriber that takes the default window still journals only
+ * under its own `consumerId`, if it passes one itself.
+ */
+export interface DeduplicateMessagesDefaultOptions {
+  /**
+   * How long a delivered `messageId` stays in the window for a new
+   * opt-in subscriber that omits `windowMs`. Must be a positive
+   * finite number when present.
+   */
+  windowMs?: number;
+  /**
+   * Maximum `(topic, messageId)` entries held per subscriber for a
+   * new opt-in subscriber that omits `maxEntries`. Must be a
+   * positive integer when present.
+   */
+  maxEntries?: number;
+}
+
+/**
  * Revision for the bus-level idempotency dedup tuning (see
  * `EventBus.setIdempotency`, EB-316). Only the fields provided move;
  * the rest keep their live values. The dedup table itself is never
@@ -12089,7 +12112,11 @@ function resolveSlowHandlerOptions(
  * Resolves `SubscribeOptions.deduplicateMessages` into per-subscriber
  * dedup state (see `SubscriberDedupState`). `defaultWindowMs` is the
  * bus's publish-side idempotency window — the subscribe-side horizon
- * matches the publisher's retry horizon unless tuned. A `consumerId`
+ * matches the publisher's retry horizon unless tuned. EB-502:
+ * `defaults` is the live bus default installed via
+ * `setDefaultDeduplicateMessages` — the terminal fallback below an
+ * explicit field, field by field (`windowMs` then falls back to the
+ * publish-side window, `maxEntries` to 10000). A `consumerId`
  * without a durable log throws: without a journal there is nothing to
  * persist the window to, so accepting the identity would silently
  * promise crash recovery it cannot deliver.
@@ -12098,14 +12125,15 @@ function resolveDeduplicateMessagesOptions(
   opt: boolean | DeduplicateMessagesOptions | undefined,
   defaultWindowMs: number,
   hasDurableLog: boolean,
+  defaults?: DeduplicateMessagesDefaultOptions,
 ): SubscriberDedupState | undefined {
   if (opt == null || opt === false) return undefined;
   const o: DeduplicateMessagesOptions = opt === true ? {} : opt;
-  const windowMs = o.windowMs ?? defaultWindowMs;
+  const windowMs = o.windowMs ?? defaults?.windowMs ?? defaultWindowMs;
   if (!Number.isFinite(windowMs) || windowMs <= 0) {
     throw new RangeError('deduplicateMessages.windowMs must be a positive finite number of milliseconds');
   }
-  const maxEntries = o.maxEntries ?? 10_000;
+  const maxEntries = o.maxEntries ?? defaults?.maxEntries ?? 10_000;
   if (!Number.isInteger(maxEntries) || maxEntries < 1) {
     throw new RangeError('deduplicateMessages.maxEntries must be a positive integer');
   }
@@ -18226,6 +18254,20 @@ export class EventBus {
    * callback — `onQuarantined` stays the subscriber's own.
    */
   private defaultHandlerFaultIsolation?: HandlerFaultIsolationDefaultOptions;
+  /**
+   * Bus-level terminal subscriber-side dedup default (EB-502): the
+   * `windowMs` / `maxEntries` a new subscriber falls back to when it
+   * opts into `deduplicateMessages` but omits a field. Starts unset
+   * (`undefined` — no default, omitting a field still means the
+   * built-in window / bound, exactly the previous behavior) and
+   * moves only via `setDefaultDeduplicateMessages`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables dedup: a subscriber that does
+   * not opt into `deduplicateMessages` is untouched by it, and it
+   * carries no `consumerId` — a durable identity stays the
+   * subscriber's own.
+   */
+  private defaultDeduplicateMessages?: DeduplicateMessagesDefaultOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34213,11 +34255,19 @@ export class EventBus {
       throw new RangeError('subscribe: maxInflight cannot be combined with batch');
     }
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
+    // half-registered subscriber behind. EB-502: a subscriber that
+    // opts into `deduplicateMessages` but omits a field falls back to
+    // the live bus default, if one is installed — the bus default
+    // sits between the explicit option and the built-in window /
+    // bound. An explicit value always wins, `true` takes the whole
+    // default, and the default never enables dedup on its own: a
+    // subscriber that passes no `deduplicateMessages` is untouched,
+    // and it carries no `consumerId`.
     const dedup = resolveDeduplicateMessagesOptions(
       opts?.deduplicateMessages,
       this.idempotencyWindowMs,
       this.durableLog != null,
+      this.defaultDeduplicateMessages,
     );
     const onDegraded = opts?.onDegraded;
     const filter = opts?.filter;
@@ -52088,6 +52138,143 @@ export class EventBus {
     return this.defaultHandlerFaultIsolation === undefined
       ? undefined
       : { ...this.defaultHandlerFaultIsolation };
+  }
+
+  /**
+   * Sets the live bus-level default subscriber-side dedup window and
+   * bound (EB-502) without re-subscribing anyone:
+   * `setDefaultDeduplicateMessages(opts, actor = 'system')` decides
+   * the `windowMs` / `maxEntries` for future subscribers that opt
+   * into `deduplicateMessages` but omit a field (see
+   * `DeduplicateMessagesDefaultOptions`) — `{ windowMs: 5_000,
+   * maxEntries: 500 }` to give every new opt-in subscriber a 5s
+   * window holding 500 identities with one call, `null` to clear the
+   * default back to no default (new opt-in subscribers go back to
+   * the built-in window / bound).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > built-in (`windowMs` falls
+   * back to the bus's publish-side idempotency window,
+   * `idempotencyWindowMs`; `maxEntries` to 10000) — the bus default
+   * is the terminal fallback below the explicit option, resolved
+   * field by field. `true` takes the whole default, and `{}` opts in
+   * and takes the whole default too. A subscriber that took the
+   * default at subscribe time keeps the window, the bound, and the
+   * recorded `(topic, messageId)` table it was baked with: a later
+   * revision never moves an already-subscribed window or bound, and
+   * `setDeduplicateMessages` (EB-295) still revises such a
+   * subscriber one at a time without touching the bus default — its
+   * partial revision still takes the live values for omitted fields,
+   * and it never consults the bus default, so the default never
+   * re-applies to it. The default never enables dedup: a subscriber
+   * that does not opt into `deduplicateMessages` is untouched by it.
+   * The default carries no `consumerId`: a durable identity can
+   * never be shared fleet-wide, so a subscriber that takes the
+   * default window still journals only under its own `consumerId`,
+   * if it passes one itself.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-finite / non-positive `windowMs` or a
+   * non-integer / < 1 `maxEntries` throws `RangeError` with the live
+   * default and the audit log untouched. `{}` is accepted and
+   * installs no field coverage (equivalent to unset). A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — fields are
+   * compared one by one, with `undefined` counting as missing.
+   * Audited as `default_deduplicate_messages_revised`
+   * (`{ previous, deduplicateMessages }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to the
+   * built-in window / bound, exactly the previous behavior; only
+   * `windowMs` / `maxEntries` are recorded, never a `consumerId` —
+   * the default carries none).
+   *
+   * Orthogonal to EB-70 (that is the dedup mechanism itself — the
+   * window, the suppression, the journal — this sets the default a
+   * new opt-in subscriber's omitted fields fall back to), to EB-295
+   * (that revises one subscriber's window / bound at a time — this
+   * sets the fleet default), to EB-493 (that sets the latency-SLO
+   * default — the sister item on the processing-latency side), and
+   * to `setIdempotency` (that retunes the publish-side idempotency
+   * window — this the subscribe-side dedup window default; the
+   * default `windowMs` overrides the "take the publish-side window"
+   * built-in fallback).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal `windowMs` /
+   * `maxEntries`.
+   */
+  setDefaultDeduplicateMessages(
+    opts: DeduplicateMessagesDefaultOptions | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setDefaultDeduplicateMessages');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultDeduplicateMessages: deduplicateMessages must be an object with windowMs and/or maxEntries, or null to clear it',
+      );
+    }
+    const windowMs = opts?.windowMs;
+    if (windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs <= 0)) {
+      throw new RangeError(
+        'deduplicateMessages.windowMs must be a positive finite number of milliseconds',
+      );
+    }
+    const maxEntries = opts?.maxEntries;
+    if (maxEntries !== undefined && (!Number.isInteger(maxEntries) || maxEntries < 1)) {
+      throw new RangeError('deduplicateMessages.maxEntries must be a positive integer');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: DeduplicateMessagesDefaultOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(windowMs !== undefined ? { windowMs } : {}),
+            ...(maxEntries !== undefined ? { maxEntries } : {}),
+          };
+    const previous: DeduplicateMessagesDefaultOptions | null =
+      this.defaultDeduplicateMessages === undefined
+        ? null
+        : { ...this.defaultDeduplicateMessages };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.windowMs ?? undefined) === (next?.windowMs ?? undefined) &&
+      (previous?.maxEntries ?? undefined) === (next?.maxEntries ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultDeduplicateMessages = next;
+    this.auditSubscription({
+      action: 'default_deduplicate_messages_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        deduplicateMessages: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default subscriber-side dedup window
+   * and bound (EB-502) — the `DeduplicateMessagesDefaultOptions`
+   * future opt-in subscribers fall back to when they omit a field —
+   * `undefined` before any revision (no default, new opt-in
+   * subscribers still take the built-in window / bound), then
+   * whatever `setDefaultDeduplicateMessages` last installed. Returns
+   * a copy, so mutating the result never moves the live default.
+   */
+  getDefaultDeduplicateMessages(): DeduplicateMessagesDefaultOptions | undefined {
+    return this.defaultDeduplicateMessages === undefined
+      ? undefined
+      : { ...this.defaultDeduplicateMessages };
   }
 
   /**

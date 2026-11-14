@@ -3467,6 +3467,33 @@ library.
   `autoMitigate` as `{ recoverDepth: <number> | null,
   onHotKeyMitigated: 'set'? }`).
   (Real-time systems: key-hotspot governance.) Disabled by default.
+  A live bus-level default (EB-502, via
+  `setDefaultDeduplicateMessages(opts | null, actor = 'system')` /
+  `getDefaultDeduplicateMessages()`) decides the `windowMs` /
+  `maxEntries` a new subscriber falls back to when it opts into
+  `deduplicateMessages` but omits a field — the priority chain is
+  subscriber-explicit > bus default > built-in (`windowMs` falls back
+  to the bus's publish-side idempotency window, `maxEntries` to
+  10000). `true` takes the whole default, and `{}` opts in and takes
+  the whole default too. The revision only affects subscribers that
+  join after it; an already-subscribed dedup window keeps the window,
+  the bound, and the recorded `(topic, messageId)` table it was baked
+  with, and the per-subscriber revision (`setDeduplicateMessages`)
+  still revises such a subscriber one at a time without touching the
+  bus default. The default never enables dedup: a subscriber that
+  does not opt into `deduplicateMessages` is untouched by it. The
+  default carries no `consumerId` — a durable identity can never be
+  shared fleet-wide, so a subscriber that takes the default window
+  still journals only under its own `consumerId`, if it passes one
+  itself. Out of the box there is no default; there is no
+  construction-time option, the default never enters a config snapshot,
+  and a restart restores the unset default. Every success is audited as
+  `default_deduplicate_messages_revised` (`{ previous,
+  deduplicateMessages }`, `null` when the default is unset; only
+  `windowMs` / `maxEntries` are recorded, never a `consumerId` — the
+  default carries none).
+  (Real-time systems: fleet-wide dedup window and bound as the
+  at-least-once baseline.) Disabled by default.
 - **Opt-in delivery-pipeline trace spans** (in `src/trace.ts`, via
   `new EventBus({ trace: true })`): one trace per sampled publish, threading
   the message through `bus.publish` → `bus.admission` → `bus.fanout` →
