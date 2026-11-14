@@ -4119,6 +4119,25 @@ library.
   current bound is a no-op with no audit. Every success is audited as `barrier_revised`
   (`{ maxHeldMessages: <number>, oldMaxHeldMessages: <number> }`). (Real-time
   systems: barrier delivery governance.)
+  A live bus-level default (EB-504, via
+  `setDefaultBarrier(opts | null, actor = 'system')` /
+  `getDefaultBarrier()`) decides the `maxHeldMessages` a new
+  subscriber falls back to when it opts into `barrier` but omits the
+  bound — the priority chain is subscriber-explicit > bus default >
+  built-in 1000. `true` takes the whole default, and `{}` opts in and
+  takes the whole default too. The revision only affects subscribers
+  that join after it; an already-subscribed barrier subscriber keeps
+  the bound, the epoch tracking (`lastEpoch`, `armedEpoch`), and the
+  already-held messages it was baked with, and the per-subscriber
+  revision (`setBarrier`) still revises such a subscriber one at a
+  time without touching the bus default. The default never enables
+  barrier delivery: a subscriber that does not opt into `barrier`
+  never sees barrier control messages and is untouched by it. Out of
+  the box there is no default; there is no construction-time option,
+  the default never enters a config snapshot, and a restart restores
+  the unset default. Every success is audited as
+  `default_barrier_revised` (`{ previous, barrier }`, `null` when the
+  default is unset; only the bound is recorded).
   `getStats().barrier` reports `{ publishedBarriers, droppedBarriers,
   heldMessages, releasedMessages, overflowedHolds }`. See "Barrier cut
   markers" below for the delayed / retained / replay combination matrix.

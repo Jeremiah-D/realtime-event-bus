@@ -11189,12 +11189,17 @@ function resolveCausalOptions(
  * Validates `SubscribeOptions.barrier` and builds the initial barrier
  * gate state (EB-98). Returns `undefined` when the subscriber did not opt
  * in. Throws `RangeError` for invalid values, before anything registers.
+ * EB-504: `defaults` is the live bus default installed via
+ * `setDefaultBarrier` — the terminal fallback below an explicit
+ * `maxHeldMessages`, and the whole default when the subscriber passes
+ * `true` or `{}`.
  */
 function resolveBarrierOptions(
   barrier: boolean | BarrierSubscribeOptions | undefined,
+  defaults?: BarrierSubscribeOptions,
 ): BarrierGateState | undefined {
   if (barrier === undefined || barrier === false) return undefined;
-  let maxHeldMessages = 1000;
+  let maxHeldMessages = defaults?.maxHeldMessages ?? 1000;
   if (barrier !== true) {
     if (typeof barrier !== 'object' || barrier === null) {
       throw new RangeError('subscribe: barrier must be a boolean or a BarrierSubscribeOptions object');
@@ -18284,6 +18289,18 @@ export class EventBus {
    * is untouched by it.
    */
   private defaultCausal?: CausalSubscribeOptions;
+  /**
+   * Bus-level terminal barrier-delivery default (EB-504): the
+   * `maxHeldMessages` a new subscriber falls back to when it opts
+   * into `barrier` but omits the bound. Starts unset (`undefined` —
+   * no default, omitting the bound still means the built-in 1000,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultBarrier`; there is no construction-time option, and a
+   * restart restores the unset default. The default never enables
+   * barrier delivery: a subscriber that does not opt into `barrier`
+   * is untouched by it.
+   */
+  private defaultBarrier?: BarrierSubscribeOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34241,8 +34258,14 @@ export class EventBus {
     // subscriber that passes no `causal` is untouched.
     const causal = resolveCausalOptions(opts?.causal, this.defaultCausal);
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const barrier = resolveBarrierOptions(opts?.barrier);
+    // half-registered subscriber behind. EB-504: a subscriber that
+    // opts into `barrier` but omits `maxHeldMessages` falls back to
+    // the live bus default, if one is installed — the bus default
+    // sits between the explicit option and the built-in 1000. An
+    // explicit bound always wins, `true` takes the whole default,
+    // and the default never enables barrier delivery on its own: a
+    // subscriber that passes no `barrier` is untouched.
+    const barrier = resolveBarrierOptions(opts?.barrier, this.defaultBarrier);
     // Delivery windows (EB-230): validated before anything
     // registers, so a throw leaves no half-registered subscriber
     // behind.
@@ -52408,6 +52431,118 @@ export class EventBus {
    */
   getDefaultCausal(): CausalSubscribeOptions | undefined {
     return this.defaultCausal === undefined ? undefined : { ...this.defaultCausal };
+  }
+
+  /**
+   * Sets the live bus-level default barrier-delivery hold bound
+   * (EB-504) without re-subscribing anyone:
+   * `setDefaultBarrier(opts, actor = 'system')` decides the
+   * `maxHeldMessages` for future subscribers that opt into
+   * `barrier` but omit the bound (see `BarrierSubscribeOptions`) —
+   * `{ maxHeldMessages: 50 }` to let every new opt-in subscriber
+   * hold 50 messages behind one armed barrier with one call, `null`
+   * to clear the default back to no default (new opt-in
+   * subscribers go back to the built-in 1000).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 1000 — the bus default is
+   * the terminal fallback below the explicit option. `true` takes
+   * the whole default, and `{}` opts in and takes the whole default
+   * too. A subscriber that took the default at subscribe time keeps
+   * the bound, the epoch tracking (`lastEpoch`, `armedEpoch`), and
+   * the already-held messages it was baked with: a later revision
+   * never moves an already-subscribed bound, and `setBarrier`
+   * (EB-292) still revises such a subscriber one at a time without
+   * touching the bus default — it only ever takes a bound value,
+   * never consults the bus default, so the default never re-applies
+   * to it. The default never enables barrier delivery: a subscriber
+   * that does not opt into `barrier` is untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-integer / < 1 `maxHeldMessages` throws
+   * `RangeError` with the live default and the audit log untouched.
+   * `{}` is accepted and installs no field coverage (equivalent to
+   * unset). A revision identical to the current default (including
+   * clearing an already-unset default) is a no-op with no audit —
+   * fields are compared one by one, with `undefined` counting as
+   * missing. Audited as `default_barrier_revised`
+   * (`{ previous, barrier }`, `null` when the default is unset —
+   * unset means new opt-in subscribers go back to the built-in
+   * 1000, exactly the previous behavior; only the bound is
+   * recorded).
+   *
+   * Orthogonal to EB-98 (that is the barrier mechanism itself —
+   * the cut marker, arming, and the hold/release gate — this sets
+   * the default a new opt-in subscriber's omitted bound falls back
+   * to), to EB-292 (that revises one subscriber's hold bound at a
+   * time — this sets the fleet default), to EB-503 (that sets the
+   * causal buffer default — the two gates run in series, barrier
+   * first, causal second, and the defaults are independent), and
+   * to EB-499–502 (those set the defaults of the other options in
+   * the same family — this the barrier hold bound).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal
+   * `maxHeldMessages`.
+   */
+  setDefaultBarrier(opts: BarrierSubscribeOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultBarrier');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultBarrier: barrier must be an object with maxHeldMessages, or null to clear it',
+      );
+    }
+    const maxHeldMessages = opts?.maxHeldMessages;
+    if (
+      maxHeldMessages !== undefined &&
+      (!Number.isInteger(maxHeldMessages) || maxHeldMessages < 1)
+    ) {
+      throw new RangeError('barrier.maxHeldMessages must be a positive integer');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: BarrierSubscribeOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(maxHeldMessages !== undefined ? { maxHeldMessages } : {}),
+          };
+    const previous: BarrierSubscribeOptions | null =
+      this.defaultBarrier === undefined ? null : { ...this.defaultBarrier };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if ((previous?.maxHeldMessages ?? undefined) === (next?.maxHeldMessages ?? undefined)) {
+      return;
+    }
+    this.defaultBarrier = next;
+    this.auditSubscription({
+      action: 'default_barrier_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        barrier: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default barrier-delivery hold bound
+   * (EB-504) — the `BarrierSubscribeOptions` future opt-in
+   * subscribers fall back to when they omit the bound — `undefined`
+   * before any revision (no default, new opt-in subscribers still
+   * take the built-in 1000), then whatever `setDefaultBarrier` last
+   * installed. Returns a copy, so mutating the result never moves
+   * the live default.
+   */
+  getDefaultBarrier(): BarrierSubscribeOptions | undefined {
+    return this.defaultBarrier === undefined ? undefined : { ...this.defaultBarrier };
   }
 
   /**
