@@ -8058,6 +8058,29 @@ is not re-sent. A throwing callback is swallowed, as at subscribe
 time. Every success is audited as `expiring_soon_callback_revised`
 (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
 callback itself is never serialized, only its presence).
+
+A live bus-level default threshold (EB-500, via
+`setDefaultExpiringSoon(opts | null, actor = 'system')` /
+`getDefaultExpiringSoon()`) decides the `expiringSoonMs` a new
+subscriber falls back to when it opts into `expiringSoon` but omits
+the threshold — `{ expiringSoonMs: 5_000 }` to warn every new opt-in
+subscriber when its queue head has 5s of life left with one call,
+`null` to clear back to no default. The resolution chain is
+subscriber-explicit > bus default > threshold required: a subscriber
+that passes `{ onExpiringSoon }` with no threshold takes the default
+threshold — but only when the default carries one; without one, the
+subscribe still throws, as before. The default never enables warning:
+a subscriber that passes no `expiringSoon` is untouched by it, and
+the default deliberately carries no callback — `onExpiringSoon`
+stays the subscriber's own, so a subscriber that takes the default
+threshold fires only the callback it passed itself. A subscriber
+that took the default at subscribe time keeps the threshold it was
+baked with; a later revision never moves it, and
+`setExpiringSoonThreshold` / `setExpiringSoonCallback` still revise
+such a subscriber one at a time without touching the bus default.
+Every success is audited as `default_expiring_soon_revised`
+(`{ previous, expiringSoon }`, `null` when the default is unset —
+only the threshold is recorded, never a callback).
 (Real-time systems: subscription governance.)
 
 ## Per-message TTL (EB-149)

@@ -41,6 +41,23 @@
  * deterministic warnings by advancing a controllable clock.
  */
 
+/**
+ * Bus-level default TTL expiring-soon warning threshold (EB-500): the
+ * `expiringSoonMs` a new subscriber falls back to when it opts into
+ * `expiringSoon` but omits the threshold. Deliberately carries no
+ * callback — `onExpiringSoon` stays bound to the subscribing identity
+ * and can never be shared fleet-wide, so a subscriber that takes the
+ * default threshold still fires only its own callback.
+ */
+export interface ExpiringSoonDefaultOptions {
+  /**
+   * Warn when the oldest queued message's remaining TTL is at or below
+   * this many milliseconds. Must be a non-negative finite number when
+   * present.
+   */
+  expiringSoonMs?: number;
+}
+
 /** Tuning for TTL expiring-soon warnings. */
 export interface ExpiringSoonOptions {
   /**
@@ -104,16 +121,27 @@ export interface SubscriberExpiringState {
  * disabled. Throws `TypeError` for a non-object option or a non-function
  * callback, `RangeError` for a negative/non-finite threshold — fail-fast
  * at subscribe time, never mid-drain.
+ *
+ * A live bus default installed via `setDefaultExpiringSoon` (EB-500)
+ * may cover an omitted threshold: the default is the terminal fallback
+ * below an explicit threshold, so `{ onExpiringSoon }` opts a
+ * subscriber in when the default carries a threshold (and still throws
+ * without one), and an explicit threshold always wins. The default
+ * never satisfies the opt-in gate — it only fills the threshold of a
+ * subscriber that already opted in — and it carries no callback:
+ * `onExpiringSoon` always comes from the subscriber's own options.
  */
 export function resolveExpiringSoonOptions(
   opt: ExpiringSoonOptions | undefined,
   where: string,
+  defaults?: ExpiringSoonDefaultOptions,
 ): SubscriberExpiringState | undefined {
   if (opt === undefined) return undefined;
   if (typeof opt !== 'object' || opt === null) {
     throw new TypeError(`${where}: expiringSoon must be an ExpiringSoonOptions object`);
   }
-  const { expiringSoonMs, onExpiringSoon } = opt;
+  const expiringSoonMs = opt.expiringSoonMs ?? defaults?.expiringSoonMs;
+  const { onExpiringSoon } = opt;
   if (!Number.isFinite(expiringSoonMs) || expiringSoonMs < 0) {
     throw new RangeError(
       `${where}: expiringSoon.expiringSoonMs must be a non-negative finite number of milliseconds`,

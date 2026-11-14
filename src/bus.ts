@@ -124,6 +124,7 @@ import {
 } from './forecast.ts';
 import {
   resolveExpiringSoonOptions,
+  type ExpiringSoonDefaultOptions,
   type ExpiringSoonEvent,
   type ExpiringSoonOptions,
   type SubscriberExpiringState,
@@ -18171,6 +18172,19 @@ export class EventBus {
    */
   private defaultDeliverySampleRate?: number;
   /**
+   * Bus-level terminal TTL expiring-soon default (EB-500): the
+   * `expiringSoonMs` a new subscriber falls back to when it opts into
+   * `expiringSoon` but omits its own threshold. Starts unset
+   * (`undefined` — no default, omitting the threshold still throws,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultExpiringSoon`; there is no construction-time option,
+   * and a restart restores the unset default. The default never
+   * enables warning: a subscriber that does not opt into
+   * `expiringSoon` is untouched by it, and it carries no callback —
+   * `onExpiringSoon` stays the subscriber's own.
+   */
+  private defaultExpiringSoon?: ExpiringSoonDefaultOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -34089,8 +34103,15 @@ export class EventBus {
     // half-registered subscriber behind.
     const lagForecast = resolveLagForecastOptions(opts?.lagForecast, this.defaultLagForecast);
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const expiring = resolveExpiringSoonOptions(opts?.expiringSoon, 'subscribe');
+    // half-registered subscriber behind. EB-500: a subscriber that
+    // opts into `expiringSoon` but omits the threshold falls back to
+    // the live bus default, if one is installed — the bus default
+    // sits between the explicit threshold and the previous
+    // threshold-required behavior. An explicit threshold always
+    // wins, and the default never enables warning on its own: a
+    // subscriber that passes no `expiringSoon` is untouched, and it
+    // carries no callback.
+    const expiring = resolveExpiringSoonOptions(opts?.expiringSoon, 'subscribe', this.defaultExpiringSoon);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind. EB-498: a subscriber that
     // opts into `keyHotspot` but omits a field falls back to the live
@@ -51766,6 +51787,128 @@ export class EventBus {
    */
   getDefaultDeliverySampleRate(): number | undefined {
     return this.defaultDeliverySampleRate;
+  }
+
+  /**
+   * Sets the live bus-level default TTL expiring-soon warning
+   * threshold (EB-500) without re-subscribing anyone:
+   * `setDefaultExpiringSoon(opts, actor = 'system')` decides the
+   * `expiringSoonMs` for future subscribers that opt into
+   * `expiringSoon` but omit the threshold (see
+   * `ExpiringSoonDefaultOptions`) — `{ expiringSoonMs: 5_000 }` to
+   * warn every new opt-in subscriber when its queue head has 5s of
+   * life left with one call, `null` to clear the default back to no
+   * default (new opt-in subscribers go back to the threshold being
+   * required).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > threshold required — the bus
+   * default is the terminal fallback below the explicit option. A
+   * subscriber that passes `{ onExpiringSoon }` with no threshold
+   * takes the default threshold — but only when the default carries
+   * one; without one, the subscribe still throws, exactly the
+   * previous behavior. A subscriber that took the default at
+   * subscribe time keeps the threshold, the callback, and the
+   * `alerted` latch it was baked with: a later revision never moves
+   * an already-subscribed threshold, and
+   * `setExpiringSoonThreshold` (EB-288) / `setExpiringSoonCallback`
+   * (EB-454) still revise such a subscriber one at a time without
+   * touching the bus default — their revisions still take the live
+   * values for omitted fields, and their `null` forms still clear
+   * the whole subscriber back to no warning without the default
+   * re-applying. The default never enables warning: a subscriber
+   * that does not opt into `expiringSoon` is untouched by it. The
+   * default carries no callback: `onExpiringSoon` stays the
+   * subscriber's own — a subscriber that takes the default threshold
+   * fires only the callback it passed itself.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-finite / negative `expiringSoonMs` throws
+   * `RangeError` with the live default and the audit log untouched.
+   * `{}` is accepted and installs no field coverage (equivalent to
+   * unset). A revision identical to the current default (including
+   * clearing an already-unset default) is a no-op with no audit —
+   * fields are compared one by one, with `undefined` counting as
+   * missing. Audited as `default_expiring_soon_revised`
+   * (`{ previous, expiringSoon }`, `null` when the default is unset
+   * — unset means new opt-in subscribers go back to the threshold
+   * being required, exactly the previous behavior; only the
+   * threshold is recorded, never a callback — the default carries
+   * none).
+   *
+   * Orthogonal to EB-288 (that revises one subscriber's threshold
+   * at a time — this sets the default a new opt-in subscriber's
+   * omitted threshold falls back to), to EB-454 (that revises one
+   * subscriber's callback — this default never carries one), to
+   * EB-493 (that sets the latency-SLO default — the sister item on
+   * the processing-latency side), and to `setDefaultTtlMs` (that
+   * sets the message TTL default — the TTL itself, this the warning
+   * as the TTL approaches).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or a non-finite / negative
+   * `expiringSoonMs`.
+   */
+  setDefaultExpiringSoon(opts: ExpiringSoonDefaultOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultExpiringSoon');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultExpiringSoon: expiringSoon must be an object with expiringSoonMs, or null to clear it',
+      );
+    }
+    const expiringSoonMs = opts?.expiringSoonMs;
+    if (
+      expiringSoonMs !== undefined &&
+      (!Number.isFinite(expiringSoonMs) || expiringSoonMs < 0)
+    ) {
+      throw new RangeError(
+        'expiringSoon.expiringSoonMs must be a non-negative finite number of milliseconds',
+      );
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: ExpiringSoonDefaultOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(expiringSoonMs !== undefined ? { expiringSoonMs } : {}),
+          };
+    const previous: ExpiringSoonDefaultOptions | null =
+      this.defaultExpiringSoon === undefined ? null : { ...this.defaultExpiringSoon };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if ((previous?.expiringSoonMs ?? undefined) === (next?.expiringSoonMs ?? undefined)) {
+      return;
+    }
+    this.defaultExpiringSoon = next;
+    this.auditSubscription({
+      action: 'default_expiring_soon_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        expiringSoon: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default TTL expiring-soon warning
+   * threshold (EB-500) — the `ExpiringSoonDefaultOptions` future
+   * opt-in subscribers fall back to when they omit the threshold —
+   * `undefined` before any revision (no default, new opt-in
+   * subscribers must still pass `expiringSoonMs`), then whatever
+   * `setDefaultExpiringSoon` last installed. Returns a copy, so
+   * mutating the result never moves the live default.
+   */
+  getDefaultExpiringSoon(): ExpiringSoonDefaultOptions | undefined {
+    return this.defaultExpiringSoon === undefined ? undefined : { ...this.defaultExpiringSoon };
   }
 
   /**
