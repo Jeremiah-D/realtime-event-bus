@@ -3829,6 +3829,22 @@ library.
   no-op with no audit. Every success is audited as `window_revised`
   (`{ windowMs: <number>, oldWindowMs: <number> }`). (Real-time
   systems: window aggregation governance.)
+  Bus default (EB-506, via `setDefaultWindow(opts | null)`): future
+  subscribers that opt into `window` without an explicit `windowMs` /
+  `aggregate` / `field` take the live bus default field by field —
+  `{ windowMs: 1000, aggregate: 'sum', field: 'metrics.price' }` to
+  smooth every new opt-in subscriber's hot topic into one-second sums
+  with one call, `null` to clear back to no default; `{}` opts in and
+  takes the whole default. The chain is explicit > bus default >
+  required (with no default installed a missing `windowMs` /
+  `aggregate` still throws), and the default never enables aggregation
+  — a subscriber that does not opt into `window` is untouched by it.
+  A revision never moves an already-subscribed window's length, fold,
+  field, accumulators, or armed timer. There is no construction-time
+  option and the revision is live-only (a restart restores the unset
+  default); a revision identical to the current default is a no-op
+  with no audit. Audited as `default_window_revised`
+  (`{ previous, window }`).
 - **Subscriber session-window aggregation** (in `src/bus.ts`, opt-in via
   `subscribe(..., { sessionWindow: { gapMs, aggregate, field?,
   maxSessionsPerKey? } })`, EB-188): the Kafka/Flink session-window

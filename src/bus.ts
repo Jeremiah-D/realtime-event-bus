@@ -3093,7 +3093,9 @@ export interface SubscribeOptions {
    * window-close timer is `unref()`'d, so an open window never keeps the
    * process alive. `getStats().aggregatedWindows` counts completed
    * (non-empty) windows. Invalid values throw `RangeError` from
-   * `subscribe`. Disabled by default.
+   * `subscribe`. A field omitted here falls back to the live bus
+   * default installed via `setDefaultWindow` (EB-506); `window: {}`
+   * opts in and takes the whole default. Disabled by default.
    */
   window?: WindowAggregateOptions;
   /**
@@ -11298,7 +11300,10 @@ const WINDOW_AGGREGATES: ReadonlySet<string> = new Set([
 
 /**
  * Opt-in subscriber-side tumbling-window aggregation (see
- * `SubscribeOptions.window`, EB-73).
+ * `SubscribeOptions.window`, EB-73). A field omitted at subscribe
+ * time falls back to the live bus default installed via
+ * `setDefaultWindow` (EB-506); with no default installed a missing
+ * `windowMs` / `aggregate` still throws.
  */
 export interface WindowAggregateOptions {
   /**
@@ -11466,26 +11471,33 @@ interface SubscriberWindowState {
  * Validates `SubscribeOptions.window` and builds the initial window
  * state. Returns `undefined` when window aggregation is disabled.
  * Throws `TypeError` for a non-object value and `RangeError` for an
- * invalid `windowMs`, `aggregate`, or `field`.
+ * invalid `windowMs`, `aggregate`, or `field`. EB-506: `defaults` is
+ * the live bus default installed via `setDefaultWindow` — the
+ * terminal fallback below an explicit `windowMs` / `aggregate` /
+ * `field`, and the whole default when the subscriber passes `{}`.
+ * A field missing from both the subscriber and the default still
+ * throws: the default fills in omitted fields, it never satisfies
+ * the required ones on its own.
  */
 function resolveWindowOptions(
   opt: WindowAggregateOptions | undefined,
+  defaults?: WindowAggregateOptions,
 ): SubscriberWindowState | undefined {
   if (opt === undefined) return undefined;
   if (typeof opt !== 'object' || opt === null) {
     throw new TypeError('subscribe: window must be a WindowAggregateOptions object');
   }
-  const windowMs = opt.windowMs;
+  const windowMs = opt.windowMs ?? defaults?.windowMs;
   if (!Number.isFinite(windowMs) || windowMs <= 0) {
     throw new RangeError('subscribe: window.windowMs must be a positive finite number of milliseconds');
   }
-  const aggregate = opt.aggregate;
+  const aggregate = opt.aggregate ?? defaults?.aggregate;
   if (typeof aggregate !== 'string' || !WINDOW_AGGREGATES.has(aggregate)) {
     throw new RangeError(
       "subscribe: window.aggregate must be one of 'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' | 'concat'",
     );
   }
-  const fieldPath = parseWindowFieldPath(opt.field);
+  const fieldPath = parseWindowFieldPath(opt.field ?? defaults?.field);
   return {
     windowMs,
     aggregate: aggregate as WindowAggregateKind,
@@ -18320,6 +18332,18 @@ export class EventBus {
    * `shadow` is untouched by it.
    */
   private defaultShadow?: ShadowSubscribeOptions;
+  /**
+   * Bus-level terminal tumbling-window aggregation default (EB-506):
+   * the `windowMs` / `aggregate` / `field` a new subscriber falls
+   * back to when it opts into `window` but omits a field. Starts
+   * unset (`undefined` — no default, omitting `windowMs` /
+   * `aggregate` still throws, exactly the previous behavior) and
+   * moves only via `setDefaultWindow`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables aggregation: a subscriber that does not opt into
+   * `window` is untouched by it.
+   */
+  private defaultWindow?: WindowAggregateOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34301,7 +34325,7 @@ export class EventBus {
     const batch = resolveBatchDeliveryOptions(opts?.batch, this.defaultBatchMaxSize, this.defaultBatchMaxWaitMs);
     // Tumbling-window aggregation (EB-73): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
-    const window = resolveWindowOptions(opts?.window);
+    const window = resolveWindowOptions(opts?.window, this.defaultWindow);
     // Session-window aggregation (EB-188): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     // Session windows cut on inactivity while tumbling windows cut on
@@ -52683,6 +52707,138 @@ export class EventBus {
    */
   getDefaultShadow(): ShadowSubscribeOptions | undefined {
     return this.defaultShadow === undefined ? undefined : { ...this.defaultShadow };
+  }
+
+  /**
+   * Sets the live bus-level default tumbling-window aggregation
+   * (EB-506) without re-subscribing anyone:
+   * `setDefaultWindow(opts, actor = 'system')` decides the
+   * `windowMs` / `aggregate` / `field` for future subscribers that
+   * opt into `window` but omit a field (see
+   * `WindowAggregateOptions`) — `{ windowMs: 1000, aggregate:
+   * 'sum', field: 'metrics.price' }` to smooth every new opt-in
+   * subscriber's hot topic into one-second sums with one call,
+   * `null` to clear the default back to no default (new opt-in
+   * subscribers go back to the subscribe-time required fields).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > required (no default means
+   * a missing `windowMs` / `aggregate` still throws) — the bus
+   * default is the terminal fallback below the explicit field, and
+   * `{}` opts in and takes the whole default. A subscriber that
+   * took the default at subscribe time keeps the window length, the
+   * fold, the field, the accumulators, and the armed close timer it
+   * was baked with: a later revision never moves an
+   * already-subscribed window, and `setWindow` (EB-293) still
+   * revises such a subscriber one at a time without touching the bus
+   * default — it only ever takes a length value, never consults the
+   * bus default, so the default never re-applies to it. The default
+   * never enables aggregation: a subscriber that does not opt into
+   * `window` is untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-finite / <= 0 `windowMs`, an `aggregate` outside
+   * the seven kinds, or an illegal dot-path `field` throws
+   * `RangeError` with the live default and the audit log untouched.
+   * `{}` is accepted and installs no field coverage (equivalent to
+   * unset). A revision identical to the current default (including
+   * clearing an already-unset default) is a no-op with no audit —
+   * fields are compared one by one, with `undefined` counting as
+   * missing. Audited as `default_window_revised`
+   * (`{ previous, window }`, `null` when the default is unset —
+   * unset means new opt-in subscribers go back to the required
+   * fields, exactly the previous behavior; only the window fields
+   * are recorded).
+   *
+   * Orthogonal to EB-73 (that is the tumbling-window mechanism
+   * itself — the fold, the close timer, and the aggregate delivery —
+   * this sets the default a new opt-in subscriber's omitted fields
+   * fall back to), to EB-293 (that revises one subscriber's window
+   * length at a time — this sets the fleet default), to EB-188 /
+   * EB-507 (those are session windows, cut on inactivity — this is
+   * the clock-cut tumbling window; the two can never share one
+   * subscription), and to EB-488–505 (those set the defaults of the
+   * other options in the same family — this the window aggregation).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal `windowMs` /
+   * `aggregate` / `field`.
+   */
+  setDefaultWindow(opts: WindowAggregateOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultWindow');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultWindow: window must be an object with windowMs/aggregate/field, or null to clear it',
+      );
+    }
+    const windowMs = opts?.windowMs;
+    if (windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs <= 0)) {
+      throw new RangeError('window.windowMs must be a positive finite number of milliseconds');
+    }
+    const aggregate = opts?.aggregate;
+    if (aggregate !== undefined && (typeof aggregate !== 'string' || !WINDOW_AGGREGATES.has(aggregate))) {
+      throw new RangeError(
+        "window.aggregate must be one of 'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' | 'concat'",
+      );
+    }
+    const field = opts?.field;
+    if (field !== undefined) {
+      try {
+        parseWindowFieldPath(field);
+      } catch (err) {
+        throw new RangeError(`setDefaultWindow: ${(err as Error).message}`);
+      }
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: WindowAggregateOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(windowMs !== undefined ? { windowMs } : {}),
+            ...(aggregate !== undefined ? { aggregate: aggregate as WindowAggregateKind } : {}),
+            ...(field !== undefined ? { field } : {}),
+          };
+    const previous: WindowAggregateOptions | null =
+      this.defaultWindow === undefined ? null : { ...this.defaultWindow };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.windowMs ?? undefined) === (next?.windowMs ?? undefined) &&
+      (previous?.aggregate ?? undefined) === (next?.aggregate ?? undefined) &&
+      (previous?.field ?? undefined) === (next?.field ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultWindow = next;
+    this.auditSubscription({
+      action: 'default_window_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        window: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default tumbling-window aggregation
+   * (EB-506) — the `WindowAggregateOptions` future opt-in
+   * subscribers fall back to when they omit a field — `undefined`
+   * before any revision (no default, new opt-in subscribers still
+   * take the subscribe-time required fields), then whatever
+   * `setDefaultWindow` last installed. Returns a copy, so mutating
+   * the result never moves the live default.
+   */
+  getDefaultWindow(): WindowAggregateOptions | undefined {
+    return this.defaultWindow === undefined ? undefined : { ...this.defaultWindow };
   }
 
   /**
