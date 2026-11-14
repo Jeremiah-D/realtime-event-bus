@@ -18366,6 +18366,17 @@ export class EventBus {
    */
   private defaultSessionWindow?: SessionWindowOptions;
   /**
+   * Bus-level terminal key-range default (EB-508): the `start` /
+   * `end` a new subscriber falls back to when it opts into
+   * `keyRange` but omits an end. Starts unset (`undefined` — no
+   * default, omitting `keyRange` means no narrowing, exactly the
+   * previous behavior) and moves only via `setDefaultKeyRange`;
+   * there is no construction-time option, and a restart restores
+   * the unset default. The default never enables a key range: a
+   * subscriber that does not opt into `keyRange` is untouched by it.
+   */
+  private defaultKeyRange?: KeyRangeOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -34039,24 +34050,36 @@ export class EventBus {
     }
     // Key-range subscription (EB-232): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
-    const keyRange = opts?.keyRange;
-    if (keyRange !== undefined) {
-      if (typeof keyRange !== 'object' || keyRange === null) {
+    // EB-508: a subscriber that opts into `keyRange` but omits an end
+    // falls back to the live bus default, if one is installed — the bus
+    // default sits between the explicit option and unbounded. An
+    // explicit end always wins, `{}` takes the whole default, and the
+    // default never enables a key range on its own: a subscriber that
+    // passes no `keyRange` is untouched. The merged range is validated
+    // by the same four gates below, so two ends that meet only after
+    // the merge (an explicit `end` <= the default `start`, or the
+    // reverse) still throw, with no half-registered subscriber behind.
+    const explicitKeyRange = opts?.keyRange;
+    let keyRange: KeyRangeOptions | undefined;
+    if (explicitKeyRange !== undefined) {
+      if (typeof explicitKeyRange !== 'object' || explicitKeyRange === null) {
         throw new RangeError('subscribe: keyRange must be an object with optional start/end strings');
       }
-      if (keyRange.start !== undefined && typeof keyRange.start !== 'string') {
+      if (explicitKeyRange.start !== undefined && typeof explicitKeyRange.start !== 'string') {
         throw new RangeError('subscribe: keyRange.start must be a string');
       }
-      if (keyRange.end !== undefined && typeof keyRange.end !== 'string') {
+      if (explicitKeyRange.end !== undefined && typeof explicitKeyRange.end !== 'string') {
         throw new RangeError('subscribe: keyRange.end must be a string');
       }
-      if (
-        keyRange.start !== undefined &&
-        keyRange.end !== undefined &&
-        keyRange.start >= keyRange.end
-      ) {
+      const start = explicitKeyRange.start ?? this.defaultKeyRange?.start;
+      const end = explicitKeyRange.end ?? this.defaultKeyRange?.end;
+      if (start !== undefined && end !== undefined && start >= end) {
         throw new RangeError('subscribe: keyRange.start must be < keyRange.end');
       }
+      keyRange = {
+        ...(start !== undefined ? { start } : {}),
+        ...(end !== undefined ? { end } : {}),
+      };
     }
     // Subscription lease (EB-69): validated before anything registers, so
     // a throw leaves no half-registered subscriber behind.
@@ -53010,6 +53033,126 @@ export class EventBus {
    */
   getDefaultSessionWindow(): SessionWindowOptions | undefined {
     return this.defaultSessionWindow === undefined ? undefined : { ...this.defaultSessionWindow };
+  }
+
+  /**
+   * Sets the live bus-level default key range (EB-508) without
+   * re-subscribing anyone: `setDefaultKeyRange(range, actor =
+   * 'system')` decides the `start` / `end` for future subscribers
+   * that opt into `keyRange` but omit an end (see
+   * `KeyRangeOptions`) — `{ start: 'a', end: 'm' }` to narrow every
+   * new opt-in subscriber's key slice with one call, `null` to clear
+   * the default back to no default (new opt-in subscribers go back
+   * to the subscribe-time gates, where an omitted end is unbounded).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > unbounded (no default means
+   * an omitted end stays unbounded) — the bus default is the
+   * terminal fallback below the explicit end, and `{}` opts in and
+   * takes the whole default. A subscriber that took the default at
+   * subscribe time keeps the range it was baked with: a later
+   * revision never moves an already-subscribed range, and
+   * `setKeyRange` (EB-284) still revises such a subscriber one at a
+   * time without touching the bus default — it only ever takes a
+   * whole range, never consults the bus default, so the default
+   * never re-applies to it (clearing a range does not re-apply the
+   * default either). The default never enables a key range: a
+   * subscriber that does not opt into `keyRange` is untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-string `start` / `end`, or both ends present with
+   * `start >= end` throws `RangeError` with the live default and the
+   * audit log untouched. `{}` is accepted and installs no end
+   * coverage (equivalent to unset). A revision identical to the
+   * current default (including clearing an already-unset default)
+   * is a no-op with no audit — ends are compared one by one, with
+   * `undefined` counting as missing.
+   * Audited as `default_key_range_revised`
+   * (`{ previous, keyRange }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to the
+   * subscribe-time gates and unbounded ends, exactly the previous
+   * behavior; only the key-range ends are recorded).
+   *
+   * Orthogonal to EB-232 (that is the key-range mechanism itself —
+   * the `[start, end)` slice and the delivery gate — this sets the
+   * default a new opt-in subscriber's omitted ends fall back to),
+   * to EB-284 (that revises one subscriber's range at a time — this
+   * sets the fleet default), to EB-504 (that is the barrier hold
+   * bound — this is key slicing; the range decision runs before the
+   * barrier gate), to EB-487 (that is the rate-limit default — this
+   * the key range), to EB-503 (that is the causal buffer bound —
+   * this the key range; the range decision runs before the causal
+   * gate), and to EB-488–507 (those set the defaults of the other
+   * options in the same family — this the key range).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal `start` / `end`.
+   */
+  setDefaultKeyRange(range: KeyRangeOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultKeyRange');
+    if (range !== null && (typeof range !== 'object' || Array.isArray(range))) {
+      throw new RangeError(
+        'setDefaultKeyRange: keyRange must be an object with optional start/end strings, or null to clear it',
+      );
+    }
+    const start = range?.start;
+    if (start !== undefined && typeof start !== 'string') {
+      throw new RangeError('setDefaultKeyRange: keyRange.start must be a string');
+    }
+    const end = range?.end;
+    if (end !== undefined && typeof end !== 'string') {
+      throw new RangeError('setDefaultKeyRange: keyRange.end must be a string');
+    }
+    if (start !== undefined && end !== undefined && start >= end) {
+      throw new RangeError('setDefaultKeyRange: keyRange.start must be < keyRange.end');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing end and an explicitly-undefined one compare equal.
+    const next: KeyRangeOptions | undefined =
+      range === null
+        ? undefined
+        : {
+            ...(start !== undefined ? { start } : {}),
+            ...(end !== undefined ? { end } : {}),
+          };
+    const previous: KeyRangeOptions | null =
+      this.defaultKeyRange === undefined ? null : { ...this.defaultKeyRange };
+    // Re-affirming the current default is a no-op: no audit. Ends
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.start ?? undefined) === (next?.start ?? undefined) &&
+      (previous?.end ?? undefined) === (next?.end ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultKeyRange = next;
+    this.auditSubscription({
+      action: 'default_key_range_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        keyRange: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default key range (EB-508) — the
+   * `KeyRangeOptions` future opt-in subscribers fall back to when
+   * they omit an end — `undefined` before any revision (no default,
+   * new opt-in subscribers still take unbounded ends), then
+   * whatever `setDefaultKeyRange` last installed. Returns a copy, so
+   * mutating the result never moves the live default.
+   */
+  getDefaultKeyRange(): KeyRangeOptions | undefined {
+    return this.defaultKeyRange === undefined ? undefined : { ...this.defaultKeyRange };
   }
 
   /**

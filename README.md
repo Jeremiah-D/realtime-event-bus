@@ -10216,6 +10216,32 @@ oldKeyRange: { start?, end? } }`). Orthogonal to content filtering
 which keys match). (Real-time systems: key-range subscription
 governance.)
 
+Bus-level default (EB-508, via `setDefaultKeyRange(range | null,
+actor = 'system')` / `getDefaultKeyRange()`): the `start` / `end`
+new opt-in `keyRange` subscribers fall back to when they omit an
+end. The priority chain is subscriber-explicit > bus default >
+unbounded, resolved field by field — `{ start: 'a', end: 'm' }`
+narrows every new opt-in subscriber at once, an explicit end always
+wins over the default end, and `{}` opts in and takes the whole
+default (with no default installed, `{}` still means match every
+keyed message). The merged range passes the same subscribe-time
+gates, so two ends that meet only after the merge (an explicit `end`
+<= the default `start`, or the reverse) still throw `RangeError`
+with no half-registered subscriber. The default never enables a
+key range: a subscriber that omits `keyRange` receives keyed and
+keyless messages exactly as before. A revision only affects
+subscribers that join after it — a subscriber keeps the range it
+was baked with — and `setKeyRange` still revises one subscriber at
+a time with its whole-range / only-set semantics, never consulting
+the bus default, so clearing a range never re-applies the default.
+`null` clears the default back to no default. A same-value revision
+is a no-op with no audit, and every success is audited as
+`default_key_range_revised` (`{ previous, keyRange }`, `null` when
+the default is unset). There is no construction-time option and the
+revision is live-only — a restart restores the unset default — and
+it never enters a config snapshot. (Real-time systems: key-range
+subscription governance.)
+
 ## Dead-letter replay approval (EB-233)
 
 `replayDeadLetter` used to redeliver immediately: any operator
