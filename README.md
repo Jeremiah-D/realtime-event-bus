@@ -4064,6 +4064,25 @@ library.
   revision identical to the current bound is a no-op with no audit. Every success is audited as
   `causal_revised` (`{ maxBufferPerSource: <number>, oldMaxBufferPerSource: <number> }`). (Real-time
   systems: causal delivery governance.)
+  A live bus-level default (EB-503, via
+  `setDefaultCausal(opts | null, actor = 'system')` /
+  `getDefaultCausal()`) decides the `maxBufferPerSource` a new
+  subscriber falls back to when it opts into `causal` but omits the
+  bound — the priority chain is subscriber-explicit > bus default >
+  built-in 1000. `true` takes the whole default, and `{}` opts in and
+  takes the whole default too. The revision only affects subscribers
+  that join after it; an already-subscribed causal subscriber keeps
+  the bound, the per-source expectations, the skipped-clock sets, and
+  the already-buffered messages it was baked with, and the
+  per-subscriber revision (`setCausal`) still revises such a
+  subscriber one at a time without touching the bus default. The
+  default never enables causal delivery: a subscriber that does not
+  opt into `causal` is untouched by it. Out of the box there is no
+  default; there is no construction-time option, the default never
+  enters a config snapshot, and a restart restores the unset default.
+  Every success is audited as `default_causal_revised` (`{ previous,
+  causal }`, `null` when the default is unset; only the bound is
+  recorded).
 - **Barrier cut markers** (EB-98, in `src/bus.ts`, via
   `publish(topic, payload, { barrier: { epoch } })` and opt-in
   `subscribe(pattern, handler, { barrier: true | { maxHeldMessages? } })`):

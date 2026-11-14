@@ -11155,13 +11155,17 @@ function resolveRateLimitOptions(
  * Resolves `SubscribeOptions.causal` into the subscriber's gate state.
  * `undefined`/`false` disables the gate (no buffers, no clock tracking —
  * zero overhead); `true` takes the defaults; an object tunes the
- * per-source buffer bound. Anything else throws `RangeError`.
+ * per-source buffer bound. EB-503: `defaults` is the live bus default
+ * installed via `setDefaultCausal` — the terminal fallback below an
+ * explicit `maxBufferPerSource`, and the whole default when the
+ * subscriber passes `true` or `{}`. Anything else throws `RangeError`.
  */
 function resolveCausalOptions(
   causal: boolean | CausalSubscribeOptions | undefined,
+  defaults?: CausalSubscribeOptions,
 ): CausalGateState | undefined {
   if (causal === undefined || causal === false) return undefined;
-  let maxBufferPerSource = 1000;
+  let maxBufferPerSource = defaults?.maxBufferPerSource ?? 1000;
   if (causal !== true) {
     if (typeof causal !== 'object' || causal === null) {
       throw new RangeError('subscribe: causal must be a boolean or a CausalSubscribeOptions object');
@@ -18268,6 +18272,18 @@ export class EventBus {
    * subscriber's own.
    */
   private defaultDeduplicateMessages?: DeduplicateMessagesDefaultOptions;
+  /**
+   * Bus-level terminal causal-delivery default (EB-503): the
+   * `maxBufferPerSource` a new subscriber falls back to when it opts
+   * into `causal` but omits the bound. Starts unset (`undefined` —
+   * no default, omitting the bound still means the built-in 1000,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultCausal`; there is no construction-time option, and a
+   * restart restores the unset default. The default never enables
+   * causal delivery: a subscriber that does not opt into `causal`
+   * is untouched by it.
+   */
+  private defaultCausal?: CausalSubscribeOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34216,8 +34232,14 @@ export class EventBus {
     // own: a subscriber that passes no `keyHotspot` is untouched.
     const keyHotspot = resolveKeyHotspotOptions(opts?.keyHotspot, this.defaultKeyHotspot);
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind.
-    const causal = resolveCausalOptions(opts?.causal);
+    // half-registered subscriber behind. EB-503: a subscriber that
+    // opts into `causal` but omits `maxBufferPerSource` falls back to
+    // the live bus default, if one is installed — the bus default
+    // sits between the explicit option and the built-in 1000. An
+    // explicit bound always wins, `true` takes the whole default,
+    // and the default never enables causal delivery on its own: a
+    // subscriber that passes no `causal` is untouched.
+    const causal = resolveCausalOptions(opts?.causal, this.defaultCausal);
     // Validated before anything registers, so a throw leaves no
     // half-registered subscriber behind.
     const barrier = resolveBarrierOptions(opts?.barrier);
@@ -52275,6 +52297,117 @@ export class EventBus {
     return this.defaultDeduplicateMessages === undefined
       ? undefined
       : { ...this.defaultDeduplicateMessages };
+  }
+
+  /**
+   * Sets the live bus-level default causal-delivery buffer bound
+   * (EB-503) without re-subscribing anyone:
+   * `setDefaultCausal(opts, actor = 'system')` decides the
+   * `maxBufferPerSource` for future subscribers that opt into
+   * `causal` but omit the bound (see `CausalSubscribeOptions`) —
+   * `{ maxBufferPerSource: 50 }` to give every new opt-in subscriber
+   * a 50-message per-source reorder buffer with one call, `null` to
+   * clear the default back to no default (new opt-in subscribers go
+   * back to the built-in 1000).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 1000 — the bus default is
+   * the terminal fallback below the explicit option. `true` takes
+   * the whole default, and `{}` opts in and takes the whole default
+   * too. A subscriber that took the default at subscribe time keeps
+   * the bound, the per-source expectations, the skipped-clock sets,
+   * and the already-buffered messages it was baked with: a later
+   * revision never moves an already-subscribed bound, and
+   * `setCausal` (EB-291) still revises such a subscriber one at a
+   * time without touching the bus default — it only ever takes a
+   * bound value, never consults the bus default, so the default
+   * never re-applies to it. The default never enables causal
+   * delivery: a subscriber that does not opt into `causal` is
+   * untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, or a non-integer / < 1 `maxBufferPerSource` throws
+   * `RangeError` with the live default and the audit log untouched.
+   * `{}` is accepted and installs no field coverage (equivalent to
+   * unset). A revision identical to the current default (including
+   * clearing an already-unset default) is a no-op with no audit —
+   * fields are compared one by one, with `undefined` counting as
+   * missing. Audited as `default_causal_revised`
+   * (`{ previous, causal }`, `null` when the default is unset —
+   * unset means new opt-in subscribers go back to the built-in
+   * 1000, exactly the previous behavior; only the bound is
+   * recorded).
+   *
+   * Orthogonal to EB-98/EB-36 (those are the causal mechanism
+   * itself — happens-before delivery and the bounded buffer — this
+   * sets the default a new opt-in subscriber's omitted bound falls
+   * back to), to EB-291 (that revises one subscriber's bound at a
+   * time — this sets the fleet default), and to EB-499–502 (those
+   * set the defaults of the other options in the same family — this
+   * the causal buffer bound).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal
+   * `maxBufferPerSource`.
+   */
+  setDefaultCausal(opts: CausalSubscribeOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultCausal');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultCausal: causal must be an object with maxBufferPerSource, or null to clear it',
+      );
+    }
+    const maxBufferPerSource = opts?.maxBufferPerSource;
+    if (
+      maxBufferPerSource !== undefined &&
+      (!Number.isInteger(maxBufferPerSource) || maxBufferPerSource < 1)
+    ) {
+      throw new RangeError('causal.maxBufferPerSource must be a positive integer');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: CausalSubscribeOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(maxBufferPerSource !== undefined ? { maxBufferPerSource } : {}),
+          };
+    const previous: CausalSubscribeOptions | null =
+      this.defaultCausal === undefined ? null : { ...this.defaultCausal };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if ((previous?.maxBufferPerSource ?? undefined) === (next?.maxBufferPerSource ?? undefined)) {
+      return;
+    }
+    this.defaultCausal = next;
+    this.auditSubscription({
+      action: 'default_causal_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        causal: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default causal-delivery buffer bound
+   * (EB-503) — the `CausalSubscribeOptions` future opt-in
+   * subscribers fall back to when they omit the bound — `undefined`
+   * before any revision (no default, new opt-in subscribers still
+   * take the built-in 1000), then whatever `setDefaultCausal` last
+   * installed. Returns a copy, so mutating the result never moves
+   * the live default.
+   */
+  getDefaultCausal(): CausalSubscribeOptions | undefined {
+    return this.defaultCausal === undefined ? undefined : { ...this.defaultCausal };
   }
 
   /**
