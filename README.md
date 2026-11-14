@@ -3895,6 +3895,23 @@ library.
   aggregate, field?, maxSessionsPerKey } | null, oldSessionWindow:
   { ... } }`). Orthogonal to the session-window mechanism itself
   (EB-188, that sets it at subscribe time, this revises it).
+  Bus default (EB-507, via `setDefaultSessionWindow(opts | null)`):
+  future subscribers that opt into `sessionWindow` without an explicit
+  `gapMs` / `aggregate` / `field` / `maxSessionsPerKey` take the live
+  bus default field by field — `{ gapMs: 5000, aggregate: 'count' }` to
+  fold every new opt-in subscriber's idle-separated bursts into one
+  aggregate per session with one call, `null` to clear back to no
+  default; `{}` opts in and takes the whole default. The chain is
+  explicit > bus default > required / 1024 (with no default installed
+  a missing `gapMs` / `aggregate` still throws and `maxSessionsPerKey`
+  still means 1024), and the default never enables aggregation — a
+  subscriber that does not opt into `sessionWindow` is untouched by
+  it. A revision never moves an already-subscribed session's gap, fold,
+  field, bound, open sessions, or armed sweep timer. There is no
+  construction-time option and the revision is live-only (a restart
+  restores the unset default); a revision identical to the current
+  default is a no-op with no audit. Audited as
+  `default_session_window_revised` (`{ previous, sessionWindow }`).
 - **Atomic cross-topic batch publish** (in `src/bus.ts`, via
   `publishAtomic(entries)`): all-or-nothing fan-out for multi-message
   batches — subscribers either see every message or none. Admission runs in

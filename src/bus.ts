@@ -11679,27 +11679,35 @@ const DEFAULT_MAX_SESSIONS_PER_KEY = 1024;
  * session state. Returns `undefined` when session aggregation is
  * disabled. Throws `TypeError` for a non-object value and `RangeError`
  * for an invalid `gapMs`, `aggregate`, `field`, or
- * `maxSessionsPerKey`.
+ * `maxSessionsPerKey`. EB-507: `defaults` is the live bus default
+ * installed via `setDefaultSessionWindow` — the terminal fallback
+ * below an explicit `gapMs` / `aggregate` / `field` /
+ * `maxSessionsPerKey`, and the whole default when the subscriber
+ * passes `{}`. A field missing from both the subscriber and the
+ * default still throws (except `maxSessionsPerKey`, which falls back
+ * to the built-in 1024): the default fills in omitted fields, it
+ * never satisfies the required ones on its own.
  */
 function resolveSessionWindowOptions(
   opt: SessionWindowOptions | undefined,
+  defaults?: SessionWindowOptions,
 ): SubscriberSessionWindowState | undefined {
   if (opt === undefined) return undefined;
   if (typeof opt !== 'object' || opt === null) {
     throw new TypeError('subscribe: sessionWindow must be a SessionWindowOptions object');
   }
-  const gapMs = opt.gapMs;
+  const gapMs = opt.gapMs ?? defaults?.gapMs;
   if (!Number.isFinite(gapMs) || gapMs <= 0) {
     throw new RangeError('subscribe: sessionWindow.gapMs must be a positive finite number of milliseconds');
   }
-  const aggregate = opt.aggregate;
+  const aggregate = opt.aggregate ?? defaults?.aggregate;
   if (typeof aggregate !== 'string' || !WINDOW_AGGREGATES.has(aggregate)) {
     throw new RangeError(
       "subscribe: sessionWindow.aggregate must be one of 'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' | 'concat'",
     );
   }
-  const fieldPath = parseWindowFieldPath(opt.field);
-  const maxSessionsPerKey = opt.maxSessionsPerKey ?? DEFAULT_MAX_SESSIONS_PER_KEY;
+  const fieldPath = parseWindowFieldPath(opt.field ?? defaults?.field);
+  const maxSessionsPerKey = opt.maxSessionsPerKey ?? defaults?.maxSessionsPerKey ?? DEFAULT_MAX_SESSIONS_PER_KEY;
   if (!Number.isInteger(maxSessionsPerKey) || maxSessionsPerKey <= 0) {
     throw new RangeError('subscribe: sessionWindow.maxSessionsPerKey must be a positive integer');
   }
@@ -18344,6 +18352,19 @@ export class EventBus {
    * `window` is untouched by it.
    */
   private defaultWindow?: WindowAggregateOptions;
+  /**
+   * Bus-level terminal session-window aggregation default (EB-507):
+   * the `gapMs` / `aggregate` / `field` / `maxSessionsPerKey` a new
+   * subscriber falls back to when it opts into `sessionWindow` but
+   * omits a field. Starts unset (`undefined` — no default, omitting
+   * `gapMs` / `aggregate` still throws and `maxSessionsPerKey` still
+   * means the built-in 1024, exactly the previous behavior) and
+   * moves only via `setDefaultSessionWindow`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables aggregation: a subscriber
+   * that does not opt into `sessionWindow` is untouched by it.
+   */
+  private defaultSessionWindow?: SessionWindowOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34331,8 +34352,14 @@ export class EventBus {
     // Session windows cut on inactivity while tumbling windows cut on
     // clock boundaries — orthogonal semantics, so combining both on one
     // subscription would double-aggregate the same messages: fail fast
-    // instead of pretending the composition is coherent.
-    const sessionWindow = resolveSessionWindowOptions(opts?.sessionWindow);
+    // instead of pretending the composition is coherent. EB-507: a
+    // subscriber that opts into `sessionWindow` but omits a field falls
+    // back to the live bus default, if one is installed — the bus
+    // default sits between the explicit option and the required fields
+    // / the built-in 1024. An explicit field always wins, `{}` takes
+    // the whole default, and the default never enables aggregation on
+    // its own: a subscriber that passes no `sessionWindow` is untouched.
+    const sessionWindow = resolveSessionWindowOptions(opts?.sessionWindow, this.defaultSessionWindow);
     if (window !== undefined && sessionWindow !== undefined) {
       throw new RangeError('subscribe: sessionWindow cannot be combined with window');
     }
@@ -52839,6 +52866,150 @@ export class EventBus {
    */
   getDefaultWindow(): WindowAggregateOptions | undefined {
     return this.defaultWindow === undefined ? undefined : { ...this.defaultWindow };
+  }
+
+  /**
+   * Sets the live bus-level default session-window aggregation
+   * (EB-507) without re-subscribing anyone:
+   * `setDefaultSessionWindow(opts, actor = 'system')` decides the
+   * `gapMs` / `aggregate` / `field` / `maxSessionsPerKey` for future
+   * subscribers that opt into `sessionWindow` but omit a field (see
+   * `SessionWindowOptions`) — `{ gapMs: 5000, aggregate: 'count' }`
+   * to fold every new opt-in subscriber's idle-separated bursts into
+   * one aggregate per session with one call, `null` to clear the
+   * default back to no default (new opt-in subscribers go back to
+   * the subscribe-time required fields and the built-in 1024).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > required / 1024 (no default
+   * means a missing `gapMs` / `aggregate` still throws and
+   * `maxSessionsPerKey` still means 1024) — the bus default is the
+   * terminal fallback below the explicit field, and `{}` opts in and
+   * takes the whole default. A subscriber that took the default at
+   * subscribe time keeps the gap, the fold, the field, the session
+   * bound, the open sessions, and the armed sweep timer it was baked
+   * with: a later revision never moves an already-subscribed session
+   * table or timer, and `setSessionWindow` (EB-280) still revises
+   * such a subscriber one at a time without touching the bus
+   * default — it only ever takes gap/bound values, never consults
+   * the bus default, so the default never re-applies to it. The
+   * default never enables aggregation: a subscriber that does not
+   * opt into `sessionWindow` is untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-finite / <= 0 `gapMs`, an `aggregate` outside the
+   * seven kinds, an illegal dot-path `field`, or a non-positive /
+   * non-integer `maxSessionsPerKey` throws `RangeError` with the
+   * live default and the audit log untouched. `{}` is accepted and
+   * installs no field coverage (equivalent to unset). A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — fields are
+   * compared one by one, with `undefined` counting as missing.
+   * Audited as `default_session_window_revised`
+   * (`{ previous, sessionWindow }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to the
+   * required fields and the built-in 1024, exactly the previous
+   * behavior; only the session-window fields are recorded).
+   *
+   * Orthogonal to EB-188 (that is the session-window mechanism
+   * itself — the gap, the fold, the session table, and the aggregate
+   * delivery — this sets the default a new opt-in subscriber's
+   * omitted fields fall back to), to EB-280 (that revises one
+   * subscriber's gap and session bound at a time — this sets the
+   * fleet default), to EB-73 / EB-506 (those are tumbling windows,
+   * cut on clock boundaries — this is the inactivity-cut session
+   * window; the two can never share one subscription), and to
+   * EB-488–506 (those set the defaults of the other options in the
+   * same family — this the session-window aggregation).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal `gapMs` /
+   * `aggregate` / `field` / `maxSessionsPerKey`.
+   */
+  setDefaultSessionWindow(opts: SessionWindowOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultSessionWindow');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultSessionWindow: sessionWindow must be an object with gapMs/aggregate/field/maxSessionsPerKey, or null to clear it',
+      );
+    }
+    const gapMs = opts?.gapMs;
+    if (gapMs !== undefined && (!Number.isFinite(gapMs) || gapMs <= 0)) {
+      throw new RangeError('sessionWindow.gapMs must be a positive finite number of milliseconds');
+    }
+    const aggregate = opts?.aggregate;
+    if (aggregate !== undefined && (typeof aggregate !== 'string' || !WINDOW_AGGREGATES.has(aggregate))) {
+      throw new RangeError(
+        "sessionWindow.aggregate must be one of 'count' | 'sum' | 'avg' | 'min' | 'max' | 'last' | 'concat'",
+      );
+    }
+    const field = opts?.field;
+    if (field !== undefined) {
+      try {
+        parseWindowFieldPath(field);
+      } catch (err) {
+        throw new RangeError(`setDefaultSessionWindow: ${(err as Error).message}`);
+      }
+    }
+    const maxSessionsPerKey = opts?.maxSessionsPerKey;
+    if (
+      maxSessionsPerKey !== undefined &&
+      (!Number.isInteger(maxSessionsPerKey) || maxSessionsPerKey <= 0)
+    ) {
+      throw new RangeError('sessionWindow.maxSessionsPerKey must be a positive integer');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: SessionWindowOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(gapMs !== undefined ? { gapMs } : {}),
+            ...(aggregate !== undefined ? { aggregate: aggregate as WindowAggregateKind } : {}),
+            ...(field !== undefined ? { field } : {}),
+            ...(maxSessionsPerKey !== undefined ? { maxSessionsPerKey } : {}),
+          };
+    const previous: SessionWindowOptions | null =
+      this.defaultSessionWindow === undefined ? null : { ...this.defaultSessionWindow };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.gapMs ?? undefined) === (next?.gapMs ?? undefined) &&
+      (previous?.aggregate ?? undefined) === (next?.aggregate ?? undefined) &&
+      (previous?.field ?? undefined) === (next?.field ?? undefined) &&
+      (previous?.maxSessionsPerKey ?? undefined) === (next?.maxSessionsPerKey ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultSessionWindow = next;
+    this.auditSubscription({
+      action: 'default_session_window_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        sessionWindow: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default session-window aggregation
+   * (EB-507) — the `SessionWindowOptions` future opt-in subscribers
+   * fall back to when they omit a field — `undefined` before any
+   * revision (no default, new opt-in subscribers still take the
+   * subscribe-time required fields and the built-in 1024), then
+   * whatever `setDefaultSessionWindow` last installed. Returns a
+   * copy, so mutating the result never moves the live default.
+   */
+  getDefaultSessionWindow(): SessionWindowOptions | undefined {
+    return this.defaultSessionWindow === undefined ? undefined : { ...this.defaultSessionWindow };
   }
 
   /**
