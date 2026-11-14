@@ -140,26 +140,36 @@ export function resolveDeliveryWindow(window: DeliveryWindow): ResolvedDeliveryW
   };
 }
 
-/** Validates `DeliveryWindowOptions`; throws `RangeError` on bad input. */
+/**
+ * Validates `DeliveryWindowOptions`; throws `RangeError` on bad input.
+ * When `opts` omits a field, the live bus default (`defaults`, EB-509)
+ * fills it in field by field — an explicit field always wins, and
+ * `windows: []` / `maxHoldMs: 0` are real values, never swallowed by
+ * `??`. `undefined` opts still means "no gate at all" — the default
+ * never opts a subscriber in on its own.
+ */
 export function resolveDeliveryWindowOptions(
   opts: DeliveryWindowOptions | undefined,
+  defaults?: DeliveryWindowOptions,
 ): ResolvedDeliveryWindowOptions | undefined {
   if (opts === undefined) return undefined;
   if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
     throw new RangeError('deliveryWindows must be an object with a windows array');
   }
-  if (!Array.isArray(opts.windows)) {
+  const windows = opts.windows ?? defaults?.windows;
+  if (!Array.isArray(windows)) {
     throw new RangeError('deliveryWindows.windows must be an array');
   }
+  const maxHoldMsOpt = opts.maxHoldMs ?? defaults?.maxHoldMs;
   let maxHoldMs: number | undefined;
-  if (opts.maxHoldMs !== undefined) {
-    if (!Number.isFinite(opts.maxHoldMs) || opts.maxHoldMs < 0) {
+  if (maxHoldMsOpt !== undefined) {
+    if (!Number.isFinite(maxHoldMsOpt) || maxHoldMsOpt < 0) {
       throw new RangeError('deliveryWindows.maxHoldMs must be a finite number of milliseconds >= 0');
     }
-    maxHoldMs = opts.maxHoldMs;
+    maxHoldMs = maxHoldMsOpt;
   }
   return {
-    windows: opts.windows.map(resolveDeliveryWindow),
+    windows: windows.map(resolveDeliveryWindow),
     maxHoldMs,
   };
 }

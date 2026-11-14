@@ -332,6 +332,7 @@ import {
 import {
   DeliveryWindowGate,
   resolveDeliveryWindowOptions,
+  type DeliveryWindow,
   type DeliveryWindowOptions,
 } from './delivery-window.ts';
 import {
@@ -1446,6 +1447,61 @@ function sameHeaders(
   if (aKeys.length !== bKeys.length) return false;
   for (const k of aKeys) {
     if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+/**
+ * Defensive copy of a `DeliveryWindowOptions` (EB-509): the windows
+ * array and every window (including its `days` array) are copied, so
+ * mutating the caller's object — or a returned getter value — never
+ * moves the live bus default. `undefined` fields are dropped, so a
+ * missing field and an explicitly-undefined one compare equal.
+ */
+function copyDeliveryWindowOptions(opts: DeliveryWindowOptions): DeliveryWindowOptions {
+  return {
+    windows: opts.windows.map((w: DeliveryWindow) => ({
+      start: w.start,
+      end: w.end,
+      ...(w.days !== undefined ? { days: [...w.days] } : {}),
+      ...(w.timeZone !== undefined ? { timeZone: w.timeZone } : {}),
+    })),
+    ...(opts.maxHoldMs !== undefined ? { maxHoldMs: opts.maxHoldMs } : {}),
+  };
+}
+
+/**
+ * Same-value comparison for two `DeliveryWindowOptions` (EB-509):
+ * windows compare window by window (`start` / `end` / `days` as a
+ * set / `timeZone`, with `undefined` counting as missing) plus
+ * `maxHoldMs`. Used by `setDefaultDeliveryWindows` so re-affirming
+ * the current default is a no-op with no audit.
+ */
+function sameDeliveryWindowOptions(
+  a: DeliveryWindowOptions | undefined,
+  b: DeliveryWindowOptions | undefined,
+): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  if ((a.maxHoldMs ?? undefined) !== (b.maxHoldMs ?? undefined)) return false;
+  if (a.windows.length !== b.windows.length) return false;
+  for (let i = 0; i < a.windows.length; i++) {
+    const wa = a.windows[i];
+    const wb = b.windows[i];
+    if (wa.start !== wb.start || wa.end !== wb.end) return false;
+    if ((wa.timeZone ?? undefined) !== (wb.timeZone ?? undefined)) return false;
+    const da = wa.days;
+    const db = wb.days;
+    if (da === undefined || db === undefined) {
+      if (da !== db) return false;
+    } else {
+      if (da.length !== db.length) return false;
+      const sortedA = [...da].sort((x, y) => x - y);
+      const sortedB = [...db].sort((x, y) => x - y);
+      for (let j = 0; j < sortedA.length; j++) {
+        if (sortedA[j] !== sortedB[j]) return false;
+      }
+    }
   }
   return true;
 }
@@ -18377,6 +18433,18 @@ export class EventBus {
    */
   private defaultKeyRange?: KeyRangeOptions;
   /**
+   * Bus-level terminal delivery-window default (EB-509): the
+   * `windows` / `maxHoldMs` a new subscriber falls back to when it
+   * opts into `deliveryWindows` but omits a field. Starts unset
+   * (`undefined` — no default, omitting `windows` still throws,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultDeliveryWindows`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables windowing: a subscriber that does not opt into
+   * `deliveryWindows` is untouched by it.
+   */
+  private defaultDeliveryWindows?: DeliveryWindowOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -34355,8 +34423,13 @@ export class EventBus {
     const barrier = resolveBarrierOptions(opts?.barrier, this.defaultBarrier);
     // Delivery windows (EB-230): validated before anything
     // registers, so a throw leaves no half-registered subscriber
-    // behind.
-    const deliveryWindowOpts = resolveDeliveryWindowOptions(opts?.deliveryWindows);
+    // behind. EB-509: a subscriber that opts into `deliveryWindows`
+    // but omits a field falls back to the live bus default, if one
+    // is installed — the bus default is the terminal fallback below
+    // the explicit field. An explicit field always wins, `{}` takes
+    // the whole default, and the default never enables windowing: a
+    // subscriber that passes no `deliveryWindows` is untouched.
+    const deliveryWindowOpts = resolveDeliveryWindowOptions(opts?.deliveryWindows, this.defaultDeliveryWindows);
     const deliveryWindow =
       deliveryWindowOpts === undefined ? undefined : new DeliveryWindowGate(deliveryWindowOpts);
     // Validated before anything registers, so a throw leaves no
@@ -53144,6 +53217,113 @@ export class EventBus {
   }
 
   /**
+   * Sets the live bus-level default delivery windows (EB-509)
+   * without re-subscribing anyone:
+   * `setDefaultDeliveryWindows(opts, actor = 'system')` decides the
+   * `windows` / `maxHoldMs` for future subscribers that opt into
+   * `deliveryWindows` but omit a field (see
+   * `DeliveryWindowOptions`) — `{ windows: [{ start: '09:00', end:
+   * '18:00' }], maxHoldMs: 60000 }` to give every new opt-in
+   * subscriber the same business-hours shape with one call, `null`
+   * to clear the default back to no default (new opt-in subscribers
+   * go back to `windows` being required at subscribe time).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > required (no default means a
+   * missing `windows` still throws) — the bus default is the
+   * terminal fallback below the explicit field, and `{}` opts in and
+   * takes the whole default. An explicit field always wins: an
+   * explicit `windows: []` means all-day delivery even when the
+   * default lists windows, and an explicit `maxHoldMs: 0` means no
+   * holding slack even when the default allows some. A subscriber
+   * that took the default at subscribe time keeps the gate, the
+   * hold queue, and the `heldAtMs` clock it was baked with: a later
+   * revision never moves an already-subscribed gate or held message,
+   * and `setDeliveryWindow` (EB-263) still revises such a subscriber
+   * one at a time without touching the bus default — it only ever
+   * takes a whole window set, never consults the bus default, so
+   * the default never re-applies to it, and clearing a subscriber's
+   * windows there does not re-apply the default either. The default
+   * never enables windowing: a subscriber that does not opt into
+   * `deliveryWindows` is untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a `windows` that is not an array (an empty array is
+   * legal — it means all-day delivery), a window whose `start` /
+   * `end` is not `HH:MM`, a `days` outside 0–6, an unknown IANA
+   * `timeZone`, or a non-finite / negative `maxHoldMs` throws
+   * `RangeError` with the live default and the audit log untouched.
+   * A revision identical to the current default (including clearing
+   * an already-unset default) is a no-op with no audit — windows
+   * compare window by window (`start` / `end` / `days` / `timeZone`)
+   * plus `maxHoldMs`. Audited as `default_delivery_windows_revised`
+   * (`{ previous, deliveryWindows }`, `null` when the default is
+   * unset — unset means new opt-in subscribers go back to `windows`
+   * being required, exactly the previous behavior; only the
+   * delivery-window fields are recorded).
+   *
+   * Orthogonal to EB-230 (that is the delivery-window mechanism
+   * itself — the calendar gate, the hold, and the flush — this sets
+   * the default a new opt-in subscriber's omitted fields fall back
+   * to), to EB-263 (that revises one subscriber's windows at a time
+   * — this sets the fleet default), to EB-506/507 (those are window
+   * aggregation — the fold on close — this is the calendar shaping
+   * of when a message may be delivered at all; a window close flush
+   * and a delivery-window hold/flush are orthogonal), and to
+   * EB-488–508 (those set the defaults of the other options in the
+   * same family — this the delivery windows).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal `windows` /
+   * `maxHoldMs`.
+   */
+  setDefaultDeliveryWindows(opts: DeliveryWindowOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDeliveryWindows');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultDeliveryWindows: deliveryWindows must be an object with a windows array and an optional maxHoldMs, or null to clear it',
+      );
+    }
+    // Validate with the subscribe-time gate before touching anything:
+    // a failed call leaves the live default untouched.
+    if (opts !== null) {
+      try {
+        resolveDeliveryWindowOptions(opts);
+      } catch (err) {
+        throw new RangeError(`setDefaultDeliveryWindows: ${(err as Error).message}`);
+      }
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal,
+    // and store a defensive deep copy of the windows array.
+    const next: DeliveryWindowOptions | undefined =
+      opts === null ? undefined : copyDeliveryWindowOptions(opts);
+    const previous: DeliveryWindowOptions | null =
+      this.defaultDeliveryWindows === undefined ? null : copyDeliveryWindowOptions(this.defaultDeliveryWindows);
+    // Re-affirming the current default is a no-op: no audit. Windows
+    // compare window by window, with `undefined` counting as missing.
+    if (sameDeliveryWindowOptions(previous ?? undefined, next)) {
+      return;
+    }
+    this.defaultDeliveryWindows = next;
+    this.auditSubscription({
+      action: 'default_delivery_windows_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : copyDeliveryWindowOptions(previous),
+        deliveryWindows: next === undefined ? null : copyDeliveryWindowOptions(next),
+      },
+    });
+  }
+
+  /**
    * Returns the live bus-level default key range (EB-508) — the
    * `KeyRangeOptions` future opt-in subscribers fall back to when
    * they omit an end — `undefined` before any revision (no default,
@@ -53155,6 +53335,20 @@ export class EventBus {
     return this.defaultKeyRange === undefined ? undefined : { ...this.defaultKeyRange };
   }
 
+  /**
+   * Returns the live bus-level default delivery windows (EB-509) —
+   * the `DeliveryWindowOptions` future opt-in subscribers fall back
+   * to when they omit a field — `undefined` before any revision (no
+   * default, new opt-in subscribers still take `windows` as
+   * required), then whatever `setDefaultDeliveryWindows` last
+   * installed. Returns a deep copy, so mutating the result never
+   * moves the live default.
+   */
+  getDefaultDeliveryWindows(): DeliveryWindowOptions | undefined {
+    return this.defaultDeliveryWindows === undefined
+      ? undefined
+      : copyDeliveryWindowOptions(this.defaultDeliveryWindows);
+  }
   /**
    * Sets the live bus-level terminal group max-members default
    * (EB-467) without touching any live group:

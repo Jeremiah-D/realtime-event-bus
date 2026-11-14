@@ -10157,8 +10157,26 @@ only `null` is), and every success is audited as
 each the resolved windows, or `null` for a clear). Orthogonal to
 `delayed.ts` (a one-shot future fan-out, not a recurring
 window) and to WR-52 (the relay's inbound quiet hours, not a
-bus subscriber window). (Real-time systems: subscriber-side
-traffic shaping.)
+bus subscriber window). Bus default (EB-509, via
+`setDefaultDeliveryWindows(opts | null)`): future subscribers
+that opt into `deliveryWindows` without an explicit `windows` /
+`maxHoldMs` take the live bus default field by field —
+`{ windows: [{ start: '09:00', end: '18:00' }], maxHoldMs: 60000 }`
+to give every new opt-in subscriber the same business-hours shape
+with one call, `null` to clear back to no default; `{}` opts in
+and takes the whole default. The chain is explicit > bus default >
+required (with no default installed a missing `windows` still
+throws), and an explicit `windows: []` still means all-day
+delivery while an explicit `maxHoldMs: 0` still means no holding
+slack. The default never enables windowing — a subscriber that
+does not opt into `deliveryWindows` is untouched by it. A
+revision never moves an already-subscribed gate, its hold queue,
+or a held message's `heldAtMs` clock. There is no
+construction-time option and the revision is live-only (a restart
+restores the unset default); a revision identical to the current
+default is a no-op with no audit. Audited as
+`default_delivery_windows_revised` (`{ previous, deliveryWindows }`).
+(Real-time systems: subscriber-side traffic shaping.)
 
 ## Key-range subscriptions (EB-232)
 
