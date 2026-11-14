@@ -1425,6 +1425,25 @@ library.
   the byte budget (EB-282, that revises `queueMaxBytes`, this revises
   the message-count capacity). (Real-time systems: delivery
   governance.)
+- **Bus-level default shadow queue tuning**
+  (`setDefaultShadow(opts | null, actor?)`, EB-505): future subscribers
+  that opt into `shadow` without an explicit `queueSize` / `dropPolicy`
+  take the live bus default field by field — `{ queueSize: 7,
+  dropPolicy: 'drop-newest' }` to mirror every new opt-in shadow
+  subscriber into a 7-deep queue that sheds the newest copy with one
+  call, `null` to clear back to no default. The subscribe-time chain is
+  explicit shadow field > bus default shadow field > subscription's own
+  `queueSize` / `dropPolicy` > bus default `queueSize` / `dropPolicy`
+  (EB-470 / EB-475) > 100 / `'drop-oldest'`; `true` takes the whole
+  default and `{}` opts in and takes the whole default too. The default
+  never enables shadowing — a subscriber that does not opt into `shadow`
+  is untouched by it — and a revision never moves an already-subscribed
+  shadow queue's capacity, policy, or counters. There is no
+  construction-time option and the revision is live-only (a restart
+  restores the unset default); a revision identical to the current
+  default is a no-op with no audit. Audited as
+  `default_shadow_revised` (`{ previous, shadow }`).
+  (Real-time systems: delivery governance.)
   Revisable after subscribe (EB-282, via
   `setQueueMaxBytes(subId, bytes | null)`): a subscriber's queue byte
   budget can be retuned without re-subscribing — but only

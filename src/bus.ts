@@ -3171,8 +3171,9 @@ export interface SubscribeOptions {
    *   handler's message as delivered.
    *
    * The shadow queue is the subscription's own queue, sized by
-   * `ShadowSubscribeOptions` (falling back to the subscription's
-   * `queueSize` / `dropPolicy`): a saturated shadow sheds only its own
+   * `ShadowSubscribeOptions` (falling back to the live bus default
+   * installed via `setDefaultShadow`, EB-505, and then to the
+   * subscription's `queueSize` / `dropPolicy`): a saturated shadow sheds only its own
    * copy per its own drop policy. The shadow copy bypasses the
    * per-subscriber ordering gates (keyed / causal) — it mirrors fan-out
    * order — and skips sequence-gap tracking (loss is visible in the
@@ -3190,7 +3191,8 @@ export interface SubscribeOptions {
    * `deliveryLatency`, `lagMonitor`, `latencySlo`, `onBackpressure`,
    * `onDrained`.
    *
-   * Pass `true` for the defaults (the subscription's own `queueSize` /
+   * Pass `true` for the defaults (the live bus default installed via
+   * `setDefaultShadow`, EB-505, then the subscription's own `queueSize` /
    * `dropPolicy`), or a `ShadowSubscribeOptions` object to size the
    * shadow queue independently. Disabled by default.
    */
@@ -3361,7 +3363,8 @@ export interface PulledMessage {
 
 /**
  * Tuning for a shadow subscriber's independent backpressure queue (see
- * `SubscribeOptions.shadow`). Unset fields fall back to the
+ * `SubscribeOptions.shadow`). Unset fields fall back to the live bus
+ * default installed via `setDefaultShadow` (EB-505) and then to the
  * subscription's own `queueSize` / `dropPolicy`, so `shadow: true` needs
  * no tuning at all; set them to size the mirror independently of any
  * production subscriber's queue. Bounds are validated at `subscribe`
@@ -11704,21 +11707,25 @@ function resolveSessionWindowOptions(
  * `queueSize` / `dropPolicy` at the `subscribe` call site). Returns
  * `undefined` when shadowing is disabled. Throws `TypeError` for a
  * non-object value and `RangeError` for an invalid queue size or drop
- * policy.
+ * policy. EB-505: `defaults` is the live bus default installed via
+ * `setDefaultShadow` — the terminal fallback below an explicit
+ * `queueSize` / `dropPolicy`, and the whole default when the
+ * subscriber passes `true` or `{}`.
  */
 function resolveShadowOptions(
   shadow: boolean | ShadowSubscribeOptions | undefined,
+  defaults?: ShadowSubscribeOptions,
 ): { queueSize?: number; dropPolicy?: DropPolicy } | undefined {
   if (shadow === undefined || shadow === false) return undefined;
-  if (shadow === true) return {};
+  if (shadow === true) return { ...defaults };
   if (typeof shadow !== 'object' || shadow === null) {
     throw new TypeError('subscribe: shadow must be a boolean or a ShadowSubscribeOptions object');
   }
-  const queueSize = shadow.queueSize;
+  const queueSize = shadow.queueSize ?? defaults?.queueSize;
   if (queueSize !== undefined && (!Number.isInteger(queueSize) || queueSize <= 0)) {
     throw new RangeError('subscribe: shadow.queueSize must be a positive integer');
   }
-  const dropPolicy = shadow.dropPolicy;
+  const dropPolicy = shadow.dropPolicy ?? defaults?.dropPolicy;
   if (dropPolicy !== undefined && dropPolicy !== 'drop-oldest' && dropPolicy !== 'drop-newest') {
     throw new RangeError("subscribe: shadow.dropPolicy must be 'drop-oldest' or 'drop-newest'");
   }
@@ -18301,6 +18308,18 @@ export class EventBus {
    * is untouched by it.
    */
   private defaultBarrier?: BarrierSubscribeOptions;
+  /**
+   * Bus-level terminal shadow-queue default (EB-505): the
+   * `queueSize` / `dropPolicy` a new subscriber falls back to when it
+   * opts into `shadow` but omits a field. Starts unset (`undefined` —
+   * no default, omitting a field still means the subscription's own
+   * `queueSize` / `dropPolicy`, exactly the previous behavior) and
+   * moves only via `setDefaultShadow`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables shadowing: a subscriber that does not opt into
+   * `shadow` is untouched by it.
+   */
+  private defaultShadow?: ShadowSubscribeOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33897,7 +33916,7 @@ export class EventBus {
     // would pre-fill the mirror with history through the shared
     // backpressure counters, so it is rejected too: a shadow subscribes
     // to live production traffic, nothing else.
-    const shadowOpts = resolveShadowOptions(opts?.shadow);
+    const shadowOpts = resolveShadowOptions(opts?.shadow, this.defaultShadow);
     if (shadowOpts !== undefined) {
       if (resumeFromSeq !== undefined || resumeFromTime !== undefined) {
         throw new RangeError(
@@ -52543,6 +52562,127 @@ export class EventBus {
    */
   getDefaultBarrier(): BarrierSubscribeOptions | undefined {
     return this.defaultBarrier === undefined ? undefined : { ...this.defaultBarrier };
+  }
+
+  /**
+   * Sets the live bus-level default shadow-queue tuning (EB-505)
+   * without re-subscribing anyone:
+   * `setDefaultShadow(opts, actor = 'system')` decides the
+   * `queueSize` / `dropPolicy` for future subscribers that opt into
+   * `shadow` but omit a field (see `ShadowSubscribeOptions`) —
+   * `{ queueSize: 7, dropPolicy: 'drop-newest' }` to let every new
+   * opt-in shadow subscriber mirror into a 7-deep queue that sheds
+   * the newest copy with one call, `null` to clear the default back
+   * to no default (new opt-in shadow subscribers go back to the
+   * subscription's own `queueSize` / `dropPolicy`).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit shadow field > bus default shadow field >
+   * subscription's own `queueSize` / `dropPolicy` > bus default
+   * `queueSize` / `dropPolicy` (EB-470 / EB-475) > 100 /
+   * `'drop-oldest'` — the bus default is the terminal fallback below
+   * the explicit shadow field. `true` takes the whole default, and
+   * `{}` opts in and takes the whole default too. A subscriber that
+   * took the default at subscribe time keeps the queue capacity, the
+   * drop policy, and the shadow counters it was baked with: a later
+   * revision never moves an already-subscribed shadow queue, and
+   * there is no per-subscriber shadow revision — the shadow queue is
+   * sized once, at subscribe time. The default never enables
+   * shadowing: a subscriber that does not opt into `shadow` is
+   * untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a non-integer / < 1 `queueSize`, or a `dropPolicy`
+   * outside `'drop-oldest' | 'drop-newest'` throws `RangeError` with
+   * the live default and the audit log untouched. `{}` is accepted
+   * and installs no field coverage (equivalent to unset). A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit — fields are
+   * compared one by one, with `undefined` counting as missing.
+   * Audited as `default_shadow_revised`
+   * (`{ previous, shadow }`, `null` when the default is unset —
+   * unset means new opt-in shadow subscribers go back to the
+   * subscription's own `queueSize` / `dropPolicy`, exactly the
+   * previous behavior; only the shadow fields are recorded).
+   *
+   * Orthogonal to EB-63 (that is the shadow mechanism itself — the
+   * mirror, its independent queue and counters — this sets the
+   * default a new opt-in subscriber's omitted shadow fields fall
+   * back to), to EB-470 (that sets the production queue-size
+   * default — the shadow default sits above it in the chain, a
+   * shadow `queueSize` always winning first), to EB-475 (that sets
+   * the production drop-policy default — the shadow default sits
+   * above it in the `'block'` tier), and to EB-488–504 (those set
+   * the defaults of the other options in the same family — this the
+   * shadow queue tuning).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal `queueSize` /
+   * `dropPolicy`.
+   */
+  setDefaultShadow(opts: ShadowSubscribeOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultShadow');
+    if (opts !== null && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError(
+        'setDefaultShadow: shadow must be an object with queueSize/dropPolicy, or null to clear it',
+      );
+    }
+    const queueSize = opts?.queueSize;
+    if (queueSize !== undefined && (!Number.isInteger(queueSize) || queueSize < 1)) {
+      throw new RangeError('shadow.queueSize must be a positive integer');
+    }
+    const dropPolicy = opts?.dropPolicy;
+    if (dropPolicy !== undefined && dropPolicy !== 'drop-oldest' && dropPolicy !== 'drop-newest') {
+      throw new RangeError("shadow.dropPolicy must be 'drop-oldest' or 'drop-newest'");
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: ShadowSubscribeOptions | undefined =
+      opts === null
+        ? undefined
+        : {
+            ...(queueSize !== undefined ? { queueSize } : {}),
+            ...(dropPolicy !== undefined ? { dropPolicy } : {}),
+          };
+    const previous: ShadowSubscribeOptions | null =
+      this.defaultShadow === undefined ? null : { ...this.defaultShadow };
+    // Re-affirming the current default is a no-op: no audit. Fields
+    // compare one by one, with `undefined` counting as missing.
+    if (
+      (previous?.queueSize ?? undefined) === (next?.queueSize ?? undefined) &&
+      (previous?.dropPolicy ?? undefined) === (next?.dropPolicy ?? undefined)
+    ) {
+      return;
+    }
+    this.defaultShadow = next;
+    this.auditSubscription({
+      action: 'default_shadow_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : { ...previous },
+        shadow: next === undefined ? null : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default shadow-queue tuning (EB-505) —
+   * the `ShadowSubscribeOptions` future opt-in subscribers fall back
+   * to when they omit a field — `undefined` before any revision (no
+   * default, new opt-in shadow subscribers still take the
+   * subscription's own `queueSize` / `dropPolicy`), then whatever
+   * `setDefaultShadow` last installed. Returns a copy, so mutating
+   * the result never moves the live default.
+   */
+  getDefaultShadow(): ShadowSubscribeOptions | undefined {
+    return this.defaultShadow === undefined ? undefined : { ...this.defaultShadow };
   }
 
   /**
