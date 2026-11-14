@@ -10857,28 +10857,75 @@ export function patternCovers(cover: string, sub: string): boolean {
  * covered by some exclude pattern; mode `'all'`: one exclude pattern
  * covering every include pattern — coverage decided by `patternCovers`).
  *
+ * When a field is omitted, the live bus default (`defaults`, EB-510)
+ * fills it in field by field — an explicit field always wins, and the
+ * merged object (not either side alone) goes through the validation, so
+ * an explicit exclude covering a defaulted include still fails fast.
+ * `undefined` opts still means "no composite at all" — the default
+ * never opts a subscriber in on its own. `{}` opts in and takes the
+ * whole default.
+ *
  * The returned lists are copies: later mutation of the caller's arrays
  * cannot change the subscription.
  */
 function resolveCompositeOptions(
   opt: CompositeSubscribeOptions | undefined,
   caller = 'subscribe',
+  defaults?: Partial<CompositeSubscribeOptions>,
 ): { patterns: string[]; exclude: string[]; mode: 'any' | 'all' } | undefined {
   if (opt === undefined) return undefined;
   if (opt === null || typeof opt !== 'object' || Array.isArray(opt)) {
     throw new TypeError(`${caller}: patterns must be an object`);
   }
-  const { patterns, mode, exclude } = opt;
-  if (!Array.isArray(patterns) || patterns.length === 0) {
+  // Field-by-field fallback to the live bus default (EB-510): an
+  // explicit field always wins.
+  const merged: {
+    patterns: string[] | undefined;
+    mode: 'any' | 'all' | undefined;
+    exclude: string[] | undefined;
+  } = {
+    patterns: opt.patterns ?? defaults?.patterns,
+    mode: opt.mode ?? defaults?.mode,
+    exclude: opt.exclude ?? defaults?.exclude,
+  };
+  const resolved = resolveCompositeFields(merged, caller, true);
+  if (resolved.patterns === undefined) {
     throw new RangeError(
       `${caller}: patterns.patterns must be a non-empty array of topic patterns`,
     );
   }
-  for (const pattern of patterns) {
-    if (typeof pattern !== 'string' || pattern.length === 0) {
+  return { patterns: [...resolved.patterns], exclude: [...resolved.exclude], mode: resolved.mode };
+}
+
+/**
+ * Validates composite option fields and resolves the effective mode /
+ * exclude. `patterns` is required unless `requirePatterns` is false (a
+ * bus-level default, EB-510, may be partial — a missing `patterns` there
+ * is legal and the subscriber must supply it at subscribe time). The
+ * exclude-covers-include fail-fast runs only when an include space
+ * exists to cover; with no include space it waits for subscribe time,
+ * when the merged include space exists. Returns the resolved triple
+ * (`patterns` undefined exactly when no patterns were given and none
+ * were required).
+ */
+function resolveCompositeFields(
+  opt: { patterns?: string[]; mode?: 'any' | 'all'; exclude?: string[] },
+  caller: string,
+  requirePatterns: boolean,
+): { patterns: string[] | undefined; exclude: string[]; mode: 'any' | 'all' } {
+  const { patterns, mode, exclude } = opt;
+  if (requirePatterns || patterns !== undefined) {
+    if (!Array.isArray(patterns) || patterns.length === 0) {
       throw new RangeError(
-        `${caller}: patterns.patterns must contain only non-empty pattern strings`,
+        `${caller}: patterns.patterns must be a non-empty array of topic patterns`,
       );
+    }
+    for (const pattern of patterns) {
+      if (typeof pattern !== 'string' || pattern.length === 0) {
+        throw new RangeError(
+          `${caller}: patterns.patterns must contain only non-empty pattern strings`,
+        );
+      }
     }
   }
   const resolvedMode = mode ?? 'any';
@@ -10899,16 +10946,56 @@ function resolveCompositeOptions(
   // An exclude set that covers the include space makes the subscription
   // permanently silent — every message the includes admit, an exclude
   // drops — so fail fast instead of registering a dead subscription.
-  const coversAll =
-    resolvedMode === 'any'
-      ? patterns.every((p) => resolvedExclude.some((e) => patternCovers(e, p)))
-      : resolvedExclude.some((e) => patterns.every((p) => patternCovers(e, p)));
-  if (coversAll) {
-    throw new RangeError(
-      `${caller}: patterns.exclude covers the include patterns — no message could ever be delivered`,
-    );
+  if (patterns !== undefined) {
+    const coversAll =
+      resolvedMode === 'any'
+        ? patterns.every((p) => resolvedExclude.some((e) => patternCovers(e, p)))
+        : resolvedExclude.some((e) => patterns.every((p) => patternCovers(e, p)));
+    if (coversAll) {
+      throw new RangeError(
+        `${caller}: patterns.exclude covers the include patterns — no message could ever be delivered`,
+      );
+    }
   }
-  return { patterns: [...patterns], exclude: [...resolvedExclude], mode: resolvedMode };
+  return { patterns, exclude: [...resolvedExclude], mode: resolvedMode };
+}
+
+/**
+ * Defensive copy of a composite options object (EB-510): the patterns
+ * and exclude arrays are copied, and `undefined` fields stay absent so
+ * a missing field and an explicitly-undefined one compare equal.
+ */
+function copyCompositeOptions(
+  opts: Partial<CompositeSubscribeOptions>,
+): Partial<CompositeSubscribeOptions> {
+  return {
+    ...(opts.patterns === undefined ? {} : { patterns: [...opts.patterns] }),
+    ...(opts.mode === undefined ? {} : { mode: opts.mode }),
+    ...(opts.exclude === undefined ? {} : { exclude: [...opts.exclude] }),
+  };
+}
+
+/**
+ * True when two composite option values are the same default (EB-510):
+ * patterns compare element by element, `mode` defaults to `'any'`, and
+ * a missing `exclude` counts as empty.
+ */
+function sameCompositeOptions(
+  a: Partial<CompositeSubscribeOptions> | undefined,
+  b: Partial<CompositeSubscribeOptions> | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  const sameStrings = (x: string[], y: string[]): boolean =>
+    x.length === y.length && x.every((v, i) => v === y[i]);
+  const patternsSame =
+    a.patterns === undefined || b.patterns === undefined
+      ? a.patterns === b.patterns
+      : sameStrings(a.patterns, b.patterns);
+  return (
+    patternsSame &&
+    (a.mode ?? 'any') === (b.mode ?? 'any') &&
+    sameStrings(a.exclude ?? [], b.exclude ?? [])
+  );
 }
 
 /**
@@ -18444,6 +18531,19 @@ export class EventBus {
    * `deliveryWindows` is untouched by it.
    */
   private defaultDeliveryWindows?: DeliveryWindowOptions;
+  /**
+   * Bus-level terminal composite-subscription default (EB-510): the
+   * `patterns` / `mode` / `exclude` a new subscriber falls back to
+   * field by field when it opts into `patterns` but omits a field.
+   * The default may be partial (only the fields it carries fill in).
+   * Starts unset (`undefined` — no default, omitting `patterns` still
+   * throws, exactly the previous behavior) and moves only via
+   * `setDefaultCompositePatterns`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables composite matching: a subscriber that does not opt
+   * into `patterns` is untouched by it.
+   */
+  private defaultCompositePatterns?: Partial<CompositeSubscribeOptions>;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34534,7 +34634,7 @@ export class EventBus {
     // Multi-pattern composite subscription (EB-70): validated before
     // anything registers, so a throw leaves no half-registered subscriber
     // behind.
-    const compositeOpts = resolveCompositeOptions(opts?.patterns);
+    const compositeOpts = resolveCompositeOptions(opts?.patterns, 'subscribe', this.defaultCompositePatterns);
     // Slow-consumer backpressure tier (EB-83): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const backpressure = resolveBackpressurePolicy(opts?.backpressure, opts?.dropPolicy);
@@ -53348,6 +53448,130 @@ export class EventBus {
     return this.defaultDeliveryWindows === undefined
       ? undefined
       : copyDeliveryWindowOptions(this.defaultDeliveryWindows);
+  }
+
+  /**
+   * Sets the live bus-level default composite subscription patterns
+   * (EB-510) without re-subscribing anyone:
+   * `setDefaultCompositePatterns(patterns, actor = 'system')` decides
+   * the `patterns` / `mode` / `exclude` for future subscribers that
+   * opt into `patterns` but omit a field (see
+   * `CompositeSubscribeOptions`) — `{ patterns: ['a.*', 'b.*'],
+   * mode: 'all', exclude: ['b.x'] }` to give every new opt-in
+   * subscriber the same multi-pattern shape with one call, `null`
+   * to clear the default back to no default (new opt-in subscribers
+   * go back to `patterns` being required at subscribe time). The
+   * default may be partial: only the fields it carries fill in, and
+   * the subscriber must supply the rest (a default of `{ mode:
+   * 'all' }` plus an explicit `patterns` still converges).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > required (no default means a
+   * missing `patterns` still throws) — the bus default is the
+   * terminal fallback below the explicit field, and `{}` opts in and
+   * takes the whole default. An explicit field always wins: an
+   * explicit `patterns` replaces the default's list, an explicit
+   * `mode` replaces the default's mode, and an explicit `exclude`
+   * replaces the default's exclude. The merged object goes through
+   * the subscribe-time validation, so an explicit `exclude` covering
+   * the merged include space still throws `RangeError`. A subscriber
+   * that took the default at subscribe time keeps the composite state
+   * it was baked with: a later revision never moves an
+   * already-subscribed composite, and `setCompositePatterns` (EB-387)
+   * still revises such a subscriber one at a time without touching
+   * the bus default — it only ever merges against the subscriber's
+   * own live values, never consults the bus default, so the default
+   * never re-applies to it, and clearing a subscriber's composite
+   * there does not re-apply the default either. The default never
+   * enables composite matching: a subscriber that does not opt into
+   * `patterns` is untouched by it.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future opt-in subscription. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value other than
+   * `null`, a `patterns` that is not a non-empty array of non-empty
+   * strings, a `mode` outside `'any'` / `'all'`, an `exclude` that
+   * is not an array of non-empty strings, or an `exclude` covering
+   * the given `patterns` throws `RangeError` with the live default
+   * and the audit log untouched. A revision identical to the current
+   * default (including clearing an already-unset default) is a
+   * no-op with no audit — `mode` compares against its `'any'`
+   * default and a missing `exclude` counts as empty. Audited as
+   * `default_composite_patterns_revised` (`{ previous, patterns }`,
+   * `null` when the default is unset — unset means new opt-in
+   * subscribers go back to `patterns` being required, exactly the
+   * previous behavior; only the composite fields are recorded).
+   *
+   * Orthogonal to EB-70 (that is the composite mechanism itself —
+   * the multi-pattern gate — this sets the default a new opt-in
+   * subscriber's omitted fields fall back to), to EB-387 (that
+   * revises one subscriber's composite at a time — this sets the
+   * fleet default), and to EB-508/509 (those set the defaults of the
+   * other options in the same family — this the composite patterns).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object value
+   * (other than `null` to clear), or an illegal `patterns` / `mode` /
+   * `exclude`.
+   */
+  setDefaultCompositePatterns(
+    patterns: Partial<CompositeSubscribeOptions> | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setDefaultCompositePatterns');
+    if (patterns !== null && (typeof patterns !== 'object' || Array.isArray(patterns))) {
+      throw new RangeError(
+        'setDefaultCompositePatterns: patterns must be an object with patterns and/or mode and/or exclude, or null to clear it',
+      );
+    }
+    // Validate with the subscribe-time gates before touching anything:
+    // a failed call leaves the live default untouched. A default may
+    // be partial — only the fields it carries are checked; the
+    // subscriber supplies the rest at subscribe time.
+    if (patterns !== null) {
+      resolveCompositeFields(patterns, 'setDefaultCompositePatterns', false);
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal,
+    // and store a defensive copy of the pattern arrays.
+    const next: Partial<CompositeSubscribeOptions> | undefined =
+      patterns === null ? undefined : copyCompositeOptions(patterns);
+    const previous: Partial<CompositeSubscribeOptions> | null =
+      this.defaultCompositePatterns === undefined
+        ? null
+        : copyCompositeOptions(this.defaultCompositePatterns);
+    // Re-affirming the current default is a no-op: no audit.
+    if (sameCompositeOptions(previous ?? undefined, next)) {
+      return;
+    }
+    this.defaultCompositePatterns = next;
+    this.auditSubscription({
+      action: 'default_composite_patterns_revised',
+      actor,
+      detail: {
+        previous: previous === null ? null : copyCompositeOptions(previous),
+        patterns: next === undefined ? null : copyCompositeOptions(next),
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default composite patterns (EB-510) —
+   * the `CompositeSubscribeOptions` future opt-in subscribers fall
+   * back to when they omit a field — `undefined` before any revision
+   * (no default, new opt-in subscribers still take `patterns` as
+   * required), then whatever `setDefaultCompositePatterns` last
+   * installed. Returns a copy, so mutating the result never moves
+   * the live default.
+   */
+  getDefaultCompositePatterns(): Partial<CompositeSubscribeOptions> | undefined {
+    return this.defaultCompositePatterns === undefined
+      ? undefined
+      : copyCompositeOptions(this.defaultCompositePatterns);
   }
   /**
    * Sets the live bus-level terminal group max-members default

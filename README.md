@@ -590,6 +590,26 @@ library.
   `RangeError`. This only moves the composite narrowing — the base
   pattern itself still moves only through EB-74's pattern hot-update,
   and the queue, backpressure, dedup, and lag state are untouched.
+  Bus default (EB-510, via
+  `bus.setDefaultCompositePatterns(patterns | null)`): future
+  subscribers that opt into `patterns` without an explicit field take
+  the live bus default field by field — `{ patterns: ['a.*', 'b.*'],
+  mode: 'all', exclude: ['b.x'] }` to give every new opt-in subscriber
+  the same multi-pattern shape with one call, `null` to clear back to
+  no default; `{}` opts in and takes the whole default, and the default
+  may be partial (only the fields it carries fill in). The chain is
+  explicit > bus default > required (with no default installed a missing
+  `patterns` still throws), and the merged object goes through the
+  subscribe-time validation, so an explicit `exclude` covering the
+  merged include space still throws. The default never enables composite
+  matching — a subscriber that does not opt into `patterns` is untouched
+  by it. A revision never moves an already-subscribed composite, and
+  `setCompositePatterns` still revises one subscriber at a time without
+  consulting the bus default, so the default never re-applies to it.
+  There is no construction-time option and the revision is live-only (a
+  restart restores the unset default); a revision identical to the
+  current default is a no-op with no audit. Audited as
+  `default_composite_patterns_revised` (`{ previous, patterns }`).
 - **`src/cluster.ts` — `ClusterHub` / `ClusterLink`**: cross-process
   cluster federation. Multiple Node processes form a cluster through a
   central TCP hub (`new ClusterHub({ port })`, TLS via `tls: { key, cert }`);
