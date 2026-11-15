@@ -11902,23 +11902,25 @@ function resolveShadowOptions(
  * under sustained saturation (refuse-new instead of churning the backlog).
  * An explicit `dropPolicy` that contradicts an explicitly chosen drop tier
  * is a configuration error — fail fast instead of silently picking one.
+ * The live bus default installed via `setDefaultBackpressure` (EB-511)
+ * is the terminal fallback below the explicit tier: when the subscriber
+ * omits `backpressure`, the default fills in and the merged tier still
+ * goes through the same conflict check, so an explicit `dropPolicy`
+ * contradicting a default drop tier fails fast too.
  */
 function resolveBackpressurePolicy(
   backpressure: unknown,
   dropPolicy: unknown,
+  defaults?: BackpressurePolicy,
 ): BackpressurePolicy {
-  if (backpressure === undefined) return 'block';
-  assertValidBackpressurePolicy(backpressure, 'subscribe');
-  if (
-    dropPolicy !== undefined &&
-    backpressure !== 'block' &&
-    dropPolicy !== backpressure
-  ) {
+  const tier = backpressure === undefined ? (defaults ?? 'block') : backpressure;
+  assertValidBackpressurePolicy(tier, 'subscribe');
+  if (dropPolicy !== undefined && tier !== 'block' && dropPolicy !== tier) {
     throw new RangeError(
-      `subscribe: backpressure '${backpressure}' conflicts with dropPolicy '${dropPolicy}'`,
+      `subscribe: backpressure '${tier}' conflicts with dropPolicy '${dropPolicy}'`,
     );
   }
-  return backpressure;
+  return tier;
 }
 
 /**
@@ -18544,6 +18546,18 @@ export class EventBus {
    * into `patterns` is untouched by it.
    */
   private defaultCompositePatterns?: Partial<CompositeSubscribeOptions>;
+  /**
+   * Bus-level terminal slow-consumer backpressure default (EB-511):
+   * the tier a new subscriber falls back to when it omits its own
+   * `backpressure` (EB-83). Starts unset (`undefined` — no default,
+   * omitting `backpressure` still resolves to `'block'`, exactly the
+   * previous behavior) and moves only via `setDefaultBackpressure`;
+   * there is no construction-time option, and a restart restores the
+   * unset default. An explicit tier always wins over the default, and
+   * the merged tier still goes through the subscribe-time
+   * dropPolicy-conflict check.
+   */
+  private defaultBackpressure?: BackpressurePolicy;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34637,7 +34651,7 @@ export class EventBus {
     const compositeOpts = resolveCompositeOptions(opts?.patterns, 'subscribe', this.defaultCompositePatterns);
     // Slow-consumer backpressure tier (EB-83): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
-    const backpressure = resolveBackpressurePolicy(opts?.backpressure, opts?.dropPolicy);
+    const backpressure = resolveBackpressurePolicy(opts?.backpressure, opts?.dropPolicy, this.defaultBackpressure);
     // The queue-level shed policy: an explicit drop tier selects it
     // directly; the 'block' tier sheds per the subscriber's own
     // `dropPolicy` on first saturation, falling back to the live bus
@@ -53573,6 +53587,94 @@ export class EventBus {
       ? undefined
       : copyCompositeOptions(this.defaultCompositePatterns);
   }
+
+  /**
+   * Sets the live bus-level terminal slow-consumer backpressure
+   * default (EB-511) without re-subscribing anyone:
+   * `setDefaultBackpressure(tier, actor = 'system')` decides what a
+   * future subscriber does when its bounded queue is full and it
+   * omits its own `backpressure` (see `SubscribeOptions.backpressure`,
+   * EB-83) — `'drop-oldest'` to shed the oldest entry fleet-wide with
+   * one call, `'drop-newest'` to refuse newcomers, `'block'` to
+   * admit-with-shed on first saturation and then refuse while
+   * saturated, `null` to clear the default back to the historical
+   * `'block'`.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > `'block'` (the bus default is
+   * the terminal fallback below the explicit tier — there is nothing
+   * below it but the historical `'block'`). An explicit tier always
+   * wins over the default, and the merged tier still goes through the
+   * subscribe-time dropPolicy-conflict check, so an explicit
+   * `dropPolicy` contradicting a default drop tier throws `RangeError`
+   * at subscribe time. A `'block'` default leaves the `dropPolicy`
+   * chain untouched: explicit `dropPolicy` > bus default (EB-475) >
+   * `'drop-oldest'`. A subscriber that took the default at subscribe
+   * time keeps the tier it was baked with: a later revision never
+   * moves an already-subscribed tier, and `setBackpressureTier`
+   * (EB-285) still revises such a subscriber one at a time without
+   * touching the bus default. Already-queued messages and the
+   * `'block'` latch are untouched by the revision.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription. The default is runtime state: it never
+   * enters a config snapshot and does not survive a restart, like
+   * the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value outside
+   * `'drop-oldest' | 'drop-newest' | 'block'` (`null` to clear)
+   * throws `RangeError` with the live default and the audit log
+   * untouched. A revision identical to the current default
+   * (including clearing an already-unset default) is a no-op with no
+   * audit. Audited as `default_backpressure_revised`
+   * (`{ previous, backpressure }`, `null` when the default is unset
+   * — unset means new subscribers resolve to the historical
+   * `'block'`, exactly the previous behavior).
+   *
+   * Orthogonal to EB-83 (that is the backpressure mechanism itself —
+   * this its missing bus-level terminal default), to EB-285 (that
+   * revises one live subscriber's tier — this the default future
+   * subscribers fall back to), to EB-375 (that revises one live
+   * subscriber's shed policy — this the block-vs-drop tier), and to
+   * EB-475 (that revises the shed policy inside the `'block'` branch —
+   * this the tier that selects the branch).
+   *
+   * Throws `RangeError` for an illegal actor or a value outside
+   * `'drop-oldest' | 'drop-newest' | 'block'` (or `null` to clear).
+   */
+  setDefaultBackpressure(tier: BackpressurePolicy | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultBackpressure');
+    if (tier !== null) {
+      assertValidBackpressurePolicy(tier, 'setDefaultBackpressure');
+    }
+    const previous = this.defaultBackpressure ?? null;
+    const next = tier ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === tier) {
+      return;
+    }
+    this.defaultBackpressure = next;
+    this.auditSubscription({
+      action: 'default_backpressure_revised',
+      actor,
+      detail: { previous, backpressure: tier },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal backpressure default
+   * (EB-511) — the tier future subscribers fall back to when they
+   * omit their own `backpressure` — `undefined` before any revision
+   * (no default, new subscribers resolve to the historical
+   * `'block'`), then whatever `setDefaultBackpressure` last
+   * installed.
+   */
+  getDefaultBackpressure(): BackpressurePolicy | undefined {
+    return this.defaultBackpressure;
+  }
+
   /**
    * Sets the live bus-level terminal group max-members default
    * (EB-467) without touching any live group:

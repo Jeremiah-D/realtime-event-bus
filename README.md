@@ -1412,6 +1412,26 @@ library.
   current default is a no-op with no audit. Audited as
   `default_drop_policy_revised` (`{ previous, dropPolicy }`).
   (Real-time systems: delivery governance.)
+- **Bus-level default backpressure tier**
+  (`setDefaultBackpressure(tier | null, actor?)`, EB-511): future
+  subscribers that omit `backpressure` fall back to the live bus
+  default — `'drop-oldest'` / `'drop-newest'` / `'block'` to set the
+  fleet-wide full-queue behavior with one call, `null` to clear back
+  to the historical `'block'`. The priority chain is
+  subscriber-explicit > bus default > `'block'`; an explicit tier
+  always wins, and the merged tier still goes through the
+  subscribe-time `dropPolicy`-conflict check, so an explicit
+  `dropPolicy` contradicting a default drop tier throws `RangeError`
+  at subscribe time. A `'block'` default leaves the `dropPolicy`
+  chain untouched (explicit `dropPolicy` > bus default (EB-475) >
+  `'drop-oldest'`). A subscriber keeps the tier it was baked with,
+  and `setBackpressureTier(subId, tier)` still revises one subscriber
+  at a time without touching the bus default. There is no
+  construction-time option and the revision is live-only (a restart
+  restores the unset default); a revision identical to the current
+  default is a no-op with no audit. Audited as
+  `default_backpressure_revised` (`{ previous, backpressure }`).
+  (Real-time systems: delivery governance.)
   Revisable after subscribe (EB-281, via
   `setQueueSize(subId, size | null)`): a subscriber's queue count
   capacity can be retuned without re-subscribing — every subscription
