@@ -2715,7 +2715,21 @@ library.
     `RangeError` with everything untouched. Every revision is audited
     as `compression_auto_train_revised` (`{ topicPattern, autoTrain,
     oldAutoTrain }` — `autoTrain` is `null` on retirement, the callback
-    recorded only as `'set'`). In short: `setTopicCompression` replaces
+    recorded only as `'set'`). A bus-level default,
+    `setDefaultAutoTrain(patch, actor = 'system')`, fills in
+    parameters a future rule omits when it opts into `autoTrain` —
+    `sampleCount`, `sampleMaxBytes`, either trigger, `onTrained` —
+    field by field, an explicit rule value always winning, and the
+    merged rule still goes through the same validation and trigger
+    rule; `null` clears the default, an identical revision is a
+    no-op, and every revision is audited as
+    `default_auto_train_revised` (`{ previous, autoTrain }`, the
+    callback recorded only as `'set'`). The default only completes a
+    rule that already opted in — a rule without `autoTrain` never
+    gains a trainer from it, and `setCompressionAutoTrain` never
+    consults it. Like the bus's other live defaults it is runtime
+    state, never in a config snapshot, and does not survive a restart.
+    In short: `setTopicCompression` replaces
     the rule and retires its trainer (samples dropped, training restarts
     from an empty corpus); `setCompressionAutoTrain` retunes the live
     trainer and keeps everything it has learned. Invalid options throw

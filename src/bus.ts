@@ -14862,6 +14862,136 @@ function serializeAutoTrainOptions(resolved: ResolvedAutoTrainOptions): {
 }
 
 /**
+ * Validates the fields a bus-level auto-train default patch carries
+ * (EB-512): only the fields present are checked, with the same gates
+ * `resolveAutoTrainOptions` applies — a default may be partial
+ * (`sampleCount` / `sampleMaxBytes` are required only when a rule
+ * actually trains, at `setTopicCompression` / `createTopic` time, on
+ * the merged object). Throws `RangeError` before anything moves.
+ */
+function assertValidPartialAutoTrainOptions(
+  patch: Partial<CompressionAutoTrainOptions>,
+  where: string,
+): void {
+  if (patch.sampleCount !== undefined && (!Number.isInteger(patch.sampleCount) || patch.sampleCount < 1)) {
+    throw new RangeError(`${where}: autoTrain.sampleCount must be a positive integer`);
+  }
+  if (
+    patch.sampleMaxBytes !== undefined &&
+    (!Number.isFinite(patch.sampleMaxBytes) || patch.sampleMaxBytes <= 0)
+  ) {
+    throw new RangeError(`${where}: autoTrain.sampleMaxBytes must be a positive finite number of bytes`);
+  }
+  if (
+    patch.retrainEveryMessages !== undefined &&
+    (!Number.isInteger(patch.retrainEveryMessages) || patch.retrainEveryMessages < 1)
+  ) {
+    throw new RangeError(`${where}: autoTrain.retrainEveryMessages must be a positive integer`);
+  }
+  if (
+    patch.retrainEveryMs !== undefined &&
+    (!Number.isFinite(patch.retrainEveryMs) || patch.retrainEveryMs <= 0)
+  ) {
+    throw new RangeError(`${where}: autoTrain.retrainEveryMs must be a positive finite number of milliseconds`);
+  }
+  if (patch.onTrained !== undefined && typeof patch.onTrained !== 'function') {
+    throw new RangeError(`${where}: autoTrain.onTrained must be a function`);
+  }
+}
+
+/**
+ * Fills a rule's `autoTrain` from the bus-level default (EB-512):
+ * fields the rule omits fall back to the default's, an explicit rule
+ * field always wins. A rule without `autoTrain` stays trainer-less —
+ * the default never opts a rule in. The merged object still goes
+ * through `resolveAutoTrainOptions`, so the construction-time trigger
+ * rule (60_000 ms cadence when neither trigger is set) applies to the
+ * merged pair.
+ */
+function mergeAutoTrainWithDefault(
+  autoTrain: CompressionAutoTrainOptions | undefined,
+  defaultAutoTrain: Partial<CompressionAutoTrainOptions> | undefined,
+): CompressionAutoTrainOptions | undefined {
+  if (autoTrain === undefined) return undefined;
+  if (defaultAutoTrain === undefined) return autoTrain;
+  return {
+    sampleCount: autoTrain.sampleCount ?? defaultAutoTrain.sampleCount,
+    sampleMaxBytes: autoTrain.sampleMaxBytes ?? defaultAutoTrain.sampleMaxBytes,
+    retrainEveryMessages: autoTrain.retrainEveryMessages ?? defaultAutoTrain.retrainEveryMessages,
+    retrainEveryMs: autoTrain.retrainEveryMs ?? defaultAutoTrain.retrainEveryMs,
+    onTrained: autoTrain.onTrained ?? defaultAutoTrain.onTrained,
+  } as CompressionAutoTrainOptions;
+}
+
+/**
+ * Defensive copy of a bus-level auto-train default (EB-512):
+ * `undefined` fields stay absent so a missing field and an
+ * explicitly-undefined one compare equal. The `onTrained` callback is
+ * copied by reference — a function has no copy.
+ */
+function copyAutoTrainDefault(
+  opts: Partial<CompressionAutoTrainOptions>,
+): Partial<CompressionAutoTrainOptions> {
+  return {
+    ...(opts.sampleCount === undefined ? {} : { sampleCount: opts.sampleCount }),
+    ...(opts.sampleMaxBytes === undefined ? {} : { sampleMaxBytes: opts.sampleMaxBytes }),
+    ...(opts.retrainEveryMessages === undefined
+      ? {}
+      : { retrainEveryMessages: opts.retrainEveryMessages }),
+    ...(opts.retrainEveryMs === undefined ? {} : { retrainEveryMs: opts.retrainEveryMs }),
+    ...(opts.onTrained === undefined ? {} : { onTrained: opts.onTrained }),
+  };
+}
+
+/**
+ * True when two auto-train defaults carry the same fields (EB-512):
+ * every field compares by value, `onTrained` by identity, and an
+ * absent field equals an explicitly-undefined one (both sides are
+ * normalized through `copyAutoTrainDefault` first).
+ */
+function sameAutoTrainDefault(
+  a: Partial<CompressionAutoTrainOptions> | undefined,
+  b: Partial<CompressionAutoTrainOptions> | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return (
+    a.sampleCount === b.sampleCount &&
+    a.sampleMaxBytes === b.sampleMaxBytes &&
+    a.retrainEveryMessages === b.retrainEveryMessages &&
+    a.retrainEveryMs === b.retrainEveryMs &&
+    a.onTrained === b.onTrained
+  );
+}
+
+/**
+ * Audit-safe form of a bus-level auto-train default (EB-512): only the
+ * fields it carries are recorded, and the `onTrained` callback is
+ * recorded only as `'set'` (present/absent), never serialized — the
+ * same rule as `serializeAutoTrainOptions` (EB-369). `null` when the
+ * default is unset.
+ */
+function serializeDefaultAutoTrain(
+  opts: Partial<CompressionAutoTrainOptions> | undefined,
+): {
+  sampleCount?: number;
+  sampleMaxBytes?: number;
+  retrainEveryMessages?: number;
+  retrainEveryMs?: number;
+  onTrained?: 'set';
+} | null {
+  if (opts === undefined) return null;
+  return {
+    ...(opts.sampleCount === undefined ? {} : { sampleCount: opts.sampleCount }),
+    ...(opts.sampleMaxBytes === undefined ? {} : { sampleMaxBytes: opts.sampleMaxBytes }),
+    ...(opts.retrainEveryMessages === undefined
+      ? {}
+      : { retrainEveryMessages: opts.retrainEveryMessages }),
+    ...(opts.retrainEveryMs === undefined ? {} : { retrainEveryMs: opts.retrainEveryMs }),
+    ...(opts.onTrained === undefined ? {} : { onTrained: 'set' as const }),
+  };
+}
+
+/**
  * Marks a timer as not keeping the process alive, tolerating timer-like
  * objects without `unref` (the same defensive shape used by the delayed
  * delivery and rate-window timers).
@@ -18558,6 +18688,20 @@ export class EventBus {
    * dropPolicy-conflict check.
    */
   private defaultBackpressure?: BackpressurePolicy;
+  /**
+   * Bus-level auto-train default (EB-512): the `sampleCount` /
+   * `sampleMaxBytes` / triggers / `onTrained` a new auto-train rule
+   * falls back to field by field when it opts into `autoTrain` but
+   * omits a field. The default may be partial (only the fields it
+   * carries fill in; the rule must supply the rest). Starts unset
+   * (`undefined` — no default, a partial `autoTrain` still throws,
+   * exactly the previous behavior) and moves only via
+   * `setDefaultAutoTrain`; there is no construction-time option, and
+   * a restart restores the unset default. The default never enables
+   * training: a rule without `autoTrain` is untouched by it, and
+   * `setCompressionAutoTrain` (EB-369) never consults it.
+   */
+  private defaultAutoTrain?: Partial<CompressionAutoTrainOptions>;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -33064,7 +33208,14 @@ export class EventBus {
     }
     let autoTrainState: CompressionAutoTrainer | undefined;
     if (opts.autoTrain !== undefined) {
-      const resolved = resolveAutoTrainOptions(opts.autoTrain, `setTopicCompression("${topicPattern}")`);
+      // EB-512: fill the rule's missing autoTrain fields from the
+      // bus-level default before resolving — the default only
+      // completes a rule that already opted in, it never opts one in.
+      const mergedAutoTrain = mergeAutoTrainWithDefault(opts.autoTrain, this.defaultAutoTrain);
+      const resolved = resolveAutoTrainOptions(
+        mergedAutoTrain ?? opts.autoTrain,
+        `setTopicCompression("${topicPattern}")`,
+      );
       autoTrainState = new CompressionAutoTrainer(
         topicPattern,
         resolved,
@@ -53676,6 +53827,122 @@ export class EventBus {
   }
 
   /**
+   * Sets the live bus-level auto-train default (EB-512) without
+   * touching any live rule or trainer:
+   * `setDefaultAutoTrain(patch, actor = 'system')` decides what a
+   * future auto-train rule falls back to field by field when it opts
+   * into `autoTrain` but omits a field (see
+   * `CompressionAutoTrainOptions`, EB-60) — `{ sampleCount: 200 }`
+   * to size every future trainer's window fleet-wide with one call,
+   * `{ retrainEveryMs: 30_000 }` to set the fleet cadence, `null` to
+   * clear the default back to no fallback.
+   *
+   * Only the default moves: the rule table, the dictionary registry,
+   * and every live trainer are untouched. The priority chain is
+   * rule-explicit > bus default > construction-time trigger rule
+   * (the bus default is the terminal fallback below the explicit
+   * field — there is nothing below it but `resolveAutoTrainOptions`,
+   * which still applies the 60_000 ms cadence when neither trigger
+   * is set after merging). An explicit field always wins over the
+   * default, and the merged object still goes through the
+   * construction-time validation, so a rule that opts in without
+   * `sampleCount` / `sampleMaxBytes` — and no default supplying
+   * them — still throws `RangeError` at `setTopicCompression` /
+   * `createTopic` time. A rule that took the default at creation
+   * keeps the parameters it was baked with: a later revision never
+   * moves a live trainer, and `setCompressionAutoTrain` (EB-369)
+   * still revises such a trainer one at a time — merging only
+   * against the trainer's own live values and never consulting the
+   * bus default, so the default never re-applies to it.
+   *
+   * The default never enables training: a rule without `autoTrain`
+   * is untouched by it, exactly as before. There is no existence
+   * gate — the default exists precisely for rules that have not
+   * been created yet, so it applies to every future
+   * `setTopicCompression` / `createTopic` call. The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a non-object value (other than
+   * `null` to clear), or an illegal field value throws `RangeError`
+   * with the live default and the audit log untouched. A revision
+   * identical to the current default (including clearing an
+   * already-unset default) is a no-op with no audit. Audited as
+   * `default_auto_train_revised`
+   * (`{ previous, autoTrain }`, `null` when the default is unset —
+   * unset means a partial `autoTrain` still throws, exactly the
+   * previous behavior — and the `onTrained` callback is recorded
+   * only as `'set'`, never serialized).
+   *
+   * Orthogonal to EB-60 (that is the auto-training mechanism itself
+   * — this its missing bus-level parameter default), to EB-369
+   * (that retunes one live trainer's parameters — this the default
+   * future rules fall back to), to `setTopicCompression` (whole-rule
+   * replacement that retires the trainer — this the default that
+   * completes the replacement rule), and to EB-510 / EB-511 (the
+   * same live-default shape for composite patterns and
+   * backpressure — this auto-train parameters).
+   *
+   * Throws `RangeError` for an illegal actor, a non-object patch
+   * (other than `null` to clear), or an illegal parameter value.
+   */
+  setDefaultAutoTrain(
+    patch: Partial<CompressionAutoTrainOptions> | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setDefaultAutoTrain');
+    if (patch !== null && (typeof patch !== 'object' || Array.isArray(patch))) {
+      throw new RangeError(
+        'setDefaultAutoTrain: patch must be an object with sampleCount and/or sampleMaxBytes and/or retrainEveryMessages and/or retrainEveryMs and/or onTrained, or null to clear it',
+      );
+    }
+    // Validate with the same gates before touching anything: a failed
+    // call leaves the live default untouched. A default may be partial
+    // — only the fields it carries are checked; the rule supplies the
+    // rest when it opts into autoTrain.
+    if (patch !== null) {
+      assertValidPartialAutoTrainOptions(patch, 'setDefaultAutoTrain');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal.
+    const next: Partial<CompressionAutoTrainOptions> | undefined =
+      patch === null ? undefined : copyAutoTrainDefault(patch);
+    const previous: Partial<CompressionAutoTrainOptions> | undefined =
+      this.defaultAutoTrain === undefined
+        ? undefined
+        : copyAutoTrainDefault(this.defaultAutoTrain);
+    // Re-affirming the current default is a no-op: no audit.
+    if (sameAutoTrainDefault(previous, next)) {
+      return;
+    }
+    this.defaultAutoTrain = next;
+    this.auditSubscription({
+      action: 'default_auto_train_revised',
+      actor,
+      detail: {
+        previous: serializeDefaultAutoTrain(previous),
+        autoTrain: serializeDefaultAutoTrain(next),
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level auto-train default (EB-512) — the
+   * `sampleCount` / `sampleMaxBytes` / triggers / `onTrained` future
+   * auto-train rules fall back to when they opt into `autoTrain` but
+   * omit a field — `undefined` before any revision (no default, a
+   * partial `autoTrain` still throws, exactly the previous
+   * behavior), then whatever `setDefaultAutoTrain` last installed.
+   * Returns a copy, so mutating the result never moves the live
+   * default.
+   */
+  getDefaultAutoTrain(): Partial<CompressionAutoTrainOptions> | undefined {
+    return this.defaultAutoTrain === undefined
+      ? undefined
+      : copyAutoTrainDefault(this.defaultAutoTrain);
+  }
+
+  /**
    * Sets the live bus-level terminal group max-members default
    * (EB-467) without touching any live group:
    * `setGroupDefaultMaxMembers(n, actor = 'system')` decides how
@@ -64217,7 +64484,11 @@ export class EventBus {
       }
       coerceCompressionDictionary(compression.dictionary);
       if (compression.autoTrain !== undefined) {
-        resolveAutoTrainOptions(compression.autoTrain, `createTopic("${name}")`);
+        // EB-512: the bus-level default fills the rule's missing
+        // autoTrain fields before validation — same merge as
+        // `setTopicCompression` applies below.
+        const mergedAutoTrain = mergeAutoTrainWithDefault(compression.autoTrain, this.defaultAutoTrain);
+        resolveAutoTrainOptions(mergedAutoTrain ?? compression.autoTrain, `createTopic("${name}")`);
       }
     }
     const signing = o.signing;
