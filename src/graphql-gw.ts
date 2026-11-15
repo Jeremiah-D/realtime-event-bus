@@ -86,6 +86,7 @@ import {
   type BusMessage,
   type Subscription,
 } from './bus.ts';
+import type { GatewayDisconnectEvent } from './gateway-ws.ts';
 import { compileFilterExpression } from './filterexpr.ts';
 
 // --- RFC 6455 codec (server side, mirrors gateway-ws.ts) ---------------------
@@ -728,6 +729,19 @@ export interface GraphqlGatewayOptions {
    */
   authToken?: string;
   /**
+   * Opt-in disconnect hook (EB-132): called once per initialized
+   * connection teardown — wire it to
+   * `bus.noteGatewayDisconnect()` to feed the ops alert outlet's
+   * disconnect-storm detector. Uninitialized teardowns never fire it
+   * (they are auth/protocol errors, counted separately). Throwing
+   * hooks are swallowed: teardown must not fail. Revisable live with
+   * `setDisconnectCallback` (EB-517): the replacement is total — the
+   * new hook does not automatically chain
+   * `bus.noteGatewayDisconnect()`, so chain it yourself when the
+   * storm detector must keep seeing disconnects.
+   */
+  onDisconnect?: (event: GatewayDisconnectEvent) => void;
+  /**
    * Cap on concurrent connections; past it new sockets are refused
    * with 503 before the handshake. Unset means unlimited. Revisable
    * live with `setGraphqlGatewayLimits` (EB-349): the new cap governs
@@ -926,6 +940,8 @@ export class GraphqlGateway {
   private readonly port: number;
   /** Mutable live via `setAuthToken` (EB-350) — see that method. */
   private authToken: string | undefined;
+  /** Mutable live via `setDisconnectCallback` (EB-517) — see that method. */
+  private onDisconnect: ((event: GatewayDisconnectEvent) => void) | undefined;
   /** Mutable live via `setGraphqlGatewayLimits` (EB-349) — see that method. */
   private maxConnections: number | undefined;
   private connectionInitTimeoutMs: number;
@@ -961,6 +977,11 @@ export class GraphqlGateway {
       fail('authToken must be a non-empty string');
     }
     this.authToken = authToken;
+    const onDisconnect = options.onDisconnect;
+    if (onDisconnect !== undefined && typeof onDisconnect !== 'function') {
+      fail('onDisconnect must be a function');
+    }
+    this.onDisconnect = onDisconnect;
     const maxConnections = options.maxConnections;
     if (
       maxConnections !== undefined &&
@@ -1388,6 +1409,59 @@ export class GraphqlGateway {
     this.bus.noteGatewayAuthTokenRevised('graphql', token === null ? 'cleared' : 'rotated');
   }
 
+  /**
+   * Replaces or clears the gateway's disconnect hook live (EB-517)
+   * without restarting the server: `setDisconnectCallback(cb)`
+   * installs `cb` as the `onDisconnect` hook, and
+   * `setDisconnectCallback(null)` clears it back to no hook.
+   *
+   * The replacement is total — the new hook does not automatically
+   * chain `bus.noteGatewayDisconnect()`. The canonical wiring is
+   * `onDisconnect: () => bus.noteGatewayDisconnect()`; if the new
+   * hook does not call it, the EB-132 disconnect-storm detector goes
+   * blind (the detector itself is untouched — it simply stops
+   * receiving disconnects). Wire the detector yourself when the new
+   * hook must keep feeding it.
+   *
+   * The trigger rule is unchanged: only the teardown of an
+   * already-initialized connection fires the live hook
+   * (`destroyConnection` / `closeWithCode` read the field per
+   * teardown, so the new hook governs from the very next teardown on
+   * every connection, existing ones included), a throwing hook is
+   * swallowed, and teardown continues to unsubscribe. Uninitialized
+   * teardowns never fire it — they are auth/protocol errors, counted
+   * separately.
+   *
+   * The revision is audited as `gateway_disconnect_callback_revised`
+   * (`bus.getSubscriptionAudit()`) with `{ gateway: 'graphql',
+   * changed: 'set' | 'cleared' }` — the hook function itself is never
+   * recorded. A revision identical to the current hook — including
+   * clearing a gateway that holds no hook — is a no-op with no audit.
+   *
+   * Fail-closed: a non-function, non-null value throws `RangeError`
+   * with the live hook untouched. Validation reuses the
+   * construction-time rule (a function, or `null` to clear) — so a
+   * value that could not be set at construction cannot be revised in
+   * later either.
+   *
+   * There is deliberately no getter exposing the live hook: the
+   * function reference stays private.
+   *
+   * Throws `RangeError` for a non-function, non-null callback.
+   */
+  setDisconnectCallback(cb: ((event: GatewayDisconnectEvent) => void) | null): void {
+    if (cb !== null && typeof cb !== 'function') {
+      throw new RangeError('setDisconnectCallback: callback must be a function or null');
+    }
+    const next = cb === null ? undefined : cb;
+    // Re-installing the live hook is a no-op — no audit.
+    if (next === this.onDisconnect) {
+      return;
+    }
+    this.onDisconnect = next;
+    this.bus.noteGatewayDisconnectCallbackRevised('graphql', cb === null ? 'cleared' : 'set');
+  }
+
   // --- connection lifecycle --------------------------------------------------
 
   private handleConnection(socket: Socket): void {
@@ -1515,6 +1589,28 @@ export class GraphqlGateway {
     conn.initTimer = initTimer;
   }
 
+  /**
+   * Fires the live `onDisconnect` hook for one initialized
+   * connection's teardown (EB-517): called from both teardown paths
+   * (`destroyConnection` and `closeWithCode`) after the closed guard
+   * passes and the init timer is cleared, before `unsubscribeAll`.
+   * The closed guard makes the first teardown win, so each
+   * connection fires at most once. A throwing hook is swallowed —
+   * teardown must not fail.
+   */
+  private fireDisconnect(conn: GqlConnection): void {
+    if (!conn.initialized || this.onDisconnect === undefined) return;
+    try {
+      const remoteAddress = conn.socket.remoteAddress;
+      this.onDisconnect({
+        id: conn.id,
+        ...(remoteAddress === undefined ? {} : { remoteAddress }),
+      });
+    } catch {
+      // Teardown is infallible.
+    }
+  }
+
   private destroyConnection(conn: GqlConnection): void {
     if (conn.closed) return;
     conn.closed = true;
@@ -1523,6 +1619,7 @@ export class GraphqlGateway {
       conn.initTimer = undefined;
     }
     this.connections.delete(conn);
+    this.fireDisconnect(conn);
     this.unsubscribeAll(conn);
     try {
       conn.socket.destroy();
@@ -1544,6 +1641,7 @@ export class GraphqlGateway {
       conn.initTimer = undefined;
     }
     this.connections.delete(conn);
+    this.fireDisconnect(conn);
     this.unsubscribeAll(conn);
     const payload = Buffer.alloc(2 + Buffer.byteLength(reason));
     payload.writeUInt16BE(code, 0);

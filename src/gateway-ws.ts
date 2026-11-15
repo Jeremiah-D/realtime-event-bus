@@ -1370,7 +1370,7 @@ export class GatewayServer {
       return;
     }
     this.onDisconnect = next;
-    this.bus.noteGatewayDisconnectCallbackRevised(cb === null ? 'cleared' : 'set');
+    this.bus.noteGatewayDisconnectCallbackRevised('ws', cb === null ? 'cleared' : 'set');
   }
 
   /**

@@ -12245,6 +12245,24 @@ Semantics:
   must carry `authorization: "Bearer <token>"` (constant-time compare);
   otherwise the connection closes with 4401. It rotates live with
   `setAuthToken(token)` (EB-350) — see the WS gateway's Auth bullet.
+- **Disconnect hook (live-revisable).** `GraphqlGateway`'s `onDisconnect`
+  hook (EB-517) fires once per initialized connection teardown with
+  `{ id, remoteAddress? }` — the id `getStats().connectionsDetail`
+  exposes — and is available as the construction option `onDisconnect`
+  or swapped live with `setDisconnectCallback(cb)` (a function installs
+  it, `null` clears back to no hook). Replacement is total: the new hook
+  does not automatically chain `bus.noteGatewayDisconnect()`, so a hook
+  that does not call it leaves the EB-132 disconnect-storm detector
+  blind — chain it yourself (`onDisconnect: () =>
+  bus.noteGatewayDisconnect()`) when the detector must keep seeing
+  disconnects. Only an initialized connection's teardown fires it (an
+  init timeout or a pre-handshake disconnect never does), a throwing
+  hook is swallowed and teardown still unsubscribes, and re-installing
+  the same hook reference (including `null` on a gateway with no hook)
+  is a no-op with no audit. Every real change is audited as
+  `gateway_disconnect_callback_revised` (`{ gateway: 'graphql',
+  changed: 'set' | 'cleared' }`, the function itself never logged).
+  There is no getter exposing the live hook.
 - **Observability.** `GraphqlGateway.getStats()` reports
   `{ connections, subscriptions, messagesSent, protocolErrors,
   authFailures, authEnabled, limits, connectionsDetail }`, where
