@@ -377,8 +377,17 @@ test('lowered pressure pauses an already-queued connection at the next check', a
       try {
         await subscribeFlood(client);
         client.pause();
-        // Flood only until the queue first passes 200 KiB — enough to
-        // cross the revised watermark, far below the live one.
+        // Flood until the queue is both over the revised watermark and
+        // demonstrably stuck. With only ~200 KiB queued the socket's
+        // kernel buffers absorb the backlog within milliseconds, the
+        // queue drains below the recovery watermark, and the pause the
+        // revision triggers clears before the 50 ms poll can see it —
+        // the pause is real but transient. A queue that is still over
+        // 512 KiB after 200 ms of drain polls is not draining: the
+        // client's kernel buffers are full and `write()` is refusing,
+        // so the pause the revision triggers persists for the
+        // assertions below. The queue stays below the live 4 MiB
+        // watermark throughout, so nothing pauses before the revision.
         const deadline = Date.now() + 15000;
         let published = 0;
         for (;;) {
@@ -386,9 +395,15 @@ test('lowered pressure pauses an already-queued connection at the next check', a
           published += 100;
           await flush();
           const queued = gw.getStats().connectionQueues[0].queuedBytes;
-          if (queued > 200 * 1024) break;
-          if (published >= 4000 || Date.now() > deadline) {
-            throw new Error(`queue never formed (published ${published}, queued ${queued})`);
+          if (queued > 1024 * 1024) {
+            // Confirm the queue is stuck, not a transient spike the
+            // drain poll is about to flush away.
+            await sleep(200);
+            if (gw.getStats().connectionQueues[0].queuedBytes > 512 * 1024) break;
+          }
+          if (published >= 8000 || Date.now() > deadline) {
+            const now = gw.getStats().connectionQueues[0].queuedBytes;
+            throw new Error(`queue never formed (published ${published}, queued ${now})`);
           }
           await sleep(10);
         }
