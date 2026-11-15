@@ -18703,6 +18703,18 @@ export class EventBus {
    */
   private defaultAutoTrain?: Partial<CompressionAutoTrainOptions>;
   /**
+   * Bus-level default publish priority (EB-513): the lane a new publish
+   * falls back to when it omits its own `priority` (see `PublishOptions`,
+   * EB-122). Starts unset (`undefined` — no default, an omitted priority
+   * rides the `normal` lane, exactly the previous behavior) and moves
+   * only via `setDefaultPublishPriority`; there is no construction-time
+   * option, and a restart restores the unset default. The default never
+   * crosses a bus boundary: bridge/cluster inbound frames and route
+   * forwards pass no lane and still land in `normal`, and the fan-out's
+   * `?? 'normal'` terminal fallback is untouched.
+   */
+  private defaultPublishPriority?: MessageLane;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -53943,6 +53955,119 @@ export class EventBus {
   }
 
   /**
+   * Sets the live bus-level default publish priority (EB-513) without
+   * touching any queued message:
+   * `setDefaultPublishPriority(priority, actor = 'system')` decides
+   * the lane a new publish falls back to when it omits its own
+   * `priority` (see `PublishOptions`, EB-122) — `'urgent'` to lift
+   * every future unlabelled publish fleet-wide with one call, `'bulk'`
+   * to press it down, `null` to clear the default back to `'normal'`.
+   *
+   * Only the default moves: the queues, the drain, and every already
+   * queued message are untouched. The priority chain is
+   * publish-explicit > bus default > `'normal'` — the bus default is
+   * the terminal fallback below the explicit option: an explicit
+   * `'bulk'` still beats a bus default of `'urgent'`, and an explicit
+   * `'normal'` still rides the normal lane under an `'urgent'`
+   * default. A message that took the default at admission keeps the
+   * lane it was stamped with: a later revision never moves an
+   * already-queued message's lane, and a delayed schedule keeps the
+   * lane stamped at schedule time (a later revision never moves a
+   * scheduled record). A recurring job without a stored priority
+   * takes the default in effect at each trigger, through `publish`.
+   * The default only ever moves publishes that pass no priority of
+   * their own, at the local acceptance points — `publishCore`
+   * (hence `publish` / `tryPublish` / `publishWithConfirmation` /
+   * `publishReceipt` / `requestResponse` / `publishCompareAndSet`),
+   * `publishIdempotent` (both its direct fan-out paths — the
+   * no-identity path and the messageId path fan out directly, they
+   * do not go through `publishCore`), `publishDedupedByContent`,
+   * and `publishDelayed` at schedule time. The gateway publishes
+   * through `bus.publish` / `publishIdempotent`, so gateway traffic
+   * takes the default too.
+   * Bridge/cluster inbound frames and route forwards pass no lane
+   * and still land in `normal`: the default never crosses a bus,
+   * and the fan-out's `?? 'normal'` terminal fallback is untouched.
+   *
+   * There is no existence gate — the default exists precisely for
+   * publishes that have not happened yet, so it applies to every
+   * future publish without an explicit priority. The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than `'urgent'`,
+   * `'normal'`, `'bulk'`, or `null` throws `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default (including setting `'normal'` on a factory
+   * bus, or clearing a bus already at `'normal'`) is a no-op with no
+   * audit — the comparison is on the effective lane, unset counting
+   * as `'normal'`. Audited as `default_publish_priority_revised`
+   * (`{ previous, priority }`, `null` when the default is unset —
+   * unset means new publishes without an explicit priority go back
+   * to the documented `'normal'`, exactly the previous behavior).
+   *
+   * Orthogonal to EB-122 (that owns the lane mechanism itself — this
+   * sets the default a new publish without an explicit priority falls
+   * back to), to EB-464 (that sets the publish TTL default — that
+   * lifetime, this priority; the same live-default family on the
+   * publish side), to EB-490 (that sets the subscribe-side delivery
+   * priority default — that subscriber weights and labels, this
+   * publish lane; the two sides of the same lane family), to EB-38
+   * (that owns the critical sampling exemption — that whether a
+   * message is sampled, this which lane it enters), and to EB-204
+   * (that owns EDF deadline ordering — that sort order, this lane).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * `'urgent' | 'normal' | 'bulk'`, or `null` to clear.
+   */
+  setDefaultPublishPriority(
+    priority: MessageLane | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setDefaultPublishPriority');
+    // The default is validated once, here, with the same gate the
+    // publish paths use for an explicit value — a failed call leaves
+    // the live default untouched, and the acceptance points below
+    // never re-validate it.
+    if (priority !== null) {
+      assertValidMessageLane(priority, 'setDefaultPublishPriority');
+    }
+    // Store the value as given, so a later `'urgent'` and a custom
+    // lane stay distinct revisions, and `undefined` keeps meaning
+    // the factory `'normal'`.
+    const next: MessageLane | undefined = priority === null ? undefined : priority;
+    const previous: MessageLane | null = this.defaultPublishPriority ?? null;
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective lane — unset means `'normal'` —
+    // so setting `'normal'` on a factory bus, or clearing a bus
+    // already at `'normal'`, audits nothing.
+    if ((previous ?? 'normal') === (next ?? 'normal')) {
+      return;
+    }
+    this.defaultPublishPriority = next;
+    this.auditSubscription({
+      action: 'default_publish_priority_revised',
+      actor,
+      detail: {
+        previous,
+        priority: next === undefined ? null : next,
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default publish priority (EB-513) —
+   * the `'urgent' | 'normal' | 'bulk'` future publishes without an
+   * explicit priority fall back to — `undefined` before any revision
+   * (no default installed, new publishes without a priority use the
+   * documented `'normal'`), then whatever
+   * `setDefaultPublishPriority` last installed.
+   */
+  getDefaultPublishPriority(): MessageLane | undefined {
+    return this.defaultPublishPriority;
+  }
+
+  /**
    * Sets the live bus-level terminal group max-members default
    * (EB-467) without touching any live group:
    * `setGroupDefaultMaxMembers(n, actor = 'system')` decides how
@@ -56883,8 +57008,9 @@ export class EventBus {
       opts?.partition,
       binary,
       // Priority lane (EB-122): validated above; `fanOut` stamps it onto
-      // the envelope and the durable-log record. Absent means `normal`.
-      opts?.priority,
+      // the envelope and the durable-log record. Absent means the bus
+      // default (`setDefaultPublishPriority`, EB-513), else `normal`.
+      opts?.priority ?? this.defaultPublishPriority,
       // Publisher confirmation (EB-125): the admitted path records the
       // receipt's content fields here.
       confirm,
@@ -57432,7 +57558,9 @@ export class EventBus {
         opts?.partitionKey,
         opts?.partition,
         binary,
-        opts?.priority,
+        // Bus-level default publish priority (EB-513): an omitted
+        // priority falls back to the live default, else `normal`.
+        opts?.priority ?? this.defaultPublishPriority,
         undefined, // confirm: only `publishCore` passes one
         undefined, // mirrorProvenance: only `receiveForward` passes one
         // Adaptive sampling exemption (EB-38): validated above; `fanOut`
@@ -57514,7 +57642,9 @@ export class EventBus {
       opts?.partitionKey,
       opts?.partition,
       binary,
-      opts?.priority,
+      // Bus-level default publish priority (EB-513): an omitted
+      // priority falls back to the live default, else `normal`.
+      opts?.priority ?? this.defaultPublishPriority,
       undefined, // confirm: only `publishCore` passes one
       undefined, // mirrorProvenance: only `receiveForward` passes one
       // Adaptive sampling exemption (EB-38): validated above; `fanOut`
@@ -57872,7 +58002,9 @@ export class EventBus {
       opts?.partitionKey,
       opts?.partition,
       binary,
-      opts?.priority,
+      // Bus-level default publish priority (EB-513): an omitted
+      // priority falls back to the live default, else `normal`.
+      opts?.priority ?? this.defaultPublishPriority,
       undefined, // confirm: only `publishCore` passes one
       undefined, // mirrorProvenance: only `receiveForward` passes one
       // Adaptive sampling exemption (EB-38): validated above; `fanOut`
@@ -59190,7 +59322,10 @@ export class EventBus {
     // time — the due-time fan-out runs the cycle check and stamps the
     // origin hop.
     const lineage = assertValidLineage(opts?.lineage, 'publishDelayed');
-    const priority = opts?.priority;
+    // Bus-level default publish priority (EB-513): the lane is stamped
+    // at schedule time — an omitted priority takes the default in
+    // effect now, and a later revision never moves this record.
+    const priority = opts?.priority ?? this.defaultPublishPriority;
     const publisherId = opts?.publisherId;
     // Topic aliases (EB-44) resolve before every other gate: the schedule
     // is filed under the resolved topic — the fail-fast ACL/schema checks

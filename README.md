@@ -9232,6 +9232,25 @@ Semantics:
   keeps counting against the live threshold. Illegal values throw
   `RangeError` with the live tuning untouched. Audited as
   `priority_lanes_revised`.
+- **Bus-level publish default.** `setDefaultPublishPriority(lane, actor = 'system')`
+  (EB-513) decides the lane a new publish falls back to when it omits its
+  own `priority` — `'urgent'` to lift every unlabelled publish fleet-wide
+  with one call, `'bulk'` to press it down, `null` to clear the default
+  back to `'normal'`. The chain is publish-explicit > bus default >
+  `'normal'`; an explicit `'normal'` still beats a bus default of
+  `'urgent'`, and an explicit `'bulk'` still beats `'urgent'`. A revision
+  only affects publishes accepted after it — messages already queued keep
+  the lane they were stamped with, and a delayed schedule keeps the lane
+  stamped at schedule time. Bridge/cluster inbound frames and route
+  forwards carry no lane and still land in `normal`; the default never
+  crosses a bus. Setting the current effective default (including
+  `'normal'` on a factory bus, or clearing an already-unset default) is
+  a no-op with no audit. Illegal values throw `RangeError` with the live
+  default untouched. Audited as `default_publish_priority_revised`
+  (`{ previous, priority }`, `null` when the default is unset). There is
+  no construction-time option and the default does not survive a restart.
+  `getDefaultPublishPriority()` returns the live default (`undefined`
+  before any revision).
 - **FIFO within a lane; priority across lanes.** Ordering is preserved
   per lane, but an urgent message published later jumps ahead of an
   earlier bulk message. That is the documented trade-off; keep one
