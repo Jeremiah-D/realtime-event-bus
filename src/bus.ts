@@ -18703,6 +18703,20 @@ export class EventBus {
    */
   private defaultAutoTrain?: Partial<CompressionAutoTrainOptions>;
   /**
+   * Bus-level default idle activity mode (EB-516): the activity mode
+   * a new subscriber falls back to when it opts into an idle window
+   * (explicitly, or via the EB-472 default window) but omits its own
+   * `idleActivity` (see `SubscribeOptions.idleActivity`, EB-72).
+   * Starts unset (`undefined` — no default, an omitted mode rides
+   * the documented `'any'`, exactly the previous behavior) and moves
+   * only via `setDefaultIdleActivity`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables idle reclamation: a subscriber with no effective
+   * window (explicit nor EB-472 default) does not take the default,
+   * and `setIdleActivity` (EB-341) never consults it.
+   */
+  private defaultIdleActivity?: IdleActivityMode;
+  /**
    * Bus-level default publish priority (EB-513): the lane a new publish
    * falls back to when it omits its own `priority` (see `PublishOptions`,
    * EB-122). Starts unset (`undefined` — no default, an omitted priority
@@ -34465,14 +34479,26 @@ export class EventBus {
     // subscriber behind. EB-472: a subscriber that omits maxIdleMs
     // falls back to the live bus default, if one is installed — the
     // bus default is the terminal fallback, below the explicit
-    // option. An explicit value always wins. The idleActivity gate
-    // below reads the merged value, so `idleActivity` alone opts in
-    // exactly when a default is installed.
+    // option. An explicit value always wins. EB-516: a subscriber
+    // that omits idleActivity falls back to the live bus default
+    // mode, if one is installed — but only when a window is in
+    // effect (explicit or EB-472 default); the default never opts a
+    // subscriber into reclamation. Only an absent (`undefined`)
+    // value falls back: an explicit `null` is still an illegal mode
+    // and throws via the validator below (a bare `??` would swallow
+    // it, since `??` treats `null` as missing). The idleActivity
+    // gate below reads the merged value, so `idleActivity` alone
+    // opts in exactly when a default window is installed.
     const maxIdleMs = opts?.maxIdleMs ?? this.defaultMaxIdleMs;
     if (maxIdleMs !== undefined && (!Number.isInteger(maxIdleMs) || maxIdleMs <= 0)) {
       throw new RangeError('subscribe: maxIdleMs must be a positive integer number of milliseconds');
     }
-    const idleActivity = opts?.idleActivity;
+    const idleActivity =
+      opts?.idleActivity !== undefined
+        ? opts.idleActivity
+        : maxIdleMs !== undefined
+          ? this.defaultIdleActivity
+          : undefined;
     if (maxIdleMs === undefined && idleActivity !== undefined) {
       throw new RangeError('subscribe: idleActivity requires maxIdleMs');
     }
@@ -53952,6 +53978,112 @@ export class EventBus {
     return this.defaultAutoTrain === undefined
       ? undefined
       : copyAutoTrainDefault(this.defaultAutoTrain);
+  }
+
+  /**
+   * Sets the live bus-level default idle activity mode (EB-516)
+   * without touching any live subscriber:
+   * `setDefaultIdleActivity(mode, actor = 'system')` decides which
+   * events count as activity for a future subscriber that opts into
+   * an idle window (explicitly, or via the EB-472 default window)
+   * but omits its own `idleActivity` (see
+   * `SubscribeOptions.idleActivity`, EB-72) — `'ack'` to count only
+   * acknowledgements fleet-wide with one call, `'deliver'` to count
+   * only deliveries, `null` to clear the default back to `'any'`.
+   *
+   * Only the default moves: the roster, the timers, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > `'any'` — the bus default is
+   * the terminal fallback below the explicit option: an explicit
+   * `'deliver'` still beats a bus default of `'ack'`, and an explicit
+   * `'any'` still counts every event under an `'ack'` default. A
+   * subscriber that took the default at subscribe time keeps the mode
+   * it was baked with: a later revision never moves an
+   * already-subscribed subscriber's mode, and `setIdleActivity`
+   * (EB-341) still revises one live subscriber at a time without
+   * touching the bus default — and never consults it, so a later
+   * default revision never moves a mode `setIdleActivity` installed.
+   * The default never enables idle reclamation: a subscriber with no
+   * effective window (explicit nor EB-472 default) does not take the
+   * default, does not throw, and its record keeps `idleActivity`
+   * `undefined` — the `?? 'any'` terminal fallback at subscribe time
+   * is untouched. The requires-`maxIdleMs` gate reads the merged
+   * value: an explicit `idleActivity` with no window still throws,
+   * exactly as before.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription that opts into a window. The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than `'deliver'`,
+   * `'ack'`, `'any'`, or `null` throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to the
+   * current default (including setting `'any'` on a factory bus, or
+   * clearing a bus already at `'any'`) is a no-op with no audit —
+   * the comparison is on the effective mode, unset counting as
+   * `'any'`. Audited as `default_idle_activity_revised`
+   * (`{ previous, idleActivity }`, `null` when the default is unset
+   * — unset means new subscribers without an explicit mode go back
+   * to the documented `'any'`, exactly the previous behavior).
+   *
+   * Orthogonal to EB-72 (that owns the reclamation mechanism itself
+   * — this the default a new windowed subscriber without an explicit
+   * mode falls back to), to EB-341 (that revises one live
+   * subscriber's mode — this the default future subscribers fall
+   * back to), to EB-472 (that sets the idle window default — that
+   * the window size, this the activity mode; the two halves of the
+   * same opt-in), and to EB-334 (that revises one live subscriber's
+   * window — this the mode default, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * `'deliver' | 'ack' | 'any'`, or `null` to clear.
+   */
+  setDefaultIdleActivity(mode: IdleActivityMode | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultIdleActivity');
+    // The default is validated once, here, with the same gate the
+    // subscribe path uses for an explicit value — a failed call
+    // leaves the live default untouched, and subscribe never
+    // re-validates it.
+    if (mode !== null && mode !== 'deliver' && mode !== 'ack' && mode !== 'any') {
+      throw new RangeError(
+        "setDefaultIdleActivity: idleActivity must be 'deliver', 'ack' or 'any', or null to clear it",
+      );
+    }
+    // Store the value as given, so a later `'ack'` and a custom mode
+    // stay distinct revisions, and `undefined` keeps meaning the
+    // factory `'any'`.
+    const next: IdleActivityMode | undefined = mode === null ? undefined : mode;
+    const previous: IdleActivityMode | null = this.defaultIdleActivity ?? null;
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective mode — unset means `'any'` — so
+    // setting `'any'` on a factory bus, or clearing a bus already at
+    // `'any'`, audits nothing.
+    if ((previous ?? 'any') === (next ?? 'any')) {
+      return;
+    }
+    this.defaultIdleActivity = next;
+    this.auditSubscription({
+      action: 'default_idle_activity_revised',
+      actor,
+      detail: {
+        previous,
+        idleActivity: next === undefined ? null : next,
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default idle activity mode (EB-516) —
+   * the `'deliver' | 'ack' | 'any'` future windowed subscribers
+   * without an explicit mode fall back to — `undefined` before any
+   * revision (no default installed, new subscribers without a mode
+   * use the documented `'any'`), then whatever
+   * `setDefaultIdleActivity` last installed.
+   */
+  getDefaultIdleActivity(): IdleActivityMode | undefined {
+    return this.defaultIdleActivity;
   }
 
   /**

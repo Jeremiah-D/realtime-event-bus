@@ -1962,7 +1962,24 @@ library.
   default untouched), a revision identical to the current default is
   a no-op with no audit, and every success is audited as
   `default_max_idle_ms_revised` (`{ previous, maxIdleMs }`, `null`
-  when unset). (Real-time systems / backend engineering: subscriber
+  when unset). A bus-level default idle activity mode is also
+  revisable live (EB-516, via `setDefaultIdleActivity(mode | null,
+  actor?)`): future subscribers that opt into an idle window
+  (explicitly, or via the EB-472 default window) but omit their own
+  `idleActivity` fall back to the bus default — the precedence chain
+  is subscriber-explicit > bus default > `'any'` (unset by default,
+  so omitting `idleActivity` still means `'any'`). The default never
+  enables idle reclamation: subscribers without an effective window
+  do not take the default, do not throw, and keep `idleActivity`
+  `undefined`. The revision only affects subscribers created after
+  it — already-subscribed modes never move — and `setIdleActivity`
+  still revises one live subscriber at a time without touching the
+  bus default. It is fail-closed (an illegal actor or a value other
+  than `'deliver'`, `'ack'`, or `'any'` throws `RangeError` with the
+  live default untouched), a revision identical to the current
+  default is a no-op with no audit, and every success is audited as
+  `default_idle_activity_revised` (`{ previous, idleActivity }`,
+  `null` when unset). (Real-time systems / backend engineering: subscriber
   lifecycle governance.)
   Disabled by default — fully backward compatible.
 - **Graceful drain-on-unsubscribe** (opt-in via
