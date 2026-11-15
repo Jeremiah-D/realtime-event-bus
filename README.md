@@ -12230,10 +12230,14 @@ Semantics:
   `setAuthToken(token)` (EB-350) — see the WS gateway's Auth bullet.
 - **Observability.** `GraphqlGateway.getStats()` reports
   `{ connections, subscriptions, messagesSent, protocolErrors,
-  authFailures, authEnabled, limits }`, where `limits` snapshots the live
-  connection limits (`{ maxConnections, connectionInitTimeoutMs,
-  maxFrameBytes, handshakeTimeoutMs, maxHandshakeBytes,
-  maxSubscriptionsPerConnection }`).
+  authFailures, authEnabled, limits, connectionsDetail }`, where
+  `limits` snapshots the live connection limits (`{ maxConnections,
+  connectionInitTimeoutMs, maxFrameBytes, handshakeTimeoutMs,
+  maxHandshakeBytes, maxSubscriptionsPerConnection }`) and
+  `connectionsDetail` lists one row per live connection (`{ id,
+  remoteAddress, subscriptions, initialized }`) — the id
+  `disconnectGraphqlConnection` (EB-515) takes. `connections` stays
+  the cumulative count of accepted sockets.
 - **Live limit revision (EB-349; EB-358 adds `maxFrameBytes`).**
   `setGraphqlGatewayLimits({ maxConnections?,
   connectionInitTimeoutMs?, maxFrameBytes? })` retunes the three
@@ -12283,6 +12287,26 @@ Semantics:
   observable in `getStats().limits`. This mirrors the WS gateway's
   `setGatewayMaxSubscriptionsPerConnection` (EB-327); before EB-402 the
   GraphQL gateway had no per-connection subscription limit at all.
+- **Single-connection disconnect (EB-515).**
+  `gw.disconnectGraphqlConnection(id)` drops one live connection by
+  its gateway-assigned id — the id
+  `gw.getStats().connectionsDetail` exposes per row — without
+  touching the others: the single-connection counterpart of
+  `gw.stop()`. Ids are handed out monotonically from 1 at accept,
+  never reused, never persisted, never put on the wire. The teardown
+  is the shared one: a clean close frame first (the normal WebSocket
+  close code 1000, `'operator disconnect'` — not one of the 44xx
+  graphql-ws protocol codes), then unsubscribe of all the
+  connection's bus subscriptions and socket destroy. A connection
+  that has not sent `connection_init` yet can be dropped too, and a
+  connection still mid-handshake as well. An unknown id — including
+  a stale id for a connection that already disconnected — throws
+  `RangeError` fail-closed. There is no per-address bulk disconnect
+  (several connections may share one remote address) and no audit
+  event; observability is `gw.getStats().connectionsDetail` plus the
+  cumulative `gw.getStats().connections` count. This mirrors the WS
+  gateway's `disconnectGatewayConnection` (EB-514); `stop()` still
+  drops every connection.
 - **Orthogonality.** `gateway-ws.ts` speaks the bus's own framing; this
   speaks the graphql-ws wire protocol. A text-frame-only WebSocket
   client is all a subscriber needs.

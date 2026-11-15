@@ -67,8 +67,12 @@
  * messagesSent, protocolErrors, authFailures}`: `connections` is the
  * cumulative count of accepted sockets, `subscriptions` the live
  * subscription count, `messagesSent` the cumulative `next` frames
- * delivered; `limits` snapshots the live connection limits, revisable
- * with `setGraphqlGatewayLimits` (EB-349) without restarting the
+ * delivered; `connectionsDetail` lists one row per live connection
+ * (its gateway-assigned id, remote address, live subscription count
+ * and whether it sent `connection_init`) — the id
+ * `disconnectGraphqlConnection` (EB-515) takes; `limits` snapshots
+ * the live connection limits, revisable with
+ * `setGraphqlGatewayLimits` (EB-349) without restarting the
  * server.
  */
 import {
@@ -793,6 +797,21 @@ export interface GraphqlGatewayStats {
   connections: number;
   /** Currently live bus subscriptions across all connections. */
   subscriptions: number;
+  /**
+   * One row per live connection, in connection order (EB-515): its
+   * gateway-assigned id, its remote address, its live bus-subscription
+   * count, and whether it sent `connection_init`. The id is the key
+   * `disconnectGraphqlConnection` takes.
+   */
+  connectionsDetail: Array<{
+    /** Gateway-assigned connection id (EB-515): monotonic from 1, never reused — the key `disconnectGraphqlConnection` takes. */
+    id: number;
+    remoteAddress?: string;
+    /** Live bus subscriptions on this connection. */
+    subscriptions: number;
+    /** True once the connection sent `connection_init`. */
+    initialized: boolean;
+  }>;
   /** Cumulative `next` frames delivered. */
   messagesSent: number;
   protocolErrors: number;
@@ -884,6 +903,13 @@ export interface GraphqlGatewaySubscriptionLimitRevision {
 
 interface GqlConnection {
   socket: Socket;
+  /**
+   * Gateway-assigned connection id (EB-515): handed out monotonically
+   * from 1 at accept, never reused, never persisted, never put on the
+   * wire — the key `disconnectGraphqlConnection` takes and
+   * `getStats().connectionsDetail` exposes.
+   */
+  id: number;
   parser: FrameParser;
   handshook: boolean;
   closed: boolean;
@@ -913,6 +939,8 @@ export class GraphqlGateway {
   private server: TcpServer | null = null;
   private boundPort = 0;
   private readonly connections = new Set<GqlConnection>();
+  /** Next gateway-assigned connection id (EB-515): monotonic from 1, never reused. */
+  private nextGraphqlConnectionId = 1;
   private readonly stats = {
     connections: 0,
     messagesSent: 0,
@@ -999,6 +1027,55 @@ export class GraphqlGateway {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
+  /**
+   * Drops one live connection by its gateway-assigned id (EB-515) —
+   * the single-connection counterpart of `stop()`:
+   * `disconnectGraphqlConnection(3)` removes connection 3 and leaves
+   * every other connection untouched. The id comes from
+   * `getStats().connectionsDetail` (one row per live connection, in
+   * connection order) — ids are handed out monotonically from 1 at
+   * accept, never reused, never persisted, never put on the wire, so
+   * a stale id (a connection already gone) can never address a
+   * different, later connection.
+   *
+   * The teardown is the shared one: a clean close frame first
+   * (`closeWithCode` with the normal WebSocket close code 1000 and
+   * reason `'operator disconnect'`, best-effort — not one of the
+   * 44xx graphql-ws protocol codes), then the socket is destroyed
+   * 25ms later; all of the connection's bus subscriptions are
+   * unsubscribed at once. A connection that has not sent
+   * `connection_init` yet can be dropped too (its id exists from
+   * accept; it holds no subscriptions to clear, and its armed
+   * `connection_init` timer is cleared by `closeWithCode`, while the
+   * raw handshake timer later no-ops behind `destroyConnection`'s
+   * `closed` guard, so nothing leaks).
+   *
+   * There is no per-address bulk disconnect: several connections may
+   * share one remote address, and the id is the only unambiguous key.
+   * The WS gateway is untouched (its single-connection disconnect is
+   * EB-514). No audit event — observability is
+   * `getStats().connectionsDetail` plus the cumulative
+   * `getStats().connections` count, like the other gateway live
+   * revisions.
+   *
+   * Throws `RangeError` for an unknown id (including a stale id for a
+   * connection that already disconnected) — fail-closed, the gateway
+   * is untouched.
+   */
+  disconnectGraphqlConnection(id: number): void {
+    let target: GqlConnection | undefined;
+    for (const conn of this.connections) {
+      if (conn.id === id) {
+        target = conn;
+        break;
+      }
+    }
+    if (target === undefined) {
+      throw new RangeError(`disconnectGraphqlConnection: unknown connection id ${id}`);
+    }
+    this.closeWithCode(target, 1000, 'operator disconnect');
+  }
+
   /** The bound port (0 until `start()` resolves). */
   getPort(): number {
     return this.boundPort;
@@ -1006,11 +1083,22 @@ export class GraphqlGateway {
 
   getStats(): GraphqlGatewayStats {
     let subscriptions = 0;
-    for (const conn of this.connections) subscriptions += conn.subscriptions.size;
+    const connectionsDetail: GraphqlGatewayStats['connectionsDetail'] = [];
+    for (const conn of this.connections) {
+      subscriptions += conn.subscriptions.size;
+      const remoteAddress = conn.socket.remoteAddress;
+      connectionsDetail.push({
+        id: conn.id,
+        ...(remoteAddress === undefined ? {} : { remoteAddress }),
+        subscriptions: conn.subscriptions.size,
+        initialized: conn.initialized,
+      });
+    }
     return {
       ...this.stats,
       authEnabled: this.authToken !== undefined,
       subscriptions,
+      connectionsDetail,
       limits: {
         maxConnections: this.maxConnections,
         connectionInitTimeoutMs: this.connectionInitTimeoutMs,
@@ -1320,6 +1408,7 @@ export class GraphqlGateway {
     }
     const conn: GqlConnection = {
       socket,
+      id: this.nextGraphqlConnectionId++,
       parser: new FrameParser(this.maxFrameBytes),
       handshook: false,
       closed: false,
