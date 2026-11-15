@@ -7239,6 +7239,24 @@ Semantics:
   existing ones included — tightening denies only new subscribes
   (existing subscriptions are kept), loosening admits the next
   subscribe on an over-cap connection at once.
+- **Single-connection disconnect (EB-514).**
+  `gw.disconnectGatewayConnection(id)` drops one live connection by
+  its gateway-assigned id — the id `gw.getStats().connectionQueues`
+  exposes per row — without touching the others: the single-connection
+  counterpart of `gw.close()`. Ids are handed out monotonically from 1
+  at accept, never reused, never persisted, never put on the wire. The
+  teardown is the shared one: a clean close frame first (code 1000,
+  `'operator disconnect'`), then unsubscribe of all the connection's
+  bus subscriptions, socket destroy, and `onDisconnect` with the id for
+  an established connection (so an operator bulk disconnect feeds the
+  EB-132 disconnect-storm detector like a client-side drop). A
+  connection still mid-handshake can be dropped too, and fires no
+  `onDisconnect`. An unknown id — including a stale id for a connection
+  that already disconnected — throws `RangeError` fail-closed. There
+  is no per-address bulk disconnect (several connections may share one
+  remote address) and no audit event; observability is
+  `gw.getStats().connections` plus the `onDisconnect` hook. The
+  GraphQL gateway is untouched.
 - **Live permessage-deflate revision (EB-330).**
   `gw.setGatewayDeflate({ compressThresholdBytes?,
   serverMaxWindowBits?, clientMaxWindowBits?, maxInflatedBytes? })`

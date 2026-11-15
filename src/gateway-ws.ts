@@ -508,6 +508,8 @@ export interface GatewayOptions {
 
 /** One established gateway connection's teardown, as delivered to `onDisconnect`. */
 export interface GatewayDisconnectEvent {
+  /** The gateway-assigned connection id (EB-514) — the same id `getStats().connectionQueues` exposes and `disconnectGatewayConnection` takes. */
+  id: number;
   /** Remote address when the socket reports one. */
   remoteAddress?: string;
 }
@@ -617,11 +619,13 @@ export interface GatewayStats {
    */
   pausedConnections: number;
   /**
-   * One row per live connection, in connection order: its queued
-   * outbound bytes, whether it is currently pressured (EB-161), and its
-   * live bus-subscription count (EB-173).
+   * One row per live connection, in connection order: its gateway-assigned
+   * id (EB-514), its queued outbound bytes, whether it is currently
+   * pressured (EB-161), and its live bus-subscription count (EB-173).
    */
   connectionQueues: Array<{
+    /** Gateway-assigned connection id (EB-514): monotonic from 1, never reused — the key `disconnectGatewayConnection` takes. */
+    id: number;
     remoteAddress?: string;
     /** Queued (not yet socket-written) outbound bytes. */
     queuedBytes: number;
@@ -673,6 +677,13 @@ interface ConnectionSubscription {
 
 interface Connection {
   socket: Socket;
+  /**
+   * Gateway-assigned connection id (EB-514): handed out monotonically
+   * from 1 at accept, never reused, never persisted, never put on the
+   * wire — the key `disconnectGatewayConnection` takes and
+   * `getStats().connectionQueues` exposes.
+   */
+  id: number;
   parser: FrameParser;
   handshook: boolean;
   closed: boolean;
@@ -855,6 +866,8 @@ export class GatewayServer {
   private deflateOpts: ResolvedPerMessageDeflate | undefined;
   private server: TcpServer | null = null;
   private readonly connections = new Set<Connection>();
+  /** Next gateway connection id (EB-514): monotonic from 1, never reused. */
+  private nextConnectionId = 1;
   private readonly stats: Omit<GatewayStats, 'pausedConnections' | 'connectionQueues' | 'limits' | 'deflate'> = {
     connections: 0,
     framesReceived: 0,
@@ -964,6 +977,53 @@ export class GatewayServer {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
+  /**
+   * Drops one live connection by its gateway-assigned id (EB-514) —
+   * the single-connection counterpart of `close()`: `disconnectGatewayConnection(3)`
+   * removes connection 3 and leaves every other connection untouched.
+   * The id comes from `getStats().connectionQueues` (one row per live
+   * connection, in connection order) — ids are handed out monotonically
+   * from 1 at accept, never reused, never persisted, never put on the
+   * wire, so a stale id (a connection already gone) can never address
+   * a different, later connection.
+   *
+   * The teardown is the shared one: a clean close frame first
+   * (`closeWithCode` with code 1000 and reason `'operator disconnect'`,
+   * best-effort), then `destroyConnection` — all of the connection's
+   * bus subscriptions are unsubscribed, the socket is destroyed, and
+   * an established (handshook) connection fires `onDisconnect` with
+   * the id, exactly like any other teardown, so an operator bulk
+   * disconnect feeds the EB-132 disconnect-storm detector the same
+   * way a client-side drop would. A connection still mid-handshake
+   * can be dropped too (its id exists from accept); its armed
+   * handshake timer is unref'd and later no-ops behind
+   * `destroyConnection`'s `closed` guard, so nothing leaks.
+   *
+   * There is no per-address bulk disconnect: several connections may
+   * share one remote address, and the id is the only unambiguous key.
+   * The GraphQL gateway is untouched (its single-connection disconnect
+   * is a separate item). No audit event — observability is
+   * `getStats().connections` plus the `onDisconnect` hook, like the
+   * other gateway live revisions.
+   *
+   * Throws `RangeError` for an unknown id (including a stale id for a
+   * connection that already disconnected) — fail-closed, the gateway
+   * is untouched.
+   */
+  disconnectGatewayConnection(id: number): void {
+    let target: Connection | undefined;
+    for (const conn of this.connections) {
+      if (conn.id === id) {
+        target = conn;
+        break;
+      }
+    }
+    if (target === undefined) {
+      throw new RangeError(`disconnectGatewayConnection: unknown connection id ${id}`);
+    }
+    this.closeWithCode(target, 1000, 'operator disconnect');
+  }
+
   getStats(): GatewayStats {
     const connectionQueues: GatewayStats['connectionQueues'] = [];
     let pausedConnections = 0;
@@ -971,6 +1031,7 @@ export class GatewayServer {
       if (conn.pressured) pausedConnections += 1;
       const remoteAddress = conn.socket.remoteAddress;
       connectionQueues.push({
+        id: conn.id,
         ...(remoteAddress === undefined ? {} : { remoteAddress }),
         queuedBytes: conn.pendingBytes,
         pressured: conn.pressured,
@@ -1471,6 +1532,7 @@ export class GatewayServer {
     socket.setNoDelay(true);
     const conn: Connection = {
       socket,
+      id: this.nextConnectionId++,
       parser: new FrameParser(this.maxFrameBytes),
       handshook: false,
       closed: false,
@@ -1618,6 +1680,10 @@ export class GatewayServer {
     if (conn.closed) return;
     conn.closed = true;
     this.connections.delete(conn);
+    // EB-514: `stats.connections` is the live connection count — accept
+    // increments it, teardown decrements it (exactly once per connection,
+    // behind the `closed` guard above).
+    this.stats.connections -= 1;
     if (conn.drainPoll !== undefined) {
       clearTimeout(conn.drainPoll);
       conn.drainPoll = undefined;
@@ -1629,9 +1695,10 @@ export class GatewayServer {
     if (conn.handshook && this.onDisconnect !== undefined) {
       try {
         const remoteAddress = conn.socket.remoteAddress;
-        this.onDisconnect(
-          remoteAddress === undefined ? {} : { remoteAddress },
-        );
+        this.onDisconnect({
+          id: conn.id,
+          ...(remoteAddress === undefined ? {} : { remoteAddress }),
+        });
       } catch {
         // Teardown is infallible.
       }
