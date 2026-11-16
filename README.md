@@ -1008,7 +1008,22 @@ library.
   no replay progress observer, or a non-positive-integer interval
   throws `RangeError` with the live interval untouched; every success
   is audited as `replay_progress_interval_revised`
-  (`{ progressInterval, oldProgressInterval }`). Opt-in segment
+  (`{ progressInterval, oldProgressInterval }`). The interval also has
+  a bus-level default: `setDefaultReplayProgressInterval(progressInterval)`
+  (EB-522) decides the interval for future replay-observed subscribers
+  that omit their own `progressInterval` — `50` to observe every new
+  omit-`progressInterval` replay at fifty-entry granularity fleet-wide
+  with one call, `null` to clear back to 100. The priority chain is
+  subscriber-explicit > bus default > 100; a revision only affects
+  subscribers created after it, and `setReplayProgressInterval` still
+  retunes one subscriber at a time without touching the bus default.
+  The default never enables observation: a subscriber that does not
+  pass `onReplayProgress` is untouched by it. Fail-closed: a
+  non-positive-integer non-`null` value or an illegal actor throws
+  `RangeError` with the live default untouched, and a revision
+  identical to the current default is a no-op; every success is
+  audited as `default_replay_progress_interval_revised`
+  (`{ previous, progressInterval }`). Opt-in segment
   rotation (`durableLogSegmentRotation: { maxEntriesPerSegment?,
   maxSegmentAgeMs? }`, validated `RangeError`): the per-topic live file
   holds the current segment, and when an append reaches the entry budget

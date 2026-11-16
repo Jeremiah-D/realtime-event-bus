@@ -2595,7 +2595,9 @@ export interface SubscribeOptions {
   /**
    * Replay entries processed between `onReplayProgress` fires (EB-71):
    * a throttle so a large replay does not spam the observer. Must be a
-   * positive integer; defaults to 100. The completion/failure event
+   * positive integer; defaults to the live bus default
+   * (`setDefaultReplayProgressInterval`, EB-522) when one is installed,
+   * else 100. The completion/failure event
    * always fires exactly once, regardless of the interval. Requires
    * `onReplayProgress` — passing it alone throws `RangeError`.
    * Live-revisable with `setReplayProgressInterval` (EB-447): the new
@@ -9604,7 +9606,8 @@ interface Subscriber {
   onReplayProgress?: ReplayProgressCallback;
   /**
    * Processed replay entries between `onReplayProgress` fires (see
-   * `SubscribeOptions.progressInterval`, EB-71). Defaults to 100.
+   * `SubscribeOptions.progressInterval`, EB-71). Defaults to the live
+   * bus default (EB-522) when one is installed, else 100.
    */
   progressInterval: number;
   /**
@@ -18818,6 +18821,21 @@ export class EventBus {
    * their pending batch, and their linger timer.
    */
   private defaultBatch?: boolean | BatchDeliveryOptions;
+  /**
+   * Bus-level default replay progress interval (EB-522): the
+   * `progressInterval` a new replay-observed subscriber falls back to
+   * when it omits its own (see `SubscribeOptions.progressInterval`).
+   * Starts unset (`undefined` — no default, omitting `progressInterval`
+   * means 100, exactly the previous behavior) and moves only via
+   * `setDefaultReplayProgressInterval`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * never enables observation — a subscriber that does not pass
+   * `onReplayProgress` is untouched by it. An explicit
+   * `progressInterval` always wins. A revision only affects
+   * subscribers created after it — already-subscribed subscribers keep
+   * the interval they were baked with at subscribe time.
+   */
+  private defaultReplayProgressInterval?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34946,9 +34964,11 @@ export class EventBus {
     // non-negative-integer contract, the same `RangeError`.
     validateSchemaVersion(opts?.schemaVersion, 'subscribe');
     // Durable-log replay progress (EB-71): the observer was validated
-    // above; the interval falls back to the 100-entry default.
+    // above; the interval falls back to the live bus default (EB-522)
+    // when one is installed, else the 100-entry default.
     const onReplayProgress = opts?.onReplayProgress;
-    const progressInterval = opts?.progressInterval ?? REPLAY_PROGRESS_INTERVAL_DEFAULT;
+    const progressInterval =
+      opts?.progressInterval ?? this.defaultReplayProgressInterval ?? REPLAY_PROGRESS_INTERVAL_DEFAULT;
     // Multi-pattern composite subscription (EB-70): validated before
     // anything registers, so a throw leaves no half-registered subscriber
     // behind.
@@ -54804,6 +54824,92 @@ export class EventBus {
       : this.defaultBatch === true
         ? true
         : { ...this.defaultBatch };
+  }
+
+  /**
+   * Sets the live bus-level default replay progress interval (EB-522)
+   * without re-subscribing anyone:
+   * `setDefaultReplayProgressInterval(progressInterval, actor = 'system')`
+   * decides how many processed replay entries pass between
+   * `onReplayProgress` fires for future replay-observed subscribers
+   * that omit their own `progressInterval` (see
+   * `SubscribeOptions.progressInterval`, EB-71) — `50` to observe
+   * every new omit-`progressInterval` replay at fifty-entry
+   * granularity fleet-wide with one call, `null` to clear the default
+   * back to 100.
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > 100 (the bus default is the
+   * terminal fallback below the explicit option — an explicit
+   * `progressInterval` always wins). The default never enables
+   * observation: a subscriber that does not pass `onReplayProgress`
+   * is untouched by it (along EB-479/EB-483/EB-484), and the
+   * subscribe-time rule "progressInterval requires onReplayProgress"
+   * is unchanged. A subscriber that took the default at subscribe time
+   * keeps the interval it was baked with: a later revision never
+   * moves an already-subscribed subscriber's interval, and
+   * `setReplayProgressInterval` (EB-447) still revises such a
+   * subscriber one at a time without touching the bus default, its new
+   * interval governing from the next pass. A pass already in flight
+   * keeps the interval it started with, and the completion event
+   * still fires exactly once regardless of the interval.
+   *
+   * There is no construction-time option: the default is runtime
+   * state, it never enters a config snapshot and does not survive a
+   * restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to the
+   * current default (including clearing an already-unset default) is
+   * a no-op with no audit. Audited as
+   * `default_replay_progress_interval_revised`
+   * (`{ previous, progressInterval }`, `null` when the default is
+   * unset — unset means new omit-`progressInterval` subscribers go
+   * back to 100, exactly the previous behavior).
+   *
+   * Orthogonal to EB-71 (that owns the observation mechanism itself —
+   * this its interval's bus-level terminal default), to EB-443 (that
+   * revises the observer identity — this the interval of the same
+   * observer), to EB-447 (that revises one subscriber's interval —
+   * this the bus-level default new subscribers fall back to), and to
+   * EB-164/EB-448 (replay throttling — the pacing never moves here).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than a
+   * positive integer (or `null` to clear).
+   */
+  setDefaultReplayProgressInterval(progressInterval: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultReplayProgressInterval');
+    if (progressInterval !== null && (!Number.isInteger(progressInterval) || progressInterval <= 0)) {
+      throw new RangeError(
+        'setDefaultReplayProgressInterval: progressInterval must be a positive integer, or null to clear it',
+      );
+    }
+    const previous = this.defaultReplayProgressInterval ?? null;
+    const next = progressInterval ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === progressInterval) {
+      return;
+    }
+    this.defaultReplayProgressInterval = next;
+    this.auditSubscription({
+      action: 'default_replay_progress_interval_revised',
+      actor,
+      detail: { previous, progressInterval },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default replay progress interval
+   * (EB-522) — the interval future omit-`progressInterval`
+   * replay-observed subscribers fall back to — `undefined` before any
+   * revision (no default, new omit-`progressInterval` subscribers use
+   * 100), then whatever `setDefaultReplayProgressInterval` last
+   * installed.
+   */
+  getDefaultReplayProgressInterval(): number | undefined {
+    return this.defaultReplayProgressInterval;
   }
 
   /**
