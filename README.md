@@ -2316,6 +2316,33 @@ library.
   `setTopicMaxMessageBytes` are configured for a topic, the message-size
   cap is evaluated first. Empty patterns and non-positive-integer sizes
   throw `RangeError`. Unset by default (fully backward compatible).
+- **Bus-level default payload-size cap** (in `src/bus.ts`, via
+  `setDefaultMaxPayloadBytes(maxPayloadBytes, actor = 'system')`,
+  EB-520): the fleet-wide terminal default for the per-topic cap above.
+  Publishes to topics with no EB-120 rule are admitted against this
+  default instead of having no cap — `1024` bounds every rule-less
+  topic with one call, `null` clears it back to no cap. The precedence
+  chain is exact-topic rule > earliest-registered matching pattern rule
+  > bus default > no cap, so an explicit rule always wins, even when it
+  is larger than the default. The default is inherited wherever admission
+  runs — `publish`, `publishBatch`, `publishAtomic`, `publishDelayed`
+  (at schedule time), and the shadow admission behind `previewPublish` —
+  because all four call sites resolve through `maxPayloadBytesForTopic`,
+  with the gate order unchanged (after schema validation and the
+  message-size cap, before any sequence number or rate-limit budget).
+  It also flows into the topic leg of `subscriberPayloadCapFor`, below
+  the EB-477 subscriber-side default. A revision only affects publishes
+  admitted after it; already-queued or already-admitted messages and
+  registered topic rules are untouched. Unlike the EB-477 subscriber-side
+  default — which skips an oversized message for one subscriber at
+  delivery time — this one rejects the publish at admission time
+  (`'payload-too-large'`, no sequence number consumed). `null` clears,
+  non-positive-integer values throw `RangeError`, re-affirming the
+  current default is a silent no-op, and every real revision is audited
+  as `default_max_payload_bytes_revised` (`{ previous, maxPayloadBytes }`).
+  `getDefaultMaxPayloadBytes()` returns the live value (`undefined`
+  when unset). Live-only: no construction-time option, no config
+  snapshot, no persistence across restarts.
 - **Per-subscriber payload-size cap** (in `src/bus.ts`, via
   `SubscribeOptions.subscriberMaxPayloadBytes`, EB-208): the consume-side
   complement of the EB-64/EB-120 publish-side caps — protecting slow or

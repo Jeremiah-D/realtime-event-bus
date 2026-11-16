@@ -18767,6 +18767,22 @@ export class EventBus {
    */
   private defaultRedeliveryBackoff?: NormalizedRedeliveryBackoffConfig;
   /**
+   * Bus-level default topic payload-size cap (EB-520): the cap a
+   * publish falls back to when its topic has no EB-120 rule (see
+   * `setTopicMaxPayloadBytes`). Starts unset (`undefined` — no
+   * default, a rule-less topic has no payload cap, exactly the
+   * previous behavior) and moves only via
+   * `setDefaultMaxPayloadBytes`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * is the terminal fallback in `maxPayloadBytesForTopic`, below
+   * the exact-topic rule and the earliest-registered matching
+   * pattern rule: an explicit rule always wins, even when it is
+   * larger than the default. A revision only affects publishes
+   * admitted after it — already-queued or already-admitted
+   * messages and registered topic rules are untouched.
+   */
+  private defaultMaxPayloadBytes?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -32507,7 +32523,7 @@ export class EventBus {
       }
       if (matcher.test(topic)) return maxPayloadBytes;
     }
-    return undefined;
+    return this.defaultMaxPayloadBytes;
   }
 
   /**
@@ -54498,6 +54514,97 @@ export class EventBus {
     return this.defaultRedeliveryBackoff === undefined
       ? undefined
       : { ...this.defaultRedeliveryBackoff };
+  }
+
+  /**
+   * Sets the live bus-level default topic payload-size cap (EB-520)
+   * without touching any registered topic rule:
+   * `setDefaultMaxPayloadBytes(maxPayloadBytes, actor = 'system')`
+   * decides the admission cap for publishes to topics with no
+   * EB-120 rule (see `setTopicMaxPayloadBytes`) — `1024` to bound
+   * every rule-less topic's single-message payload fleet-wide with
+   * one call, `null` to clear the default back to no cap.
+   *
+   * Only the default moves: the topic rules, the queues, and every
+   * already-admitted or already-queued message are untouched. The
+   * priority chain is exact-topic rule > earliest-registered
+   * matching pattern rule > bus default > no cap (the bus default
+   * is the terminal fallback below the explicit rules — an explicit
+   * rule always wins, even when it is larger than the default). A
+   * revision only affects publishes admitted after it: a delayed
+   * publish keeps the verdict it received at schedule time, and
+   * `setTopicMaxPayloadBytes` still revises one topic at a time
+   * without touching the bus default. The default is inherited
+   * wherever admission runs — `publish`, `publishBatch`,
+   * `publishAtomic`, `publishDelayed` (at schedule time), and the
+   * shadow admission behind `previewPublish` — because all four
+   * call sites read it through `maxPayloadBytesForTopic`, whose
+   * gate order is unchanged (still after schema validation and the
+   * message-size cap, before sequence-number assignment and any
+   * rate-limit budget). It also flows into the topic leg of
+   * `subscriberPayloadCapFor`, below the EB-477 subscriber-side
+   * default: subscriber-explicit > subscriber default > topic rule
+   * or bus default > no cap.
+   *
+   * There is no existence gate — the default exists precisely for
+   * topics that have no rule yet, so it applies to every future
+   * publish to a rule-less topic. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to the
+   * current default (including clearing an already-unset default) is
+   * a no-op with no audit. Audited as
+   * `default_max_payload_bytes_revised`
+   * (`{ previous, maxPayloadBytes }`, `null` when the default is
+   * unset — unset means rule-less topics have no payload cap,
+   * exactly the previous behavior).
+   *
+   * Orthogonal to EB-120 (that owns the per-topic cap mechanism
+   * itself — this its missing bus-level terminal default), to
+   * EB-477 (that sets the bus-level default subscriber cap — that
+   * the delivery-side default, this the admission-side default;
+   * the two are different fields, and the subscriber default still
+   * wins over the topic leg), to EB-208 (that owns the subscriber
+   * cap mechanism — this rejects at admission, that skips at
+   * delivery), and to EB-282 (that revises the queue byte budget —
+   * this the single-message volume cap).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer number of bytes (or `null` to clear).
+   */
+  setDefaultMaxPayloadBytes(maxPayloadBytes: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxPayloadBytes');
+    if (maxPayloadBytes !== null && (!Number.isInteger(maxPayloadBytes) || maxPayloadBytes <= 0)) {
+      throw new RangeError(
+        'setDefaultMaxPayloadBytes: maxPayloadBytes must be a positive integer number of bytes, or null to clear it',
+      );
+    }
+    const previous = this.defaultMaxPayloadBytes ?? null;
+    const next = maxPayloadBytes ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === maxPayloadBytes) {
+      return;
+    }
+    this.defaultMaxPayloadBytes = next;
+    this.auditSubscription({
+      action: 'default_max_payload_bytes_revised',
+      actor,
+      detail: { previous, maxPayloadBytes },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default topic payload-size cap
+   * (EB-520) — the cap publishes to rule-less topics fall back to —
+   * `undefined` before any revision (no default, rule-less topics
+   * have no payload cap), then whatever
+   * `setDefaultMaxPayloadBytes` last installed.
+   */
+  getDefaultMaxPayloadBytes(): number | undefined {
+    return this.defaultMaxPayloadBytes;
   }
 
   /**
