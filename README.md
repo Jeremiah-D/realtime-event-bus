@@ -3887,7 +3887,25 @@ library.
   linger timer), and the default never enables batching — a subscriber
   that does not opt in still receives one message at a time. Audited as
   `default_batch_max_wait_ms_revised` (`{ previous, batchMaxWaitMs }`,
-  `null` when unset). (Real-time systems: delivery
+  `null` when unset). Bus-level default opt-in (EB-521, via
+  `setDefaultBatch(true | BatchDeliveryOptions | null)`): future
+  subscribers that omit `batch` entirely take the live bus default —
+  `true` opts them in at the scalar defaults, an object opts them in
+  at its fields (a field the object omits still falls back to the live
+  scalar defaults, then 100 / 10). The chain is explicit > bus default
+  > one-at-a-time delivery: an explicit `batch` always wins, including
+  an explicit `false` opting out under a default, and `null` clears
+  the default back to unset. Unlike the scalar defaults, this default
+  CAN enable batching — it is the opt-in itself. A subscriber keeps
+  the batch state it was baked with (a later revision never moves a
+  live subscriber, its pending batch, or its linger timer), and
+  `setBatch(subId, null)` still clears one subscriber back to
+  one-at-a-time delivery without the default re-applying. The
+  combination gate reads the effective values: a default batch plus an
+  effective `maxInflight` still throws `RangeError` at subscribe time,
+  while an explicit `batch: false` bypasses it. Audited as
+  `default_batch_revised` (`{ previous, batch }`, `null` when unset).
+  (Real-time systems: delivery
   governance.)
   Disabled by default. `bench/batch.bench.ts` measures the before/after
   throughput — see [Benchmark](#benchmark).

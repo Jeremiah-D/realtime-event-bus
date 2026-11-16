@@ -3109,6 +3109,20 @@ export interface SubscribeOptions {
    * Pass `true` for the defaults (`maxSize` 100, `maxWaitMs` 10), or a
    * `BatchDeliveryOptions` object to tune them. Invalid values throw
    * `RangeError` from `subscribe`. Disabled by default.
+   *
+   * Bus default (EB-521, via `setDefaultBatch`): omitting `batch`
+   * falls back to the live bus default when one is installed — `true`
+   * opts the new subscriber in at the scalar defaults (see
+   * `BatchDeliveryOptions`), an object opts it in at the object's
+   * fields (a field the object omits still falls back to the live
+   * scalar defaults of EB-483/EB-485, then 100 / 10). The precedence
+   * is subscriber-explicit > bus default > one-at-a-time delivery:
+   * an explicit `batch` always wins, including an explicit `false`
+   * opting out under a default. A subscriber takes the default in
+   * effect at subscribe time and keeps the batch state it was baked
+   * with; a later revision never moves it, and `setBatch(subId, null)`
+   * still clears it back to one-at-a-time delivery without the
+   * default re-applying.
    */
   batch?: boolean | BatchDeliveryOptions;
   /**
@@ -11397,7 +11411,12 @@ interface BatchDeliveryState {
  * `defaultMaxWaitMs` is the live bus default (EB-485): it fills in an
  * omitted `maxWaitMs` the same way — callers that already merged live
  * values never reach it, because their object always carries
- * `maxWaitMs`.
+ * `maxWaitMs`. The opt-in itself comes from the caller: `subscribe`
+ * passes the subscriber's explicit `batch` when one is given and the
+ * live bus default installed via `setDefaultBatch` (EB-521) otherwise,
+ * so the bus default can enable batching for subscribers that omit
+ * `batch` entirely — an explicit `false` still opts out, and with no
+ * default installed an omitted `batch` still means no batch state.
  */
 function resolveBatchDeliveryOptions(
   opt: boolean | BatchDeliveryOptions | undefined,
@@ -18782,6 +18801,23 @@ export class EventBus {
    * messages and registered topic rules are untouched.
    */
   private defaultMaxPayloadBytes?: number;
+  /**
+   * Bus-level default batch delivery opt-in (EB-521): the `batch` a new
+   * subscriber falls back to when it omits its own (see
+   * `SubscribeOptions.batch`). Starts unset (`undefined` — no default,
+   * omitting `batch` means one-at-a-time delivery, exactly the previous
+   * behavior) and moves only via `setDefaultBatch`; there is no
+   * construction-time option, and a restart restores the unset default.
+   * Unlike the scalar batch defaults (EB-483/EB-485), this default CAN
+   * enable batching: a subscriber that omits `batch` takes the default
+   * whole — `true` opts it in at the scalar defaults, an object opts
+   * it in at the object's fields. An explicit `batch` always wins,
+   * including an explicit `false` opting out under a default. A
+   * revision only affects subscribers created after it — already-
+   * subscribed subscribers keep the batch state they were baked with,
+   * their pending batch, and their linger timer.
+   */
+  private defaultBatch?: boolean | BatchDeliveryOptions;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -34804,13 +34840,24 @@ export class EventBus {
     const deliveryWindow =
       deliveryWindowOpts === undefined ? undefined : new DeliveryWindowGate(deliveryWindowOpts);
     // Validated before anything registers, so a throw leaves no
-    // half-registered subscriber behind. EB-483: a batch subscriber
-    // that omits `maxSize` falls back to the live bus default, if one
-    // is installed — the bus default is the terminal fallback below
-    // the explicit option. An explicit value always wins, and the
-    // default never enables batching: `undefined`/`false` here still
-    // means no batch state at all.
-    const batch = resolveBatchDeliveryOptions(opts?.batch, this.defaultBatchMaxSize, this.defaultBatchMaxWaitMs);
+    // half-registered subscriber behind. EB-483/EB-485: a batch
+    // subscriber that omits `maxSize` / `maxWaitMs` falls back to the
+    // live bus defaults, if one is installed — the bus defaults are
+    // the terminal fallback below the explicit fields. EB-521: a
+    // subscriber that omits `batch` entirely falls back to the live
+    // bus default installed via `setDefaultBatch`, if one is
+    // installed — unlike the scalar defaults, the bus default CAN
+    // enable batching. An explicit `batch` always wins, including an
+    // explicit `false` opting out under a default; with no default
+    // installed an omitted `batch` still means no batch state at
+    // all. The merge is an explicit `!== undefined` check, never
+    // `??`, so an explicit `null` still reaches the resolver
+    // unchanged instead of silently taking the default.
+    const batch = resolveBatchDeliveryOptions(
+      opts?.batch !== undefined ? opts.batch : this.defaultBatch,
+      this.defaultBatchMaxSize,
+      this.defaultBatchMaxWaitMs,
+    );
     // Tumbling-window aggregation (EB-73): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
     const window = resolveWindowOptions(opts?.window, this.defaultWindow);
@@ -54605,6 +54652,158 @@ export class EventBus {
    */
   getDefaultMaxPayloadBytes(): number | undefined {
     return this.defaultMaxPayloadBytes;
+  }
+
+  /**
+   * Sets the live bus-level default batch delivery opt-in (EB-521)
+   * without re-subscribing anyone:
+   * `setDefaultBatch(batch, actor = 'system')` decides the `batch`
+   * for future subscribers that omit their own (see
+   * `SubscribeOptions.batch`) — `true` to batch every new
+   * omit-`batch` subscriber at the scalar defaults (`maxSize` 100 /
+   * `maxWaitMs` 10, or the live scalar defaults of EB-483/EB-485),
+   * `{ maxSize: 3 }` to batch them three at a time, `null` to clear
+   * the default back to no default (new omit-`batch` subscribers go
+   * back to one-at-a-time delivery).
+   *
+   * Only the default moves: the roster, the queues, and every live
+   * subscriber are untouched. The priority chain is
+   * subscriber-explicit > bus default > one-at-a-time delivery (the
+   * bus default is the terminal fallback below the explicit option —
+   * an explicit `batch` always wins, including an explicit `false`
+   * opting out under a default). Within a defaulted batch, a field
+   * the default object omits still falls back to the live scalar
+   * defaults (EB-483/EB-485), then 100 / 10. A subscriber that took
+   * the default at subscribe time keeps the batch state it was baked
+   * with and its pending batch and linger timer: a later revision
+   * never moves an already-subscribed subscriber, and `setBatch`
+   * still revises such a subscriber one at a time without touching
+   * the bus default — its partial revision still takes the live
+   * value, and its `null` still clears the whole subscriber back to
+   * one-at-a-time delivery without the default re-applying. Unlike
+   * the scalar batch defaults (EB-483/EB-485), this default CAN
+   * enable batching: it is the opt-in itself, not just a field
+   * filler for subscribers that already opted in.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future omit-`batch` subscription. The default is runtime state:
+   * it never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, `false` as the default (a
+   * "closed default" is indistinguishable from unset), or a value
+   * other than `true`, a `BatchDeliveryOptions` object, or `null` to
+   * clear throws `RangeError` with the live default and the audit
+   * log untouched; object fields reuse the subscribe-time bounds
+   * (`maxSize` a positive integer, `maxWaitMs` a finite number
+   * `>= 0`). A revision identical to the current default (including
+   * clearing an already-unset default, or re-setting an object equal
+   * field by field, with `undefined` counting as missing) is a
+   * no-op with no audit. Audited as `default_batch_revised`
+   * (`{ previous, batch }`, both `true | BatchDeliveryOptions |
+   * null`, `null` when the default is unset — unset means new
+   * omit-`batch` subscribers go back to one-at-a-time delivery,
+   * exactly the previous behavior; objects are recorded field by
+   * field and never carry runtime state).
+   *
+   * Orthogonal to EB-483 (that sets the batch maxSize default — a
+   * field filler for subscribers that already opted in, this the
+   * opt-in itself; EB-483's "default never enables batching" still
+   * holds for the scalar), to EB-485 (that sets the batch maxWaitMs
+   * default — same shape, the linger filler), to EB-269 (that
+   * revises one subscriber's batch parameters at a time — this sets
+   * the default a new omit-`batch` subscriber falls back to; its
+   * `null` still clears one subscriber without the default
+   * re-applying), and to EB-466 (that sets the maxInFlight default
+   * — the combination gate reads both effective values at subscribe
+   * time, so a default batch plus an effective maxInFlight still
+   * throws `RangeError`).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * `true`, a `BatchDeliveryOptions` object, or `null` to clear.
+   */
+  setDefaultBatch(batch: true | BatchDeliveryOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultBatch');
+    if (
+      batch === false ||
+      (batch !== true &&
+        batch !== null &&
+        (typeof batch !== 'object' || Array.isArray(batch)))
+    ) {
+      throw new RangeError(
+        'setDefaultBatch: batch must be true or a BatchDeliveryOptions object, or null to clear it',
+      );
+    }
+    const maxSize = batch === true || batch === null ? undefined : batch.maxSize;
+    const maxWaitMs = batch === true || batch === null ? undefined : batch.maxWaitMs;
+    if (maxSize !== undefined && (!Number.isInteger(maxSize) || maxSize <= 0)) {
+      throw new RangeError('batch.maxSize must be a positive integer');
+    }
+    if (maxWaitMs !== undefined && (!Number.isFinite(maxWaitMs) || maxWaitMs < 0)) {
+      throw new RangeError('batch.maxWaitMs must be a finite number of milliseconds >= 0');
+    }
+    // Normalize to the known fields only, dropping `undefined` so a
+    // missing field and an explicitly-undefined one compare equal,
+    // and defensively copy so mutating the caller's object afterwards
+    // cannot move the live default.
+    const next: boolean | BatchDeliveryOptions | undefined =
+      batch === null
+        ? undefined
+        : batch === true
+          ? true
+          : {
+              ...(maxSize !== undefined ? { maxSize } : {}),
+              ...(maxWaitMs !== undefined ? { maxWaitMs } : {}),
+            };
+    const previous: boolean | BatchDeliveryOptions | null =
+      this.defaultBatch === undefined
+        ? null
+        : this.defaultBatch === true
+          ? true
+          : { ...this.defaultBatch };
+    // Re-affirming the current default is a no-op: no audit. Objects
+    // compare field by field, with `undefined` counting as missing;
+    // `true` and an object are different values even when the object
+    // carries no fields.
+    const same =
+      previous === null
+        ? next === undefined
+        : previous === true
+          ? next === true
+          : next !== undefined &&
+            next !== true &&
+            (previous.maxSize ?? undefined) === (next.maxSize ?? undefined) &&
+            (previous.maxWaitMs ?? undefined) === (next.maxWaitMs ?? undefined);
+    if (same) {
+      return;
+    }
+    this.defaultBatch = next;
+    this.auditSubscription({
+      action: 'default_batch_revised',
+      actor,
+      detail: {
+        previous:
+          previous === null ? null : previous === true ? true : { ...previous },
+        batch: next === undefined ? null : next === true ? true : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default batch delivery opt-in
+   * (EB-521) — the `batch` future omit-`batch` subscribers fall back
+   * to — `undefined` before any revision (no default, new omit-`batch`
+   * subscribers use one-at-a-time delivery), then whatever
+   * `setDefaultBatch` last installed. Returns a copy for objects, so
+   * mutating the result never moves the live default.
+   */
+  getDefaultBatch(): boolean | BatchDeliveryOptions | undefined {
+    return this.defaultBatch === undefined
+      ? undefined
+      : this.defaultBatch === true
+        ? true
+        : { ...this.defaultBatch };
   }
 
   /**
