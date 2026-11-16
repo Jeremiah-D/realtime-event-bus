@@ -2310,6 +2310,21 @@ library.
   `publishAtomic` runs the cap in shadow admission (an oversized entry aborts
   the batch with reason `'message-too-big'`), and `publishDelayed`
   fail-fasts on it at schedule time, exactly like schema validation.
+- **Bus-level default max message size** (in `src/bus.ts`, via
+  `setDefaultMaxMessageBytes(maxBytes, actor = 'system')`, EB-524):
+  the admission cap publishes to rule-less topics fall back to — the
+  terminal fallback below the exact-topic rule and the earliest-
+  registered matching pattern rule (an explicit rule always wins,
+  even when it is larger than the default). It is inherited wherever
+  admission runs (`publish`, `publishBatch`, `publishAtomic` via the
+  shared `fanOut` path, `publishDelayed` at schedule time, and the
+  shadow admission behind `previewPublish`) because all three call
+  sites resolve through `maxMessageBytesForTopic`. Unlike the
+  per-topic payload-size cap (EB-520), this is the first volume gate:
+  on a double violation the `'message-too-big'` reason wins over
+  `'payload-too-large'`. `null` clears the default back to no cap;
+  re-affirming the current default is a silent no-op. There is no
+  construction-time option and a restart restores the unset default.
 - **Per-topic payload-size cap** (in `src/bus.ts`, via
   `setTopicMaxPayloadBytes(pattern, maxPayloadBytes)`, EB-120): an
   admission gate for oversized payloads positioned after schema validation

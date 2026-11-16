@@ -18839,6 +18839,22 @@ export class EventBus {
    */
   private defaultReplayProgressInterval?: number;
   /**
+   * Bus-level default per-message byte cap (EB-524): the cap a publish
+   * falls back to when its topic has no EB-64 rule (see
+   * `setTopicMaxMessageBytes`). Starts unset (`undefined` — no
+   * default, a rule-less topic has no message-size cap, exactly the
+   * previous behavior) and moves only via
+   * `setDefaultMaxMessageBytes`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * is the terminal fallback in `maxMessageBytesForTopic`, below
+   * the exact-topic rule and the earliest-registered matching
+   * pattern rule: an explicit rule always wins, even when it is
+   * larger than the default. A revision only affects publishes
+   * admitted after it — already-queued or already-admitted
+   * messages and registered topic rules are untouched.
+   */
+  private defaultMaxMessageBytes?: number;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -32574,7 +32590,7 @@ export class EventBus {
       }
       if (matcher.test(topic)) return maxBytes;
     }
-    return undefined;
+    return this.defaultMaxMessageBytes;
   }
 
   private maxPayloadBytesForTopic(topic: string): number | undefined {
@@ -54924,6 +54940,96 @@ export class EventBus {
    */
   getDefaultReplayProgressInterval(): number | undefined {
     return this.defaultReplayProgressInterval;
+  }
+
+  /**
+   * Sets the live bus-level default per-message byte cap (EB-524)
+   * without touching any registered topic rule:
+   * `setDefaultMaxMessageBytes(maxBytes, actor = 'system')`
+   * decides the admission cap for publishes to topics with no
+   * EB-64 rule (see `setTopicMaxMessageBytes`) — `1024` to bound
+   * every rule-less topic's single-message size fleet-wide with
+   * one call, `null` to clear the default back to no cap.
+   *
+   * Only the default moves: the topic rules, the queues, and every
+   * already-admitted or already-queued message are untouched. The
+   * priority chain is exact-topic rule > earliest-registered
+   * matching pattern rule > bus default > no cap (the bus default
+   * is the terminal fallback below the explicit rules — an explicit
+   * rule always wins, even when it is larger than the default). A
+   * revision only affects publishes admitted after it: a delayed
+   * publish keeps the verdict it received at schedule time, and
+   * `setTopicMaxMessageBytes` still revises one topic at a time
+   * without touching the bus default. The default is inherited
+   * wherever admission runs — `publish`, `publishBatch`,
+   * `publishAtomic` (via the shared `fanOut` admission path),
+   * `publishDelayed` (at schedule time), and the shadow admission
+   * behind `previewPublish` — because all three call sites read it
+   * through `maxMessageBytesForTopic`, whose gate order is
+   * unchanged (still after schema validation and before the
+   * payload cap, sequence-number assignment, and any rate-limit
+   * budget). On a double violation the message-size reason wins
+   * over the payload reason, exactly as before.
+   *
+   * There is no existence gate — the default exists precisely for
+   * topics that have no rule yet, so it applies to every future
+   * publish to a rule-less topic. The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to the
+   * current default (including clearing an already-unset default) is
+   * a no-op with no audit. Audited as
+   * `default_max_message_bytes_revised`
+   * (`{ previous, maxMessageBytes }`, `null` when the default is
+   * unset — unset means rule-less topics have no message-size cap,
+   * exactly the previous behavior).
+   *
+   * Orthogonal to EB-64 (that owns the per-topic cap mechanism
+   * itself — this its missing bus-level terminal default), to
+   * EB-520 (that sets the bus-level default payload cap — that the
+   * second volume gate, this the first; on a double violation this
+   * reason wins), to EB-208 (that owns the subscriber cap
+   * mechanism — this rejects at admission, that skips at
+   * delivery), and to EB-477 (that sets the bus-level default
+   * subscriber cap — that the delivery-side default, this the
+   * admission-side default).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer number of bytes (or `null` to clear).
+   */
+  setDefaultMaxMessageBytes(maxBytes: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxMessageBytes');
+    if (maxBytes !== null && (!Number.isInteger(maxBytes) || maxBytes <= 0)) {
+      throw new RangeError(
+        'setDefaultMaxMessageBytes: maxBytes must be a positive integer number of bytes, or null to clear it',
+      );
+    }
+    const previous = this.defaultMaxMessageBytes ?? null;
+    const next = maxBytes ?? undefined;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === maxBytes) {
+      return;
+    }
+    this.defaultMaxMessageBytes = next;
+    this.auditSubscription({
+      action: 'default_max_message_bytes_revised',
+      actor,
+      detail: { previous, maxMessageBytes: maxBytes },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default per-message byte cap
+   * (EB-524) — the cap publishes to rule-less topics fall back to —
+   * `undefined` before any revision (no default, rule-less topics
+   * have no message-size cap), then whatever
+   * `setDefaultMaxMessageBytes` last installed.
+   */
+  getDefaultMaxMessageBytes(): number | undefined {
+    return this.defaultMaxMessageBytes;
   }
 
   /**
