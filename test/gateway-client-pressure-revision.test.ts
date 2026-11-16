@@ -533,8 +533,29 @@ test('cleared mode falls back to shed-newest instead of pausing', async () => {
       try {
         await subscribeFlood(client);
         client.pause();
-        for (let i = 0; i < 2000; i++) bus.publish('flood.t', { i, big: BIG });
-        await waitForPressure(gw, 'first flood');
+        // Flood until the pause is observed, not a fixed 2000
+        // publishes: the pause is real but transient — the queue
+        // drains below the recovery watermark within ~10-90 ms of
+        // forming (the drain poll moves it to the kernel), so a
+        // fixed flood can come and go before the 50 ms poll sees it
+        // (the same hazard the 'lowered pressure' test documents).
+        // Publishing until the poll sees the pause keeps pressure
+        // applied, so the pause is still active for the assertions
+        // and the clear below.
+        const pressureDeadline = Date.now() + 15000;
+        let floodPublished = 0;
+        for (;;) {
+          for (let i = 0; i < 100; i++) bus.publish('flood.t', { i: floodPublished, big: BIG });
+          floodPublished += 100;
+          await flush();
+          if (gw.getStats().pausedConnections === 1) break;
+          if (floodPublished >= 20000 || Date.now() > pressureDeadline) {
+            throw new Error(
+              `pressure never landed (published ${floodPublished}, queued ${gw.getStats().connectionQueues[0].queuedBytes})`,
+            );
+          }
+          await sleep(10);
+        }
         assert.equal(bus.getStats().pausedSubscribers, 1);
         // The synchronous burst collects into one bus batch, so the
         // already-collected batch keeps flowing past the 32 KiB
