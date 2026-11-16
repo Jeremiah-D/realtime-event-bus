@@ -12438,6 +12438,21 @@ const report = await bus.replayRange('market.ticks', { from: 1, to: 10_000, spee
   identical to the live switch is a no-op with no audit. Every success
   is audited as `catch_up_on_replay_revised`
   (`{ catchUpOnReplay: <boolean>, oldCatchUpOnReplay: <boolean> }`).
+  **Bus-level default (EB-518).** `setDefaultCatchUpOnReplay(enabled |
+  null, actor?)` installs the switch future subscribers without an
+  explicit `catchUpOnReplay` fall back to — the precedence chain is
+  subscriber-explicit > bus default > `false` (unset by default, so
+  omitting the switch still means `false`). The default is baked at
+  subscribe time: a later revision never moves an already-subscribed
+  subscriber's switch, and `setCatchUpOnReplay` still revises one live
+  subscriber at a time without touching the bus default. A revision
+  landing mid-replay never touches the replay already running (its
+  paused set was fixed at its start). It is fail-closed (an illegal
+  actor or a non-boolean value throws `RangeError` with the live
+  default untouched), a revision identical to the current default is
+  a no-op with no audit, and every success is audited as
+  `default_catch_up_on_replay_revised`
+  (`{ previous, catchUpOnReplay }`, `null` when unset).
 - **Clean stats.** Replayed messages carry `replayed: true`: they never
   move the sequence-gap baseline and never pollute `sequenceGaps`, are
   never re-appended to the durable log, and skip reliable-delivery ack

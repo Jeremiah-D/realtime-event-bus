@@ -2637,7 +2637,9 @@ export interface SubscribeOptions {
    * replay finishes, so catch-up is lossless and seamless. Without it a
    * replay's history interleaves with the live stream at the handler.
    * Disabled by default; must be a boolean when given. Revisable live
-   * via `setCatchUpOnReplay` (EB-457).
+   * via `setCatchUpOnReplay` (EB-457). A bus-level default is revisable
+   * live via `setDefaultCatchUpOnReplay` (EB-518): a subscriber that
+   * omits the option falls back to it (explicit always wins).
    */
   catchUpOnReplay?: boolean;
   /**
@@ -18729,6 +18731,20 @@ export class EventBus {
    */
   private defaultPublishPriority?: MessageLane;
   /**
+   * Bus-level default time-travel replay catch-up mode (EB-518): whether a
+   * new subscriber pauses its live drain while a `replayRange` runs, when
+   * it omits its own `catchUpOnReplay` (see
+   * `SubscribeOptions.catchUpOnReplay`, EB-203). Starts unset
+   * (`undefined` — no default, an omitted switch rides `false`, exactly
+   * the previous behavior) and moves only via
+   * `setDefaultCatchUpOnReplay`; there is no construction-time option,
+   * and a restart restores the unset default. The default is baked into
+   * the subscriber record at subscribe time: a later revision never
+   * moves an already-subscribed subscriber's switch, and
+   * `setCatchUpOnReplay` (EB-457) never consults it.
+   */
+  private defaultCatchUpOnReplay?: boolean;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -34474,7 +34490,17 @@ export class EventBus {
     validateDeliverySampleRate(deliverySampleRate, 'subscribe');
     // Time-travel replay catch-up (EB-203): validated before anything
     // registers, so a throw leaves no half-registered subscriber behind.
-    const catchUpOnReplay = opts?.catchUpOnReplay;
+    // EB-518: a subscriber that omits catchUpOnReplay falls back to the
+    // live bus default, if one is installed — the bus default is the
+    // terminal fallback, below the explicit option. An explicit value
+    // always wins. Only an absent (`undefined`) value falls back: an
+    // explicit `null` is still an illegal value and throws via the
+    // validator below (a bare `??` would swallow it, since `??` treats
+    // `null` as missing — the same guard as the EB-516 idleActivity
+    // merge above). The resolved switch is frozen into the subscriber
+    // record below; a later default revision never moves it.
+    const catchUpOnReplay =
+      opts?.catchUpOnReplay !== undefined ? opts.catchUpOnReplay : this.defaultCatchUpOnReplay;
     if (catchUpOnReplay !== undefined && typeof catchUpOnReplay !== 'boolean') {
       throw new RangeError('subscribe: catchUpOnReplay must be a boolean');
     }
@@ -54201,6 +54227,114 @@ export class EventBus {
    */
   getDefaultPublishPriority(): MessageLane | undefined {
     return this.defaultPublishPriority;
+  }
+
+  /**
+   * Sets the live bus-level default time-travel replay catch-up mode
+   * (EB-518) without touching any live subscriber:
+   * `setDefaultCatchUpOnReplay(enabled, actor = 'system')` decides
+   * whether a future subscriber that omits its own `catchUpOnReplay`
+   * (see `SubscribeOptions.catchUpOnReplay`, EB-203) pauses its live
+   * drain while a `replayRange` runs — `true` to pause the live drain
+   * fleet-wide with one call during backtest / catch-up replays, `null`
+   * to clear the default back to `false`.
+   *
+   * Only the default moves: the roster and every live subscriber are
+   * untouched. The priority chain is subscriber-explicit > bus default
+   * > `false` — the bus default is the terminal fallback below the
+   * explicit option: an explicit `false` still lets a replay interleave
+   * with the live stream under a `true` default, and an explicit `true`
+   * still pauses the live drain under a `false` default. A subscriber
+   * that took the default at subscribe time keeps the switch it was
+   * baked with: a later revision never moves an already-subscribed
+   * subscriber's switch, and `setCatchUpOnReplay` (EB-457) still
+   * revises one live subscriber at a time without touching the bus
+   * default — and never consults it, so a later default revision never
+   * moves a switch `setCatchUpOnReplay` installed.
+   *
+   * The default is baked at subscribe time: `replayRange` reads the
+   * subscriber record's switch once, at the start of the next replay,
+   * and snapshots the paused set there — a default revision landing
+   * mid-replay never touches the replay already running (its paused
+   * set was fixed at its start), and it never early-releases a
+   * `replayPaused` already set. The replay semantics themselves
+   * (range, speed, key filter, the two-replays fail-fast), the
+   * `replayPaused` set/clear timing, and the resume cursor are all
+   * untouched.
+   *
+   * There is no existence gate — the default exists precisely for
+   * subscribers that have not joined yet, so it applies to every
+   * future subscription that omits the switch. The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a boolean, or
+   * `null`, throws `RangeError` with the live default and the audit
+   * log untouched. A revision identical to the current default
+   * (including setting `false` on a factory bus, or clearing a bus
+   * already at `false`) is a no-op with no audit — the comparison is
+   * on the effective switch, unset counting as `false`. Audited as
+   * `default_catch_up_on_replay_revised`
+   * (`{ previous, catchUpOnReplay }`, `null` when the default is
+   * unset — unset means new subscribers without an explicit switch
+   * go back to `false`, exactly the previous behavior).
+   *
+   * Orthogonal to EB-203 (that owns the catch-up mechanism itself —
+   * this the default a new subscriber without an explicit switch
+   * falls back to), to EB-457 (that revises one live subscriber's
+   * switch — this the default future subscribers fall back to), to
+   * EB-448 (that revises the replay throttle — that replay rate, this
+   * the live-pause strategy), and to EB-71 (that owns the
+   * `onReplayProgress` callback — that progress observation, this the
+   * pause strategy).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than a
+   * boolean, or `null` to clear.
+   */
+  setDefaultCatchUpOnReplay(enabled: boolean | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultCatchUpOnReplay');
+    // The default is validated once, here, with the same gate the
+    // subscribe path uses for an explicit value — a failed call
+    // leaves the live default untouched, and subscribe never
+    // re-validates it.
+    if (enabled !== null && typeof enabled !== 'boolean') {
+      throw new RangeError(
+        'setDefaultCatchUpOnReplay: catchUpOnReplay must be a boolean, or null to clear it',
+      );
+    }
+    // Store the value as given, so a later `true` and a custom switch
+    // stay distinct revisions, and `undefined` keeps meaning the
+    // factory `false`.
+    const next: boolean | undefined = enabled === null ? undefined : enabled;
+    const previous: boolean | null = this.defaultCatchUpOnReplay ?? null;
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective switch — unset means `false` —
+    // so setting `false` on a factory bus, or clearing a bus already
+    // at `false`, audits nothing.
+    if ((previous ?? false) === (next ?? false)) {
+      return;
+    }
+    this.defaultCatchUpOnReplay = next;
+    this.auditSubscription({
+      action: 'default_catch_up_on_replay_revised',
+      actor,
+      detail: {
+        previous,
+        catchUpOnReplay: next === undefined ? null : next,
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default time-travel replay catch-up
+   * mode (EB-518) — whether future subscribers without an explicit
+   * `catchUpOnReplay` pause their live drain while a `replayRange`
+   * runs — `undefined` before any revision (no default installed,
+   * new subscribers without a switch use the documented `false`),
+   * then whatever `setDefaultCatchUpOnReplay` last installed.
+   */
+  getDefaultCatchUpOnReplay(): boolean | undefined {
+    return this.defaultCatchUpOnReplay;
   }
 
   /**
