@@ -174,9 +174,17 @@ test('window shrink drops stale disconnects on the next note', () => {
 });
 
 test('dedup window shrink un-suppresses after the new horizon (dead-letter growth)', async () => {
+  // The dedup decision reads the bus clock, not wall time: the three
+  // dead-letter moves of one flood land on real timers, and under load
+  // they can spread past a 1ms window, so a wall-clock test flakes
+  // (3 deliveries instead of 2). A controlled clock keeps the three
+  // notes of each flood at one timestamp — the collapse under test —
+  // while the dead-lettering itself still runs on real timers.
+  let now = 1_000;
   const sink = new RecordingAlertSink();
   const bus = new EventBus({
     busId: 'ops-rev-dedup',
+    now: () => now,
     opsAlert: { sink, secret: 's', dedupWindowMs: 60_000 },
   });
   bus.subscribeReliable(
@@ -194,7 +202,11 @@ test('dedup window shrink un-suppresses after the new horizon (dead-letter growt
   assert.equal(sink.deliveries.length, 1);
   assert.ok(bus.getStats().opsAlert.suppressed >= 2);
   // Shrink the window below the time since the last alert: the next
-  // flood notes again instead of suppressing.
+  // flood notes again instead of suppressing. The first alert landed
+  // at t=1000, so advancing the clock 2ms puts it past the new 1ms
+  // horizon while the three notes of the next flood still share one
+  // timestamp and collapse into a single delivery.
+  now = 1_002;
   bus.setOpsAlert({ dedupWindowMs: 1 });
   bus.publish('t', { v: 4 });
   bus.publish('t', { v: 5 });
