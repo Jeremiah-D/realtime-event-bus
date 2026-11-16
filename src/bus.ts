@@ -5062,7 +5062,9 @@ export interface GroupSubscribeOptions extends SubscribeOptions {
    * `subscribeToGroup` for the (groupId, pattern): a later member that
    * specifies a different assignor throws `RangeError` and its
    * subscription is rolled back. Members that omit it inherit the group's
-   * assignor. The active assignor name is reported on every
+   * assignor. A first member that omits it falls back to the live bus
+   * default (`setGroupDefaultAssignment`, EB-523 — `'rendezvous'`
+   * unless revised). The active assignor name is reported on every
    * `partitionRebalance` event (`PartitionRebalanceInfo.strategy`).
    */
   assignment?: 'rendezvous' | 'sticky';
@@ -18875,6 +18877,15 @@ export class EventBus {
    * default.
    */
   private groupDefaultHandoffLinger?: number;
+  /**
+   * Bus-level terminal group partition-assignment default (EB-523):
+   * the `assignment` a new partitioned group's first member falls
+   * back to when it omits its own `assignment` (EB-54). Always
+   * `'rendezvous'` unless revised via `setGroupDefaultAssignment`;
+   * there is no construction-time option, and a restart restores
+   * `'rendezvous'`.
+   */
+  private groupDefaultAssignment: 'rendezvous' | 'sticky' = 'rendezvous';
   /**
    * Per-group static-membership session-timeout defaults (EB-403):
    * groupKey -> sessionTimeoutMs, set live via
@@ -46655,8 +46666,9 @@ export class EventBus {
         `partition assignor mismatch: assignment is '${assignment}' but assignor.name is '${assignor.name}'`,
       );
     }
-    const name = assignor?.name ?? assignment ?? 'rendezvous';
-    const impl = assignor ?? resolveBuiltinPartitionAssignor(assignment ?? 'rendezvous');
+    const name = assignor?.name ?? assignment ?? this.groupDefaultAssignment ?? 'rendezvous';
+    const impl =
+      assignor ?? resolveBuiltinPartitionAssignor(assignment ?? this.groupDefaultAssignment ?? 'rendezvous');
     if (!this.groupMembers.has(groupKey)) {
       // New (or fully drained and recreated) group: the first member fixes
       // the assignor; a stale entry from a dead generation is dropped.
@@ -48797,7 +48809,9 @@ export class EventBus {
    * `createZoneAwarePartitionAssignor` / `createLagAwarePartitionAssignor`
    * / `createWeightedPartitionAssignor`); the string form only names
    * the two option-free built-ins, `'rendezvous'` and `'sticky'`.
-   * Passing `null` restores the default rendezvous built-in.
+   * Passing `null` restores the live bus default
+   * (`getGroupDefaultAssignment`, EB-523 — `'sticky'` when set,
+   * otherwise `'rendezvous'`).
    *
    * Fail-closed: an empty groupId, an illegal actor, an unknown group
    * or a group that never opted into partitions (no `groupPartitions`
@@ -48847,13 +48861,13 @@ export class EventBus {
     const pattern = key.slice(sep + 1);
     const name =
       assignor === null
-        ? 'rendezvous'
+        ? this.groupDefaultAssignment
         : typeof assignor === 'string'
           ? assignor
           : assignor.name;
     const impl =
       assignor === null
-        ? rendezvousPartitionAssignor
+        ? resolveBuiltinPartitionAssignor(this.groupDefaultAssignment)
         : typeof assignor === 'string'
           ? resolveBuiltinPartitionAssignor(assignor)
           : assignor;
@@ -55251,6 +55265,100 @@ export class EventBus {
    */
   getGroupDefaultHandoffLinger(): number | undefined {
     return this.groupDefaultHandoffLinger;
+  }
+
+  /**
+   * Sets the live bus-level terminal group partition-assignment
+   * default (EB-523) without touching any live group:
+   * `setGroupDefaultAssignment(assignment, actor = 'system')`
+   * decides which built-in strategy a new partitioned group's first
+   * member falls back to when it omits its own `assignment` (see
+   * `GroupSubscribeOptions.assignment`, EB-54) — `'sticky'` to cut
+   * new groups fleet-wide to minimal-migration placement with one
+   * call, `'rendezvous'` to restore the factory default.
+   *
+   * Only the default moves: the roster, the partition assignment,
+   * and every live group are untouched, and no rebalance fires for
+   * the revision itself. The priority chain is custom assignor >
+   * member-explicit assignment > bus default > `'rendezvous'` (the
+   * bus default is the terminal fallback below the explicit option —
+   * a custom assignor or an explicit `assignment` always wins). A
+   * group that took the default at creation keeps the assignor it
+   * was baked with: a later revision never moves a live group's
+   * assignor, and `setGroupAssignor` still revises one live group
+   * at a time without touching the bus default. A group that drains
+   * fully and is recreated takes the default in effect at its
+   * recreation, like any new group, since the stale assignor from
+   * the dead generation is dropped. A later member that names a
+   * different explicit strategy still throws `RangeError`,
+   * including when the group's strategy was derived from the bus
+   * default — the default never participates in mismatch
+   * determination, which counts member-explicit values only.
+   * `setGroupAssignor(groupId, null)` restores the live bus
+   * default (`'sticky'` when set, otherwise `'rendezvous'`).
+   *
+   * There is no existence gate — the default exists precisely for
+   * groups that have not joined yet, so it applies to every future
+   * group. The default is runtime state: it never enters a config
+   * snapshot and does not survive a restart, like the bus's other
+   * live revisions. The default is always a value — `'rendezvous'`
+   * unless revised — and restoring the factory default is
+   * `setGroupDefaultAssignment('rendezvous')`; there is no clear
+   * method.
+   *
+   * Fail-closed: an illegal actor or a value other than
+   * `'rendezvous'` / `'sticky'` throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to
+   * the current default is a no-op with no audit. Audited as
+   * `group_default_assignment_revised`
+   * (`{ previous, assignment }`, both always
+   * `'rendezvous'` / `'sticky'`, never null).
+   *
+   * Orthogonal to EB-54 (that is the sticky assignor mechanism
+   * itself — this its bus-level terminal default), to EB-106
+   * (that is custom-assignor injection — this the built-in
+   * strategy default; a custom assignor always wins), to EB-175
+   * (that verifies custom-assignor plugins — this changes the
+   * default itself), to EB-346 (that switches one live group's
+   * assignor — this the default new groups fall back to; its
+   * `null` restore target follows this default), and to EB-465 /
+   * EB-467 / EB-468 / EB-469 / EB-471 (that revise the bus
+   * auto-offset-reset / max-members / auto-commit /
+   * rebalance-debounce / handoff-linger defaults — same "bus
+   * default" shape, a different knob).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * `'rendezvous'` / `'sticky'`.
+   */
+  setGroupDefaultAssignment(assignment: 'rendezvous' | 'sticky', actor = 'system'): void {
+    assertValidActor(actor, 'setGroupDefaultAssignment');
+    if (assignment !== 'rendezvous' && assignment !== 'sticky') {
+      throw new RangeError(
+        "setGroupDefaultAssignment: assignment must be 'rendezvous' or 'sticky'",
+      );
+    }
+    const previous = this.groupDefaultAssignment;
+    // Re-affirming the current default is a no-op: no audit.
+    if (previous === assignment) {
+      return;
+    }
+    this.groupDefaultAssignment = assignment;
+    this.auditSubscription({
+      action: 'group_default_assignment_revised',
+      actor,
+      detail: { previous, assignment },
+    });
+  }
+
+  /**
+   * Returns the live bus-level terminal group partition-assignment
+   * default (EB-523) — the strategy new partitioned groups fall
+   * back to when their first member omits its own `assignment` —
+   * `'rendezvous'` before any revision (the factory default), then
+   * whatever `setGroupDefaultAssignment` last installed.
+   */
+  getGroupDefaultAssignment(): 'rendezvous' | 'sticky' {
+    return this.groupDefaultAssignment;
   }
 
   /**

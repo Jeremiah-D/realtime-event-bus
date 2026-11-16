@@ -371,11 +371,22 @@ library.
   so `partitionRebalance.strategy` reports the new name. A custom assignor is trial-run against the live roster
   before anything moves (a throwing or invalid assignor aborts with the old assignor in place); the built-ins
   skip the trial. Zone-aware, lag-aware, and weighted assignors arrive as factory-built `PartitionAssignor`
-  objects; the string form only names `'rendezvous'` and `'sticky'`, and `null` restores the default rendezvous.
+  objects; the string form only names `'rendezvous'` and `'sticky'`, and `null` restores the live bus default
+  (`setGroupDefaultAssignment`, EB-523 — `'sticky'` when set, otherwise `'rendezvous'`).
   An unknown groupId, a group that never opted into partitions, or an ambiguous groupId throws `RangeError`;
   switching to the running assignor is a no-op with no audit. Audited as `group_assignor_revised`
   (`{ assignor, oldAssignor }`). A fully drained group records the switch by the audit entry alone, and the
-  next generation's first member re-fixes the assignor under the first-member-fixes rule. **Partition fencing
+  next generation's first member re-fixes the assignor under the first-member-fixes rule. **Bus-level default
+  assignment** (EB-523): `setGroupDefaultAssignment(assignment, actor = 'system')` revises the live bus default
+  a new partitioned group's first member falls back to when it omits its own `assignment` — `'sticky'` to cut
+  new groups fleet-wide to minimal-migration placement with one call, `setGroupDefaultAssignment('rendezvous')`
+  to restore the factory default (always `'rendezvous'` unless revised; no construction-time option, no config
+  snapshot entry, a restart restores `'rendezvous'`). The value chain is custom assignor > member-explicit
+  assignment > bus default > `'rendezvous'`; a revision only affects groups created after it — a group keeps the
+  assignor its first member baked in, a drained-and-rebuilt group takes the default live at rebuild time, and
+  the default never participates in mismatch determination (an explicitly different member still throws
+  `RangeError`). `setGroupAssignor(groupId, null)` restores the live bus default. Audited as
+  `group_default_assignment_revised` (`{ previous, assignment }`, both always `'rendezvous'` / `'sticky'`). **Partition fencing
   token** (EB-441): every (re)computation of a partitioned group's assignment table produces a monotonically
   increasing fencing generation — 1 on the first assignment, +1 on every rebalance or revocation that recomputes
   the table — reported on `partitionRebalance.generation` in `onRebalance` events and on
