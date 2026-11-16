@@ -10541,6 +10541,7 @@ function thrownErrorMessage(err: unknown): string {
 function normalizeDeadLetterOptions(
   opt: boolean | DeadLetterOptions | undefined,
   caller: string,
+  defaultRetryLadder?: number[],
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -10619,8 +10620,21 @@ function normalizeDeadLetterOptions(
     maxPending,
     // EB-155: validate the pre-DLQ retry ladder. Invalid rungs throw here,
     // before anything is mutated or subscribed — a rejected option never
-    // leaves a half-registered subscription behind.
-    retryLadder: validateRetryLadder(o.retryLadder, caller),
+    // leaves a half-registered subscription behind. EB-525: a bus-level
+    // default ladder fills an omitted `retryLadder` for a reliable
+    // subscriber that already opted into a dead-letter queue — the
+    // default never enables the DLQ itself (an absent `deadLetter`
+    // still returns `null` above), and an explicit value always wins,
+    // including an explicit empty array (still disabled) and an
+    // explicit `null` (still a `RangeError` from the validator — only
+    // an absent (`undefined`) value falls back: a bare `??` would
+    // swallow `null`, since `??` treats `null` as missing — the same
+    // guard as the EB-519 redelivery-backoff fallback in
+    // `subscribeReliable`).
+    retryLadder: validateRetryLadder(
+      o.retryLadder === undefined ? defaultRetryLadder : o.retryLadder,
+      caller,
+    ),
   };
 }
 
@@ -18854,6 +18868,23 @@ export class EventBus {
    * messages and registered topic rules are untouched.
    */
   private defaultMaxMessageBytes?: number;
+  /**
+   * Bus-level default pre-DLQ retry ladder (EB-525): the rung delays
+   * a new reliable subscriber falls back to when it opts into a
+   * dead-letter queue (`deadLetter`) and omits `retryLadder` (see
+   * `validateRetryLadder`, EB-155). Starts unset (`undefined` — no
+   * default, omitting `retryLadder` disables the ladder and budget
+   * exhaustion dead-letters immediately, exactly the previous
+   * behavior) and moves only via `setDefaultRetryLadder`; there is
+   * no construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `retryLadder` always wins, including an explicit
+   * empty array (still disabled). A revision only affects reliable
+   * subscribers created after it — already-subscribed subscribers
+   * keep the ladder instance they were baked with at subscribe time.
+   */
+  private defaultRetryLadder?: number[];
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44369,7 +44400,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable');
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55030,6 +55061,120 @@ export class EventBus {
    */
   getDefaultMaxMessageBytes(): number | undefined {
     return this.defaultMaxMessageBytes;
+  }
+
+  /**
+   * Sets the live bus-level default pre-DLQ retry ladder (EB-525)
+   * without touching any live subscriber:
+   * `setDefaultRetryLadder(delays, actor = 'system')` decides the
+   * rung delays new reliable subscribers fall back to when they opt
+   * into a dead-letter queue (`deadLetter`) and omit `retryLadder`
+   * (see `validateRetryLadder`, EB-155) — `[100, 500]` to give every
+   * future opted-in reliable subscriber two delayed retries before
+   * the DLQ with one call, `null` to clear the default back to
+   * immediate dead-lettering on budget exhaustion.
+   *
+   * Only the default moves: the subscribers, their baked ladders,
+   * their armed rungs, and every already-queued message are
+   * untouched. The priority chain is explicit `retryLadder` > bus
+   * default > disabled (the bus default is the terminal fallback
+   * below the explicit option — an explicit ladder always wins,
+   * including an explicit empty array, which still disables the
+   * ladder even while a default is installed). The default never
+   * enables a dead-letter queue: a subscriber that does not pass
+   * `deadLetter` still has no DLQ, and its failures still requeue
+   * under the immediate redelivery loop. A revision only affects
+   * reliable subscribers created after it: a subscriber takes the
+   * default in effect at subscribe time and keeps the ladder
+   * instance it was baked with — a later revision never moves an
+   * already-subscribed ladder, its armed rungs, or a ladder already
+   * cleared by `setRetryLadder` — and `setRetryLadder` (EB-270)
+   * still revises one subscriber at a time without touching the bus
+   * default (a default-baked subscriber can still be revised per
+   * subscriber, and a revision after a clear is still refused).
+   * The default is runtime state: it never enters a config snapshot
+   * and does not survive a restart, like the bus's other live
+   * revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than an array of
+   * non-negative finite rung delays (`null` to clear) throws
+   * `RangeError` with the live default and the audit log untouched.
+   * An empty array normalizes to unset (no ladder), so setting it
+   * on a bus with no default installed is a no-op. A revision
+   * identical to the current default (including re-setting the same
+   * rungs, and clearing an already-unset default) is a no-op with
+   * no audit. Audited as `default_retry_ladder_revised`
+   * (`{ previous, retryLadder }`, `null` when the default is unset
+   * — unset means new omit-`retryLadder` reliable subscribers go
+   * back to immediate dead-lettering, exactly the previous
+   * behavior).
+   *
+   * Orthogonal to EB-155 (that owns the retry-ladder mechanism
+   * itself — this its bus-level terminal default), to EB-270 (that
+   * revises one subscriber's ladder — this the bus-level default
+   * new subscribers fall back to), to EB-519 (that sets the bus-level
+   * default reliable redelivery backoff — that spaces the instant
+   * redeliveries, this the delayed rungs after the instant budget is
+   * spent; the two stack), to EB-365 (that revises the dead-letter
+   * budget — this the rhythm after the budget is spent), and to
+   * EB-134 (that replays from inside the DLQ — this retries before
+   * a message ever reaches it).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * an array of non-negative finite rung delays (or `null` to
+   * clear).
+   */
+  setDefaultRetryLadder(delays: number[] | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultRetryLadder');
+    // Validate before touching anything: `undefined` is not a clear —
+    // only an explicit `null` (or an empty array, which
+    // `validateRetryLadder` already maps to disabled, EB-155) clears.
+    // `validateRetryLadder` returns `undefined` for an absent value
+    // too, so the `undefined` guard above is what keeps a missing
+    // argument from silently clearing the default.
+    if (delays === undefined) {
+      throw new RangeError(
+        'setDefaultRetryLadder: retryLadder must be an array of delay milliseconds, or null to clear it',
+      );
+    }
+    const validated =
+      delays === null ? undefined : validateRetryLadder(delays, 'setDefaultRetryLadder');
+    const previous: number[] | null =
+      this.defaultRetryLadder === undefined ? null : [...this.defaultRetryLadder];
+    const next: number[] | null = validated === undefined ? null : [...validated];
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is rung by rung — so an array that normalizes to
+    // the current default (an empty array on a bus with no default
+    // installed) audits nothing, and clearing a bus already at
+    // immediate dead-lettering audits nothing.
+    const same =
+      previous === null
+        ? next === null
+        : next !== null &&
+          previous.length === next.length &&
+          previous.every((delay, i) => delay === next[i]);
+    if (same) {
+      return;
+    }
+    this.defaultRetryLadder = validated === undefined ? undefined : [...validated];
+    this.auditSubscription({
+      action: 'default_retry_ladder_revised',
+      actor,
+      detail: { previous, retryLadder: next },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default pre-DLQ retry ladder
+   * (EB-525) — the rung delays future omit-`retryLadder` reliable
+   * subscribers with a dead-letter queue fall back to —
+   * `undefined` before any revision (no default, new omit-`retryLadder`
+   * subscribers dead-letter immediately on budget exhaustion), then
+   * whatever `setDefaultRetryLadder` last installed. The returned
+   * array is a copy: mutating it never moves the live default.
+   */
+  getDefaultRetryLadder(): number[] | undefined {
+    return this.defaultRetryLadder === undefined ? undefined : [...this.defaultRetryLadder];
   }
 
   /**

@@ -11005,6 +11005,24 @@ Semantics:
   clear is refused); every success is audited as `retry_ladder_revised`
   (`{ retryLadder: number[] | null, oldRetryLadder: number[] }`).
   (Real-time systems: reliable delivery.)
+- **Bus-level default (EB-525, via
+  `setDefaultRetryLadder(delays | null)` / `getDefaultRetryLadder()`).**
+  A fleet-wide default ladder for new reliable subscribers that opt
+  into a dead-letter queue and omit `retryLadder` — one call retunes
+  the pre-DLQ rhythm for every future subscriber. The priority chain
+  is explicit `retryLadder` > bus default > disabled, and an explicit
+  empty array still disables the ladder even while a default is
+  installed. The default never enables a dead-letter queue: a
+  subscriber that does not pass `deadLetter` still has none. A
+  revision only affects subscribers created after it — a subscriber
+  keeps the ladder it was baked with, and `setRetryLadder` still
+  revises one subscriber at a time without touching the bus default
+  (a default-baked subscriber can still be revised per subscriber,
+  and a revision after a clear is still refused). Fail-closed
+  (illegal rungs and `undefined` throw `RangeError` with the live
+  default untouched); a re-affirmed default is a silent no-op.
+  Every success is audited as `default_retry_ladder_revised`
+  (`{ previous: number[] | null, retryLadder: number[] | null }`).
 - **Orthogonal to EB-47 hotspot detection.** A rung redelivery re-enters
   the normal pipeline, so a keyed message that keeps missing its
   predecessor keeps tripping the hotspot threshold per rung — expected:
