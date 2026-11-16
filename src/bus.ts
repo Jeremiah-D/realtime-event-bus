@@ -30,7 +30,7 @@ import {
 } from './idle.ts';
 import { AckTracker, type Delivery } from './ack.ts';
 import { validateRetryLadder, RetryLadder, type RetryLadderTimer, type RetryLadderTimerFactory } from './retry-ladder.ts';
-import { validateRedeliveryBackoff, RedeliveryBackoff, type RedeliveryBackoffConfig, type RedeliveryBackoffTimer } from './redelivery-backoff.ts';
+import { validateRedeliveryBackoff, RedeliveryBackoff, type RedeliveryBackoffConfig, type NormalizedRedeliveryBackoffConfig, type RedeliveryBackoffTimer } from './redelivery-backoff.ts';
 import {
   validateAdmissionWebhookOptions,
   decideAdmission,
@@ -4174,7 +4174,10 @@ export interface ReliableSubscribeOptions extends SubscribeOptions {
    * pending backoff never keeps the process alive and is cancelled on
    * unsubscribe. A graceful drain (`unsubscribe({ drain: true })`)
    * stays open while a backoff is pending — the redelivery still
-   * settles before teardown.
+   * settles before teardown. A bus-level default is revisable live
+   * via `setDefaultRedeliveryBackoff` (EB-519): a reliable subscriber
+   * that omits the option falls back to it (explicit always wins,
+   * whole-object; `null` at subscribe time still throws).
    */
   redeliveryBackoff?: RedeliveryBackoffConfig;
   /**
@@ -18744,6 +18747,25 @@ export class EventBus {
    * `setCatchUpOnReplay` (EB-457) never consults it.
    */
   private defaultCatchUpOnReplay?: boolean;
+  /**
+   * Bus-level default reliable redelivery backoff (EB-519): the backoff
+   * config a new reliable subscriber falls back to when it omits its
+   * own `redeliveryBackoff` (see
+   * `ReliableSubscribeOptions.redeliveryBackoff`, EB-220). Starts unset
+   * (`undefined` — no default, an omitted config means immediate
+   * redelivery, exactly the previous behavior) and moves only via
+   * `setDefaultRedeliveryBackoff`; there is no construction-time
+   * option, and a restart restores the unset default. Stored
+   * normalized (capMs defaulted to Infinity, jitter to false), so the
+   * subscribe path uses it as-is and never re-validates it. The
+   * default is baked into the reliable subscriber record at subscribe
+   * time: a later revision never moves an already-subscribed
+   * subscriber's scheduler or an armed timer, and
+   * `setRedeliveryBackoff` (EB-261) never consults it. Plain
+   * subscriptions never read it — there is no backoff scheduler to
+   * build for them.
+   */
+  private defaultRedeliveryBackoff?: NormalizedRedeliveryBackoffConfig;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44240,7 +44262,22 @@ export class EventBus {
     const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable');
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
-    const redeliveryBackoff = validateRedeliveryBackoff(opts?.redeliveryBackoff, 'subscribeReliable');
+    // EB-519: a reliable subscriber that omits redeliveryBackoff falls
+    // back to the live bus default, if one is installed — the bus
+    // default is the terminal fallback, below the explicit option. An
+    // explicit config always wins, whole-object (no per-field merge).
+    // Only an absent (`undefined`) value falls back: an explicit
+    // `null` still throws via the validator below (a bare `??` would
+    // swallow it, since `??` treats `null` as missing — the same guard
+    // as the EB-516 idleActivity merge). The default is already
+    // normalized at setter time, so it is used as-is: re-running it
+    // through `validateRedeliveryBackoff` would reject its defaulted
+    // capMs (Infinity is not finite), and the subscribe path never
+    // re-validates a value the setter already normalized.
+    const redeliveryBackoff =
+      opts?.redeliveryBackoff !== undefined
+        ? validateRedeliveryBackoff(opts.redeliveryBackoff, 'subscribeReliable')
+        : this.defaultRedeliveryBackoff;
     let deliver!: (msg: BusMessage | BusMessage[]) => void;
     // The retained snapshot (EB-87) is deferred until the at-least-once
     // wrapper below is installed: delivering through the not-yet-assigned
@@ -54335,6 +54372,132 @@ export class EventBus {
    */
   getDefaultCatchUpOnReplay(): boolean | undefined {
     return this.defaultCatchUpOnReplay;
+  }
+
+  /**
+   * Sets the live bus-level default reliable redelivery backoff
+   * (EB-519) without touching any live subscriber:
+   * `setDefaultRedeliveryBackoff(config, actor = 'system')` decides
+   * the backoff a future reliable subscriber that omits its own
+   * `redeliveryBackoff` (see
+   * `ReliableSubscribeOptions.redeliveryBackoff`, EB-220) spaces its
+   * in-budget redeliveries with — `null` to clear the default back to
+   * immediate redelivery.
+   *
+   * Only the default moves: the roster and every live subscriber are
+   * untouched. The priority chain is subscriber-explicit > bus default
+   * > immediate redelivery — the bus default is the terminal fallback
+   * below the explicit option, taken whole-object (an explicit config
+   * replaces the default entirely, never merges field by field). A
+   * reliable subscriber that took the default at subscribe time keeps
+   * the scheduler it was baked with: a later revision never moves an
+   * already-subscribed subscriber's backoff, never shortens or
+   * lengthens an armed timer, and `setRedeliveryBackoff` (EB-261)
+   * still revises one live reliable subscriber at a time without
+   * touching the bus default — and never consults it, so a later
+   * default revision never moves a policy `setRedeliveryBackoff`
+   * installed.
+   *
+   * The default only ever moves reliable subscriptions: plain
+   * `subscribe` paths never read it, since there is no backoff
+   * scheduler to build for them. The config is stored normalized
+   * (capMs defaulted to Infinity, jitter to false) and the getter
+   * returns a copy, so a caller mutating what it passed in — or what
+   * the getter returned — never moves the live default.
+   *
+   * There is no existence gate — the default exists precisely for
+   * reliable subscribers that have not joined yet, so it applies to
+   * every future reliable subscription that omits the config. The
+   * default is runtime state: it never enters a config snapshot and
+   * does not survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a config other than a valid
+   * `RedeliveryBackoffConfig` throws `RangeError` with the live
+   * default and the audit log untouched — the validation reuses
+   * `validateRedeliveryBackoff` (EB-220), so a config that could not
+   * be set at subscribe time cannot be installed as the default
+   * either; `undefined` is not a clear, only `null` is. A revision
+   * identical to the current default (compared on the normalized
+   * values, field by field — including a config that normalizes to
+   * the same values, or clearing a bus already at immediate
+   * redelivery) is a no-op with no audit. Audited as
+   * `default_redelivery_backoff_revised`
+   * (`{ previous, redeliveryBackoff }`, each the normalized config
+   * or `null` — `null` when the default is unset, meaning new
+   * reliable subscribers without an explicit config go back to
+   * immediate redelivery, exactly the previous behavior).
+   *
+   * Orthogonal to EB-220 (that owns the backoff mechanism itself —
+   * this the default a new reliable subscriber without an explicit
+   * config falls back to), to EB-261 (that revises one live reliable
+   * subscriber's backoff — this the default future subscribers fall
+   * back to), to EB-259 (that sets the ack-timeout default — that
+   * confirmation deadline, this the redelivery spacing; the same
+   * reliable-delivery family, different knobs), to EB-365 (that
+   * revises the dead-letter budget — that where a message goes once
+   * the budget is exhausted, this the pace before it is), and to
+   * EB-155 (that owns the retry ladder — that the rung delays after
+   * the budget is exhausted, this the exponential spacing inside it;
+   * the two stack, the backoff governing the immediate-redelivery
+   * interval and the ladder the post-budget rungs).
+   *
+   * Throws `RangeError` for an illegal actor or an illegal config, or
+   * for `undefined` (only `null` clears).
+   */
+  setDefaultRedeliveryBackoff(config: RedeliveryBackoffConfig | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultRedeliveryBackoff');
+    // Validate before touching anything: `validateRedeliveryBackoff`
+    // returns `undefined` for an absent value, but here absent is not
+    // a clear — only an explicit `null` clears the policy, mirroring
+    // `setRedeliveryBackoff` (EB-261).
+    const normalized =
+      config === null ? undefined : validateRedeliveryBackoff(config, 'setDefaultRedeliveryBackoff');
+    if (config !== null && normalized === undefined) {
+      throw new RangeError('setDefaultRedeliveryBackoff: redeliveryBackoff must be an object with baseMs, or null to clear it');
+    }
+    const previous: NormalizedRedeliveryBackoffConfig | null =
+      this.defaultRedeliveryBackoff === undefined ? null : { ...this.defaultRedeliveryBackoff };
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the normalized values, field by field — so a
+    // config that normalizes to the same values (e.g. `{ baseMs: 100 }`
+    // after `{ baseMs: 100, jitter: false }`) audits nothing, and
+    // clearing a bus already at immediate redelivery audits nothing.
+    const current = this.defaultRedeliveryBackoff;
+    const same =
+      current === undefined
+        ? normalized === undefined
+        : normalized !== undefined &&
+          current.baseMs === normalized.baseMs &&
+          current.capMs === normalized.capMs &&
+          current.jitter === normalized.jitter;
+    if (same) {
+      return;
+    }
+    this.defaultRedeliveryBackoff = normalized === undefined ? undefined : { ...normalized };
+    this.auditSubscription({
+      action: 'default_redelivery_backoff_revised',
+      actor,
+      detail: {
+        previous,
+        redeliveryBackoff: normalized === undefined ? null : { ...normalized },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default reliable redelivery backoff
+   * (EB-519) — the normalized config future reliable subscribers
+   * without an explicit `redeliveryBackoff` fall back to —
+   * `undefined` before any revision (no default installed, new
+   * reliable subscribers without a config redeliver immediately),
+   * then whatever `setDefaultRedeliveryBackoff` last installed. The
+   * returned object is a copy: mutating it never moves the live
+   * default.
+   */
+  getDefaultRedeliveryBackoff(): NormalizedRedeliveryBackoffConfig | undefined {
+    return this.defaultRedeliveryBackoff === undefined
+      ? undefined
+      : { ...this.defaultRedeliveryBackoff };
   }
 
   /**

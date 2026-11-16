@@ -11735,6 +11735,27 @@ Semantics:
   `redelivery_backoff_revised`
   (`{ redeliveryBackoff, oldRedeliveryBackoff }`, each the
   normalized config or `null`).
+- **Bus-level default (EB-519, via
+  `setDefaultRedeliveryBackoff(config | null, actor?)`).** A reliable
+  subscriber that omits its own `redeliveryBackoff` falls back to the
+  bus default — the precedence chain is subscriber-explicit > bus
+  default > immediate redelivery (unset by default, so omitting the
+  config still means immediate requeueing). The explicit config is
+  taken whole-object, never merged field by field, and `null` at
+  subscribe time still throws. The default is baked at subscribe
+  time: a later revision never moves an already-subscribed
+  subscriber's scheduler or an armed timer, and
+  `setRedeliveryBackoff` still revises one live reliable subscriber
+  at a time without touching the bus default. Plain subscriptions
+  never read it. The config is stored normalized (`capMs` defaulted
+  to Infinity, `jitter` to `false`) and the getter returns a copy.
+  It is fail-closed (an illegal actor or config throws `RangeError`
+  with the live default untouched), a revision identical to the
+  current default (compared on the normalized values) is a no-op
+  with no audit, and every success is audited as
+  `default_redelivery_backoff_revised`
+  (`{ previous, redeliveryBackoff }`, each the normalized config or
+  `null` when unset).
 
 ## Per-key TTL for the keyed-compacted durable log (EB-221)
 
