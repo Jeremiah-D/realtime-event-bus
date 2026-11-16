@@ -38,6 +38,21 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** The publish `seq`s carried by the spans in one OTLP/HTTP JSON request body. */
+function spanSeqs(body: string): number[] {
+  const parsed = JSON.parse(body) as {
+    resourceSpans: Array<{
+      scopeSpans: Array<{
+        spans: Array<{ attributes: Array<{ key: string; value: { intValue?: string } }> }>;
+      }>;
+    }>;
+  };
+  return parsed.resourceSpans[0].scopeSpans[0].spans.map((span) => {
+    const seq = span.attributes.find((attr) => attr.key === 'seq');
+    return Number(seq?.value.intValue);
+  });
+}
+
 /**
  * Stub OTLP/HTTP collector on 127.0.0.1. Records every POST body; the
  * exporter uses `agent: false`, so connections close after each
@@ -265,7 +280,18 @@ describe('OTLP export revision (EB-299)', () => {
       await flush();
       await waitFor(() => (bus.getStats().otlp?.exportedSpans ?? 0) > 0);
       assert.ok(collector.requests.length > 0);
-      const posted = collector.requests.length;
+      // The 'a' publish's seq, read off the spans exported so far —
+      // the baseline for the no-'b'-export assertion below. A raw
+      // request-count baseline cannot work here: the 'a' flush is
+      // still in flight when the revision lands, so its remaining
+      // batches can reach the collector after any count is taken and
+      // would be misread as 'b' POSTs. The spans themselves carry
+      // the publish seq, so 'a' and 'b' exports are told apart by
+      // content, not by arrival order.
+      const preSeqs = collector.requests.flatMap((body) => spanSeqs(body));
+      assert.ok(preSeqs.length > 0);
+      const aSeq = preSeqs[0];
+      assert.ok(preSeqs.every((seq) => seq === aSeq));
       // Widen the batch: the next publish buffers instead of flushing —
       // no new POST can fire (the timer is 60s away, the batch is
       // nowhere near full).
@@ -274,7 +300,12 @@ describe('OTLP export revision (EB-299)', () => {
       await flush();
       assert.ok((bus.getStats().otlp?.bufferedSpans ?? 0) > 0);
       await sleep(100);
-      assert.equal(collector.requests.length, posted);
+      // No 'b' span may have been exported: every span in every POST
+      // the collector recorded must still carry the 'a' seq, whenever
+      // its POST landed.
+      const seqs = collector.requests.flatMap((body) => spanSeqs(body));
+      assert.ok(seqs.length > 0);
+      assert.ok(seqs.every((seq) => seq === aSeq));
     } finally {
       await collector.close();
     }

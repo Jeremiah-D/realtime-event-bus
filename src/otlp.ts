@@ -304,6 +304,15 @@ export class OtlpSpanExporter {
   // slices at the live `batchSize`, and `postBatch` times out at the
   // live `timeoutMs` — so a revision governs from the next
   // admission/flush/POST without draining or rebuilding the exporter.
+  // `flushInner` additionally distinguishes the two flush kinds: a
+  // drain-all flush (`flush()`, the timer, `shutdown()`) exports
+  // everything including a sub-batch remainder, while a
+  // batch-triggered flush stops sweeping up spans admitted after a
+  // mid-flight `batchSize` revision — the revision starts a new
+  // drain epoch (`batchEpoch`), and the in-flight flush stops once
+  // the pre-revision backlog is gone and the buffer no longer holds
+  // a full live batch. Without a revision the loop drains
+  // everything, as before.
   // `serviceName` moves only via `setServiceName` (EB-412);
   // `headers` move only via `setHeaders` (EB-409).
   private sampleRate: number;
@@ -317,6 +326,20 @@ export class OtlpSpanExporter {
   private timer: ReturnType<typeof setInterval>;
   private stopped = false;
   private flushPromise: Promise<void> | undefined;
+  // Set by the drain-all entry point `flush()` (timer, manual call,
+  // `shutdown()`): the running `flushInner` loop re-reads it each
+  // iteration, so a drain-all requested while a batch-triggered flush
+  // is in flight is honored before that loop exits. Cleared when the
+  // loop exits — a batch-triggered flush never sets it, so it never
+  // inherits a stale drain-all.
+  private drainAllRequested = false;
+  // Bumped by `retune` whenever `batchSize` changes. A flush records
+  // the epoch it started under; spans admitted after a mid-flight
+  // `batchSize` revision belong to the new regime, and the in-flight
+  // flush stops sweeping them up once the pre-revision backlog is
+  // gone (see `flushInner`). Other revisions do not bump it: the
+  // sample rate governs admission, not the drain.
+  private batchEpoch = 0;
   private exportedSpans = 0;
   private failedSpans = 0;
   private droppedSpans = 0;
@@ -382,6 +405,12 @@ export class OtlpSpanExporter {
    * the timer — a stopped exporter stays stopped.
    */
   retune(next: ResolvedOtlpSpanExporterOptions): void {
+    // A batchSize change starts a new drain epoch: a flush already in
+    // flight stops sweeping up spans admitted after this revision
+    // once the pre-revision backlog is gone (see `flushInner`) — the
+    // revised batch size governs from the next flush, not from the
+    // middle of the one already running.
+    if (next.batchSize !== this.batchSize) this.batchEpoch += 1;
     this.sampleRate = next.sampleRate;
     this.batchSize = next.batchSize;
     this.timeoutMs = next.timeoutMs;
@@ -457,7 +486,10 @@ export class OtlpSpanExporter {
    * Buffers one span for export. Best-effort and allocation-light on
    * the hot path: the export-side sampling decision first, then a
    * bounded push. Never throws — an exporter must not disturb the
-   * publish/deliver path it observes.
+   * publish/deliver path it observes. A batch-triggered flush exports
+   * full batches at the live `batchSize`; a retune that widens the
+   * batch starts a new drain epoch, so an in-flight flush stops
+   * sweeping up spans admitted after the revision (see `flushInner`).
    */
   exportSpan(span: TraceSpan): void {
     try {
@@ -468,7 +500,7 @@ export class OtlpSpanExporter {
         this.buffer.splice(0, overflow);
         this.droppedSpans += overflow;
       }
-      if (this.buffer.length >= this.batchSize) void this.flush();
+      if (this.buffer.length >= this.batchSize) void this.flushBatch();
     } catch {
       // Swallowed: observation must never break delivery.
     }
@@ -478,9 +510,48 @@ export class OtlpSpanExporter {
    * Flushes every buffered span to the collector, in `batchSize`
    * batches. Concurrent callers share one in-flight flush. Never
    * throws: a failed batch is dropped and counted in `failedSpans`.
+   * This is a drain-all flush — the timer, a manual call, and
+   * `shutdown()` all go through here — so a sub-`batchSize`
+   * remainder is exported too, and spans admitted after a mid-flight
+   * `batchSize` revision are exported as well (a batch-triggered
+   * flush from `exportSpan` stops at the revision's drain epoch
+   * instead; see `flushInner`).
    */
   flush(): Promise<void> {
+    this.drainAllRequested = true;
+    if (this.flushPromise !== undefined) {
+      // Join the in-flight flush. The running loop re-reads
+      // `drainAllRequested` each iteration, so a drain-all requested
+      // mid-flight is honored before the loop exits — except when the
+      // loop already passed its last check. Re-check after it
+      // settles: a still-pending drain-all with a non-empty buffer
+      // re-flushes, an empty buffer clears the stale request.
+      return this.flushPromise.then(() => {
+        if (this.buffer.length === 0) {
+          this.drainAllRequested = false;
+          return undefined;
+        }
+        if (this.drainAllRequested) return this.flush();
+        return undefined;
+      });
+    }
+    return this.startFlush();
+  }
+
+  /**
+   * Starts (or joins) the shared in-flight flush for a batch trigger
+   * (`exportSpan`). Never sets `drainAllRequested`: a batch-triggered
+   * flush stops at a mid-flight `batchSize` revision's drain epoch
+   * instead of sweeping up spans admitted after the revision (see
+   * `flushInner`).
+   */
+  private flushBatch(): Promise<void> {
     if (this.flushPromise !== undefined) return this.flushPromise;
+    return this.startFlush();
+  }
+
+  /** Starts the shared in-flight flush; the caller owns the mode. */
+  private startFlush(): Promise<void> {
     const run = this.flushInner().catch(() => {
       // Defensive: flushInner already counts per-batch failures, so this
       // only guards against an unexpected internal error.
@@ -491,17 +562,50 @@ export class OtlpSpanExporter {
     return this.flushPromise;
   }
 
+  /**
+   * Drains the buffer to the collector, in live-`batchSize` batches.
+   * Without a mid-flight `batchSize` revision the loop drains
+   * everything, as before — a span admitted late (a delivery span
+   * landing while the flush is still posting) is swept up by the
+   * in-flight flush. A revision landing mid-flight starts a new
+   * drain epoch (`batchEpoch`): once the pre-revision backlog is
+   * gone and the buffer no longer holds a full live batch, the loop
+   * stops — the spans admitted after the revision stay buffered
+   * until the buffer reaches the new batch size or a drain-all flush
+   * runs — so the revised batch size governs from the next flush.
+   * Both the drain-all flag and the epoch are read live each
+   * iteration, so a revision or a drain-all request landing
+   * mid-flight governs the next batch. A drain-all flush (timer,
+   * manual `flush()`, `shutdown()`) exports everything regardless
+   * of epoch, however small the remainder.
+   */
   private async flushInner(): Promise<void> {
-    while (this.buffer.length > 0) {
-      const batch = this.buffer.splice(0, this.batchSize);
-      try {
-        await this.postBatch(batch);
-        this.exportedSpans += batch.length;
-      } catch {
-        // Best-effort: drop the failed batch, count it, keep draining
-        // the rest — a down collector must not wedge the buffer.
-        this.failedSpans += batch.length;
+    // The drain epoch this flush started under: a `batchSize` retune
+    // mid-flight bumps `batchEpoch`, and spans admitted after the
+    // retune belong to the new regime.
+    const startEpoch = this.batchEpoch;
+    try {
+      for (;;) {
+        if (this.buffer.length === 0) break;
+        if (
+          !this.drainAllRequested &&
+          this.batchEpoch !== startEpoch &&
+          this.buffer.length < this.batchSize
+        ) {
+          break;
+        }
+        const batch = this.buffer.splice(0, this.batchSize);
+        try {
+          await this.postBatch(batch);
+          this.exportedSpans += batch.length;
+        } catch {
+          // Best-effort: drop the failed batch, count it, keep draining
+          // the rest — a down collector must not wedge the buffer.
+          this.failedSpans += batch.length;
+        }
       }
+    } finally {
+      this.drainAllRequested = false;
     }
   }
 
