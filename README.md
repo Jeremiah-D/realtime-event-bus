@@ -105,7 +105,16 @@ library.
   > 5, the default never enables a DLQ for a subscriber that did not pass
   `deadLetter`, and an explicit `0` still dead-letters on the first failure;
   `null` clears the default back to 5, and setting `5` on a bus with no
-  default installed is a no-op with no audit. Opt-in `deadLetter.diagnosticTopic` fans each
+  default installed is a no-op with no audit. A bus-level default
+  capacity is live-revisable with `setDefaultMaxDeadLetterEntries(n)`
+  (EB-527): new reliable subscribers that opt into `deadLetter` and
+  omit `maxEntries` take the bus default instead of 1000 — the
+  resolution chain is explicit > bus default > 1000, the default never
+  enables a DLQ for a subscriber that did not pass `deadLetter`, and
+  tightening the default never evicts an existing subscriber's entries
+  (eviction still happens only on the next dead-letter enqueue);
+  `null` clears the default back to 1000, and setting `1000` on a bus
+  with no default installed is a no-op with no audit. Opt-in `deadLetter.diagnosticTopic` fans each
   dead-lettering out as one diagnostic event on the configured topic — the
   original payload plus `{ subscriberId, pattern, seq, lastError,
   redeliveries, traceId, deadLetteredAt }` metadata — so operators consume

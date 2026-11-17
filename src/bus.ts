@@ -10543,6 +10543,7 @@ function normalizeDeadLetterOptions(
   caller: string,
   defaultRetryLadder?: number[],
   defaultMaxRedeliveries?: number,
+  defaultMaxEntries?: number,
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -10560,7 +10561,16 @@ function normalizeDeadLetterOptions(
   // chain would swallow `null` into the default).
   const maxRedeliveries =
     o.maxRedeliveries === undefined ? (defaultMaxRedeliveries ?? 5) : (o.maxRedeliveries ?? 5);
-  const maxEntries = o.maxEntries ?? 1000;
+  // EB-527: a bus-level default capacity fills an omitted
+  // `maxEntries` for a reliable subscriber that already opted
+  // into a dead-letter queue — the default never enables the DLQ
+  // itself (an absent `deadLetter` still returns `null` above), and
+  // an explicit value always wins. Only an absent (`undefined`) value
+  // falls back: an explicit `null` keeps the subscribe-time gate's
+  // own behavior (the `?? 1000` below, exactly as before — a bare `??`
+  // chain would swallow `null` into the default).
+  const maxEntries =
+    o.maxEntries === undefined ? (defaultMaxEntries ?? 1000) : (o.maxEntries ?? 1000);
   const maxAgeMs = o.maxAgeMs;
   if (!Number.isInteger(maxRedeliveries) || maxRedeliveries < 0) {
     throw new RangeError(`${caller}: deadLetter.maxRedeliveries must be a non-negative integer`);
@@ -18914,6 +18924,23 @@ export class EventBus {
    * subscribe time.
    */
   private defaultMaxRedeliveries?: number;
+  /**
+   * Bus-level default dead-letter queue capacity (EB-527):
+   * the `maxEntries` a new reliable subscriber falls back to
+   * when it opts into a dead-letter queue (`deadLetter`) and omits
+   * `maxEntries` (see `DeadLetterOptions.maxEntries`,
+   * EB-28). Starts unset (`undefined` — no default, omitting
+   * `maxEntries` means 1000, exactly the previous behavior) and
+   * moves only via `setDefaultMaxDeadLetterEntries`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `maxEntries` always wins. A revision only
+   * affects reliable subscribers created after it — already-subscribed
+   * subscribers keep the capacity instance they were baked with at
+   * subscribe time.
+   */
+  private defaultMaxDeadLetterEntries?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44429,7 +44456,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries);
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55307,6 +55334,107 @@ export class EventBus {
    */
   getDefaultMaxRedeliveries(): number | undefined {
     return this.defaultMaxRedeliveries;
+  }
+
+  /**
+   * Sets the live bus-level default dead-letter queue capacity
+   * (EB-527) without touching any live subscriber:
+   * `setDefaultMaxDeadLetterEntries(max, actor = 'system')` decides
+   * how many entries a new reliable subscriber's dead-letter queue
+   * keeps before the oldest entry is evicted, for new reliable
+   * subscribers that opt into a dead-letter queue (`deadLetter`)
+   * and omit `maxEntries` (see `DeadLetterOptions.maxEntries`,
+   * EB-28) — `3` to keep only the three freshest poison samples
+   * fleet-wide with one call, `null` to clear the default back to
+   * 1000.
+   *
+   * Only the default moves: the subscribers, their baked capacities,
+   * and every already-queued dead-letter entry are untouched.
+   * Tightening the default never evicts an existing subscriber's
+   * entries — eviction still happens only on the next dead-letter
+   * enqueue, exactly as `setDeadLetterBudget` (EB-365) behaves for
+   * a per-subscriber tightening. The priority chain is explicit
+   * `maxEntries` > bus default > 1000 (the bus default is the
+   * terminal fallback below the explicit option — an explicit
+   * capacity always wins). The default never enables a dead-letter
+   * queue: a subscriber that does not pass `deadLetter` still has
+   * no DLQ. A revision only affects reliable subscribers created
+   * after it: a subscriber takes the default in effect at
+   * subscribe time and keeps the capacity instance it was baked
+   * with — a later revision never moves an already-subscribed
+   * capacity or its entries, and `setDeadLetterBudget` (EB-365)
+   * still revises one subscriber at a time without touching the
+   * bus default (a default-baked subscriber can still be revised
+   * per subscriber, and a later default revision never re-applies
+   * to an already-revised one). The default is runtime state: it
+   * never enters a config snapshot and does not survive a restart,
+   * like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * integer (`null` to clear) throws `RangeError` with the live
+   * default and the audit log untouched. A revision identical to
+   * the current default — compared on the effective capacity, so
+   * setting `1000` on a factory bus (whose effective capacity is
+   * already 1000) is a no-op, and clearing an already-unset
+   * default is a no-op — audits nothing. Audited as
+   * `default_max_dead_letter_entries_revised`
+   * (`{ previous, maxEntries }`, `null` when the default is
+   * unset — unset means new omit-`maxEntries` reliable
+   * subscribers go back to a capacity of 1000, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-28 (that owns the DLQ mechanism itself — this
+   * its bus-level capacity terminal default), to EB-365 (that revises
+   * one subscriber's capacity — this the bus-level default new
+   * subscribers fall back to), to EB-526 (that sets the bus-level
+   * default pre-DLQ redelivery budget — that how many failures
+   * before a message enters the DLQ, this how many entries the
+   * DLQ keeps once it is there; the two stack), and to EB-525
+   * (that sets the bus-level default retry ladder — that the
+   * delayed rungs after the budget is spent, this the DLQ
+   * capacity after dead-lettering).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer (or `null` to clear).
+   */
+  setDefaultMaxDeadLetterEntries(max: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxDeadLetterEntries');
+    if (max !== null && (!Number.isInteger(max) || max <= 0)) {
+      throw new RangeError(
+        'setDefaultMaxDeadLetterEntries: maxEntries must be a positive integer, or null to clear it',
+      );
+    }
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective capacity — the unset default
+    // behaves as 1000, so setting 1000 on a factory bus audits
+    // nothing. A clear is a no-op only when no default is installed
+    // at all: clearing a bus that holds an explicit default (even
+    // 1000) still moves it back to unset and audits.
+    if (max !== null && (this.defaultMaxDeadLetterEntries ?? 1000) === max) {
+      return;
+    }
+    if (max === null && this.defaultMaxDeadLetterEntries === undefined) {
+      return;
+    }
+    const previous: number | null = this.defaultMaxDeadLetterEntries ?? null;
+    this.defaultMaxDeadLetterEntries = max === null ? undefined : max;
+    this.auditSubscription({
+      action: 'default_max_dead_letter_entries_revised',
+      actor,
+      detail: { previous, maxEntries: max },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default dead-letter queue capacity
+   * (EB-527) — the `maxEntries` future omit-`maxEntries` reliable
+   * subscribers with a dead-letter queue fall back to —
+   * `undefined` before any revision (no default, new
+   * omit-`maxEntries` subscribers fall back to 1000), then
+   * whatever `setDefaultMaxDeadLetterEntries` last installed.
+   */
+  getDefaultMaxDeadLetterEntries(): number | undefined {
+    return this.defaultMaxDeadLetterEntries;
   }
 
   /**
