@@ -10545,6 +10545,7 @@ function normalizeDeadLetterOptions(
   defaultMaxRedeliveries?: number,
   defaultMaxEntries?: number,
   defaultMaxDeadLetterAgeMs?: number,
+  defaultMaxPending?: number,
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -10636,7 +10637,17 @@ function normalizeDeadLetterOptions(
   if (typeof requireApproval !== 'boolean') {
     throw new TypeError(`${caller}: deadLetter.requireApproval must be a boolean`);
   }
-  const maxPending = o.maxPending ?? 100;
+  // EB-529: a bus-level default capacity fills an omitted
+  // `maxPending` for a reliable subscriber that already opted
+  // into a dead-letter queue — the default never enables the DLQ
+  // itself (an absent `deadLetter` still returns `null` above),
+  // and an explicit value always wins. Only an absent
+  // (`undefined`) value falls back: an explicit `null` keeps the
+  // subscribe-time gate's own behavior (the `?? 100` below,
+  // exactly as before — a bare `??` chain would swallow `null`
+  // into the default).
+  const maxPending =
+    o.maxPending === undefined ? (defaultMaxPending ?? 100) : (o.maxPending ?? 100);
   if (!Number.isInteger(maxPending) || maxPending <= 0) {
     throw new RangeError(`${caller}: deadLetter.maxPending must be a positive integer`);
   }
@@ -18970,6 +18981,24 @@ export class EventBus {
    * subscribe time.
    */
   private defaultMaxDeadLetterAgeMs?: number;
+  /**
+   * Bus-level default dead-letter replay-approval pending-queue
+   * capacity (EB-529): the `maxPending` a new reliable subscriber
+   * falls back to when it opts into a dead-letter queue
+   * (`deadLetter`) and omits `maxPending` (see
+   * `DeadLetterOptions.maxPending`, EB-233). Starts unset
+   * (`undefined` — no default, omitting `maxPending` means a
+   * capacity of 100, exactly the previous behavior) and moves
+   * only via `setDefaultMaxDeadLetterPending`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `maxPending` always wins. A revision only
+   * affects reliable subscribers created after it — already-subscribed
+   * subscribers keep the capacity they were baked with at
+   * subscribe time.
+   */
+  private defaultMaxDeadLetterPending?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44485,7 +44514,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs);
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs, this.defaultMaxDeadLetterPending);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55566,6 +55595,113 @@ export class EventBus {
    */
   getDefaultMaxDeadLetterAgeMs(): number | undefined {
     return this.defaultMaxDeadLetterAgeMs;
+  }
+
+  /**
+   * Sets the live bus-level default dead-letter replay-approval
+   * pending-queue capacity (EB-529) without touching any live
+   * subscriber:
+   * `setDefaultMaxDeadLetterPending(max, actor = 'system')`
+   * decides how many replay requests may park in the approval
+   * queue of a new reliable subscriber that opts into a
+   * dead-letter queue (`deadLetter`) and omits `maxPending`
+   * (see `DeadLetterOptions.maxPending`, EB-233) — `1` to give
+   * every new approval-gated subscriber a one-request queue
+   * fleet-wide with one call, `null` to clear the default back
+   * to 100.
+   *
+   * Only the default moves: the subscribers, their baked
+   * capacities, and every already-parked replay request are
+   * untouched. Tightening the default never evicts an existing
+   * subscriber's parked requests — rejection still happens only
+   * on the next replay request (`replayDeadLetter` returns
+   * `false`, the entry stays in the DLQ, audited as
+   * `dead_letter_replay_rejected` with reason
+   * `'approval_queue_full'`), exactly as `setDeadLetterApproval`
+   * (EB-377) behaves for a per-subscriber tightening. The
+   * priority chain is explicit `maxPending` > bus default > 100
+   * (the bus default is the terminal fallback below the explicit
+   * option — an explicit capacity always wins). The default
+   * never enables a dead-letter queue: a subscriber that does
+   * not pass `deadLetter` still has no DLQ — and it never
+   * enables the approval gate: `requireApproval` still defaults
+   * to `false`, so the capacity is only meaningful when a
+   * subscriber explicitly opens the gate. A revision only
+   * affects reliable subscribers created after it: a subscriber
+   * takes the default in effect at subscribe time and keeps the
+   * capacity it was baked with — a later revision never moves an
+   * already-subscribed capacity or its parked requests, and
+   * `setDeadLetterApproval` (EB-377) still revises one subscriber
+   * at a time without touching the bus default (a default-baked
+   * subscriber can still be revised per subscriber, and a later
+   * default revision never re-applies to an already-revised
+   * one). The default is runtime state: it never enters a
+   * config snapshot and does not survive a restart, like the
+   * bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a
+   * positive integer (`null` to clear) throws `RangeError` with
+   * the live default and the audit log untouched. A revision
+   * identical to the current default — re-setting the same
+   * capacity, setting `100` on a factory bus, or clearing an
+   * already-unset default — audits nothing. Audited as
+   * `default_max_dead_letter_pending_revised`
+   * (`{ previous, maxPending }`, `null` when the default is
+   * unset — unset means new omit-`maxPending` reliable
+   * subscribers go back to a capacity of 100, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-233 (that owns the approval-gate mechanism
+   * itself — this its bus-level terminal default), to EB-377
+   * (that revises one subscriber's approval gate — this the
+   * bus-level default new subscribers fall back to), to EB-527
+   * (that sets the bus-level default DLQ capacity — that how
+   * many entries the DLQ keeps, this how many replay requests
+   * may park waiting for approval), and to EB-528 (that sets the
+   * bus-level default entry TTL — that how long each DLQ entry
+   * survives, this how deep the approval queue runs).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive integer (or `null` to clear).
+   */
+  setDefaultMaxDeadLetterPending(max: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxDeadLetterPending');
+    if (max !== null && (!Number.isInteger(max) || max <= 0)) {
+      throw new RangeError(
+        'setDefaultMaxDeadLetterPending: maxPending must be a positive integer, or null to clear it',
+      );
+    }
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective capacity — the unset default
+    // behaves as 100, so setting 100 on a factory bus audits
+    // nothing. A clear is a no-op only when no default is installed
+    // at all: clearing a bus that holds an explicit default (even
+    // 100) still moves it back to unset and audits.
+    if (max !== null && (this.defaultMaxDeadLetterPending ?? 100) === max) {
+      return;
+    }
+    if (max === null && this.defaultMaxDeadLetterPending === undefined) {
+      return;
+    }
+    const previous: number | null = this.defaultMaxDeadLetterPending ?? null;
+    this.defaultMaxDeadLetterPending = max === null ? undefined : max;
+    this.auditSubscription({
+      action: 'default_max_dead_letter_pending_revised',
+      actor,
+      detail: { previous, maxPending: max },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default dead-letter replay-approval
+   * pending-queue capacity (EB-529) — the `maxPending` future
+   * omit-`maxPending` reliable subscribers with a dead-letter
+   * queue fall back to — `undefined` before any revision (no
+   * default, new omit-`maxPending` subscribers fall back to 100),
+   * then whatever `setDefaultMaxDeadLetterPending` last installed.
+   */
+  getDefaultMaxDeadLetterPending(): number | undefined {
+    return this.defaultMaxDeadLetterPending;
   }
 
   /**

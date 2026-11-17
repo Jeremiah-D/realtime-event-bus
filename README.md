@@ -10536,6 +10536,25 @@ oldRequireApproval, maxPending, oldMaxPending }`), and
 systems / backend engineering: dead-letter replay
 governance.)
 
+A bus-level default pending-queue capacity is live-revisable
+with `setDefaultMaxDeadLetterPending(n)` (EB-529): new
+reliable subscribers that opt into `deadLetter` and omit
+`maxPending` take the bus default instead of 100 — the
+resolution chain is explicit > bus default > 100, the default
+never enables a DLQ for a subscriber that did not pass
+`deadLetter`, and it never enables the approval gate
+(`requireApproval` still defaults to `false`), so the
+capacity is only meaningful when `requireApproval` is on;
+tightening the default never evicts an existing subscriber's
+parked requests (rejection still happens only on the next
+replay request). `null` clears the default back to 100, and
+setting `100` on a bus with no default installed is a no-op
+with no audit. Revisions audit as
+`default_max_dead_letter_pending_revised` (`{ previous,
+maxPending }`), and `getDefaultMaxDeadLetterPending()` reads
+the live value. (Real-time systems / backend engineering:
+dead-letter replay governance.)
+
 ## Dead-letter replay rate limit (EB-238)
 
 `setDeadLetterReplayRateLimit(subId, { messagesPerSec, burst })`
