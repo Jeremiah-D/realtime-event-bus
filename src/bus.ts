@@ -10544,6 +10544,7 @@ function normalizeDeadLetterOptions(
   defaultRetryLadder?: number[],
   defaultMaxRedeliveries?: number,
   defaultMaxEntries?: number,
+  defaultMaxDeadLetterAgeMs?: number,
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -10571,7 +10572,17 @@ function normalizeDeadLetterOptions(
   // chain would swallow `null` into the default).
   const maxEntries =
     o.maxEntries === undefined ? (defaultMaxEntries ?? 1000) : (o.maxEntries ?? 1000);
-  const maxAgeMs = o.maxAgeMs;
+  // EB-528: a bus-level default TTL fills an omitted `maxAgeMs`
+  // for a reliable subscriber that already opted into a
+  // dead-letter queue — the default never enables the DLQ itself
+  // (an absent `deadLetter` still returns `null` above), and an
+  // explicit value always wins. Only an absent (`undefined`) value
+  // falls back: an explicit `null` keeps the subscribe-time gate's
+  // own behavior (the validation below throws on it, exactly as
+  // before — `null` was never a legal subscribe-time `maxAgeMs`).
+  // With no default installed the fallback is `undefined`, i.e.
+  // no TTL, exactly the previous behavior.
+  const maxAgeMs = o.maxAgeMs === undefined ? defaultMaxDeadLetterAgeMs : o.maxAgeMs;
   if (!Number.isInteger(maxRedeliveries) || maxRedeliveries < 0) {
     throw new RangeError(`${caller}: deadLetter.maxRedeliveries must be a non-negative integer`);
   }
@@ -18941,6 +18952,24 @@ export class EventBus {
    * subscribe time.
    */
   private defaultMaxDeadLetterEntries?: number;
+  /**
+   * Bus-level default dead-letter entry TTL (EB-528): the
+   * `maxAgeMs` a new reliable subscriber falls back to when it
+   * opts into a dead-letter queue (`deadLetter`) and omits
+   * `maxAgeMs` (see `DeadLetterOptions.maxAgeMs`, EB-145).
+   * Starts unset (`undefined` — no default, omitting `maxAgeMs`
+   * means no TTL, entries never expire, exactly the previous
+   * behavior) and moves only via
+   * `setDefaultMaxDeadLetterAgeMs`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `maxAgeMs` always wins. A revision only
+   * affects reliable subscribers created after it — already-subscribed
+   * subscribers keep the TTL instance they were baked with at
+   * subscribe time.
+   */
+  private defaultMaxDeadLetterAgeMs?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44456,7 +44485,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries);
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55435,6 +55464,108 @@ export class EventBus {
    */
   getDefaultMaxDeadLetterEntries(): number | undefined {
     return this.defaultMaxDeadLetterEntries;
+  }
+
+  /**
+   * Sets the live bus-level default dead-letter entry TTL (EB-528)
+   * without touching any live subscriber:
+   * `setDefaultMaxDeadLetterAgeMs(maxAgeMs, actor = 'system')`
+   * decides how long a dead-letter entry survives before the next
+   * lazy sweep drops it, for new reliable subscribers that opt
+   * into a dead-letter queue (`deadLetter`) and omit `maxAgeMs`
+   * (see `DeadLetterOptions.maxAgeMs`, EB-145) — `60_000` to give
+   * every new poison sample a one-minute retention window
+   * fleet-wide with one call, `null` to clear the default back to
+   * no TTL.
+   *
+   * Only the default moves: the subscribers, their baked TTLs,
+   * and every already-queued dead-letter entry are untouched.
+   * Tightening the default never expires an existing subscriber's
+   * entries — expiry still happens only on the next lazy sweep
+   * (`getDeadLetterMessages` / `replayDeadLetter` / the next
+   * dead-letter enqueue), exactly as `setDeadLetterBudget`
+   * (EB-365) behaves for a per-subscriber tightening. The
+   * priority chain is explicit `maxAgeMs` > bus default > no TTL
+   * (the bus default is the terminal fallback below the explicit
+   * option — an explicit TTL always wins). The default never
+   * enables a dead-letter queue: a subscriber that does not pass
+   * `deadLetter` still has no DLQ. A revision only affects
+   * reliable subscribers created after it: a subscriber takes the
+   * default in effect at subscribe time and keeps the TTL instance
+   * it was baked with — a later revision never moves an
+   * already-subscribed TTL or its entries, and
+   * `setDeadLetterBudget` (EB-365) still revises one subscriber
+   * at a time without touching the bus default (a default-baked
+   * subscriber can still be revised per subscriber, including
+   * clearing its TTL with `null`, and a later default revision
+   * never re-applies to an already-revised one). The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a positive
+   * finite number (`null` to clear) throws `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default — re-setting the same TTL, or clearing
+   * an already-unset default — audits nothing. Audited as
+   * `default_max_dead_letter_age_ms_revised`
+   * (`{ previous, maxAgeMs }`, `null` when the default is unset —
+   * unset means new omit-`maxAgeMs` reliable subscribers go back
+   * to no TTL, exactly the previous behavior).
+   *
+   * Orthogonal to EB-145 (that owns the DLQ TTL mechanism itself —
+   * this its bus-level terminal default), to EB-365 (that revises
+   * one subscriber's TTL — this the bus-level default new
+   * subscribers fall back to), to EB-527 (that sets the bus-level
+   * default DLQ capacity — that how many entries the DLQ keeps,
+   * this how long each entry survives; the TTL sweep runs before
+   * the capacity eviction), and to EB-526 (that sets the bus-level
+   * default pre-DLQ redelivery budget — that how many failures
+   * before a message enters the DLQ, this how long it lives once
+   * it is there).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a positive finite number of milliseconds (or `null` to clear).
+   */
+  setDefaultMaxDeadLetterAgeMs(maxAgeMs: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxDeadLetterAgeMs');
+    if (maxAgeMs !== null && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
+      throw new RangeError(
+        'setDefaultMaxDeadLetterAgeMs: maxAgeMs must be a positive finite number of milliseconds, or null to clear it',
+      );
+    }
+    // Re-affirming the current default is a no-op: no audit. The
+    // factory state is "no TTL", so there is no effective-value
+    // fallback to compare against — the comparison is on the
+    // installed default itself: setting the same TTL twice, or
+    // clearing an already-unset default, audits nothing. Clearing
+    // a bus that holds an explicit default still moves it back to
+    // unset and audits.
+    if (maxAgeMs !== null && this.defaultMaxDeadLetterAgeMs === maxAgeMs) {
+      return;
+    }
+    if (maxAgeMs === null && this.defaultMaxDeadLetterAgeMs === undefined) {
+      return;
+    }
+    const previous: number | null = this.defaultMaxDeadLetterAgeMs ?? null;
+    this.defaultMaxDeadLetterAgeMs = maxAgeMs === null ? undefined : maxAgeMs;
+    this.auditSubscription({
+      action: 'default_max_dead_letter_age_ms_revised',
+      actor,
+      detail: { previous, maxAgeMs },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default dead-letter entry TTL
+   * (EB-528) — the `maxAgeMs` future omit-`maxAgeMs` reliable
+   * subscribers with a dead-letter queue fall back to —
+   * `undefined` before any revision (no default, new
+   * omit-`maxAgeMs` subscribers have no TTL, entries never
+   * expire), then whatever `setDefaultMaxDeadLetterAgeMs` last
+   * installed.
+   */
+  getDefaultMaxDeadLetterAgeMs(): number | undefined {
+    return this.defaultMaxDeadLetterAgeMs;
   }
 
   /**

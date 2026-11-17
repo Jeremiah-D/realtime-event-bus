@@ -114,7 +114,19 @@ library.
   tightening the default never evicts an existing subscriber's entries
   (eviction still happens only on the next dead-letter enqueue);
   `null` clears the default back to 1000, and setting `1000` on a bus
-  with no default installed is a no-op with no audit. Opt-in `deadLetter.diagnosticTopic` fans each
+  with no default installed is a no-op with no audit. A bus-level
+  default dead-letter entry TTL is live-revisable with
+  `setDefaultMaxDeadLetterAgeMs(n)` (EB-528): new reliable
+  subscribers that opt into `deadLetter` and omit `maxAgeMs` take
+  the bus default instead of no TTL — the resolution chain is
+  explicit > bus default > no TTL, the default never enables a DLQ
+  for a subscriber that did not pass `deadLetter`, and expiry
+  happens on the next lazy sweep (entries are dropped when
+  `getDeadLetterMessages` / `replayDeadLetter` runs, or before the
+  next dead-letter enqueue, and counted in
+  `dlqExpiredMessages`); `null` clears the default back to no TTL,
+  and re-setting the same TTL or clearing an already-unset default
+  is a no-op with no audit. Opt-in `deadLetter.diagnosticTopic` fans each
   dead-lettering out as one diagnostic event on the configured topic — the
   original payload plus `{ subscriberId, pattern, seq, lastError,
   redeliveries, traceId, deadLetteredAt }` metadata — so operators consume
