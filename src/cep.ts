@@ -38,8 +38,10 @@
  * really elapsed, only delivery was late — and a partial is dropped
  * only when its armed window exceeds the live `withinMs` (an explicit
  * `absenceMs > withinMs`, or a live shrink under EB-297). `durationMs`
- * records the actual late-fire time. `getStats().cep` exposes
- * `absencePatterns` and `absenceMatches`.
+ * records the actual late-fire time, floored at the armed deadline
+ * (a fire landing a hair before the deadline settles at the deadline
+ * itself, so the derived duration always covers the armed window).
+ * `getStats().cep` exposes `absencePatterns` and `absenceMatches`.
  *
  * The deadline is also evaluated on `observe` (EB-380), before topic
  * matching: a message arriving after the armed deadline — `now >=
@@ -817,7 +819,15 @@ export class CepEngine {
    * counts it, and advances the partial — completing the pattern when
    * the absence step was last, or re-arming immediately when the next
    * step is also an absence step. `durationMs` records the settle time
-   * `now` (the late-fire / late-arrival time, as it happened).
+   * `now` (the late-fire / late-arrival time, as it happened) — except
+   * a fire that lands a hair BEFORE the armed deadline (real-timer
+   * granularity / a wall-clock step back on the bus clock) settles at
+   * the deadline itself: the timer fire IS the deadline elapsing in
+   * this engine's model (EB-379), so a `durationMs` shorter than the
+   * armed window would be a clock artifact, not a real elapsed time
+   * (the CI failure on d3771ff: a 40ms window read `durationMs` 39).
+   * A late fire still records its actual late time (see the 500ms-late
+   * test pinning `durationMs` 580 for an 80ms window).
    *
    * Index ownership stays with the caller: on `'completed'` or
    * `'dropped'` the partial is resolved but still in the pattern
@@ -835,6 +845,7 @@ export class CepEngine {
       partial.absenceTimer = undefined;
     }
     const armedWindowMs = partial.absenceWindowMs;
+    const armedAt = partial.absenceArmedAt;
     partial.absenceWindowMs = undefined;
     partial.absenceArmedAt = undefined;
     if (armedWindowMs !== undefined && armedWindowMs > pattern.withinMs) {
@@ -844,6 +855,15 @@ export class CepEngine {
       partial.resolved = true;
       return 'dropped';
     }
+    // The absence is satisfied at the armed deadline at the earliest:
+    // a timer that fires a hair before it (or a clock that reads a hair
+    // early) settles at the deadline, never before it — so the derived
+    // duration always covers the whole armed window. A late settle keeps
+    // its actual late time.
+    const settleAt =
+      armedAt !== undefined && armedWindowMs !== undefined
+        ? Math.max(now, armedAt + armedWindowMs)
+        : now;
     const step = pattern.steps[partial.stepIndex];
     // The recorded window is the armed value — a live revision after
     // arming never rewrites what the deadline waited out.
@@ -852,7 +872,7 @@ export class CepEngine {
     this.totalAbsenceMatches += 1;
     if (partial.stepIndex === pattern.steps.length - 1) {
       partial.resolved = true;
-      this.complete(pattern, partial, partial.events, partial.key, now);
+      this.complete(pattern, partial, partial.events, partial.key, settleAt);
       return 'completed';
     }
     partial.stepIndex += 1;
@@ -871,9 +891,9 @@ export class CepEngine {
    * Guard (EB-379): the armed window is compared against the LIVE
    * `withinMs` — drop only when the armed window exceeds it (an
    * explicit `absenceMs > withinMs`, or a live shrink under EB-297).
-   * The fire time is never re-checked: when the bus was idle and the
-   * timer fires late, the event-free window really elapsed and the
-   * absence still derives, with `durationMs` recording the actual
+   * The fire time is never re-checked for lateness: when the bus was
+   * idle and the timer fires late, the event-free window really elapsed
+   * and the absence still derives, with `durationMs` recording the actual
    * late-fire time.
    */
   private onAbsenceDeadline(pattern: CompiledPattern, partial: PartialMatch): void {

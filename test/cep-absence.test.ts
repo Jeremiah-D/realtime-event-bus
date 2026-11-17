@@ -594,6 +594,49 @@ test('CEP absence (EB-379): shrink below an explicit absenceMs drops on fire', (
   assert.equal(snap.partialMatches, 0);
 });
 
+test('CEP absence (EB-379): timer firing a hair before the armed deadline still derives at the deadline', () => {
+  // Deterministic repro of the CI failure on d3771ff (run 44031700142):
+  // the real-timer test failed at `durationMs >= 40` — the 40ms timer
+  // fired while the bus clock still read 39ms after the anchor (early
+  // fire / wall-clock step back), so the derived duration came out 39,
+  // shorter than the window that was armed. The timer fire IS the
+  // deadline elapsing in this engine's model, so an early fire settles
+  // at the deadline itself: the match derives with a duration covering
+  // the whole armed window.
+  let now = 1_000;
+  const matches: SequenceMatchEvent[] = [];
+  const armed: Array<{ fn: () => void; ms: number }> = [];
+  const engine = new CepEngine({
+    now: () => now,
+    compile: (p: string) => new RegExp(`^${p.replace(/\./g, '\\.')}$`),
+    emitMatch: (_id, match) => {
+      matches.push(match);
+    },
+    setTimer: (fn, ms) => {
+      armed.push({ fn, ms });
+      return armed.length;
+    },
+    clearTimer: () => {},
+  });
+  engine.define({
+    id: 'early-fire',
+    steps: [{ topic: 'a' }, { topic: 'b', absence: true }],
+    withinMs: 40,
+  });
+  engine.observe({ topic: 'a', seq: 1, key: 'k', payload: 1 } as never);
+  assert.equal(armed.length, 1);
+  assert.equal(armed[0].ms, 40);
+  // 1ms before the deadline: the timer fires early. The absence still
+  // derives, and the duration covers the whole armed window.
+  now = 1_039;
+  armed[0].fn();
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].durationMs, 40);
+  assert.equal(matches[0].absences![0].windowMs, 40);
+  assert.equal(engine.snapshot().absenceMatches, 1);
+  assert.equal(engine.snapshot().partialMatches, 0);
+});
+
 test('CEP absence (EB-379): real timer, default window derives despite fire jitter', async () => {
   const bus = new EventBus();
   const seen = collect(bus, 'cep.jitter');
