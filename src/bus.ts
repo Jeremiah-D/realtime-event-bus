@@ -10542,13 +10542,24 @@ function normalizeDeadLetterOptions(
   opt: boolean | DeadLetterOptions | undefined,
   caller: string,
   defaultRetryLadder?: number[],
+  defaultMaxRedeliveries?: number,
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
     throw new TypeError(`${caller}: deadLetter must be true or a DeadLetterOptions object`);
   }
   const o: DeadLetterOptions = opt === true ? {} : opt;
-  const maxRedeliveries = o.maxRedeliveries ?? 5;
+  // EB-526: a bus-level default budget fills an omitted
+  // `maxRedeliveries` for a reliable subscriber that already opted
+  // into a dead-letter queue — the default never enables the DLQ
+  // itself (an absent `deadLetter` still returns `null` above), and
+  // an explicit value always wins, including an explicit `0` (still
+  // immediate dead-lettering). Only an absent (`undefined`) value
+  // falls back: an explicit `null` keeps the subscribe-time gate's
+  // own behavior (the `?? 5` below, exactly as before — a bare `??`
+  // chain would swallow `null` into the default).
+  const maxRedeliveries =
+    o.maxRedeliveries === undefined ? (defaultMaxRedeliveries ?? 5) : (o.maxRedeliveries ?? 5);
   const maxEntries = o.maxEntries ?? 1000;
   const maxAgeMs = o.maxAgeMs;
   if (!Number.isInteger(maxRedeliveries) || maxRedeliveries < 0) {
@@ -18885,6 +18896,24 @@ export class EventBus {
    * keep the ladder instance they were baked with at subscribe time.
    */
   private defaultRetryLadder?: number[];
+  /**
+   * Bus-level default pre-DLQ immediate redelivery budget (EB-526):
+   * the `maxRedeliveries` a new reliable subscriber falls back to
+   * when it opts into a dead-letter queue (`deadLetter`) and omits
+   * `maxRedeliveries` (see `DeadLetterOptions.maxRedeliveries`,
+   * EB-28). Starts unset (`undefined` — no default, omitting
+   * `maxRedeliveries` means 5, exactly the previous behavior) and
+   * moves only via `setDefaultMaxRedeliveries`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `maxRedeliveries` always wins, including an
+   * explicit `0` (still immediate dead-lettering). A revision only
+   * affects reliable subscribers created after it — already-subscribed
+   * subscribers keep the budget instance they were baked with at
+   * subscribe time.
+   */
+  private defaultMaxRedeliveries?: number;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44400,7 +44429,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder);
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55175,6 +55204,109 @@ export class EventBus {
    */
   getDefaultRetryLadder(): number[] | undefined {
     return this.defaultRetryLadder === undefined ? undefined : [...this.defaultRetryLadder];
+  }
+
+  /**
+   * Sets the live bus-level default pre-DLQ immediate redelivery
+   * budget (EB-526) without touching any live subscriber:
+   * `setDefaultMaxRedeliveries(max, actor = 'system')` decides how
+   * many times a message may be requeued (via `nack()` or ack
+   * timeout) before it moves to the DLQ for new reliable
+   * subscribers that opt into a dead-letter queue (`deadLetter`)
+   * and omit `maxRedeliveries` (see `DeadLetterOptions.
+   * maxRedeliveries`, EB-28) — `2` to tighten every future
+   * opted-in reliable subscriber to two immediate redeliveries
+   * with one call, `0` to dead-letter every future opted-in
+   * subscriber on its first failure, `null` to clear the default
+   * back to 5.
+   *
+   * Only the default moves: the subscribers, their baked budgets,
+   * their consumed redelivery counts, and every already-queued
+   * message are untouched. The priority chain is explicit
+   * `maxRedeliveries` > bus default > 5 (the bus default is the
+   * terminal fallback below the explicit option — an explicit
+   * budget always wins, including an explicit `0`, which still
+   * dead-letters on the first failure even while a default is
+   * installed). The default never enables a dead-letter queue: a
+   * subscriber that does not pass `deadLetter` still has no DLQ,
+   * and its failures still requeue under the immediate redelivery
+   * loop. A revision only affects reliable subscribers created
+   * after it: a subscriber takes the default in effect at
+   * subscribe time and keeps the budget instance it was baked
+   * with — a later revision never moves an already-subscribed
+   * budget or its consumed counts, and `setDeadLetterBudget`
+   * (EB-365) still revises one subscriber at a time without
+   * touching the bus default (a default-baked subscriber can
+   * still be revised per subscriber, and a later default revision
+   * never re-applies to an already-revised one). The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a
+   * non-negative integer (`null` to clear) throws `RangeError`
+   * with the live default and the audit log untouched. A revision
+   * identical to the current default — compared on the effective
+   * budget, so setting `5` on a factory bus (whose effective
+   * budget is already 5) is a no-op, and clearing an already-unset
+   * default is a no-op — audits nothing. Audited as
+   * `default_max_redeliveries_revised`
+   * (`{ previous, maxRedeliveries }`, `null` when the default is
+   * unset — unset means new omit-`maxRedeliveries` reliable
+   * subscribers go back to a budget of 5, exactly the previous
+   * behavior).
+   *
+   * Orthogonal to EB-28 (that owns the DLQ mechanism itself — this
+   * its bus-level budget terminal default), to EB-365 (that revises
+   * one subscriber's budget — this the bus-level default new
+   * subscribers fall back to), to EB-525 (that sets the bus-level
+   * default retry ladder — that the delayed rungs after the budget
+   * is spent, this the immediate budget before it; the two stack),
+   * to EB-270 (that revises one subscriber's ladder — this the
+   * bus-level budget), and to EB-519 (that sets the bus-level
+   * default reliable redelivery backoff — that spaces the instant
+   * redeliveries, this how many there are).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a non-negative integer (or `null` to clear).
+   */
+  setDefaultMaxRedeliveries(max: number | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultMaxRedeliveries');
+    if (max !== null && (!Number.isInteger(max) || max < 0)) {
+      throw new RangeError(
+        'setDefaultMaxRedeliveries: maxRedeliveries must be a non-negative integer, or null to clear it',
+      );
+    }
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective budget — the unset default
+    // behaves as 5, so setting 5 on a factory bus audits nothing.
+    // A clear is a no-op only when no default is installed at all:
+    // clearing a bus that holds an explicit default (even 5) still
+    // moves it back to unset and audits.
+    if (max !== null && (this.defaultMaxRedeliveries ?? 5) === max) {
+      return;
+    }
+    if (max === null && this.defaultMaxRedeliveries === undefined) {
+      return;
+    }
+    const previous: number | null = this.defaultMaxRedeliveries ?? null;
+    this.defaultMaxRedeliveries = max === null ? undefined : max;
+    this.auditSubscription({
+      action: 'default_max_redeliveries_revised',
+      actor,
+      detail: { previous, maxRedeliveries: max },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default pre-DLQ immediate redelivery
+   * budget (EB-526) — the `maxRedeliveries` future omit-
+   * `maxRedeliveries` reliable subscribers with a dead-letter queue
+   * fall back to — `undefined` before any revision (no default, new
+   * omit-`maxRedeliveries` subscribers fall back to 5), then
+   * whatever `setDefaultMaxRedeliveries` last installed.
+   */
+  getDefaultMaxRedeliveries(): number | undefined {
+    return this.defaultMaxRedeliveries;
   }
 
   /**

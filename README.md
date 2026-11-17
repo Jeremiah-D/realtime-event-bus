@@ -98,7 +98,14 @@ library.
   only on the next dead-letter enqueue (after an expire-first sweep), and a
   newly set `maxAgeMs` expires old entries on the next lazy sweep. Revisions
   are audited as `dead_letter_budget_revised` (actor `system`); passing the
-  current values is a no-op with no audit. Opt-in `deadLetter.diagnosticTopic` fans each
+  current values is a no-op with no audit. A bus-level default budget is
+  live-revisable with `setDefaultMaxRedeliveries(n)` (EB-526): new reliable
+  subscribers that opt into `deadLetter` and omit `maxRedeliveries` take the
+  bus default instead of 5 — the resolution chain is explicit > bus default
+  > 5, the default never enables a DLQ for a subscriber that did not pass
+  `deadLetter`, and an explicit `0` still dead-letters on the first failure;
+  `null` clears the default back to 5, and setting `5` on a bus with no
+  default installed is a no-op with no audit. Opt-in `deadLetter.diagnosticTopic` fans each
   dead-lettering out as one diagnostic event on the configured topic — the
   original payload plus `{ subscriberId, pattern, seq, lastError,
   redeliveries, traceId, deadLetteredAt }` metadata — so operators consume
