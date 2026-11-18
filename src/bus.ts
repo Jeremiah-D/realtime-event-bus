@@ -10547,6 +10547,7 @@ function normalizeDeadLetterOptions(
   defaultMaxDeadLetterAgeMs?: number,
   defaultMaxPending?: number,
   defaultDiagnosticTopic?: string,
+  defaultRequireApproval?: boolean,
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -10643,7 +10644,16 @@ function normalizeDeadLetterOptions(
   }
   // EB-233: replay-approval gate. Invalid values throw before anything
   // is mutated, matching the other validations above.
-  const requireApproval = o.requireApproval ?? false;
+  // EB-531: a bus-level default gate fills an omitted
+  // `requireApproval` for a reliable subscriber that already opted
+  // into a dead-letter queue — the default never enables the DLQ
+  // itself (an absent `deadLetter` still returns `null` above), and
+  // an explicit value always wins, including an explicit `false`
+  // under a `true` default. Only an absent (`undefined`) value
+  // falls back: an explicit `null` keeps the subscribe-time gate's
+  // own behavior (the `?? false` below, exactly as before).
+  const requireApproval =
+    o.requireApproval === undefined ? (defaultRequireApproval ?? false) : (o.requireApproval ?? false);
   if (typeof requireApproval !== 'boolean') {
     throw new TypeError(`${caller}: deadLetter.requireApproval must be a boolean`);
   }
@@ -19027,6 +19037,26 @@ export class EventBus {
    * time.
    */
   private defaultDeadLetterDiagnosticTopic?: string;
+  /**
+   * Bus-level default dead-letter replay approval gate (EB-531): the
+   * `requireApproval` a new reliable subscriber falls back to when
+   * it opts into a dead-letter queue (`deadLetter`) and omits
+   * `requireApproval` (see `DeadLetterOptions.requireApproval`,
+   * EB-233). Starts unset (`undefined` — no default, omitting
+   * `requireApproval` means replays go straight through, exactly
+   * the previous behavior) and moves only via
+   * `setDefaultDeadLetterRequireApproval`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `requireApproval` always wins, including an
+   * explicit `false` under a `true` default. A revision only
+   * affects reliable subscribers created after it — already-subscribed
+   * subscribers keep the gate they were baked with at subscribe
+   * time, and flipping the default off never auto-releases their
+   * already-parked requests.
+   */
+  private defaultDeadLetterRequireApproval?: boolean;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44542,7 +44572,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs, this.defaultMaxDeadLetterPending, this.defaultDeadLetterDiagnosticTopic);
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs, this.defaultMaxDeadLetterPending, this.defaultDeadLetterDiagnosticTopic, this.defaultDeadLetterRequireApproval);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55819,6 +55849,111 @@ export class EventBus {
    */
   getDefaultDeadLetterDiagnosticTopic(): string | undefined {
     return this.defaultDeadLetterDiagnosticTopic;
+  }
+
+  /**
+   * Sets the live bus-level default dead-letter replay approval gate
+   * (EB-531) without touching any live subscriber:
+   * `setDefaultDeadLetterRequireApproval(require, actor = 'system')`
+   * decides whether a new reliable subscriber that opts into a
+   * dead-letter queue (`deadLetter`) and omits `requireApproval`
+   * parks its replay requests for approval (see
+   * `DeadLetterOptions.requireApproval`, EB-233) — `true` to make
+   * every new subscriber's replays park fleet-wide with one call,
+   * `null` to clear the default back to straight-through replays.
+   *
+   * Only the default moves: the subscribers, their baked gates,
+   * and every already-parked request are untouched. A revision
+   * only affects reliable subscribers created after it: a
+   * subscriber takes the default in effect at subscribe time and
+   * keeps the gate it was baked with — a later revision never
+   * moves an already-subscribed gate, and `setDeadLetterApproval`
+   * (EB-377) still revises one subscriber at a time without
+   * touching the bus default (a default-baked subscriber can
+   * still be revised per subscriber, and a later default revision
+   * never re-applies to an already-revised one). Flipping the
+   * default off does not auto-release already-parked requests —
+   * they still need `approveDeadLetterReplay` /
+   * `rejectDeadLetterReplay`. The priority chain is explicit
+   * `requireApproval` > bus default > `false` (the bus default is
+   * the terminal fallback below the explicit option — an explicit
+   * value always wins, including an explicit `false` under a
+   * `true` default, which switches the gate off for that
+   * subscriber). The default never enables a dead-letter queue: a
+   * subscriber that does not pass `deadLetter` still has no DLQ —
+   * and an explicit `null` at subscribe time still falls back to
+   * `false`, exactly as before (only an absent value falls back).
+   * The default composes with the EB-529 default pending-queue
+   * capacity: a default-gated subscriber that omits `maxPending`
+   * still takes the EB-529 default capacity. The default is
+   * runtime state: it never enters a config snapshot and does not
+   * survive a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a boolean
+   * (`null` to clear) throws `TypeError` with the live default
+   * and the audit log untouched. A revision identical to the
+   * current default — re-setting the same gate, setting `false`
+   * on a factory bus, or clearing an already-unset default —
+   * audits nothing. Audited as
+   * `default_dead_letter_require_approval_revised`
+   * (`{ previous, requireApproval }`, `null` when the default is
+   * unset — unset means new omit-`requireApproval` reliable
+   * subscribers go back to straight-through replays, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-233 (that owns the approval-gate mechanism
+   * itself — this its bus-level terminal default), to EB-377
+   * (that revises one subscriber's gate — this the bus-level
+   * default new subscribers fall back to), to EB-529 (that sets
+   * the bus-level default pending-queue capacity — that how deep
+   * the queue is, this whether the gate defaults open), and to
+   * EB-526/527/528/530 (that set the bus-level defaults for the
+   * budget, capacity, TTL, and diagnostic topic of the same
+   * `DeadLetterOptions` — same family, different knobs).
+   *
+   * Throws `RangeError` for an illegal actor and `TypeError` for a
+   * value other than a boolean (or `null` to clear).
+   */
+  setDefaultDeadLetterRequireApproval(require: boolean | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDeadLetterRequireApproval');
+    if (require !== null && typeof require !== 'boolean') {
+      throw new TypeError(
+        'setDefaultDeadLetterRequireApproval: require must be a boolean, or null to clear it',
+      );
+    }
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the effective gate — the unset default
+    // behaves as `false`, so setting `false` on a factory bus
+    // audits nothing. A clear is a no-op only when no default is
+    // installed at all: clearing a bus that holds an explicit
+    // default (even `false`) still moves it back to unset and
+    // audits.
+    if (require !== null && (this.defaultDeadLetterRequireApproval ?? false) === require) {
+      return;
+    }
+    if (require === null && this.defaultDeadLetterRequireApproval === undefined) {
+      return;
+    }
+    const previous: boolean | null = this.defaultDeadLetterRequireApproval ?? null;
+    this.defaultDeadLetterRequireApproval = require === null ? undefined : require;
+    this.auditSubscription({
+      action: 'default_dead_letter_require_approval_revised',
+      actor,
+      detail: { previous, requireApproval: require },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default dead-letter replay approval
+   * gate (EB-531) — the `requireApproval` future
+   * omit-`requireApproval` reliable subscribers with a dead-letter
+   * queue fall back to — `undefined` before any revision (no
+   * default, new omit-`requireApproval` subscribers replay
+   * straight through), then whatever
+   * `setDefaultDeadLetterRequireApproval` last installed.
+   */
+  getDefaultDeadLetterRequireApproval(): boolean | undefined {
+    return this.defaultDeadLetterRequireApproval;
   }
 
   /**

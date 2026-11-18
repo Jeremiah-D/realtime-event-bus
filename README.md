@@ -10556,6 +10556,25 @@ oldRequireApproval, maxPending, oldMaxPending }`), and
 systems / backend engineering: dead-letter replay
 governance.)
 
+A bus-level default approval gate is live-revisable with
+`setDefaultDeadLetterRequireApproval(require)` (EB-531):
+new reliable subscribers that opt into `deadLetter` and omit
+`requireApproval` take the bus default instead of `false` —
+the resolution chain is explicit > bus default > `false`,
+so an explicit `false` under a `true` default still replays
+straight through, and the default never enables a DLQ for a
+subscriber that did not pass `deadLetter`; flipping the
+default off does not auto-release already-parked requests —
+they still need `approveDeadLetterReplay` /
+`rejectDeadLetterReplay` — only new requests go straight
+through. `null` clears the default back to `false`, and
+setting `false` on a bus with no default installed is a
+no-op with no audit. Revisions audit as
+`default_dead_letter_require_approval_revised` (`{ previous,
+requireApproval }`), and `getDefaultDeadLetterRequireApproval()`
+reads the live value. (Real-time systems / backend
+engineering: dead-letter replay governance.)
+
 A bus-level default pending-queue capacity is live-revisable
 with `setDefaultMaxDeadLetterPending(n)` (EB-529): new
 reliable subscribers that opt into `deadLetter` and omit
