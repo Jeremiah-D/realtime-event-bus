@@ -9857,6 +9857,16 @@ interface PublishCircuitBreaker {
   openedAtMs: number;
   /** Publishes refused while open (fast-fail). */
   rejectedMessages: number;
+  /**
+   * Whether this record was materialized on demand from the bus-level
+   * default (EB-533) rather than armed explicitly with
+   * `setPublishCircuitBreaker`. Internal only: it never enters a
+   * snapshot or a stats row. A default revision retunes a
+   * `fromDefault` record's thresholds in place; clearing the default
+   * retires every `fromDefault` record; re-arming the topic
+   * explicitly rebuilds the record and clears the marker.
+   */
+  fromDefault?: boolean;
 }
 
 /**
@@ -19093,6 +19103,31 @@ export class EventBus {
     maxAutoReplayAttempts: number;
   };
   /**
+   * Bus-level default publish circuit breaker thresholds (EB-533):
+   * the `PublishCircuitBreakerOptions` a topic without an explicit
+   * `setPublishCircuitBreaker` rule falls back to. Starts unset
+   * (`undefined` — no default, a topic without a rule keeps exactly
+   * its pre-EB-116 behavior) and moves only via
+   * `setDefaultPublishCircuitBreaker`; there is no construction-time
+   * option, and a restart restores the unset default. The default
+   * holds thresholds only, always resolved to both fields
+   * (`{}` installs the factory thresholds 5 / 1000ms). It never arms
+   * a topic by itself — a record materializes on demand, only when
+   * a publish finds every subscriber of the topic degraded/shedding
+   * (`updatePublishCircuitBreaker`), so a healthy topic never grows
+   * a record; the materialized record carries `fromDefault: true`.
+   * An explicit rule always wins: re-arming a materialized topic
+   * rebuilds the record and clears the marker. Unlike the other
+   * `setDefault*` defaults, a revision here is live for already
+   * covered topics — the breaker thresholds are read live at every
+   * publish evaluation, so a default revision retunes every
+   * `fromDefault` record's thresholds at once (state and counters
+   * preserved), and clearing the default retires every
+   * `fromDefault` record (explicit records survive). There is no
+   * per-topic opt-out while a default is installed.
+   */
+  private defaultPublishCircuitBreaker?: PublishCircuitBreakerOptions;
+  /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
    * `maxMembers` (EB-196). Starts unset (`undefined` — no default, no
@@ -22349,7 +22384,11 @@ export class EventBus {
    *
    * The rule keys on the exact concrete topic name (post namespace and
    * alias resolution). Re-setting replaces the rule and resets the
-   * breaker's state and streak. Throws `RangeError` when `topic` is
+   * breaker's state and streak. Re-arming a topic whose record was
+   * materialized on demand from the bus default (EB-533) rebuilds it
+   * the same way — state back to `'closed'`, counters zeroed, the
+   * record turned explicit (`fromDefault` cleared) so later default
+   * revisions never retune it. Throws `RangeError` when `topic` is
    * empty, when `consecutiveShedPublishes` is not a positive integer, or
    * when `halfOpenProbeIntervalMs` is not a positive finite number.
    */
@@ -22378,7 +22417,11 @@ export class EventBus {
 
   /**
    * Removes the publish circuit breaker previously armed for `topic`.
-   * Returns true when a rule existed and was removed.
+   * Returns true when a rule existed and was removed. With a bus
+   * default installed (EB-533) the topic falls back to default
+   * coverage: its next all-degraded/shedding publish materializes a
+   * fresh `fromDefault` record — there is no per-topic opt-out while
+   * a default is in place.
    */
   clearPublishCircuitBreaker(topic: string): boolean {
     return this.publishCircuitBreakers.delete(topic);
@@ -56200,6 +56243,188 @@ export class EventBus {
   }
 
   /**
+   * Sets the live bus-level default publish circuit breaker
+   * thresholds (EB-533) without touching any live breaker:
+   * `setDefaultPublishCircuitBreaker(opts, actor = 'system')`
+   * decides the trip thresholds a topic without an explicit
+   * `setPublishCircuitBreaker` rule falls back to — `{ consecutiveShedPublishes: 2 }`
+   * to fast-fail fleet-wide after two all-degraded publishes with
+   * one call, `{}` to install the factory thresholds (5 publishes,
+   * 1000ms probe interval), `null` to clear the default back to
+   * no protection for unruled topics.
+   *
+   * Only the default moves, plus the `fromDefault` records it owns:
+   * installing or revising the default retunes every already
+   * materialized `fromDefault` record's thresholds in place — an
+   * open one stays open, is not re-timed, and no counter is zeroed,
+   * so shortening `halfOpenProbeIntervalMs` makes the next probe
+   * earlier against the original open time, and lowering
+   * `consecutiveShedPublishes` trips a record already at the new
+   * streak on its next all-degraded publish. Explicit records are
+   * never touched by a default revision, and a record materialized
+   * after the revision takes the revised thresholds. Clearing the
+   * default retires every `fromDefault` record at once — an open
+   * one stops fast-failing immediately — while explicit records
+   * survive untouched. A cleared topic falls back to the default
+   * again on its next all-degraded publish (there is no per-topic
+   * opt-out while a default is installed), and a topic whose
+   * explicit rule is cleared returns to default coverage the same
+   * way.
+   *
+   * The priority chain is explicit rule > bus default > no
+   * protection (the bus default is the terminal fallback below the
+   * explicit option — an explicit rule always wins, including one
+   * armed after the default materialized a record: re-arming
+   * rebuilds the record from scratch, state back to `'closed'`,
+   * counters zeroed, `fromDefault` cleared). The default never
+   * arms a topic by itself: a record materializes on demand only
+   * when a publish finds every subscriber of the topic degraded
+   * (health-probe auto-pause, EB-18) or shedding at the publish
+   * side (adaptive-throttle excursion, EB-14), so a healthy topic
+   * never grows a record and never appears in
+   * `getStats().circuitBreakers`. `revisePublishCircuitBreaker`
+   * (EB-372) works on a materialized record exactly as on an
+   * explicit one; a topic with neither a record nor a default
+   * still throws `RangeError`. `circuitBreakerState(topic)` and
+   * `publishCircuitBreaker(topic)` report `undefined` for a
+   * default-covered topic that has never shed, exactly as for an
+   * unruled topic. The default is runtime state: it never enters a
+   * config snapshot and does not survive a restart, like the bus's
+   * other live revisions.
+   *
+   * Fail-closed: an illegal actor, a value other than an object
+   * (`null` to clear), or a threshold outside the setter's gates
+   * throws `TypeError` / `RangeError` with the live default and
+   * the audit log untouched. A revision identical to the current
+   * default — re-setting the same resolved thresholds, setting
+   * `{}` on a factory bus (the unset default already behaves as
+   * the factory thresholds), or clearing an already-unset default
+   * — audits nothing. Audited as
+   * `default_publish_circuit_breaker_revised`
+   * (`{ previous, circuitBreaker }`, both the resolved two-field
+   * thresholds, `null` when the default is unset — unset means
+   * unruled topics go back to no protection, exactly the previous
+   * behavior). There is no closed-state gate: like the other
+   * `setDefault*` setters, a closed bus still takes the revision
+   * (unlike EB-372's per-topic revision, which refuses with
+   * `BusClosedError`).
+   *
+   * Orthogonal to EB-116 (that is the breaker mechanism itself —
+   * this its bus-level threshold terminal default), to EB-372
+   * (that revises one topic's thresholds — this the default
+   * unruled topics fall back to, and the default revision retunes
+   * materialized records the same live-read way), to EB-215/EB-373
+   * (that own the subscriber-side self-protection breaker — this
+   * the publish side), to EB-18/EB-14 (that own the
+   * degraded/shedding signals — this the thresholds those signals
+   * trip against), and to EB-525–532 (that set the bus-level
+   * defaults for the other `DeadLetterOptions` and publish knobs
+   * — same family, a different knob; this is the family's first
+   * per-topic rule-table default, so it adds on-demand
+   * materialization and the `fromDefault` marker instead of the
+   * family's subscribe-time baking).
+   *
+   * Throws `RangeError` for an illegal actor and for a threshold
+   * outside the setter's gates, and `TypeError` for a value other
+   * than an object (or `null` to clear).
+   */
+  setDefaultPublishCircuitBreaker(opts: PublishCircuitBreakerOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultPublishCircuitBreaker');
+    if (opts === null) {
+      // A clear is a no-op only when no default is installed at all:
+      // clearing a bus that holds a default still moves it back to
+      // unset and audits — and retires every record the default
+      // materialized, so an open default breaker stops fast-failing
+      // at once. Explicit records survive.
+      if (this.defaultPublishCircuitBreaker === undefined) {
+        return;
+      }
+      const previous: PublishCircuitBreakerOptions = { ...this.defaultPublishCircuitBreaker };
+      this.defaultPublishCircuitBreaker = undefined;
+      for (const [topic, breaker] of this.publishCircuitBreakers) {
+        if (breaker.fromDefault === true) {
+          this.publishCircuitBreakers.delete(topic);
+        }
+      }
+      this.auditSubscription({
+        action: 'default_publish_circuit_breaker_revised',
+        actor,
+        detail: { previous, circuitBreaker: null },
+      });
+      return;
+    }
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new TypeError(
+        'setDefaultPublishCircuitBreaker: opts must be a PublishCircuitBreakerOptions object, or null to clear it',
+      );
+    }
+    // Resolve first, then store: missing fields take the factory
+    // thresholds, exactly like the per-topic setter.
+    const consecutiveShedPublishes = opts.consecutiveShedPublishes ?? 5;
+    if (!Number.isInteger(consecutiveShedPublishes) || consecutiveShedPublishes < 1) {
+      throw new RangeError('consecutiveShedPublishes must be a positive integer');
+    }
+    const halfOpenProbeIntervalMs = opts.halfOpenProbeIntervalMs ?? 1000;
+    if (!Number.isFinite(halfOpenProbeIntervalMs) || halfOpenProbeIntervalMs <= 0) {
+      throw new RangeError('halfOpenProbeIntervalMs must be a positive finite number of milliseconds');
+    }
+    const next: PublishCircuitBreakerOptions = { consecutiveShedPublishes, halfOpenProbeIntervalMs };
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the resolved form — and the unset default
+    // behaves as the factory thresholds, so setting `{}` on a
+    // factory bus audits nothing.
+    const current = this.defaultPublishCircuitBreaker;
+    if (
+      current !== undefined &&
+      current.consecutiveShedPublishes === next.consecutiveShedPublishes &&
+      current.halfOpenProbeIntervalMs === next.halfOpenProbeIntervalMs
+    ) {
+      return;
+    }
+    if (
+      current === undefined &&
+      next.consecutiveShedPublishes === 5 &&
+      next.halfOpenProbeIntervalMs === 1000
+    ) {
+      return;
+    }
+    const previous: PublishCircuitBreakerOptions | null =
+      current === undefined ? null : { ...current };
+    this.defaultPublishCircuitBreaker = { ...next };
+    // Live retune: the breaker thresholds are read live at every
+    // publish evaluation, so a default revision moves every
+    // already-materialized `fromDefault` record's thresholds at
+    // once — state and counters preserved, exactly like EB-372's
+    // per-topic revision. Explicit records are never touched.
+    for (const breaker of this.publishCircuitBreakers.values()) {
+      if (breaker.fromDefault === true) {
+        breaker.consecutiveShedPublishes = next.consecutiveShedPublishes;
+        breaker.halfOpenProbeIntervalMs = next.halfOpenProbeIntervalMs;
+      }
+    }
+    this.auditSubscription({
+      action: 'default_publish_circuit_breaker_revised',
+      actor,
+      detail: { previous, circuitBreaker: { ...next } },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default publish circuit breaker
+   * thresholds (EB-533) — the thresholds future unruled topics fall
+   * back to — `undefined` before any revision (no default,
+   * unruled topics keep exactly their pre-EB-116 behavior), then
+   * whatever `setDefaultPublishCircuitBreaker` last installed, as
+   * the resolved two-field object. The returned object is a copy:
+   * mutating it never moves the live default.
+   */
+  getDefaultPublishCircuitBreaker(): PublishCircuitBreakerOptions | undefined {
+    const current = this.defaultPublishCircuitBreaker;
+    if (current === undefined) return undefined;
+    return { ...current };
+  }
+
+  /**
    * Sets the live bus-level terminal group max-members default
    * (EB-467) without touching any live group:
    * `setGroupDefaultMaxMembers(n, actor = 'system')` decides how
@@ -59189,14 +59414,17 @@ export class EventBus {
     }
     // Publish circuit breaker (EB-116): the fail-fast gate for topics
     // whose every subscriber is degraded or shedding. Opt-in per topic —
-    // with no rules installed this branch is a single map-size check and
-    // publish behaves exactly as before. The rule keys on the concrete
-    // (alias-resolved) topic; a retired alias is rejected by `fanOut`
-    // below with reason 'alias-retired' and never consults the breaker.
-    // Barrier control messages return above and skip the gate
-    // (control-plane, not business data).
+    // with no rules installed and no bus default this branch is a
+    // single map-size check and publish behaves exactly as before. A
+    // bus default (EB-533) arms the branch too: unruled topics are
+    // covered by the default thresholds, their records materializing
+    // on demand in `updatePublishCircuitBreaker`. The rule keys on the
+    // concrete (alias-resolved) topic; a retired alias is rejected by
+    // `fanOut` below with reason 'alias-retired' and never consults
+    // the breaker. Barrier control messages return above and skip the
+    // gate (control-plane, not business data).
     let breakerTopic: string | undefined;
-    if (this.publishCircuitBreakers.size > 0) {
+    if (this.publishCircuitBreakers.size > 0 || this.defaultPublishCircuitBreaker !== undefined) {
       const aliasResolution = this.resolvePublishTopic(topic);
       if (!aliasResolution.retired) {
         breakerTopic = aliasResolution.topic;
@@ -66273,7 +66501,11 @@ export class EventBus {
    * for a delivered message. When the probe interval has elapsed the
    * breaker moves to half-open and this one publish is admitted as the
    * probe; the post-fan-out evaluation in `updatePublishCircuitBreaker`
-   * then closes or re-opens it. No-op for topics without a rule.
+   * then closes or re-opens it. No-op for topics without a rule — and
+   * it never materializes one: a default-covered topic (EB-533) stays
+   * unrecorded until `updatePublishCircuitBreaker` sees its first
+   * all-degraded/shedding publish, so a closed record that was just
+   * materialized is itself a no-op here.
    */
   private checkPublishCircuitBreaker(topic: string, payload: unknown, publisherId?: string): void {
     const breaker = this.publishCircuitBreakers.get(topic);
@@ -66307,9 +66539,30 @@ export class EventBus {
    * degraded/shedding. A topic with no subscribers never trips.
    */
   private updatePublishCircuitBreaker(topic: string): void {
-    const breaker = this.publishCircuitBreakers.get(topic);
-    if (breaker === undefined) return;
+    let breaker = this.publishCircuitBreakers.get(topic);
     const unhealthy = this.circuitBreakerUnhealthy(topic);
+    if (breaker === undefined) {
+      // EB-533: a bus-level default covers topics without an explicit
+      // rule — the record materializes on demand, and only on a
+      // publish that actually finds every subscriber degraded or
+      // shedding, so a healthy topic never grows a record. The
+      // streak starts at 0 and this publish counts as the first shed
+      // one via the shared path below; a topic with no subscribers
+      // never trips, exactly as with an explicit rule.
+      const fallback = this.defaultPublishCircuitBreaker;
+      if (fallback === undefined || !unhealthy.allUnhealthy) return;
+      breaker = {
+        topic,
+        consecutiveShedPublishes: fallback.consecutiveShedPublishes,
+        halfOpenProbeIntervalMs: fallback.halfOpenProbeIntervalMs,
+        state: 'closed',
+        consecutiveBlocked: 0,
+        openedAtMs: 0,
+        rejectedMessages: 0,
+        fromDefault: true,
+      };
+      this.publishCircuitBreakers.set(topic, breaker);
+    }
     if (breaker.state === 'half-open') {
       if (unhealthy.allUnhealthy) {
         // Probe failed: every subscriber is still degraded/shedding —

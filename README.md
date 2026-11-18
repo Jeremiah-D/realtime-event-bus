@@ -9240,6 +9240,31 @@ Semantics:
   live snapshot — both thresholds plus `state`, `consecutiveBlocked`,
   and `rejectedMessages` — or `undefined` when no rule is armed
   (`getStats().circuitBreakers` rows carry no thresholds).
+- **Bus-level default (EB-533).**
+  `bus.setDefaultPublishCircuitBreaker(opts)` sets the trip thresholds
+  unruled topics fall back to, fleet-wide with one call — `{}` installs
+  the factory thresholds (5 publishes, 1000ms probe interval), `null`
+  clears the default back to no protection. The precedence chain is
+  explicit rule > bus default > no protection: a topic with its own
+  rule is never touched by the default, and a topic with neither keeps
+  exactly its pre-EB-116 behavior. The default never arms a topic by
+  itself — a record materializes on demand, only when a publish finds
+  every subscriber of the topic degraded/shedding, so a healthy topic
+  never grows a record and never appears in
+  `getStats().circuitBreakers`; `circuitBreakerState(topic)` still
+  reports `undefined` for a default-covered topic that has never shed.
+  A default revision live-retunes every already-materialized record's
+  thresholds at once (state and counters preserved, exactly like
+  EB-372), and clearing the default retires every materialized record
+  at once — an open one stops fast-failing immediately — while explicit
+  records survive. There is no per-topic opt-out while a default is
+  installed: clearing a rule (or a materialized record) drops the topic
+  back to default coverage on its next all-degraded publish. Revisions
+  are recorded in the subscription audit log as
+  `default_publish_circuit_breaker_revised`
+  (`{ previous, circuitBreaker }`, both the resolved two-field
+  thresholds, `null` when the default is unset); a revision identical
+  to the current default audits nothing.
 
 ## Subscriber auto circuit breaker (EB-215)
 
