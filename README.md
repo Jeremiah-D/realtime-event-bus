@@ -138,7 +138,17 @@ library.
   entries already dead-lettered never re-emit, and the DLQ entries, budget,
   retry ladder, auto-replay, approval gate, and callbacks are untouched.
   Revisions are audited as `dead_letter_diagnostic_topic_revised` (actor
-  `system`); passing the current topic is a no-op with no audit. Opt-in `deadLetter.autoReplay` (EB-134) re-enqueues
+  `system`); passing the current topic is a no-op with no audit. A
+  bus-level default covers new subscribers — `setDefaultDeadLetterDiagnosticTopic(topic)`
+  (EB-530) installs the `diagnosticTopic` future reliable subscribers that
+  opt into `deadLetter` and omit `diagnosticTopic` fall back to, so one call
+  points the whole fleet's poison-message diagnostics at a single alerting
+  topic; the resolution chain is explicit > bus default > no diagnostic, the
+  default never enables a DLQ for a subscriber that did not pass `deadLetter`,
+  an explicit `null` at subscribe time still throws `RangeError`, `null`
+  clears the default, and revisions audit as
+  `default_dead_letter_diagnostic_topic_revised` (`{ previous,
+  diagnosticTopic }`). Opt-in `deadLetter.autoReplay` (EB-134) re-enqueues
   dead-lettered messages automatically after an exponential backoff
   (`initialDelayMs` default 1000, `maxDelayMs` default 60000,
   `backoffMultiplier` default 2) instead of waiting for a manual
@@ -5065,6 +5075,16 @@ npm test
   audit event carries old and new topics, already dead-lettered entries
   never re-emit, auto-replay and the approval gate are unaffected, and an
   admission-rejected diagnostic still leaves the DLQ move unaffected.
+- `test/default-dead-letter-diagnostic-topic.test.ts` — bus-level default
+  dead-letter diagnostic topic (EB-530): `setDefaultDeadLetterDiagnosticTopic`
+  points new omit-`diagnosticTopic` reliable subscribers at one centralized
+  alerting topic (exact diagnostic metadata on the default topic), an explicit
+  topic always wins, an explicit `null` at subscribe time still throws
+  `RangeError`, the default never enables a DLQ, clearing returns new
+  subscribers to no diagnostic, illegal values throw with the live default
+  untouched, same-value revisions are no-ops with no audit, revisions never
+  move an already-subscribed topic, a default-baked subscriber can still be
+  revised per subscriber, and the audit carries previous and new topics.
 - `test/deadletter-replay-topic.test.ts` — dead-letter replay to a repair
   topic (EB-240): retarget republishes as a normal publish (target-topic
   admission and sequence number, original `messageId`/`key`/trace id and

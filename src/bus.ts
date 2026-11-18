@@ -10546,6 +10546,7 @@ function normalizeDeadLetterOptions(
   defaultMaxEntries?: number,
   defaultMaxDeadLetterAgeMs?: number,
   defaultMaxPending?: number,
+  defaultDiagnosticTopic?: string,
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -10596,7 +10597,16 @@ function normalizeDeadLetterOptions(
   if (o.onDeadLetter !== undefined && typeof o.onDeadLetter !== 'function') {
     throw new TypeError(`${caller}: deadLetter.onDeadLetter must be a function`);
   }
-  const diagnosticTopic = o.diagnosticTopic;
+  // EB-530: a bus-level default diagnostic topic fills an omitted
+  // `diagnosticTopic` for a reliable subscriber that already opted
+  // into a dead-letter queue — the default never enables the DLQ
+  // itself (an absent `deadLetter` still returns `null` above), and
+  // an explicit topic always wins. Only an absent (`undefined`)
+  // value falls back: an explicit `null` keeps the subscribe-time
+  // gate's own behavior (the validation below throws on it, exactly
+  // as before — `null` was never a legal subscribe-time
+  // `diagnosticTopic`).
+  const diagnosticTopic = o.diagnosticTopic === undefined ? defaultDiagnosticTopic : o.diagnosticTopic;
   if (diagnosticTopic !== undefined && (typeof diagnosticTopic !== 'string' || diagnosticTopic.length === 0)) {
     throw new RangeError(`${caller}: deadLetter.diagnosticTopic must be a non-empty string`);
   }
@@ -18999,6 +19009,24 @@ export class EventBus {
    * subscribe time.
    */
   private defaultMaxDeadLetterPending?: number;
+  /**
+   * Bus-level default dead-letter diagnostic topic (EB-530): the
+   * `diagnosticTopic` a new reliable subscriber falls back to when
+   * it opts into a dead-letter queue (`deadLetter`) and omits
+   * `diagnosticTopic` (see `DeadLetterOptions.diagnosticTopic`,
+   * EB-57). Starts unset (`undefined` — no default, omitting
+   * `diagnosticTopic` means no diagnostic fan-out, exactly the
+   * previous behavior) and moves only via
+   * `setDefaultDeadLetterDiagnosticTopic`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `diagnosticTopic` always wins. A revision only
+   * affects reliable subscribers created after it — already-subscribed
+   * subscribers keep the topic they were baked with at subscribe
+   * time.
+   */
+  private defaultDeadLetterDiagnosticTopic?: string;
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44514,7 +44542,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs, this.defaultMaxDeadLetterPending);
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs, this.defaultMaxDeadLetterPending, this.defaultDeadLetterDiagnosticTopic);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55702,6 +55730,95 @@ export class EventBus {
    */
   getDefaultMaxDeadLetterPending(): number | undefined {
     return this.defaultMaxDeadLetterPending;
+  }
+
+  /**
+   * Sets the live bus-level default dead-letter diagnostic topic
+   * (EB-530) without touching any live subscriber:
+   * `setDefaultDeadLetterDiagnosticTopic(topic, actor = 'system')`
+   * decides where the diagnostic event of a new reliable
+   * subscriber that opts into a dead-letter queue (`deadLetter`)
+   * and omits `diagnosticTopic` is fanned out (see
+   * `DeadLetterOptions.diagnosticTopic`, EB-57) — `'ops.poison'`
+   * to send every new subscriber's poison-message diagnostics to
+   * one centralized alerting topic fleet-wide with one call,
+   * `null` to clear the default back to no diagnostic.
+   *
+   * Only the default moves: the subscribers, their baked topics,
+   * and every already dead-lettered entry are untouched. A
+   * revision only affects reliable subscribers created after it:
+   * a subscriber takes the default in effect at subscribe time
+   * and keeps the topic it was baked with — a later revision
+   * never moves an already-subscribed topic, and
+   * `setDeadLetterDiagnosticTopic` (EB-460) still revises one
+   * subscriber at a time without touching the bus default (a
+   * default-baked subscriber can still be revised per subscriber,
+   * including clearing it, and a later default revision never
+   * re-applies to an already-revised one). The priority chain is
+   * explicit `diagnosticTopic` > bus default > no diagnostic
+   * (the bus default is the terminal fallback below the explicit
+   * option — an explicit topic always wins). The default never
+   * enables a dead-letter queue: a subscriber that does not pass
+   * `deadLetter` still has no DLQ — and an explicit `null` at
+   * subscribe time still throws `RangeError`, exactly as before
+   * (only an absent value falls back). The default is runtime
+   * state: it never enters a config snapshot and does not survive
+   * a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor or a value other than a
+   * non-empty string (`null` to clear) throws `RangeError` with
+   * the live default and the audit log untouched. A revision
+   * identical to the current default — re-setting the same topic,
+   * or clearing an already-unset default — audits nothing.
+   * Audited as `default_dead_letter_diagnostic_topic_revised`
+   * (`{ previous, diagnosticTopic }`, `null` when the default is
+   * unset — unset means new omit-`diagnosticTopic` reliable
+   * subscribers go back to no diagnostic fan-out, exactly the
+   * previous behavior).
+   *
+   * Orthogonal to EB-57 (that owns the diagnostic-topic mechanism
+   * itself — this its bus-level terminal default), to EB-460
+   * (that revises one subscriber's diagnostic topic — this the
+   * bus-level default new subscribers fall back to), to EB-139
+   * (that sets the topic-level admission dead-letter topic — that
+   * the admission dimension, this the delivery-stage per-subscriber
+   * DLQ diagnostic topic), and to EB-526/527/528/529 (that set the
+   * bus-level defaults for the budget, capacity, TTL, and pending
+   * queue of the same `DeadLetterOptions` — same family, different
+   * knobs).
+   *
+   * Throws `RangeError` for an illegal actor or a value other than
+   * a non-empty string (or `null` to clear).
+   */
+  setDefaultDeadLetterDiagnosticTopic(topic: string | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDefaultDeadLetterDiagnosticTopic');
+    if (topic !== null && (typeof topic !== 'string' || topic.length === 0)) {
+      throw new RangeError(
+        'setDefaultDeadLetterDiagnosticTopic: topic must be a non-empty string, or null to clear it',
+      );
+    }
+    const previous: string | null = this.defaultDeadLetterDiagnosticTopic ?? null;
+    if (topic === previous) {
+      return;
+    }
+    this.defaultDeadLetterDiagnosticTopic = topic === null ? undefined : topic;
+    this.auditSubscription({
+      action: 'default_dead_letter_diagnostic_topic_revised',
+      actor,
+      detail: { previous, diagnosticTopic: topic },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default dead-letter diagnostic topic
+   * (EB-530) — the `diagnosticTopic` future omit-`diagnosticTopic`
+   * reliable subscribers with a dead-letter queue fall back to —
+   * `undefined` before any revision (no default, new
+   * omit-`diagnosticTopic` subscribers emit no diagnostic), then
+   * whatever `setDefaultDeadLetterDiagnosticTopic` last installed.
+   */
+  getDefaultDeadLetterDiagnosticTopic(): string | undefined {
+    return this.defaultDeadLetterDiagnosticTopic;
   }
 
   /**
