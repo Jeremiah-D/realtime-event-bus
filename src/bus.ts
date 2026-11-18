@@ -10548,6 +10548,7 @@ function normalizeDeadLetterOptions(
   defaultMaxPending?: number,
   defaultDiagnosticTopic?: string,
   defaultRequireApproval?: boolean,
+  defaultAutoReplay?: boolean | AutoReplayOptions,
 ): (Pick<SubscriberDeadLetter, 'maxRedeliveries' | 'maxEntries' | 'maxAgeMs' | 'onDeadLetter' | 'diagnosticTopic' | 'autoReplay' | 'onPoisoned' | 'requireApproval' | 'maxPending'> & { retryLadder?: number[] }) | null {
   if (opt === undefined || opt === false) return null;
   if (opt !== true && (typeof opt !== 'object' || opt === null)) {
@@ -10614,8 +10615,17 @@ function normalizeDeadLetterOptions(
   // EB-134: resolve the auto-replay config. `true` enables the defaults;
   // an object tunes the backoff. Invalid values throw before anything is
   // mutated, matching the other validations above.
+  // EB-532: a bus-level default auto-replay fills an omitted
+  // `autoReplay` for a reliable subscriber that already opted
+  // into a dead-letter queue — the default never enables the DLQ
+  // itself (an absent `deadLetter` still returns `null` above), and
+  // an explicit value always wins, including an explicit `false`
+  // under a `true` default. Only an absent (`undefined`) value
+  // falls back: an explicit `null` keeps the subscribe-time gate's
+  // own behavior (the validation below throws on it, exactly as
+  // before — `null` was never a legal subscribe-time `autoReplay`).
   let autoReplay: SubscriberDeadLetter['autoReplay'];
-  const ar = o.autoReplay;
+  const ar = o.autoReplay === undefined ? defaultAutoReplay : o.autoReplay;
   if (ar !== undefined && ar !== false) {
     if (ar !== true && (typeof ar !== 'object' || ar === null)) {
       throw new TypeError(`${caller}: deadLetter.autoReplay must be true or an AutoReplayOptions object`);
@@ -19057,6 +19067,31 @@ export class EventBus {
    * already-parked requests.
    */
   private defaultDeadLetterRequireApproval?: boolean;
+  /**
+   * Bus-level default dead-letter auto-replay (EB-532): the
+   * `autoReplay` a new reliable subscriber falls back to when
+   * it opts into a dead-letter queue (`deadLetter`) and omits
+   * `autoReplay` (see `DeadLetterOptions.autoReplay`, EB-134).
+   * Starts unset (`undefined` — no default, omitting
+   * `autoReplay` means no auto-replay, exactly the previous
+   * behavior) and moves only via
+   * `setDefaultDeadLetterAutoReplay`; there is no
+   * construction-time option, and a restart restores the unset
+   * default. The default never enables a dead-letter queue — a
+   * subscriber that does not pass `deadLetter` is untouched by it —
+   * and an explicit `autoReplay` always wins, including an
+   * explicit `false` under a `true` default. A revision only
+   * affects reliable subscribers created after it — already-subscribed
+   * subscribers keep the auto-replay config they were baked with
+   * at subscribe time, and an already-armed timer keeps the delay
+   * it was armed with.
+   */
+  private defaultDeadLetterAutoReplay?: boolean | {
+    initialDelayMs: number;
+    maxDelayMs: number;
+    backoffMultiplier: number;
+    maxAutoReplayAttempts: number;
+  };
   /**
    * Bus-level terminal group max-members default (EB-467): the member
    * cap a new group falls back to when its first member omits its own
@@ -44572,7 +44607,7 @@ export class EventBus {
     if (opts?.shadow !== undefined && opts.shadow !== false) {
       throw new RangeError('subscribeReliable: shadow cannot be combined with reliable delivery');
     }
-    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs, this.defaultMaxDeadLetterPending, this.defaultDeadLetterDiagnosticTopic, this.defaultDeadLetterRequireApproval);
+    const dlq = normalizeDeadLetterOptions(opts?.deadLetter, 'subscribeReliable', this.defaultRetryLadder, this.defaultMaxRedeliveries, this.defaultMaxDeadLetterEntries, this.defaultMaxDeadLetterAgeMs, this.defaultMaxDeadLetterPending, this.defaultDeadLetterDiagnosticTopic, this.defaultDeadLetterRequireApproval, this.defaultDeadLetterAutoReplay);
     // EB-220: validate the redelivery backoff before subscribing — a
     // rejected option must not leave a half-registered subscription.
     // EB-519: a reliable subscriber that omits redeliveryBackoff falls
@@ -55954,6 +55989,214 @@ export class EventBus {
    */
   getDefaultDeadLetterRequireApproval(): boolean | undefined {
     return this.defaultDeadLetterRequireApproval;
+  }
+
+  /**
+   * Sets the live bus-level default dead-letter auto-replay (EB-532)
+   * without touching any live subscriber:
+   * `setDefaultDeadLetterAutoReplay(autoReplay, actor = 'system')`
+   * decides how a new reliable subscriber that opts into a
+   * dead-letter queue (`deadLetter`) and omits `autoReplay` heals
+   * itself (see `DeadLetterOptions.autoReplay`, EB-134) — `true`
+   * to switch fleet-wide self-healing on with one call (dead-lettered
+   * messages auto-replay on the default backoff, 1000ms first delay,
+   * 60000ms cap, x2 multiplier, 3 attempts before poison),
+   * `{ initialDelayMs: 50, maxAutoReplayAttempts: 1 }` to tune the
+   * fleet backoff, `false` to switch it off fleet-wide, `null` to
+   * clear the default back to closed.
+   *
+   * Only the default moves: the subscribers, their baked auto-replay
+   * configs, and every already-armed timer are untouched. A revision
+   * only affects reliable subscribers created after it: a
+   * subscriber takes the default in effect at subscribe time and
+   * keeps the auto-replay config it was baked with — a later revision
+   * never moves an already-subscribed config or an already-armed
+   * timer (an armed timer keeps the delay it was armed with and
+   * still fires once), and `setDeadLetterAutoReplay` (EB-367) still
+   * revises one subscriber at a time without touching the bus
+   * default (a default-baked subscriber can still be revised per
+   * subscriber, including a `null` clear, and a later default
+   * revision never re-applies to an already-revised or already-cleared
+   * one). The priority chain is explicit `autoReplay` > bus default
+   * > closed (the bus default is the terminal fallback below the
+   * explicit option — an explicit value always wins, including an
+   * explicit `false` under a `true` default, which switches
+   * auto-replay off for that subscriber, and an explicit object
+   * under any default, which replaces it wholesale). The default
+   * never enables a dead-letter queue: a subscriber that does not
+   * pass `deadLetter` still has no DLQ — and an explicit `null`
+   * at subscribe time still throws `TypeError`, exactly as before
+   * (only an absent value falls back). Auto-replay still bypasses
+   * the approval gate (EB-233): a default-enabled subscriber's
+   * system-initiated replays never park, even under a default
+   * `requireApproval` of `true` (EB-531). The default is runtime
+   * state: it never enters a config snapshot and does not survive
+   * a restart, like the bus's other live revisions.
+   *
+   * Fail-closed: an illegal actor, a value other than a boolean or
+   * an object (`null` to clear), or an object field outside the
+   * subscribe-time gates throws `TypeError` / `RangeError` with the
+   * live default and the audit log untouched. A revision identical
+   * to the current default — re-setting the same value, setting the
+   * full-value object `{ 1000, 60000, 2, 3 }` over a `true` default
+   * (or the reverse), setting `false` on a factory bus, or clearing
+   * an already-unset default — audits nothing. Audited as
+   * `default_dead_letter_auto_replay_revised`
+   * (`{ previous, autoReplay }`, both the resolved four-field
+   * object, `false`, or `null` — `null` when the default is unset
+   * or cleared; unset means new omit-`autoReplay` reliable
+   * subscribers go back to no auto-replay, exactly the previous
+   * behavior).
+   *
+   * Orthogonal to EB-134 (that owns the auto-replay mechanism
+   * itself — this its bus-level terminal default), to EB-367
+   * (that revises one subscriber's auto-replay — this the bus-level
+   * default new subscribers fall back to), to EB-233/EB-531 (that
+   * own the replay approval gate — system auto-replays bypass it),
+   * and to EB-525–531 (that set the bus-level defaults for the
+   * other `DeadLetterOptions` fields — same family, different knobs;
+   * this is the last non-callback field).
+   *
+   * Throws `RangeError` for an illegal actor and for an object
+   * field outside the subscribe-time gates, and `TypeError` for a
+   * value other than a boolean or an object (or `null` to clear).
+   */
+  setDefaultDeadLetterAutoReplay(
+    autoReplay: boolean | AutoReplayOptions | null,
+    actor = 'system',
+  ): void {
+    assertValidActor(actor, 'setDefaultDeadLetterAutoReplay');
+    // A clear is a no-op only when no default is installed at all:
+    // clearing a bus that holds an explicit default (even `false`)
+    // still moves it back to unset and audits.
+    if (autoReplay === null) {
+      if (this.defaultDeadLetterAutoReplay === undefined) {
+        return;
+      }
+      const previous: boolean | {
+        initialDelayMs: number;
+        maxDelayMs: number;
+        backoffMultiplier: number;
+        maxAutoReplayAttempts: number;
+      } | null =
+        this.defaultDeadLetterAutoReplay === false
+          ? false
+          : { ...this.defaultDeadLetterAutoReplay };
+      this.defaultDeadLetterAutoReplay = undefined;
+      this.auditSubscription({
+        action: 'default_dead_letter_auto_replay_revised',
+        actor,
+        detail: { previous, autoReplay: null },
+      });
+      return;
+    }
+    if (typeof autoReplay !== 'boolean' && typeof autoReplay !== 'object') {
+      throw new TypeError(
+        'setDefaultDeadLetterAutoReplay: autoReplay must be true, false, or an AutoReplayOptions object, or null to clear it',
+      );
+    }
+    // Resolve first, then store: `true` resolves to the four-field
+    // defaults, an object fills its missing fields the same way, and
+    // `false` stores as `false`. The field gates reuse the
+    // subscribe-time validation from `normalizeDeadLetterOptions`.
+    let resolved: {
+      initialDelayMs: number;
+      maxDelayMs: number;
+      backoffMultiplier: number;
+      maxAutoReplayAttempts: number;
+    } | null = null;
+    if (autoReplay !== false) {
+      const aro: AutoReplayOptions = autoReplay === true ? {} : autoReplay;
+      const initialDelayMs = aro.initialDelayMs ?? 1000;
+      const maxDelayMs = aro.maxDelayMs ?? 60000;
+      const backoffMultiplier = aro.backoffMultiplier ?? 2;
+      const maxAutoReplayAttempts = aro.maxAutoReplayAttempts ?? 3;
+      if (!Number.isFinite(initialDelayMs) || initialDelayMs < 0) {
+        throw new RangeError(
+          'setDefaultDeadLetterAutoReplay: autoReplay.initialDelayMs must be a non-negative finite number',
+        );
+      }
+      if (!Number.isFinite(maxDelayMs) || maxDelayMs <= 0) {
+        throw new RangeError(
+          'setDefaultDeadLetterAutoReplay: autoReplay.maxDelayMs must be a positive finite number',
+        );
+      }
+      if (!Number.isFinite(backoffMultiplier) || backoffMultiplier < 1) {
+        throw new RangeError(
+          'setDefaultDeadLetterAutoReplay: autoReplay.backoffMultiplier must be a finite number >= 1',
+        );
+      }
+      if (!Number.isInteger(maxAutoReplayAttempts) || maxAutoReplayAttempts < 0) {
+        throw new RangeError(
+          'setDefaultDeadLetterAutoReplay: autoReplay.maxAutoReplayAttempts must be a non-negative integer',
+        );
+      }
+      resolved = { initialDelayMs, maxDelayMs, backoffMultiplier, maxAutoReplayAttempts };
+    }
+    const next: boolean | {
+      initialDelayMs: number;
+      maxDelayMs: number;
+      backoffMultiplier: number;
+      maxAutoReplayAttempts: number;
+    } = autoReplay === false ? false : resolved!;
+    // Re-affirming the current default is a no-op: no audit. The
+    // comparison is on the resolved form — `true` and the full-value
+    // object `{ 1000, 60000, 2, 3 }` are the same default, and the
+    // unset default behaves as closed, so setting `false` on a
+    // factory bus audits nothing.
+    const current = this.defaultDeadLetterAutoReplay;
+    if (next === false) {
+      if (current === undefined || current === false) {
+        return;
+      }
+    } else if (
+      current !== undefined &&
+      current !== false &&
+      current.initialDelayMs === next.initialDelayMs &&
+      current.maxDelayMs === next.maxDelayMs &&
+      current.backoffMultiplier === next.backoffMultiplier &&
+      current.maxAutoReplayAttempts === next.maxAutoReplayAttempts
+    ) {
+      return;
+    }
+    const previous: boolean | {
+      initialDelayMs: number;
+      maxDelayMs: number;
+      backoffMultiplier: number;
+      maxAutoReplayAttempts: number;
+    } | null =
+      current === undefined ? null : current === false ? false : { ...current };
+    this.defaultDeadLetterAutoReplay = next;
+    this.auditSubscription({
+      action: 'default_dead_letter_auto_replay_revised',
+      actor,
+      detail: {
+        previous,
+        autoReplay: next === false ? false : { ...next },
+      },
+    });
+  }
+
+  /**
+   * Returns the live bus-level default dead-letter auto-replay
+   * (EB-532) — the `autoReplay` future omit-`autoReplay` reliable
+   * subscribers with a dead-letter queue fall back to —
+   * `undefined` before any revision (no default, new omit-`autoReplay`
+   * subscribers never auto-replay), `false` when the default was
+   * explicitly switched off, then whatever
+   * `setDefaultDeadLetterAutoReplay` last installed, as the resolved
+   * four-field object. The returned object is a copy: mutating it
+   * never moves the live default.
+   */
+  getDefaultDeadLetterAutoReplay(): boolean | {
+    initialDelayMs: number;
+    maxDelayMs: number;
+    backoffMultiplier: number;
+    maxAutoReplayAttempts: number;
+  } | undefined {
+    const current = this.defaultDeadLetterAutoReplay;
+    if (current === undefined || typeof current !== 'object') return current;
+    return { ...current };
   }
 
   /**

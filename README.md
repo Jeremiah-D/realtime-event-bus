@@ -173,6 +173,18 @@ library.
   armed with and still fires once after a clear. Revisions are audited
   as `dead_letter_auto_replay_revised` (actor `system`, new value `null`
   on a clear); passing the current values is a no-op with no audit.
+  A bus-level default covers new subscribers —
+  `setDefaultDeadLetterAutoReplay(autoReplay)` (EB-532) installs the
+  `autoReplay` future reliable subscribers that opt into `deadLetter`
+  and omit `autoReplay` fall back to, so one call switches fleet-wide
+  dead-letter self-healing on or off; the resolution chain is explicit
+  > bus default > closed, the default never enables a DLQ for a
+  subscriber that did not pass `deadLetter`, an explicit `false` still
+  switches a subscriber off under a `true` default, an explicit `null`
+  at subscribe time still throws `TypeError`, `null` clears the
+  default, and revisions audit as
+  `default_dead_letter_auto_replay_revised` (`{ previous, autoReplay }`,
+  both the resolved four-field form, `false`, or `null`).
   The dead-letter callbacks themselves are live-revisable the same way
   (EB-434, via `reviseSubscriberDeadLetterCallbacks(subId,
   { onDeadLetter?, onPoisoned? })`): only a reliable subscription that
