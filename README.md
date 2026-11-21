@@ -3157,20 +3157,26 @@ library.
   integer >= 1 — anything else throws `RangeError` from `subscribe`, as do
   combinations with `batch` or `shadow`. Disabled by default.
   Revisable after subscribe (EB-264, via
-  `setMaxInflight(subId, max | null)`): a capped subscriber's cap
+  `setMaxInflight(subId, max | null)`): a subscriber's cap
   can be changed without re-subscribing — the drain reads the
   live cap, so queued messages become admittable on the next
-  flush, and `null` clears the cap back to unlimited. Only the cap
+  flush, and `null` clears the cap back to unlimited. On a
+  subscriber that never opted into a cap, a number installs one
+  live (EB-537): the count starts at 0 — only invocations
+  admitted after the enable hold a slot, so pre-enable executing
+  or unacked ones are not counted (a reliable pre-enable settle
+  clamps the count at 0); `null` there is a silent no-op with no
+  audit, and a batch subscriber refuses the enable. Only the cap
   moves: the live in-flight count is untouched (a lowered cap
   never evicts an invocation already unsettled), and the
   subscribe-time delivery-concurrency cap keeps its value even
   when it defaulted from `maxInflight`. It is fail-closed (an
-  unknown subscriber, a subscriber that never opted into a cap,
-  or a non-integer / < 1 value throws `RangeError` with the live
-  cap and the audit log untouched; `undefined` is not a clear,
-  only `null` is), and every success is audited as
-  `max_inflight_revised` (`{ maxInflight, oldMaxInflight }`,
-  `null` for a clear). Bus-level default (EB-466, via
+  unknown subscriber or a non-integer / < 1 value throws
+  `RangeError` with the live cap and the audit log untouched;
+  `undefined` is not a clear, only `null` is), and every success
+  is audited as `max_inflight_revised`
+  (`{ maxInflight, oldMaxInflight }`, `null` for a clear and
+  `null` for `oldMaxInflight` on an enable). Bus-level default (EB-466, via
   `setDefaultMaxInFlight(max | null)`): future subscribers that
   omit `maxInflight` take the live bus default instead of running
   uncapped — `null` clears it back to unset. An explicit value
@@ -5396,6 +5402,16 @@ npm test
   values, re-affirming the enabled window as a no-op, the enable audit recording a `null`
   previous with actor `system`, the enable carrying no `consumerId` (no `__dedup.jsonl`
   written), and the live enable gone after a restart.
+- `test/maxinflight-enable.test.ts` — subscriber maxInflight live enable (EB-537):
+  a number installing a fresh cap on a never-capped subscriber (the drain binding
+  from the next flush, pre-enable executions not in the count, the backlog never
+  wedging), a batch subscriber refusing the enable, `null` on a never-capped
+  subscriber as a silent no-op, `null` on an enabled subscriber still clearing
+  with a later call re-enabling, unknown / empty / illegal enables throwing
+  `RangeError`, the enable never recomputing the subscribe-time
+  delivery-concurrency cap, a reliable subscriber settling pre-enable deliveries
+  without underflowing the count (the cap admitting `max` more on top of
+  pre-enable unacked deliveries), and the live enable gone after a restart.
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output

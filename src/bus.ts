@@ -37400,35 +37400,57 @@ export class EventBus {
   }
 
   /**
-   * Revises the max in-flight cap of one capped subscriber (EB-264):
-   * the drain's live read of `subscriber.maxInflight.max` picks the
-   * new cap up immediately, so messages queued behind the old cap
-   * become admittable on the next flush and new deliveries are
-   * admitted under the new cap. Passing `null` clears the cap: the
-   * subscriber returns to unlimited unsettled invocations and the
-   * `maxInflight` state is removed, so a later revision is refused
-   * until the subscriber opts in again at subscribe time.
+   * Revises — or enables (EB-537) — the max in-flight cap of one
+   * subscriber (EB-264) without re-subscribing: the drain's live read
+   * of `subscriber.maxInflight.max` picks the new cap up immediately,
+   * so messages queued behind the old cap become admittable on the
+   * next flush and new deliveries are admitted under the new cap.
+   * Passing `null` clears the cap: the subscriber returns to
+   * unlimited unsettled invocations and the `maxInflight` state is
+   * removed.
    *
-   * Only the cap moves: the live `inFlight` count is untouched, so
-   * invocations already unsettled keep their slots and settle
-   * exactly as before — a lowered cap never evicts an invocation
-   * already running, it only stops the drain from opening new ones
-   * until settlements bring the count back under the cap. The
-   * subscribe-time delivery-concurrency cap (`deliveryConcurrency`,
-   * EB-159) is untouched too: when it defaulted from `maxInflight`
-   * at subscribe time it keeps the subscribe-time value, so a
-   * revision here never silently widens handler execution
+   * Enabling (EB-537): on a subscriber that never opted into
+   * `maxInflight`, a number installs a fresh cap — and the count
+   * starts at 0, not at the currently-executing handler count.
+   * Only invocations admitted after the enable hold a slot:
+   * `invokeWithInflightSlot` snapshots the cap when the invocation
+   * starts, so a handler already executing when the cap lands never
+   * acquired one and its settle releases none — seeding the
+   * executing count would strand it (the drain budget
+   * `max - inFlight` would stay 0 after those invocations settle
+   * and the backlog would wedge; verified by probe). The transient
+   * cost is bounded: at most the pre-enable executing (plain) or
+   * unacked (reliable) invocations run on top of the new cap until
+   * they settle. For a reliable subscriber the tracker's `onSettle`
+   * hook reads the cap live, so settling a pre-enable unacked
+   * delivery decrements with the `Math.max(0, …)` clamp and the
+   * count never underflows. `null` on a never-capped subscriber is
+   * a silent no-op with no audit, and a batch subscriber refuses
+   * the enable — `maxInflight` cannot be combined with batch, the
+   * subscribe-time rule, not a revision-time oversight. The enable
+   * is live-only: no construction-time option, no config snapshot,
+   * a restart restores the uncapped state.
+   *
+   * Only the cap moves: on a revision the live `inFlight` count is
+   * untouched, so invocations already unsettled keep their slots and
+   * settle exactly as before — a lowered cap never evicts an
+   * invocation already running, it only stops the drain from opening
+   * new ones until settlements bring the count back under the cap.
+   * The subscribe-time delivery-concurrency cap
+   * (`deliveryConcurrency`, EB-159) is untouched too: when it
+   * defaulted from `maxInflight` at subscribe time it keeps the
+   * subscribe-time value, and an enable never recomputes it either,
+   * so enabling here never silently widens handler execution
    * parallelism — widening that is `maxConcurrentDeliveries`' own
    * job, and the two caps compose (a message is delivered only
    * when both allow it).
    *
-   * Fail-closed: an unknown subscriber id, a subscriber that never
-   * opted into `maxInflight`, a non-integer or < 1 cap, and
-   * `undefined` — only an explicit `null` clears — all throw
+   * Fail-closed: an unknown subscriber id, a non-integer or < 1 cap,
+   * and `undefined` — only an explicit `null` clears — all throw
    * `RangeError` with the live cap, the live count, and the audit
    * log untouched. Audited as `max_inflight_revised`
-   * (`{ maxInflight, oldMaxInflight }`, `null` for a clear) on
-   * success.
+   * (`{ maxInflight, oldMaxInflight }`, `null` for a clear and
+   * `null` for `oldMaxInflight` on an enable) on success.
    *
    * Orthogonal to `setAckTimeout` (EB-259) and
    * `setRedeliveryBackoff` (EB-261): those revise reliable-delivery
@@ -37436,8 +37458,8 @@ export class EventBus {
    * subscriber may hold, and to `setDeliveryWindow` (EB-263),
    * which revises the calendar gate before delivery starts.
    *
-   * Throws `RangeError` for an unknown / uncapped subscriber or an
-   * illegal cap value.
+   * Throws `RangeError` for an unknown subscriber or an illegal
+   * cap value.
    */
   setMaxInflight(subId: string, max: number | null): void {
     if (typeof subId !== 'string' || subId.length === 0) {
@@ -37448,30 +37470,74 @@ export class EventBus {
       throw new RangeError(`setMaxInflight: unknown subscriber: ${subId}`);
     }
     const cap = subscriber.maxInflight;
+    if (max === null) {
+      // EB-537: `null` on a subscriber that never opted into a cap is a
+      // silent no-op with no audit — the null branch moves ahead of the
+      // opt-in gate (EB-535's enable shape). On a capped subscriber it
+      // still clears, as before.
+      if (cap == null) return;
+      subscriber.maxInflight = undefined;
+      this.auditSubscription({
+        action: 'max_inflight_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { maxInflight: null, oldMaxInflight: cap.max },
+      });
+      this.scheduleFlush();
+      return;
+    }
     if (cap == null) {
-      throw new RangeError('setMaxInflight: subscriber has no maxInflight cap set');
+      // EB-537: enable a cap on a never-capped subscriber. Batch and the
+      // cap are mutually exclusive at subscribe time, so a batch
+      // subscriber refuses the enable instead of pretending the cap
+      // applies to batched calls.
+      if (subscriber.batch != null) {
+        throw new RangeError('setMaxInflight: maxInflight cannot be combined with batch');
+      }
+      // Validate before touching anything: `resolveMaxInflightOptions`
+      // returns `undefined` for an absent value, but here absent is not
+      // a clear — only an explicit `null` clears, and `null` already
+      // returned above.
+      const resolved = resolveMaxInflightOptions(max);
+      if (resolved === undefined) {
+        throw new RangeError('setMaxInflight: maxInflight must be an integer >= 1, or null to clear it');
+      }
+      // The count starts at 0, not at the currently-executing
+      // handler count: only invocations admitted after the enable
+      // hold a slot (see the doc comment above) — seeding the
+      // executing count would strand it, since a pre-enable
+      // invocation's settle releases no in-flight slot and the
+      // drain budget `max - inFlight` would stay 0 forever.
+      subscriber.maxInflight = { max: resolved, inFlight: 0 };
+      this.auditSubscription({
+        action: 'max_inflight_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { maxInflight: resolved, oldMaxInflight: null },
+      });
+      this.scheduleFlush();
+      return;
     }
     // Validate before touching anything: `resolveMaxInflightOptions`
     // returns `undefined` for an absent value, but here absent is not
-    // a clear — only an explicit `null` clears the cap.
-    const resolved = max === null ? undefined : resolveMaxInflightOptions(max);
-    if (max !== null && resolved === undefined) {
+    // a clear — only an explicit `null` clears the cap, and `null`
+    // already returned above.
+    const resolved = resolveMaxInflightOptions(max);
+    if (resolved === undefined) {
       throw new RangeError('setMaxInflight: maxInflight must be an integer >= 1, or null to clear it');
     }
     const oldMaxInflight = cap.max;
-    if (resolved === undefined) {
-      subscriber.maxInflight = undefined;
-    } else {
-      // Only the cap moves; `cap.inFlight` keeps counting the
-      // invocations already unsettled.
-      cap.max = resolved;
-    }
+    // Only the cap moves; `cap.inFlight` keeps counting the
+    // invocations already unsettled.
+    cap.max = resolved;
     this.auditSubscription({
       action: 'max_inflight_revised',
       actor: 'system',
       subId: subscriber.id,
       pattern: subscriber.pattern,
-      detail: { maxInflight: resolved ?? null, oldMaxInflight },
+      detail: { maxInflight: resolved, oldMaxInflight },
     });
     // A raised or cleared cap may have made queued messages
     // admittable; a lowered cap simply admits nothing new.

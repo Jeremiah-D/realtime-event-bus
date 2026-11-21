@@ -56,7 +56,7 @@ test('setMaxInflight raises the cap for new deliveries but keeps unsettled slots
   sub.unsubscribe();
 });
 
-test('setMaxInflight with null clears the cap and a later revision is refused', async () => {
+test('setMaxInflight with null clears the cap and a later call re-enables it (EB-537)', async () => {
   const bus = new EventBus();
   const { seen, releases, handler } = deferredHandler();
   const sub = bus.subscribe('t', handler, { maxInflight: 1, maxConcurrentDeliveries: 3 });
@@ -70,11 +70,19 @@ test('setMaxInflight with null clears the cap and a later revision is refused', 
     [],
     'clearing removes the cap row, not just its value',
   );
-  assert.throws(() => bus.setMaxInflight(sub.id, 3), RangeError);
+  // EB-537: a clear no longer refuses the next call — the cap
+  // re-installs with a null previous, exactly like a first enable.
+  // The still-pending invocation is pre-enable, so the count starts
+  // at 0 (see maxinflight-enable.test.ts).
+  bus.setMaxInflight(sub.id, 3);
+  assert.deepEqual(bus.getStats().inFlightUsage, [
+    { subscriberId: sub.id, pattern: 't', maxInflight: 3, inFlight: 0 },
+  ]);
 
   const events = bus.getSubscriptionAudit({ action: 'max_inflight_revised' });
-  assert.equal(events.length, 1);
+  assert.equal(events.length, 2);
   assert.deepEqual(events[0].detail, { maxInflight: null, oldMaxInflight: 1 });
+  assert.deepEqual(events[1].detail, { maxInflight: 3, oldMaxInflight: null });
   for (const release of releases.splice(0)) release();
   await flush();
   sub.unsubscribe();
@@ -96,11 +104,10 @@ test('setMaxInflight leaves the subscribe-time delivery-concurrency cap alone', 
   sub.unsubscribe();
 });
 
-test('setMaxInflight rejects unknown, uncapped, and illegal revisions fail-closed', async () => {
+test('setMaxInflight rejects unknown and illegal revisions fail-closed', async () => {
   const bus = new EventBus();
   const { seen, releases, handler } = deferredHandler();
   const sub = bus.subscribe('t', handler, { maxInflight: 1, maxConcurrentDeliveries: 3 });
-  const plain = bus.subscribe('plain', () => {});
   bus.publish('t', { n: 1 });
   bus.publish('t', { n: 2 });
   await flush();
@@ -108,8 +115,6 @@ test('setMaxInflight rejects unknown, uncapped, and illegal revisions fail-close
 
   assert.throws(() => bus.setMaxInflight('', 2), RangeError);
   assert.throws(() => bus.setMaxInflight('no-such-sub', 2), RangeError);
-  assert.throws(() => bus.setMaxInflight(plain.id, 2), RangeError);
-  assert.throws(() => bus.setMaxInflight(plain.id, null), RangeError);
   assert.throws(() => bus.setMaxInflight(sub.id, 0), RangeError);
   assert.throws(() => bus.setMaxInflight(sub.id, -1), RangeError);
   assert.throws(() => bus.setMaxInflight(sub.id, 1.5), RangeError);
