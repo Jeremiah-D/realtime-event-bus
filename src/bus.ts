@@ -37900,12 +37900,23 @@ export class EventBus {
   }
 
   /**
-   * Revises one dedup-enabled subscriber's exactly-once window
-   * (EB-295) without re-subscribing:
+   * Revises — or enables (EB-536) — one subscriber's exactly-once
+   * window (EB-295) without re-subscribing:
    * `setDeduplicateMessages(subId, { windowMs?, maxEntries? })`
    * retunes how long a delivered `messageId` stays remembered and
    * how many identities the window holds (see
-   * `SubscribeOptions.deduplicateMessages`, EB-70).
+   * `SubscribeOptions.deduplicateMessages`, EB-70). Passing `true`
+   * — or an object patch — on a subscription that never opted into
+   * `deduplicateMessages` enables it live: `true` resolves through
+   * the subscribe-time rule (`resolveDeduplicateMessagesOptions`),
+   * so missing fields fall back to the live bus default (EB-502),
+   * then to the publish-side idempotency window / `10_000` — exactly
+   * the `true` / `{}` a subscriber would get at subscribe time. The
+   * enable builds a fresh empty table, so a `messageId` delivered
+   * before the enable is not retro-suppressed, and it carries no
+   * `consumerId` — the revision type has none — so nothing is
+   * journaled and a restart restores the un-enabled state. `null`
+   * on a never-enabled subscriber is a silent no-op with no audit.
    *
    * Only `dedup.windowMs` / `dedup.maxEntries` move: the
    * `consumerId` and the recorded `(topic, messageId)` table are
@@ -37922,8 +37933,7 @@ export class EventBus {
    * `maxEntries` evicts the oldest entries down to the new bound
    * on the next arrival's bounded-eviction loop.
    *
-   * Fail-closed: an unknown subscriber id, a subscription that
-   * never opted into `deduplicateMessages`, a non-object revision,
+   * Fail-closed: an unknown subscriber id, a non-object revision,
    * and an illegal value all throw `RangeError` with the live
    * window, the table, and the audit log untouched. Validation
    * reuses the subscribe-time rule (`resolveDeduplicateMessagesOptions`:
@@ -37936,19 +37946,19 @@ export class EventBus {
    * as they were. A revision that provides neither field, and a
    * revision identical to the current window, are both no-ops with
    * no audit. Audited as `deduplicate_messages_revised`
-   * (`{ windowMs: <number>, oldWindowMs: <number>, maxEntries:
-   * <number>, oldMaxEntries: <number> }`).
+   * (`{ windowMs: <number>, oldWindowMs: <number | null>, maxEntries:
+   * <number>, oldMaxEntries: <number | null> }` — the old side is
+   * `null` when the call freshly enables dedup).
    *
    * Orthogonal to EB-70 (that is the dedup mechanism itself — the
    * window, the suppression, the journal — this its window/bound
    * revision), and to EB-279 (that retunes the ack-sampling
    * window, this the dedup window).
    *
-   * Throws `RangeError` for an unknown subscriber, a subscriber
-   * without dedup enabled, a non-object revision, or an illegal
-   * `windowMs` / `maxEntries`.
+   * Throws `RangeError` for an unknown subscriber, a non-object
+   * revision, or an illegal `windowMs` / `maxEntries`.
    */
-  setDeduplicateMessages(subId: string, opts: DeduplicateMessagesRevision): void {
+  setDeduplicateMessages(subId: string, opts: DeduplicateMessagesRevision | true | null): void {
     if (typeof subId !== 'string' || subId.length === 0) {
       throw new RangeError('setDeduplicateMessages: subId must be a non-empty string');
     }
@@ -37956,12 +37966,51 @@ export class EventBus {
     if (subscriber == null) {
       throw new RangeError(`setDeduplicateMessages: unknown subscriber: ${subId}`);
     }
+    // An absent revision asks nothing to move — on a never-enabled
+    // subscriber too (EB-536: `null` there is a silent no-op).
+    if (opts == null) {
+      return;
+    }
     const dedup = subscriber.dedup;
     if (dedup === undefined) {
-      throw new RangeError('setDeduplicateMessages: subscriber has no deduplicateMessages enabled');
-    }
-    // An absent revision asks nothing to move.
-    if (opts == null) {
+      // EB-536: enabling dedup on a never-enabled subscriber. `true`
+      // and an object patch both resolve through the subscribe-time
+      // rule (`resolveDeduplicateMessagesOptions`): missing fields
+      // fall back to the live bus default, then to the publish-side
+      // idempotency window / 10000 — exactly the `true` / `{}` a
+      // subscriber would get at subscribe time. Only `windowMs` /
+      // `maxEntries` are passed in, so the enable carries no
+      // `consumerId` and journals nothing. The fresh empty table
+      // means messageIds delivered before the enable are not
+      // retro-suppressed: only arrivals after the enable are
+      // recorded, and a restart restores the un-enabled state.
+      if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
+        throw new RangeError(
+          'setDeduplicateMessages: revision must be an object with windowMs and/or maxEntries, true to enable, or null',
+        );
+      }
+      const resolved = resolveDeduplicateMessagesOptions(
+        opts === true ? true : { windowMs: opts.windowMs, maxEntries: opts.maxEntries },
+        this.idempotencyWindowMs,
+        this.durableLog != null,
+        this.defaultDeduplicateMessages,
+      );
+      if (resolved === undefined) {
+        throw new RangeError('setDeduplicateMessages: revision must be an object with windowMs and/or maxEntries');
+      }
+      subscriber.dedup = resolved;
+      this.auditSubscription({
+        action: 'deduplicate_messages_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: {
+          windowMs: resolved.windowMs,
+          oldWindowMs: null,
+          maxEntries: resolved.maxEntries,
+          oldMaxEntries: null,
+        },
+      });
       return;
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {

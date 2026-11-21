@@ -35,18 +35,21 @@ const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const freshDir = () => mkdtempSync(join(tmpdir(), 'eb-deduprev-'));
 
-test('setDeduplicateMessages rejects unknown, empty, and non-dedup subscribers fail-closed', async () => {
+test('setDeduplicateMessages rejects unknown, empty, and non-object revisions fail-closed', async () => {
   const bus = new EventBus();
   const sub = bus.subscribe('t', () => {}, { deduplicateMessages: true });
   const plain = bus.subscribe('t2', () => {});
   for (const bad of [
     () => bus.setDeduplicateMessages('no-such-sub', { windowMs: 100 }),
     () => bus.setDeduplicateMessages('', { windowMs: 100 }),
-    () => bus.setDeduplicateMessages(plain.id, { windowMs: 100 }),
-    () => bus.setDeduplicateMessages(plain.id, { maxEntries: 5 }),
+    // EB-536: an object patch on a never-enabled subscriber enables
+    // dedup instead of throwing — the enable is covered by
+    // `deduplicate-messages-enable.test.ts`, not rejected here.
     () => bus.setDeduplicateMessages(sub.id, 'x' as never),
     () => bus.setDeduplicateMessages(sub.id, 5 as never),
     () => bus.setDeduplicateMessages(sub.id, [] as never),
+    () => bus.setDeduplicateMessages(plain.id, 'x' as never),
+    () => bus.setDeduplicateMessages(plain.id, 5 as never),
   ]) {
     assert.throws(bad, RangeError);
   }

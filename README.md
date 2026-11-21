@@ -4242,12 +4242,19 @@ library.
   `getStats().dedupDropped` (per topic and global) and exported as
   `eventbus_dedup_dropped_messages_total`. The window is revisable
   without re-subscribing (EB-295, via
-  `setDeduplicateMessages(subId, { windowMs?, maxEntries? })`): only a
-  subscription that opted into `deduplicateMessages` can be retuned — a
-  never-opted-in subscription throws `RangeError`, as does any value
-  that fails the subscribe-time rule (`windowMs` a positive finite
-  number, `maxEntries` a positive integer); only the fields provided
-  move, and an illegal value leaves both live values untouched. Only
+  `setDeduplicateMessages(subId, { windowMs?, maxEntries? })`): a
+  subscription that opted into `deduplicateMessages` is retuned, and
+  (EB-536) a never-opted-in subscription is enabled live instead of
+  refusing — `true` or an object patch resolves through the
+  subscribe-time rule (bus default, then the publish-side idempotency
+  window / `10_000`), builds a fresh empty table (messageIds
+  delivered before the enable are not retro-suppressed), and carries
+  no `consumerId`, so nothing is journaled and a restart restores the
+  un-enabled state; `null` on a never-enabled subscriber is a silent
+  no-op. Any value that fails the subscribe-time rule (`windowMs` a
+  positive finite number, `maxEntries` a positive integer) throws
+  `RangeError`; only the fields provided move, and an illegal value
+  leaves both live values untouched. Only
   the window and the bound move: the `consumerId` and the recorded
   `(topic, messageId)` table are untouched — entries already seen stay
   seen — and the new values govern from the next arrival, which reads
@@ -4258,7 +4265,7 @@ library.
   provides neither field, and one identical to the current window, are
   no-ops with no audit. Every success is audited as
   `deduplicate_messages_revised`
-  (`{ windowMs: <number>, oldWindowMs: <number>, maxEntries: <number>, oldMaxEntries: <number> }`).
+  (`{ windowMs: <number>, oldWindowMs: <number | null>, maxEntries: <number>, oldMaxEntries: <number | null> }` — the old side is `null` on an enable).
   (Real-time systems: dedup window governance.)
 - **Per-key publish-order delivery** (in `src/bus.ts`, via
   `publish(topic, payload, { key })` — also on batch/atomic/delayed/idempotent
@@ -5371,7 +5378,7 @@ npm test
   the alert latch, the threshold, and the recovery depth untouched, same-value
   revisions as no-ops with no audit, and the audit presence exact.
 - `test/deduplicate-messages-revision.test.ts` — subscriber dedup window revision (EB-295):
-  `setDeduplicateMessages` fail-closed preconditions (unknown / empty / non-dedup subscriber,
+  `setDeduplicateMessages` fail-closed preconditions (unknown / empty subscriber,
   non-object revision, invalid `windowMs` / `maxEntries`, one illegal field vetoing the whole
   revision) with the live window and the audit log untouched, shrinking the window expiring
   entries past the new horizon on the next arrival, widening it extending recorded entries,
@@ -5379,6 +5386,16 @@ npm test
   moving only the provided field, re-affirming the current window or revising nothing as a
   no-op with no audit, and a revision keeping the `consumerId` and the recorded entries (the
   durable `__dedup.jsonl` journal keeps writing under the same identity).
+- `test/deduplicate-messages-enable.test.ts` — subscriber dedup live enable (EB-536):
+  `true` enabling with the subscribe-time defaults (in-window duplicates suppressed,
+  out-of-window delivered), an object patch resolving missing fields from the bus default
+  and the publish-side window, pre-enable deliveries not retro-suppressed (fresh empty
+  table), post-enable arrivals bound by the new window and bound, `null` on a never-enabled
+  subscriber as a silent no-op, unknown / non-object enables throwing `RangeError`, illegal
+  enable values leaving dedup off, partial revisions after the enable still merging live
+  values, re-affirming the enabled window as a no-op, the enable audit recording a `null`
+  previous with actor `system`, the enable carrying no `consumerId` (no `__dedup.jsonl`
+  written), and the live enable gone after a restart.
 - `test/metrics.test.ts` — bus-level `delivered`/`dropped`/`throttled`/
   `expired`/`rejected` counters (drop-oldest sheds, throttle sheds,
   TTL expiry, schema rejection), `renderPrometheus` exposition output
