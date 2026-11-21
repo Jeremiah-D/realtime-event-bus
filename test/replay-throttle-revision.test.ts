@@ -176,30 +176,33 @@ describe('replay throttle revision (EB-448)', () => {
     assert.deepEqual(received, [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
     assert.equal(bus.getStats().replayThrottled, 0);
     // The gate is the live config, not the history: a cleared
-    // throttle cannot be retuned until the subscription opts in again.
-    assert.throws(() => bus.setReplayThrottle(sub.id, { messagesPerSec: 5 }), RangeError);
+    // throttle can be enabled again (EB-534) — the clear is not
+    // terminal, and the fresh enable is audited with oldThrottle null.
+    bus.setReplayThrottle(sub.id, { messagesPerSec: 5 });
+    assert.deepEqual(throttleRevisionAudits(bus)[1].detail, {
+      throttle: { messagesPerSec: 5, burst: 5 },
+      oldThrottle: null,
+    });
     bus.destroy?.();
   });
 
-  it('unknown, empty, never-configured, and illegal values throw RangeError with the live throttle untouched', async () => {
+  it('unknown, empty, and illegal values throw RangeError with the live throttle untouched', async () => {
     const { bus, sub, received, clock } = busWithThrottle();
     await flush();
     await drainThrottled(bus, clock, received, 5);
     assert.deepEqual(received, [0, 1, 2, 3, 4]);
 
-    // No throttle at all: a plain subscription, and a resume replay
-    // that ran unthrottled — retuning a throttle nobody configured is
-    // a different decision from retuning an existing one.
-    const plain = bus.subscribe('plain', () => {});
-    const unthrottled = bus.subscribe('unthr', () => {}, { resumeFromSeq: 0 });
-    await flush();
+    // A never-configured subscription is no longer refused here: it
+    // can be enabled live (EB-534) — see
+    // test/replay-throttle-enable.test.ts.
     const bad = (value: unknown) =>
       assert.throws(() => bus.setReplayThrottle(sub.id, value as never), RangeError);
     assert.throws(() => bus.setReplayThrottle('', { messagesPerSec: 5 }), RangeError);
     assert.throws(() => bus.setReplayThrottle('no-such-sub', { messagesPerSec: 5 }), RangeError);
-    assert.throws(() => bus.setReplayThrottle(plain.id, { messagesPerSec: 5 }), RangeError);
-    assert.throws(() => bus.setReplayThrottle(unthrottled.id, { messagesPerSec: 5 }), RangeError);
     bad({});
+    // `true` only enables a never-configured subscription; as a
+    // revision of an existing throttle it is refused.
+    bad(true);
     bad({ messagesPerSec: 0 });
     bad({ messagesPerSec: -1 });
     bad({ messagesPerSec: Number.NaN });

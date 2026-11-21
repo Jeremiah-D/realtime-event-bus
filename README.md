@@ -910,7 +910,15 @@ library.
   the next pass — the pass in flight keeps the bucket it started with —
   and `null` clears back to unpaced replay; only subscriptions that
   opted into `replayThrottle` can be revised, and a revision is audited
-  as `replay_throttle_revised`. Hot topics
+  as `replay_throttle_revised`. A subscription that never opted in can
+  be enabled live with the same method (EB-534): `setReplayThrottle(subId,
+  { messagesPerSec, burst? } | true, actor?)` throttles from the next
+  pass — `true` enables the 1000 msgs/sec default, an object patch must
+  set `messagesPerSec` (`burst` defaults to `ceil(messagesPerSec)`), and
+  enabling requires a durable log (otherwise `RangeError`); `null` on a
+  never-throttled subscription is a silent no-op, and a `null` clear can
+  be followed by a fresh enable. An enable is audited as
+  `replay_throttle_revised` with `oldThrottle: null`. Hot topics
   compact automatically (`durableLogMaxEntriesPerTopic`, default 10000,
   amortized rewrite at 2x). Opt-in time-based retention
   (`durableLogMaxAgeMs`, EB-85): records older than `now - maxAgeMs` (bus

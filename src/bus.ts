@@ -40160,8 +40160,8 @@ export class EventBus {
   }
 
   /**
-   * Revises one throttled subscriber's durable-log replay throttle
-   * (EB-448) without re-subscribing: `setReplayThrottle(subId,
+   * Revises — or enables (EB-534) — one subscriber's durable-log
+   * replay throttle (EB-448) without re-subscribing: `setReplayThrottle(subId,
    * throttle, actor?)` retunes the admission rate of the next replay
    * pass (see `SubscribeOptions.replayThrottle`, EB-164) — the only
    * way to move the pacing after subscribe time: today a large seek /
@@ -40184,33 +40184,47 @@ export class EventBus {
    * The progress observer (EB-443), the progress interval (EB-447),
    * and the replay state are untouched.
    *
-   * Fail-closed: a closed bus (EB-154), an unknown subscriber id, a
-   * subscription that never opted into `replayThrottle` (enabling
-   * throttling on a never-throttled subscription is a different
-   * decision — this revision only retunes an existing throttle), and
-   * an illegal patch (anything but an object with at least one of
-   * `messagesPerSec` / `burst`, or a merged value that fails the
+   * Enabling (EB-534): a subscription that never opted into
+   * `replayThrottle` at subscribe time can be throttled live — the
+   * same method, the other half of the decision. Passing `true`
+   * enables the subscribe-time default (`{ messagesPerSec: 1000,
+   * burst: 1000 }`); an object patch enables at its rate, but with no
+   * live value to merge against it must set `messagesPerSec` (`burst`
+   * defaults to `ceil(messagesPerSec)`), and `null` on a
+   * never-throttled subscription is a silent no-op with no audit.
+   * Enabling requires a durable log: a subscriber on a bus with no
+   * `durableLogDir` can never reach a replay pass, so enabling there
+   * would silently never engage — it throws `RangeError` instead.
+   * A `null` clear can be followed by a fresh enable. An enable is
+   * audited the same way as a revision, with `oldThrottle: null`.
+   *
+   * Fail-closed: a closed bus (EB-154), an unknown subscriber id, an
+   * enable on a subscriber with no durable log, and an illegal patch
+   * (anything but an object with at least one of `messagesPerSec` /
+   * `burst` — `messagesPerSec` required when enabling, since there is
+   * no live value to merge — or a merged value that fails the
    * subscribe-time gate — `messagesPerSec` a finite number > 0,
    * `burst` a finite number >= 1) all throw `RangeError` with the
    * live throttle, the replay state, and the audit log untouched. A
    * revision identical to the live throttle is a no-op with no audit.
    * Audited as `replay_throttle_revised`
    * (`{ throttle: { messagesPerSec, burst } | null,
-   * oldThrottle: { messagesPerSec, burst } }`).
+   * oldThrottle: { messagesPerSec, burst } | null }` — `null` when
+   * enabling a never-throttled subscription).
    *
    * Orthogonal to EB-164 (that is the throttling mechanism itself,
-   * this its live revision), to EB-443 (that the progress observer —
+   * this its live revision and enable), to EB-443 (that the progress observer —
    * this the pacing of the same replay), to EB-447 (that the progress
    * interval — this the rate), to EB-71 (progress observation), and
    * to `seek` / `seekGroupOffsets` / `requestMissingReplay` (that own
    * the trigger — this the pacing of the pass they start).
    *
-   * Throws `RangeError` for a closed bus, an unknown subscriber, a
-   * subscription with no replay throttle, or an illegal patch value.
+   * Throws `RangeError` for a closed bus, an unknown subscriber, an
+   * enable with no durable log, or an illegal patch value.
    */
   setReplayThrottle(
     subId: string,
-    throttle: { messagesPerSec?: number; burst?: number } | null,
+    throttle: { messagesPerSec?: number; burst?: number } | true | null,
     actor = 'system',
   ): void {
     // Fail-fast on a closed bus (EB-154, along
@@ -40228,7 +40242,67 @@ export class EventBus {
       throw new RangeError(`setReplayThrottle: unknown subscriber: ${subId}`);
     }
     if (subscriber.replayThrottleCfg === undefined) {
-      throw new RangeError('setReplayThrottle: subscriber has no replay throttle configured');
+      // EB-534: enabling throttling on a never-throttled subscription.
+      // `null` here is a silent no-op (along EB-531/532 "clearing a
+      // cleared value"): there is nothing to clear and nothing to
+      // audit — the gate is the live config, not the history.
+      if (throttle === null) {
+        return;
+      }
+      // Resolve the enable value first: `true` takes the
+      // subscribe-time default, and an object patch must set
+      // `messagesPerSec` — there is no live value to merge against —
+      // with `burst` defaulting to `ceil(messagesPerSec)` (along
+      // `validateReplayThrottleOptions`).
+      let next: { messagesPerSec: number; burst: number };
+      if (throttle === true) {
+        next = {
+          messagesPerSec: REPLAY_THROTTLE_DEFAULT_MESSAGES_PER_SEC,
+          burst: REPLAY_THROTTLE_DEFAULT_MESSAGES_PER_SEC,
+        };
+      } else {
+        if (typeof throttle !== 'object') {
+          throw new RangeError(
+            'setReplayThrottle: throttle must be an object with messagesPerSec, true, or null',
+          );
+        }
+        if (throttle.messagesPerSec === undefined) {
+          throw new RangeError(
+            'setReplayThrottle: throttle must set messagesPerSec when enabling replay throttle',
+          );
+        }
+        if (!Number.isFinite(throttle.messagesPerSec) || throttle.messagesPerSec <= 0) {
+          throw new RangeError('setReplayThrottle: messagesPerSec must be a finite number > 0');
+        }
+        const burst =
+          throttle.burst === undefined
+            ? Math.max(1, Math.ceil(throttle.messagesPerSec))
+            : throttle.burst;
+        if (!Number.isFinite(burst) || burst < 1) {
+          throw new RangeError('setReplayThrottle: burst must be a finite number >= 1');
+        }
+        next = { messagesPerSec: throttle.messagesPerSec, burst };
+      }
+      // Enabling only engages on a durable-log replay, so a
+      // subscriber with no durable log to replay from can never reach
+      // a throttled pass — fail closed, along the subscribe-time
+      // gate's "otherwise it would silently never engage". The log
+      // is the same fallback the replay paths use
+      // (`subscriber.durableLog ?? this.durableLog`): the
+      // subscriber-level log is only set for namespaced subscriptions,
+      // so the bus root log is what a plain subscriber replays from.
+      if ((subscriber.durableLog ?? this.durableLog) === undefined) {
+        throw new RangeError('setReplayThrottle: enabling replay throttle requires a durable log');
+      }
+      subscriber.replayThrottleCfg = next;
+      this.auditSubscription({
+        action: 'replay_throttle_revised',
+        actor,
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { throttle: { ...next }, oldThrottle: null },
+      });
+      return;
     }
     // Validate before touching anything: `null` clears back to
     // unpaced replay; anything else must be an object with at least
@@ -40238,8 +40312,8 @@ export class EventBus {
     const oldThrottle = subscriber.replayThrottleCfg;
     if (throttle === null) {
       // Re-affirming an already-cleared throttle is impossible here:
-      // the gate above refuses a subscriber with no throttle at all,
-      // so a clear is always a real change.
+      // the enable branch above returns early for a subscriber with
+      // no throttle at all, so a clear is always a real change.
       subscriber.replayThrottleCfg = undefined;
       this.auditSubscription({
         action: 'replay_throttle_revised',
