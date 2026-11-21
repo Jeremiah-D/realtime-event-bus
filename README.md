@@ -164,15 +164,21 @@ library.
   subscriber without re-subscribing — `setDeadLetterAutoReplay(subId,
   patch)` (EB-367) moves only the fields present (`initialDelayMs` /
   `maxDelayMs` / `backoffMultiplier` / `maxAutoReplayAttempts`); passing
-  `null` clears auto-replay outright, and a revision after a clear is
-  refused until the subscriber opts in again at subscribe time. Raising
+  `null` clears auto-replay outright, and a `null` clear can be followed
+  by a fresh enable (EB-535): passing `true` — or an object patch — on a
+  subscriber that never enabled auto-replay enables it, `true` resolving
+  to the factory defaults (`1000` / `60000` / `2` / `3`) and an object
+  resolving its missing fields against the same defaults, while `null`
+  on a never-enabled subscriber is a silent no-op. An enable only arms
+  dead-letterings after it — entries already in the DLQ are not
+  retro-armed — and auto-replay still bypasses the approval gate. Raising
   `maxAutoReplayAttempts` rescues a message at the poison edge, lowering
   it (including to `0`) poisons on the next dead-lettering once the
   carried attempt count reaches the new max, and the delay fields only
   shape the next arming — an already-armed timer keeps the delay it was
   armed with and still fires once after a clear. Revisions are audited
   as `dead_letter_auto_replay_revised` (actor `system`, new value `null`
-  on a clear); passing the current values is a no-op with no audit.
+  on a clear, old value `null` on a fresh enable); passing the current values is a no-op with no audit.
   A bus-level default covers new subscribers —
   `setDefaultDeadLetterAutoReplay(autoReplay)` (EB-532) installs the
   `autoReplay` future reliable subscribers that opt into `deadLetter`

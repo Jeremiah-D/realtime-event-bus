@@ -33,7 +33,7 @@ test('setDeadLetterAutoReplay rejects unknown, non-reliable, DLQ-less subscriber
   );
 });
 
-test('setDeadLetterAutoReplay refuses a subscriber whose deadLetter never enabled autoReplay', () => {
+test('setDeadLetterAutoReplay on a subscriber whose deadLetter never enabled autoReplay enables it, and null is a silent no-op', () => {
   const bus = new EventBus();
   const sub = bus.subscribeReliable(
     't',
@@ -46,15 +46,34 @@ test('setDeadLetterAutoReplay refuses a subscriber whose deadLetter never enable
     { ackTimeoutMs: 1000, deadLetter: { maxRedeliveries: 0, autoReplay: false } },
   );
 
-  assert.throws(() => bus.setDeadLetterAutoReplay(sub.id, { initialDelayMs: 5 }), RangeError);
-  assert.throws(() => bus.setDeadLetterAutoReplay(sub.id, null), RangeError);
-  assert.throws(() => bus.setDeadLetterAutoReplay(disabled.id, { initialDelayMs: 5 }), RangeError);
-  assert.throws(() => bus.setDeadLetterAutoReplay(disabled.id, null), RangeError);
+  // `null` on a never-enabled subscriber is a silent no-op: no audit,
+  // and the subscriber stays without auto-replay.
+  bus.setDeadLetterAutoReplay(sub.id, null);
+  bus.setDeadLetterAutoReplay(disabled.id, null);
   assert.equal(
     bus.getSubscriptionAudit({ action: 'dead_letter_auto_replay_revised' }).length,
     0,
-    'no failed revision is audited',
+    'null on a never-enabled subscriber audits nothing',
   );
+
+  // An object patch enables it, resolving missing fields against the
+  // subscribe-time factory defaults, and audits with oldAutoReplay null.
+  bus.setDeadLetterAutoReplay(sub.id, { initialDelayMs: 5 });
+  let audit = bus.getSubscriptionAudit({ action: 'dead_letter_auto_replay_revised' });
+  assert.equal(audit.length, 1);
+  assert.deepEqual(audit[0].detail, {
+    autoReplay: { initialDelayMs: 5, maxDelayMs: 60000, backoffMultiplier: 2, maxAutoReplayAttempts: 3 },
+    oldAutoReplay: null,
+  });
+
+  // `true` enables with the factory defaults outright.
+  bus.setDeadLetterAutoReplay(disabled.id, true);
+  audit = bus.getSubscriptionAudit({ action: 'dead_letter_auto_replay_revised' });
+  assert.equal(audit.length, 2);
+  assert.deepEqual(audit[1].detail, {
+    autoReplay: { initialDelayMs: 1000, maxDelayMs: 60000, backoffMultiplier: 2, maxAutoReplayAttempts: 3 },
+    oldAutoReplay: null,
+  });
 });
 
 test('setDeadLetterAutoReplay illegal values are fail-closed', () => {
@@ -362,7 +381,7 @@ test('setDeadLetterAutoReplay null does not cancel an already-armed replay timer
   assert.equal(bus.getStats().autoReplayed, 1);
 });
 
-test('setDeadLetterAutoReplay after a null clear is refused until subscribe-time opt-in', async () => {
+test('setDeadLetterAutoReplay after a null clear can be enabled again', async () => {
   const bus = new EventBus();
   const sub = bus.subscribeReliable(
     't',
@@ -370,20 +389,26 @@ test('setDeadLetterAutoReplay after a null clear is refused until subscribe-time
     { ackTimeoutMs: 1000, deadLetter: { maxRedeliveries: 0, autoReplay: true } },
   );
   bus.setDeadLetterAutoReplay(sub.id, null);
-  assert.throws(() => bus.setDeadLetterAutoReplay(sub.id, { initialDelayMs: 5 }), RangeError);
-  assert.throws(() => bus.setDeadLetterAutoReplay(sub.id, null), RangeError);
-  assert.equal(
-    bus.getSubscriptionAudit({ action: 'dead_letter_auto_replay_revised' }).length,
-    1,
-    'only the clear itself was audited',
-  );
+  // A fresh enable after the clear: audits with oldAutoReplay null.
+  bus.setDeadLetterAutoReplay(sub.id, { initialDelayMs: 30, maxAutoReplayAttempts: 1 });
+  const audit = bus.getSubscriptionAudit({ action: 'dead_letter_auto_replay_revised' });
+  assert.equal(audit.length, 2);
+  assert.deepEqual(audit[1].detail, {
+    autoReplay: { initialDelayMs: 30, maxDelayMs: 60000, backoffMultiplier: 2, maxAutoReplayAttempts: 1 },
+    oldAutoReplay: null,
+  });
 
-  // Clearing also leaves the DLQ functional: a message still
-  // dead-letters, just without auto-replay.
+  // A message dead-lettered after the re-enable auto-replays and
+  // poisons once its single attempt is spent.
   bus.publish('t', 'x');
-  await sleep(50);
+  await flush();
   assert.equal(bus.getDeadLetterMessages(sub.id).length, 1);
-  assert.equal(bus.getDeadLetterMessages(sub.id)[0].poisoned, false);
+  await sleep(120);
+  await flush();
+  assert.equal(bus.getDeadLetterMessages(sub.id)[0].poisoned, true);
+  assert.equal(bus.getDeadLetterMessages(sub.id)[0].autoReplayAttempts, 1);
+  assert.equal(bus.getStats().autoReplayed, 1);
+  assert.equal(bus.getStats().poisoned, 1);
 });
 
 test('setDeadLetterAutoReplay same values are a no-op with no audit', () => {

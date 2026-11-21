@@ -40897,8 +40897,17 @@ export class EventBus {
    * — without re-subscribing. Only the fields present in `patch` move;
    * the rest keep their live values. Passing `null` clears auto-replay
    * outright (along `setRetryLadder` / `setRedeliveryBackoff`), and a
-   * revision after a clear is refused until the subscriber opts in
-   * again at subscribe time (along EB-359).
+   * `null` clear can be followed by a fresh enable (EB-535) — the
+   * EB-359 "a clear is terminal" rule no longer applies to this
+   * method. Passing `true` — or an object patch — on a subscriber
+   * whose `deadLetter` never enabled `autoReplay` enables it:
+   * `true` resolves to the subscribe-time factory defaults
+   * (`{ 1000, 60000, 2, 3 }`), an object resolves its missing fields
+   * against the same defaults, and `null` on a never-enabled
+   * subscriber is a silent no-op with no audit. An enable only arms
+   * dead-letterings after it: entries already in the DLQ are not
+   * retro-armed, never resurrected, and still replay manually via
+   * `replayDeadLetter`.
    *
    * The four values are read live at every dead-lettering, so the
    * revision takes effect on the next dead-lettering with no message,
@@ -40921,8 +40930,7 @@ export class EventBus {
    * - A replayed message still takes a fresh redelivery budget.
    *
    * Fail-closed: an unknown subscriber id, a non-reliable subscriber,
-   * a reliable subscriber with no `deadLetter` configured, a reliable
-   * subscriber whose `deadLetter` never enabled `autoReplay`, and an
+   * a reliable subscriber with no `deadLetter` configured, and an
    * illegal value — `initialDelayMs` must be a non-negative finite
    * number, `maxDelayMs` a positive finite number, `backoffMultiplier`
    * a finite number >= 1, `maxAutoReplayAttempts` a non-negative
@@ -40932,7 +40940,8 @@ export class EventBus {
    * four fields is a no-op with no audit. Audited as
    * `dead_letter_auto_replay_revised`
    * (`{ autoReplay, oldAutoReplay }`, `null` on the new side meaning
-   * "auto-replay cleared") on success.
+   * "auto-replay cleared" and `null` on the old side meaning
+   * "auto-replay freshly enabled") on success.
    *
    * Orthogonal to EB-134 (the auto-replay mechanism itself — this
    * revises its parameters live), to EB-365 (the dead-letter budget /
@@ -40940,15 +40949,18 @@ export class EventBus {
    * dead-lettering), to EB-270 (the pre-DLQ retry ladder — this is the
    * post-DLQ auto-replay), to EB-238 (the operator replay rate limit
    * — this is the automatic replay), to EB-233 (the replay approval
-   * gate — automatic replays bypass approval), and to EB-145 (the DLQ
-   * entry TTL — an expired entry is never resurrected by a replay).
+   * gate — automatic replays bypass approval), to EB-145 (the DLQ
+   * entry TTL — an expired entry is never resurrected by a replay),
+   * and to EB-532 (the bus-level default auto-replay — that covers
+   * new subscribers, this enables one that is already subscribed).
    *
-   * Throws `RangeError` for an unknown / non-reliable / DLQ-less /
-   * auto-replay-less subscriber or an illegal auto-replay value.
+   * Throws `RangeError` for an unknown / non-reliable / DLQ-less
+   * subscriber, a non-object non-`true` patch, or an illegal
+   * auto-replay value.
    */
   setDeadLetterAutoReplay(
     subId: string,
-    patch: DeadLetterAutoReplayRevision | null,
+    patch: DeadLetterAutoReplayRevision | true | null,
   ): void {
     if (typeof subId !== 'string' || subId.length === 0) {
       throw new RangeError('setDeadLetterAutoReplay: subId must be a non-empty string');
@@ -40966,7 +40978,53 @@ export class EventBus {
     }
     const oldAutoReplay = dlq.autoReplay;
     if (oldAutoReplay == null) {
-      throw new RangeError('setDeadLetterAutoReplay: subscriber has no deadLetter.autoReplay enabled');
+      // EB-535 enable: the subscriber never enabled auto-replay, or it
+      // was cleared. `null` is a silent no-op; `true` resolves to the
+      // subscribe-time factory defaults; an object resolves its missing
+      // fields against those same defaults. Only dead-letterings after
+      // the enable arm a replay — `moveToDeadLetter` reads the live
+      // `dlq.autoReplay` at dead-lettering time, so entries already in
+      // the DLQ are never retro-armed.
+      if (patch === null) {
+        return;
+      }
+      if (patch !== true && typeof patch !== 'object') {
+        throw new RangeError(
+          'setDeadLetterAutoReplay: patch must be a DeadLetterAutoReplayRevision object, true to enable auto-replay with the defaults, or null to clear auto-replay',
+        );
+      }
+      const aro: AutoReplayOptions = patch === true ? {} : patch;
+      const enableInitialDelayMs = aro.initialDelayMs ?? 1000;
+      const enableMaxDelayMs = aro.maxDelayMs ?? 60000;
+      const enableBackoffMultiplier = aro.backoffMultiplier ?? 2;
+      const enableMaxAutoReplayAttempts = aro.maxAutoReplayAttempts ?? 3;
+      if (!Number.isFinite(enableInitialDelayMs) || enableInitialDelayMs < 0) {
+        throw new RangeError('setDeadLetterAutoReplay: initialDelayMs must be a non-negative finite number');
+      }
+      if (!Number.isFinite(enableMaxDelayMs) || enableMaxDelayMs <= 0) {
+        throw new RangeError('setDeadLetterAutoReplay: maxDelayMs must be a positive finite number');
+      }
+      if (!Number.isFinite(enableBackoffMultiplier) || enableBackoffMultiplier < 1) {
+        throw new RangeError('setDeadLetterAutoReplay: backoffMultiplier must be a finite number >= 1');
+      }
+      if (!Number.isInteger(enableMaxAutoReplayAttempts) || enableMaxAutoReplayAttempts < 0) {
+        throw new RangeError('setDeadLetterAutoReplay: maxAutoReplayAttempts must be a non-negative integer');
+      }
+      const enabledAutoReplay = {
+        initialDelayMs: enableInitialDelayMs,
+        maxDelayMs: enableMaxDelayMs,
+        backoffMultiplier: enableBackoffMultiplier,
+        maxAutoReplayAttempts: enableMaxAutoReplayAttempts,
+      };
+      dlq.autoReplay = enabledAutoReplay;
+      this.auditSubscription({
+        action: 'dead_letter_auto_replay_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { autoReplay: { ...enabledAutoReplay }, oldAutoReplay: null },
+      });
+      return;
     }
     if (patch === null) {
       // Clear: future dead-letterings neither arm a replay nor poison.
@@ -40983,10 +41041,38 @@ export class EventBus {
       });
       return;
     }
+    if (patch === true) {
+      // EB-535: `true` on an already-enabled subscriber resolves to the
+      // factory defaults — a full reset, not a merge. Re-affirming the
+      // factory values is a no-op with no audit.
+      const factoryAutoReplay = {
+        initialDelayMs: 1000,
+        maxDelayMs: 60000,
+        backoffMultiplier: 2,
+        maxAutoReplayAttempts: 3,
+      };
+      if (
+        factoryAutoReplay.initialDelayMs === oldAutoReplay.initialDelayMs &&
+        factoryAutoReplay.maxDelayMs === oldAutoReplay.maxDelayMs &&
+        factoryAutoReplay.backoffMultiplier === oldAutoReplay.backoffMultiplier &&
+        factoryAutoReplay.maxAutoReplayAttempts === oldAutoReplay.maxAutoReplayAttempts
+      ) {
+        return;
+      }
+      dlq.autoReplay = factoryAutoReplay;
+      this.auditSubscription({
+        action: 'dead_letter_auto_replay_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { autoReplay: { ...factoryAutoReplay }, oldAutoReplay: { ...oldAutoReplay } },
+      });
+      return;
+    }
     // Validate before touching anything: the construction-time rules
     // from `normalizeDeadLetterOptions`, reused rather than restated.
     if (typeof patch !== 'object') {
-      throw new RangeError('setDeadLetterAutoReplay: patch must be a DeadLetterAutoReplayRevision object, or null to clear auto-replay');
+      throw new RangeError('setDeadLetterAutoReplay: patch must be a DeadLetterAutoReplayRevision object, true to enable auto-replay with the defaults, or null to clear auto-replay');
     }
     const { initialDelayMs, maxDelayMs, backoffMultiplier, maxAutoReplayAttempts } = patch;
     if (initialDelayMs !== undefined && (!Number.isFinite(initialDelayMs) || initialDelayMs < 0)) {

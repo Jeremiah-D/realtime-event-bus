@@ -370,8 +370,9 @@ test('EB-532: a revision does not move an already-subscribed config or an alread
 });
 
 test('EB-532: a default-baked subscriber can still be revised per subscriber', async () => {
-  // Per-subscriber null clear: no more replays, and a revision after
-  // the clear is refused.
+  // Per-subscriber null clear: no more replays — but a fresh enable
+  // after the clear is allowed (EB-535), and it only arms
+  // dead-letterings after it.
   const cleared = poisonBus({ defaultAutoReplay: { initialDelayMs: 30, maxAutoReplayAttempts: 3 } });
   cleared.bus.setDeadLetterAutoReplay(cleared.sub.id, null);
   assert.equal(
@@ -387,16 +388,41 @@ test('EB-532: a default-baked subscriber can still be revised per subscriber', a
   await flush();
   assert.equal(cleared.attempts, 1, 'no auto-replay was armed after the per-subscriber clear');
   assert.equal(cleared.bus.getDeadLetterMessages(cleared.sub.id)[0].poisoned, false);
-  assert.throws(
-    () => cleared.bus.setDeadLetterAutoReplay(cleared.sub.id, { initialDelayMs: 5 }),
-    RangeError,
-    'a revision after a clear is refused until subscribe-time opt-in',
-  );
-  assert.throws(() => cleared.bus.setDeadLetterAutoReplay(cleared.sub.id, null), RangeError);
+  // `null` on the cleared subscriber is a silent no-op, not a refusal.
+  cleared.bus.setDeadLetterAutoReplay(cleared.sub.id, null);
   assert.equal(
     cleared.bus.getSubscriptionAudit({ action: 'dead_letter_auto_replay_revised' }).length,
     1,
+    'null on a cleared subscriber audits nothing',
   );
+  // Re-enable after the clear: audits with oldAutoReplay null, and the
+  // entry already in the DLQ is not retro-armed.
+  cleared.bus.setDeadLetterAutoReplay(cleared.sub.id, { initialDelayMs: 30, maxAutoReplayAttempts: 1 });
+  let audit = cleared.bus.getSubscriptionAudit({ action: 'dead_letter_auto_replay_revised' });
+  assert.equal(audit.length, 2);
+  assert.deepEqual(audit[1].detail, {
+    autoReplay: { initialDelayMs: 30, maxDelayMs: 60000, backoffMultiplier: 2, maxAutoReplayAttempts: 1 },
+    oldAutoReplay: null,
+  });
+  await sleep(200);
+  await flush();
+  assert.equal(cleared.attempts, 1, 'an enable never retro-arms entries already in the DLQ');
+  // A message dead-lettered after the enable auto-replays and poisons
+  // once its single attempt is spent. The re-dead-lettering re-inserts
+  // the entry with a fresh seq, so the second entry stays last.
+  cleared.bus.publish('t', 'second');
+  await flush();
+  await flush();
+  assert.equal(cleared.bus.getDeadLetterMessages(cleared.sub.id).length, 2);
+  await sleep(200);
+  await flush();
+  assert.equal(cleared.attempts, 3, 'the publish plus the re-enabled auto-replay');
+  const afterReplay = cleared.bus.getDeadLetterMessages(cleared.sub.id);
+  assert.equal(afterReplay.length, 2);
+  assert.equal(afterReplay[0].poisoned, false, 'the pre-enable entry was never retro-armed');
+  assert.equal(afterReplay[1].poisoned, true);
+  assert.equal(afterReplay[1].autoReplayAttempts, 1);
+  assert.equal(cleared.poisoned.length, 1);
 
   // Per-subscriber partial revision still works on a default-baked
   // subscriber: tightening the budget to 1 poisons after one replay.
