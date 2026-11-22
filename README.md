@@ -11168,21 +11168,29 @@ Semantics:
   ack never cancels a pending rung. Unsubscribing clears armed rungs.
 - **Observability.** `getStats()` exposes `ladderPending` (messages with
   an armed rung) and `ladderAttempts` (cumulative rung deliveries fired).
-- **Revisable after subscribe (EB-270, via
+- **Revisable — and now enableable — after subscribe (EB-270, enable
+  half EB-539, via
   `setRetryLadder(subId, delays | null)`).** Only a reliable subscriber
-  that already opted into a ladder can be revised, and only the ladder
-  instance is replaced (delays are defensively copied): an already-armed
-  rung still fires once on its old delay, and the next rung arms from
-  the new ladder — a degraded pause re-arms the same rung from the live
-  ladder too — while pending rungs, messages, sequences, TTL deadlines,
-  and redelivery counts are untouched. `null` or an empty array clears
-  the ladder back to immediate dead-lettering on budget exhaustion,
-  except that an already-armed rung still fires once and dead-letters
-  on its failure. Fail-closed (unknown, non-reliable, or ladderless
-  subscribers, illegal delays, and `undefined` all throw `RangeError`
-  with the live ladder and audit log untouched, and a revision after a
-  clear is refused); every success is audited as `retry_ladder_revised`
-  (`{ retryLadder: number[] | null, oldRetryLadder: number[] }`).
+  that already opted into a ladder can be revised, and a reliable
+  subscriber that opted into a dead-letter queue without a ladder can
+  gain one live — only the ladder instance is replaced (delays are
+  defensively copied): an already-armed rung still fires once on its
+  old delay, and the next rung arms from the new ladder — a degraded
+  pause re-arms the same rung from the live ladder too — while pending
+  rungs, messages, sequences, TTL deadlines, and redelivery counts are
+  untouched. `null` or an empty array clears the ladder back to
+  immediate dead-lettering on budget exhaustion, except that an
+  already-armed rung still fires once and dead-letters on its failure.
+  A clear is no longer terminal: a later call with a non-empty array
+  installs a fresh ladder, and `null` or an empty array on a subscriber
+  that never had a ladder is a silent no-op with no audit. An enable
+  only arms budget exhaustions after it lands — a message that already
+  dead-lettered while ladderless stays dead-lettered. Fail-closed
+  (unknown, non-reliable, or DLQ-less subscribers, illegal delays, and
+  `undefined` all throw `RangeError` with the live ladder and audit log
+  untouched); every success is audited as `retry_ladder_revised`
+  (`{ retryLadder: number[] | null, oldRetryLadder: number[] | null }`,
+  `null` for `oldRetryLadder` on an enable).
   (Real-time systems: reliable delivery.)
 - **Bus-level default (EB-525, via
   `setDefaultRetryLadder(delays | null)` / `getDefaultRetryLadder()`).**
@@ -11197,7 +11205,7 @@ Semantics:
   keeps the ladder it was baked with, and `setRetryLadder` still
   revises one subscriber at a time without touching the bus default
   (a default-baked subscriber can still be revised per subscriber,
-  and a revision after a clear is still refused). Fail-closed
+  and a clear can still be followed by a fresh enable, EB-539). Fail-closed
   (illegal rungs and `undefined` throw `RangeError` with the live
   default untouched); a re-affirmed default is a silent no-op.
   Every success is audited as `default_retry_ladder_revised`

@@ -229,9 +229,11 @@ test('EB-525: a default-baked subscriber is still revisable per subscriber, and 
   assert.deepEqual(seen, [0, 1, 2], 'the new ladder spaces the second rung');
   assert.equal(bus.getDeadLetterMessages(sub.id).length, 1, 'the spent new ladder dead-letters');
   // Clear the per-subscriber ladder, then move the bus default: the
-  // cleared subscriber must not pick the new default up.
+  // cleared subscriber must not pick the new default up. (EB-539: a
+  // re-enable after the clear is now allowed, so no refusal is
+  // asserted here — the point below is that the default is not
+  // re-applied to a cleared subscriber.)
   bus.setRetryLadder(sub.id, null);
-  assert.throws(() => bus.setRetryLadder(sub.id, [10]), RangeError, 'a revision after a clear is refused');
   bus.setDefaultRetryLadder([50, 50]);
   bus.publish('t', 'doomed');
   await flush();

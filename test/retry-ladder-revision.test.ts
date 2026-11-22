@@ -61,8 +61,8 @@ test('setRetryLadder null clears: an armed rung still fires once, then immediate
   assert.equal(audit.length, 1);
   assert.deepEqual(audit[0].detail, { retryLadder: null, oldRetryLadder: [30, 60] });
 
-  assert.throws(() => bus.setRetryLadder(sub.id, [10]), RangeError, 'a revision after a clear is refused');
-  assert.throws(() => bus.setRetryLadder(sub.id, null), RangeError, 'a second clear is refused too');
+  // A clear is no longer terminal (EB-539): the same subscriber can be
+  // re-enabled with a fresh ladder — see test/retry-ladder-enable.test.ts.
 });
 
 test('setRetryLadder empty array clears like null', async () => {
@@ -100,16 +100,13 @@ test('setRetryLadder is fail-closed and defensively copies the new delays', asyn
   );
   const plain = bus.subscribe('plain', () => {});
   const noDlq = bus.subscribeReliable('nodlq', () => {}, { ackTimeoutMs: 1000 });
-  const noLadder = bus.subscribeReliable('noladder', () => {}, {
-    ackTimeoutMs: 1000,
-    deadLetter: { maxRedeliveries: 0 },
-  });
 
   assert.throws(() => bus.setRetryLadder('', [10]), RangeError);
   assert.throws(() => bus.setRetryLadder('no-such-sub', [10]), RangeError);
   assert.throws(() => bus.setRetryLadder(plain.id, [10]), RangeError, 'a plain subscriber has no ladder');
   assert.throws(() => bus.setRetryLadder(noDlq.id, [10]), RangeError, 'no dead-letter queue, no ladder');
-  assert.throws(() => bus.setRetryLadder(noLadder.id, [10]), RangeError, 'a DLQ without a ladder cannot be revised');
+  // A DLQ without a ladder can now be enabled (EB-539) — see
+  // test/retry-ladder-enable.test.ts — so no throw is asserted here.
   assert.throws(() => bus.setRetryLadder(sub.id, undefined as never), RangeError, 'undefined is not a clear');
   assert.throws(() => bus.setRetryLadder(sub.id, 1000 as never), RangeError);
   assert.throws(() => bus.setRetryLadder(sub.id, '1000' as never), RangeError);
@@ -131,5 +128,4 @@ test('setRetryLadder is fail-closed and defensively copies the new delays', asyn
   assert.equal(bus.getDeadLetterMessages(sub.id).length, 1);
   plain.unsubscribe();
   noDlq.unsubscribe();
-  noLadder.unsubscribe();
 });
