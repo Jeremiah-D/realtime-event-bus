@@ -20,16 +20,23 @@ function sloBus(slo: LagSloOptions, opts?: { now?: () => number }) {
 }
 
 test('setLagSlo fails closed when groupLag.slo is not enabled', () => {
+  // A bus with no `groupLag` at all still refuses (EB-544): the enable
+  // installs an SLO, not a group-lag monitor.
   const plain = new EventBus();
   assert.throws(() => plain.setLagSlo({ maxLagMessages: 5 }), RangeError);
+  assert.throws(() => plain.setLagSlo({ maxLagMs: 100 }), RangeError);
   assert.equal(plain.getSubscriptionAudit({ action: 'lag_slo_revised' }).length, 0);
+});
 
-  // groupLag alerting without an SLO is not an SLO: still refused.
+test('setLagSlo enables the SLO on a bus whose groupLag never opted into one (EB-544)', () => {
+  // groupLag alerting without an SLO is now an enable, not a refusal:
+  // the first call installs the SLO live.
   const lagOnly = new EventBus({ groupLag: { thresholdMessages: 10 } });
-  assert.throws(() => lagOnly.setLagSlo({ maxLagMessages: 5 }), RangeError);
+  lagOnly.setLagSlo({ maxLagMessages: 5 });
+  assert.equal(lagOnly.getSubscriptionAudit({ action: 'lag_slo_revised' }).length, 1);
   const hookOnly = new EventBus({ groupLag: { onGroupLag: () => {} } });
-  assert.throws(() => hookOnly.setLagSlo({ breachSamples: 2 }), RangeError);
-  assert.equal(hookOnly.getSubscriptionAudit({ action: 'lag_slo_revised' }).length, 0);
+  hookOnly.setLagSlo({ maxLagMessages: 5, breachSamples: 2 });
+  assert.equal(hookOnly.getSubscriptionAudit({ action: 'lag_slo_revised' }).length, 1);
 });
 
 test('setLagSlo works when the SLO is configured without a callback', () => {

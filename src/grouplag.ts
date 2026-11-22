@@ -297,6 +297,29 @@ export class LagSloMonitor {
   }
 
   /**
+   * Installs the lag SLO live on a bus that never configured one
+   * (EB-544): the mirror of `retune` for the unconfigured case — where
+   * `retune` refuses an unconfigured monitor, `install` refuses a
+   * configured one, and assigns the fresh resolved SLO otherwise. The
+   * caller must have validated `next` through
+   * `resolveLagSloOptions` first — this method applies
+   * unconditionally, installing the whole resolved tuning (bounds plus
+   * `breachSamples`; the callback stays unset until
+   * `setBreachCallback` installs one). There is no in-flight episode
+   * state to preserve: `check()` returns early while no SLO is
+   * configured, so `rows` is empty, and the new SLO governs from the
+   * next `check` sample — consecutive counts start at the first sample
+   * after the install (and after a callback is installed), never from
+   * lag accrued before it.
+   */
+  install(next: ResolvedLagSloOptions): void {
+    if (this.slo !== undefined) {
+      throw new RangeError('LagSloMonitor.install: lag SLO is already configured');
+    }
+    this.slo = { ...next };
+  }
+
+  /**
    * Replaces the breach callback live (EB-415). The caller must have
    * validated `callback` first — this method applies unconditionally,
    * like `retune`, replacing only the callback while keeping the three
@@ -482,6 +505,18 @@ export class GroupLagMonitor {
    */
   retuneLagSlo(next: { maxLagMessages?: number; maxLagMs?: number; breachSamples: number }): void {
     this.sloMonitor.retune(next);
+  }
+
+  /**
+   * Installs the lag SLO live on a bus whose `groupLag` is configured
+   * but never opted into `groupLag.slo` (EB-544), delegating to
+   * `LagSloMonitor.install`. The `onLagSloBreach` callback is untouched
+   * (there is none yet — it moves separately via
+   * `setLagSloBreachCallback`, EB-415), and the new SLO governs from
+   * the next lag evaluation.
+   */
+  installLagSlo(next: ResolvedLagSloOptions): void {
+    this.sloMonitor.install(next);
   }
 
   /**

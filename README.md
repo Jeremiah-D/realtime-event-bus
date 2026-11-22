@@ -8769,7 +8769,13 @@ breachSamples? })` (EB-314): only the fields provided move; the new
 values govern from the next lag evaluation — a tightened bound may fire
 on the very next sample, a loosened one simply defers it, and a new
 `breachSamples` counts from the next consecutive sample without resetting
-the in-flight consecutive count, latched breach, or episode start.
+the in-flight consecutive count, latched breach, or episode start. A
+bus whose `groupLag` is configured but never opted into an SLO gains
+one live on the first `setLagSlo` call instead (EB-544) — the revision
+is resolved through the construction-time rule (`breachSamples`
+defaults to 3), installs no callback, and is live-only (a restart
+restores the unconfigured state); lag accrued before the enable never
+counts toward the consecutive-breach debounce.
 Swap the breach callback live with
 `bus.setLagSloBreachCallback(callback | null)` (EB-415): the new hook
 pages from the next lag evaluation, `null` silences paging — episode
@@ -8777,13 +8783,15 @@ state freezes rather than resetting, so a reinstall resumes from the
 frozen state (lag accrued during the silence may trip `maxLagMs` on the
 next sample) — a latched episode never re-fires under the new hook, a
 mid-debounce swap hands the remaining samples over, and the ops-alert
-outlet is re-wrapped exactly once per replacement. Only a bus that
-already enabled `groupLag.slo` can be revised (otherwise `RangeError`);
-illegal values fail closed with the live tuning untouched; an identical
-or empty revision is a no-op with no audit. Audited as `lag_slo_revised`
-(`{ maxLagMessages?, oldMaxLagMessages?, maxLagMs?, oldMaxLagMs?,
-breachSamples, oldBreachSamples }` — a bound's old value is omitted
-when it was not configured).
+outlet is re-wrapped exactly once per replacement. Only a bus with
+`groupLag` configured can be revised or enabled (a bus with no
+`groupLag` at all still refuses with `RangeError`); a closed bus
+refuses too; illegal values fail closed with the live tuning untouched;
+an identical or empty revision is a no-op with no audit. Audited as
+`lag_slo_revised` (`{ maxLagMessages?, oldMaxLagMessages?, maxLagMs?,
+oldMaxLagMs?, breachSamples, oldBreachSamples? }` — a bound's old value
+is omitted when it was not configured, and the first enable omits every
+old value).
 
 Swap the threshold-alert callback live with
 `bus.setGroupLagCallback(callback | null)` (EB-417): the new hook pages

@@ -48174,7 +48174,10 @@ export class EventBus {
    * Revises the bus-level consumer-lag SLO tuning live (EB-314) without
    * restarting the bus: `setLagSlo({ maxLagMessages?, maxLagMs?,
    * breachSamples? })` retunes the bounds that decide when a lag row's
-   * breach episode pages (see `EventBusOptions.groupLag.slo`, EB-112).
+   * breach episode pages (see `EventBusOptions.groupLag.slo`, EB-112) —
+   * or installs the SLO live on a bus whose `groupLag` is configured
+   * but never opted into one (EB-544), so a bus that started without
+   * lag-SLO detection gains it without a restart.
    *
    * Only the fields provided move; the rest keep their live values.
    * `onLagSloBreach` moves separately via `setLagSloBreachCallback`
@@ -48185,9 +48188,22 @@ export class EventBus {
    * bound may fire on the very next sample, a loosened one simply
    * defers it.
    *
-   * Fail-closed: a bus that never enabled `groupLag.slo`, a non-object
-   * revision, and an illegal value all throw `RangeError` with the live
-   * tuning and the audit log untouched. Validation reuses the
+   * Fail-closed: a bus that never enabled `groupLag` at all, a
+   * non-object revision, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched. A bus whose
+   * `groupLag` is configured but never opted into `groupLag.slo`
+   * gains an SLO live on the first call instead (EB-544): the
+   * revision is resolved through the construction-time rule
+   * (`resolveLagSloOptions`: each bound a finite number `>= 0`, at
+   * least one bound present, `breachSamples` an integer `>= 1`,
+   * defaulting to 3) and installed whole — no restart, no lost
+   * subscriptions — and the enable is itself audited as
+   * `lag_slo_revised` with every old value omitted (there was no live
+   * tuning to replace). The enable installs no callback, so the SLO
+   * stays silent until `setLagSloBreachCallback` (EB-415) installs
+   * one, and it is live-only: a restart restores the unconfigured
+   * state. A failed enable leaves the bus unconfigured, so a later
+   * valid call still enables it. Validation reuses the
    * construction-time rule (`resolveLagSloOptions`: each bound a finite
    * number `>= 0`, at least one bound present, `breachSamples` an
    * integer `>= 1`) against the merged values, so a value that could
@@ -48198,22 +48214,76 @@ export class EventBus {
    * revision that provides neither field, and a revision identical to
    * the current tuning, are both no-ops with no audit. Audited as
    * `lag_slo_revised` (`{ maxLagMessages?, oldMaxLagMessages?,
-   * maxLagMs?, oldMaxLagMs?, breachSamples, oldBreachSamples }` — a
-   * bound's old value is omitted when it was not configured).
+   * maxLagMs?, oldMaxLagMs?, breachSamples, oldBreachSamples? }` — a
+   * bound's old value is omitted when it was not configured, and the
+   * first enable omits every old value).
    *
    * Orthogonal to EB-48 (that is the per-group runtime lag threshold
    * `setGroupLagThreshold` — this the bus-level SLO breach-detection
    * parameters), and to EB-296 (that retunes tail sampling — this the
    * lag SLO).
    *
-   * Throws `RangeError` when `groupLag.slo` is not enabled, for a
-   * non-object revision, or for an illegal `maxLagMessages` /
-   * `maxLagMs` / `breachSamples`.
+   * Throws `RangeError` when `groupLag` is not enabled at all, for a
+   * closed bus, for a non-object revision, or for an illegal
+   * `maxLagMessages` / `maxLagMs` / `breachSamples`.
    */
   setLagSlo(opts: LagSloRevision): void {
+    // Fail-fast on a closed bus (EB-154, EB-544, along
+    // `setLagSloBreachCallback`): close() already flushed once — there
+    // is no live SLO left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setLagSlo: bus is closed');
+    }
     const current = this.groupLagMonitor.lagSloCurrent();
     if (current === undefined) {
-      throw new RangeError('setLagSlo: groupLag.slo is not enabled on this bus');
+      // EB-544: the enable half — a bus whose `groupLag` is configured
+      // but never opted into `groupLag.slo` gains an SLO live on the
+      // first call, with the revision resolved through the same
+      // `resolveLagSloOptions` construction-time rule the configured
+      // path enforces (at least one bound; `breachSamples` defaults
+      // to 3). Validate BEFORE installing anything: an illegal value
+      // throws here with the bus still unconfigured, so a later valid
+      // call still enables it. A bus with no `groupLag` at all still
+      // refuses — this item installs an SLO, not a groupLag monitor.
+      // Enabling installs no callback — the SLO stays silent until
+      // the EB-415 entry point installs one — and the enable itself
+      // is audited with every old value omitted.
+      if (this.groupLagMonitor.groupLagCurrent() === undefined) {
+        throw new RangeError('setLagSlo: groupLag.slo is not enabled on this bus');
+      }
+      // An absent revision asks nothing to enable.
+      if (opts == null) {
+        return;
+      }
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setLagSlo: revision must be an object with maxLagMessages and/or maxLagMs and/or breachSamples',
+        );
+      }
+      const resolved = resolveLagSloOptions(
+        {
+          maxLagMessages: opts.maxLagMessages,
+          maxLagMs: opts.maxLagMs,
+          breachSamples: opts.breachSamples,
+        },
+        'setLagSlo',
+      );
+      if (resolved === undefined) {
+        throw new RangeError('setLagSlo: groupLag.slo is not enabled on this bus');
+      }
+      this.groupLagMonitor.installLagSlo(resolved);
+      this.auditSubscription({
+        action: 'lag_slo_revised',
+        actor: 'system',
+        detail: {
+          ...(resolved.maxLagMessages === undefined
+            ? {}
+            : { maxLagMessages: resolved.maxLagMessages }),
+          ...(resolved.maxLagMs === undefined ? {} : { maxLagMs: resolved.maxLagMs }),
+          breachSamples: resolved.breachSamples,
+        },
+      });
+      return;
     }
     // An absent revision asks nothing to move.
     if (opts == null) {
