@@ -266,6 +266,10 @@ import {
   FailureRateRegimeMonitor,
   assertValidDeliveryOutcome,
   resolveFailureRegimeOptions,
+  DEFAULT_FAILURE_REGIME_DELTA,
+  DEFAULT_FAILURE_REGIME_LAMBDA,
+  DEFAULT_FAILURE_REGIME_WARMUP_SAMPLES,
+  DEFAULT_FAILURE_REGIME_WINDOW_SAMPLES,
   type DeliveryOutcome,
   type FailureRegimeOptions,
   type FailureRegimeParams,
@@ -49241,6 +49245,50 @@ export class EventBus {
   }
 
   /**
+   * Resolves an enable patch for `reviseFailureRegimeParams` on a
+   * bus that never opted into `failureRegime` (EB-543): the patch is
+   * validated against the same rules the configured path enforces
+   * (`FailureRateRegimeMonitor.reviseParams` — a non-object, an
+   * empty patch, or an unknown field throws `RangeError`) and then
+   * resolved over the construction defaults, reusing the
+   * construction-time validation (`resolveFailureRegimeOptions`:
+   * `delta` in (0, 1), `lambda` > 0, `warmupSamples` an integer ≥ 1,
+   * `windowSamples` an integer ≥ 2), so an illegal value throws
+   * before any monitor exists and a failed enable leaves the bus
+   * unconfigured. Explicit values win; fields left out fall back to
+   * the defaults (`delta` 0.05 / `lambda` 5 / `warmupSamples` 50 /
+   * `windowSamples` 50).
+   */
+  private resolveFailureRegimeEnableParams(
+    patch: FailureRegimeParamsRevision,
+  ): FailureRegimeOptions {
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new RangeError('reviseFailureRegimeParams: patch must be an object');
+    }
+    const known = ['delta', 'lambda', 'warmupSamples', 'windowSamples'];
+    const keys = Object.keys(patch);
+    if (keys.length === 0) {
+      throw new RangeError(
+        'reviseFailureRegimeParams: patch must provide at least one parameter',
+      );
+    }
+    for (const key of keys) {
+      if (!known.includes(key)) {
+        throw new RangeError(`reviseFailureRegimeParams: unknown field '${key}'`);
+      }
+    }
+    const resolved = resolveFailureRegimeOptions({
+      delta: patch.delta ?? DEFAULT_FAILURE_REGIME_DELTA,
+      lambda: patch.lambda ?? DEFAULT_FAILURE_REGIME_LAMBDA,
+      warmupSamples: patch.warmupSamples ?? DEFAULT_FAILURE_REGIME_WARMUP_SAMPLES,
+      windowSamples: patch.windowSamples ?? DEFAULT_FAILURE_REGIME_WINDOW_SAMPLES,
+    });
+    // resolveFailureRegimeOptions never returns undefined here: the
+    // argument is a full four-field object, so only its validation runs.
+    return resolved as FailureRegimeOptions;
+  }
+
+  /**
    * Live-retunes the failure-rate regime detection parameters
    * (EB-446) without restarting the bus:
    * `reviseFailureRegimeParams(patch, actor = 'system')` moves
@@ -49276,20 +49324,38 @@ export class EventBus {
    * `windowSamples` lengthens settling; shrinking it tightens the
    * sample cap on the next push.
    *
-   * Fail-closed: a closed bus throws `RangeError` (EB-154), and a
-   * bus that never enabled `failureRegime` throws `Error` — there
-   * is no monitor at all, so enabling detection needs a restart
-   * (along the WR-365 circuit-breaker gate wording). An empty
+   * Enabling (EB-543): a bus that never opted into `failureRegime`
+   * gains a monitor live on the first call — no restart, no lost
+   * subscriptions: the patch is resolved over the construction
+   * defaults (`delta` 0.05 / `lambda` 5 / `warmupSamples` 50 /
+   * `windowSamples` 50 — explicit values win, fields left out fall
+   * back to the defaults) through the same
+   * `ensureFailureRegimeMonitor` wiring construction uses, and the
+   * monitor is built with those resolved values on the bus clock.
+   * Detection starts from the first outcome after the enable —
+   * outcomes reported before it were refused, so nothing is traced
+   * back — and the enable is live-only: a restart restores the
+   * unconfigured state. Enabling installs no callback
+   * (`onFailureRateRegimeChange` stays undefined; detection runs
+   * audit-only until the EB-542 entry point installs one — the two
+   * enable items are complementary). The enable is audited like any
+   * revision, with `oldParams: null`. Once enabled, a later call
+   * with the same parameters is still a no-op with no audit.
+   *
+   * Fail-closed: a closed bus throws `RangeError` (EB-154). An empty
    * patch, an unknown field, or an illegal merged value (the
    * construction-time rules: `delta` in (0, 1), `lambda` > 0,
    * `warmupSamples` an integer ≥ 1, `windowSamples` an integer
    * ≥ 2) throws `RangeError` with the live parameters, every
-   * detector's state, and the audit log untouched. A revision
+   * detector's state, and the audit log untouched — on a bus that
+   * never enabled `failureRegime` a failed call leaves the bus
+   * unconfigured, so a later valid call still enables it. A revision
    * identical to the live parameters is a no-op with no audit.
    * Audited as `failure_rate_regime_params_revised`
    * (`{ params: { delta, lambda, warmupSamples, windowSamples },
-   * oldParams: { ... } }` — the `lag_forecast_revised` snapshot
-   * shape).
+   * oldParams: { ... } | null }` — the `lag_forecast_revised` snapshot
+   * shape; `null` on the first enable, when there were no live
+   * parameters to replace).
    *
    * Orthogonal to EB-442 (that is the regime detection itself, this
    * its parameters' live revision), to EB-445 (that is the alert
@@ -49302,8 +49368,7 @@ export class EventBus {
    * EB-428 / EB-429 / EB-430 / EB-431 / EB-436 (sibling bus-level
    * hook revisions — this the regime-detection channel).
    *
-   * Throws `Error` when `failureRegime` was never configured, and
-   * `RangeError` for a closed bus, an empty or malformed patch, an
+   * Throws `RangeError` for a closed bus, an empty or malformed patch, an
    * unknown field, or an illegal parameter value.
    */
   reviseFailureRegimeParams(
@@ -49319,9 +49384,27 @@ export class EventBus {
     }
     const monitor = this.failureRegimeMonitor;
     if (monitor === undefined) {
-      throw new Error(
-        'reviseFailureRegimeParams: failureRegime is not configured — enabling it requires a restart',
-      );
+      // EB-543: the enable half — a bus that never opted into
+      // `failureRegime` gains a monitor live, built with the patch
+      // resolved over the construction defaults on the bus clock,
+      // through the same `ensureFailureRegimeMonitor` wiring
+      // construction uses. Validate BEFORE building anything: an
+      // empty patch, an unknown field, or an illegal value throws
+      // here with the bus still unconfigured, so a later valid call
+      // still enables it. Enabling installs no callback — detection
+      // runs audit-only until the EB-542 entry point installs one —
+      // and the enable itself is audited with `oldParams: null`.
+      const params = this.resolveFailureRegimeEnableParams(patch);
+      const fresh = this.ensureFailureRegimeMonitor(params);
+      this.auditSubscription({
+        action: 'failure_rate_regime_params_revised',
+        actor,
+        detail: {
+          params: { ...fresh.getParams() },
+          oldParams: null,
+        },
+      });
+      return fresh.getParams();
     }
     const oldParams = monitor.getParams();
     // Merge + validate + fan out, before anything is audited: an

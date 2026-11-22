@@ -284,17 +284,22 @@ test('a larger windowSamples lengthens settling and enlarges the snapshot sample
   assert.deepEqual(seen[1].after, { failureRate: 1, samples: 11 });
 });
 
-test('an unconfigured bus throws a must-restart Error', () => {
+test('an unconfigured bus enables on the first call, with the defaults resolved', () => {
+  // EB-543 overturns EB-446's must-restart exclusion: the first
+  // revision on a never-configured bus builds the monitor live with
+  // the patch resolved over the construction defaults.
   const bus = new EventBus();
-  assert.throws(
-    () => bus.reviseFailureRegimeParams({ delta: 0.02 }),
-    (e: unknown) =>
-      e instanceof Error &&
-      !(e instanceof RangeError) &&
-      /failureRegime is not configured — enabling it requires a restart/.test((e as Error).message),
-  );
-  assert.equal(paramsRevisionAudits(bus).length, 0, 'a refused revision must not audit');
-  // A configured bus (even with no callback) accepts the revision
+  const snapshot = bus.reviseFailureRegimeParams({ delta: 0.02 });
+  assert.deepEqual(snapshot, { ...DEFAULTS, delta: 0.02 });
+  const audit = paramsRevisionAudits(bus);
+  assert.equal(audit.length, 1);
+  assert.deepEqual(audit[0].detail, {
+    params: { ...DEFAULTS, delta: 0.02 },
+    oldParams: null,
+  });
+  // The bus is now configured: reporting works.
+  assert.doesNotThrow(() => bus.reportDeliveryOutcome('orders', 'success'));
+  // A configured bus (even with no callback) still accepts the revision
   // and reports the resolved defaults.
   const enabled = new EventBus({ failureRegime: {} });
   assert.deepEqual(enabled.reviseFailureRegimeParams({ lambda: 10 }), {
@@ -302,6 +307,7 @@ test('an unconfigured bus throws a must-restart Error', () => {
     lambda: 10,
   });
   assert.equal(paramsRevisionAudits(enabled).length, 1);
+  assert.deepEqual(paramsRevisionAudits(enabled)[0].detail.oldParams, { ...DEFAULTS });
 });
 
 test('an empty patch, illegal values, and unknown fields throw RangeError and leave live state untouched', () => {

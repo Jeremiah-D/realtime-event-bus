@@ -9030,11 +9030,18 @@ Semantics:
   `delta` in (0, 1), `lambda` > 0, `warmupSamples` an integer ≥ 1,
   `windowSamples` an integer ≥ 2) throws `RangeError` with the live
   parameters untouched; a bus that never enabled `failureRegime`
-  throws `Error` (enabling it needs a restart); a same-value
-  revision is a no-op with no audit; every success is audited as
+  gains a monitor live on the first call (EB-543) — built with the
+  patch resolved over the construction defaults (`delta` 0.05 /
+  `lambda` 5 / `warmupSamples` 50 / `windowSamples` 50, explicit
+  values win, fields left out fall back to the defaults) on the bus
+  clock, installing no callback (detection runs audit-only until
+  the EB-542 entry point installs one) — and the enable is audited
+  with `oldParams: null`; the enable is live-only, a restart
+  restores the unconfigured state; a same-value revision is a no-op
+  with no audit; every success is audited as
   `failure_rate_regime_params_revised`
   (`{ params: { delta, lambda, warmupSamples, windowSamples },
-  oldParams: { ... } }`).
+  oldParams: { ... } | null }`).
 
 ## Manual subscriber pause/resume (EB-113)
 
