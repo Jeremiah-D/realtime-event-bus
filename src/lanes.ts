@@ -227,7 +227,13 @@ export class LaneQueue<T> {
   private maxBytes?: number;
   private readonly byteSize: (item: T) => number;
   private bytesTotal = 0;
-  private readonly onHighWaterMark?: (size: number) => void;
+  // Mutable since EB-538 (`setOnHighWaterMark`): the excursion signal
+  // is installed at construction when the subscription opts into a
+  // throttle or a backpressure observer, and installed live by
+  // `EventBus.setThrottle` when throttling is enabled later — a
+  // subscription that opted into neither has no hook until then. The
+  // only writers are the constructor and `setOnHighWaterMark`.
+  private onHighWaterMark?: (size: number) => void;
   private readonly onDrained?: (size: number) => void;
   private readonly onEvicted?: (item: T, lane: MessageLane) => void;
   private highWaterMarkFraction: number;
@@ -346,6 +352,21 @@ export class LaneQueue<T> {
     }
     this.highWaterMarkFraction = ratio;
     this.maybeFireDrained();
+  }
+
+  /**
+   * Installs (or replaces) the high-water-mark hook after construction
+   * (EB-538, via `EventBus.setThrottle`): a subscription that never
+   * opted into throttling or a backpressure observer at subscribe time
+   * has no hook, so enabling throttling later must install the
+   * excursion signal live instead of re-subscribing. Replacing a hook
+   * is safe: the hook only forwards the excursion — the latch
+   * (`highWaterMarkReached`) is untouched, so an excursion already in
+   * flight is not re-fired, and a later drain still ends it via
+   * `onDrained`.
+   */
+  setOnHighWaterMark(cb: ((size: number) => void) | undefined): void {
+    this.onHighWaterMark = cb;
   }
 
   /**

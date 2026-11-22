@@ -140,7 +140,7 @@ test('setThrottle keeps omitted rates and clamps the stored initial at engagemen
   sub.unsubscribe();
 });
 
-test('setThrottle is fail-closed for unknown, unthrottled, or illegal values', () => {
+test('setThrottle is fail-closed for unknown subscribers or illegal values', () => {
   const clock = controllableClock();
   const bus = new EventBus({ now: clock.now });
   const events: ThrottleEvent[] = [];
@@ -149,10 +149,8 @@ test('setThrottle is fail-closed for unknown, unthrottled, or illegal values', (
     throttle: { initialRatePerSec: 2, minRatePerSec: 1 },
     onThrottled: (e) => events.push(e),
   });
-  const plain = bus.subscribe('u', () => {});
 
   assert.throws(() => bus.setThrottle('nope', { minRatePerSec: 1 }), RangeError);
-  assert.throws(() => bus.setThrottle(plain.id, { minRatePerSec: 1 }), RangeError);
   assert.throws(() => bus.setThrottle('', { minRatePerSec: 1 }), RangeError);
   assert.throws(() => bus.setThrottle(throttled.id, { minRatePerSec: 0 }), RangeError);
   assert.throws(() => bus.setThrottle(throttled.id, { minRatePerSec: -1 }), RangeError);
@@ -176,10 +174,9 @@ test('setThrottle is fail-closed for unknown, unthrottled, or illegal values', (
   assert.equal(events.length, 1);
   assert.equal(events[0].ratePerSec, 2);
   throttled.unsubscribe();
-  plain.unsubscribe();
 });
 
-test('setThrottle null clears the throttling and refuses later revisions', async () => {
+test('setThrottle null clears the throttling and a later enable works', async () => {
   const clock = controllableClock();
   const bus = new EventBus({ now: clock.now });
   const sub = bus.subscribe('t', () => {}, {
@@ -198,13 +195,20 @@ test('setThrottle null clears the throttling and refuses later revisions', async
   assert.deepEqual(accepted, [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 'full speed resumes immediately');
   assert.equal(bus.pendingCount(sub.id), 90);
 
-  assert.throws(() => bus.setThrottle(sub.id, { minRatePerSec: 1 }), RangeError);
+  // A clear is no longer terminal (EB-538): the same call re-enables,
+  // and the queue — still at 90, above the 80 mark — engages at once.
+  bus.setThrottle(sub.id, { minRatePerSec: 1 });
+  assert.equal(bus.getStats().throttledSubscribers, 1, 'the re-enable engages the queue already above the mark');
 
   const audit = bus.getSubscriptionAudit({ action: 'throttle_revised' });
-  assert.equal(audit.length, 1);
+  assert.equal(audit.length, 2);
   assert.deepEqual(audit[0].detail, {
     throttle: null,
     oldThrottle: { minRatePerSec: 1, maxRatePerSec: Infinity, initialRatePerSec: 2 },
+  });
+  assert.deepEqual(audit[1].detail, {
+    throttle: { minRatePerSec: 1, maxRatePerSec: Infinity, initialRatePerSec: 80 },
+    oldThrottle: null,
   });
   await flush();
   sub.unsubscribe();

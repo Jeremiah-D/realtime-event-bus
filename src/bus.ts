@@ -9127,11 +9127,15 @@ interface Subscriber {
   onDrained?: (event: DrainedEvent) => void;
   /**
    * Whether the queue's `onHighWaterMark` hook was installed at subscribe
-   * time (EB-455): true exactly when a subscribe-time `onBackpressure` or
-   * a `throttle` was present. The hook is the gate for revising
-   * `onBackpressure` — a subscription that never opted into either can
-   * only gain the observer by re-subscribing. `onDrained` needs no gate:
-   * its hook is installed for every subscription (EB-285).
+   * time (EB-455) — or later, by `setThrottle` (EB-538) when throttling
+   * is enabled on a subscription that opted into neither: true exactly
+   * when a subscribe-time `onBackpressure` or a `throttle` was present,
+   * or throttling was enabled live afterwards. The hook is the gate for
+   * revising `onBackpressure` — a subscription that never opted into
+   * either can only gain the observer by re-subscribing, unless
+   * throttling is enabled first (EB-538 installs the hook, which
+   * unlocks the observer revision as a side effect). `onDrained` needs
+   * no gate: its hook is installed for every subscription (EB-285).
    */
   backpressureHookInstalled: boolean;
   /**
@@ -35319,36 +35323,17 @@ export class EventBus {
       // (The closure runs long after `subscriber` below is initialized,
       // exactly like the `onHighWaterMark` wrapper that follows.)
       onEvicted: (msg: BusMessage) => this.noteSubscriberDrop(subscriber, msg, 'evicted'),
-      // The internal wrappers are registered whenever throttling is enabled,
+      // The internal wrapper is registered whenever throttling is enabled,
       // even without user callbacks: the bus needs the excursion signals to
-      // engage/disengage the throttle.
+      // engage/disengage the throttle. It delegates to
+      // `onSubscriberHighWaterMark`, which reads the live throttle and the
+      // live observer off the subscriber — the same wrapper `setThrottle`
+      // (EB-538) installs live when throttling is enabled after
+      // subscribe time.
       ...(onBackpressure == null && throttle == null
         ? {}
         : {
-            onHighWaterMark: (size: number) => {
-              if (throttle != null) {
-                this.engageThrottle(subscriber, size, subscriber.queueCapacity);
-              }
-              // EB-455: the callback is read live off the subscriber, so
-              // a `setBackpressureCallbacks` revision governs from the
-              // next excursion — the subscribe-time capture is never
-              // consulted here. With no callback installed the wrapper
-              // still fires for the throttle above: the excursion signal
-              // is independent of the observer.
-              subscriber.onBackpressure?.({
-                // The subscriber's live pattern, not the registration-time
-                // capture: `updateSubscriptionPattern` (EB-74) rewrites it
-                // in place, and events must name the pattern the
-                // subscription actually matches on. Likewise the live
-                // capacity, not the subscribe-time one: `setQueueSize`
-                // (EB-281) revises it in place.
-                subscriberId: id,
-                pattern: subscriber.pattern,
-                queueSize: size,
-                capacity: subscriber.queueCapacity,
-                dropped: queue.droppedCount,
-              });
-            },
+            onHighWaterMark: (size: number) => this.onSubscriberHighWaterMark(subscriber, queue, size),
           }),
       // EB-285: the drain hook is installed for every subscription, not
       // only for subscribe-time 'block' tiers — a tier revised to
@@ -35369,7 +35354,13 @@ export class EventBus {
         if (subscriber.blocked) {
           subscriber.blocked = false;
         }
-        if (throttle != null) {
+        // EB-538: read the live throttle, not the subscribe-time
+        // capture — a throttle enabled after subscribe time must
+        // release on drain, or its first engagement would never end.
+        // Behavior-neutral for subscribe-time throttles:
+        // `releaseThrottle` itself reads the live state and no-ops
+        // when there is none.
+        if (subscriber.throttle != null) {
           this.releaseThrottle(subscriber, size);
         }
         // EB-455: read live off the subscriber, like `onBackpressure`
@@ -35450,7 +35441,8 @@ export class EventBus {
       // `onBackpressure` or a `throttle` was present — the gate
       // `setBackpressureCallbacks` applies to `onBackpressure`. The
       // `onDrained` hook needs no gate: it is installed for every
-      // subscription (EB-285).
+      // subscription (EB-285). `setThrottle` (EB-538) flips the flag
+      // below to true when it installs the hook live for an enable.
       backpressureHookInstalled: onBackpressure != null || throttle != null,
       // The `onDropped` gate (EB-456): true exactly when a subscribe-time
       // `onDropped` was present — a subscription that never opted in can
@@ -39885,36 +39877,61 @@ export class EventBus {
 
   /**
    * Revises the adaptive-throttle rates of one throttled subscriber
-   * (EB-268): a throttled subscriber can retune its publish-side
-   * shedding without re-subscribing. The revision is partial: a rate
-   * left out keeps its current value, and only `minRatePerSec` /
-   * `maxRatePerSec` / `initialRatePerSec` ever move — `throttledDrops`,
-   * the observed drain rate, the queue, and the backpressure state
-   * are untouched. The three rates are stored live on the throttle
-   * state, so the next engagement reads them: a current excursion
-   * keeps its bucket and its enforced rate until it ends (the bucket
-   * is created at engagement time and is never retuned), and the
-   * observed drain rate recorded when that excursion ends is clamped
-   * to the revised bounds before it seeds the next engagement — the
-   * same clamping `engageThrottle` already applies at engagement
-   * time, so a stored initial below a raised floor (or above a
-   * lowered ceiling) is clamped when it is used, not rewritten here.
-   * Passing `null` clears the throttling: the subscriber returns to
-   * unthrottled publish (the publish-side gate is the throttle state
-   * itself), and a later revision is refused until the subscriber
-   * opts in again at subscribe time.
+   * (EB-268), or enables throttling on a subscriber that never opted
+   * in (EB-538): a subscription that missed the subscribe-time
+   * opt-in can gain publish-side shedding without re-subscribing.
+   * The revision is partial: a rate left out keeps its current value,
+   * and only `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec`
+   * ever move — `throttledDrops`, the observed drain rate, the queue,
+   * and the backpressure state are untouched. The three rates are
+   * stored live on the throttle state, so the next engagement reads
+   * them: a current excursion keeps its bucket and its enforced rate
+   * until it ends (the bucket is created at engagement time and is
+   * never retuned), and the observed drain rate recorded when that
+   * excursion ends is clamped to the revised bounds before it seeds
+   * the next engagement — the same clamping `engageThrottle` already
+   * applies at engagement time, so a stored initial below a raised
+   * floor (or above a lowered ceiling) is clamped when it is used, not
+   * rewritten here. Passing `null` clears the throttling: the
+   * subscriber returns to unthrottled publish (the publish-side gate
+   * is the throttle state itself), and a later enable installs a
+   * fresh throttle (EB-538) — the clear is no longer terminal.
    *
-   * Fail-closed: an unknown subscriber id, a subscriber that never
-   * opted into `throttle`, a non-object value, an illegal rate
-   * (`min` / `initial` non-finite or <= 0, `max` non-positive and not
-   * `Infinity`, or `min` above `max`), and `undefined` — only an
-   * explicit `null` clears — all throw `RangeError` with the live
-   * rates, the live bucket, the drop count, and the audit log
-   * untouched. The validation mirrors `resolveThrottleOptions`.
+   * Enabling (EB-538): `true` installs the subscribe-time built-in
+   * rates (`min` 1, `max` `Infinity`, `initial` one high-water-mark
+   * worth per second), and an object patch resolves its missing
+   * fields through the same chain as a subscribe-time opt-in
+   * (explicit > live bus default from `setDefaultThrottle` (EB-488)
+   * > built-ins) against the subscriber's live `queueCapacity` and
+   * the queue's live high-water-mark ratio; `{}` resolves exactly
+   * like `true`. The enable installs a fresh `ThrottleState` (fresh
+   * token bucket, `throttledDrops: 0`, unengaged) and only governs
+   * excursions after it. Enabling also installs the queue's
+   * `onHighWaterMark` hook live when the subscription has none
+   * (a subscribe-time `onBackpressure` or `throttle` would already
+   * have installed it) and flips `backpressureHookInstalled`, so
+   * `setBackpressureCallbacks` (EB-455) and `setThrottledCallback`
+   * (EB-440) become available on the newly throttled subscriber as
+   * a side effect; the drain hook's release guard reads the live
+   * throttle, so an enabled throttle releases on drain. A queue
+   * already at or above the high-water mark when the enable lands
+   * engages immediately — its crossing fired while no hook was
+   * installed, so waiting for the next crossing would leave an
+   * excursion already in flight unthrottled. `null` on a subscriber
+   * that never had throttling is a silent no-op with no audit.
+   *
+   * Fail-closed: an unknown subscriber id, a non-object value, an
+   * illegal rate (`min` / `initial` non-finite or <= 0, `max`
+   * non-positive and not `Infinity`, or `min` above `max`), and
+   * `undefined` — only an explicit `null` clears — all throw
+   * `RangeError` with the live rates, the live bucket, the drop
+   * count, and the audit log untouched. The validation mirrors
+   * `resolveThrottleOptions`.
    * Audited as `throttle_revised` (`{ throttle:
    * { minRatePerSec, maxRatePerSec, initialRatePerSec } | null,
-   * oldThrottle: { minRatePerSec, maxRatePerSec, initialRatePerSec } }`,
-   * `null` for a clear) on success.
+   * oldThrottle: { minRatePerSec, maxRatePerSec, initialRatePerSec }
+   * | null }`, `null` for a clear, `null` for `oldThrottle` on an
+   * enable) on success.
    *
    * Orthogonal to the subscribe-time throttling of EB-14 (this
    * revises it, that sets it), and to the delivery-shaping rate of
@@ -39922,10 +39939,10 @@ export class EventBus {
    * deliveries at drain time, this sheds fresh publishes while the
    * queue is under backpressure.
    *
-   * Throws `RangeError` for an unknown / unthrottled subscriber or an
-   * illegal throttle value.
+   * Throws `RangeError` for an unknown subscriber or an illegal
+   * throttle value.
    */
-  setThrottle(subId: string, opts: ThrottleOptions | null): void {
+  setThrottle(subId: string, opts: ThrottleOptions | true | null): void {
     if (typeof subId !== 'string' || subId.length === 0) {
       throw new RangeError('setThrottle: subId must be a non-empty string');
     }
@@ -39935,7 +39952,65 @@ export class EventBus {
     }
     const throttle = subscriber.throttle;
     if (throttle == null) {
-      throw new RangeError('setThrottle: subscriber has no throttle set');
+      // EB-538: the enable half — a subscriber that never opted into
+      // throttling can gain it live. `null` on a never-throttled
+      // subscriber is a silent no-op (clearing what was never set);
+      // `true` or an object installs a fresh throttle resolved
+      // exactly like a subscribe-time opt-in. Anything else —
+      // `undefined`, a non-object, an array — is refused, and the
+      // resolution below validates before anything moves, so a failed
+      // enable leaves the subscriber unthrottled and unaudited.
+      if (opts === null) {
+        return;
+      }
+      if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
+        throw new RangeError(
+          'setThrottle: throttle must be true or an object with minRatePerSec and/or maxRatePerSec and/or initialRatePerSec to enable throttling',
+        );
+      }
+      const enabled = resolveThrottleOptions(
+        opts,
+        subscriber.queueCapacity,
+        subscriber.queue.highWaterMarkRatio,
+        this.now,
+        this.defaultThrottle,
+      )!;
+      subscriber.throttle = enabled;
+      // The excursion signal is a subscribe-time hook: a subscription
+      // that opted into neither a throttle nor a backpressure observer
+      // has no wrapper on its queue, so the fresh throttle would never
+      // engage. Install the same live-reading wrapper the subscribe
+      // path installs, and flip the gate — which also unlocks
+      // `setBackpressureCallbacks` for this subscriber (EB-455, an
+      // intended side effect of the enable).
+      if (!subscriber.backpressureHookInstalled) {
+        subscriber.queue.setOnHighWaterMark((size: number) =>
+          this.onSubscriberHighWaterMark(subscriber, subscriber.queue, size),
+        );
+        subscriber.backpressureHookInstalled = true;
+      }
+      // A queue already at or above the mark crossed it while no hook
+      // was installed, so no signal will fire until it drains and
+      // re-crosses — engage the excursion now instead of leaving it
+      // unthrottled.
+      if (subscriber.queue.size >= subscriber.queue.highWaterMark) {
+        this.engageThrottle(subscriber, subscriber.queue.size, subscriber.queueCapacity);
+      }
+      this.auditSubscription({
+        action: 'throttle_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: {
+          throttle: {
+            minRatePerSec: enabled.minRatePerSec,
+            maxRatePerSec: enabled.maxRatePerSec,
+            initialRatePerSec: enabled.initialRatePerSec,
+          },
+          oldThrottle: null,
+        },
+      });
+      return;
     }
     const oldThrottle: ThrottleOptions = {
       minRatePerSec: throttle.minRatePerSec,
@@ -76911,6 +76986,39 @@ export class EventBus {
     const subscriber = this.subscribers.get(subId);
     if (subscriber == null) throw new Error(`unknown subscriber: ${subId}`);
     return subscriber.reliable?.tracker.unackedCount ?? 0;
+  }
+
+  /**
+   * The queue's `onHighWaterMark` excursion signal (EB-83 / EB-455 /
+   * EB-538): fires once when the aggregate size reaches the high-water
+   * mark. The throttle engagement reads the live throttle off the
+   * subscriber — a throttle enabled after subscribe time (EB-538)
+   * engages exactly like a subscribe-time one, and a cleared throttle
+   * never engages (the guard is behavior-neutral for subscribe-time
+   * throttles: `engageThrottle` itself reads the live state and no-ops
+   * when there is none). The observer is read live off the subscriber,
+   * so a `setBackpressureCallbacks` revision governs from the next
+   * excursion — the subscribe-time capture is never consulted here.
+   * With no callback installed the wrapper still fires for the throttle
+   * above: the excursion signal is independent of the observer.
+   */
+  private onSubscriberHighWaterMark(subscriber: Subscriber, queue: LaneQueue<BusMessage>, size: number): void {
+    if (subscriber.throttle != null) {
+      this.engageThrottle(subscriber, size, subscriber.queueCapacity);
+    }
+    subscriber.onBackpressure?.({
+      // The subscriber's live pattern, not the registration-time
+      // capture: `updateSubscriptionPattern` (EB-74) rewrites it
+      // in place, and events must name the pattern the
+      // subscription actually matches on. Likewise the live
+      // capacity, not the subscribe-time one: `setQueueSize`
+      // (EB-281) revises it in place.
+      subscriberId: subscriber.id,
+      pattern: subscriber.pattern,
+      queueSize: size,
+      capacity: subscriber.queueCapacity,
+      dropped: queue.droppedCount,
+    });
   }
 
   /**

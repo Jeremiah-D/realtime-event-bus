@@ -186,10 +186,21 @@ test('EB-488: setThrottle keeps its own semantics — partial revisions take the
     'the cleared subscriber publishes at full speed even though a default is installed',
   );
   assert.equal(bus.pendingCount(sub.id), 100);
-  assert.throws(
-    () => bus.setThrottle(sub.id, { minRatePerSec: 2 }),
-    RangeError,
+  // A clear is no longer terminal (EB-538): the same call re-enables,
+  // resolving the omitted fields through the installed default — the
+  // default still never applies itself without an explicit call.
+  bus.setThrottle(sub.id, { minRatePerSec: 2 });
+  assert.equal(
+    bus.getStats().throttledSubscribers,
+    1,
+    'the re-enable engages the queue already above the mark',
   );
+  const audit = bus.getSubscriptionAudit({ action: 'throttle_revised' });
+  assert.equal(audit.length, 3);
+  assert.deepEqual(audit[2].detail, {
+    throttle: { minRatePerSec: 2, maxRatePerSec: 10, initialRatePerSec: 3 },
+    oldThrottle: null,
+  });
   sub.unsubscribe();
 });
 

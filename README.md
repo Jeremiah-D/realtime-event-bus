@@ -1636,7 +1636,7 @@ library.
   throw `RangeError` from `subscribe`. Disabled by default — existing
   backpressure behavior is unchanged unless a subscriber opts in.
   Revisable after subscribe (EB-268, via
-  `setThrottle(subId, opts | null)`): a throttled subscriber's rates can
+  `setThrottle(subId, opts | true | null)`): a throttled subscriber's rates can
   be retuned without re-subscribing — the revision is partial (a rate
   left out keeps its value) and only the three rates ever move: the drop
   count, the observed drain rate, the queue, and the backpressure state
@@ -1644,14 +1644,23 @@ library.
   until it ends, and the new rates apply from the next engagement (the
   observed drain rate recorded when the excursion ends is clamped to the
   revised bounds before it seeds the next one). `null` clears the
-  throttling back to unthrottled publish. It is fail-closed (an unknown
-  subscriber, a subscriber that never opted into throttling, or an
-  illegal rate throws `RangeError` with the live rates, bucket, drop
-  count, and audit log untouched; `undefined` is not a clear, only `null`
-  is, and a revision after a clear is refused until the subscriber opts
-  in again at subscribe time), and every success is audited as
+  throttling back to unthrottled publish, and a later enable installs a
+  fresh throttle (EB-538) — the clear is no longer terminal. Enabling
+  (EB-538): `true` takes the subscribe-time built-in rates (`min` 1 /
+  `max` `Infinity` / `initial` one high-water-mark worth per second),
+  an object patch fills omitted fields from the live bus default
+  (EB-488) then the built-ins, and `{}` resolves like `true`; the
+  enable installs the queue's high-water-mark hook live when the
+  subscription has none (which also unlocks `setBackpressureCallbacks`
+  and `setThrottledCallback` on it), and a queue already at or above
+  the mark engages immediately. It is fail-closed (an unknown
+  subscriber or an illegal rate throws `RangeError` with the live
+  rates, bucket, drop count, and audit log untouched; `undefined` is
+  not a clear, only `null` is, and `null` on a never-throttled
+  subscriber is a silent no-op), and every success is audited as
   `throttle_revised` (`{ throttle: { minRatePerSec, maxRatePerSec,
-  initialRatePerSec } | null, oldThrottle: { ... } }`). Bus-level
+  initialRatePerSec } | null, oldThrottle: { ... } | null }`,
+  `oldThrottle` `null` on an enable). Bus-level
   default (EB-488, via
   `setDefaultThrottle(opts | null, actor = 'system')`): the
   `minRatePerSec` / `maxRatePerSec` / `initialRatePerSec` a new
