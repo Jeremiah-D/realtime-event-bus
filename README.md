@@ -1753,7 +1753,7 @@ library.
   `subscribe`. Disabled by default — a throwing handler behaves exactly as
   before unless a subscriber opts in.
   Revisable after subscribe (EB-267, via
-  `setHealthProbe(subId, opts | null)`): a probed subscriber's failure
+  `setHealthProbe(subId, opts | true | null)`): a probed subscriber's failure
   budget can be retuned without re-subscribing — the revision is partial
   (a field left out keeps its value) and only `maxConsecutiveFailures` /
   `processingTimeoutMs` / `autoResumeAfterMs` ever move: the
@@ -1764,13 +1764,21 @@ library.
   (an already-armed timer keeps its cooldown). `null` clears the probe
   back to unprobed delivery, cancelling a pending auto-resume timer and
   releasing a degraded pause it held (a manual pause is separate and
-  survives). It is fail-closed (an unknown subscriber, a subscriber that
-  never opted into probing, or an illegal value throws `RangeError` with
-  the live probe, counter, and audit log untouched; `undefined` is not a
-  clear, only `null` is, and a revision after a clear is refused until
-  the subscriber opts in again at subscribe time), and every success is
+  survives), and a later enable installs a fresh probe (EB-540) — the
+  clear is no longer terminal. Enabling (EB-540): `true` takes the
+  documented default (`maxConsecutiveFailures` 5, no timeout budget,
+  manual-only resume), an object patch fills omitted fields from the
+  live bus default (EB-496) then the documented default, and `{}` resolves
+  like `true`; the enable installs a fresh probe (counter 0, undegraded),
+  failures recorded before it are not counted retroactively, and a
+  degradation / auto-resume after it follows the new probe. It is
+  fail-closed (an unknown subscriber or an illegal value throws
+  `RangeError` with the live probe, counter, and audit log untouched;
+  `undefined` is not a clear, only `null` is, and `null` on a subscriber
+  that never had a probe is a silent no-op), and every success is
   audited as `health_probe_revised` (`{ healthProbe: { ... } | null,
-  oldHealthProbe: { ... } }`). The degraded callback itself is
+  oldHealthProbe: { ... } | null }`, `oldHealthProbe` `null` on an
+  enable). The degraded callback itself is
   live-revisable (EB-435, via `setDegradedCallback(subId, cb |
   null)`): only a probed subscription can be retuned — a subscription
   that never opted into `healthProbe` throws `RangeError` — and `null`

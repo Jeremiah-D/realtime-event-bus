@@ -39760,9 +39760,11 @@ export class EventBus {
   }
 
   /**
-   * Revises the health-probe parameters of one probed subscriber
-   * (EB-267): a probed subscriber can retune its failure budget without
-   * re-subscribing. The revision is partial: a field left out keeps its
+   * Revises — or enables — the health-probe parameters of one subscriber
+   * (EB-267, enable half EB-540): a probed subscriber can retune its
+   * failure budget without re-subscribing, and a subscriber that never
+   * opted into `healthProbe` can gain one live, without re-subscribing
+   * either. The revision is partial: a field left out keeps its
    * current value, and only `maxConsecutiveFailures` /
    * `processingTimeoutMs` / `autoResumeAfterMs` ever move — the
    * `consecutiveFailures` counter and the `degraded` flag are untouched.
@@ -39779,27 +39781,46 @@ export class EventBus {
    * same cleanup unsubscribe performs), and the degraded gate — which
    * is the probe itself — releases, so a preserved backlog drains on
    * the next flush. A manual EB-113 pause is separate and is not
-   * released by clearing the probe. A later revision is refused until
-   * the subscriber opts in again at subscribe time.
+   * released by clearing the probe. A clear is no longer terminal
+   * (EB-540): a later call with `true` or an object installs a fresh
+   * probe, and `null` on a subscriber that never had a probe is a
+   * silent no-op with no audit.
    *
-   * Fail-closed: an unknown subscriber id, a subscriber that never
-   * opted into `healthProbe`, a non-object value, an illegal
-   * threshold (non-integer or < 1) or timeout / cooldown (non-finite
-   * or <= 0), and `undefined` — only an explicit `null` clears — all
-   * throw `RangeError` with the live probe, the live counter, and the
-   * audit log untouched. Audited as `health_probe_revised`
+   * Enabling (EB-540): `true` or an object on a subscriber that never
+   * had a probe resolves through `resolveHealthProbeOptions` exactly
+   * like a subscribe-time opt-in — explicit fields win, the live bus
+   * default from `setDefaultHealthProbe` (EB-496) fills omitted fields
+   * one by one, and the documented default (`maxConsecutiveFailures`
+   * 5, no timeout budget, manual-only resume) covers the rest — and
+   * installs a fresh `HealthProbeState` (`consecutiveFailures` 0,
+   * `degraded` false, no auto-resume timer). The enable needs no
+   * wiring: `deliverWithHealth` / `deliverBatchWithHealth` already
+   * read `subscriber.health` live and return early while it is null,
+   * so the fresh probe governs from the next handler invocation.
+   * Failures recorded before the enable are not counted retroactively
+   * — counting starts at the enable — and a degradation / auto-resume
+   * after the enable follows the new probe. The enable is live-only:
+   * a restart restores the unprobed state.
+   *
+   * Fail-closed: an unknown subscriber id, a non-object value, an
+   * illegal threshold (non-integer or < 1) or timeout / cooldown
+   * (non-finite or <= 0), and `undefined` — only an explicit `null`
+   * clears — all throw `RangeError` with the live probe, the live
+   * counter, and the audit log untouched. Audited as
+   * `health_probe_revised`
    * (`{ healthProbe: { maxConsecutiveFailures, processingTimeoutMs?,
-   * autoResumeAfterMs? } | null, oldHealthProbe: { ... } }`, `null`
-   * for a clear; optional fields appear only when set) on success.
+   * autoResumeAfterMs? } | null, oldHealthProbe: { ... } | null }`,
+   * `null` for a clear, `null` for `oldHealthProbe` on an enable;
+   * optional fields appear only when set) on success.
    *
    * Orthogonal to the subscribe-time probing of EB-18 (this revises
    * it, that sets it), and to the handler fault isolation of EB-197
    * (its own error budget and quarantine gate are untouched).
    *
-   * Throws `RangeError` for an unknown / unprobed subscriber or an
-   * illegal probe value.
+   * Throws `RangeError` for an unknown subscriber or an illegal probe
+   * value.
    */
-  setHealthProbe(subId: string, opts: HealthProbeOptions | null): void {
+  setHealthProbe(subId: string, opts: HealthProbeOptions | true | null): void {
     if (typeof subId !== 'string' || subId.length === 0) {
       throw new RangeError('setHealthProbe: subId must be a non-empty string');
     }
@@ -39808,9 +39829,6 @@ export class EventBus {
       throw new RangeError(`setHealthProbe: unknown subscriber: ${subId}`);
     }
     const health = subscriber.health;
-    if (health == null) {
-      throw new RangeError('setHealthProbe: subscriber has no healthProbe set');
-    }
     const snapshotProbe = (probe: HealthProbeState): HealthProbeOptions => ({
       maxConsecutiveFailures: probe.maxConsecutiveFailures,
       ...(probe.processingTimeoutMs !== undefined
@@ -39818,6 +39836,38 @@ export class EventBus {
         : {}),
       ...(probe.autoResumeAfterMs !== undefined ? { autoResumeAfterMs: probe.autoResumeAfterMs } : {}),
     });
+    if (health == null) {
+      // EB-540: the enable half — a subscriber that never opted into
+      // `healthProbe` can gain one live. `null` on a never-probed
+      // subscriber is a silent no-op (clearing what was never set);
+      // `true` or an object installs a fresh probe resolved exactly
+      // like a subscribe-time opt-in. Anything else — `undefined`, a
+      // non-object, an array — is refused, and the resolution below
+      // validates before anything moves, so a failed enable leaves
+      // the subscriber unprobed and unaudited.
+      if (opts === null) {
+        return;
+      }
+      if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
+        throw new RangeError(
+          'setHealthProbe: healthProbe must be true or an object with maxConsecutiveFailures and/or processingTimeoutMs and/or autoResumeAfterMs to enable health probing, or null to clear it',
+        );
+      }
+      const resolved = resolveHealthProbeOptions(opts, this.defaultHealthProbe)!;
+      subscriber.health = {
+        consecutiveFailures: 0,
+        degraded: false,
+        ...resolved,
+      };
+      this.auditSubscription({
+        action: 'health_probe_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { healthProbe: snapshotProbe(subscriber.health), oldHealthProbe: null },
+      });
+      return;
+    }
     const oldHealthProbe = snapshotProbe(health);
     if (opts === null) {
       // Drop a pending auto-resume timer with the probe: the timer

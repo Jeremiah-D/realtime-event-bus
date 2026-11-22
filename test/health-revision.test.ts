@@ -173,13 +173,14 @@ test('setHealthProbe keeps omitted fields and still applies the revised threshol
   sub.unsubscribe();
 });
 
-test('setHealthProbe is fail-closed for unknown, unprobed, or illegal values', async () => {
+test('setHealthProbe is fail-closed for unknown subscribers or illegal values', async () => {
   const bus = new EventBus();
   const probed = bus.subscribe('t', () => {}, { healthProbe: { maxConsecutiveFailures: 3 } });
+  // An unprobed subscriber can now be enabled (EB-540) — see
+  // test/health-probe-enable.test.ts — so no throw is asserted here.
   const plain = bus.subscribe('u', () => {});
 
   assert.throws(() => bus.setHealthProbe('nope', { maxConsecutiveFailures: 1 }), RangeError);
-  assert.throws(() => bus.setHealthProbe(plain.id, { maxConsecutiveFailures: 1 }), RangeError);
   assert.throws(() => bus.setHealthProbe('', { maxConsecutiveFailures: 1 }), RangeError);
   assert.throws(() => bus.setHealthProbe(probed.id, { maxConsecutiveFailures: 0 }), RangeError);
   assert.throws(() => bus.setHealthProbe(probed.id, { maxConsecutiveFailures: 1.5 }), RangeError);
@@ -207,7 +208,7 @@ test('setHealthProbe is fail-closed for unknown, unprobed, or illegal values', a
   plain.unsubscribe();
 });
 
-test('setHealthProbe null clears the probe, releases a degraded pause, and refuses later revisions', async () => {
+test('setHealthProbe null clears the probe, releases a degraded pause, and a later enable works', async () => {
   const bus = new EventBus();
   const events: DegradedEvent[] = [];
   const received: unknown[] = [];
@@ -241,13 +242,26 @@ test('setHealthProbe null clears the probe, releases a degraded pause, and refus
   assert.deepEqual(received, ['b'], 'delivery flows again once the probe gate is gone');
   assert.equal(bus.getStats().degradedSubscribers, 0);
 
-  assert.throws(() => bus.setHealthProbe(sub.id, { maxConsecutiveFailures: 1 }), RangeError);
+  // A clear is no longer terminal (EB-540): the same call re-enables
+  // with a fresh probe — see test/health-probe-enable.test.ts for the
+  // full enable coverage.
+  bus.setHealthProbe(sub.id, { maxConsecutiveFailures: 1 });
+  assert.deepEqual(bus.subscriberHealth(sub.id), {
+    subscriberId: sub.id,
+    enabled: true,
+    degraded: false,
+    consecutiveFailures: 0,
+  });
 
   const audit = bus.getSubscriptionAudit({ action: 'health_probe_revised' });
-  assert.equal(audit.length, 1);
+  assert.equal(audit.length, 2);
   assert.deepEqual(audit[0].detail, {
     healthProbe: null,
     oldHealthProbe: { maxConsecutiveFailures: 1 },
+  });
+  assert.deepEqual(audit[1].detail, {
+    healthProbe: { maxConsecutiveFailures: 1 },
+    oldHealthProbe: null,
   });
   sub.unsubscribe();
 });

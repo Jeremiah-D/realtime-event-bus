@@ -456,7 +456,22 @@ test('EB-496: setHealthProbe(null) clears a subscriber without the default re-ap
   assert.equal(calls, 3);
   assert.deepEqual(received, ['b', 'c']);
   assert.equal(bus.getStats().degradedSubscribers, 0);
-  assert.throws(() => bus.setHealthProbe(sub.id, { maxConsecutiveFailures: 2 }), RangeError);
+  // A clear is no longer terminal (EB-540): the same call re-enables,
+  // resolving the omitted threshold through the installed default — the
+  // default still never applies itself without an explicit call.
+  bus.setHealthProbe(sub.id, { processingTimeoutMs: 50 });
+  assert.deepEqual(bus.subscriberHealth(sub.id), {
+    subscriberId: sub.id,
+    enabled: true,
+    degraded: false,
+    consecutiveFailures: 0,
+  });
+  const audit = bus.getSubscriptionAudit({ action: 'health_probe_revised' });
+  assert.equal(audit.length, 2);
+  assert.deepEqual(audit[1].detail, {
+    healthProbe: { maxConsecutiveFailures: 1, processingTimeoutMs: 50 },
+    oldHealthProbe: null,
+  });
   assert.deepEqual(
     bus.getDefaultHealthProbe(),
     { maxConsecutiveFailures: 1 },
