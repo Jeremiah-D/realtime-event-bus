@@ -39361,9 +39361,10 @@ export class EventBus {
    * is left alone and nothing is audited — only an explicit `null`
    * clears a gate. Passing `null` clears the gate: the subscriber
    * returns to full speed immediately, a pending re-flush timer is
-   * cancelled (the same cleanup unsubscribe performs), and a later
-   * revision is refused until the subscriber opts in again at
-   * subscribe time.
+   * cancelled (the same cleanup unsubscribe performs). A clear is no
+   * longer terminal (EB-541): a later call with `true` or an object
+   * installs a fresh gate (see Enabling below), and `null` on a
+   * subscriber that never had a gate is a silent no-op with no audit.
    *
    * The revision is a full replacement, not a partial merge: options
    * reuse `resolveSlowStartOptions`, so a field left out takes the
@@ -39372,19 +39373,40 @@ export class EventBus {
    * revision identical to the current gate's parameters, field by
    * field, is a no-op with no audit.
    *
-   * Fail-closed: an unknown subscriber id, a subscriber that never
-   * opted into `slowStart` (or whose completed gate a drain already
-   * dropped), a non-object / non-boolean value, an illegal
-   * `initialPerSec` (non-finite or <= 0), `rampMs` (non-finite or
-   * <= 0) or `strategy` (not `'linear'` / `'exponential'`), and
-   * `undefined` / `false` — only an explicit `null` clears — all
-   * throw `RangeError` with the live gate, its re-flush timer, and
-   * the audit log untouched. Audited as `slow_start_revised`
+   * Enabling (EB-541): `true` or an object on a subscriber that never
+   * opted into `slowStart` — or whose gate was cleared, or whose
+   * completed gate a drain already dropped — resolves through
+   * `resolveSlowStartOptions` exactly like a subscribe-time opt-in:
+   * explicit fields win, the live bus default from
+   * `setDefaultSlowStart` (EB-486) fills omitted fields one by one,
+   * and the documented default (`initialPerSec` 10, `rampMs` 1000,
+   * `strategy` `'linear'`) covers the rest — and installs a fresh
+   * `SlowStartGate` (`startedAtMs` at the enable moment, one second
+   * of initial budget, exactly as `subscribe` builds it). The enable
+   * needs no wiring: the drain already reads `subscriber.slowStart`
+   * live, so the fresh gate paces the next flush round — messages
+   * already queued are not reordered or re-judged, they simply leave
+   * under the new gate. The target is read live at enable time (the
+   * subscriber's `deliveryShaping` cap when configured, full speed
+   * otherwise), and a fresh gate always re-ramps from the enable
+   * moment. An enable that would build no gate (`initialPerSec` at
+   * or above the live target) is a documented no-op that leaves the
+   * subscriber unconfigured, mirroring subscribe-time inertness. The
+   * enable is live-only: a restart restores the unconfigured state.
+   *
+   * Fail-closed: an unknown subscriber id, a non-object / non-boolean
+   * value, an illegal `initialPerSec` (non-finite or <= 0), `rampMs`
+   * (non-finite or <= 0) or `strategy` (not `'linear'` /
+   * `'exponential'`), and `undefined` / `false` — only an explicit
+   * `null` clears — all throw `RangeError` with the live gate, its
+   * re-flush timer, and the audit log untouched; on a subscriber with
+   * no gate a failed enable leaves it unconfigured and unaudited.
+   * Audited as `slow_start_revised`
    * (`{ slowStart: { initialPerSec, rampMs, strategy } | null,
-   * oldSlowStart: { initialPerSec, rampMs, strategy } }`, `null`
-   * for a clear) on success. `getStats().rampingSubscribers`
-   * already reads the live gate, so it reflects a revision (and a
-   * re-ramp) with no new field.
+   * oldSlowStart: { initialPerSec, rampMs, strategy } | null }`,
+   * `null` for a clear, `null` for `oldSlowStart` on an enable) on
+   * success. `getStats().rampingSubscribers` already reads the live
+   * gate, so it reflects a revision (and a re-ramp) with no new field.
    *
    * Orthogonal to the subscribe-time ramp of EB-75 (this revises it,
    * that sets it), to `setDeliveryShaping` (EB-266, that retunes the
@@ -39392,8 +39414,8 @@ export class EventBus {
    * `setRateLimit` (EB-271, a separate limiter that still bounds
    * every delivery the retuned ramp admits).
    *
-   * Throws `RangeError` for an unknown / non-slow-start subscriber
-   * or an illegal slow-start value.
+   * Throws `RangeError` for an unknown subscriber or an illegal
+   * slow-start value.
    */
   setSlowStart(subId: string, opts: boolean | SlowStartOptions | null): void {
     if (typeof subId !== 'string' || subId.length === 0) {
@@ -39405,7 +39427,45 @@ export class EventBus {
     }
     const gate = subscriber.slowStart;
     if (gate == null) {
-      throw new RangeError('setSlowStart: subscriber has no slowStart set');
+      // EB-541: the enable half — a subscriber that never opted into
+      // `slowStart` (or whose gate was cleared, or whose completed
+      // gate a drain already dropped) can gain one live. `null` on a
+      // subscriber with no gate is a silent no-op (clearing what was
+      // never set); `true` or an object installs a fresh gate resolved
+      // exactly like a subscribe-time opt-in — explicit fields win,
+      // the live bus default (EB-486) fills omitted fields, and the
+      // documented defaults cover the rest. Anything else —
+      // `undefined`, `false`, a non-object — is refused, and the
+      // resolution below validates before anything moves, so a failed
+      // enable leaves the subscriber unconfigured and unaudited.
+      if (opts === null) {
+        return;
+      }
+      const resolved = resolveSlowStartOptions(opts, this.defaultSlowStart);
+      if (resolved === undefined) {
+        throw new RangeError('setSlowStart: slowStart must be a boolean or a SlowStartOptions object, or null to clear it');
+      }
+      // No headroom: mirrors subscribe-time inertness — when
+      // `initialPerSec` is already at or above the live target there
+      // is no ramp to run, so the subscriber stays unconfigured and
+      // unaudited; a later call with headroom can still enable it.
+      const target = subscriber.deliveryShaping?.messagesPerSec ?? Number.POSITIVE_INFINITY;
+      if (resolved.initialPerSec >= target) {
+        return;
+      }
+      subscriber.slowStart = new SlowStartGate(resolved, target, this.now);
+      this.auditSubscription({
+        action: 'slow_start_revised',
+        actor: 'system',
+        subId: subscriber.id,
+        pattern: subscriber.pattern,
+        detail: { slowStart: { ...resolved }, oldSlowStart: null },
+      });
+      // The fresh gate's initial budget may make queued messages
+      // admittable on this flush; a drain that finds nothing new
+      // simply does nothing.
+      this.scheduleFlush();
+      return;
     }
     const oldSlowStart = gate.options();
     if (opts === null) {

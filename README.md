@@ -3065,11 +3065,19 @@ library.
   gate a drain already dropped — a non-object / non-boolean value, or
   an illegal rate, window, or strategy throws `RangeError` with the
   live gate, its timer, and the audit log untouched; `undefined` and
-  `false` are not a clear, only `null` is, and a revision after a
-  clear is refused until the subscriber opts in again at subscribe
-  time), and every success is audited as `slow_start_revised`
+  `false` are not a clear, only `null` is. A clear is no longer
+  terminal (EB-541): a later call with `true` or an object installs a
+  fresh gate on a subscriber that never opted in — or whose gate was
+  cleared or dropped — resolving exactly like a subscribe-time opt-in
+  (explicit fields > live bus default > 10 / 1000 / `'linear'`),
+  re-ramping from the enable moment with the target read live, and
+  `null` on a subscriber with no gate is a silent no-op; an enable
+  that would build no gate (`initialPerSec` at or above the live
+  target) is a documented no-op that leaves the subscriber
+  unconfigured), and every success is audited as `slow_start_revised`
   (`{ slowStart: { initialPerSec, rampMs, strategy } | null,
-  oldSlowStart: { initialPerSec, rampMs, strategy } }`). (Real-time
+  oldSlowStart: { initialPerSec, rampMs, strategy } | null }`,
+  `null` for `oldSlowStart` on an enable). (Real-time
   systems: delivery governance.)
   Bus-level default (EB-486, via
   `setDefaultSlowStart(opts | null, actor = 'system')`): the
@@ -3085,8 +3093,9 @@ library.
   ramp or its armed re-flush timer. `setSlowStart` keeps its own
   semantics — a partial revision still takes the documented default
   for an omitted field, `null` still clears to full speed without
-  the default re-applying, and a revision after a clear is still
-  refused. The ramp target follows the effective shaping cap at
+  the default re-applying, and a revision after a clear now re-enables
+  (EB-541) — the enable resolves omitted fields against the bus
+  default, unlike a revision. The ramp target follows the effective shaping cap at
   subscribe time, and the headless-room rule is unchanged: when the
   resolved `initialPerSec` is already at or above the finite target
   no gate is built. Every success is audited as

@@ -231,7 +231,7 @@ test('EB-486: the default never enables slow-start', async () => {
   sub.unsubscribe();
 });
 
-test('EB-486: setSlowStart partial revision still takes the documented defaults, null clears without the default re-applying, and a later revision is refused', async () => {
+test('EB-486: setSlowStart partial revision still takes the documented defaults, null clears without the default re-applying, and a later revision re-enables (EB-541)', async () => {
   const clock = makeClock();
   const bus = new EventBus({ now: clock.now });
   bus.setDefaultSlowStart({ initialPerSec: 2, rampMs: 5000 });
@@ -263,11 +263,33 @@ test('EB-486: setSlowStart partial revision still takes the documented defaults,
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     'the cleared subscriber delivers at full speed even though a default is installed',
   );
-  assert.throws(() => bus.setSlowStart(sub.id, { initialPerSec: 5 }), RangeError);
-  bus.publish('t', 10);
-  bus.publish('t', 11);
+  // A clear is no longer terminal (EB-541): `null` on the cleared
+  // subscriber is a silent no-op, and a later call re-enables — the
+  // enable resolves omitted fields against the bus default (unlike a
+  // revision, which takes the documented defaults), so the fresh gate
+  // ramps from 5/s over the default 5000ms.
+  bus.setSlowStart(sub.id, null);
+  assert.equal(
+    bus.getSubscriptionAudit({ action: 'slow_start_revised' }).length,
+    2,
+    'null on an unconfigured subscriber audits nothing',
+  );
+  bus.setSlowStart(sub.id, { initialPerSec: 5 });
+  const after = bus.getSubscriptionAudit({ action: 'slow_start_revised' });
+  assert.equal(after.length, 3);
+  assert.deepEqual(after[2].detail, {
+    slowStart: { initialPerSec: 5, rampMs: 5000, strategy: 'linear' },
+    oldSlowStart: null,
+  });
+  assert.equal(bus.getStats().rampingSubscribers, 1, 'the re-enable re-ramps');
+  for (let i = 10; i < 18; i++) bus.publish('t', i);
   await flush();
-  assert.equal(received.length, 12, 'still full speed after the refused revision');
+  assert.deepEqual(
+    received,
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    'the fresh gate admits its five-token budget',
+  );
+  assert.equal(bus.pendingCount(sub.id), 3);
   sub.unsubscribe();
 });
 

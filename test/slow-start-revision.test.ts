@@ -78,7 +78,7 @@ test('setSlowStart re-ramps a completed gate that is still attached', async () =
   sub.unsubscribe();
 });
 
-test('setSlowStart with null clears the gate and a later revision is refused', async () => {
+test('setSlowStart with null clears the gate and a later revision re-enables it (EB-541)', async () => {
   const clock = makeClock();
   const bus = new EventBus({ now: clock.now });
   const received: unknown[] = [];
@@ -102,8 +102,27 @@ test('setSlowStart with null clears the gate and a later revision is refused', a
     oldSlowStart: { initialPerSec: 1, rampMs: 10000, strategy: 'linear' },
   });
 
-  assert.throws(() => bus.setSlowStart(sub.id, { initialPerSec: 5 }), RangeError);
-  assert.throws(() => bus.setSlowStart(sub.id, null), RangeError);
+  // A clear is no longer terminal (EB-541): `null` on the cleared
+  // subscriber is a silent no-op, and a later call installs a fresh
+  // gate that re-ramps from the enable moment.
+  bus.setSlowStart(sub.id, null);
+  assert.equal(
+    bus.getSubscriptionAudit({ action: 'slow_start_revised' }).length,
+    1,
+    'null on an unconfigured subscriber audits nothing',
+  );
+  bus.setSlowStart(sub.id, { initialPerSec: 2, rampMs: 10000 });
+  assert.equal(bus.getStats().rampingSubscribers, 1, 'the re-enable re-ramps');
+  for (let i = 5; i < 10; i++) bus.publish('t', i);
+  await flush();
+  assert.deepEqual(received, [0, 1, 2, 3, 4, 5, 6], 'the fresh gate admits its two-token budget');
+  assert.equal(bus.pendingCount(sub.id), 3);
+  const after = bus.getSubscriptionAudit({ action: 'slow_start_revised' });
+  assert.equal(after.length, 2);
+  assert.deepEqual(after[1].detail, {
+    slowStart: { initialPerSec: 2, rampMs: 10000, strategy: 'linear' },
+    oldSlowStart: null,
+  });
   sub.unsubscribe();
 });
 
@@ -242,11 +261,10 @@ test('setSlowStart is fail-closed: illegal revisions leave the gate untouched', 
 
   assert.throws(() => bus.setSlowStart('sub-999', { initialPerSec: 2 }), RangeError);
   assert.throws(() => bus.setSlowStart('', { initialPerSec: 2 }), RangeError);
-  assert.throws(
-    () => bus.setSlowStart(plain.id, { initialPerSec: 2 }),
-    RangeError,
-    'a subscriber that never opted into slowStart refuses revision',
-  );
+  // A subscriber that never opted into slowStart no longer refuses:
+  // since EB-541 the same call enables it — covered by
+  // slow-start-enable.test.ts, so the fail-closed assertions here stay
+  // on the configured subscriber only.
   const bad: unknown[] = [
     undefined,
     false,
