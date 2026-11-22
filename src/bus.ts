@@ -16848,9 +16848,14 @@ export class EventBus {
    * Per-topic delivery failure-rate regime detection (EB-442, see
    * `EventBusOptions.failureRegime`). Present only when the option is
    * passed — an absent option means no monitor at all: reporting
-   * throws `RangeError` and the bus pays nothing.
+   * throws `RangeError` and the bus pays nothing — until
+   * `setFailureRateRegimeChangeCallback` (EB-542) or
+   * `reviseFailureRegimeParams` (EB-543) builds one live with the
+   * construction defaults. Deliberately *not* readonly (EB-542):
+   * the monitor starts absent and is installed by
+   * `ensureFailureRegimeMonitor`.
    */
-  private readonly failureRegimeMonitor: FailureRateRegimeMonitor | undefined;
+  private failureRegimeMonitor: FailureRateRegimeMonitor | undefined;
   /**
    * Unhealthy-skip counters (EB-217): publishes rerouted away from an
    * unhealthy (topic, partition) pair, keyed by concrete topic then by
@@ -19767,10 +19772,11 @@ export class EventBus {
     // detector's clock is forced to the bus clock (`this.now()`), so
     // `detectedAtMs` always reads on bus time.
     const failureRegimeOptions = resolveFailureRegimeOptions(options?.failureRegime);
-    this.failureRegimeMonitor =
-      failureRegimeOptions === undefined
-        ? undefined
-        : new FailureRateRegimeMonitor({ ...failureRegimeOptions, nowMs: () => this.now() });
+    if (failureRegimeOptions !== undefined) {
+      // EB-542: construction goes through the same `ensure…` wiring
+      // the live enable uses, so the two paths can never drift apart.
+      this.ensureFailureRegimeMonitor(failureRegimeOptions);
+    }
     // EB-182: opt-in publish-side admission latency sampling. A present
     // (even empty) options object arms the tracker; an absent option
     // disables everything — no sampling, zeroed stats, no Prometheus
@@ -49067,6 +49073,36 @@ export class EventBus {
   }
 
   /**
+   * Returns the live failure-rate regime monitor, building one when
+   * the bus never opted into `failureRegime` (EB-542; shared with
+   * `reviseFailureRegimeParams`, EB-543). The build is exactly the
+   * construction-time wiring — the resolved options plus the bus
+   * clock (`() => this.now()`, so `detectedAtMs` always reads on bus
+   * time) — so a monitor built live behaves exactly like one built
+   * at construction: same defaults (`delta` 0.05 / `lambda` 5 /
+   * `warmupSamples` 50 / `windowSamples` 50 when `resolved` omits
+   * them), same per-topic detectors built lazily on first outcome.
+   * A caller that passes `resolved` owns its validation — the
+   * options are stored as given, and an illegal value must be
+   * refused before this is called, so a failed enable never
+   * half-wires a monitor.
+   */
+  private ensureFailureRegimeMonitor(
+    resolved: FailureRegimeOptions = {},
+  ): FailureRateRegimeMonitor {
+    const existing = this.failureRegimeMonitor;
+    if (existing !== undefined) {
+      return existing;
+    }
+    const monitor = new FailureRateRegimeMonitor({
+      ...resolved,
+      nowMs: () => this.now(),
+    });
+    this.failureRegimeMonitor = monitor;
+    return monitor;
+  }
+
+  /**
    * Live-redirects the failure-rate regime-change alert callback
    * (EB-445) without restarting the bus:
    * `setFailureRateRegimeChangeCallback(cb, actor = 'system')` swaps
@@ -49099,15 +49135,29 @@ export class EventBus {
    * a throwing observer never breaks the outcome stream or the
    * `reportDeliveryOutcome` call that delivered the alarming outcome.
    *
+   * Enabling (EB-542): a bus that never opted into `failureRegime`
+   * gains a monitor live on the first call — no restart, no lost
+   * subscriptions: the monitor is built with the construction
+   * defaults (`delta` 0.05 / `lambda` 5 / `warmupSamples` 50 /
+   * `windowSamples` 50) on the bus clock, through the same
+   * `ensureFailureRegimeMonitor` wiring construction uses, and the
+   * callback is installed on the fresh monitor (a function arms
+   * alerting; `null` enables detection audit-only). Detection starts
+   * from the first outcome after the enable — outcomes reported
+   * before it were refused, so nothing is traced back — and the
+   * enable is live-only: a restart restores the unconfigured state.
+   * The enable is audited like any revision, with
+   * `oldHasCallback: false`. Once enabled, `reviseFailureRegimeParams`
+   * (EB-446) works on the same monitor, and a later call with the
+   * same callback reference is still a no-op with no audit.
+   *
    * Fail-closed: a closed bus and an illegal callback value
    * (anything but a function or an explicit `null` — `undefined` is
-   * not a value) throw `RangeError` with the live callback, the
-   * baselines, and the audit log untouched; a bus that never enabled
-   * `failureRegime` throws `Error` — there is no monitor at all, so
-   * enabling detection needs a restart (along the WR-365
-   * circuit-breaker gate wording). A revision identical to the live
-   * callback — the same function reference, including clearing a
-   * callback that was never set — is a no-op with no audit. Audited
+   * not a value) throw `RangeError` with the bus unconfigured (on a
+   * bus that never enabled `failureRegime`) or the live callback,
+   * the baselines, and the audit log untouched. A revision identical
+   * to the live callback — the same function reference, including
+   * clearing a callback that was never set — is a no-op with no audit. Audited
    * as `failure_rate_regime_change_callback_revised`
    * (`{ hasCallback: <boolean>, oldHasCallback: <boolean> }` — the
    * callback itself is a function and is never serialized into the
@@ -49122,8 +49172,7 @@ export class EventBus {
    * EB-427 / EB-428 / EB-429 / EB-430 / EB-431 / EB-436 (sibling
    * bus-level hook redirections — this the regime-detection channel).
    *
-   * Throws `Error` when `failureRegime` was never configured, and
-   * `RangeError` for a closed bus or an illegal callback value.
+   * Throws `RangeError` for a closed bus or an illegal callback value.
    */
   setFailureRateRegimeChangeCallback(
     cb: ((change: FailureRateRegimeChange) => void) | null,
@@ -49136,31 +49185,51 @@ export class EventBus {
     if (this.closed) {
       throw new RangeError('setFailureRateRegimeChangeCallback: bus is closed');
     }
-    const monitor = this.failureRegimeMonitor;
-    if (monitor === undefined) {
-      throw new Error(
-        'setFailureRateRegimeChangeCallback: failureRegime is not configured — enabling it requires a restart',
-      );
-    }
     // Validate before touching anything: `null` clears back to
     // audit-only, so it normalizes to `undefined`; anything that is
     // neither a function nor `null` is rejected outright, and a failed
-    // call leaves the live callback untouched.
+    // call leaves the bus unconfigured (EB-542) or the live callback
+    // untouched.
     if (cb !== null && typeof cb !== 'function') {
       throw new RangeError('setFailureRateRegimeChangeCallback: cb must be a function or null');
     }
     const next = cb ?? undefined;
+    const existing = this.failureRegimeMonitor;
+    if (existing === undefined) {
+      // EB-542: the enable half — a bus that never opted into
+      // `failureRegime` gains a monitor live, built with the
+      // construction defaults on the bus clock. The callback is
+      // installed on the fresh monitor (a function arms alerting;
+      // `null` enables detection audit-only, with no callback fired)
+      // and the enable itself is audited with `oldHasCallback:
+      // false`. Outcomes reported before the enable never existed —
+      // `reportDeliveryOutcome` refused them — so detection starts
+      // from the first outcome after the enable.
+      const monitor = this.ensureFailureRegimeMonitor();
+      if (next !== undefined) {
+        monitor.setOnChange(next);
+      }
+      this.auditSubscription({
+        action: 'failure_rate_regime_change_callback_revised',
+        actor,
+        detail: {
+          hasCallback: next !== undefined,
+          oldHasCallback: false,
+        },
+      });
+      return;
+    }
     // Re-installing the live callback (the same raw reference,
     // including clearing a bus with no callback) is a no-op: no swap,
     // no audit.
-    if (next === monitor.getOnChange()) {
+    if (next === existing.getOnChange()) {
       return;
     }
-    const oldHasCallback = monitor.getOnChange() !== undefined;
+    const oldHasCallback = existing.getOnChange() !== undefined;
     // Only the callback moves: the monitor fans the swap out to every
     // already-built detector and stores it for later topics, and the
     // next alarm on any topic reads the new value.
-    monitor.setOnChange(next);
+    existing.setOnChange(next);
     this.auditSubscription({
       action: 'failure_rate_regime_change_callback_revised',
       actor,

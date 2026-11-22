@@ -144,17 +144,14 @@ test('clearing with null keeps detection running with no callback, and a reinsta
   ]);
 });
 
-test('an unconfigured bus throws a must-restart Error', () => {
+test('an unconfigured bus enables on the first call (EB-542)', () => {
   const bus = new EventBus();
-  assert.throws(
-    () => bus.setFailureRateRegimeChangeCallback(() => {}),
-    (e: unknown) =>
-      e instanceof Error &&
-      !(e instanceof RangeError) &&
-      /failureRegime is not configured — enabling it requires a restart/.test((e as Error).message),
-  );
-  assert.equal(callbackRevisionAudits(bus).length, 0, 'a refused revision must not audit');
-  // A configured bus (even with no callback) accepts the revision.
+  assert.doesNotThrow(() => bus.setFailureRateRegimeChangeCallback(() => {}));
+  assert.deepEqual(callbackRevisionAudits(bus)[0].detail, {
+    hasCallback: true,
+    oldHasCallback: false,
+  });
+  // A configured bus (even with no callback) still accepts the revision.
   const enabled = new EventBus({ failureRegime: {} });
   assert.doesNotThrow(() => enabled.setFailureRateRegimeChangeCallback(() => {}));
   assert.equal(callbackRevisionAudits(enabled).length, 1);

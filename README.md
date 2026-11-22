@@ -9000,9 +9000,13 @@ Semantics:
   state are untouched, and a swap mid-settling does not reset the
   settling count. `null` clears back to audit-only — detection keeps
   running, just with no callback fired. A bus that never enabled
-  `failureRegime` throws `Error` (enabling it needs a restart); a
-  same-reference reinstall is a no-op with no audit; every success is
-  audited as `failure_rate_regime_change_callback_revised`
+  `failureRegime` gains a monitor live on the first call (EB-542) —
+  built with the construction defaults on the bus clock, `null`
+  enabling detection audit-only — and the enable is audited with
+  `oldHasCallback: false`; the enable is live-only, a restart
+  restores the unconfigured state; a same-reference reinstall is a
+  no-op with no audit; every success is audited as
+  `failure_rate_regime_change_callback_revised`
   (`{ hasCallback, oldHasCallback }`). `reportDeliveryOutcome`
   itself is still not audited.
 - **Live-retunable detection parameters (EB-446).**
