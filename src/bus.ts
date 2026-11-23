@@ -17778,9 +17778,13 @@ export class EventBus {
   /**
    * Delayed-delivery schedule-skew observability (EB-136, see
    * `EventBusOptions.scheduleSkew`). Absent when the option is not
-   * passed — no sampling, no tracker, zeroed stats.
+   * passed — no sampling, no tracker, zeroed stats — until
+   * `setScheduleSkew` (EB-548) builds one live with the construction
+   * defaults. Deliberately *not* readonly (EB-548): the tracker
+   * starts absent and is installed by the enable half of
+   * `setScheduleSkew`.
    */
-  private readonly scheduleSkew:
+  private scheduleSkew:
     | { tracker: ScheduleSkewTracker; options: ResolvedScheduleSkewOptions }
     | undefined;
   /**
@@ -29827,12 +29831,14 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level schedule-skew observation tuning live (EB-303)
-   * without restarting the bus: `setScheduleSkew({ windowSize?,
-   * alertThresholdMs?, onScheduleSkew? })` retunes how many of the most
-   * recent delayed-schedule skew samples the bus keeps and when a
-   * sample is alert-worthy (see `EventBusOptions.scheduleSkew`,
-   * EB-136).
+   * Revises — or enables — the bus-level schedule-skew observation
+   * tuning live (EB-303, enable half EB-548) without restarting the
+   * bus: `setScheduleSkew({ windowSize?, alertThresholdMs?,
+   * onScheduleSkew? })` retunes how many of the most recent
+   * delayed-schedule skew samples the bus keeps and when a sample is
+   * alert-worthy (see `EventBusOptions.scheduleSkew`, EB-136) — or
+   * installs the tracker live on a bus that never opted into
+   * `scheduleSkew`.
    *
    * Only the fields provided move; the rest keep their live values.
    * The samples are untouched: a tightened `windowSize` truncates the
@@ -29846,12 +29852,33 @@ export class EventBus {
    * that armed a callback keeps alerting until the callback is
    * replaced by another one.
    *
-   * Fail-closed: a bus that never enabled `scheduleSkew`, a non-object
-   * revision, and an illegal value all throw `RangeError` with the live
-   * tuning and the audit log untouched. Validation reuses the
-   * construction-time rule (`resolveScheduleSkewOptions`: the window a
-   * positive integer, the threshold a non-negative finite number, the
-   * callback a function that requires a threshold in force) against the
+   * Enabling (EB-548): an object on a bus that never enabled
+   * `scheduleSkew` resolves through `resolveScheduleSkewOptions`
+   * exactly like a construction-time opt-in — `{}` takes every
+   * construction default (window 1024, no threshold, no callback),
+   * a partial object falls back per field (a callback still requires
+   * a threshold in force) — and installs a fresh
+   * `ScheduleSkewTracker` with an empty window, so skews fanned out
+   * before the enable were never recorded and nothing is sampled
+   * retroactively: the new tracker accumulates from the next sweep
+   * onward. The enable needs no wiring: the sweep already reads
+   * `this.scheduleSkew` live and skips sampling while it is
+   * `undefined`, so the fresh tracker governs from the next fan-out
+   * onward. The enable is live-only: a restart restores the
+   * unconfigured state. `null` on a never-enabled bus is a silent
+   * no-op with no audit (along EB-540).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live tuning and the audit
+   * log untouched. A bus that never enabled `scheduleSkew` gains a
+   * tracker live on the first call instead (EB-548): the revision is
+   * resolved through the construction-time rule
+   * (`resolveScheduleSkewOptions`: the window a positive integer,
+   * the threshold a non-negative finite number, the callback a
+   * function that requires a threshold in force) and installed
+   * whole — no restart, no lost subscriptions — and a failed enable
+   * leaves the bus unconfigured, so a later valid call still enables
+   * it. Validation reuses the construction-time rule against the
    * merged values, so a value that could not be set at construction
    * cannot be revised in later either — and a failed call changes
    * nothing at all: when only one field is provided only that field is
@@ -29862,21 +29889,91 @@ export class EventBus {
    * (`{ windowSize, oldWindowSize, alertThresholdMs,
    * oldAlertThresholdMs, hasOnScheduleSkew, oldHasOnScheduleSkew }` —
    * the callback itself is a function, so the audit records only
-   * whether one is armed).
+   * whether one is armed — all three old values are `null` /
+   * `false` on the first enable, since there was no live tuning to
+   * replace).
    *
    * Orthogonal to EB-296 (that retunes tail sampling — this the
    * schedule-skew observation), and to EB-298/EB-299/EB-300/EB-301/
    * EB-302 (those retune other bus-level parameters — this the
    * schedule-skew tuning).
    *
-   * Throws `RangeError` when schedule-skew sampling is not enabled,
-   * for a non-object revision, or for an illegal `windowSize` /
-   * `alertThresholdMs` / `onScheduleSkew`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, or for an illegal `windowSize` / `alertThresholdMs` /
+   * `onScheduleSkew`.
    */
-  setScheduleSkew(opts: ScheduleSkewRevision): void {
+  setScheduleSkew(opts: ScheduleSkewRevision | null): void {
+    // Fail-fast on a closed bus (EB-154, EB-548, along
+    // `setPartitionHealth`): close() already flushed once — there is
+    // no live tracker left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setScheduleSkew: bus is closed');
+    }
     const state = this.scheduleSkew;
     if (state === undefined) {
-      throw new RangeError('setScheduleSkew: scheduleSkew is not enabled on this bus');
+      // EB-548: the enable half — a bus that never enabled
+      // `scheduleSkew` gains a tracker live on the first call, with
+      // the revision resolved through the same
+      // `resolveScheduleSkewOptions` construction-time rule the
+      // configured path enforces (`{}` takes every construction
+      // default, a partial object falls back per field). Validate
+      // BEFORE installing anything: an illegal value throws here with
+      // the bus still unconfigured, so a later valid call still
+      // enables it. `null` on a never-enabled bus is a silent no-op
+      // (along EB-540). The enable installs a fresh tracker with an
+      // empty window — skews fanned out before the enable were never
+      // recorded, so nothing is sampled retroactively — and is
+      // audited with `oldWindowSize` / `oldAlertThresholdMs` `null`
+      // and `oldHasOnScheduleSkew` `false` (there was no live tuning
+      // to replace).
+      if (opts == null) {
+        return;
+      }
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setScheduleSkew: revision must be an object with windowSize and/or alertThresholdMs and/or onScheduleSkew',
+        );
+      }
+      // The resolver reports a non-function callback as a TypeError;
+      // the revision contract is RangeError for every illegal value
+      // (EB-303) — reject it here with the revision's message, and
+      // convert any other resolver TypeError the same way.
+      if (opts.onScheduleSkew !== undefined && typeof opts.onScheduleSkew !== 'function') {
+        throw new RangeError('setScheduleSkew: onScheduleSkew must be a function');
+      }
+      let resolved: ResolvedScheduleSkewOptions | undefined;
+      try {
+        resolved = resolveScheduleSkewOptions({
+          windowSize: opts.windowSize,
+          alertThresholdMs: opts.alertThresholdMs,
+          onScheduleSkew: opts.onScheduleSkew,
+        });
+      } catch (e) {
+        if (e instanceof TypeError) {
+          throw new RangeError(`setScheduleSkew: ${e.message}`);
+        }
+        throw e;
+      }
+      if (resolved === undefined) {
+        throw new RangeError('setScheduleSkew: scheduleSkew is not enabled on this bus');
+      }
+      this.scheduleSkew = {
+        tracker: new ScheduleSkewTracker(resolved.windowSize),
+        options: resolved,
+      };
+      this.auditSubscription({
+        action: 'schedule_skew_revised',
+        actor: 'system',
+        detail: {
+          windowSize: resolved.windowSize,
+          oldWindowSize: null,
+          alertThresholdMs: resolved.alertThresholdMs,
+          oldAlertThresholdMs: null,
+          hasOnScheduleSkew: resolved.onScheduleSkew !== undefined,
+          oldHasOnScheduleSkew: false,
+        },
+      });
+      return;
     }
     // An absent revision asks nothing to move.
     if (opts == null) {

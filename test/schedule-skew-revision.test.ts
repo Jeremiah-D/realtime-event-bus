@@ -1,10 +1,11 @@
 /**
- * Bus-level schedule-skew observation revision (EB-303).
+ * Bus-level schedule-skew observation revision (EB-303) and live
+ * enable (EB-548).
  *
  * `setScheduleSkew` retunes the delayed-delivery schedule-skew
  * observation live — the rolling window bound, the alert threshold,
- * and the alert callback — without restarting the bus. Only a bus
- * that already enabled `scheduleSkew` can be revised; illegal values
+ * and the alert callback — without restarting the bus, or installs
+ * it live on a bus that never enabled `scheduleSkew`; illegal values
  * fail closed with the live tuning and the audit log untouched; an
  * identical (or empty) revision is a no-op with no audit. The samples
  * are untouched by a revision: a tightened window truncates at the
@@ -48,15 +49,44 @@ async function fanOutWithSkew(
 }
 
 describe('schedule-skew revision (EB-303)', () => {
-  it('setScheduleSkew fails closed when scheduleSkew is not enabled', () => {
+  it('setScheduleSkew on a bus that never enabled scheduleSkew installs the tracker live (EB-548)', () => {
     const bus = new EventBus();
-    assert.throws(() => bus.setScheduleSkew({ windowSize: 5 }), RangeError);
-    assert.throws(() => bus.setScheduleSkew({ alertThresholdMs: 10 }), RangeError);
-    assert.throws(() => bus.setScheduleSkew({ onScheduleSkew: () => {} }), RangeError);
-    assert.equal(
-      bus.getSubscriptionAudit({ action: 'schedule_skew_revised' }).length,
-      0,
-    );
+    assert.deepEqual(bus.getStats().delayedScheduleSkew, {
+      samples: 0,
+      p50Ms: 0,
+      p99Ms: 0,
+      minMs: 0,
+      maxMs: 0,
+      meanMs: 0,
+    });
+    // The first call enables: the window takes the given value, the
+    // rest take the construction defaults, and the old side is null.
+    bus.setScheduleSkew({ windowSize: 5 });
+    let entries = bus.getSubscriptionAudit({ action: 'schedule_skew_revised' });
+    assert.equal(entries.length, 1);
+    assert.deepEqual(entries[0].detail, {
+      windowSize: 5,
+      oldWindowSize: null,
+      alertThresholdMs: undefined,
+      oldAlertThresholdMs: null,
+      hasOnScheduleSkew: false,
+      oldHasOnScheduleSkew: false,
+    });
+    // The next calls revise from the live enabled values — the old
+    // side is now real, and the callback can arm now that a threshold
+    // is in force.
+    bus.setScheduleSkew({ alertThresholdMs: 10 });
+    bus.setScheduleSkew({ onScheduleSkew: () => {} });
+    entries = bus.getSubscriptionAudit({ action: 'schedule_skew_revised' });
+    assert.equal(entries.length, 3);
+    assert.deepEqual(entries[2].detail, {
+      windowSize: 5,
+      oldWindowSize: 5,
+      alertThresholdMs: 10,
+      oldAlertThresholdMs: 10,
+      hasOnScheduleSkew: true,
+      oldHasOnScheduleSkew: false,
+    });
   });
 
   it('setScheduleSkew rejects illegal values and leaves the live tuning untouched', async () => {

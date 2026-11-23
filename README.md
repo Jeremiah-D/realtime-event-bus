@@ -4612,12 +4612,20 @@ library.
   provided move, the rest keep their live values — a tightened
   `windowSize` truncates the oldest samples down to the new bound at
   the next recorded sample, and a revised threshold / callback governs
-  from the next sweep's alert check; only a bus that already enabled
-  `scheduleSkew` can be revised (otherwise `RangeError`); illegal
-  values fail closed with the live tuning untouched; an identical or
-  empty revision is a no-op with no audit. Audited as
-  `schedule_skew_revised` (old and new values; the callback recorded
-  only as whether one is armed). Opt-in same-tick fan-out priority (EB-219, via
+  from the next sweep's alert check. A bus that never enabled
+  `scheduleSkew` gains the tracker live on the first call instead
+  (EB-548): `{}` takes every construction default (window 1024, no
+  threshold, no callback), a partial object falls back per field, the
+  fresh tracker starts with an empty window — schedules fanned out
+  before the enable were never sampled — and the enable is live-only
+  (a restart restores the unconfigured state). `null` on a
+  never-enabled bus is a silent no-op. A closed bus refuses the
+  revision and the enable; illegal values fail closed with the live
+  tuning untouched; an identical or empty revision is a no-op with no
+  audit. Audited as `schedule_skew_revised` (old and new values —
+  `oldWindowSize` / `oldAlertThresholdMs` are `null` and
+  `oldHasOnScheduleSkew` is `false` on the first enable; the callback
+  recorded only as whether one is armed). Opt-in same-tick fan-out priority (EB-219, via
   `setDelayedTopicPriority(topicPattern, priority)`): when one sweep pass
   finds several schedules due at once, entries for higher-priority topics
   fan out first, so a burst of low-priority delayed traffic cannot starve
