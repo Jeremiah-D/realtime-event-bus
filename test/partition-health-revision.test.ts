@@ -1,13 +1,14 @@
 /**
- * Bus-level partition-health revision (EB-298).
+ * Bus-level partition-health revision (EB-298) and live enable
+ * (EB-547).
  *
  * `setPartitionHealth` retunes the tracker live — the sliding window,
  * the unhealthy threshold, the minimum samples, and the recovery
- * cool-down — without restarting the bus. Only a bus that enabled
- * `partitionHealth` can be revised; illegal values fail closed with
- * the live tuning and the audit log untouched; an identical (or empty)
- * revision is a no-op with no audit. In-flight outcome windows are
- * untouched: a tightened window truncates at the next report, a
+ * cool-down — without restarting the bus — or installs it live on a
+ * bus that never enabled `partitionHealth`; illegal values fail closed
+ * with the live tuning and the audit log untouched; an identical (or
+ * empty) revision is a no-op with no audit. In-flight outcome windows
+ * are untouched: a tightened window truncates at the next report, a
  * tightened threshold condemns at the next classify, and a revised
  * cool-down arms the next condemnation (an in-flight cool-down
  * counter is not rewritten).
@@ -22,12 +23,30 @@ const tight = {
 };
 
 describe('partition health revision (EB-298)', () => {
-  it('setPartitionHealth fails closed when partitionHealth is not enabled', () => {
+  it('setPartitionHealth on a bus that never enabled partitionHealth installs the tracker live (EB-547)', () => {
     const bus = new EventBus();
     bus.setTopicPartitions('t', 3);
-    assert.throws(() => bus.setPartitionHealth({ unhealthyThreshold: 0.5 }), RangeError);
-    assert.throws(() => bus.setPartitionHealth({ windowSize: 10 }), RangeError);
-    assert.equal(bus.getSubscriptionAudit({ action: 'partition_health_revised' }).length, 0);
+    assert.equal(bus.getStats().partitionHealth, undefined);
+    // A partial object falls back per field: the window takes the
+    // construction default (and the default minSamples of 10 fits it).
+    bus.setPartitionHealth({ unhealthyThreshold: 0.25 });
+    assert.deepEqual(bus.getStats().partitionHealth, []);
+    const entries = bus.getSubscriptionAudit({ action: 'partition_health_revised' });
+    assert.equal(entries.length, 1);
+    assert.deepEqual(entries[0].detail, {
+      windowSize: 20,
+      oldWindowSize: null,
+      unhealthyThreshold: 0.25,
+      oldUnhealthyThreshold: null,
+      minSamples: 10,
+      oldMinSamples: null,
+      cooldownSuccesses: 5,
+      oldCooldownSuccesses: null,
+    });
+    // The fresh tracker governs from the next report onward.
+    bus.reportPartitionFailure('t', 0);
+    assert.equal(bus.getStats().partitionHealth?.[0]?.healthy, true);
+    bus.close();
   });
 
   it('setPartitionHealth rejects illegal values and leaves the live tuning untouched', () => {

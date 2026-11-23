@@ -6457,10 +6457,20 @@ How it works:
   truncates the oldest outcomes down to the new window at the next report, a tightened
   threshold/minSamples condemns at the next classify, and a revised
   cool-down arms the next condemnation (an in-flight cool-down counter
-  is not rewritten). Only a bus that enabled `partitionHealth` can be
-  revised (otherwise `RangeError`); illegal values fail closed with the
-  live tuning untouched; an identical or empty revision is a no-op with
-  no audit. Audited as `partition_health_revised` (old and new values).
+  is not rewritten). A bus that never enabled `partitionHealth` gains
+  the tracker live on the first call instead (EB-547): `true` or an
+  object resolves exactly like a construction-time opt-in (explicit
+  fields win, the rest take the defaults — window 20, threshold 0.5,
+  minSamples 10, cool-down 5), the fresh tracker starts with an empty
+  window — outcomes reported before the enable were never recorded —
+  and the enable is live-only (a restart restores the unconfigured
+  state). `null` on a never-enabled bus is a silent no-op; `true` on a
+  bus that already has a tracker is refused — `true` is an
+  enable-only token (EB-540 / EB-536 family convention). A closed bus
+  refuses the revision and the enable; illegal values fail closed with
+  the live tuning untouched; an identical or empty revision is a no-op
+  with no audit. Audited as `partition_health_revised` (old and new
+  values — all four old values are `null` on the first enable).
 - **Scope note** — partition routing is a publish-side admission
   decision: delayed schedules, pause-buffered messages, and bridge/cluster
   ingress fan out as ordinary (partition-0) publishes.

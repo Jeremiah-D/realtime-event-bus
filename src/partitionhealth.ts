@@ -85,7 +85,11 @@ export interface ResolvedPartitionHealthOptions {
 /**
  * Revision for the bus-level partition-health tuning (see
  * `EventBus.setPartitionHealth`, EB-298). Only the fields provided move;
- * the rest keep their live values.
+ * the rest keep their live values. A bus that never enabled
+ * `partitionHealth` gains a tracker live on the first call (EB-547) —
+ * `true` takes the construction defaults, an object tunes the bounds —
+ * while `true` on a bus that already has a tracker is refused
+ * (EB-540 / EB-536 family convention — `true` is an enable-only token).
  */
 export interface PartitionHealthRevision {
   /**

@@ -16845,9 +16845,12 @@ export class EventBus {
    * `EventBusOptions.partitionHealth`). Present only when the option is
    * passed — an absent option means no health state at all: the publish
    * path skips the health branch and `resolvePartition` behaves exactly
-   * as EB-90 defined it.
+   * as EB-90 defined it — until `setPartitionHealth` (EB-547) builds
+   * one live with the construction defaults. Deliberately *not*
+   * readonly (EB-547): the tracker starts absent and is installed by
+   * the enable half of `setPartitionHealth`.
    */
-  private readonly partitionHealthTracker: PartitionHealthTracker | undefined;
+  private partitionHealthTracker: PartitionHealthTracker | undefined;
   /**
    * Per-topic delivery failure-rate regime detection (EB-442, see
    * `EventBusOptions.failureRegime`). Present only when the option is
@@ -28419,12 +28422,14 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level partition-health tuning live (EB-298) without
-   * restarting the bus: `setPartitionHealth({ windowSize?,
-   * unhealthyThreshold?, minSamples?, cooldownSuccesses? })` retunes
-   * how aggressively partitions are condemned unhealthy and how long
-   * their recovery cool-down runs (see
-   * `EventBusOptions.partitionHealth`, EB-217).
+   * Revises — or enables — the bus-level partition-health tuning live
+   * (EB-298, enable half EB-547) without restarting the bus:
+   * `setPartitionHealth({ windowSize?, unhealthyThreshold?,
+   * minSamples?, cooldownSuccesses? })` retunes how aggressively
+   * partitions are condemned unhealthy and how long their recovery
+   * cool-down runs (see `EventBusOptions.partitionHealth`, EB-217) —
+   * or installs the tracker live on a bus that never opted into
+   * `partitionHealth`.
    *
    * Only the fields provided move; the rest keep their live values.
    * In-flight outcome windows are untouched: already-recorded
@@ -28435,36 +28440,122 @@ export class EventBus {
    * and a revised `cooldownSuccesses` arms the cool-down of the next
    * condemnation (an in-flight cool-down counter is not rewritten).
    *
-   * Fail-closed: a bus that never enabled `partitionHealth`, a
-   * non-object revision, and an illegal value all throw `RangeError`
-   * with the live tuning and the audit log untouched. Validation
-   * reuses the construction-time rule
+   * Enabling (EB-547): `true` or an object on a bus that never
+   * enabled `partitionHealth` resolves through
+   * `resolvePartitionHealthOptions` exactly like a construction-time
+   * opt-in — `true` takes every construction default, a partial
+   * object falls back per field (the construction-time
+   * `minSamples <= windowSize` gate still applies, so a window
+   * tighter than the default `minSamples` of 10 needs an explicit
+   * `minSamples`) — and installs a fresh `PartitionHealthTracker`
+   * with an empty window, so outcomes reported before the enable
+   * were never recorded and nothing is decided retroactively: the
+   * new tracker accumulates from the next report onward, and there
+   * is no in-flight cool-down to carry over. The enable needs no
+   * wiring: every report and publish path already reads
+   * `this.partitionHealthTracker` live and falls through while it is
+   * `undefined`, so the fresh tracker governs from the next report
+   * onward. The enable is live-only: a restart restores the
+   * unconfigured state. `null` on a never-enabled bus is a silent
+   * no-op with no audit (along EB-540).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live tuning and the audit
+   * log untouched. A bus that never enabled `partitionHealth` gains
+   * a tracker live on the first call instead (EB-547): the revision
+   * is resolved through the construction-time rule
    * (`resolvePartitionHealthOptions`: the window a positive integer,
    * the threshold a number in (0, 1], `minSamples` a positive integer
    * no larger than the merged window, the cool-down a positive
-   * integer) against the merged values, so a value that could not be
-   * set at construction cannot be revised in later either — and a
-   * failed call changes nothing at all: when only one field is
-   * provided only that field is validated and moved, and an illegal
-   * value in either field leaves every live value exactly as it was.
-   * A revision that provides neither field, and a revision identical
+   * integer) and installed whole — no restart, no lost subscriptions
+   * — and a failed enable leaves the bus unconfigured, so a later
+   * valid call still enables it. Validation reuses the
+   * construction-time rule against the merged values, so a value
+   * that could not be set at construction cannot be revised in later
+   * either — and a failed call changes nothing at all: when only one
+   * field is provided only that field is validated and moved, and an
+   * illegal value in any field leaves every live value exactly as it
+   * was. `true` is an enable-only token (EB-540 / EB-536 family
+   * convention): on a bus that already has a tracker it throws
+   * `RangeError` — a configured bus retunes through an object. A
+   * revision that provides neither field, and a revision identical
    * to the current tuning, are both no-ops with no audit. Audited as
    * `partition_health_revised` (`{ windowSize, oldWindowSize,
    * unhealthyThreshold, oldUnhealthyThreshold, minSamples,
-   * oldMinSamples, cooldownSuccesses, oldCooldownSuccesses }`).
+   * oldMinSamples, cooldownSuccesses, oldCooldownSuccesses }` — all
+   * four old values are `null` on the first enable, since there was
+   * no live tuning to replace).
    *
    * Orthogonal to EB-85 (that is the durable log's retention bound —
    * this the partition health tuning), and to `setTopicPartitions`
    * (that retunes the partition count — this the health observation).
    *
-   * Throws `RangeError` when partition health is not enabled, for a
-   * non-object revision, or for an illegal `windowSize` /
-   * `unhealthyThreshold` / `minSamples` / `cooldownSuccesses`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for `true` on a bus that already has a tracker, or for
+   * an illegal `windowSize` / `unhealthyThreshold` / `minSamples` /
+   * `cooldownSuccesses`.
    */
-  setPartitionHealth(opts: PartitionHealthRevision): void {
+  setPartitionHealth(opts: PartitionHealthRevision | true | null): void {
+    // Fail-fast on a closed bus (EB-154, EB-547, along
+    // `setTailSampling`): close() already flushed once — there is no
+    // live tracker left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setPartitionHealth: bus is closed');
+    }
     const tracker = this.partitionHealthTracker;
     if (tracker === undefined) {
-      throw new RangeError('setPartitionHealth: partitionHealth is not enabled on this bus');
+      // EB-547: the enable half — a bus that never enabled
+      // `partitionHealth` gains a tracker live on the first call, with
+      // the revision resolved through the same
+      // `resolvePartitionHealthOptions` construction-time rule the
+      // configured path enforces (`true` takes every construction
+      // default — passed as `{}` since the resolver takes an options
+      // object — a partial object falls back per field). Validate
+      // BEFORE installing anything: an illegal value throws here with
+      // the bus still unconfigured, so a later valid call still
+      // enables it. `null` on a never-enabled bus is a silent no-op
+      // (along EB-540). The enable installs a fresh tracker with an
+      // empty window — outcomes reported before the enable were never
+      // recorded, so nothing is decided retroactively — and is audited
+      // with all four old values `null` (there was no live tuning to
+      // replace).
+      if (opts == null) {
+        return;
+      }
+      if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
+        throw new RangeError(
+          'setPartitionHealth: revision must be an object with windowSize and/or unhealthyThreshold and/or minSamples and/or cooldownSuccesses',
+        );
+      }
+      const resolved = resolvePartitionHealthOptions(
+        opts === true
+          ? {}
+          : {
+              windowSize: opts.windowSize,
+              unhealthyThreshold: opts.unhealthyThreshold,
+              minSamples: opts.minSamples,
+              cooldownSuccesses: opts.cooldownSuccesses,
+            },
+      );
+      if (resolved === undefined) {
+        throw new RangeError('setPartitionHealth: partitionHealth is not enabled on this bus');
+      }
+      this.partitionHealthTracker = new PartitionHealthTracker(resolved);
+      this.auditSubscription({
+        action: 'partition_health_revised',
+        actor: 'system',
+        detail: {
+          windowSize: resolved.windowSize,
+          oldWindowSize: null,
+          unhealthyThreshold: resolved.unhealthyThreshold,
+          oldUnhealthyThreshold: null,
+          minSamples: resolved.minSamples,
+          oldMinSamples: null,
+          cooldownSuccesses: resolved.cooldownSuccesses,
+          oldCooldownSuccesses: null,
+        },
+      });
+      return;
     }
     // An absent revision asks nothing to move.
     if (opts == null) {
