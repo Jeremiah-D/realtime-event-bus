@@ -16,27 +16,18 @@ import { EventBus } from '../src/bus.ts';
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-test('setTailSampling(true) on a configured bus resets the tuning to the defaults (EB-545)', () => {
-  const bus = new EventBus({
-    tailSampling: { successSampleRate: 0.25, maxOpenTraces: 50, maxSpansPerTrace: 10, bufferSize: 7 },
-  });
-  bus.setTailSampling(true);
-  const audit = bus.getSubscriptionAudit({ action: 'tail_sampling_revised' });
-  assert.equal(audit.length, 1);
-  assert.deepEqual(audit[0].detail, {
-    successSampleRate: 1,
-    oldSuccessSampleRate: 0.25,
-    maxOpenTraces: 4096,
-    oldMaxOpenTraces: 50,
-    maxSpansPerTrace: 512,
-    oldMaxSpansPerTrace: 10,
-    bufferSize: 1024,
-    oldBufferSize: 7,
-  });
-  // And `true` against a bus already at the defaults is a no-op.
-  const defaults = new EventBus({ tailSampling: true });
-  defaults.setTailSampling(true);
-  assert.equal(defaults.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 0);
+test('setTailSampling enables tail sampling on a bus that never opted into it (EB-545)', () => {
+  // A never-enabled bus gains a sampler live on the first call instead
+  // of refusing: the enable resolves through the construction-time rule.
+  const bus = new EventBus();
+  bus.setTailSampling({ successSampleRate: 0.5 });
+  assert.equal(bus.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 1);
+  const viaTrue = new EventBus();
+  viaTrue.setTailSampling(true);
+  assert.equal(viaTrue.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 1);
+  const viaEmpty = new EventBus();
+  viaEmpty.setTailSampling({});
+  assert.equal(viaEmpty.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 1);
 });
 
 test('setTailSampling rejects illegal values and leaves the live tuning untouched', async () => {

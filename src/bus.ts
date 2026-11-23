@@ -26552,8 +26552,10 @@ export class EventBus {
    * later either — and a failed call changes nothing at all: when only
    * one field is provided only that field is validated and moved, and
    * an illegal value in either field leaves every live value exactly
-   * as it was. `true` on an already-configured bus resets the four
-   * bounds to the construction defaults. A revision that provides
+   * as it was. `true` is an enable-only token (EB-540 / EB-536 family
+   * convention): on a bus that already has a sampler it throws
+   * `RangeError` — a configured bus retunes through an object. A
+   * revision that provides
    * neither field, and a revision identical to the current tuning, are
    * both no-ops with no audit. Audited as `tail_sampling_revised`
    * (`{ successSampleRate, oldSuccessSampleRate, maxOpenTraces,
@@ -26566,7 +26568,8 @@ export class EventBus {
    * (that retunes log retention — this sampling).
    *
    * Throws `RangeError` when the bus is closed, for a non-object
-   * revision, or for an illegal `successSampleRate` /
+   * revision, for `true` on a bus that already has a sampler, or for
+   * an illegal `successSampleRate` /
    * `maxOpenTraces` / `maxSpansPerTrace` / `bufferSize`.
    */
   setTailSampling(opts: TailSamplingRevision | true | null): void {
@@ -26641,7 +26644,7 @@ export class EventBus {
     if (opts == null) {
       return;
     }
-    if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
       throw new RangeError(
         'setTailSampling: revision must be an object with successSampleRate and/or maxOpenTraces and/or maxSpansPerTrace and/or bufferSize',
       );
@@ -26649,12 +26652,11 @@ export class EventBus {
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the fields it leaves out — so resolution
     // happens here, against the merged values, before anything moves.
-    // `true` resets the four bounds to the construction defaults.
     const current = sampler.current();
-    const successSampleRate = opts === true ? 1 : (opts.successSampleRate ?? current.successSampleRate);
-    const maxOpenTraces = opts === true ? 4096 : (opts.maxOpenTraces ?? current.maxOpenTraces);
-    const maxSpansPerTrace = opts === true ? 512 : (opts.maxSpansPerTrace ?? current.maxSpansPerTrace);
-    const bufferSize = opts === true ? 1024 : (opts.bufferSize ?? current.bufferSize);
+    const successSampleRate = opts.successSampleRate ?? current.successSampleRate;
+    const maxOpenTraces = opts.maxOpenTraces ?? current.maxOpenTraces;
+    const maxSpansPerTrace = opts.maxSpansPerTrace ?? current.maxSpansPerTrace;
+    const bufferSize = opts.bufferSize ?? current.bufferSize;
     // Re-affirming the current tuning is a no-op: no retune, no audit.
     if (
       successSampleRate === current.successSampleRate &&

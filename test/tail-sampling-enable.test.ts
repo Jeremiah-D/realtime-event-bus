@@ -240,6 +240,67 @@ test('spans published before the enable are not traced back', async () => {
   assert.equal(spans.find((s) => s.name === 'bus.publish')!.attrs.tailKeepReason, 'sampled');
 });
 
+test('there is no live clear: null after enabling leaves the sampler live', async () => {
+  // Verified by grep: no clearTailSampling exists anywhere — the
+  // constructor is the only place that assigns the sampler, and
+  // `null` is a no-op on both sides of the enable. The nearest
+  // faithful equivalent of "clear then re-enable" is: a failed enable
+  // leaves the bus unconfigured and a later valid call still enables
+  // (pinned above), while `null` after enabling changes nothing.
+  const bus = new EventBus();
+  bus.subscribe(
+    't',
+    () => {
+      throw new Error('boom');
+    },
+    { healthProbe: true },
+  );
+  bus.setTailSampling({ successSampleRate: 0 });
+  bus.setTailSampling(null);
+  assert.equal(bus.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 1);
+  bus.publish('t', 1);
+  await flush();
+  await flush();
+  // The sampler is still live: the error trace is kept at rate 0.
+  const spans = bus.getStats().tailSampledSpans;
+  assert.ok(spans.length > 0, 'expected the sampler to stay live after null');
+  assert.equal(spans.find((s) => s.name === 'bus.publish')!.attrs.tailKeepReason, 'error');
+  // And a later valid revision still moves the live tuning.
+  bus.setTailSampling({ successSampleRate: 1 });
+  assert.equal(bus.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 2);
+});
+
+test('a same-value revision after enabling is a no-op with no second audit', () => {
+  const bus = new EventBus();
+  bus.setTailSampling({ successSampleRate: 0.5, maxOpenTraces: 100 });
+  bus.setTailSampling({ successSampleRate: 0.5 });
+  bus.setTailSampling({ maxOpenTraces: 100 });
+  bus.setTailSampling({ maxSpansPerTrace: 512 });
+  bus.setTailSampling({ bufferSize: 1024 });
+  bus.setTailSampling({ successSampleRate: 0.5, maxOpenTraces: 100 });
+  bus.setTailSampling({});
+  bus.setTailSampling(null);
+  assert.equal(bus.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 1);
+});
+
+test('true on a bus that already has a sampler is refused', async () => {
+  // EB-540 / EB-536 family convention: `true` is an enable-only
+  // token — a configured bus retunes through an object.
+  const constructed = new EventBus({ tailSampling: { successSampleRate: 0 } });
+  assert.throws(() => constructed.setTailSampling(true), RangeError);
+  assert.equal(constructed.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 0);
+
+  const enabled = new EventBus();
+  enabled.setTailSampling({ successSampleRate: 0 });
+  assert.throws(() => enabled.setTailSampling(true), RangeError);
+  assert.equal(enabled.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 1);
+  // The live tuning is untouched by the refused call: rate 0 still drops.
+  enabled.subscribe('t', () => {});
+  enabled.publish('t', 1);
+  await flush();
+  assert.deepEqual(enabled.getStats().tailSampledSpans, []);
+});
+
 test('the enable is live-only: a fresh bus is unconfigured again', () => {
   const bus = new EventBus();
   bus.setTailSampling({ successSampleRate: 1 });

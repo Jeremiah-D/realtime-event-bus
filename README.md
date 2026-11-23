@@ -3842,8 +3842,9 @@ library.
   installs one — spans published before the enable were never traced,
   so nothing is decided retroactively, and the enable is live-only (a
   restart restores the unconfigured state). `null` on a never-enabled
-  bus is a silent no-op; `true` on a configured bus resets the four
-  bounds to the construction defaults. The tail's own
+  bus is a silent no-op; `true` on a bus that already has a sampler is
+  refused — `true` is an enable-only token (EB-540 / EB-536 family
+  convention). The tail's own
   `onTraceSpan` moves live via `setTailSpanCallback(handler, actor?)`
   (EB-418): installing a callback of the tail's own splits the tail
   off the shared head channel for good (a later head swap via
