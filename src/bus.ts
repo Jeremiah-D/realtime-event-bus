@@ -17579,7 +17579,7 @@ export class EventBus {
    * instrumentation site checks this field first, which is what makes
    * the disabled path allocation-free.
    */
-  private readonly tailSampler: TailSampler | undefined;
+  private tailSampler: TailSampler | undefined;
   /**
    * Trace span archive journal (`EventBusOptions.trace.archive`,
    * EB-167), or `undefined` when the archive is disabled — every
@@ -26493,11 +26493,13 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level tail-sampling tuning live (EB-296) without
-   * restarting the bus: `setTailSampling({ successSampleRate?,
-   * maxOpenTraces?, maxSpansPerTrace?, bufferSize? })` retunes how
-   * aggressively successful traces are kept and how much memory the
-   * sampler may hold (see `EventBusOptions.tailSampling`, EB-181).
+   * Revises — or enables — the bus-level tail-sampling tuning live
+   * (EB-296, enable half EB-545) without restarting the bus:
+   * `setTailSampling({ successSampleRate?, maxOpenTraces?,
+   * maxSpansPerTrace?, bufferSize? })` retunes how aggressively
+   * successful traces are kept and how much memory the sampler may
+   * hold (see `EventBusOptions.tailSampling`, EB-181) — or installs
+   * the sampler live on a bus that never opted into `tailSampling`.
    *
    * Only the fields provided move; the rest keep their live values.
    * The tail's own `onTraceSpan` does not move here — it is a
@@ -26514,40 +26516,132 @@ export class EventBus {
    * to the newest spans at once, so the next append evicts the oldest
    * under the new bound.
    *
-   * Fail-closed: a bus that never enabled `tailSampling`, a non-object
-   * revision, and an illegal value all throw `RangeError` with the live
-   * tuning and the audit log untouched. Validation reuses the
-   * construction-time rule (`resolveTailSamplingOptions`: the rate a
-   * finite number in [0, 1], the rest positive integers) against the
-   * merged values, so a value that could not be set at construction
-   * cannot be revised in later either — and a failed call changes
-   * nothing at all: when only one field is provided only that field is
-   * validated and moved, and an illegal value in either field leaves
-   * every live value exactly as it was. A revision that provides
+   * Enabling (EB-545): `true` or an object on a bus that never
+   * enabled `tailSampling` resolves through `resolveTailSamplingOptions`
+   * exactly like a construction-time opt-in — explicit fields win, the
+   * fields left out take the construction defaults
+   * (`successSampleRate` 1, `maxOpenTraces` 4096, `maxSpansPerTrace`
+   * 512, `bufferSize` 1024) — and installs a fresh `TailSampler` on
+   * the bus clock. The enable needs no wiring: every instrumentation
+   * site already reads `this.tailSampler` live and returns past one
+   * branch while it is `undefined`, so the fresh sampler governs from
+   * the next publish. Spans published before the enable were never
+   * traced — there was no sampler to open a trace — so nothing is
+   * decided retroactively. The enable installs no callback of its own:
+   * when `trace` is enabled the fresh sampler falls back to the
+   * shared head channel exactly as construction does
+   * (`tailSharesTraceSpanChannel` is set and the composed head closure
+   * is installed, so a later head swap retargets the tail too), and
+   * when `trace` is not enabled the tail keeps spans in the ring only
+   * until `setTailSpanCallback` (EB-418) installs a callback of its
+   * own. The enable is live-only: a restart restores the unconfigured
+   * state. `null` on a never-enabled bus is a silent no-op with no
+   * audit (along EB-540).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live tuning and the audit
+   * log untouched. A bus that never enabled `tailSampling` gains a
+   * sampler live on the first call instead (EB-545): the revision is
+   * resolved through the construction-time rule
+   * (`resolveTailSamplingOptions`: the rate a finite number in [0, 1],
+   * the rest positive integers) and installed whole — no restart, no
+   * lost subscriptions — and a failed enable leaves the bus
+   * unconfigured, so a later valid call still enables it. Validation
+   * reuses the construction-time rule against the merged values, so a
+   * value that could not be set at construction cannot be revised in
+   * later either — and a failed call changes nothing at all: when only
+   * one field is provided only that field is validated and moved, and
+   * an illegal value in either field leaves every live value exactly
+   * as it was. `true` on an already-configured bus resets the four
+   * bounds to the construction defaults. A revision that provides
    * neither field, and a revision identical to the current tuning, are
    * both no-ops with no audit. Audited as `tail_sampling_revised`
    * (`{ successSampleRate, oldSuccessSampleRate, maxOpenTraces,
    * oldMaxOpenTraces, maxSpansPerTrace, oldMaxSpansPerTrace,
-   * bufferSize, oldBufferSize }`).
+   * bufferSize, oldBufferSize }` — every old value is `null` on the
+   * first enable, since there was no live tuning to replace).
    *
    * Orthogonal to EB-85 (that is the durable log's retention bound —
    * this the tail sampler's tuning), and to `setDurableLogMaxAgeMs`
    * (that retunes log retention — this sampling).
    *
-   * Throws `RangeError` when tail sampling is not enabled, for a
-   * non-object revision, or for an illegal `successSampleRate` /
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, or for an illegal `successSampleRate` /
    * `maxOpenTraces` / `maxSpansPerTrace` / `bufferSize`.
    */
-  setTailSampling(opts: TailSamplingRevision): void {
+  setTailSampling(opts: TailSamplingRevision | true | null): void {
+    // Fail-fast on a closed bus (EB-154, EB-545, along
+    // `setTraceSpanCallback`): close() already flushed once — there is
+    // no live sampler left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setTailSampling: bus is closed');
+    }
     const sampler = this.tailSampler;
     if (sampler === undefined) {
-      throw new RangeError('setTailSampling: tailSampling is not enabled on this bus');
+      // EB-545: the enable half — a bus that never enabled
+      // `tailSampling` gains a sampler live on the first call, with the
+      // revision resolved through the same `resolveTailSamplingOptions`
+      // construction-time rule the configured path enforces (`true`
+      // takes every construction default, a partial object falls back
+      // per field). Validate BEFORE installing anything: an illegal
+      // value throws here with the bus still unconfigured, so a later
+      // valid call still enables it. `null` on a never-enabled bus is
+      // a silent no-op (along EB-540). The enable installs no callback
+      // of its own — when `trace` is enabled the fresh sampler falls
+      // back to the shared head channel exactly as construction does
+      // (the composed head closure, so a later head swap retargets the
+      // tail too), and when it is not the tail keeps spans in the ring
+      // only until `setTailSpanCallback` (EB-418) installs a callback
+      // of its own. The enable itself is audited with every old value
+      // `null` (there was no live tuning to replace).
+      if (opts == null) {
+        return;
+      }
+      if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
+        throw new RangeError(
+          'setTailSampling: revision must be an object with successSampleRate and/or maxOpenTraces and/or maxSpansPerTrace and/or bufferSize',
+        );
+      }
+      const resolved = resolveTailSamplingOptions(
+        opts === true
+          ? true
+          : {
+              successSampleRate: opts.successSampleRate,
+              maxOpenTraces: opts.maxOpenTraces,
+              maxSpansPerTrace: opts.maxSpansPerTrace,
+              bufferSize: opts.bufferSize,
+            },
+        'setTailSampling',
+      );
+      if (resolved === undefined) {
+        throw new RangeError('setTailSampling: tailSampling is not enabled on this bus');
+      }
+      this.tailSharesTraceSpanChannel = this.trace !== undefined;
+      if (this.trace !== undefined) {
+        resolved.onTraceSpan = this.composeTraceSpanHook(this.traceSpanUserHook);
+      }
+      this.tailSampler = new TailSampler(resolved, this.now);
+      this.auditSubscription({
+        action: 'tail_sampling_revised',
+        actor: 'system',
+        detail: {
+          successSampleRate: resolved.successSampleRate,
+          oldSuccessSampleRate: null,
+          maxOpenTraces: resolved.maxOpenTraces,
+          oldMaxOpenTraces: null,
+          maxSpansPerTrace: resolved.maxSpansPerTrace,
+          oldMaxSpansPerTrace: null,
+          bufferSize: resolved.bufferSize,
+          oldBufferSize: null,
+        },
+      });
+      return;
     }
     // An absent revision asks nothing to move.
     if (opts == null) {
       return;
     }
-    if (typeof opts !== 'object' || Array.isArray(opts)) {
+    if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
       throw new RangeError(
         'setTailSampling: revision must be an object with successSampleRate and/or maxOpenTraces and/or maxSpansPerTrace and/or bufferSize',
       );
@@ -26555,11 +26649,12 @@ export class EventBus {
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the fields it leaves out — so resolution
     // happens here, against the merged values, before anything moves.
+    // `true` resets the four bounds to the construction defaults.
     const current = sampler.current();
-    const successSampleRate = opts.successSampleRate ?? current.successSampleRate;
-    const maxOpenTraces = opts.maxOpenTraces ?? current.maxOpenTraces;
-    const maxSpansPerTrace = opts.maxSpansPerTrace ?? current.maxSpansPerTrace;
-    const bufferSize = opts.bufferSize ?? current.bufferSize;
+    const successSampleRate = opts === true ? 1 : (opts.successSampleRate ?? current.successSampleRate);
+    const maxOpenTraces = opts === true ? 4096 : (opts.maxOpenTraces ?? current.maxOpenTraces);
+    const maxSpansPerTrace = opts === true ? 512 : (opts.maxSpansPerTrace ?? current.maxSpansPerTrace);
+    const bufferSize = opts === true ? 1024 : (opts.bufferSize ?? current.bufferSize);
     // Re-affirming the current tuning is a no-op: no retune, no audit.
     if (
       successSampleRate === current.successSampleRate &&

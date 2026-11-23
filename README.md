@@ -3831,7 +3831,19 @@ library.
   live rate, the next span buffers truncate at the live per-trace cap,
   the next open enforces the live open-trace budget (tightening it
   force-decides the oldest open traces), and shrinking `bufferSize`
-  trims the ring to the newest spans at once. The tail's own
+  trims the ring to the newest spans at once. A bus that never enabled
+  `tailSampling` gains a sampler live on the first call instead
+  (EB-545): `true` or an object resolves exactly like a
+  construction-time opt-in (explicit fields win, the rest take the
+  construction defaults), the enable installs no callback of its own —
+  when `trace` is enabled the fresh sampler falls back to the shared
+  head channel exactly as construction does, and when it is not the
+  tail keeps spans in the ring only until `setTailSpanCallback`
+  installs one — spans published before the enable were never traced,
+  so nothing is decided retroactively, and the enable is live-only (a
+  restart restores the unconfigured state). `null` on a never-enabled
+  bus is a silent no-op; `true` on a configured bus resets the four
+  bounds to the construction defaults. The tail's own
   `onTraceSpan` moves live via `setTailSpanCallback(handler, actor?)`
   (EB-418): installing a callback of the tail's own splits the tail
   off the shared head channel for good (a later head swap via
@@ -3840,10 +3852,11 @@ library.
   channel — only a restart restores it), and the tail's own callback
   is installed raw, so after the split tail-kept spans no longer
   reach OTLP export or the archive journal while head spans keep
-  flowing to both. Only a bus that enabled `tailSampling` can be revised
-  (otherwise `RangeError`); illegal values fail closed with the live
-  tuning untouched; an identical or empty revision is a no-op with no
-  audit. Audited as `tail_sampling_revised` (old and new values).
+  flowing to both. A closed bus refuses the revision and the enable;
+  illegal values fail closed with the live tuning untouched; an
+  identical or empty revision is a no-op with no audit. Audited as
+  `tail_sampling_revised` (old and new values — every old value is
+  `null` on the first enable).
 - **Per-topic sliding-window publish rates** (in `src/rates.ts`, always
   on): each topic's publish rate in messages/sec over trailing 1s / 1m / 5m
   windows, load-average style (`r1s` / `r1m` / `r5m`) — the real-time signal

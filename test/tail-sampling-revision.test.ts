@@ -1,12 +1,13 @@
 /**
- * Bus-level tail-sampling revision (EB-296).
+ * Bus-level tail-sampling revision (EB-296) and live enable (EB-545).
  *
  * `setTailSampling` retunes the sampler live — the sampling rate, the
  * open-trace budget, the per-trace span cap, and the ring capacity —
- * without restarting the bus. Only a bus that enabled `tailSampling`
- * can be revised; illegal values fail closed with the live tuning and
- * the audit log untouched; an identical (or empty) revision is a
- * no-op with no audit.
+ * without restarting the bus. A bus that never enabled `tailSampling`
+ * gains a sampler live on the first call (EB-545, covered in
+ * `test/tail-sampling-enable.test.ts`); illegal values fail closed
+ * with the live tuning and the audit log untouched; an identical (or
+ * empty) revision is a no-op with no audit.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,11 +16,27 @@ import { EventBus } from '../src/bus.ts';
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-test('setTailSampling fails closed when tailSampling is not enabled', () => {
-  const bus = new EventBus();
-  assert.throws(() => bus.setTailSampling({ successSampleRate: 0.5 }), RangeError);
-  assert.throws(() => bus.setTailSampling({ maxOpenTraces: 10 }), RangeError);
-  assert.equal(bus.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 0);
+test('setTailSampling(true) on a configured bus resets the tuning to the defaults (EB-545)', () => {
+  const bus = new EventBus({
+    tailSampling: { successSampleRate: 0.25, maxOpenTraces: 50, maxSpansPerTrace: 10, bufferSize: 7 },
+  });
+  bus.setTailSampling(true);
+  const audit = bus.getSubscriptionAudit({ action: 'tail_sampling_revised' });
+  assert.equal(audit.length, 1);
+  assert.deepEqual(audit[0].detail, {
+    successSampleRate: 1,
+    oldSuccessSampleRate: 0.25,
+    maxOpenTraces: 4096,
+    oldMaxOpenTraces: 50,
+    maxSpansPerTrace: 512,
+    oldMaxSpansPerTrace: 10,
+    bufferSize: 1024,
+    oldBufferSize: 7,
+  });
+  // And `true` against a bus already at the defaults is a no-op.
+  const defaults = new EventBus({ tailSampling: true });
+  defaults.setTailSampling(true);
+  assert.equal(defaults.getSubscriptionAudit({ action: 'tail_sampling_revised' }).length, 0);
 });
 
 test('setTailSampling rejects illegal values and leaves the live tuning untouched', async () => {
