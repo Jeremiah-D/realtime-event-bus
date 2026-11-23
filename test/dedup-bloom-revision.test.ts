@@ -1,9 +1,10 @@
 /**
- * Bus-level dedup bloom sizing revision (EB-312).
+ * Bus-level dedup bloom sizing revision (EB-312) and live enable
+ * (EB-546).
  *
  * `setDedupBloom` resizes the EB-214 bloom pre-filter live — without
- * restarting the bus. Only a bus that enabled `dedupBloom` can be
- * revised; illegal values fail closed with the live filter and the
+ * restarting the bus — or installs it live on a bus that never enabled
+ * `dedupBloom`; illegal values fail closed with the live filter and the
  * audit log untouched; an identical (or empty) revision is a no-op
  * with no audit. The revision builds a fresh filter at the merged
  * sizing and rebuilds it from the live dedup table, so no dedup
@@ -25,11 +26,24 @@ const bloomStats = (bus: EventBus) => bus.getStats().bloomStats!;
 const audit = (bus: EventBus) =>
   bus.getSubscriptionAudit({ action: 'dedup_bloom_revised' });
 
-test('setDedupBloom fails closed when dedupBloom is not enabled', () => {
+test('setDedupBloom on a bus that never enabled dedupBloom installs the filter live (EB-546)', () => {
   const bus = new EventBus();
-  assert.throws(() => bus.setDedupBloom({ expectedInsertions: 500 }), RangeError);
-  assert.throws(() => bus.setDedupBloom({ falsePositiveRate: 0.001 }), RangeError);
-  assert.equal(audit(bus).length, 0);
+  assert.equal(bloomStats(bus).enabled, false);
+  // A partial object falls back per field: the rate takes the
+  // construction default.
+  bus.setDedupBloom({ expectedInsertions: 500 });
+  assert.equal(bloomStats(bus).enabled, true);
+  assert.equal(bloomStats(bus).bitSize, new BloomFilter(500, 0.01).size);
+  assert.equal(bloomStats(bus).hashFunctions, new BloomFilter(500, 0.01).hashes);
+  assert.equal(bloomStats(bus).insertions, 0);
+  const entries = audit(bus);
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].detail, {
+    expectedInsertions: 500,
+    oldExpectedInsertions: null,
+    falsePositiveRate: 0.01,
+    oldFalsePositiveRate: null,
+  });
   bus.close();
 });
 

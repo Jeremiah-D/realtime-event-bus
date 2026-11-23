@@ -27685,11 +27685,13 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level dedup bloom sizing live (EB-312) without
-   * restarting the bus: `setDedupBloom({ expectedInsertions?,
-   * falsePositiveRate? })` resizes the EB-214 pre-filter in front of
-   * the exact EB-27 `(topic, messageId)` dedup map (see
-   * `EventBusOptions.dedupBloom`).
+   * Revises — or enables — the bus-level dedup bloom sizing live
+   * (EB-312, enable half EB-546) without restarting the bus:
+   * `setDedupBloom({ expectedInsertions?, falsePositiveRate? })`
+   * resizes the EB-214 pre-filter in front of the exact EB-27
+   * `(topic, messageId)` dedup map (see `EventBusOptions.dedupBloom`)
+   * — or installs the filter live on a bus that never opted into
+   * `dedupBloom`.
    *
    * Only the fields provided move; the rest keep their live values.
    * The revision builds a fresh `BloomFilter` at the merged sizing and
@@ -27704,34 +27706,119 @@ export class EventBus {
    * publish already admitted keeps its claim, and the new filter
    * governs from the next probe onward.
    *
-   * Fail-closed: a bus that never enabled `dedupBloom`, a non-object
-   * revision, and an illegal value all throw `RangeError` with the
-   * live filter and the audit log untouched. Validation reuses the
-   * construction-time rule (`resolveDedupBloomOptions`: the sizing an
-   * integer >= 1, the rate in the open interval (0, 1)) against the
-   * merged values, so a value that could not be set at construction
-   * cannot be revised in later either — and a failed call changes
-   * nothing at all: when only one field is provided only that field is
-   * validated and moved, and an illegal value in either field leaves
-   * every live value exactly as it was. The resolver's `TypeError`
-   * (a non-object shape) is converted to `RangeError` at this layer,
-   * along the EB-303 precedent. A revision that provides neither
-   * field, and a revision identical to the current sizing, are both
-   * no-ops with no audit. Audited as `dedup_bloom_revised`
-   * (`{ expectedInsertions, oldExpectedInsertions, falsePositiveRate,
-   * oldFalsePositiveRate }`).
+   * Enabling (EB-546): `true` or an object on a bus that never
+   * enabled `dedupBloom` resolves through `resolveDedupBloomOptions`
+   * exactly like a construction-time opt-in — explicit fields win, the
+   * fields left out take the construction defaults (sized for
+   * `idempotencyMaxEntries` at p = 0.01) — and installs a fresh
+   * `BloomFilter` rebuilt from the live dedup table, so claims made
+   * before the enable are already in the filter and the insertion
+   * count starts from the live table size. The enable needs no wiring:
+   * every publish path already reads `this.dedupBloom` live and falls
+   * through to the exact map while it is `undefined`, so the fresh
+   * filter governs from the next probe onward. Claims admitted before
+   * the enable keep their claims — the map was authoritative all
+   * along — so nothing is decided retroactively. The enable is
+   * live-only: a restart restores the unconfigured state. `null` on a
+   * never-enabled bus is a silent no-op with no audit (along EB-540).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live filter and the audit
+   * log untouched. A bus that never enabled `dedupBloom` gains a
+   * filter live on the first call instead (EB-546): the revision is
+   * resolved through the construction-time rule
+   * (`resolveDedupBloomOptions`: the sizing an integer >= 1, the rate
+   * in the open interval (0, 1)) and installed whole — no restart, no
+   * lost subscriptions — and a failed enable leaves the bus
+   * unconfigured, so a later valid call still enables it. Validation
+   * reuses the construction-time rule against the merged values, so a
+   * value that could not be set at construction cannot be revised in
+   * later either — and a failed call changes nothing at all: when only
+   * one field is provided only that field is validated and moved, and
+   * an illegal value in either field leaves every live value exactly
+   * as it was. The resolver's `TypeError` (a non-object shape) is
+   * converted to `RangeError` at this layer, along the EB-303
+   * precedent. `true` is an enable-only token (EB-540 / EB-536 family
+   * convention): on a bus that already has a filter it throws
+   * `RangeError` — a configured bus retunes through an object. A
+   * revision that provides neither field, and a revision identical to
+   * the current sizing, are both no-ops with no audit. Audited as
+   * `dedup_bloom_revised` (`{ expectedInsertions,
+   * oldExpectedInsertions, falsePositiveRate, oldFalsePositiveRate }`
+   * — both old values are `null` on the first enable, since there was
+   * no live sizing to replace).
    *
    * Orthogonal to EB-214 (that is the bloom pre-filter mechanism
    * itself — this the live resizing of it), and to EB-296 (that
    * retunes tail sampling — this the dedup bloom).
    *
-   * Throws `RangeError` when dedupBloom is not enabled, for a
-   * non-object revision, or for an illegal `expectedInsertions` /
-   * `falsePositiveRate`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for `true` on a bus that already has a filter, or for an
+   * illegal `expectedInsertions` / `falsePositiveRate`.
    */
-  setDedupBloom(opts: DedupBloomRevision): void {
+  setDedupBloom(opts: DedupBloomRevision | true | null): void {
+    // Fail-fast on a closed bus (EB-154, EB-546, along
+    // `setTailSampling`): close() already flushed once — there is no
+    // live filter left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setDedupBloom: bus is closed');
+    }
     if (this.dedupBloom === undefined) {
-      throw new RangeError('setDedupBloom: dedupBloom is not enabled on this bus');
+      // EB-546: the enable half — a bus that never enabled
+      // `dedupBloom` gains a filter live on the first call, with the
+      // revision resolved through the same `resolveDedupBloomOptions`
+      // construction-time rule the configured path enforces (`true`
+      // takes every construction default, a partial object falls back
+      // per field). Validate BEFORE installing anything: an illegal
+      // value throws here with the bus still unconfigured, so a later
+      // valid call still enables it. `null` on a never-enabled bus is
+      // a silent no-op (along EB-540). The enable installs a fresh
+      // filter rebuilt from the live dedup table — the map is
+      // authoritative, so no dedup decision is lost — and is audited
+      // with both old values `null` (there was no live sizing to
+      // replace).
+      if (opts == null) {
+        return;
+      }
+      if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
+        throw new RangeError(
+          'setDedupBloom: revision must be an object with expectedInsertions and/or falsePositiveRate',
+        );
+      }
+      let resolved: ResolvedDedupBloomOptions;
+      try {
+        resolved = resolveDedupBloomOptions(
+          opts === true
+            ? true
+            : {
+                expectedInsertions: opts.expectedInsertions,
+                falsePositiveRate: opts.falsePositiveRate,
+              },
+          this.idempotencyMaxEntries,
+          'setDedupBloom',
+        ) as ResolvedDedupBloomOptions;
+      } catch (err) {
+        if (err instanceof TypeError) {
+          throw new RangeError(err.message);
+        }
+        throw err;
+      }
+      const enabled = new BloomFilter(resolved.expectedInsertions, resolved.falsePositiveRate);
+      enabled.rebuild(this.dedup.keys());
+      this.dedupBloom = enabled;
+      this.dedupBloomExpectedInsertions = resolved.expectedInsertions;
+      this.dedupBloomFalsePositiveRate = resolved.falsePositiveRate;
+      this.auditSubscription({
+        action: 'dedup_bloom_revised',
+        actor: 'system',
+        detail: {
+          expectedInsertions: resolved.expectedInsertions,
+          oldExpectedInsertions: null,
+          falsePositiveRate: resolved.falsePositiveRate,
+          oldFalsePositiveRate: null,
+        },
+      });
+      return;
     }
     // An absent revision asks nothing to move.
     if (opts == null) {

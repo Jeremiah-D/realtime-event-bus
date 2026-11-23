@@ -54,8 +54,11 @@ export interface ResolvedDedupBloomOptions {
 /**
  * Bus-level revision for the dedup bloom sizing (EB-312). Only the two
  * sizing knobs move — the filter itself is rebuilt from the live dedup
- * table on revision, so there is no separate enable/disable switch
- * here: a bus that never enabled `dedupBloom` cannot be revised.
+ * table on revision. A bus that never enabled `dedupBloom` gains a
+ * filter live on the first call (EB-546) — `true` takes the
+ * construction defaults, an object tunes the sizing — while `true` on
+ * a bus that already has a filter is refused (EB-540 / EB-536 family
+ * convention — `true` is an enable-only token).
  */
 export interface DedupBloomRevision {
   /**

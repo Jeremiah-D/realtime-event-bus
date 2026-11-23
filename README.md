@@ -4255,11 +4255,21 @@ library.
   rest keep their live values, and the revision builds a fresh filter
   at the merged sizing and rebuilds it from the live dedup table — the
   map stays authoritative, so no dedup decision is lost and the
-  insertion count restarts from the live table size. Only a bus that
-  enabled `dedupBloom` can be revised (otherwise `RangeError`); illegal
-  values fail closed with the live filter untouched; an identical or
-  empty revision is a no-op with no audit. Audited as
-  `dedup_bloom_revised` (old and new sizing). `getStats().bloomStats` reports `{ enabled, insertions,
+  insertion count restarts from the live table size. A bus that never
+  enabled `dedupBloom` gains the filter live on the first call instead
+  (EB-546): `true` or an object resolves exactly like a
+  construction-time opt-in (explicit fields win, the rest take the
+  defaults sized for `idempotencyMaxEntries` at p = 0.01), the fresh
+  filter is rebuilt from the live dedup table — claims made before the
+  enable are already in it — and the enable is live-only (a restart
+  restores the unconfigured state). `null` on a never-enabled bus is a
+  silent no-op; `true` on a bus that already has a filter is refused
+  — `true` is an enable-only token (EB-540 / EB-536 family
+  convention). A closed bus refuses the revision and the enable;
+  illegal values fail closed with the live filter untouched; an
+  identical or empty revision is a no-op with no audit. Audited as
+  `dedup_bloom_revised` (old and new sizing — both old values are
+  `null` on the first enable). `getStats().bloomStats` reports `{ enabled, insertions,
   estimatedFalsePositiveRate, bitSize, hashFunctions }`. Measured
   (`bench/bloom-dedup.bench.ts`, Node v24, `--expose-gc`): 100k 64-char
   messageIds retain 3.50 MiB as a `Map` vs ~19 KiB as a filter (~186x
