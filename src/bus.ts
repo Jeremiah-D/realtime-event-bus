@@ -17791,9 +17791,13 @@ export class EventBus {
    * Publish-side admission latency sampling (EB-182, see
    * `EventBusOptions.publishLatency`). Absent when the option is not
    * passed — no sampling, no tracker, zeroed stats, and the publish
-   * path pays one branch per gate with zero clock reads.
+   * path pays one branch per gate with zero clock reads — until
+   * `setAdmissionLatency` (EB-549) builds one live with the
+   * construction defaults. Deliberately *not* readonly (EB-549): the
+   * tracker starts absent and is installed by the enable half of
+   * `setAdmissionLatency`.
    */
-  private readonly admissionLatency: AdmissionLatencyTracker | undefined;
+  private admissionLatency: AdmissionLatencyTracker | undefined;
   /**
    * Publishes rejected because the target topic's migration alias expired
    * (global total, see `BusStats.aliasRetiredMessages`). Like a schema
@@ -30047,13 +30051,34 @@ export class EventBus {
    * new values govern from the next publish admission onward; windows
    * created after the retune are built at the new bounds.
    *
-   * Fail-closed: a bus that never enabled `publishLatency`, a
-   * non-object revision, and an illegal value all throw `RangeError`
-   * with the live tuning and the audit log untouched. Validation
-   * reuses the construction-time rule
+   * Enabling (EB-549): an object on a bus that never enabled
+   * `publishLatency` resolves through `resolveAdmissionLatencyOptions`
+   * exactly like a construction-time opt-in — `{}` takes every
+   * construction default (windows 1024/1024, slow threshold 100ms),
+   * a partial object falls back per field — and installs a fresh
+   * `AdmissionLatencyTracker` with empty windows, so publishes
+   * admitted before the enable were never sampled and nothing is
+   * sampled retroactively: the new tracker accumulates from the next
+   * publish admission onward. The enable needs no wiring: the
+   * admission gates already read `this.admissionLatency` live and
+   * skip sampling while it is `undefined`, so the fresh tracker
+   * governs from the next publish onward, and `getStats()` and the
+   * Prometheus renderer read the same live field. The enable is
+   * live-only: a restart restores the unconfigured state. `null` on
+   * a never-enabled bus is a silent no-op with no audit (along
+   * EB-540).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live tuning and the audit
+   * log untouched. A bus that never enabled `publishLatency` gains a
+   * tracker live on the first call instead (EB-549): the revision is
+   * resolved through the construction-time rule
    * (`resolveAdmissionLatencyOptions`: the windows positive integers,
-   * the threshold a non-negative finite number) against the merged
-   * values, so a value that could not be set at construction cannot be
+   * the threshold a non-negative finite number) and installed
+   * whole — no restart, no lost subscriptions — and a failed enable
+   * leaves the bus unconfigured, so a later valid call still enables
+   * it. Validation reuses the construction-time rule against the
+   * merged values, so a value that could not be set at construction cannot be
    * revised in later either — and a failed call changes nothing at
    * all: when only one field is provided only that field is validated
    * and moved, and an illegal value in any field leaves every live
@@ -30061,24 +30086,81 @@ export class EventBus {
    * and a revision identical to the current tuning, are both no-ops
    * with no audit. Audited as `admission_latency_revised`
    * (`{ windowSize, oldWindowSize, gateWindowSize, oldGateWindowSize,
-   * slowAdmissionThresholdMs, oldSlowAdmissionThresholdMs }`).
+   * slowAdmissionThresholdMs, oldSlowAdmissionThresholdMs }` — all
+   * three old values are `null` on the first enable, since there was
+   * no live tuning to replace).
    *
    * Orthogonal to EB-303 (that retunes schedule-skew observation —
    * this the admission-latency observation), and to EB-296/EB-298/
    * EB-299/EB-300/EB-301/EB-302 (those retune other bus-level
    * parameters — this the admission-latency tuning).
    *
-   * Throws `RangeError` when publish-side admission latency sampling
-   * is not enabled, for a non-object revision, or for an illegal
-   * `windowSize` / `gateWindowSize` / `slowAdmissionThresholdMs`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, or for an illegal `windowSize` / `gateWindowSize` /
+   * `slowAdmissionThresholdMs`.
    */
-  setAdmissionLatency(opts: AdmissionLatencyRevision): void {
+  setAdmissionLatency(opts: AdmissionLatencyRevision | null): void {
+    // Fail-fast on a closed bus (EB-154, EB-549, along
+    // `setScheduleSkew`): close() already flushed once — there is no
+    // live tracker left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setAdmissionLatency: bus is closed');
+    }
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-549, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
+    if (opts == null) {
+      return;
+    }
     const tracker = this.admissionLatency;
     if (tracker === undefined) {
-      throw new RangeError('setAdmissionLatency: publishLatency is not enabled on this bus');
-    }
-    // An absent revision asks nothing to move.
-    if (opts == null) {
+      // EB-549: the enable half — a bus that never enabled
+      // `publishLatency` gains a tracker live on the first call, with
+      // the revision resolved through the same
+      // `resolveAdmissionLatencyOptions` construction-time rule the
+      // configured path enforces (`{}` takes every construction
+      // default, a partial object falls back per field). Validate
+      // BEFORE installing anything: an illegal value throws here with
+      // the bus still unconfigured, so a later valid call still
+      // enables it. The enable installs a fresh tracker with empty
+      // windows — publishes admitted before the enable were never
+      // sampled, so nothing is sampled retroactively — and is audited
+      // with `oldWindowSize` / `oldGateWindowSize` /
+      // `oldSlowAdmissionThresholdMs` `null` (there was no live tuning
+      // to replace).
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setAdmissionLatency: revision must be an object with windowSize and/or gateWindowSize and/or slowAdmissionThresholdMs',
+        );
+      }
+      let resolved: AdmissionLatencyOptions | undefined;
+      try {
+        resolved = resolveAdmissionLatencyOptions(opts);
+      } catch (e) {
+        if (e instanceof TypeError) {
+          throw new RangeError(`setAdmissionLatency: ${e.message}`);
+        }
+        throw e;
+      }
+      if (resolved === undefined) {
+        throw new RangeError('setAdmissionLatency: publishLatency is not enabled on this bus');
+      }
+      const installed = new AdmissionLatencyTracker(resolved);
+      this.admissionLatency = installed;
+      const live = installed.current();
+      this.auditSubscription({
+        action: 'admission_latency_revised',
+        actor: 'system',
+        detail: {
+          windowSize: live.windowSize,
+          oldWindowSize: null,
+          gateWindowSize: live.gateWindowSize,
+          oldGateWindowSize: null,
+          slowAdmissionThresholdMs: live.slowAdmissionThresholdMs,
+          oldSlowAdmissionThresholdMs: null,
+        },
+      });
       return;
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {

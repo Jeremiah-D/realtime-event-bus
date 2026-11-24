@@ -12402,11 +12402,18 @@ fields provided move, the rest keep their live values — a tightened
 window truncates the oldest samples down to the new bound at the next
 recorded sample, and a revised slow threshold counts from the next
 sample onward (samples already counted keep the verdict they were
-recorded under); only a bus that already enabled `publishLatency` can
-be revised (otherwise `RangeError`); illegal values fail closed with
-the live tuning untouched; an identical or empty revision is a no-op
-with no audit. Audited as `admission_latency_revised` (old and new
-values).
+recorded under). A bus that never enabled `publishLatency` gains the
+tracker live on the first call instead (EB-549): `{}` takes every
+construction default (windows 1024/1024, slow threshold 100ms), a
+partial object falls back per field, the fresh tracker starts with an
+empty window — publishes admitted before the enable were never
+sampled — and the enable is live-only (a restart restores the
+unconfigured state). `null` on a never-enabled bus is a silent no-op.
+A closed bus refuses the revision and the enable; illegal values fail
+closed with the live tuning untouched; an identical or empty revision
+is a no-op with no audit. Audited as `admission_latency_revised`
+(old and new values — `oldWindowSize` / `oldGateWindowSize` /
+`oldSlowAdmissionThresholdMs` are `null` on the first enable).
 
 Retune the admission webhook live with `bus.setAdmissionWebhook({
 timeoutMs?, failureMode?, headers? })` (EB-308): only the fields

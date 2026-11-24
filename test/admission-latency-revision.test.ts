@@ -1,12 +1,14 @@
 /**
- * Bus-level admission-latency observation revision (EB-304).
+ * Bus-level admission-latency observation revision (EB-304) and live
+ * enable (EB-549).
  *
  * `setAdmissionLatency` retunes the publish-side admission latency
  * sampling live — the per-topic total-span window, the per-gate
  * window, and the slow-admission threshold — without restarting the
- * bus. Only a bus that already enabled `publishLatency` can be
- * revised; illegal values fail closed with the live tuning and the
- * audit log untouched; an identical (or empty) revision is a no-op
+ * bus, or installs it live on a bus that never enabled
+ * `publishLatency`. Only a bus that already enabled `publishLatency`
+ * can be revised; illegal values fail closed with the live tuning and
+ * the audit log untouched; an identical (or empty) revision is a no-op
  * with no audit. The samples are untouched by a revision: a tightened
  * window truncates at the next recorded sample, and a revised slow
  * threshold counts from the next sample onward — samples already
@@ -53,15 +55,36 @@ function gateFor(bus: EventBus, gate: string, topic = 't') {
 }
 
 describe('admission-latency revision (EB-304)', () => {
-  it('setAdmissionLatency fails closed when publishLatency is not enabled', () => {
+  it('setAdmissionLatency on a bus that never enabled publishLatency installs the tracker live (EB-549)', () => {
     const bus = new EventBus();
-    assert.throws(() => bus.setAdmissionLatency({ windowSize: 5 }), RangeError);
-    assert.throws(() => bus.setAdmissionLatency({ gateWindowSize: 5 }), RangeError);
-    assert.throws(() => bus.setAdmissionLatency({ slowAdmissionThresholdMs: 10 }), RangeError);
-    assert.equal(
-      bus.getSubscriptionAudit({ action: 'admission_latency_revised' }).length,
-      0,
-    );
+    assert.deepEqual(bus.getStats().publishLatency, []);
+    // The first call enables: the window takes the given value, the
+    // rest take the construction defaults, and the old side is null.
+    bus.setAdmissionLatency({ windowSize: 5 });
+    let entries = bus.getSubscriptionAudit({ action: 'admission_latency_revised' });
+    assert.equal(entries.length, 1);
+    assert.deepEqual(entries[0].detail, {
+      windowSize: 5,
+      oldWindowSize: null,
+      gateWindowSize: 1024,
+      oldGateWindowSize: null,
+      slowAdmissionThresholdMs: 100,
+      oldSlowAdmissionThresholdMs: null,
+    });
+    // The next calls revise from the live enabled values — the old
+    // side is now real.
+    bus.setAdmissionLatency({ gateWindowSize: 5 });
+    bus.setAdmissionLatency({ slowAdmissionThresholdMs: 10 });
+    entries = bus.getSubscriptionAudit({ action: 'admission_latency_revised' });
+    assert.equal(entries.length, 3);
+    assert.deepEqual(entries[2].detail, {
+      windowSize: 5,
+      oldWindowSize: 5,
+      gateWindowSize: 5,
+      oldGateWindowSize: 5,
+      slowAdmissionThresholdMs: 10,
+      oldSlowAdmissionThresholdMs: 100,
+    });
   });
 
   it('setAdmissionLatency rejects illegal values and leaves the live tuning untouched', () => {
