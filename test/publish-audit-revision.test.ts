@@ -3,9 +3,10 @@
  *
  * `setPublishAudit` retunes the publish audit journal live — the
  * in-memory read-view bound and the live-file byte budget — without
- * restarting the bus. Only a bus that enabled `publishAudit` can be
- * revised; illegal values fail closed with the live tuning and the
- * audit log untouched; an identical (or empty) revision is a no-op
+ * restarting the bus. A bus that never enabled `publishAudit` gains a
+ * journal live on the first call (EB-554) when it was built with a
+ * `durableLogDir`; illegal values fail closed with the live tuning and
+ * the audit log untouched; an identical (or empty) revision is a no-op
  * with no audit. In-flight entries are retained: a tightened bound
  * evicts at the next record, never immediately.
  */
@@ -47,11 +48,24 @@ function publishN(bus: EventBus, n: number, startSeq = 1): void {
   }
 }
 
-test('setPublishAudit fails closed when publishAudit is not enabled', () => {
-  const bus = new EventBus();
-  assert.throws(() => bus.setPublishAudit({ maxEntries: 100 }), RangeError);
-  assert.throws(() => bus.setPublishAudit({ maxBytes: 1024 }), RangeError);
-  assert.equal(audit(bus).length, 0);
+test('setPublishAudit enables a never-configured bus with a durableLogDir (EB-554)', (t) => {
+  const dir = tempDir('pubaudit-rev-enable-');
+  const bus = new EventBus({ durableLogDir: dir });
+  bus.subscribe('t', () => {});
+  t.after(() => bus.close());
+
+  bus.setPublishAudit({ maxEntries: 100 });
+  const entries = audit(bus);
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].detail, {
+    maxEntries: 100,
+    oldMaxEntries: null,
+    maxBytes: 64 * 1024 * 1024,
+    oldMaxBytes: null,
+  });
+  // The enabled journal records from the next publish onward.
+  bus.publish('t', { n: 1 });
+  assert.equal(bus.getPublishAudit().length, 1);
 });
 
 test('setPublishAudit rejects illegal values and leaves the live tuning untouched', (t) => {

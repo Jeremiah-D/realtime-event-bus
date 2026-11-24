@@ -417,6 +417,8 @@ import {
 } from './trace.ts';
 import {
   PublishAuditLog,
+  PUBLISH_AUDIT_DEFAULT_MAX_BYTES,
+  PUBLISH_AUDIT_DEFAULT_MAX_ENTRIES,
   type PublishAuditEntry,
   type PublishAuditOptions,
   type PublishAuditQuery,
@@ -19486,11 +19488,13 @@ export class EventBus {
   private readonly subAudit: SubscriptionAuditLog;
   /**
    * Publish audit journal (EB-138): opt-in via `EventBusOptions.publishAudit`
-   * (requires `durableLogDir`). Undefined when disabled — the publish path
-   * then pays a single undefined-check per admission and nothing else.
+   * (requires `durableLogDir`), or enabled live via `setPublishAudit`
+   * (EB-554). Undefined when disabled — the publish path then pays a
+   * single undefined-check per admission and nothing else.
    * Not readonly: `setPublishAuditDir` (EB-422) swaps in a fresh journal
-   * under a new directory, and the publish path always reads the live
-   * reference.
+   * under a new directory, and `setPublishAudit` (EB-554) installs the
+   * first journal on a never-configured bus; the publish path always
+   * reads the live reference.
    */
   private publishAudit: PublishAuditLog | undefined;
   /**
@@ -31325,17 +31329,18 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level publish audit journal tuning live (EB-309)
-   * without restarting the bus: `setPublishAudit({ maxEntries?,
-   * maxBytes? })` retunes how many admission records the in-memory
-   * read view keeps and how large the live journal file may grow
-   * before it rotates (see `EventBusOptions.publishAudit`, EB-138).
+   * Revises — or first enables (EB-554) — the bus-level publish audit
+   * journal tuning live (EB-309) without restarting the bus:
+   * `setPublishAudit({ maxEntries?, maxBytes? })` retunes how many
+   * admission records the in-memory read view keeps and how large the
+   * live journal file may grow before it rotates (see
+   * `EventBusOptions.publishAudit`, EB-138).
    *
    * Only the fields provided move; the rest keep their live values.
    * The journal directory moves separately via `setPublishAuditDir`
    * (EB-422), which swaps in a fresh journal under the new directory;
    * the clock is fixed at construction. The log object itself is never
-   * replaced by this method: the revision retunes its two bounds in
+   * replaced by a revision: the revision retunes its two bounds in
    * place, and the record and rotation sites already read those bounds
    * live, so the new values govern from the next record onward. In-flight entries
    * are retained, never cleared or rewritten: shrinking `maxEntries`
@@ -31345,35 +31350,105 @@ export class EventBus {
    * live file at the next record while a loosened one simply defers
    * the next rotation.
    *
-   * Fail-closed: a bus that never enabled `publishAudit`, a
-   * non-object revision, and an illegal value all throw `RangeError`
-   * with the live tuning and the audit log untouched. Validation
-   * reuses the construction-time rule (`maxEntries` a positive
-   * integer, `maxBytes` a positive finite number of bytes) against
-   * the merged values, so a value that could not be set at
-   * construction cannot be revised in later either — and a failed
-   * call changes nothing at all: when only one field is provided only
-   * that field is validated and moved, and an illegal value in any
-   * field leaves every live value exactly as it was. A revision that
-   * provides neither field, and a revision identical to the current
-   * tuning, are both no-ops with no audit. Audited as
-   * `publish_audit_revised` (`{ maxEntries, oldMaxEntries, maxBytes,
-   * oldMaxBytes }`).
+   * Enabling (EB-554): a bus that never enabled `publishAudit` gains
+   * a journal live on the first call — `{}` takes the full defaults
+   * (`maxEntries` 10_000, `maxBytes` 64 MiB, the construction-time
+   * `publishAudit: true` shape), and a partial call takes its given
+   * fields with the rest defaulted. The journal is built under the
+   * bus's own `durableLogDir` — a bus without one cannot be enabled
+   * (there is no directory to journal under, and `durableLogDir` is
+   * fixed at construction) — with the bus clock, so the enable is the
+   * construction-time row plus the default expansion, nothing more.
+   * The new journal's constructor `recover()` back-fills the read view
+   * from journal files already in the directory, so entries left there
+   * by an earlier bus are queryable at once and the chain verifies over
+   * them; publishes from before the enable were never recorded and are
+   * not back-filled. The next publish after the enable is journaled at
+   * once — the record site reads the live reference on every admission.
+   * The enable is live-only: a restart restores the unconfigured state.
+   * `null` on a never-enabled bus is a silent no-op with no audit
+   * (along EB-540). Audited like any revision, with both old values
+   * `null` (there was no live journal to replace).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live tuning and the audit log
+   * untouched — and a failed enable leaves the bus unconfigured, so a
+   * later valid call still enables it. Validation reuses the
+   * construction-time rule (`maxEntries` a positive integer,
+   * `maxBytes` a positive finite number of bytes) against the merged
+   * values, so a value that could not be set at construction cannot be
+   * revised in later either — and a failed call changes nothing at all:
+   * when only one field is provided only that field is validated and
+   * moved, and an illegal value in any field leaves every live value
+   * exactly as it was. A revision that provides neither field, and a
+   * revision identical to the current tuning, are both no-ops with no
+   * audit. Audited as `publish_audit_revised` (`{ maxEntries,
+   * oldMaxEntries, maxBytes, oldMaxBytes }` — both old values `null`
+   * on the first enable).
    *
    * Orthogonal to EB-138 (that is the publish audit journal itself —
    * this the journal's tuning), and to EB-296 (that retunes tail
    * sampling — this the publish audit).
    *
-   * Throws `RangeError` when the publish audit is not enabled, for a
-   * non-object revision, or for an illegal `maxEntries` / `maxBytes`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for an enable on a bus without `durableLogDir`, or for
+   * an illegal `maxEntries` / `maxBytes`.
    */
   setPublishAudit(opts: PublishAuditRevision): void {
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-554, along EB-540/EB-553): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
+    if (opts == null) {
+      return;
+    }
     const log = this.publishAudit;
     if (log === undefined) {
-      throw new RangeError('setPublishAudit: publishAudit is not enabled on this bus');
-    }
-    // An absent revision asks nothing to move.
-    if (opts == null) {
+      // EB-554: the enable half — a bus that never enabled
+      // `publishAudit` gains a journal live on the first call, built
+      // exactly like the construction-time row under the bus's own
+      // `durableLogDir` with the bus clock. Fail-fast on a closed bus
+      // (EB-154, along `setPublishAuditDir`): close() already flushed
+      // once — there is no live bus left to journal for.
+      if (this.closed) {
+        throw new RangeError('setPublishAudit: bus is closed');
+      }
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setPublishAudit: revision must be an object with maxEntries and/or maxBytes',
+        );
+      }
+      // No directory, no journal: `durableLogDir` is fixed at
+      // construction, so a bus built without one can never be enabled.
+      const durableLog = this.durableLog;
+      if (durableLog === undefined) {
+        throw new RangeError(
+          'setPublishAudit: publishAudit requires durableLogDir to be set at construction',
+        );
+      }
+      // Validate before touching anything: the constructor re-validates
+      // both bounds with the construction-time rule and throws before
+      // anything is assigned, so a failed enable leaves the bus
+      // unconfigured and a later valid call still enables it. `{}` takes
+      // the full defaults — the construction-time `publishAudit: true`
+      // shape — and a partial call fills only the fields it leaves out.
+      const maxEntries = opts.maxEntries ?? PUBLISH_AUDIT_DEFAULT_MAX_ENTRIES;
+      const maxBytes = opts.maxBytes ?? PUBLISH_AUDIT_DEFAULT_MAX_BYTES;
+      this.publishAudit = new PublishAuditLog(durableLog.dir, {
+        maxEntries,
+        maxBytes,
+        now: this.now,
+      });
+      this.auditSubscription({
+        action: 'publish_audit_revised',
+        actor: 'system',
+        detail: {
+          maxEntries,
+          oldMaxEntries: null,
+          maxBytes,
+          oldMaxBytes: null,
+        },
+      });
       return;
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {

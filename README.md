@@ -6885,12 +6885,22 @@ the next record onward — a tightened `maxEntries` evicts down to the
 new bound at the next record (in-flight entries are never cleared or
 rewritten), and a revised `maxBytes` is honored by the next record's
 rotation check, so a tightened budget may rotate the live file at the
-next record while a loosened one simply defers the next rotation; only
-a bus that already enabled `publishAudit` can be revised (otherwise
-`RangeError`); illegal values fail closed with the live tuning
-untouched; an identical or empty revision is a no-op with no audit.
-Audited as `publish_audit_revised` (`{ maxEntries, oldMaxEntries,
-maxBytes, oldMaxBytes }`).
+next record while a loosened one simply defers the next rotation;
+illegal values fail closed with the live tuning untouched; an
+identical or empty revision is a no-op with no audit. Audited as
+`publish_audit_revised` (`{ maxEntries, oldMaxEntries, maxBytes,
+oldMaxBytes }` — both old values `null` on the first enable).
+
+Enable live with the same call (EB-554): a bus that never enabled
+`publishAudit` gains a journal on the first `setPublishAudit` — `{}`
+takes the full defaults (`maxEntries` 10_000, `maxBytes` 64 MiB), a
+partial call fills only the fields it leaves out, and the journal is
+built under the bus's own `durableLogDir` with the bus clock. A bus
+built without `durableLogDir` cannot be enabled (`RangeError`); `null`
+on a never-enabled bus is a silent no-op; publishes from before the
+enable were never recorded, and the next publish after the enable is
+journaled at once. The enable is live-only — a restart restores the
+unconfigured state.
 
 Migrate the directory live with `bus.setPublishAuditDir(dir, actor?)`
 (EB-422): a fresh journal is built under the new directory with the
