@@ -503,13 +503,13 @@ import {
   canonicalChaosScenario,
   ChaosInjectionError,
   chaosScenariosEqual,
+  FaultInjector,
   resolveChaosOptions,
   type ChaosFaultType,
   type ChaosOptions,
   type ChaosScenario,
   type ChaosStats,
   type ChaosTarget,
-  type FaultInjector,
 } from './chaos.ts';
 
 export { ChaosInjectionError } from './chaos.ts';
@@ -19247,11 +19247,13 @@ export class EventBus {
   private readonly now: () => number;
   /**
    * Deterministic fault-injection harness (EB-103), present only when
-   * `EventBusOptions.chaos` configured scenarios. `undefined` otherwise —
-   * every hook site checks this single field, so a chaos-free bus pays
-   * nothing and behaves exactly as before.
+   * `EventBusOptions.chaos` configured scenarios — or `setChaos`
+   * installed one live on a never-configured bus (EB-552).
+   * `undefined` otherwise — every hook site checks this single field,
+   * so a chaos-free bus pays nothing and behaves exactly as before.
+   * Not `readonly`: `setChaos` (EB-552) installs the injector live.
    */
-  private readonly chaos?: FaultInjector;
+  private chaos?: FaultInjector;
   /**
    * Subscriber ids with a chaos drain-`latency` deferral currently armed.
    * While armed, drain-target fault evaluation is skipped for that
@@ -29537,13 +29539,27 @@ export class EventBus {
    * without restarting the bus: `setChaos(scenarios)` replaces the
    * whole scenario list (see `EventBusOptions.chaos`, EB-103).
    *
-   * Only a bus that already enabled `chaos` can be revised — a bus
-   * built without scenarios holds no injector at all and refuses with
-   * `RangeError` until chaos is opted into at construction. An empty
-   * list disables injection: the injector stays (and its counters stay
-   * with it), `faultFor` returns `null` for every target, and a later
-   * revision can re-arm it — this is distinct from a bus constructed
-   * with no scenarios, which never builds an injector.
+   * Enabling (EB-552): a bus that never enabled `chaos` gains an
+   * injector live on the first call, with the scenarios resolved
+   * through the construction-time rule exactly like a
+   * construction-time opt-in — except an empty list cannot enable,
+   * since there is nothing to build (unlike EB-300, where an empty
+   * list on an already-enabled bus disables injection while keeping
+   * the injector alive). The enable installs a fresh `FaultInjector`
+   * whose counters start at zero — publishes before the enable were
+   * never evaluated, so nothing is counted retroactively — and the
+   * hook sites already read `this.chaos` live and skip while it is
+   * `undefined`, so the fresh injector governs from the next
+   * `faultFor` evaluation onward. The enable is live-only: a restart
+   * restores the unconfigured state. `null` on a never-enabled bus
+   * is a silent no-op with no audit (along EB-540).
+   *
+   * An empty list disables injection on an already-enabled bus: the
+   * injector stays (and its counters stay with it), `faultFor`
+   * returns `null` for every target, and a later revision can
+   * re-arm it — this is distinct from a bus constructed with no
+   * scenarios, which never builds an injector until `setChaos`
+   * enables one (EB-552).
    *
    * Each scenario in the new list gets a fresh private RNG stream from
    * its seed, so the fault sequence restarts deterministically from the
@@ -29554,34 +29570,44 @@ export class EventBus {
    * next `faultFor` evaluation sees (an armed drain-`latency`
    * deferral still fires its deferred drain).
    *
-   * Fail-closed: a bus that never enabled `chaos`, a non-array
-   * revision, and an illegal scenario all throw `RangeError` with the
-   * live scenarios and the audit log untouched. Validation reuses the
-   * construction-time rule (`assertValidChaosScenario`: the
-   * type/target pair supported, `rate` a finite number in [0, 1],
-   * `latencyMs` a positive finite number for `'latency'` faults and
-   * absent otherwise, `seed` a finite number) for every scenario, so
-   * a scenario that could not be set at construction cannot be revised
-   * in later either — and a failed call changes nothing at all. A
-   * revision identical to the current scenarios (same list, same order,
-   * same canonical form — an omitted seed equals the default seed),
-   * and an absent revision, are both no-ops with no audit. Audited as
-   * `chaos_revised` (`{ scenarios, oldScenarios }`, each scenario in
-   * canonical form with its seed defaulted).
+   * Fail-closed: a closed bus, a non-array revision, and an illegal
+   * scenario all throw `RangeError` with the live scenarios and the
+   * audit log untouched. A bus that never enabled `chaos` gains an
+   * injector live on the first call instead (EB-552) — and a failed
+   * enable leaves the bus unconfigured, so a later valid call still
+   * enables it. Validation reuses the construction-time rule
+   * (`assertValidChaosScenario`: the type/target pair supported,
+   * `rate` a finite number in [0, 1], `latencyMs` a positive finite
+   * number for `'latency'` faults and absent otherwise, `seed` a
+   * finite number) for every scenario, so a scenario that could not
+   * be set at construction cannot be revised in later either — and a
+   * failed call changes nothing at all. A revision identical to the
+   * current scenarios (same list, same order, same canonical form —
+   * an omitted seed equals the default seed), and an absent revision,
+   * are both no-ops with no audit. Audited as `chaos_revised`
+   * (`{ scenarios, oldScenarios }`, each scenario in canonical form
+   * with its seed defaulted — `oldScenarios` is `null` on the first
+   * enable, since there was no live scenario list to replace).
    *
    * Orthogonal to EB-103 (that is the fault-injection mechanism
    * itself — this the scenario list), and to `setTailSampling` (that
    * retunes trace sampling — this fault injection).
    *
-   * Throws `RangeError` when chaos is not enabled, for a non-array
-   * revision, or for any illegal scenario.
+   * Throws `RangeError` when the bus is closed, for a non-array
+   * revision, or for any illegal scenario — including an empty list
+   * on a never-enabled bus, since there is nothing to build.
    */
   setChaos(scenarios: ChaosScenario[]): void {
-    const injector = this.chaos;
-    if (injector === undefined) {
-      throw new RangeError('setChaos: chaos is not enabled on this bus');
+    // Fail-fast on a closed bus (EB-154, EB-552, along
+    // `setGlobalPublishRateLimit`): close() already stopped the bus —
+    // there is no live injector left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setChaos: bus is closed');
     }
-    // An absent revision asks nothing to move.
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-552, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
     if (scenarios == null) {
       return;
     }
@@ -29590,8 +29616,35 @@ export class EventBus {
     }
     // Validate before touching anything: a failed call leaves every
     // live scenario — and the RNG streams behind them — exactly as
-    // they were.
+    // they were, and a failed enable leaves the bus unconfigured.
     scenarios.forEach((s, i) => assertValidChaosScenario(s, `setChaos.scenarios[${i}]`));
+    const injector = this.chaos;
+    if (injector === undefined) {
+      // EB-552: the enable half — a bus that never enabled `chaos`
+      // gains an injector live on the first call, with the scenarios
+      // resolved through the same construction-time rule the
+      // configured path enforces. An empty list cannot enable: there
+      // is nothing to build, so the bus stays unconfigured and a
+      // later valid call still enables it. The enable installs a
+      // fresh injector whose counters start at zero — publishes
+      // before the enable were never evaluated — and is audited with
+      // `oldScenarios` `null` (there was no live scenario list to
+      // replace).
+      if (scenarios.length === 0) {
+        throw new RangeError('setChaos: chaos is not enabled on this bus');
+      }
+      const installed = new FaultInjector(scenarios);
+      this.chaos = installed;
+      this.auditSubscription({
+        action: 'chaos_revised',
+        actor: 'system',
+        detail: {
+          scenarios: scenarios.map((s) => canonicalChaosScenario(s)),
+          oldScenarios: null,
+        },
+      });
+      return;
+    }
     const current = injector.current();
     // Re-affirming the current scenarios is a no-op: no retune (the
     // RNG streams keep running), no audit.

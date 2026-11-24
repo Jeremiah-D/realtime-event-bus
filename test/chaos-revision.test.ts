@@ -1,15 +1,17 @@
 /**
- * Bus-level chaos scenario revision (EB-300).
+ * Bus-level chaos scenario revision (EB-300) and live enable (EB-552).
  *
  * `setChaos` replaces the fault-injection scenario list live — no
- * restart, no new injector. Only a bus that enabled `chaos` can be
- * revised; illegal scenarios fail closed with the live scenarios (and
- * their RNG streams) untouched; an identical revision is a no-op with
- * no audit. An empty list disables injection while keeping the
- * injector — and its counters — alive, so a later revision can re-arm
- * it. Each scenario's RNG stream restarts from its seed, so the fault
- * sequence restarts deterministically; the counters are retained, not
- * reset; an already-triggered in-flight fault is unaffected.
+ * restart, no new injector. A bus that never enabled `chaos` gains an
+ * injector live on the first call (EB-552) — an empty list cannot
+ * enable, since there is nothing to build; illegal scenarios fail
+ * closed with the live scenarios (and their RNG streams) untouched;
+ * an identical revision is a no-op with no audit. An empty list
+ * disables injection while keeping the injector — and its counters —
+ * alive, so a later revision can re-arm it. Each scenario's RNG
+ * stream restarts from its seed, so the fault sequence restarts
+ * deterministically; the counters are retained, not reset; an
+ * already-triggered in-flight fault is unaffected.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -25,16 +27,33 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const DEFAULT_SEED = 0x9e3779b9;
 
 describe('chaos scenario revision (EB-300)', () => {
-  it('setChaos fails closed when chaos is not enabled', () => {
+  it('setChaos enables a bus that never enabled chaos (EB-552)', async () => {
     const plain = new EventBus();
-    assert.throws(() => plain.setChaos([{ type: 'error', target: 'admission', rate: 1 }]), RangeError);
-    assert.equal(plain.getSubscriptionAudit({ action: 'chaos_revised' }).length, 0);
+    plain.subscribe('t', () => {});
+    assert.equal(plain.getStats().chaos, undefined);
+    assert.equal(plain.publish('t', 'before'), 1);
+    plain.setChaos([{ type: 'error', target: 'admission', rate: 1 }]);
+    assert.notEqual(plain.getStats().chaos, undefined);
+    assert.throws(() => plain.publish('t', 'a'), ChaosInjectionError);
+    assert.equal(plain.getStats().chaos?.byTarget.admission, 1);
+    const audit = plain.getSubscriptionAudit({ action: 'chaos_revised' });
+    assert.equal(audit.length, 1);
+    assert.deepEqual(audit[0].detail, {
+      scenarios: [{ type: 'error', target: 'admission', rate: 1, seed: DEFAULT_SEED }],
+      oldScenarios: null,
+    });
+    await plain.close();
 
-    // Empty chaos at construction builds no injector at all.
+    // Empty chaos at construction builds no injector at all — but the
+    // first valid call still enables it live (EB-552).
     for (const bus of [new EventBus({ chaos: {} }), new EventBus({ chaos: { scenarios: [] } })]) {
-      assert.throws(() => bus.setChaos([{ type: 'error', target: 'admission', rate: 1 }]), RangeError);
-      assert.equal(bus.getSubscriptionAudit({ action: 'chaos_revised' }).length, 0);
+      bus.subscribe('t', () => {});
       assert.equal(bus.getStats().chaos, undefined);
+      bus.setChaos([{ type: 'error', target: 'admission', rate: 1 }]);
+      assert.notEqual(bus.getStats().chaos, undefined);
+      assert.throws(() => bus.publish('t', 'a'), ChaosInjectionError);
+      assert.equal(bus.getSubscriptionAudit({ action: 'chaos_revised' }).length, 1);
+      await bus.close();
     }
   });
 
