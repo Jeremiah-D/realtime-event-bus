@@ -11394,11 +11394,17 @@ countdown untouched), and a revised threshold governs from the next
 failure onward (a tightened threshold trips on the next failure past it,
 a loosened one needs more failures from here on); the health state is
 untouched — the consecutive-failure counter, the last-probe timestamp,
-and the healthy/unhealthy state all survive a revision. Only a bus that
-already enabled `bridge.health` can be revised (otherwise `RangeError`);
-illegal values fail closed with the live tuning untouched; an identical or
-empty revision is a no-op with no audit. Audited as
-`bridge_health_revised` (old and new values).
+and the healthy/unhealthy state all survive a revision. A bus whose
+`bridge` is configured but never opted into `bridge.health` gains a
+monitor live on the first call (EB-550): `{}` takes the construction
+defaults (30000ms / 3), the fresh monitor starts healthy with zero
+consecutive failures, mirror failures before the enable are never
+counted, and the first probe fires after one full interval; the old
+values in the audit are `null`. A bus with no `bridge` at all still
+refuses (`RangeError`), as does a closed bus; `null` on a
+never-enabled bus is a silent no-op. Illegal values fail closed with
+the live tuning untouched; an identical or empty revision is a no-op
+with no audit. Audited as `bridge_health_revised` (old and new values).
 
 ## Rebalance debounce: storm protection for consumer groups (EB-169)
 

@@ -3,7 +3,9 @@
  *
  * `setBridgeHealth` retunes the probe interval and the failure
  * threshold live — without restarting the bus. Only a bus that already
- * enabled `bridge.health` can be revised; illegal values fail closed
+ * enabled `bridge.health` can be revised — a bus whose `bridge` is
+ * configured but never opted into `bridge.health` gains a monitor live
+ * on the first call instead (EB-550); illegal values fail closed
  * with the live tuning and the audit log untouched; an identical (or
  * empty) revision is a no-op with no audit. The health state is
  * untouched by a revision: the consecutive-failure counter, the
@@ -62,11 +64,26 @@ function timerCapture() {
 }
 
 describe('bridge-health revision (EB-305)', () => {
-  it('setBridgeHealth fails closed when bridge.health is not enabled', () => {
+  it('setBridgeHealth on a never-enabled bus enables the monitor live (EB-550)', async () => {
     const bus = new EventBus({ bridge: { transport: failingTransport() } });
-    assert.throws(() => bus.setBridgeHealth({ intervalMs: 100 }), RangeError);
-    assert.throws(() => bus.setBridgeHealth({ failureThreshold: 1 }), RangeError);
-    assert.equal(bus.getSubscriptionAudit({ action: 'bridge_health_revised' }).length, 0);
+    assert.equal(bus.getStats().bridge.health.state, 'disabled');
+    bus.setBridgeHealth({ intervalMs: 100 });
+    assert.deepEqual(bus.getStats().bridge.health, {
+      state: 'healthy',
+      consecutiveFailures: 0,
+    });
+    const revised = bus.getSubscriptionAudit({ action: 'bridge_health_revised' });
+    assert.equal(revised.length, 1);
+    assert.deepEqual(revised[0].detail, {
+      intervalMs: 100,
+      oldIntervalMs: null,
+      failureThreshold: 3,
+      oldFailureThreshold: null,
+    });
+    // A second call revises the live tuning instead of re-enabling.
+    bus.setBridgeHealth({ failureThreshold: 2 });
+    assert.equal(bus.getSubscriptionAudit({ action: 'bridge_health_revised' }).length, 2);
+    await bus.close();
   });
 
   it('setBridgeHealth rejects illegal values and leaves the live tuning untouched', async () => {

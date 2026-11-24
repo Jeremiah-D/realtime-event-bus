@@ -19701,10 +19701,13 @@ export class EventBus {
   private bridge: ResolvedBridgeOptions | undefined;
   /**
    * Bridge transport health monitor (EB-168), present only when
-   * `EventBusOptions.bridge.health` was configured. Gates outbound
-   * mirroring and records every mirror outcome.
+   * `EventBusOptions.bridge.health` was configured — or when
+   * `setBridgeHealth` enabled it live on a bus whose `bridge` was
+   * configured (EB-550). Gates outbound mirroring and records every
+   * mirror outcome. Not `readonly`: `setBridgeHealth` (EB-550)
+   * installs the monitor on the first call on a never-enabled bus.
    */
-  private readonly bridgeHealth: BridgeHealthMonitor | undefined;
+  private bridgeHealth: BridgeHealthMonitor | undefined;
   /**
    * Doctor auto-remediation schedule timer (EB-211): the unref'd
    * interval armed by the `EventBusOptions.autoRemediate` opt-in.
@@ -20006,7 +20009,8 @@ export class EventBus {
         : new TailSampler(resolvedTailSampling, this.now);
     this.bridge = resolveBridgeOptions(options?.bridge, 'EventBus');
     // Bridge transport health monitor (EB-168): opt-in via
-    // `EventBusOptions.bridge.health`. Watches every mirror outcome
+    // `EventBusOptions.bridge.health`, or enabled live later via
+    // `setBridgeHealth` (EB-550). Watches every mirror outcome
     // and runs periodic probes; at the failure threshold the bus pauses
     // outbound mirroring until a probe or mirror succeeds again. The
     // monitor's timer is unref'd and stopped on close().
@@ -30231,12 +30235,39 @@ export class EventBus {
    * flight re-arms itself at the new interval, and a threshold-only
    * revision leaves the pending probe's countdown untouched.
    *
-   * Fail-closed: a bus that never enabled `bridge.health`, a
+   * Enabling (EB-550): an object on a bus whose `bridge` is
+   * configured but never opted into `bridge.health` resolves through
+   * `resolveBridgeHealthOptions` exactly like a construction-time
+   * opt-in — `{}` takes every construction default (interval 30000ms,
+   * threshold 3), a partial object falls back per field — and installs
+   * a fresh `BridgeHealthMonitor` in the healthy state with zero
+   * consecutive failures and no probe run yet, so mirror failures
+   * before the enable were never recorded and nothing is counted
+   * retroactively: the new monitor counts from the next mirror
+   * failure onward, and the first probe fires after one full
+   * interval. The enable needs no other wiring: the mirror gate and
+   * the failure-record point already read `this.bridgeHealth` live
+   * and skip while it is `undefined`, so the fresh monitor governs
+   * from the next publish onward, and `getStats()` reads the same
+   * live field (`'disabled'` before the enable, the live state
+   * after). The monitor's clock is the bus clock and its timers are
+   * the default unref'd `setTimeout`, exactly as at construction —
+   * `now` / `setTimer` / `clearTimer` are fixed at construction and
+   * are not revisable here. The enable is live-only: a restart
+   * restores the unconfigured state. `null` on a never-enabled bus is
+   * a silent no-op with no audit (along EB-540).
+   *
+   * Fail-closed: a closed bus, a bus with no `bridge` at all, a
    * non-object revision, and an illegal value all throw `RangeError`
-   * with the live tuning and the audit log untouched. Validation
-   * reuses the construction-time rule
+   * with the live tuning and the audit log untouched. A bus whose
+   * `bridge` is configured but never opted into `bridge.health`
+   * gains a monitor live on the first call instead (EB-550): the
+   * revision is resolved through the construction-time rule
    * (`resolveBridgeHealthOptions`: the interval a positive finite
-   * number, the threshold a positive integer) against the merged
+   * number, the threshold a positive integer) and installed whole —
+   * no restart, no lost subscriptions — and a failed enable leaves
+   * the bus unconfigured, so a later valid call still enables it.
+   * Validation reuses the construction-time rule against the merged
    * values, so a value that could not be set at construction cannot be
    * revised in later either — and a failed call changes nothing at
    * all: when only one field is provided only that field is validated
@@ -30245,22 +30276,28 @@ export class EventBus {
    * and a revision identical to the current tuning, are both no-ops
    * with no audit. Audited as `bridge_health_revised`
    * (`{ intervalMs, oldIntervalMs, failureThreshold,
-   * oldFailureThreshold }`).
+   * oldFailureThreshold }` — both old values are `null` on the first
+   * enable, since there was no live tuning to replace).
    *
    * Orthogonal to EB-168 (that is the bridge health monitor itself —
    * this the monitor tuning), and to EB-296–EB-304 (those retune other
    * bus-level parameters — this the bridge health tuning).
    *
-   * Throws `RangeError` when bridge health monitoring is not enabled,
-   * for a non-object revision, or for an illegal `intervalMs` /
-   * `failureThreshold`.
+   * Throws `RangeError` when the bus is closed, when `bridge` is not
+   * configured at all, for a non-object revision, or for an illegal
+   * `intervalMs` / `failureThreshold`.
    */
   setBridgeHealth(opts: BridgeHealthRevision): void {
-    const monitor = this.bridgeHealth;
-    if (monitor === undefined) {
-      throw new RangeError('setBridgeHealth: bridge.health is not enabled on this bus');
+    // Fail-fast on a closed bus (EB-154, EB-550, along
+    // `setAdmissionLatency`): close() already stopped the monitor —
+    // there is no live monitor left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setBridgeHealth: bus is closed');
     }
-    // An absent revision asks nothing to move.
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-550, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
     if (opts == null) {
       return;
     }
@@ -30268,6 +30305,50 @@ export class EventBus {
       throw new RangeError(
         'setBridgeHealth: revision must be an object with intervalMs and/or failureThreshold',
       );
+    }
+    const monitor = this.bridgeHealth;
+    if (monitor === undefined) {
+      // EB-550: the enable half — a bus whose `bridge` is configured
+      // but never opted into `bridge.health` gains a monitor live on
+      // the first call, with the revision resolved through the same
+      // `resolveBridgeHealthOptions` construction-time rule the
+      // configured path enforces (`{}` takes every construction
+      // default, a partial object falls back per field). Validate
+      // BEFORE installing anything: an illegal value throws here with
+      // the bus still unconfigured, so a later valid call still
+      // enables it. A bus with no `bridge` at all still refuses —
+      // this item installs a monitor, not a bridge. The enable
+      // installs a fresh monitor in the healthy state with zero
+      // consecutive failures — mirror failures before the enable were
+      // never recorded, so nothing is counted retroactively — and is
+      // audited with `oldIntervalMs` / `oldFailureThreshold` `null`
+      // (there was no live tuning to replace).
+      if (this.bridge === undefined) {
+        throw new RangeError('setBridgeHealth: bridge.health is not enabled on this bus');
+      }
+      const bridge = this.bridge;
+      const resolved = resolveBridgeHealthOptions(opts, 'setBridgeHealth');
+      if (resolved === undefined) {
+        throw new RangeError('setBridgeHealth: bridge.health is not enabled on this bus');
+      }
+      const installed = new BridgeHealthMonitor(bridge.transport, resolved, this.now, {
+        onUnhealthy: () => this.auditBridgeHealth('bridge_unhealthy'),
+        onRecovered: () => this.auditBridgeHealth('bridge_recovered'),
+      });
+      this.bridgeHealth = installed;
+      installed.start();
+      const live = installed.current();
+      this.auditSubscription({
+        action: 'bridge_health_revised',
+        actor: 'system',
+        detail: {
+          intervalMs: live.intervalMs,
+          oldIntervalMs: null,
+          failureThreshold: live.failureThreshold,
+          oldFailureThreshold: null,
+        },
+      });
+      return;
     }
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the fields it leaves out — so resolution
