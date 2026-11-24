@@ -107,11 +107,13 @@ export interface AutoRemediateScheduleOptions extends AutoRemediateOptions {
 }
 
 /**
- * A live revision of the auto-remediation schedule (EB-306, EB-360): the
- * partial update `EventBus.setAutoRemediate()` applies to a bus that
- * already enabled the `EventBusOptions.autoRemediate` opt-in. Only the
- * fields present move; the rest keep their live values. The `doctor`
- * tuning is revisable here (EB-360): a partial `doctor` object moves
+ * A live revision of the auto-remediation schedule (EB-306, EB-360,
+ * enabled live by EB-553): the partial update
+ * `EventBus.setAutoRemediate()` applies to a bus that already enabled
+ * the `EventBusOptions.autoRemediate` opt-in — or first enables it on
+ * a bus that never did, provided the call carries `intervalMs` (there
+ * is no default interval). Only the fields present move; the rest keep
+ * their live values. The `doctor` tuning is revisable here (EB-360): a partial `doctor` object moves
  * only the thresholds it names, each resolved against the live parsed
  * values, so a field left out keeps the live threshold (the doctor
  * default when never configured).

@@ -15,14 +15,29 @@ function makeClock(startMs = 0) {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-test('setAutoRemediate doctor revision fails closed when autoRemediate is not enabled', async () => {
+test('setAutoRemediate doctor-only call still needs an interval to enable (EB-553)', async () => {
   const bus = new EventBus();
   assert.equal(bus.getStats().autoRemediate, undefined);
+  // A doctor-only call cannot enable: there is no default interval,
+  // so the bus stays unconfigured.
   assert.throws(
     () => bus.setAutoRemediate({ doctor: { slowSubscriberP99Ms: 500 } }),
     RangeError,
   );
   assert.equal(bus.getSubscriptionAudit({ action: 'auto_remediate_revised' }).length, 0);
+  // The same doctor tuning enables once the call carries an interval,
+  // filling only the threshold it leaves out with the default.
+  bus.setAutoRemediate({ intervalMs: 5000, doctor: { slowSubscriberP99Ms: 500 } });
+  assert.deepEqual(bus.getStats().autoRemediate, {
+    intervalMs: 5000,
+    maxActions: 10,
+    dryRun: false,
+    doctor: { slowSubscriberP99Ms: 500, lagWatermarkDefaultMs: 30000 },
+  });
+  const revised = bus.getSubscriptionAudit({ action: 'auto_remediate_revised' });
+  assert.equal(revised.length, 1);
+  assert.equal(revised[0].detail.oldIntervalMs, null);
+  assert.equal(revised[0].detail.oldDoctor, null);
   await bus.close();
 });
 

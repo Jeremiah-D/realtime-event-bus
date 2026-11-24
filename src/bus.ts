@@ -19728,12 +19728,12 @@ export class EventBus {
    */
   private remediateTimer: ReturnType<typeof setInterval> | undefined;
   /**
-   * Live doctor auto-remediation schedule (EB-211, revised by EB-306):
-   * the opt-in as configured at construction, as later revised by
-   * `setAutoRemediate()`. The timer closure reads this field on every
+   * Live doctor auto-remediation schedule (EB-211, revised by EB-306,
+   * enabled live by EB-553): the opt-in as configured at construction,
+   * as later revised — or first enabled — by `setAutoRemediate()`. The timer closure reads this field on every
    * tick, so a maxActions/dryRun-only revision takes effect on the
    * next run without re-arming the timer. Absent unless the opt-in is
-   * configured.
+   * configured or enabled live.
    */
   private remediateSchedule: AutoRemediateScheduleOptions | undefined;
   /** Envelopes mirrored to the bridge transport (see `BridgeStats`). */
@@ -30627,13 +30627,13 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level doctor auto-remediation schedule live
-   * (EB-306, EB-360) without restarting the bus: `setAutoRemediate({
-   * intervalMs?, maxActions?, dryRun?, doctor? })` retunes how often
-   * the periodic `autoRemediate()` run fires, how many actions each run
-   * may apply, whether runs only preview, and the doctor thresholds the
-   * scheduled run diagnoses with (see `EventBusOptions.autoRemediate`,
-   * EB-211).
+   * Revises — or first enables (EB-553) — the bus-level doctor
+   * auto-remediation schedule live (EB-306, EB-360) without restarting
+   * the bus: `setAutoRemediate({ intervalMs?, maxActions?, dryRun?,
+   * doctor? })` retunes how often the periodic `autoRemediate()` run
+   * fires, how many actions each run may apply, whether runs only
+   * preview, and the doctor thresholds the scheduled run diagnoses
+   * with (see `EventBusOptions.autoRemediate`, EB-211).
    *
    * Only the fields provided move; the rest keep their live values,
    * and a partial `doctor` object moves only the thresholds it names
@@ -30649,23 +30649,43 @@ export class EventBus {
    * per-call `options?.doctor`, and `exportBusHealth(options?)` with
    * its own per-call `options` — neither reads the stored tuning.
    *
-   * Fail-closed: a bus that never enabled `autoRemediate`, a bus that
-   * is already closed, a non-object revision, and an illegal value all
-   * throw `RangeError` with the live schedule and the audit log
-   * untouched. Validation reuses the construction-time rule
-   * (`assertValidRemediateSchedule`: the interval a positive finite
-   * number, maxActions a non-negative integer) against the merged
-   * values, plus a boolean check on `dryRun` and a positive-finite
-   * check on each provided doctor threshold, so a value that could
-   * not be set at construction cannot be revised in later either —
-   * and a failed call changes nothing at all: when only one field is
-   * provided only that field is validated and moved, and an illegal
-   * value in any field leaves every live value exactly as it was. A
-   * revision that provides neither field, and a revision identical to
-   * the current schedule, are both no-ops with no audit. Audited as
+   * Enabling (EB-553): a bus that never enabled `autoRemediate` gains
+   * a schedule live on the first call, with the call resolved through
+   * the construction-time rule exactly like a construction-time
+   * opt-in — except the enable must carry `intervalMs`: there is no
+   * default interval, so `{}` / a maxActions-only / dryRun-only /
+   * doctor-only call cannot enable and leaves the bus unconfigured,
+   * while `null` is a silent no-op with no audit (along EB-540). The
+   * other fields take their defaults on the enable (maxActions 10,
+   * dryRun false, the doctor defaults), and a partial `doctor` fills
+   * only the thresholds it leaves out. The enable installs the
+   * schedule and arms the timer at the new interval — the next tick
+   * runs with the new schedule, with no extra run fired and nothing
+   * remediated retroactively: degraded state from before the enable
+   * is only picked up by the next scheduled run. The enable is
+   * live-only: a restart restores the unconfigured state. Audited
+   * like any revision, with every old value `null` (there was no live
+   * schedule to replace).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live schedule and the audit
+   * log untouched — and a failed enable leaves the bus unconfigured,
+   * so a later valid call still enables it. Validation reuses the
+   * construction-time rule (`assertValidRemediateSchedule`: the
+   * interval a positive finite number, maxActions a non-negative
+   * integer) against the merged values, plus a boolean check on
+   * `dryRun` and a positive-finite check on each provided doctor
+   * threshold, so a value that could not be set at construction
+   * cannot be revised in later either — and a failed call changes
+   * nothing at all: when only one field is provided only that field
+   * is validated and moved, and an illegal value in any field leaves
+   * every live value exactly as it was. A revision that provides
+   * neither field, and a revision identical to the current schedule,
+   * are both no-ops with no audit. Audited as
    * `auto_remediate_revised` (`{ intervalMs, oldIntervalMs,
    * maxActions, oldMaxActions, dryRun, oldDryRun, doctor,
-   * oldDoctor }`, the doctor pair carrying the parsed thresholds).
+   * oldDoctor }`, the doctor pair carrying the parsed thresholds —
+   * every old value is `null` on the first enable).
    * `getStats().autoRemediate` exposes the live schedule including
    * the parsed doctor thresholds.
    *
@@ -30673,17 +30693,92 @@ export class EventBus {
    * the run's schedule), and to EB-305 (that retunes bridge-health
    * probing — this the doctor schedule).
    *
-   * Throws `RangeError` when auto-remediation is not enabled, when the
-   * bus is closed, for a non-object revision, or for an illegal
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for an enable without `intervalMs`, or for an illegal
    * `intervalMs` / `maxActions` / `dryRun` / `doctor` value.
    */
   setAutoRemediate(opts: AutoRemediateRevision): void {
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-553, along EB-540/EB-552): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
+    if (opts == null) {
+      return;
+    }
     const current = this.remediateSchedule;
     if (current === undefined) {
-      throw new RangeError('setAutoRemediate: autoRemediate is not enabled on this bus');
-    }
-    // An absent revision asks nothing to move.
-    if (opts == null) {
+      // EB-553: the enable half — a bus that never enabled
+      // `autoRemediate` gains a schedule live on the first call, with
+      // the call resolved through the same construction-time rule the
+      // configured path enforces. Fail-fast on a closed bus (EB-154,
+      // along `setChaos` / `setBridgeHealth`): close() already cleared
+      // the timer — and the timer is `undefined` on a never-enabled
+      // bus too, so the timer alone cannot tell a closed bus from an
+      // unconfigured one — so the closed check must read `this.closed`
+      // explicitly, before anything is built.
+      if (this.closed) {
+        throw new RangeError('setAutoRemediate: bus is closed');
+      }
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setAutoRemediate: revision must be an object with intervalMs and/or maxActions and/or dryRun and/or doctor',
+        );
+      }
+      // Enabling requires an interval: there is no default interval
+      // (no DEFAULT_REMEDIATE_INTERVAL_MS exists), so `{}` / a
+      // maxActions-only / dryRun-only / doctor-only call cannot
+      // enable — the bus stays unconfigured and a later valid call
+      // still enables it.
+      if (opts.intervalMs === undefined) {
+        throw new RangeError(
+          'setAutoRemediate: intervalMs is required to enable autoRemediate on this bus',
+        );
+      }
+      if (opts.dryRun !== undefined && typeof opts.dryRun !== 'boolean') {
+        throw new RangeError('setAutoRemediate: dryRun must be a boolean');
+      }
+      // Doctor tuning (EB-360): a partial `doctor` fills only the
+      // thresholds it leaves out, against the doctor defaults — the
+      // same positive-finite check the revision path enforces.
+      if (opts.doctor !== undefined && (typeof opts.doctor !== 'object' || opts.doctor === null || Array.isArray(opts.doctor))) {
+        throw new RangeError(
+          'setAutoRemediate: doctor must be an object with slowSubscriberP99Ms and/or lagWatermarkDefaultMs',
+        );
+      }
+      for (const field of ['slowSubscriberP99Ms', 'lagWatermarkDefaultMs'] as const) {
+        const value = opts.doctor?.[field];
+        if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+          throw new RangeError(`setAutoRemediate: doctor.${field} must be a positive finite number of milliseconds`);
+        }
+      }
+      // Validate before touching anything: a failed enable leaves the
+      // bus unconfigured, so a later valid call still enables it.
+      const intervalMs = opts.intervalMs;
+      const maxActions = opts.maxActions ?? DEFAULT_REMEDIATE_MAX_ACTIONS;
+      const dryRun = opts.dryRun ?? false;
+      const doctor = {
+        slowSubscriberP99Ms:
+          opts.doctor?.slowSubscriberP99Ms ?? DEFAULT_SLOW_SUBSCRIBER_P99_MS,
+        lagWatermarkDefaultMs:
+          opts.doctor?.lagWatermarkDefaultMs ?? DEFAULT_LAG_WATERMARK_MS,
+      };
+      assertValidRemediateSchedule({ intervalMs, maxActions, dryRun }, 'setAutoRemediate');
+      this.remediateSchedule = { intervalMs, maxActions, dryRun, doctor };
+      this.armRemediateTimer();
+      this.auditSubscription({
+        action: 'auto_remediate_revised',
+        actor: 'system',
+        detail: {
+          intervalMs,
+          oldIntervalMs: null,
+          maxActions,
+          oldMaxActions: null,
+          dryRun,
+          oldDryRun: null,
+          doctor,
+          oldDoctor: null,
+        },
+      });
       return;
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {

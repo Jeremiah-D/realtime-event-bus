@@ -407,23 +407,30 @@ export type SubscriptionAuditAction =
  *   including dry-run previews
  * - `auto_remediate_revised`: `{ intervalMs, oldIntervalMs, maxActions,
  *   oldMaxActions, dryRun, oldDryRun, doctor, oldDoctor }` — the bus-level doctor
- *   auto-remediation schedule was revised (EB-306, doctor tuning EB-360; only a bus that
- *   already enabled `autoRemediate` can be revised — a never-enabled
- *   bus refuses until the opt-in is set at construction, since it holds
- *   no schedule at all; the new values reuse the construction-time
+ *   auto-remediation schedule was revised — or first enabled live
+ *   (EB-553; a bus that never enabled `autoRemediate` gains a schedule
+ *   on the first call, provided the call carries `intervalMs` — there
+ *   is no default interval, so `{}` / a maxActions-only / dryRun-only /
+ *   doctor-only call cannot enable and leaves the bus unconfigured,
+ *   while `null` is a silent no-op with no audit — and the old values
+ *   are all `null` on the first enable, since there was no live
+ *   schedule to replace; the enable is live-only — a restart restores
+ *   the unconfigured state — and a closed bus refuses; EB-306, doctor
+ *   tuning EB-360; the new values reuse the construction-time
  *   validation (`assertValidRemediateSchedule`: the interval a positive
  *   finite number, maxActions a non-negative integer), plus a boolean
  *   check on `dryRun` and a positive-finite check on each provided
  *   doctor threshold, so a failed call leaves the live schedule
- *   untouched, and only the fields provided move — a partial revision
- *   keeps the fields it leaves out, and an illegal value in any field
- *   leaves every live value exactly as it was; the `doctor` pair
- *   carries the parsed thresholds (the doctor defaults when never
- *   configured), and only the scheduled run reads the stored tuning —
- *   a manual `autoRemediate(options)` still diagnoses with its own
- *   per-call `options?.doctor`, and `exportBusHealth(options?)` with
- *   its own per-call options — and a moved interval clears and re-arms
- *   the timer at the new interval with no extra run fired, while a
+ *   untouched (and a failed enable leaves the bus unconfigured), and
+ *   only the fields provided move — a partial revision keeps the fields
+ *   it leaves out, and an illegal value in any field leaves every live
+ *   value exactly as it was; the `doctor` pair carries the parsed
+ *   thresholds (the doctor defaults when never configured), and only
+ *   the scheduled run reads the stored tuning — a manual
+ *   `autoRemediate(options)` still diagnoses with its own per-call
+ *   `options?.doctor`, and `exportBusHealth(options?)` with its own
+ *   per-call options — and a moved interval clears and re-arms the
+ *   timer at the new interval with no extra run fired, while a
  *   maxActions/dryRun/doctor-only revision leaves the pending run's
  *   countdown untouched and takes effect on the next run; a revision
  *   that provides neither field, and a revision identical to the

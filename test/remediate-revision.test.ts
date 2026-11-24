@@ -2,10 +2,10 @@
  * Bus-level doctor auto-remediation schedule revision (EB-306).
  *
  * `setAutoRemediate` retunes the periodic `autoRemediate()` schedule
- * live — without restarting the bus. Only a bus that already enabled
- * the `autoRemediate` opt-in can be revised; illegal values fail
- * closed with the live schedule and the audit log untouched; an
- * identical (or empty) revision is a no-op with no audit. A moved
+ * live — without restarting the bus — and first enables it on a bus
+ * that never opted in (EB-553, provided the call carries `intervalMs`);
+ * illegal values fail closed with the live schedule and the audit log
+ * untouched; an identical (or empty) revision is a no-op with no audit. A moved
  * interval clears and re-arms the timer at the new interval with no
  * extra run fired; a maxActions/dryRun-only revision leaves the
  * pending run's countdown untouched and takes effect on the next run.
@@ -39,13 +39,35 @@ async function degradedSubscriber(bus: EventBus) {
 }
 
 describe('auto-remediation schedule revision (EB-306)', () => {
-  it('setAutoRemediate fails closed when autoRemediate is not enabled', async () => {
+  it('setAutoRemediate enables autoRemediate on a bus that never enabled it (EB-553)', async () => {
     const bus = new EventBus();
     assert.equal(bus.getStats().autoRemediate, undefined);
-    assert.throws(() => bus.setAutoRemediate({ intervalMs: 100 }), RangeError);
+    // An enable without an interval cannot enable: there is no default
+    // interval, so the bus stays unconfigured.
     assert.throws(() => bus.setAutoRemediate({ maxActions: 1 }), RangeError);
     assert.throws(() => bus.setAutoRemediate({ dryRun: true }), RangeError);
     assert.equal(bus.getSubscriptionAudit({ action: 'auto_remediate_revised' }).length, 0);
+    // The first call that carries an interval enables it, with the
+    // defaults filled in and every old value null in the audit.
+    bus.setAutoRemediate({ intervalMs: 100 });
+    assert.deepEqual(bus.getStats().autoRemediate, {
+      intervalMs: 100,
+      maxActions: 10,
+      dryRun: false,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
+    });
+    const revised = bus.getSubscriptionAudit({ action: 'auto_remediate_revised' });
+    assert.equal(revised.length, 1);
+    assert.deepEqual(revised[0].detail, {
+      intervalMs: 100,
+      oldIntervalMs: null,
+      maxActions: 10,
+      oldMaxActions: null,
+      dryRun: false,
+      oldDryRun: null,
+      doctor: { slowSubscriberP99Ms: 1000, lagWatermarkDefaultMs: 30000 },
+      oldDoctor: null,
+    });
     await bus.close();
   });
 

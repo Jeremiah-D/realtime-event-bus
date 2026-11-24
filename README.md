@@ -7706,23 +7706,35 @@ when never configured).
 
 `bus.setAutoRemediate({ intervalMs?, maxActions?, dryRun?, doctor? })`
 (EB-306, doctor tuning EB-360) retunes that schedule live without
-restarting the bus — only a bus that already enabled the opt-in can be
-revised, and only the fields provided move; a partial `doctor` object
-moves only the thresholds it names, each resolved against the live
-parsed values, so a field left out keeps its live threshold. The new
-thresholds govern the scheduled run's diagnosis from the next run on
-(the tick reads the live schedule), while a manual `autoRemediate(options)`
-still diagnoses with its own per-call `options?.doctor` and
+restarting the bus — and first enables it live on a bus that never
+opted in (EB-553): the enable must carry `intervalMs` (there is no
+default interval, so `{}` / a `maxActions`-only / `dryRun`-only /
+`doctor`-only call cannot enable and leaves the bus unconfigured,
+while `null` on a never-enabled bus is a silent no-op); the other
+fields take their defaults on the enable (`maxActions` 10, `dryRun`
+false, the doctor defaults), a partial `doctor` fills only the
+thresholds it leaves out, and the next tick runs with the new
+schedule — with no extra run fired and nothing remediated
+retroactively. The enable is live-only: a restart restores the
+unconfigured state, and a closed bus refuses the enable. Only the
+fields provided move; a partial `doctor` object moves only the
+thresholds it names, each resolved against the live parsed values, so
+a field left out keeps its live threshold. The new thresholds govern
+the scheduled run's diagnosis from the next run on (the tick reads
+the live schedule), while a manual `autoRemediate(options)` still
+diagnoses with its own per-call `options?.doctor` and
 `exportBusHealth(options?)` with its own per-call `options` — neither
 reads the stored tuning. A moved interval re-arms the timer at the new
 interval with no extra run fired; a `maxActions`/`dryRun`/`doctor`-only
 revision leaves the pending run's countdown untouched and takes effect
 on the next run. Illegal values (including a non-positive or
 non-finite doctor threshold) throw `RangeError` with the live schedule
-untouched, and an identical (or empty) revision is a no-op with no
-audit. Audited as `auto_remediate_revised` (`{ intervalMs,
-oldIntervalMs, maxActions, oldMaxActions, dryRun, oldDryRun, doctor,
-oldDoctor }`).
+untouched (and a failed enable leaves the bus unconfigured, so a
+later valid call still enables it), and an identical (or empty)
+revision is a no-op with no audit. Audited as
+`auto_remediate_revised` (`{ intervalMs, oldIntervalMs, maxActions,
+oldMaxActions, dryRun, oldDryRun, doctor, oldDoctor }` — every old
+value is `null` on the first enable).
 
 ## Transactional outbox relay (EB-102)
 
