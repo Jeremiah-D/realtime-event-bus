@@ -76,10 +76,12 @@ export interface GlobalPublishRateLimitRevision {
 /**
  * Validates `EventBusOptions.globalPublishRateLimit`. Returns
  * `undefined` when unset (unlimited); anything invalid throws
- * `RangeError` at construction time.
+ * `RangeError` at construction time. Also validates a live-enable
+ * revision (EB-551), where `messagesPerSecond` is required and has no
+ * default — `{}` throws here instead of enabling.
  */
 export function resolveGlobalPublishRateLimit(
-  raw: GlobalPublishRateLimitOptions | undefined,
+  raw: GlobalPublishRateLimitOptions | GlobalPublishRateLimitRevision | undefined,
   where = 'EventBus',
 ): ResolvedGlobalPublishRateLimit | undefined {
   if (raw === undefined) return undefined;

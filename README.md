@@ -2272,10 +2272,15 @@ library.
   live values — a rate-only revision keeps the live `burst` instead of
   recomputing it from the new rate's default — and the stored token budget
   is kept (a lowered burst clamps the banked tokens, a raised burst does
-  not top the bucket up, the new rate applies from the next refill). Only
-  a bus that enabled `globalPublishRateLimit` can be revised (otherwise
-  `RangeError`); illegal values fail closed with the live tuning
-  untouched; an identical or empty revision is a no-op with no audit.
+  not top the bucket up, the new rate applies from the next refill). A bus
+  that never enabled `globalPublishRateLimit` gains a limiter live on the
+  first call instead (EB-551): `messagesPerSecond` is required (`{}` cannot
+  enable), `burst` defaults to `max(1, ceil(messagesPerSecond))`, the fresh
+  bucket starts full so the first `burst` publishes pass at once, and the
+  enable is audited with both old values `null`. `null` on a never-enabled
+  bus is a silent no-op; a closed bus refuses. The enable is live-only: a
+  restart restores unlimited. Illegal values fail closed with the live
+  tuning untouched; an identical or empty revision is a no-op with no audit.
   Audited as `global_publish_rate_limit_revised` (old and new values).
 - **Per-topic subscriber caps** (in `src/bus.ts`, via
   `setTopicMaxSubscribers(pattern, maxSubscribers)`): a fail-fast guard

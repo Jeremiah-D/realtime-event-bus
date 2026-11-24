@@ -58,6 +58,7 @@ import {
   GlobalPublishRateLimiter,
   resolveGlobalPublishRateLimit,
   type GlobalPublishRateLimitRevision,
+  type ResolvedGlobalPublishRateLimit,
 } from './global-rate-limit.ts';
 import {
   computePayloadFingerprint,
@@ -6926,6 +6927,14 @@ export interface BusStats {
    * global limit is configured.
    */
   globalRateLimitedMessages: number;
+  /**
+   * The live bus-level global publish rate-limit tuning (EB-180, see
+   * `EventBusOptions.globalPublishRateLimit`), or `null` when no limit
+   * is configured — the live view of what `setGlobalPublishRateLimit`
+   * (EB-301, EB-551) installed or revised, so an enable on a
+   * never-configured bus is observable without publishing.
+   */
+  globalPublishRateLimit: ResolvedGlobalPublishRateLimit | null;
   /**
    * Per-rule usage vs. quota for every registered namespace tenant
    * quota (EB-162, see `setNamespaceQuota`), in registration order —
@@ -19341,9 +19350,11 @@ export class EventBus {
    * `EventBusOptions.globalPublishRateLimit`). `undefined` when
    * unconfigured — the publish path then pays a single `undefined`
    * check. The limiter's clock is the bus's injected `now`, so tests
-   * drive the bucket deterministically.
+   * drive the bucket deterministically. Not `readonly`:
+   * `setGlobalPublishRateLimit` (EB-551) installs the limiter on the
+   * first call on a never-enabled bus.
    */
-  private readonly globalPublishRateLimiter: GlobalPublishRateLimiter | undefined;
+  private globalPublishRateLimiter: GlobalPublishRateLimiter | undefined;
   /** Chunked fan-out yield counter surfaced as `getStats().fanOutYields` (EB-150). */
   private fanOutYieldCount = 0;
   /**
@@ -20395,7 +20406,9 @@ export class EventBus {
     this.maxDelayedEntries = maxDelayedEntries;
     // Bus-level global publish rate limit (EB-180): absent means
     // unlimited (backward compatible); a configured limit is enforced in
-    // the fan-out admission phase, after every per-topic gate.
+    // the fan-out admission phase, after every per-topic gate. A bus
+    // constructed without one can gain a limiter live later via
+    // `setGlobalPublishRateLimit` (EB-551).
     const resolvedGlobalRateLimit = resolveGlobalPublishRateLimit(
       options?.globalPublishRateLimit,
       'EventBus',
@@ -29615,10 +29628,34 @@ export class EventBus {
    * publish — including the `publishAtomic` shadow reservation, which
    * peeks at the live `availableTokens`.
    *
-   * Fail-closed: a bus that never enabled `globalPublishRateLimit`, a
-   * non-object revision, and an illegal value all throw `RangeError`
-   * with the live tuning and the audit log untouched. Validation
-   * reuses the construction-time rule
+   * Enabling (EB-551): an object on a bus that never enabled
+   * `globalPublishRateLimit` resolves through
+   * `resolveGlobalPublishRateLimit` exactly like a construction-time
+   * opt-in — except `messagesPerSecond` is required: `{}` cannot
+   * enable, since the rate has no construction default (unlike
+   * EB-550, where `{}` takes every default) — and installs a fresh
+   * `GlobalPublishRateLimiter` whose bucket starts full, so the first
+   * `burst` publishes pass at once and publishes before the enable
+   * were never charged. The enable needs no other wiring: the
+   * admission gates already read `this.globalPublishRateLimiter` live
+   * and skip while it is `undefined`, so the fresh limiter governs
+   * from the next publish onward, and `getStats()` reads the same
+   * live field (`null` before the enable, the live tuning after).
+   * The limiter's clock is the bus clock, exactly as at
+   * construction. The enable is live-only: a restart restores the
+   * unconfigured state. `null` on a never-enabled bus is a silent
+   * no-op with no audit (along EB-540).
+   *
+   * Fail-closed: a closed bus, a non-object revision, and an illegal
+   * value all throw `RangeError` with the live tuning and the audit
+   * log untouched. A bus that never enabled `globalPublishRateLimit`
+   * gains a limiter live on the first call instead (EB-551): the
+   * revision is resolved through the construction-time rule
+   * (`resolveGlobalPublishRateLimit`: the rate and the burst positive
+   * finite numbers) and installed whole — no restart, no lost
+   * subscriptions — and a failed enable leaves the bus unconfigured,
+   * so a later valid call still enables it. Validation reuses the
+   * construction-time rule
    * (`resolveGlobalPublishRateLimit`: the rate and the burst positive
    * finite numbers) against the merged values, so a value that could
    * not be set at construction cannot be revised in later either —
@@ -29628,24 +29665,30 @@ export class EventBus {
    * A revision that provides neither field, and a revision identical
    * to the current tuning, are both no-ops with no audit. Audited as
    * `global_publish_rate_limit_revised` (`{ messagesPerSecond,
-   * oldMessagesPerSecond, burst, oldBurst }`).
+   * oldMessagesPerSecond, burst, oldBurst }` — both old values are
+   * `null` on the first enable, since there was no live tuning to
+   * replace).
    *
    * Orthogonal to EB-180 (that is the global rate-limit mechanism
    * itself — this the limit tuning), and to EB-19 (that is the
    * per-topic rate limit — this the bus-wide backstop).
    *
-   * Throws `RangeError` when the global publish rate limit is not
-   * enabled, for a non-object revision, or for an illegal
-   * `messagesPerSecond` / `burst`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, or for an illegal `messagesPerSecond` / `burst` —
+   * including `{}` on a never-enabled bus, since `messagesPerSecond`
+   * has no default.
    */
   setGlobalPublishRateLimit(opts: GlobalPublishRateLimitRevision): void {
-    const limiter = this.globalPublishRateLimiter;
-    if (limiter === undefined) {
-      throw new RangeError(
-        'setGlobalPublishRateLimit: globalPublishRateLimit is not enabled on this bus',
-      );
+    // Fail-fast on a closed bus (EB-154, EB-551, along
+    // `setAdmissionLatency`): close() already stopped the bus — there
+    // is no live limiter left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setGlobalPublishRateLimit: bus is closed');
     }
-    // An absent revision asks nothing to move.
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-551, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
     if (opts == null) {
       return;
     }
@@ -29653,6 +29696,46 @@ export class EventBus {
       throw new RangeError(
         'setGlobalPublishRateLimit: revision must be an object with messagesPerSecond and/or burst',
       );
+    }
+    const limiter = this.globalPublishRateLimiter;
+    if (limiter === undefined) {
+      // EB-551: the enable half — a bus that never enabled
+      // `globalPublishRateLimit` gains a limiter live on the first
+      // call, with the revision resolved through the same
+      // `resolveGlobalPublishRateLimit` construction-time rule the
+      // configured path enforces (`messagesPerSecond` is required —
+      // `{}` cannot enable, since the rate has no default — and
+      // `burst` falls back to `max(1, ceil(messagesPerSecond))`).
+      // Validate BEFORE installing anything: an illegal value throws
+      // here with the bus still unconfigured, so a later valid call
+      // still enables it. The enable installs a fresh limiter whose
+      // bucket starts full — publishes before the enable were never
+      // charged, so nothing is counted retroactively — and is audited
+      // with `oldMessagesPerSecond` / `oldBurst` `null` (there was no
+      // live tuning to replace).
+      const resolved = resolveGlobalPublishRateLimit(
+        opts,
+        'setGlobalPublishRateLimit',
+      );
+      if (resolved === undefined) {
+        throw new RangeError(
+          'setGlobalPublishRateLimit: globalPublishRateLimit is not enabled on this bus',
+        );
+      }
+      const installed = new GlobalPublishRateLimiter(resolved, this.now);
+      this.globalPublishRateLimiter = installed;
+      const live = installed.current();
+      this.auditSubscription({
+        action: 'global_publish_rate_limit_revised',
+        actor: 'system',
+        detail: {
+          messagesPerSecond: live.messagesPerSecond,
+          oldMessagesPerSecond: null,
+          burst: live.burst,
+          oldBurst: null,
+        },
+      });
+      return;
     }
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the fields it leaves out — so resolution
@@ -75064,6 +75147,7 @@ export class EventBus {
       backpressureRejected: this.totalBackpressureRejected,
       tenantQuotaShedMessages: this.totalTenantQuotaShed,
       globalRateLimitedMessages: this.totalGlobalRateLimited,
+      globalPublishRateLimit: this.globalPublishRateLimiter?.current() ?? null,
       namespaceQuotas: this.tenantQuotaUsageSnapshot(),
       droppedMessages: this.totalDropped,
       dropJournal: this.dropJournal.stats(),

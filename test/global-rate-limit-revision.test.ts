@@ -3,14 +3,16 @@
  *
  * `setGlobalPublishRateLimit` retunes the bus-wide token bucket live —
  * the sustained rate and the burst — without restarting the bus. Only a
- * bus that enabled `globalPublishRateLimit` can be revised; illegal
- * values fail closed with the live tuning and the audit log untouched;
- * an identical (or empty) revision is a no-op with no audit. A partial
- * revision keeps the fields it leaves out — in particular a rate-only
- * revision keeps the live burst instead of recomputing it from the new
- * rate's default. The stored token budget is kept across a retune: a
- * lowered burst clamps the banked tokens, a raised burst does not top
- * the bucket up, and the new rate applies from the next refill.
+ * bus that enabled `globalPublishRateLimit` can be revised — a bus that
+ * never enabled it gains a limiter live on the first call instead
+ * (EB-551); illegal values fail closed with the live tuning and the
+ * audit log untouched; an identical (or empty) revision is a no-op
+ * with no audit. A partial revision keeps the fields it leaves out —
+ * in particular a rate-only revision keeps the live burst instead of
+ * recomputing it from the new rate's default. The stored token budget
+ * is kept across a retune: a lowered burst clamps the banked tokens,
+ * a raised burst does not top the bucket up, and the new rate applies
+ * from the next refill.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -30,17 +32,39 @@ function makeClock(startMs = 0) {
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 describe('global publish rate-limit revision (EB-301)', () => {
-  it('setGlobalPublishRateLimit fails closed when the limit is not enabled', () => {
-    const bus = new EventBus();
-    assert.throws(
-      () => bus.setGlobalPublishRateLimit({ messagesPerSecond: 10 }),
-      RangeError,
-    );
-    assert.throws(() => bus.setGlobalPublishRateLimit({ burst: 5 }), RangeError);
+  it('setGlobalPublishRateLimit on a never-enabled bus enables the limiter live (EB-551)', async () => {
+    const clock = makeClock();
+    const bus = new EventBus({ now: clock.now });
+    bus.subscribe('t', () => {});
+    assert.equal(bus.getStats().globalPublishRateLimit, null);
+    // Unlimited before the enable: far more than any burst passes.
+    for (let i = 0; i < 10; i++) assert.equal(bus.publish('t', i), 1);
+    bus.setGlobalPublishRateLimit({ messagesPerSecond: 2 });
+    // `burst` defaulted to max(1, ceil(2)) = 2.
+    assert.deepEqual(bus.getStats().globalPublishRateLimit, {
+      messagesPerSecond: 2,
+      burst: 2,
+    });
+    const revised = bus.getSubscriptionAudit({ action: 'global_publish_rate_limit_revised' });
+    assert.equal(revised.length, 1);
+    assert.deepEqual(revised[0].detail, {
+      messagesPerSecond: 2,
+      oldMessagesPerSecond: null,
+      burst: 2,
+      oldBurst: null,
+    });
+    // The fresh bucket starts full: the first burst passes at once,
+    // then the gate sheds.
+    assert.equal(bus.publish('t', 'a'), 1);
+    assert.equal(bus.publish('t', 'b'), 1);
+    assert.equal(bus.publish('t', 'c'), 0);
+    // A second call revises the live tuning instead of re-enabling.
+    bus.setGlobalPublishRateLimit({ burst: 4 });
     assert.equal(
       bus.getSubscriptionAudit({ action: 'global_publish_rate_limit_revised' }).length,
-      0,
+      2,
     );
+    await bus.close();
   });
 
   it('setGlobalPublishRateLimit rejects illegal values and leaves the live tuning untouched', () => {
