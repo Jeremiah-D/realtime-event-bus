@@ -48,10 +48,17 @@ function bridgedBus(maxInboundQueue?: number) {
 }
 
 describe('bridge revision (EB-313)', () => {
-  it('setBridge fails closed when bridge is not enabled', async () => {
+  it('setBridge without a transport cannot enable a bridge on an unconfigured bus', async () => {
     const bus = new EventBus({});
+    // A revision-shaped call carries no transport, so the enable half
+    // (EB-559) refuses it — the bus stays unconfigured, and a later
+    // full-options call still enables it.
     assert.throws(() => bus.setBridge({ maxInboundQueue: 2 }), RangeError);
     assert.equal(bus.getSubscriptionAudit({ action: 'bridge_revised' }).length, 0);
+    assert.deepEqual(bus.receiveFromBridge({ topic: 't', payload: 1 }), {
+      accepted: false,
+      reason: 'not-configured',
+    });
     await bus.close();
   });
 

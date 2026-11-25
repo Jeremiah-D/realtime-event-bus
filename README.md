@@ -845,11 +845,18 @@ library.
   `bus.setBridge({ maxInboundQueue? })` (EB-313): only the bound moves —
   the transport and the health monitor are untouched — and the new bound
   governs from the next inbound envelope onward (a tightened bound sheds
-  on the next arrival, a loosened one admits more). Only a bus that
-  enabled `bridge` can be revised (otherwise `RangeError`); illegal
+  on the next arrival, a loosened one admits more). A bus that never
+  enabled `bridge` gains one live with `bus.setBridge({ transport,
+  maxInboundQueue?, health? })` (EB-559): the next publish mirrors to
+  the new transport and `receiveFromBridge` starts accepting inbound
+  envelopes — envelopes refused before the enable are not replayed,
+  publishes before it are never back-mirrored — and the enable is
+  live-only (a restart restores the unconfigured state). Only a bus that
+  enabled `bridge` can be revised (otherwise a revision-shaped call
+  without a `transport` throws `RangeError`); illegal
   values fail closed with the live bound untouched; an identical or empty
   revision is a no-op with no audit. Audited as `bridge_revised` (old and
-  new bound). `getStats().bridge` reports
+  new bound — the old bound is `null` on the first enable). `getStats().bridge` reports
   `{ inbound, outbound, dropped, health }`, and the Prometheus exposition carries
   `eventbus_bridge_{outbound,inbound,dropped}_total`. Opt-in transport
   health monitoring (`bridge.health`, EB-168): periodic probes (custom

@@ -461,6 +461,7 @@ import {
   resolveBridgeOptions,
   validateBridgeEnvelope,
   type BridgeEnvelope,
+  type BridgeOptions,
   type BridgeReceiveResult,
   type BridgeRevision,
   type ResolvedBridgeOptions,
@@ -6266,7 +6267,10 @@ export interface EventBusOptions {
    * pauses (local delivery is unaffected) until a probe or mirror succeeds
    * again, with `bridge_unhealthy` / `bridge_recovered` audit events.
    * Disabled by default; an invalid config throws `RangeError`
-   * from the constructor.
+   * from the constructor. Enable live later with `setBridge` (EB-559):
+   * a bus constructed without a bridge gains one without restarting,
+   * and the enable is live-only — a restart restores the unconfigured
+   * state.
    */
   bridge?: BridgeOptions;
   /**
@@ -19720,10 +19724,12 @@ export class EventBus {
   private clusterLink: ClusterLink | null = null;
   /**
    * Cross-process bridge config (see `src/bridge.ts`, EB-51), present when
-   * `EventBusOptions.bridge` was given. The transport is caller-owned:
-   * the bus never closes it. Not `readonly`: `setBridge` (EB-313)
-   * swaps in a re-resolved config so the next inbound envelope reads
-   * the live `maxInboundQueue`.
+   * `EventBusOptions.bridge` was given — or when `setBridge` enabled one
+   * live on a bus that never configured it (EB-559). The transport is
+   * caller-owned: the bus never closes it. Not `readonly`: `setBridge`
+   * (EB-313) swaps in a re-resolved config so the next inbound envelope
+   * reads the live `maxInboundQueue`, and (EB-559) installs the first
+   * config on a never-enabled bus.
    */
   private bridge: ResolvedBridgeOptions | undefined;
   /**
@@ -30713,50 +30719,131 @@ export class EventBus {
    * holds before it sheds the newest (see `EventBusOptions.bridge`,
    * EB-51).
    *
-   * Only the field provided moves; the rest keep their live values.
-   * The revision swaps in a re-resolved bridge config, so the new
-   * bound governs from the next inbound envelope onward — the next
-   * `receiveFromBridge` reads the live `maxInboundQueue`. Envelopes
-   * already queued are untouched: tightening below the live queue
-   * depth does not trim the buffer (the queued envelopes still drain),
-   * but the next arrival sheds at once because the queue is already
-   * at or over the new bound, and loosening simply admits more before
-   * the next shed. The bridge identity is untouched: the `transport`
-   * object and the health monitor (EB-168, revised by `setBridgeHealth`,
-   * EB-305) keep their live state — a revision never re-arms a probe
-   * timer, never resets a failure counter, and never pauses or resumes
-   * outbound mirroring.
+   * A bus that never enabled `bridge` gains one live on the first call
+   * (EB-559): `setBridge({ transport, maxInboundQueue?, health? })`
+   * takes the full `BridgeOptions`, built exactly like the construction
+   * row — the `transport` is the one knob with no default, and the rest
+   * fall back to the construction defaults (`maxInboundQueue` 1024, no
+   * health monitor unless one is given). The enable installs the
+   * bridge at once: the next publish mirrors to the new transport
+   * (the mirror point reads the live config on every publish, and
+   * from-bridge envelopes never re-mirror, so the hop stays
+   * loop-free), and `receiveFromBridge` starts accepting inbound
+   * envelopes — envelopes refused before the enable are not traced
+   * back and never replayed, and publishes made before the enable
+   * are never back-mirrored (mirroring is best-effort, never queued).
+   * A `health` block builds the monitor exactly like the construction
+   * row (EB-168) and starts it, so the next publish is already
+   * watched; without one there is no monitor, and `setBridgeHealth`
+   * (EB-550) can still enable probing later. `getStats().bridge`
+   * counts from the enable onward. The enable is live-only: a restart
+   * restores the unconfigured state.
    *
-   * Fail-closed: a bus that never enabled `bridge`, a non-object
-   * revision, and an illegal value all throw `RangeError` with the
-   * live config and the audit log untouched. Validation reuses the
-   * construction-time rule (`resolveBridgeOptions`: the queue bound a
-   * positive integer) against the merged values — the transport and
-   * the health options are carried over from the live config, so a
-   * value that could not be set at construction cannot be revised in
-   * later either — and a failed call changes nothing at all. A
-   * revision that provides no field, and a revision identical to the
-   * current bound, are both no-ops with no audit. Audited as
-   * `bridge_revised` (`{ maxInboundQueue, oldMaxInboundQueue }`).
+   * Only the field provided moves on a configured bus; the rest keep
+   * their live values. The revision swaps in a re-resolved bridge
+   * config, so the new bound governs from the next inbound envelope
+   * onward — the next `receiveFromBridge` reads the live
+   * `maxInboundQueue`. Envelopes already queued are untouched:
+   * tightening below the live queue depth does not trim the buffer
+   * (the queued envelopes still drain), but the next arrival sheds at
+   * once because the queue is already at or over the new bound, and
+   * loosening simply admits more before the next shed. The bridge
+   * identity is untouched: the `transport` object and the health
+   * monitor (EB-168, revised by `setBridgeHealth`, EB-305) keep their
+   * live state — a revision never re-arms a probe timer, never resets
+   * a failure counter, and never pauses or resumes outbound mirroring.
+   * A full `BridgeOptions` passed to an already-configured bus moves
+   * only `maxInboundQueue`; a different `transport` there is ignored,
+   * exactly like the `endpoint` / `headers` / `serviceName` a full
+   * `OtlpSpanExporterOptions` carries past `setOtlp` on an enabled
+   * exporter.
+   *
+   * Fail-closed: a closed bus, a non-object revision, an enable
+   * without a `transport`, and an illegal value all throw `RangeError`
+   * with the live config and the audit log untouched. Validation
+   * reuses the construction-time rule (`resolveBridgeOptions`: the
+   * transport an object with a `publish` function, the queue bound a
+   * positive integer, the health block valid) — a value that could
+   * not be set at construction cannot be enabled or revised in later
+   * either — and a failed call changes nothing at all: a failed enable
+   * leaves the bus unconfigured, so a later valid call still enables
+   * it. `null` on a never-enabled bus is a silent no-op with no audit
+   * (along EB-540). A revision that provides no field, and a revision
+   * identical to the current bound, are both no-ops with no audit.
+   * Audited as `bridge_revised` (`{ maxInboundQueue,
+   * oldMaxInboundQueue }` — `oldMaxInboundQueue` is `null` on the
+   * first enable, since there was no live bound to replace).
    *
    * Orthogonal to EB-305 (that retunes the bridge health monitor —
    * this the ingress buffer bound), and to EB-296 (that retunes tail
    * sampling — this the bridge).
    *
-   * Throws `RangeError` when bridge is not enabled, for a non-object
-   * revision, or for an illegal `maxInboundQueue`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for an enable without a `transport`, or for an illegal
+   * `maxInboundQueue` / `transport` / `health`.
    */
-  setBridge(opts: BridgeRevision): void {
-    const current = this.bridge;
-    if (current === undefined) {
-      throw new RangeError('setBridge: bridge is not enabled on this bus');
+  setBridge(opts: BridgeRevision | BridgeOptions): void {
+    // Fail-fast on a closed bus (EB-154): close() already stopped the
+    // monitor — there is no live bridge left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setBridge: bus is closed');
     }
-    // An absent revision asks nothing to move.
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-559, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
     if (opts == null) {
       return;
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {
       throw new RangeError('setBridge: revision must be an object with maxInboundQueue');
+    }
+    const current = this.bridge;
+    if (current === undefined) {
+      // EB-559: the enable half — a bus that never enabled `bridge`
+      // gains one live on the first call, built exactly like the
+      // construction row: the `transport` is the one knob with no
+      // default, and the rest fall back to the construction defaults.
+      // Validate BEFORE installing anything: an illegal value throws
+      // here with the bus still unconfigured, so a later valid call
+      // still enables it — the same order as construction, which
+      // resolves the options before installing the bridge. A
+      // revision-shaped object (`{ maxInboundQueue }` with no
+      // `transport`) cannot enable: `resolveBridgeOptions` refuses it.
+      const resolved = resolveBridgeOptions(opts as BridgeOptions, 'setBridge');
+      if (resolved === undefined) {
+        throw new RangeError('setBridge: bridge is not enabled on this bus');
+      }
+      this.bridge = resolved;
+      // A `health` block builds the monitor exactly like the
+      // construction row (EB-168) and starts it, so the next publish
+      // is already watched; without it there is no monitor, and
+      // `setBridgeHealth` (EB-550) can still enable probing later.
+      if (resolved.health !== undefined) {
+        const bridge = resolved;
+        this.bridgeHealth = new BridgeHealthMonitor(
+          bridge.transport,
+          resolved.health,
+          this.now,
+          {
+            onUnhealthy: () => this.auditBridgeHealth('bridge_unhealthy'),
+            onRecovered: () => this.auditBridgeHealth('bridge_recovered'),
+          },
+        );
+        this.bridgeHealth.start();
+      }
+      // The enable is audited like any revision, with
+      // `oldMaxInboundQueue` `null` (there was no live bound to
+      // replace).
+      this.auditSubscription({
+        action: 'bridge_revised',
+        actor: 'system',
+        detail: {
+          maxInboundQueue: resolved.maxInboundQueue,
+          oldMaxInboundQueue: null,
+        },
+      });
+      return;
     }
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the field it leaves out — so resolution
