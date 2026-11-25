@@ -3,11 +3,13 @@
  *
  * `setAdmissionWebhook` retunes the external admission webhook live —
  * the response timeout, the timeout/transport failure mode, and the
- * extra decision-request headers — without restarting the bus. Only a
- * bus that enabled `admissionWebhook` can be revised; illegal values
- * fail closed with the live tuning and the audit log untouched; an
- * identical (or empty) revision is a no-op with no audit. The `url`
- * is not revisable — it is the policy endpoint's identity.
+ * extra decision-request headers — without restarting the bus. A bus
+ * that never enabled `admissionWebhook` gains the hook live on the
+ * first call instead (EB-555 — see `admission-webhook-enable.test.ts`);
+ * illegal values fail closed with the live tuning and the audit log
+ * untouched; an identical (or empty) revision is a no-op with no
+ * audit. The `url` is not revisable — it is the policy endpoint's
+ * identity.
  *
  * NOTE: The webhook server MUST run in a separate process. The
  * admission check blocks the main thread via `Atomics.wait` (the
@@ -109,12 +111,27 @@ async function closedPortUrl(): Promise<string> {
 const audit = (bus: EventBus) =>
   bus.getSubscriptionAudit({ action: 'admission_webhook_revised' });
 
-test('setAdmissionWebhook fails closed when admissionWebhook is not enabled', () => {
+test('setAdmissionWebhook enables a never-configured bus when given a url (EB-555)', async (t) => {
+  const { proc, url } = await startWebhook(JSON.stringify({ allowed: true }));
+  t.after(() => stopWebhook(proc));
   const bus = new EventBus();
-  assert.throws(() => bus.setAdmissionWebhook({ timeoutMs: 1000 }), RangeError);
-  assert.throws(() => bus.setAdmissionWebhook({ failureMode: 'fail-open' }), RangeError);
-  assert.throws(() => bus.setAdmissionWebhook({ headers: { 'x-a': '1' } }), RangeError);
-  assert.equal(audit(bus).length, 0);
+  t.after(() => bus.close());
+  bus.subscribe('orders.**', () => {});
+
+  // Before the enable, publishes are admitted with no webhook in play.
+  assert.equal(bus.publish('orders.created', { id: 1 }), 1);
+  bus.setAdmissionWebhook({ url });
+  // The next decision queries the new endpoint: the stub allows.
+  assert.equal(bus.publish('orders.created', { id: 2 }), 1);
+  const entries = audit(bus);
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].detail, {
+    timeoutMs: 1000,
+    oldTimeoutMs: null,
+    failureMode: 'fail-closed',
+    oldFailureMode: null,
+    headersChanged: false,
+  });
 });
 
 test('setAdmissionWebhook rejects illegal values and leaves the live tuning untouched', async (t) => {

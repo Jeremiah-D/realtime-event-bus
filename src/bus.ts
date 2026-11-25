@@ -16265,11 +16265,12 @@ export class EventBus {
    * External admission webhook config (EB-157): `undefined` when the
    * operator did not configure one — the webhook gate is a single
    * undefined check and publish behaves exactly as before. Live-tuned
-   * by `setAdmissionWebhook` (EB-308): the field is not `readonly`
-   * because a revision swaps in a fresh merged options object, and the
+   * by `setAdmissionWebhook` (EB-308) — and first installed live by
+   * the same setter (EB-555): the field is not `readonly` because a
+   * revision swaps in a fresh merged options object, and the
    * admission check reads this field on every publish
-   * (`checkAdmissionWebhook`), so a revision governs from the next
-   * `decideAdmission` call.
+   * (`checkAdmissionWebhook`), so a revision — or an enable — governs
+   * from the next `decideAdmission` call.
    */
   private admissionWebhook: AdmissionWebhookOptions | undefined;
   /**
@@ -31126,9 +31127,10 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level external admission webhook tuning live
-   * (EB-308) without restarting the bus: `setAdmissionWebhook({
-   * timeoutMs?, failureMode?, headers? })` retunes how long the bus
+   * Revises — or first enables (EB-555) — the bus-level external
+   * admission webhook tuning live (EB-308) without restarting the
+   * bus: `setAdmissionWebhook({ timeoutMs?, failureMode?, headers?
+   * })` retunes how long the bus
    * waits for the policy endpoint, what a timeout or transport failure
    * does, and which extra headers the decision request carries (see
    * `EventBusOptions.admissionWebhook`, EB-157).
@@ -31145,9 +31147,29 @@ export class EventBus {
    * worker already blocked in `Atomics.wait` keeps the timeout it was
    * called with.
    *
-   * Fail-closed: a bus that never enabled `admissionWebhook`, a
-   * non-object revision, and an illegal value all throw `RangeError`
-   * with the live tuning and the audit log untouched. Validation
+   * Enabling (EB-555): a bus that never enabled `admissionWebhook`
+   * gains the hook live on the first call — `setAdmissionWebhook({
+   * url, timeoutMs?, failureMode?, headers? })` installs it with the
+   * construction-time validation and defaults: the `url` is required
+   * (there is no endpoint to default to), `timeoutMs` falls back to
+   * 1000ms, `failureMode` to `'fail-closed'`, and `headers` to none.
+   * The admission check reads the live field on every publish, so the
+   * next decision POSTs to the new endpoint — publishes from before
+   * the enable were never checked and are not re-judged — while a
+   * decision already dispatched keeps the URL and timeout it started
+   * with (the worker is spawned per call with the URL in its worker
+   * data). `null` on a never-enabled bus is a silent no-op with no
+   * audit (along EB-540). The enable is live-only: a restart restores
+   * the unconfigured state. Audited like any revision, with
+   * `oldTimeoutMs` / `oldFailureMode` `null` (there was no live hook
+   * to replace) and `headersChanged` recording whether headers were
+   * given.
+   *
+   * Fail-closed: a closed bus, a non-object revision, an enable
+   * without a `url`, and an illegal value all throw `RangeError`
+   * with the live tuning and the audit log untouched — and a failed
+   * enable leaves the bus unconfigured, so a later valid call still
+   * enables it. Validation
    * reuses the construction-time rule
    * (`validateAdmissionWebhookOptions`: the timeout a positive finite
    * number, the failure mode `'fail-open'`/`'fail-closed'`, the
@@ -31170,17 +31192,74 @@ export class EventBus {
    * itself — this the webhook's tuning), and to EB-296 (that retunes
    * tail sampling — this the admission webhook).
    *
-   * Throws `RangeError` when the admission webhook is not enabled,
-   * for a non-object revision, or for an illegal `timeoutMs` /
-   * `failureMode` / `headers`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for an enable without a `url`, or for an illegal
+   * `timeoutMs` / `failureMode` / `headers` / `url`.
    */
-  setAdmissionWebhook(opts: AdmissionWebhookRevision): void {
+  setAdmissionWebhook(opts: AdmissionWebhookOptions | AdmissionWebhookRevision): void {
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-555, along EB-540/EB-553): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
+    if (opts == null) {
+      return;
+    }
     const current = this.admissionWebhook;
     if (current === undefined) {
-      throw new RangeError('setAdmissionWebhook: admissionWebhook is not enabled on this bus');
-    }
-    // An absent revision asks nothing to move.
-    if (opts == null) {
+      // EB-555: the enable half — a bus that never enabled
+      // `admissionWebhook` gains the hook live on the first call,
+      // built exactly like the construction-time row: the `url` is the
+      // one knob with no default, and the rest fall back to the
+      // construction defaults. Fail-fast on a closed bus (EB-154,
+      // along `setAdmissionWebhookUrl`): close() already ended the
+      // bus — there is no live publish path left to gate.
+      if (this.closed) {
+        throw new RangeError('setAdmissionWebhook: bus is closed');
+      }
+      if (typeof opts !== 'object' || Array.isArray(opts)) {
+        throw new RangeError(
+          'setAdmissionWebhook: enable must be an object with a url and optional timeoutMs/failureMode/headers',
+        );
+      }
+      const enable = opts as AdmissionWebhookOptions;
+      const timeoutMs = enable.timeoutMs ?? 1000;
+      const failureMode = enable.failureMode ?? 'fail-closed';
+      const headers = enable.headers;
+      // Validate before touching anything: the merged values go through
+      // the construction-time rule with the `url` taking the new value,
+      // so a failed enable leaves the bus unconfigured and a later
+      // valid call still enables it.
+      const merged: AdmissionWebhookOptions = {
+        url: enable.url,
+        timeoutMs,
+        failureMode,
+        ...(headers === undefined ? {} : { headers }),
+      };
+      try {
+        validateAdmissionWebhookOptions(merged, 'setAdmissionWebhook');
+      } catch (err) {
+        if (err instanceof TypeError) {
+          throw new RangeError(err.message);
+        }
+        throw err;
+      }
+      // Copy the header map on assignment so later mutation of the
+      // caller's object cannot move the live tuning without an audit.
+      this.admissionWebhook = {
+        ...merged,
+        ...(merged.headers === undefined ? {} : { headers: { ...merged.headers } }),
+      };
+      this.auditSubscription({
+        action: 'admission_webhook_revised',
+        actor: 'system',
+        detail: {
+          timeoutMs,
+          oldTimeoutMs: null,
+          failureMode,
+          oldFailureMode: null,
+          headersChanged: headers !== undefined,
+        },
+      });
       return;
     }
     if (typeof opts !== 'object' || Array.isArray(opts)) {

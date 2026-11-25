@@ -12452,15 +12452,26 @@ is a no-op with no audit. Audited as `admission_latency_revised`
 (old and new values — `oldWindowSize` / `oldGateWindowSize` /
 `oldSlowAdmissionThresholdMs` are `null` on the first enable).
 
-Retune the admission webhook live with `bus.setAdmissionWebhook({
+Enable the admission webhook live with `bus.setAdmissionWebhook({
+url, timeoutMs?, failureMode?, headers? })` (EB-555): a bus that
+never enabled `admissionWebhook` gains the hook live on the first
+call — the `url` is required, `timeoutMs` / `failureMode` /
+`headers` fall back to the construction defaults (1000ms /
+`'fail-closed'` / none); the next decision POSTs to the new endpoint,
+decisions already dispatched keep the url and timeout they started
+with; `null` on a never-enabled bus is a silent no-op; a closed bus
+refuses the enable; the enable is live-only (a restart restores the
+unconfigured state). Audited as `admission_webhook_revised` with
+`oldTimeoutMs` / `oldFailureMode` `null` and `headersChanged`
+recording whether headers were given. Retune the admission webhook
+live with `bus.setAdmissionWebhook({
 timeoutMs?, failureMode?, headers? })` (EB-308): only the fields
 provided move — the `url` moves via `setAdmissionWebhookUrl`
 (below); the new timeout governs from the next decision, the new
 failure mode from the next timeout or transport failure, and the new
-headers from the next decision request; only a bus that already
-enabled `admissionWebhook` can be revised (otherwise `RangeError`);
-illegal values fail closed with the live tuning untouched; an identical
-or empty revision is a no-op with no audit. Audited as
+headers from the next decision request; illegal values fail closed
+with the live tuning untouched; an identical or empty revision is a
+no-op with no audit. Audited as
 `admission_webhook_revised` (`{ timeoutMs, oldTimeoutMs, failureMode,
 oldFailureMode, headersChanged }`) — header values are never written
 to the audit log (they may carry bearer tokens).
