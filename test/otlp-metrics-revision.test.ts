@@ -4,13 +4,15 @@
  * `setOtlpMetrics` retunes the metrics exporter live — the export
  * cadence, the per-request timeout, and the per-topic series cap —
  * without restarting the bus. Only a bus that enabled `otlpMetrics`
- * can be revised; illegal values fail closed with the live tuning
- * and the audit log untouched; an identical (or empty) revision is
- * a no-op with no audit. The counters and the Sum start time are
- * retained across a retune, an in-flight flush is untouched, a
- * revised timeout governs the next POST, a revised per-topic cap
- * governs the next export, and a revised flush interval rebuilds
- * the flush timer at the new cadence from the next tick.
+ * can be revised; a never-enabled bus gains one live via
+ * `setOtlpMetrics` with an `endpoint` (EB-556, covered in
+ * test/otlp-metrics-enable.test.ts). Illegal values fail closed with
+ * the live tuning and the audit log untouched; an identical (or
+ * empty) revision is a no-op with no audit. The counters and the Sum
+ * start time are retained across a retune, an in-flight flush is
+ * untouched, a revised timeout governs the next POST, a revised
+ * per-topic cap governs the next export, and a revised flush interval
+ * rebuilds the flush timer at the new cadence from the next tick.
  * `endpoint`, `headers`, and `serviceName` are not revisable here.
  * A closed bus refuses the revision (EB-154 fail-fast).
  */
@@ -135,22 +137,36 @@ function attrValue(point: Record<string, any>, key: string): string | undefined 
 }
 
 describe('OTLP metrics export revision (EB-374)', () => {
-  it('setOtlpMetrics fails closed when otlpMetrics is not enabled', async () => {
+  it('setOtlpMetrics without an endpoint still refuses on a never-enabled bus, but with one it enables (EB-556)', async () => {
     const collector = startCollector();
     const endpoint = await collector.endpoint;
     try {
       const plain = new EventBus();
+      // No endpoint, no enable: the call still refuses — but the
+      // refusal is now "missing endpoint", not "never enabled".
       assert.throws(() => plain.setOtlpMetrics({ timeoutMs: 1000 }), RangeError);
       assert.equal(plain.getSubscriptionAudit({ action: 'otlp_metrics_revised' }).length, 0);
+      assert.equal(plain.getStats().otlpMetrics, undefined);
+      // With an endpoint the same call enables live (EB-556).
+      plain.setOtlpMetrics({ endpoint });
+      const live = plain.getStats().otlpMetrics;
+      assert.ok(live !== undefined);
+      assert.equal(live.endpoint, endpoint);
+      assert.equal(live.flushIntervalMs, 5000);
+      assert.equal(plain.getSubscriptionAudit({ action: 'otlp_metrics_revised' }).length, 1);
+      await plain.close();
 
       // Span export alone is not metrics export: the metrics
-      // exporter was never built.
+      // exporter was never built — but it can still be enabled live.
       const traced = new EventBus({
         trace: { sampleRate: 1 },
         otlp: { endpoint, flushIntervalMs: 60_000 },
       });
       assert.throws(() => traced.setOtlpMetrics({ timeoutMs: 1000 }), RangeError);
-      assert.equal(traced.getSubscriptionAudit({ action: 'otlp_metrics_revised' }).length, 0);
+      assert.equal(traced.getStats().otlpMetrics, undefined);
+      traced.setOtlpMetrics({ endpoint, serviceName: 'traced-bus' });
+      assert.equal(traced.getStats().otlpMetrics?.serviceName, 'traced-bus');
+      await traced.close();
     } finally {
       await collector.close();
     }

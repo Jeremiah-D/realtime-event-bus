@@ -8181,9 +8181,10 @@ Semantics notes:
 **Revising the metrics export live (EB-374).**
 `bus.setOtlpMetrics({ flushIntervalMs?, timeoutMs?, perTopic? })`
 retunes the export cadence, the per-request timeout, and the
-per-topic series cap without restarting the bus — only a bus that
-already enabled `otlpMetrics` can be revised, and a closed bus
-refuses. Only the fields provided move; the counters and the Sum
+per-topic series cap without restarting the bus — a bus that already
+enabled `otlpMetrics` can be revised, and a never-enabled bus gains
+an exporter live on the first call with an `endpoint` (EB-556,
+below); a closed bus refuses. Only the fields provided move; the counters and the Sum
 `startTimeUnixNano` are retained, so a retune never restarts the
 cumulative series, and an in-flight flush is untouched. A revised
 `flushIntervalMs` rebuilds the flush timer at the new cadence from
@@ -8199,6 +8200,28 @@ empty) revision is a no-op with no audit. Audited as
 `otlp_metrics_revised` (`{ flushIntervalMs, oldFlushIntervalMs,
 timeoutMs, oldTimeoutMs, perTopicEnabled, oldPerTopicEnabled,
 perTopicMaxTopics, oldPerTopicMaxTopics }`).
+
+**Enabling metrics export live (EB-556).**
+`bus.setOtlpMetrics({ endpoint, serviceName?, flushIntervalMs?,
+timeoutMs?, headers?, perTopic? })` gives a bus that never enabled
+`otlpMetrics` an exporter without restarting it — the `endpoint` is
+required (there is no collector to default to) and the rest fall
+back to the construction defaults (`serviceName`
+`'realtime-event-bus'`, `flushIntervalMs` / `timeoutMs` 5000ms,
+`headers` none, `perTopic` enabled at cap 20). The exporter is built
+exactly like the construction row, so the first snapshot POSTs on
+the next flush tick — no immediate flush, since metrics are snapshots
+with nothing buffered to drain — and the Sum `startTimeUnixNano` is
+taken at the enable, so the collector-side rate computation starts
+there with no backfill of pre-enable snapshots. `null` on a
+never-enabled bus is a silent no-op with no audit; `{}` (and any
+patch without an `endpoint`) refuses with `RangeError` and leaves the
+bus unconfigured, so a later valid call still enables it; a closed
+bus refuses. Audited as `otlp_metrics_revised` with every `old*`
+value `null`. The enable is live-only: a restart restores the
+unconfigured state. Once enabled, revision follows EB-374 above and
+the endpoint / headers / `serviceName` move via their own setters
+below.
 
 **Repointing the metrics export destination live (EB-407).**
 `bus.setOtlpMetricsEndpoint(endpoint)` moves the collector the next

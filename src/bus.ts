@@ -17624,9 +17624,12 @@ export class EventBus {
    * OTLP metrics exporter (`EventBusOptions.otlpMetrics`), or
    * `undefined` when export is not configured (EB-370). Fed by a
    * snapshot supplier (`() => this.getStats()`), so each tick exports
-   * the latest snapshot; independent of the span exporter above.
+   * the latest snapshot; independent of the span exporter above. A
+   * never-enabled bus gains one live via `setOtlpMetrics` (EB-556),
+   * so the field is mutable — the exporter is installed after
+   * construction, exactly like the construction row.
    */
-  private readonly otlpMetricsExporter: OtlpMetricsExporter | undefined;
+  private otlpMetricsExporter: OtlpMetricsExporter | undefined;
   /**
    * Compiled broker-level ACL rules in evaluation order
    * (`EventBusOptions.acl` / `setAclRules`). Empty means no ACL — every
@@ -29078,8 +29081,8 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level OTLP metrics export tuning live (EB-374)
-   * without restarting the bus:
+   * Revises — or first enables (EB-556) — the bus-level OTLP metrics
+   * export tuning live (EB-374) without restarting the bus:
    * `setOtlpMetrics({ flushIntervalMs?, timeoutMs?, perTopic? })`
    * retunes how often snapshots are pushed, how long a POST may
    * take, and how many hottest topics get per-topic series (see
@@ -29107,9 +29110,35 @@ export class EventBus {
    * live value, which is that default unless a `{ maxTopics }`
    * revision moved it while enabled.
    *
-   * Fail-closed: a bus that never enabled `otlpMetrics`, a closed
-   * bus, a non-object revision, and an illegal value all throw
-   * `RangeError` with the live tuning and the audit log untouched.
+   * Enabling (EB-556): a bus that never enabled `otlpMetrics` gains
+   * an exporter live on the first call — `setOtlpMetrics({
+   * endpoint, serviceName?, flushIntervalMs?, timeoutMs?, headers?,
+   * perTopic? })` installs it with the construction-time validation
+   * and defaults: the `endpoint` is required (there is no collector
+   * to default to), `serviceName` falls back to
+   * `'realtime-event-bus'`, `flushIntervalMs` / `timeoutMs` to
+   * 5000ms, `headers` to none, and `perTopic` to enabled at cap 20.
+   * The exporter is built exactly like the construction row
+   * (`resolveOtlpMetricsOptions` then `new OtlpMetricsExporter`), so
+   * its constructor arms the unref flush timer and the first
+   * snapshot POSTs on the next tick — there is no separate start and
+   * no immediate flush, since metrics are snapshots with nothing
+   * buffered to drain — and the Sum `startTimeUnixNano` is taken at
+   * the enable, so the collector-side rate computation starts there
+   * with no backfill of pre-enable snapshots. `null` on a
+   * never-enabled bus is a silent no-op with no audit (along
+   * EB-540). The enable is live-only: a restart restores the
+   * unconfigured state. Audited like any revision, with every `old*`
+   * value `null` (there was no live tuning to replace). Once
+   * enabled, the `endpoint` / `headers` / `serviceName` move via
+   * their own setters (EB-407 / EB-410 / EB-413), exactly as for a
+   * bus that enabled export at construction.
+   *
+   * Fail-closed: a closed bus, a non-object revision, an enable
+   * without an `endpoint`, and an illegal value all throw
+   * `RangeError` with the live tuning and the audit log untouched —
+   * and a failed enable leaves the bus unconfigured, so a later
+   * valid call still enables it.
    * Validation reuses the construction-time rule
    * (`resolveOtlpMetricsOptions`: `flushIntervalMs`/`timeoutMs`
    * positive finite numbers, `perTopic.maxTopics` a positive
@@ -29122,29 +29151,34 @@ export class EventBus {
    * identical to the current tuning, are both no-ops with no audit.
    * Audited as `otlp_metrics_revised` (`{ flushIntervalMs,
    * oldFlushIntervalMs, timeoutMs, oldTimeoutMs, perTopicEnabled,
-   * oldPerTopicEnabled, perTopicMaxTopics, oldPerTopicMaxTopics }`).
+   * oldPerTopicEnabled, perTopicMaxTopics, oldPerTopicMaxTopics }` —
+   * every `old*` value is `null` on the first enable, since there
+   * was no live tuning to replace).
    *
    * Orthogonal to EB-370 (that is the metrics export mechanism
    * itself — this the export tuning), and to `setOtlp` (that retunes
    * the span exporter — this the metrics exporter).
    *
-   * Throws `RangeError` when OTLP metrics export is not enabled,
-   * when the bus is closed, for a non-object revision, or for an
-   * illegal `flushIntervalMs` / `timeoutMs` / `perTopic`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for an enable without an `endpoint`, or for an
+   * illegal `flushIntervalMs` / `timeoutMs` / `perTopic` /
+   * `endpoint` / `serviceName` / `headers`.
    */
-  setOtlpMetrics(patch: OtlpMetricsRevision, actor = 'system'): void {
+  setOtlpMetrics(
+    patch: OtlpMetricsRevision | OtlpMetricsExporterOptions,
+    actor = 'system',
+  ): void {
     assertValidActor(actor, 'setOtlpMetrics');
-    const exporter = this.otlpMetricsExporter;
-    if (exporter === undefined) {
-      throw new RangeError('setOtlpMetrics: otlpMetrics is not enabled on this bus');
-    }
     // Fail-fast on a closed bus (EB-154): close() already flushed
     // once and stopped the exporter — there is no live tuning left
-    // to revise.
+    // to revise or enable.
     if (this.closed) {
       throw new RangeError('setOtlpMetrics: bus is closed');
     }
-    // An absent revision asks nothing to move.
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-556, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
     if (patch == null) {
       return;
     }
@@ -29152,6 +29186,45 @@ export class EventBus {
       throw new RangeError(
         'setOtlpMetrics: revision must be an object with flushIntervalMs and/or timeoutMs and/or perTopic',
       );
+    }
+    const exporter = this.otlpMetricsExporter;
+    if (exporter === undefined) {
+      // EB-556: the enable half — a bus that never enabled
+      // `otlpMetrics` gains an exporter live on the first call, built
+      // exactly like the construction row: the `endpoint` is the one
+      // knob with no default, and the rest fall back to the
+      // construction defaults. Validate BEFORE installing anything:
+      // an illegal value throws here with the bus still unconfigured,
+      // so a later valid call still enables it. The constructor arms
+      // the unref flush timer itself, so the first snapshot POSTs on
+      // the next tick with the Sum start time taken at the enable —
+      // and is audited with every `old*` value `null` (there was no
+      // live tuning to replace).
+      const resolved = resolveOtlpMetricsOptions(
+        patch as OtlpMetricsExporterOptions,
+        'setOtlpMetrics',
+      );
+      if (resolved === undefined) {
+        throw new RangeError('setOtlpMetrics: otlpMetrics is not enabled on this bus');
+      }
+      const installed = new OtlpMetricsExporter(resolved, () => this.getStats());
+      this.otlpMetricsExporter = installed;
+      const live = installed.current();
+      this.auditSubscription({
+        action: 'otlp_metrics_revised',
+        actor,
+        detail: {
+          flushIntervalMs: live.flushIntervalMs,
+          oldFlushIntervalMs: null,
+          timeoutMs: live.timeoutMs,
+          oldTimeoutMs: null,
+          perTopicEnabled: live.perTopic.enabled,
+          oldPerTopicEnabled: null,
+          perTopicMaxTopics: live.perTopic.maxTopics,
+          oldPerTopicMaxTopics: null,
+        },
+      });
+      return;
     }
     // Validate before touching anything: `undefined` is not a value —
     // a partial object keeps the fields it leaves out — so resolution
