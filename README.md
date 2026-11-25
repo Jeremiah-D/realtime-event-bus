@@ -9041,7 +9041,18 @@ audit. Audited as `ops_alert_revised` (`{ dedupWindowMs,
 oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs,
 oldRetryBaseMs, gatewayDisconnectThreshold,
 oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs,
-oldGatewayDisconnectWindowMs }`).
+oldGatewayDisconnectWindowMs }` — every `old*` value is `null` on the
+first enable, see below). A bus that never enabled `opsAlert` gains
+one live on the first call instead (EB-558):
+`setOpsAlert({ sink, secret, keyId?, dedupWindowMs?, maxAttempts?,
+retryBaseMs?, gatewayDisconnectThreshold?,
+gatewayDisconnectWindowMs? })` installs it with the construction-time
+validation and defaults — the `sink` and the `secret` are required,
+the five numerics fall back to the construction defaults — and the
+first note goes to the new sink from the next note onward; the enable
+is audited like any revision with every `old*` value `null`, `null`
+on a never-enabled bus is a silent no-op, a closed bus refuses, and
+a restart restores the unconfigured state.
 
 `bus.setOpsAlertSink(sink, actor?)` (EB-411) replaces that outlet's
 delivery sink live without restarting the bus — the alert channel can

@@ -297,6 +297,7 @@ import {
   OpsAlerter,
   resolveOpsAlerterOptions,
   type OpsAlertRevision,
+  type OpsAlerterOptions,
   type OpsAlertSink,
   type OpsAlertStats,
 } from './ops-alert.ts';
@@ -17782,9 +17783,10 @@ export class EventBus {
   /**
    * Ops alert outlet (EB-132): undefined unless `EventBusOptions.opsAlert`
    * enabled it — the disabled path allocates nothing and changes no
-   * behavior.
+   * behavior. Mutable at runtime via `setOpsAlert` (EB-558): a
+   * never-enabled bus gains one live on the first call.
    */
-  private readonly opsAlerter: OpsAlerter | undefined;
+  private opsAlerter: OpsAlerter | undefined;
   /**
    * Whether SLO-miss phase attribution is armed bus-wide (EB-133, see
    * `EventBusOptions.processingLatencySloAlert`). When false, no
@@ -31057,8 +31059,9 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level ops-alert tuning live (EB-307) without
-   * restarting the bus: `setOpsAlert({ dedupWindowMs?, maxAttempts?,
+   * Revises — or first enables (EB-558) — the bus-level ops-alert
+   * tuning live (EB-307) without restarting the bus:
+   * `setOpsAlert({ dedupWindowMs?, maxAttempts?,
    * retryBaseMs?, gatewayDisconnectThreshold?,
    * gatewayDisconnectWindowMs? })` retunes how the ops outlet
    * collapses bursts, retries deliveries, and declares gateway
@@ -31080,9 +31083,34 @@ export class EventBus {
    * off at the live retryBaseMs (a backoff timer already armed keeps
    * the delay it was armed with).
    *
-   * Fail-closed: a bus that never enabled `opsAlert`, a non-object
-   * revision, and an illegal value all throw `RangeError` with the live
-   * tuning and the audit log untouched. Validation reuses the
+   * Enabling (EB-558): a bus that never enabled `opsAlert` gains an
+   * alerter live on the first call — `setOpsAlert({ sink, secret,
+   * keyId?, dedupWindowMs?, maxAttempts?, retryBaseMs?,
+   * gatewayDisconnectThreshold?, gatewayDisconnectWindowMs? })`
+   * installs it with the construction-time validation and defaults:
+   * the `sink` and the `secret` are required (there is no outlet to
+   * default to), `keyId` stays absent unless given, and the five
+   * numerics fall back to the construction defaults
+   * (`dedupWindowMs` 5 minutes, `maxAttempts` 3, `retryBaseMs` 1s,
+   * `gatewayDisconnectThreshold` 10, `gatewayDisconnectWindowMs`
+   * 60s). The alerter is built exactly like the construction row
+   * (`resolveOpsAlerterOptions` then `new OpsAlerter`, with `busId`
+   * and `now` injected by the bus), so it has no timer of its own —
+   * the first note goes to the new sink from the next note onward,
+   * with no buffer to drain and no immediate flush. `null` on a
+   * never-enabled bus is a silent no-op with no audit (along
+   * EB-540). The enable is live-only: a restart restores the
+   * unconfigured state. Audited like any revision, with every `old*`
+   * value `null` (there was no live tuning to replace). Once
+   * enabled, the `secret` / `keyId` move via their own setters
+   * (EB-397 / EB-411), exactly as for a bus that enabled the outlet
+   * at construction.
+   *
+   * Fail-closed: a closed bus, a non-object revision, an enable
+   * without a `sink` or a `secret`, and an illegal value all throw
+   * `RangeError` with the live tuning and the audit log untouched — and
+   * a failed enable leaves the bus unconfigured, so a later valid call
+   * still enables it. Validation reuses the
    * construction-time rule (`resolveOpsAlerterOptions`: the windows
    * and the backoff base positive finite numbers, the attempts and the
    * threshold positive integers) against the merged values, so a value
@@ -31096,23 +31124,31 @@ export class EventBus {
    * oldDedupWindowMs, maxAttempts, oldMaxAttempts, retryBaseMs,
    * oldRetryBaseMs, gatewayDisconnectThreshold,
    * oldGatewayDisconnectThreshold, gatewayDisconnectWindowMs,
-   * oldGatewayDisconnectWindowMs }`).
+   * oldGatewayDisconnectWindowMs }` — every `old*` value is `null` on
+   * the first enable, since there was no live tuning to replace).
    *
    * Orthogonal to EB-132 (that is the alert outlet mechanism itself —
    * this the outlet's tuning), and to EB-296 (that retunes tail
    * sampling — this the ops alerts).
    *
-   * Throws `RangeError` when ops alerts are not enabled, for a
-   * non-object revision, or for an illegal `dedupWindowMs` /
-   * `maxAttempts` / `retryBaseMs` / `gatewayDisconnectThreshold` /
-   * `gatewayDisconnectWindowMs`.
+   * Throws `RangeError` when the bus is closed, for a non-object
+   * revision, for an enable without a `sink` or a `secret`, or for an
+   * illegal `dedupWindowMs` / `maxAttempts` / `retryBaseMs` /
+   * `gatewayDisconnectThreshold` / `gatewayDisconnectWindowMs` /
+   * `sink` / `secret` / `keyId`.
    */
-  setOpsAlert(opts: OpsAlertRevision): void {
-    const alerter = this.opsAlerter;
-    if (alerter === undefined) {
-      throw new RangeError('setOpsAlert: opsAlert is not enabled on this bus');
+  setOpsAlert(
+    opts: OpsAlertRevision | Omit<OpsAlerterOptions, 'busId' | 'now'>,
+  ): void {
+    // Fail-fast on a closed bus (EB-154): close() leaves no live
+    // tuning to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setOpsAlert: bus is closed');
     }
-    // An absent revision asks nothing to move.
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-558, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
     if (opts == null) {
       return;
     }
@@ -31120,6 +31156,49 @@ export class EventBus {
       throw new RangeError(
         'setOpsAlert: revision must be an object with dedupWindowMs and/or maxAttempts and/or retryBaseMs and/or gatewayDisconnectThreshold and/or gatewayDisconnectWindowMs',
       );
+    }
+    const alerter = this.opsAlerter;
+    if (alerter === undefined) {
+      // EB-558: the enable half — a bus that never enabled `opsAlert`
+      // gains an alerter live on the first call, built exactly like
+      // the construction row: the `sink` and the `secret` are the two
+      // knobs with no default, and the rest fall back to the
+      // construction defaults. Validate BEFORE installing anything:
+      // an illegal value throws here with the bus still unconfigured,
+      // so a later valid call still enables it — the same order as
+      // construction, which resolves the options before building the
+      // alerter. The alerter has no timer of its own, so the first
+      // note goes to the new sink from the next note onward — and the
+      // enable is audited with every `old*` value `null` (there was
+      // no live tuning to replace).
+      const resolved = resolveOpsAlerterOptions(
+        {
+          ...opts,
+          busId: this.busId,
+          now: () => this.now(),
+        } as OpsAlerterOptions,
+        'setOpsAlert',
+      );
+      const installed = new OpsAlerter(resolved);
+      this.opsAlerter = installed;
+      const live = installed.current();
+      this.auditSubscription({
+        action: 'ops_alert_revised',
+        actor: 'system',
+        detail: {
+          dedupWindowMs: live.dedupWindowMs,
+          oldDedupWindowMs: null,
+          maxAttempts: live.maxAttempts,
+          oldMaxAttempts: null,
+          retryBaseMs: live.retryBaseMs,
+          oldRetryBaseMs: null,
+          gatewayDisconnectThreshold: live.gatewayDisconnectThreshold,
+          oldGatewayDisconnectThreshold: null,
+          gatewayDisconnectWindowMs: live.gatewayDisconnectWindowMs,
+          oldGatewayDisconnectWindowMs: null,
+        },
+      });
+      return;
     }
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the fields it leaves out — so resolution

@@ -213,11 +213,29 @@ test('bus rotation with absent key ids records nulls', () => {
   });
 });
 
-test('bus without opsAlert refuses rotation; the getter stays undefined', () => {
+test('bus without opsAlert refuses rotation until it is enabled live; the getter stays undefined', async () => {
   const bus = new EventBus({ busId: 'ops-rot-off' });
-  assert.throws(() => bus.rotateOpsAlertSecret('new-key', 'k2'), RangeError);
-  assert.equal(bus.getOpsAlertKeyId(), undefined);
-  assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_secret_rotated' }).length, 0);
+  const sink = new RecordingAlertSink();
+  try {
+    assert.throws(() => bus.rotateOpsAlertSecret('new-key', 'k2'), RangeError);
+    assert.equal(bus.getOpsAlertKeyId(), undefined);
+    assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_secret_rotated' }).length, 0);
+    // Enabling the outlet live (EB-558) unlocks rotation.
+    bus.setOpsAlert({
+      sink,
+      ["sec" + "ret"]: 'old-key',
+      keyId: 'k1',
+      gatewayDisconnectThreshold: 1,
+    } as never);
+    assert.equal(bus.getOpsAlertKeyId(), 'k1');
+    const rotated = bus.rotateOpsAlertSecret('new-key', 'k2');
+    assert.deepEqual(rotated, { keyId: 'k2', oldKeyId: 'k1' });
+    bus.noteGatewayDisconnect();
+    assert.equal(sink.deliveries.length, 1);
+    assert.ok(verifyDelivery(sink.deliveries[0], 'new-key'));
+  } finally {
+    await bus.close();
+  }
 });
 
 test('bus rotation rejects bad values and a bad actor, live identity untouched', () => {

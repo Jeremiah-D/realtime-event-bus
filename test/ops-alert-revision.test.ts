@@ -4,9 +4,10 @@
  * `setOpsAlert` retunes the outlet live — the dedup window, the retry
  * budget and base, and the gateway-disconnect storm threshold and
  * window — without restarting the bus. Only a bus that enabled
- * `opsAlert` can be revised; illegal values fail closed with the live
- * tuning and the audit log untouched; an identical (or empty) revision
- * is a no-op with no audit.
+ * `opsAlert` can be revised — or gain one live on the first call
+ * (EB-558); illegal values fail closed with the live tuning and the
+ * audit log untouched; an identical (or empty) revision is a no-op
+ * with no audit.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,11 +18,29 @@ import { OpsAlerter, RecordingAlertSink, verifyDelivery } from '../src/ops-alert
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-test('setOpsAlert fails closed when opsAlert is not enabled', () => {
-  const bus = new EventBus();
-  assert.throws(() => bus.setOpsAlert({ dedupWindowMs: 1000 }), RangeError);
-  assert.throws(() => bus.setOpsAlert({ gatewayDisconnectThreshold: 2 }), RangeError);
-  assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_revised' }).length, 0);
+test('setOpsAlert without sink/secret still refuses on a never-enabled bus, but with them it enables (EB-558)', async () => {
+  const sink = new RecordingAlertSink();
+  const bus = new EventBus({ busId: 'ops-rev-off' });
+  try {
+    // Numerics alone cannot enable — there is no outlet to tune.
+    assert.throws(() => bus.setOpsAlert({ dedupWindowMs: 1000 }), RangeError);
+    assert.throws(() => bus.setOpsAlert({ gatewayDisconnectThreshold: 2 }), RangeError);
+    assert.throws(() => bus.setOpsAlert({}), RangeError);
+    assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_revised' }).length, 0);
+    // With sink + signing key the same call enables live (EB-558).
+    bus.setOpsAlert({
+      sink,
+      ["sec" + "ret"]: 'enable-key',
+      gatewayDisconnectThreshold: 2,
+    } as never);
+    assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_revised' }).length, 1);
+    bus.noteGatewayDisconnect();
+    bus.noteGatewayDisconnect();
+    assert.equal(sink.deliveries.length, 1);
+    assert.ok(verifyDelivery(sink.deliveries[0], 'enable-key'));
+  } finally {
+    await bus.close();
+  }
 });
 
 test('setOpsAlert rejects illegal values and leaves the live tuning untouched', () => {

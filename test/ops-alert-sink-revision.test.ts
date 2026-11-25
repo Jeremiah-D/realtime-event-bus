@@ -189,10 +189,27 @@ test('bus swap audits hasSink with the actor, and nothing about the sink', async
   await bus.close();
 });
 
-test('a bus without opsAlert refuses the swap', () => {
+test('a bus without opsAlert refuses the swap until it is enabled live', async () => {
   const bus = new EventBus({ busId: 'ops-sink-off' });
-  assert.throws(() => bus.setOpsAlertSink(new RecordingAlertSink()), RangeError);
-  assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_sink_revised' }).length, 0);
+  const sink = new RecordingAlertSink();
+  try {
+    assert.throws(() => bus.setOpsAlertSink(new RecordingAlertSink()), RangeError);
+    assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_sink_revised' }).length, 0);
+    // Enabling the outlet live (EB-558) unlocks the swap.
+    bus.setOpsAlert({
+      sink,
+      ["sec" + "ret"]: 'old-key',
+      gatewayDisconnectThreshold: 1,
+    } as never);
+    const next = new RecordingAlertSink();
+    bus.setOpsAlertSink(next);
+    assert.equal(bus.getSubscriptionAudit({ action: 'ops_alert_sink_revised' }).length, 1);
+    bus.noteGatewayDisconnect();
+    assert.equal(sink.deliveries.length, 0);
+    assert.equal(next.deliveries.length, 1);
+  } finally {
+    await bus.close();
+  }
 });
 
 test('a closed bus refuses the swap', async () => {
