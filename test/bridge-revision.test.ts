@@ -131,7 +131,7 @@ describe('bridge revision (EB-313)', () => {
     assert.deepEqual(received, [1, 2]);
     const revised = bus.getSubscriptionAudit({ action: 'bridge_revised' });
     assert.equal(revised.length, 1);
-    assert.deepEqual(revised[0].detail, { maxInboundQueue: 1, oldMaxInboundQueue: 3 });
+    assert.deepEqual(revised[0].detail, { maxInboundQueue: 1, oldMaxInboundQueue: 3, dropPolicy: 'drop-newest', oldDropPolicy: 'drop-newest' });
     await bus.close();
   });
 
@@ -151,7 +151,7 @@ describe('bridge revision (EB-313)', () => {
     assert.deepEqual(received, [1, 3, 4]);
     const revised = bus.getSubscriptionAudit({ action: 'bridge_revised' });
     assert.equal(revised.length, 1);
-    assert.deepEqual(revised[0].detail, { maxInboundQueue: 3, oldMaxInboundQueue: 1 });
+    assert.deepEqual(revised[0].detail, { maxInboundQueue: 3, oldMaxInboundQueue: 1, dropPolicy: 'drop-newest', oldDropPolicy: 'drop-newest' });
     await bus.close();
   });
 
@@ -160,7 +160,7 @@ describe('bridge revision (EB-313)', () => {
     bus.setBridge({ maxInboundQueue: 2 });
     const revised = bus.getSubscriptionAudit({ action: 'bridge_revised' });
     assert.equal(revised.length, 1);
-    assert.deepEqual(revised[0].detail, { maxInboundQueue: 2, oldMaxInboundQueue: 1024 });
+    assert.deepEqual(revised[0].detail, { maxInboundQueue: 2, oldMaxInboundQueue: 1024, dropPolicy: 'drop-newest', oldDropPolicy: 'drop-newest' });
     // The new bound governs: a burst of three sheds the third.
     assert.equal(bus.receiveFromBridge({ topic: 't', payload: 1 }).accepted, true);
     assert.equal(bus.receiveFromBridge({ topic: 't', payload: 2 }).accepted, true);

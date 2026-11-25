@@ -42,11 +42,13 @@ import { isValidLineageShape, type MessageLineage } from './lineage.ts';
  * receiving node's own TTL rules apply.
  *
  * Backpressure: inbound envelopes land in a bounded ingress buffer
- * (`maxInboundQueue`, default 1024). A full buffer sheds the NEWEST
- * envelope (drop-newest keeps the older publish order intact) and counts
- * it in `BridgeStats.dropped`. The buffer drains on a microtask, so a
- * transport that delivers synchronously from inside a publish can never
- * recurse into the bus.
+ * (`maxInboundQueue`, default 1024). A full buffer sheds per
+ * `dropPolicy` (EB-560): the default `'drop-newest'` sheds the NEWEST
+ * envelope (drop-newest keeps the older publish order intact), while
+ * `'drop-oldest'` sheds the OLDEST queued envelope to admit the new
+ * one. Either way the shed envelope counts in `BridgeStats.dropped`.
+ * The buffer drains on a microtask, so a transport that delivers
+ * synchronously from inside a publish can never recurse into the bus.
  */
 
 /**
@@ -140,6 +142,16 @@ export interface BridgeTransport {
   close?(): void | Promise<void>;
 }
 
+/**
+ * Which envelope a full bridge ingress buffer sheds (EB-560).
+ * `'drop-newest'` (the default) refuses the newcomer and keeps the
+ * older publish order intact; `'drop-oldest'` sheds the oldest queued
+ * envelope so the newcomer is admitted. Distinct from the
+ * subscription-level `DropPolicy` (`src/backpressure.ts`, EB-83) —
+ * this one governs the bridge ingress buffer, not a subscriber queue.
+ */
+export type BridgeDropPolicy = 'drop-newest' | 'drop-oldest';
+
 export interface BridgeOptions {
   /** The adapter carrying envelopes to the other nodes. Required. */
   transport: BridgeTransport;
@@ -148,6 +160,13 @@ export interface BridgeOptions {
    * positive integer. Default 1024.
    */
   maxInboundQueue?: number;
+  /**
+   * Which envelope a full ingress buffer sheds (EB-560): `'drop-newest'`
+   * refuses the newcomer, `'drop-oldest'` sheds the oldest queued
+   * envelope to admit it. Default `'drop-newest'` — the EB-51 behavior.
+   * Revisable live via `setBridge({ dropPolicy? })`.
+   */
+  dropPolicy?: BridgeDropPolicy;
   /**
    * Opt-in transport health monitoring (see `src/bridgehealth.ts`,
    * EB-168): periodic probes plus mirror-outcome accounting; at
@@ -209,6 +228,7 @@ export const DEFAULT_BRIDGE_MAX_INBOUND_QUEUE = 1024;
 export interface ResolvedBridgeOptions {
   transport: BridgeTransport;
   maxInboundQueue: number;
+  dropPolicy: BridgeDropPolicy;
   health: ResolvedBridgeHealthOptions | undefined;
 }
 
@@ -216,10 +236,12 @@ export interface ResolvedBridgeOptions {
  * Partial revision for `EventBus.setBridge` (EB-313). Only the fields
  * provided move; `transport` is the bridge's identity and is not
  * revisable here, and `health` is revised by `setBridgeHealth`
- * (EB-305).
+ * (EB-305). `dropPolicy` retunes the full-buffer shed policy
+ * (EB-560).
  */
 export interface BridgeRevision {
   maxInboundQueue?: number;
+  dropPolicy?: BridgeDropPolicy;
 }
 
 const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -239,7 +261,7 @@ export function resolveBridgeOptions(
   if (typeof options !== 'object' || options === null) {
     throw new RangeError(`${where}: bridge must be an object`);
   }
-  const { transport, maxInboundQueue, health } = options;
+  const { transport, maxInboundQueue, health, dropPolicy } = options;
   if (typeof transport !== 'object' || transport === null) {
     throw new RangeError(`${where}: bridge.transport must be an object`);
   }
@@ -254,9 +276,14 @@ export function resolveBridgeOptions(
   if (!Number.isInteger(queue) || queue < 1) {
     throw new RangeError(`${where}: bridge.maxInboundQueue must be a positive integer`);
   }
+  const policy = dropPolicy ?? 'drop-newest';
+  if (policy !== 'drop-newest' && policy !== 'drop-oldest') {
+    throw new RangeError(`${where}: bridge.dropPolicy must be 'drop-newest' or 'drop-oldest'`);
+  }
   return {
     transport: transport as BridgeTransport,
     maxInboundQueue: queue,
+    dropPolicy: policy,
     health: resolveBridgeHealthOptions(health, where),
   };
 }

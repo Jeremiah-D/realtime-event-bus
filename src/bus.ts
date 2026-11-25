@@ -527,6 +527,7 @@ export type {
 
 export type { Delivery, RedeliveryReason } from './ack.ts';
 export type {
+  BridgeDropPolicy,
   BridgeEnvelope,
   BridgeMessageSignature,
   BridgeOptions,
@@ -6261,7 +6262,11 @@ export interface EventBusOptions {
    * node-local sequence numbers, and are never mirrored back — the bridge
    * stays loop-free. `key` (with its publish-order `keySeq`), `messageId`,
    * the end-to-end `traceId`, and the source TTL deadline ride the
-   * envelope. Opt-in transport health monitoring via `BridgeOptions.health`
+   * envelope. A full ingress buffer sheds per `BridgeOptions.dropPolicy`
+   * (EB-560): `'drop-newest'` (the default) refuses the newcomer,
+   * `'drop-oldest'` sheds the oldest queued envelope to admit it;
+   * retunable live with `setBridge({ dropPolicy? })`. Opt-in transport
+   * health monitoring via `BridgeOptions.health`
    * (see `src/bridgehealth.ts`, EB-168): periodic probes plus
    * mirror-outcome accounting; at the failure threshold outbound mirroring
    * pauses (local delivery is unaffected) until a probe or mirror succeeds
@@ -19728,8 +19733,8 @@ export class EventBus {
    * live on a bus that never configured it (EB-559). The transport is
    * caller-owned: the bus never closes it. Not `readonly`: `setBridge`
    * (EB-313) swaps in a re-resolved config so the next inbound envelope
-   * reads the live `maxInboundQueue`, and (EB-559) installs the first
-   * config on a never-enabled bus.
+   * reads the live `maxInboundQueue` and `dropPolicy` (EB-560), and
+   * (EB-559) installs the first config on a never-enabled bus.
    */
   private bridge: ResolvedBridgeOptions | undefined;
   /**
@@ -19764,7 +19769,9 @@ export class EventBus {
   private bridgeDropped = 0;
   /**
    * Bounded bridge ingress buffer. Envelopes queue here until the
-   * microtask drain admits them; a full buffer sheds the newest envelope.
+   * microtask drain admits them; a full buffer sheds per the live
+   * `dropPolicy` (EB-560): `'drop-newest'` refuses the newcomer,
+   * `'drop-oldest'` sheds the oldest queued envelope to admit it.
    */
   private readonly bridgeInboundQueue: BridgeEnvelope[] = [];
   private bridgeDrainScheduled = false;
@@ -30713,11 +30720,13 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level bridge inbound queue bound live (EB-313)
-   * without restarting the bus: `setBridge({ maxInboundQueue? })`
-   * retunes how many inbound envelopes the bridge ingress buffer
-   * holds before it sheds the newest (see `EventBusOptions.bridge`,
-   * EB-51).
+   * Revises the bus-level bridge inbound queue bound and full-buffer
+   * shed policy live (EB-313, EB-560) without restarting the bus:
+   * `setBridge({ maxInboundQueue?, dropPolicy? })` retunes how many
+   * inbound envelopes the bridge ingress buffer holds before it sheds,
+   * and which envelope it sheds when full — `'drop-newest'` (the
+   * default) refuses the newcomer, `'drop-oldest'` sheds the oldest
+   * queued envelope to admit it (see `EventBusOptions.bridge`, EB-51).
    *
    * A bus that never enabled `bridge` gains one live on the first call
    * (EB-559): `setBridge({ transport, maxInboundQueue?, health? })`
@@ -30739,21 +30748,23 @@ export class EventBus {
    * counts from the enable onward. The enable is live-only: a restart
    * restores the unconfigured state.
    *
-   * Only the field provided moves on a configured bus; the rest keep
+   * Only the fields provided move on a configured bus; the rest keep
    * their live values. The revision swaps in a re-resolved bridge
-   * config, so the new bound governs from the next inbound envelope
-   * onward — the next `receiveFromBridge` reads the live
-   * `maxInboundQueue`. Envelopes already queued are untouched:
-   * tightening below the live queue depth does not trim the buffer
-   * (the queued envelopes still drain), but the next arrival sheds at
-   * once because the queue is already at or over the new bound, and
-   * loosening simply admits more before the next shed. The bridge
-   * identity is untouched: the `transport` object and the health
-   * monitor (EB-168, revised by `setBridgeHealth`, EB-305) keep their
-   * live state — a revision never re-arms a probe timer, never resets
-   * a failure counter, and never pauses or resumes outbound mirroring.
-   * A full `BridgeOptions` passed to an already-configured bus moves
-   * only `maxInboundQueue`; a different `transport` there is ignored,
+   * config, so the new bound and policy govern from the next inbound
+   * envelope onward — the next `receiveFromBridge` reads the live
+   * `maxInboundQueue` and `dropPolicy`. Envelopes already queued are
+   * untouched: tightening below the live queue depth does not trim the
+   * buffer (the queued envelopes still drain), but the next arrival
+   * sheds at once because the queue is already at or over the new
+   * bound, and loosening simply admits more before the next shed; a
+   * policy retune likewise leaves the queued envelopes in place and
+   * only decides the next shed. The bridge identity is untouched: the
+   * `transport` object and the health monitor (EB-168, revised by
+   * `setBridgeHealth`, EB-305) keep their live state — a revision never
+   * re-arms a probe timer, never resets a failure counter, and never
+   * pauses or resumes outbound mirroring. A full `BridgeOptions`
+   * passed to an already-configured bus moves only `maxInboundQueue`
+   * and `dropPolicy`; a different `transport` there is ignored,
    * exactly like the `endpoint` / `headers` / `serviceName` a full
    * `OtlpSpanExporterOptions` carries past `setOtlp` on an enabled
    * exporter.
@@ -30763,24 +30774,26 @@ export class EventBus {
    * with the live config and the audit log untouched. Validation
    * reuses the construction-time rule (`resolveBridgeOptions`: the
    * transport an object with a `publish` function, the queue bound a
-   * positive integer, the health block valid) — a value that could
+   * positive integer, the shed policy `'drop-newest'` or
+   * `'drop-oldest'`, the health block valid) — a value that could
    * not be set at construction cannot be enabled or revised in later
    * either — and a failed call changes nothing at all: a failed enable
    * leaves the bus unconfigured, so a later valid call still enables
    * it. `null` on a never-enabled bus is a silent no-op with no audit
    * (along EB-540). A revision that provides no field, and a revision
-   * identical to the current bound, are both no-ops with no audit.
-   * Audited as `bridge_revised` (`{ maxInboundQueue,
-   * oldMaxInboundQueue }` — `oldMaxInboundQueue` is `null` on the
-   * first enable, since there was no live bound to replace).
+   * identical to the current bound and policy, are both no-ops with no
+   * audit. Audited as `bridge_revised` (`{ maxInboundQueue,
+   * oldMaxInboundQueue, dropPolicy, oldDropPolicy }` — both old values
+   * are `null` on the first enable, since there was no live bound or
+   * policy to replace).
    *
    * Orthogonal to EB-305 (that retunes the bridge health monitor —
-   * this the ingress buffer bound), and to EB-296 (that retunes tail
-   * sampling — this the bridge).
+   * this the ingress buffer bound and shed policy), and to EB-296
+   * (that retunes tail sampling — this the bridge).
    *
    * Throws `RangeError` when the bus is closed, for a non-object
    * revision, for an enable without a `transport`, or for an illegal
-   * `maxInboundQueue` / `transport` / `health`.
+   * `maxInboundQueue` / `dropPolicy` / `transport` / `health`.
    */
   setBridge(opts: BridgeRevision | BridgeOptions): void {
     // Fail-fast on a closed bus (EB-154): close() already stopped the
@@ -30833,14 +30846,16 @@ export class EventBus {
         this.bridgeHealth.start();
       }
       // The enable is audited like any revision, with
-      // `oldMaxInboundQueue` `null` (there was no live bound to
-      // replace).
+      // `oldMaxInboundQueue` and `oldDropPolicy` `null` (there was no
+      // live bound or policy to replace).
       this.auditSubscription({
         action: 'bridge_revised',
         actor: 'system',
         detail: {
           maxInboundQueue: resolved.maxInboundQueue,
           oldMaxInboundQueue: null,
+          dropPolicy: resolved.dropPolicy,
+          oldDropPolicy: null,
         },
       });
       return;
@@ -30849,12 +30864,14 @@ export class EventBus {
     // partial object keeps the field it leaves out — so resolution
     // happens here, against the merged values, before anything moves.
     const maxInboundQueue = opts.maxInboundQueue ?? current.maxInboundQueue;
-    // Re-affirming the current bound is a no-op: no swap, no audit.
-    if (maxInboundQueue === current.maxInboundQueue) {
+    const dropPolicy = opts.dropPolicy ?? current.dropPolicy;
+    // Re-affirming the current bound and policy is a no-op: no swap,
+    // no audit.
+    if (maxInboundQueue === current.maxInboundQueue && dropPolicy === current.dropPolicy) {
       return;
     }
     const resolved = resolveBridgeOptions(
-      { transport: current.transport, maxInboundQueue, health: current.health },
+      { transport: current.transport, maxInboundQueue, dropPolicy, health: current.health },
       'setBridge',
     );
     if (resolved === undefined) {
@@ -30867,6 +30884,8 @@ export class EventBus {
       detail: {
         maxInboundQueue,
         oldMaxInboundQueue: current.maxInboundQueue,
+        dropPolicy,
+        oldDropPolicy: current.dropPolicy,
       },
     });
   }
@@ -59474,8 +59493,17 @@ export class EventBus {
       }
     }
     if (this.bridgeInboundQueue.length >= bridge.maxInboundQueue) {
-      this.bridgeDropped += 1;
-      return { accepted: false, reason: 'shed' };
+      if (bridge.dropPolicy === 'drop-oldest') {
+        // EB-560: shed the oldest queued envelope so the newcomer is
+        // admitted — the shed still counts, exactly like drop-newest.
+        // The queue is non-empty here (the bound is a positive
+        // integer), so the shift always removes a real envelope.
+        this.bridgeInboundQueue.shift();
+        this.bridgeDropped += 1;
+      } else {
+        this.bridgeDropped += 1;
+        return { accepted: false, reason: 'shed' };
+      }
     }
     this.bridgeInboundQueue.push(validated.envelope);
     this.scheduleBridgeDrain();

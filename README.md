@@ -841,11 +841,13 @@ library.
   TTL deadline (verbatim; otherwise the peer's own TTL rules apply) ride
   the envelope. Inbound envelopes queue in a bounded ingress buffer
   (`maxInboundQueue`, default 1024) drained on a microtask — a full buffer
-  sheds the newest envelope and counts it. Retune live with
-  `bus.setBridge({ maxInboundQueue? })` (EB-313): only the bound moves —
+  sheds per `dropPolicy` (EB-560): `'drop-newest'` (the default) refuses
+  the newcomer, `'drop-oldest'` sheds the oldest queued envelope to admit
+  it — and counts the shed envelope. Retune live with
+  `bus.setBridge({ maxInboundQueue?, dropPolicy? })` (EB-313, EB-560): only the bound and the policy move —
   the transport and the health monitor are untouched — and the new bound
-  governs from the next inbound envelope onward (a tightened bound sheds
-  on the next arrival, a loosened one admits more). A bus that never
+  and policy govern from the next inbound envelope onward (a tightened bound sheds
+  on the next arrival, a loosened one admits more; a retuned policy decides the next shed). A bus that never
   enabled `bridge` gains one live with `bus.setBridge({ transport,
   maxInboundQueue?, health? })` (EB-559): the next publish mirrors to
   the new transport and `receiveFromBridge` starts accepting inbound
@@ -856,7 +858,7 @@ library.
   without a `transport` throws `RangeError`); illegal
   values fail closed with the live bound untouched; an identical or empty
   revision is a no-op with no audit. Audited as `bridge_revised` (old and
-  new bound — the old bound is `null` on the first enable). `getStats().bridge` reports
+  new bound and policy — both old values are `null` on the first enable). `getStats().bridge` reports
   `{ inbound, outbound, dropped, health }`, and the Prometheus exposition carries
   `eventbus_bridge_{outbound,inbound,dropped}_total`. Opt-in transport
   health monitoring (`bridge.health`, EB-168): periodic probes (custom

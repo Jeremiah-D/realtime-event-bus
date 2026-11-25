@@ -276,14 +276,14 @@ describe('bridge live enable (EB-559)', () => {
     bus.setBridge({ maxInboundQueue: 5 });
     const revised = auditEntries(bus, 'bridge_revised');
     assert.equal(revised.length, 2);
-    assert.deepEqual(revised[1].detail, { maxInboundQueue: 5, oldMaxInboundQueue: 2 });
+    assert.deepEqual(revised[1].detail, { maxInboundQueue: 5, oldMaxInboundQueue: 2, dropPolicy: 'drop-newest', oldDropPolicy: 'drop-newest' });
 
     // A full options object on a configured bus moves only the bound:
     // the different transport is ignored, exactly like setOtlp.
     bus.setBridge({ transport: other, maxInboundQueue: 3 });
     const revisedAgain = auditEntries(bus, 'bridge_revised');
     assert.equal(revisedAgain.length, 3);
-    assert.deepEqual(revisedAgain[2].detail, { maxInboundQueue: 3, oldMaxInboundQueue: 5 });
+    assert.deepEqual(revisedAgain[2].detail, { maxInboundQueue: 3, oldMaxInboundQueue: 5, dropPolicy: 'drop-newest', oldDropPolicy: 'drop-newest' });
     bus.publish('t', 2);
     assert.equal(transport.mirrored.length, 2);
     assert.equal(other.mirrored.length, 0);
@@ -340,7 +340,7 @@ describe('bridge live enable (EB-559)', () => {
     // The enable itself was audited with the old bound null.
     const revised = auditEntries(bus, 'bridge_revised');
     assert.equal(revised.length, 1);
-    assert.deepEqual(revised[0].detail, { maxInboundQueue: 1024, oldMaxInboundQueue: null });
+    assert.deepEqual(revised[0].detail, { maxInboundQueue: 1024, oldMaxInboundQueue: null, dropPolicy: 'drop-newest', oldDropPolicy: null });
     await bus.close();
     // Close stops the monitor through the injected clearTimer.
     assert.equal(cleared.length, 1);
@@ -398,7 +398,7 @@ describe('bridge live enable (EB-559)', () => {
     const revised = auditEntries(bus, 'bridge_revised');
     assert.equal(revised.length, 1);
     assert.equal(revised[0].actor, 'system');
-    assert.deepEqual(revised[0].detail, { maxInboundQueue: 7, oldMaxInboundQueue: null });
+    assert.deepEqual(revised[0].detail, { maxInboundQueue: 7, oldMaxInboundQueue: null, dropPolicy: 'drop-newest', oldDropPolicy: null });
     await bus.close();
   });
 
