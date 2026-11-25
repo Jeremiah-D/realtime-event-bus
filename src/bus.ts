@@ -17617,9 +17617,13 @@ export class EventBus {
   /**
    * OTLP span exporter (`EventBusOptions.otlp`), or `undefined` when
    * export is not configured (EB-105). Fed through the trace pipeline's
-   * span fan-out, so it only ever sees spans of sampled traces.
+   * span fan-out, so it only ever sees spans of sampled traces. A
+   * never-enabled bus gains one live via `setOtlp` (EB-557), so the
+   * field is mutable — the exporter is installed after construction,
+   * exactly like the construction row, and the trace pipeline's span
+   * fan-out is re-composed around it at install time.
    */
-  private readonly otlpExporter: OtlpSpanExporter | undefined;
+  private otlpExporter: OtlpSpanExporter | undefined;
   /**
    * OTLP metrics exporter (`EventBusOptions.otlpMetrics`), or
    * `undefined` when export is not configured (EB-370). Fed by a
@@ -28645,8 +28649,9 @@ export class EventBus {
   }
 
   /**
-   * Revises the bus-level OTLP export tuning live (EB-299; EB-357
-   * adds the flush interval) without restarting the bus:
+   * Revises — or first enables (EB-557) — the bus-level OTLP export
+   * tuning live (EB-299; EB-357 adds the flush interval) without
+   * restarting the bus:
    * `setOtlp({ sampleRate?, batchSize?, flushIntervalMs?, timeoutMs?,
    * maxBuffered? })` retunes how aggressively spans are sampled for
    * export, how large each export POST is, how often the buffer
@@ -28668,9 +28673,47 @@ export class EventBus {
    * `setOtlpHeaders` (EB-409) and the `endpoint` via `setOtlpEndpoint`
    * (EB-406), not here.
    *
-   * Fail-closed: a bus that never enabled `otlp`, a non-object
-   * revision, and an illegal value all throw `RangeError` with the live
-   * tuning and the audit log untouched. Validation reuses the
+   * Enabling (EB-557): a bus that never enabled `otlp` gains an
+   * exporter live on the first call — `setOtlp({ endpoint,
+   * sampleRate?, batchSize?, flushIntervalMs?, timeoutMs?, headers?,
+   * serviceName?, maxBuffered? })` installs it with the
+   * construction-time validation and defaults: the `endpoint` is
+   * required (there is no collector to default to), `sampleRate`
+   * falls back to 1, `batchSize` to 512, `flushIntervalMs` /
+   * `timeoutMs` to 5000ms, `headers` to none, `serviceName` to
+   * `'realtime-event-bus'`, and `maxBuffered` to 10000. The exporter
+   * is built exactly like the construction row
+   * (`resolveOtlpOptions` then `new OtlpSpanExporter`), so its
+   * constructor arms the unref flush timer and there is no separate
+   * start — and the first spans export from the next admission
+   * onward, with no buffer to drain and no immediate flush. The
+   * install needs the trace pipeline underneath it: a bus whose
+   * trace was never enabled refuses (fail-closed, along the
+   * construction-time wording — spans only exist when the trace
+   * pipeline samples them), and a bus that enabled tracing live
+   * first (`setTraceEnabled(true)`) enables export right after.
+   * Installing the exporter re-composes the trace pipeline's span
+   * fan-out around it (`composeTraceSpanHook`, EB-416 — the
+   * recorder's callback was composed when no exporter existed, so
+   * the new exporter only sees spans once the hook is rebuilt; the
+   * tail sampler follows when it shares the head channel, exactly
+   * like `setTraceSpanCallback`), so a user-supplied `onTraceSpan`
+   * keeps firing alongside export and a paused trace still enables
+   * (spans flow again on re-enable). `null` on a never-enabled bus
+   * is a silent no-op with no audit (along EB-540). The enable is
+   * live-only: a restart restores the unconfigured state. Audited
+   * like any revision, with every `old*` value `null` (there was no
+   * live tuning to replace). Once enabled, the `endpoint` /
+   * `headers` / `serviceName` move via their own setters (EB-406 /
+   * EB-409 / EB-412), exactly as for a bus that enabled export at
+   * construction.
+   *
+   * Fail-closed: a closed bus, a bus whose trace was never enabled
+   * (on enable), a non-object revision, an enable without an
+   * `endpoint`, and an illegal value all throw `RangeError` with the
+   * live tuning and the audit log untouched — and a failed enable
+   * leaves the bus unconfigured, so a later valid call still enables
+   * it. Validation reuses the
    * construction-time rule (`resolveOtlpOptions`: the rate a finite
    * number in [0, 1], `batchSize`/`maxBuffered` positive integers,
    * `timeoutMs`/`flushIntervalMs` positive finite numbers) against the
@@ -28683,22 +28726,29 @@ export class EventBus {
    * both no-ops with no audit. Audited as `otlp_revised` (`{
    * sampleRate, oldSampleRate, batchSize, oldBatchSize,
    * flushIntervalMs, oldFlushIntervalMs, timeoutMs, oldTimeoutMs,
-   * maxBuffered, oldMaxBuffered }`).
+   * maxBuffered, oldMaxBuffered }` — every `old*` value is `null` on
+   * the first enable, since there was no live tuning to replace).
    *
    * Orthogonal to EB-105 (that is the OTLP export mechanism itself —
    * this the export tuning), and to `setTailSampling` (that retunes
    * which traces are kept — this how many of the kept spans ship).
    *
-   * Throws `RangeError` when OTLP export is not enabled, for a
-   * non-object revision, or for an illegal `sampleRate` / `batchSize` /
-   * `flushIntervalMs` / `timeoutMs` / `maxBuffered`.
+   * Throws `RangeError` when the bus is closed, when trace is not
+   * enabled (on enable), for a non-object revision, for an enable
+   * without an `endpoint`, or for an illegal `sampleRate` /
+   * `batchSize` / `flushIntervalMs` / `timeoutMs` / `maxBuffered` /
+   * `endpoint` / `headers` / `serviceName`.
    */
-  setOtlp(opts: OtlpRevision): void {
-    const exporter = this.otlpExporter;
-    if (exporter === undefined) {
-      throw new RangeError('setOtlp: otlp is not enabled on this bus');
+  setOtlp(opts: OtlpRevision | OtlpSpanExporterOptions): void {
+    // Fail-fast on a closed bus (EB-154): close() already flushed
+    // once — there is no live tuning left to revise or enable.
+    if (this.closed) {
+      throw new RangeError('setOtlp: bus is closed');
     }
-    // An absent revision asks nothing to move.
+    // An absent revision asks nothing to move — on a never-enabled bus
+    // this is a silent no-op too (EB-557, along EB-540): the null
+    // branch sits before the enable gate, since the old gate threw
+    // before reaching it.
     if (opts == null) {
       return;
     }
@@ -28706,6 +28756,66 @@ export class EventBus {
       throw new RangeError(
         'setOtlp: revision must be an object with sampleRate and/or batchSize and/or flushIntervalMs and/or timeoutMs and/or maxBuffered',
       );
+    }
+    const exporter = this.otlpExporter;
+    if (exporter === undefined) {
+      // EB-557: the enable half — a bus that never enabled `otlp`
+      // gains an exporter live on the first call, built exactly like
+      // the construction row: the `endpoint` is the one knob with no
+      // default, and the rest fall back to the construction defaults.
+      // Validate BEFORE installing anything: an illegal value throws
+      // here with the bus still unconfigured, so a later valid call
+      // still enables it — the same order as construction, which
+      // resolves the options before checking the trace requirement.
+      const resolved = resolveOtlpOptions(opts as OtlpSpanExporterOptions, 'setOtlp');
+      if (resolved === undefined) {
+        throw new RangeError('setOtlp: otlp is not enabled on this bus');
+      }
+      // The exporter rides the trace pipeline's span fan-out, so
+      // there must be a recorder underneath it — a bus whose trace
+      // was never enabled refuses, along the construction-time
+      // wording. A bus that enabled tracing live first
+      // (`setTraceEnabled(true)`) passes this gate.
+      const recorder = this.trace;
+      if (recorder === undefined) {
+        throw new RangeError(
+          'setOtlp: otlp span export requires EventBusOptions.trace to be enabled',
+        );
+      }
+      const installed = new OtlpSpanExporter(resolved);
+      this.otlpExporter = installed;
+      // Re-compose the trace pipeline's span fan-out around the new
+      // exporter: the recorder's callback was composed when no
+      // exporter existed, so the exporter only sees spans once the
+      // hook is rebuilt — exactly like `setTraceSpanCallback`
+      // re-installs the composed hook, and the tail sampler follows
+      // when it shares the head channel. The constructor arms the
+      // unref flush timer itself, so the first spans export from the
+      // next admission onward — and the enable is audited with every
+      // `old*` value `null` (there was no live tuning to replace).
+      const composed = this.composeTraceSpanHook(this.traceSpanUserHook);
+      recorder.setSpanCallback(composed);
+      if (this.tailSharesTraceSpanChannel && this.tailSampler !== undefined) {
+        this.tailSampler.setSpanCallback(composed);
+      }
+      const live = installed.current();
+      this.auditSubscription({
+        action: 'otlp_revised',
+        actor: 'system',
+        detail: {
+          sampleRate: live.sampleRate,
+          oldSampleRate: null,
+          batchSize: live.batchSize,
+          oldBatchSize: null,
+          flushIntervalMs: live.flushIntervalMs,
+          oldFlushIntervalMs: null,
+          timeoutMs: live.timeoutMs,
+          oldTimeoutMs: null,
+          maxBuffered: live.maxBuffered,
+          oldMaxBuffered: null,
+        },
+      });
+      return;
     }
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the fields it leaves out — so resolution

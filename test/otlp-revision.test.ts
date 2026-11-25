@@ -105,15 +105,28 @@ function makeSpan(overrides: Partial<TraceSpan> = {}): TraceSpan {
 }
 
 describe('OTLP export revision (EB-299)', () => {
-  it('setOtlp fails closed when otlp is not enabled', async () => {
-    const plain = new EventBus();
-    assert.throws(() => plain.setOtlp({ sampleRate: 0.5 }), RangeError);
-    assert.equal(plain.getSubscriptionAudit({ action: 'otlp_revised' }).length, 0);
+  it('setOtlp enables a traced bus and still refuses without an endpoint', async () => {
+    const collector = startCollector();
+    const endpoint = await collector.endpoint;
+    try {
+      // A bus with no trace at all still refuses: spans only exist
+      // when the trace pipeline samples them (EB-557).
+      const plain = new EventBus();
+      assert.throws(() => plain.setOtlp({ endpoint }), RangeError);
+      assert.equal(plain.getSubscriptionAudit({ action: 'otlp_revised' }).length, 0);
 
-    // Trace alone is not export: the exporter was never built.
-    const traced = new EventBus({ trace: { sampleRate: 1 } });
-    assert.throws(() => traced.setOtlp({ batchSize: 10 }), RangeError);
-    assert.equal(traced.getSubscriptionAudit({ action: 'otlp_revised' }).length, 0);
+      // A traced bus gains an exporter on the first call with an
+      // endpoint; without one it still refuses.
+      const traced = new EventBus({ trace: { sampleRate: 1 } });
+      assert.throws(() => traced.setOtlp({ batchSize: 10 }), RangeError);
+      assert.equal(traced.getSubscriptionAudit({ action: 'otlp_revised' }).length, 0);
+      traced.setOtlp({ endpoint });
+      assert.ok(traced.getStats().otlp !== undefined);
+      await traced.close();
+      await plain.close();
+    } finally {
+      await collector.close();
+    }
   });
 
   it('setOtlp rejects illegal values and leaves the live tuning untouched', async () => {

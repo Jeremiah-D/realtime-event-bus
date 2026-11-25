@@ -8052,9 +8052,10 @@ Semantics notes:
   the constructor.
 - `bus.setOtlp({ sampleRate?, batchSize?, flushIntervalMs?,
   timeoutMs?, maxBuffered? })` (EB-299; EB-357 adds the flush
-  interval) retunes the export live without restarting the bus — only a
-  bus that already enabled `otlp` can be revised (a never-enabled bus
-  throws `RangeError`); illegal values fail closed with the live tuning
+  interval) retunes the export live without restarting the bus — a
+  bus that already enabled `otlp` can be revised, and a never-enabled
+  bus gains an exporter live on the first call with an `endpoint`
+  (EB-557, below); illegal values fail closed with the live tuning
   untouched; an identical or empty revision is a no-op with no audit
   (audited as `otlp_revised`); in-flight buffered spans are retained
   and the new values govern from the next admission/flush/POST. A
@@ -8064,6 +8065,30 @@ Semantics notes:
   it moves via `setOtlpServiceName` (EB-412, below); `headers` move
   via `setOtlpHeaders` (EB-409, below) and the `endpoint` via
   `setOtlpEndpoint` (EB-406), not here.
+- **Enabling span export live (EB-557).**
+  `bus.setOtlp({ endpoint, sampleRate?, batchSize?,
+  flushIntervalMs?, timeoutMs?, headers?, serviceName?, maxBuffered?
+  })` gives a bus that never enabled `otlp` an exporter without
+  restarting it — the `endpoint` is required (there is no collector
+  to default to) and the rest fall back to the construction defaults
+  (`sampleRate` 1, `batchSize` 512, `flushIntervalMs` / `timeoutMs`
+  5000ms, `headers` none, `serviceName` `'realtime-event-bus'`,
+  `maxBuffered` 10000). The exporter is built exactly like the
+  construction row, so the first spans export from the next admission
+  onward — no immediate flush, since there is nothing buffered to
+  drain. The install needs the trace pipeline underneath it: a bus
+  whose trace was never enabled refuses, and a bus that enabled
+  tracing live first (`setTraceEnabled(true)`) enables export right
+  after; installing the exporter re-composes the trace pipeline's
+  span fan-out around it, so a user-supplied `onTraceSpan` keeps
+  firing alongside export. `null` on a never-enabled bus is a silent
+  no-op with no audit; `{}` (and any patch without an `endpoint`)
+  refuses with `RangeError` and leaves the bus unconfigured, so a
+  later valid call still enables it; a closed bus refuses. Audited as
+  `otlp_revised` with every `old*` value `null`. The enable is
+  live-only: a restart restores the unconfigured state. Once enabled,
+  revision follows EB-299/EB-357 above and the endpoint / headers /
+  `serviceName` move via their own setters below.
 - `bus.setOtlpEndpoint(endpoint, actor = 'system')` (EB-406) repoints
   the export destination live without restarting the bus — only a bus
   that already enabled `otlp` can be repointed (a never-enabled bus
