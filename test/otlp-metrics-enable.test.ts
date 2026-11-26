@@ -181,7 +181,12 @@ describe('OTLP metrics export live enable (EB-556)', () => {
       const body = parseBody(collector.requests[0]);
       assert.equal(serviceNameOf(body), 'realtime-event-bus');
       assert.ok(body.resourceMetrics[0].scopeMetrics[0].metrics.length > 0);
-      assert.ok((bus.getStats().otlpMetrics?.exportedMetrics ?? 0) > 0);
+      // The collector records the request when the body arrives, but
+      // `exportedMetrics` moves only once the export POST completes
+      // (the response is received), so poll the counter instead of
+      // asserting it at request-arrival time: under load the waitFor
+      // above can return in the gap between the two (CI c341901).
+      await waitFor(() => (bus.getStats().otlpMetrics?.exportedMetrics ?? 0) > 0);
     } finally {
       await bus.close();
       await collector.close();
