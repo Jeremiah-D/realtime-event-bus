@@ -302,8 +302,8 @@ test('EB-515: two clients get incrementing distinct ids, both in connectionsDeta
         [1, 2],
       );
       assert.deepEqual(stats.connectionsDetail, [
-        { id: 1, remoteAddress: '127.0.0.1', subscriptions: 0, initialized: true },
-        { id: 2, remoteAddress: '127.0.0.1', subscriptions: 0, initialized: false },
+        { id: 1, remoteAddress: '127.0.0.1', subscriptions: 0, initialized: true, deflate: false },
+        { id: 2, remoteAddress: '127.0.0.1', subscriptions: 0, initialized: false, deflate: false },
       ]);
       // `connections` stays the cumulative accept count (EB-515 keeps
       // it; the live per-connection view is connectionsDetail).
@@ -501,8 +501,8 @@ test('EB-515: connectionsDetail tracks subscriptions and initialized per connect
       first.send({ type: 'subscribe', id: 's2', payload: { query: SUB('topic: "b"') } });
       await waitForSubscribers(bus, 2, 'subscribe s1+s2');
       assert.deepEqual(gw.getStats().connectionsDetail, [
-        { id: 1, remoteAddress: '127.0.0.1', subscriptions: 2, initialized: true },
-        { id: 2, remoteAddress: '127.0.0.1', subscriptions: 0, initialized: false },
+        { id: 1, remoteAddress: '127.0.0.1', subscriptions: 2, initialized: true, deflate: false },
+        { id: 2, remoteAddress: '127.0.0.1', subscriptions: 0, initialized: false, deflate: false },
       ]);
       assert.equal(gw.getStats().subscriptions, 2);
     } finally {

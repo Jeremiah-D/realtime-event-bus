@@ -74,6 +74,23 @@
  * the live connection limits, revisable with
  * `setGraphqlGatewayLimits` (EB-349) without restarting the
  * server.
+ *
+ * permessage-deflate (RFC 7692, EB-562) is opt-in via
+ * `permessageDeflate`: when enabled and the client offers the
+ * extension, the handshake selects it and answers
+ * `permessage-deflate; client_no_context_takeover` (plus agreed
+ * window-bits parameters) — the same strict model and the same shared
+ * helpers (`src/gateway-deflate.ts`) as the WS gateway (EB-206):
+ * client context takeover is never used, every message compresses and
+ * decompresses with a fresh context, payloads below
+ * `compressThresholdBytes` (default 1024) and payloads whose
+ * compressed form is not smaller go out plaintext, and an inflated
+ * message past `maxInflatedBytes` (default 8 MiB) fails the
+ * connection. `getStats().deflate` reports the resolved tuning
+ * (`undefined` when disabled) and each `connectionsDetail` row
+ * carries `deflate: boolean` for whether that connection negotiated
+ * the extension. There is no live revision yet — the GraphQL
+ * `setGraphqlGatewayDeflate` setter is a separate item (EB-563).
  */
 import {
   createServer as createTcpServer,
@@ -87,6 +104,15 @@ import {
   type Subscription,
 } from './bus.ts';
 import type { GatewayDisconnectEvent } from './gateway-ws.ts';
+import {
+  decompressMessage,
+  maybeCompressMessage,
+  negotiateServerDeflate,
+  resolvePerMessageDeflate,
+  WsInflateBombError,
+  type PerMessageDeflateOptions,
+  type ResolvedPerMessageDeflate,
+} from './gateway-deflate.ts';
 import { compileFilterExpression } from './filterexpr.ts';
 
 // --- RFC 6455 codec (server side, mirrors gateway-ws.ts) ---------------------
@@ -104,10 +130,14 @@ function wsAcceptKey(key: string): string {
   return createHash('sha1').update(key + WS_GUID).digest('base64');
 }
 
-/** Encode one server-to-client frame: servers never mask (RFC 6455 §5.3). */
-function encodeFrame(opcode: number, payload: Buffer): Buffer {
+/**
+ * Encode one server-to-client frame: servers never mask (RFC 6455 §5.3).
+ * `rsv1` sets the RSV1 bit (RFC 7692 §7.2.1) for permessage-deflate
+ * frames — only ever set on data frames when the extension negotiated.
+ */
+function encodeFrame(opcode: number, payload: Buffer, rsv1 = false): Buffer {
   const len = payload.length;
-  const b0 = 0x80 | opcode;
+  const b0 = (rsv1 ? 0x40 : 0) | 0x80 | opcode;
   let header: Buffer;
   if (len < 126) {
     header = Buffer.from([b0, len]);
@@ -128,6 +158,8 @@ function encodeFrame(opcode: number, payload: Buffer): Buffer {
 interface WsMessage {
   opcode: number;
   payload: Buffer;
+  /** RSV1 was set on the first frame of this message (permessage-deflate). */
+  rsv1: boolean;
 }
 
 /**
@@ -135,12 +167,21 @@ interface WsMessage {
  * chunks, pull out complete messages. Masked inbound frames are unmasked
  * (clients must mask; unmasked frames are tolerated). Throws on frames
  * whose declared length exceeds `maxFrameBytes`.
+ *
+ * permessage-deflate (EB-562): set `permessageDeflate` once the
+ * extension negotiated; RSV1 is then legal on data frames (first
+ * fragment only — continuations and control frames must keep RSV1
+ * clear) and is reported on the assembled message. Without the
+ * extension, any set RSV bit throws, as before.
  */
 class FrameParser {
   private buf = Buffer.alloc(0);
   private fragments: Buffer[] = [];
   private fragmentOpcode = -1;
+  private fragmentRsv1 = false;
   private readonly maxFrameBytes: number;
+  /** Set when permessage-deflate negotiated on this connection. */
+  permessageDeflate = false;
 
   constructor(maxFrameBytes: number) {
     this.maxFrameBytes = maxFrameBytes;
@@ -152,32 +193,46 @@ class FrameParser {
     for (;;) {
       const frame = this.nextFrame();
       if (frame === undefined) return out;
-      const { fin, opcode, payload } = frame;
+      const { fin, opcode, payload, rsv1 } = frame;
+      const isControl = opcode >= OP_CLOSE;
+      if (isControl && rsv1) {
+        throw new Error('websocket: RSV1 set on control frame');
+      }
       if (opcode === OP_CONT) {
         if (this.fragmentOpcode === -1) throw new Error('websocket: unexpected continuation');
+        if (rsv1) throw new Error('websocket: RSV1 set on continuation frame');
         this.fragments.push(payload);
         if (fin) {
-          out.push({ opcode: this.fragmentOpcode, payload: Buffer.concat(this.fragments) });
+          out.push({
+            opcode: this.fragmentOpcode,
+            payload: Buffer.concat(this.fragments),
+            rsv1: this.fragmentRsv1,
+          });
           this.fragments = [];
           this.fragmentOpcode = -1;
+          this.fragmentRsv1 = false;
         }
         continue;
       }
       if (!fin && (opcode === OP_TEXT || opcode === OP_BINARY)) {
         this.fragments = [payload];
         this.fragmentOpcode = opcode;
+        this.fragmentRsv1 = rsv1;
         continue;
       }
-      out.push({ opcode, payload });
+      out.push({ opcode, payload, rsv1 });
     }
   }
 
-  private nextFrame(): { fin: boolean; opcode: number; payload: Buffer } | undefined {
+  private nextFrame(): { fin: boolean; opcode: number; payload: Buffer; rsv1: boolean } | undefined {
     const b = this.buf;
     if (b.length < 2) return undefined;
     const fin = (b[0] & 0x80) !== 0;
     const rsv = b[0] & 0x70;
-    if (rsv !== 0) throw new Error('websocket: RSV bits set without negotiated extension');
+    const rsv1 = (b[0] & 0x40) !== 0;
+    if (rsv !== 0 && !(rsv === 0x40 && this.permessageDeflate)) {
+      throw new Error('websocket: RSV bits set without negotiated extension');
+    }
     const opcode = b[0] & 0x0f;
     const masked = (b[1] & 0x80) !== 0;
     let len = b[1] & 0x7f;
@@ -205,7 +260,7 @@ class FrameParser {
       payload = unmasked;
     }
     this.buf = b.subarray(off + maskOff + len);
-    return { fin, opcode, payload };
+    return { fin, opcode, payload, rsv1 };
   }
 }
 
@@ -804,6 +859,31 @@ export interface GraphqlGatewayOptions {
    * revision clears the cap back to unlimited.
    */
   maxSubscriptionsPerConnection?: number;
+  /**
+   * Opt-in permessage-deflate (RFC 7692, EB-562): `true` enables with
+   * defaults, or pass `PerMessageDeflateOptions` to tune it.
+   * `false`/`undefined` (default) disables — the extension is never
+   * selected and every frame goes out plaintext.
+   *
+   * When enabled and the client offers `permessage-deflate`, the
+   * server selects it and answers
+   * `permessage-deflate; client_no_context_takeover` (plus agreed
+   * window-bits params). Client context takeover is never used, and
+   * the server never reuses its own deflate context either: every
+   * message compresses and decompresses independently.
+   * `compressThresholdBytes` (default 1024) gates compression by
+   * payload size; payloads whose compressed form is not smaller than
+   * the original go out plaintext. `serverMaxWindowBits` /
+   * `clientMaxWindowBits` (default 15, range 8–15) tune the LZ77
+   * windows in each direction. Invalid values throw `RangeError` at
+   * construction, like every other option. Not revisable live yet —
+   * the GraphQL `setGraphqlGatewayDeflate` setter is a separate item
+   * (EB-563). The shared helpers live in `src/gateway-deflate.ts`
+   * (EB-206); `maxFrameBytes` bounds the compressed wire frame, while
+   * `maxInflatedBytes` caps the decompressed message (the EB-206
+   * precedent).
+   */
+  permessageDeflate?: boolean | PerMessageDeflateOptions;
 }
 
 export interface GraphqlGatewayStats {
@@ -825,6 +905,8 @@ export interface GraphqlGatewayStats {
     subscriptions: number;
     /** True once the connection sent `connection_init`. */
     initialized: boolean;
+    /** True when this connection negotiated permessage-deflate (EB-562). */
+    deflate: boolean;
   }>;
   /** Cumulative `next` frames delivered. */
   messagesSent: number;
@@ -866,6 +948,14 @@ export interface GraphqlGatewayStats {
     maxHandshakeBytes: number;
     maxSubscriptionsPerConnection: number | undefined;
   };
+  /**
+   * Live permessage-deflate tuning (EB-562): the construction values —
+   * `undefined` when permessage-deflate is disabled. The window bits
+   * are the live values for *new* connections: a connection that is
+   * already open keeps the window bits its handshake negotiated.
+   * (Live revision arrives with `setGraphqlGatewayDeflate`, EB-563.)
+   */
+  deflate: ResolvedPerMessageDeflate | undefined;
 }
 
 /**
@@ -930,6 +1020,25 @@ interface GqlConnection {
   initialized: boolean;
   initTimer: ReturnType<typeof setTimeout> | undefined;
   subscriptions: Map<string, Subscription>;
+  /**
+   * permessage-deflate negotiation for this connection (EB-562):
+   * set when the handshake selected the extension — the window bits
+   * the server must use when compressing to this client. Undefined
+   * means plaintext both ways.
+   */
+  deflate: { serverWindowBits: number } | undefined;
+  /**
+   * Outbound serialization chain: compression is async, so every
+   * outbound data frame is appended here to keep wire order across
+   * slow compresses. Settling the chain never throws.
+   */
+  sendChain: Promise<void>;
+  /**
+   * Inbound serialization chain: decompression is async, so every
+   * inbound message is appended here to keep dispatch order across
+   * slow inflates. Settling the chain never throws.
+   */
+  recvChain: Promise<void>;
 }
 
 // --- Gateway ------------------------------------------------------------------
@@ -952,6 +1061,8 @@ export class GraphqlGateway {
   private maxHandshakeBytes: number;
   /** Mutable live via `setGraphqlGatewayMaxSubscriptionsPerConnection` (EB-402) — see that method. */
   private maxSubscriptionsPerConnection: number | undefined;
+  /** Resolved permessage-deflate config (EB-562); undefined = disabled. Mutable live via `setGraphqlGatewayDeflate` (EB-563) — see that method. */
+  private deflateOpts: ResolvedPerMessageDeflate | undefined;
   private server: TcpServer | null = null;
   private boundPort = 0;
   private readonly connections = new Set<GqlConnection>();
@@ -1020,6 +1131,8 @@ export class GraphqlGateway {
       fail('maxSubscriptionsPerConnection must be a positive integer');
     }
     this.maxSubscriptionsPerConnection = maxSubscriptionsPerConnection;
+    // EB-562: validate permessage-deflate once, at construction.
+    this.deflateOpts = resolvePerMessageDeflate(options.permessageDeflate);
   }
 
   /** Starts listening; resolves once bound. */
@@ -1113,6 +1226,7 @@ export class GraphqlGateway {
         ...(remoteAddress === undefined ? {} : { remoteAddress }),
         subscriptions: conn.subscriptions.size,
         initialized: conn.initialized,
+        deflate: conn.deflate !== undefined,
       });
     }
     return {
@@ -1128,6 +1242,7 @@ export class GraphqlGateway {
         maxHandshakeBytes: this.maxHandshakeBytes,
         maxSubscriptionsPerConnection: this.maxSubscriptionsPerConnection,
       },
+      deflate: this.deflateOpts === undefined ? undefined : { ...this.deflateOpts },
     };
   }
 
@@ -1489,6 +1604,9 @@ export class GraphqlGateway {
       initialized: false,
       initTimer: undefined,
       subscriptions: new Map(),
+      deflate: undefined,
+      sendChain: Promise.resolve(),
+      recvChain: Promise.resolve(),
     };
     this.connections.add(conn);
     this.stats.connections += 1;
@@ -1528,7 +1646,13 @@ export class GraphqlGateway {
         this.closeWithCode(conn, CLOSE_BAD_REQUEST, 'frame too large');
         return;
       }
-      for (const msg of messages) this.handleWsMessage(conn, msg);
+      // Inbound order is connection-scoped: decompression is async, so
+      // each message joins the connection's receive chain. The chain
+      // settles without throwing (processWsMessage is infallible).
+      for (const msg of messages) {
+        const task = (): Promise<void> => this.processWsMessage(conn, msg);
+        conn.recvChain = conn.recvChain.then(task, task);
+      }
     });
     socket.on('error', () => {});
     socket.on('close', () => this.destroyConnection(conn));
@@ -1571,12 +1695,35 @@ export class GraphqlGateway {
       .split(',')
       .map((s) => s.trim());
     if (!protocols.includes(WS_SUBPROTOCOL)) return reject('400 Bad Request');
+    // EB-562: permessage-deflate negotiation. An enabled server that
+    // cannot honor the client's offer fails the handshake outright;
+    // a client that offers nothing (or a server with the extension
+    // disabled) connects normally in plaintext.
+    let extensionsResponse: string | undefined;
+    if (this.deflateOpts !== undefined) {
+      const offered = headers.get('sec-websocket-extensions');
+      if (offered !== undefined && offered.trim() !== '') {
+        try {
+          const negotiated = negotiateServerDeflate(offered, this.deflateOpts);
+          if (negotiated !== null) {
+            extensionsResponse = negotiated.response;
+            conn.deflate = { serverWindowBits: negotiated.serverWindowBits };
+            conn.parser.permessageDeflate = true;
+          }
+        } catch {
+          return reject('400 Bad Request');
+        }
+      }
+    }
     conn.socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
         'Upgrade: websocket\r\n' +
         'Connection: Upgrade\r\n' +
         `Sec-WebSocket-Accept: ${wsAcceptKey(key)}\r\n` +
         `Sec-WebSocket-Protocol: ${WS_SUBPROTOCOL}\r\n` +
+        (extensionsResponse === undefined
+          ? ''
+          : `Sec-WebSocket-Extensions: ${extensionsResponse}\r\n`) +
         '\r\n',
     );
     conn.handshook = true;
@@ -1674,6 +1821,19 @@ export class GraphqlGateway {
 
   // --- outbound --------------------------------------------------------------
 
+  /**
+   * Sends one JSON text frame. Compression is async, so the frame joins
+   * the connection's send chain to keep wire order across slow
+   * compresses; settling the chain never throws. Control frames
+   * (ping/pong/close) bypass this and are written directly, never
+   * compressed.
+   *
+   * Builds one outbound data frame, applying permessage-deflate
+   * (EB-562) when negotiated: payloads at/above
+   * `compressThresholdBytes` whose compressed form is strictly smaller
+   * go out with RSV1 set. A failed deflate or a non-shrinking result
+   * falls back to plaintext — never breaking frame semantics.
+   */
   private sendJson(conn: GqlConnection, value: unknown): void {
     if (conn.closed) return;
     let text: string;
@@ -1683,11 +1843,26 @@ export class GraphqlGateway {
       this.stats.protocolErrors += 1;
       return;
     }
-    try {
-      conn.socket.write(encodeFrame(OP_TEXT, Buffer.from(text, 'utf8')));
-    } catch {
-      this.destroyConnection(conn);
-    }
+    const payload = Buffer.from(text, 'utf8');
+    const task = async (): Promise<void> => {
+      if (conn.closed) return;
+      const negotiated = conn.deflate;
+      let bytes = payload;
+      let compressed = false;
+      if (negotiated !== undefined && this.deflateOpts !== undefined) {
+        ({ bytes, compressed } = await maybeCompressMessage(
+          payload,
+          this.deflateOpts.compressThresholdBytes,
+          negotiated.serverWindowBits,
+        ));
+      }
+      try {
+        conn.socket.write(encodeFrame(OP_TEXT, bytes, compressed));
+      } catch {
+        this.destroyConnection(conn);
+      }
+    };
+    conn.sendChain = conn.sendChain.then(task, task);
   }
 
   private sendError(conn: GqlConnection, id: string, message: string): void {
@@ -1726,6 +1901,46 @@ export class GraphqlGateway {
   }
 
   // --- inbound ---------------------------------------------------------------
+
+  /**
+   * One inbound message off the connection's receive chain: RSV1 data
+   * frames (permessage-deflate, EB-562) are decompressed with a fresh
+   * inflate context before the frame enters the normal dispatch below.
+   * A decompression bomb (past `maxInflatedBytes`) or corrupt input
+   * fails the connection — a tampered compressed frame must not
+   * produce garbage bytes. Infallible: settling never throws.
+   *
+   * Close codes are the standard WebSocket ones (the failure is at
+   * the framing layer, not the graphql-ws layer): 1002 protocol
+   * error for a compressed frame on a connection that never
+   * negotiated the extension, 1009 message too big for a
+   * decompression bomb, 1007 invalid payload data for corrupt input
+   * (the WS gateway's EB-206 precedent).
+   */
+  private async processWsMessage(conn: GqlConnection, msg: WsMessage): Promise<void> {
+    if (conn.closed) return;
+    if (msg.rsv1) {
+      if (conn.deflate === undefined || this.deflateOpts === undefined) {
+        this.stats.protocolErrors += 1;
+        this.closeWithCode(conn, 1002, 'unexpected compressed frame');
+        return;
+      }
+      let payload: Buffer;
+      try {
+        payload = await decompressMessage(msg.payload, this.deflateOpts.maxInflatedBytes);
+      } catch (err) {
+        this.stats.protocolErrors += 1;
+        if (err instanceof WsInflateBombError) {
+          this.closeWithCode(conn, 1009, 'compressed frame too large');
+        } else {
+          this.closeWithCode(conn, 1007, 'invalid compressed frame');
+        }
+        return;
+      }
+      msg = { opcode: msg.opcode, payload, rsv1: false };
+    }
+    this.handleWsMessage(conn, msg);
+  }
 
   private handleWsMessage(conn: GqlConnection, msg: WsMessage): void {
     if (conn.closed) return;

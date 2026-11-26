@@ -12752,6 +12752,30 @@ Semantics:
   (same opcodes, masking rules, incremental parsing). Standard close
   codes: 4400 bad request, 4401 unauthorized, 4409 duplicate
   subscription id, 4429 connection-init timeout.
+- **permessage-deflate (EB-562).** Opt-in: pass `permessageDeflate:
+  true` (defaults: threshold 1024 bytes, window bits 15, bomb cap
+  8 MiB) or a `PerMessageDeflateOptions` object to tune it. When
+  enabled and the client offers `permessage-deflate` in
+  `Sec-WebSocket-Extensions`, the handshake selects it and answers
+  `permessage-deflate; client_no_context_takeover` (plus agreed
+  window-bits parameters) — the same strict model and the same shared
+  helpers (`src/gateway-deflate.ts`) as the WS gateway (EB-206):
+  client context takeover is never used, every message compresses and
+  decompresses with a fresh context, payloads below
+  `compressThresholdBytes` and payloads whose compressed form is not
+  smaller go out plaintext (RSV1 only on the first frame of a
+  fragmented message), control frames (ping/pong/close) are never
+  compressed, and an inflated message past `maxInflatedBytes` fails
+  the connection with 1009 (corrupt input 1007, a compressed frame on
+  a connection that never negotiated the extension 1002). A client
+  that offers nothing, or a gateway with the extension disabled,
+  connects normally in plaintext. Invalid option values throw
+  `RangeError` at construction; an invalid offer fails the handshake
+  with 400. Not revisable live yet — the GraphQL
+  `setGraphqlGatewayDeflate` setter is a separate item (EB-563).
+  `maxFrameBytes` bounds the compressed wire frame, while
+  `maxInflatedBytes` caps the decompressed message (the EB-206
+  precedent).
 - **Query mapping.** Only `subscription` operations with a single root
   field are accepted. The root field takes `topic: String!` (required
   topic pattern) and `filter: String` (optional `filterexpr`
@@ -12790,13 +12814,16 @@ Semantics:
   There is no getter exposing the live hook.
 - **Observability.** `GraphqlGateway.getStats()` reports
   `{ connections, subscriptions, messagesSent, protocolErrors,
-  authFailures, authEnabled, limits, connectionsDetail }`, where
+  authFailures, authEnabled, limits, connectionsDetail, deflate }`, where
   `limits` snapshots the live connection limits (`{ maxConnections,
   connectionInitTimeoutMs, maxFrameBytes, handshakeTimeoutMs,
-  maxHandshakeBytes, maxSubscriptionsPerConnection }`) and
+  maxHandshakeBytes, maxSubscriptionsPerConnection }`),
   `connectionsDetail` lists one row per live connection (`{ id,
-  remoteAddress, subscriptions, initialized }`) — the id
-  `disconnectGraphqlConnection` (EB-515) takes. `connections` stays
+  remoteAddress, subscriptions, initialized, deflate }`) — the id
+  `disconnectGraphqlConnection` (EB-515) takes, and `deflate` flags
+  whether that connection negotiated permessage-deflate (EB-562) —
+  and `deflate` reports the resolved permessage-deflate tuning
+  (`undefined` when the extension is disabled). `connections` stays
   the cumulative count of accepted sockets.
 - **Live limit revision (EB-349; EB-358 adds `maxFrameBytes`).**
   `setGraphqlGatewayLimits({ maxConnections?,
