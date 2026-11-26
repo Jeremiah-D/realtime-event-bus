@@ -582,7 +582,9 @@ library.
   `setGroupLagThreshold`/`clearGroupLagThreshold` adjust at runtime with an
   immediate re-evaluation, and `setGroupLagDefaultThreshold` (EB-363) retunes
   the default every group without an override falls back to, re-evaluating
-  every group at once — lag is re-checked on every assignment, commit,
+  every group at once — and `setGroupLag` (EB-565) installs the whole monitor
+  live on a bus that never opted into `groupLag`, with no restart — lag is
+  re-checked on every assignment, commit,
   and rebalance, so a lag spike during a rebalance alerts promptly. Lag rows
   are exposed as `eventbus_group_lag_messages{group,topic}` and
   `eventbus_group_partition_lag_messages{group,topic,partition}` gauges in
@@ -8927,7 +8929,8 @@ next sample) — a latched episode never re-fires under the new hook, a
 mid-debounce swap hands the remaining samples over, and the ops-alert
 outlet is re-wrapped exactly once per replacement. Only a bus with
 `groupLag` configured can be revised or enabled (a bus with no
-`groupLag` at all still refuses with `RangeError`); a closed bus
+`groupLag` at all still refuses with `RangeError` — unless it first
+installs the monitor live with `setGroupLag`, EB-565); a closed bus
 refuses too; illegal values fail closed with the live tuning untouched;
 an identical or empty revision is a no-op with no audit. Audited as
 `lag_slo_revised` (`{ maxLagMessages?, oldMaxLagMessages?, maxLagMs?,
@@ -8944,12 +8947,24 @@ already-lagging rows on the next evaluation — a latched row never
 re-fires under the new hook. Clearing makes
 `setGroupLagDefaultThreshold` refuse until a callback returns, while
 the SLO keeps paging and `lagSloBreaches` keeps climbing. Only a bus
-that already enabled `groupLag` can be revised (otherwise `RangeError`);
+that already enabled `groupLag` — at construction or live via
+`setGroupLag` (EB-565) — can be revised (otherwise `RangeError`);
 illegal values fail closed with the live callback untouched;
 re-installing the live callback is a no-op with no audit. Audited as
 `group_lag_callback_revised` (`{ hasCallback, oldHasCallback }` — only
 whether a callback is installed is recorded, never the function).
 Observe the live value via `getStats().groupLagHasCallback`.
+
+Enable the whole monitor live with
+`bus.setGroupLag(opts)` (EB-565): a bus that never opted into `groupLag`
+gains threshold alerting and SLO detection without a restart — `{}` takes
+every construction default (threshold 100, no callback, no SLO) and enables
+silently, `null` is a silent no-op, and a bus that already enabled `groupLag`
+refuses a second call. The enable re-evaluates every group at once, so a bus
+that installs a callback pages already-lagging rows immediately; lag accrued
+before the enable is never traced back. The enable is live-only (a restart
+restores the unconfigured state) and audited as `group_lag_revised`
+(`{ defaultThreshold, oldDefaultThreshold: null, hasCallback, hasSlo }`).
 
 Retune the alert default live with
 `bus.setGroupLagDefaultThreshold(thresholdMessages)` (EB-363): only the
@@ -8958,7 +8973,8 @@ default moves — per-group overrides still win and
 group is re-evaluated at once, so a lowered default alerts
 already-lagging groups immediately and a raised default clears
 already-triggered latches. Only a bus with `groupLag` and `onGroupLag`
-configured can be revised (otherwise `RangeError`); illegal values fail
+configured — at construction or live via `setGroupLag` (EB-565) — can
+be revised (otherwise `RangeError`); illegal values fail
 closed with the live default untouched; an identical revision is a
 no-op. There is no audit event for this family; observe the live default
 via `getStats().groupLagThresholdFor(groupId)`.

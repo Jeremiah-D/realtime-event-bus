@@ -520,6 +520,36 @@ export class GroupLagMonitor {
   }
 
   /**
+   * Installs the whole group-lag monitor live on a bus that never
+   * opted into `groupLag` (EB-565): the mirror of `installLagSlo` for
+   * the unconfigured case — where `installLagSlo` refuses a bus with
+   * no `groupLag` at all, `install` refuses a configured one, and
+   * assigns the fresh resolved tuning otherwise (plus its SLO, when
+   * one was resolved, via `LagSloMonitor.install` — the SLO monitor
+   * was built unconfigured alongside the empty resolved tuning, so
+   * its own install cannot refuse here). The caller must have
+   * validated `next` through `resolveGroupLagOptions` first — this
+   * method applies unconditionally, installing the whole resolved
+   * tuning (default and per-group thresholds, the `onGroupLag`
+   * callback, and the SLO). There is no in-flight alarm state to
+   * preserve: `check()` never ran while no tuning was configured
+   * (the threshold loop needs `onGroupLag`, the SLO loop needs a
+   * callback), so `alarmed` and the SLO rows are empty, and the new
+   * tuning governs from the next `check` sample — a row already over
+   * threshold fires on the first evaluation after the install, never
+   * from lag accrued before it.
+   */
+  install(next: ResolvedGroupLagOptions): void {
+    if (this.resolved !== undefined) {
+      throw new RangeError('GroupLagMonitor.install: groupLag is already configured');
+    }
+    this.resolved = { ...next };
+    if (next.slo !== undefined) {
+      this.sloMonitor.install(next.slo);
+    }
+  }
+
+  /**
    * Replaces the lag-SLO breach callback live (EB-415), delegating to
    * `LagSloMonitor.setBreachCallback`. The three numeric bounds and
    * the in-flight episode state are untouched — the new callback

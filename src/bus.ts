@@ -49246,7 +49246,8 @@ export class EventBus {
    * unaudited); observe the live default via
    * `getStats().groupLagThresholdFor(groupId)`.
    *
-   * Fail-closed: a bus with no `groupLag` configured, or with
+   * Fail-closed: a bus with no `groupLag` configured — unless it
+   * first enables group lag live via `setGroupLag` (EB-565) — or with
    * `groupLag` but no `onGroupLag` callback, throws `RangeError` —
    * only a bus that enabled alerting can be revised, since a default
    * that can never fire has no behaviour to revise. An illegal value
@@ -49476,7 +49477,8 @@ export class EventBus {
    * bound may fire on the very next sample, a loosened one simply
    * defers it.
    *
-   * Fail-closed: a bus that never enabled `groupLag` at all, a
+   * Fail-closed: a bus that never enabled `groupLag` at all — unless
+   * it first enables group lag live via `setGroupLag` (EB-565) — a
    * non-object revision, and an illegal value all throw `RangeError`
    * with the live tuning and the audit log untouched. A bus whose
    * `groupLag` is configured but never opted into `groupLag.slo`
@@ -49532,8 +49534,9 @@ export class EventBus {
       // to 3). Validate BEFORE installing anything: an illegal value
       // throws here with the bus still unconfigured, so a later valid
       // call still enables it. A bus with no `groupLag` at all still
-      // refuses — this item installs an SLO, not a groupLag monitor.
-      // Enabling installs no callback — the SLO stays silent until
+      // refuses — this item installs an SLO, not a groupLag monitor;
+      // enable the monitor itself live via `setGroupLag` (EB-565)
+      // first. Enabling installs no callback — the SLO stays silent until
       // the EB-415 entry point installs one — and the enable itself
       // is audited with every old value omitted.
       if (this.groupLagMonitor.groupLagCurrent() === undefined) {
@@ -49702,11 +49705,13 @@ export class EventBus {
    * the revision is live-only, a restart restores the
    * construction-time callback.
    *
-   * Fail-closed: a bus that never enabled `groupLag.slo`, a closed
-   * bus, an illegal actor, and an illegal callback all throw
-   * `RangeError` with the live callback and the audit log untouched.
-   * The gate is the SLO being configured, not a callback already
-   * existing — a bounds-only SLO can gain a callback. Validation
+   * Fail-closed: a bus that never enabled `groupLag.slo` — a
+   * never-enabled bus gains one at construction, live via `setLagSlo`
+   * (EB-544), or by first enabling the monitor live via `setGroupLag`
+   * (EB-565) — a closed bus, an illegal actor, and an illegal callback
+   * all throw `RangeError` with the live callback and the audit log
+   * untouched. The gate is the SLO being configured, not a callback
+   * already existing — a bounds-only SLO can gain a callback. Validation
    * reuses the construction-time rule (`resolveLagSloOptions`: a
    * callback must be a function) — `null` clears back to silent —
    * so a value that could not be set at construction cannot be
@@ -49814,8 +49819,9 @@ export class EventBus {
    * enters a config snapshot: the revision is live-only, a restart
    * restores the construction-time callback.
    *
-   * Fail-closed: a bus that never enabled `groupLag`, a closed bus, an
-   * illegal actor, and an illegal callback all throw `RangeError`
+   * Fail-closed: a bus that never enabled `groupLag` — at construction
+   * or live via `setGroupLag` (EB-565) — a closed bus, an illegal
+   * actor, and an illegal callback all throw `RangeError`
    * with the live callback and the audit log untouched. The gate is
    * `groupLag` being configured, not a callback already existing — a
    * silent `groupLag` can gain a callback. Validation reuses the
@@ -49882,6 +49888,145 @@ export class EventBus {
         oldHasCallback,
       },
     });
+  }
+
+  /**
+   * Installs consumer-group lag monitoring live (EB-565) on a bus that
+   * never opted into `groupLag`: `setGroupLag(opts)` gives a running
+   * bus the threshold alerting and SLO detection it was built without
+   * — no restart, no loss of the live subscriptions, replay positions,
+   * consumer-group assignments, or rate-limit and dedup state a
+   * restart would drop.
+   *
+   * The whole monitor installs at once: the default threshold
+   * (`thresholdMessages`, default 100), the per-group overrides
+   * (`thresholds`), the threshold-alert callback (`onGroupLag`), and
+   * the SLO (`slo`, with its bounds and `onLagSloBreach` callback) —
+   * all resolved through the construction-time rule
+   * (`resolveGroupLagOptions`: each threshold a finite number `>= 0`,
+   * `thresholds` keys non-empty groupIds, each callback a function,
+   * the SLO needing at least one bound with `breachSamples` an integer
+   * `>= 1`, defaulting to 3). `{}` is the all-defaults silent enable
+   * (along EB-550): the monitor installs with threshold 100 and no
+   * callback, so the lag rows keep their accounting and alerting
+   * stays silent until `setGroupLagCallback` (EB-417) installs one.
+   *
+   * Installing replicates the construction-time wiring exactly: the
+   * raw user hooks are recorded on `groupLagUserHook` /
+   * `lagSloBreachUserHook`, and the SLO breach hook is wrapped once
+   * through the ops-alert outlet (`wrapLagSloBreachHook`, EB-132)
+   * when an alerter is configured — the monitor holds the wrapped
+   * copy, `onGroupLag` carries no outlet and is held raw (along
+   * EB-417). The enable opens the gates the configured bus already
+   * has: `setGroupLagCallback` (EB-417), `setLagSlo` (EB-314 — it
+   * retunes the bounds when the enable carried an SLO, or installs
+   * one live via the EB-544 half when it carried none),
+   * `setGroupLagDefaultThreshold` (EB-363), and
+   * `setLagSloBreachCallback` (EB-415, once an SLO exists) — each
+   * reads the live `groupLagCurrent()` / `lagSloCurrent()`.
+   *
+   * The enable re-evaluates every group at once (along EB-363), so a
+   * bus that installs a callback pages already-lagging rows
+   * immediately instead of waiting for the next publish: the alarm
+   * latch starts empty, so every row already over threshold fires on
+   * that first evaluation, and lag accrued before the enable is never
+   * traced back — the SLO's consecutive counts likewise start at the
+   * first sample after the install. A silent enable (no callback at
+   * all) does not evaluate: `enabled()` is still false, so the
+   * `checkGroupLagForGroup` gate returns as before. The lag rows
+   * themselves (`getStats().groupLag`) are unaffected — they were
+   * always computed — and `groupLagHasCallback` flips to `true` when
+   * a callback installs, while `lagSloBreaches` counts from 0.
+   *
+   * Fail-closed: a bus that already enabled `groupLag`, a closed bus,
+   * and an illegal value all throw `RangeError` with the live tuning
+   * and the audit log untouched — the gate is `groupLag` being
+   * configured, so a bus that gained a tuning through the
+   * `setGroupLagThreshold` lazy-initialization side door (EB-48)
+   * already counts as configured and refuses here; each field still
+   * moves afterwards only through its own fine-grained setter, never
+   * through a second call here. Validation reuses the
+   * construction-time rule, so a value that could not be set at
+   * construction cannot be installed later either — and a failed call
+   * changes nothing at all: the bus stays unconfigured, so a later
+   * valid call still enables it. `null` on a never-enabled bus is a
+   * silent no-op with no audit (along EB-540/EB-559), and the null
+   * branch sits before the already-enabled gate. Audited as
+   * `group_lag_revised` (`{ defaultThreshold, oldDefaultThreshold:
+   * null, hasCallback, hasSlo }` — the old value is `null`, since
+   * there was no live tuning to replace; the callbacks themselves are
+   * never written to the audit log, only whether they are installed).
+   * The enable is live-only: a restart restores the unconfigured
+   * state.
+   *
+   * Orthogonal to EB-48 (that is the lag-row mechanism itself — this
+   * installs the monitor that alerts on it), to EB-112 (that is the
+   * SLO mechanism — this installs the monitor it hangs on), to
+   * EB-314/`setLagSlo` (that retunes or installs the SLO bounds — this
+   * installs the monitor itself, which that entry still refuses on a
+   * bus with no `groupLag` at all), to EB-363 (that retunes the
+   * default threshold — this installs the monitor whose default that
+   * is), to EB-415 (that replaces the SLO breach callback — this
+   * installs the monitor the callback pages for), and to EB-417 (that
+   * replaces the threshold-alert callback — this installs the monitor
+   * whose callback that is). There is no disable: an installed
+   * monitor stays installed (along EB-544/EB-559, install-only).
+   *
+   * Throws `RangeError` when `groupLag` is already enabled, when the
+   * bus is closed, or for an illegal option value.
+   */
+  setGroupLag(opts: GroupLagMonitorOptions | null): void {
+    // Fail-fast on a closed bus (EB-154, along `setLagSlo`): close()
+    // already flushed once — there is no live monitor left to install.
+    if (this.closed) {
+      throw new RangeError('setGroupLag: bus is closed');
+    }
+    // `null` on a never-enabled bus is a silent no-op (along EB-540 /
+    // EB-559): the null branch sits before the already-enabled gate,
+    // so it asks nothing to install on any bus.
+    if (opts == null) {
+      return;
+    }
+    if (this.groupLagMonitor.groupLagCurrent() !== undefined) {
+      throw new RangeError('setGroupLag: groupLag is already enabled on this bus');
+    }
+    // Validate BEFORE installing anything: an illegal value throws
+    // here with the bus still unconfigured, so a later valid call
+    // still enables it.
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new RangeError('setGroupLag: opts must be an options object');
+    }
+    const resolved = resolveGroupLagOptions(opts, 'setGroupLag');
+    if (resolved === undefined) {
+      throw new RangeError('setGroupLag: groupLag is not enabled on this bus');
+    }
+    // Replicate the construction-time wiring (bus.ts:20083-20102):
+    // the raw user hooks are kept on `groupLagUserHook` /
+    // `lagSloBreachUserHook`, and the SLO breach hook is wrapped once
+    // through the ops-alert outlet when an alerter is configured —
+    // the monitor holds the wrapped copy, `onGroupLag` is held raw.
+    this.groupLagUserHook = resolved.onGroupLag;
+    this.lagSloBreachUserHook = resolved.slo?.onLagSloBreach;
+    if (this.opsAlerter !== undefined && resolved.slo?.onLagSloBreach !== undefined) {
+      resolved.slo.onLagSloBreach = this.wrapLagSloBreachHook(resolved.slo.onLagSloBreach);
+    }
+    this.groupLagMonitor.install(resolved);
+    this.auditSubscription({
+      action: 'group_lag_revised',
+      actor: 'system',
+      detail: {
+        defaultThreshold: resolved.defaultThreshold,
+        oldDefaultThreshold: null,
+        hasCallback: resolved.onGroupLag !== undefined,
+        hasSlo: resolved.slo !== undefined,
+      },
+    });
+    // Re-evaluate every group at once (along EB-363): a bus that
+    // installs a callback pages already-lagging rows now; a silent
+    // enable does not evaluate — `enabled()` is still false.
+    if (this.groupLagMonitor.enabled()) {
+      this.groupLagMonitor.check(this.groupLagRowsFor(undefined), this.now());
+    }
   }
 
   /**
