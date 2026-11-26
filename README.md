@@ -7419,7 +7419,14 @@ Semantics:
   server never reuses its own deflate context either — every message
   compresses and decompresses independently, so a client that reuses
   context across messages fails with a 1007 close instead of silently
-  mis-decoding. Server → client text and binary message frames at/above
+  mis-decoding. A gateway started without the extension can gain it
+  live (EB-561): `gw.setGatewayDeflate(true)` enables it with the
+  construction defaults, or pass an object to tune per field; only
+  handshakes that start after the enable negotiate — a connection
+  that is already open stays plaintext — and the enable is one-way
+  and live-only (a restart drops it, and the extension can never be
+  cleared through a revision). Server → client text and binary
+  message frames at/above
   `compressThresholdBytes` (default 1024) whose compressed form is
   strictly smaller go out with RSV1 set (the `00 00 ff ff` sync-flush
   trailer is stripped per RFC 7692 §7.2.1); anything else — and any
@@ -7570,8 +7577,13 @@ Semantics:
   included; the window bits bind only connections established after
   the revision — a connection that is already open keeps the window
   bits its handshake negotiated until it reconnects. A gateway that
-  never enabled permessage-deflate refuses the revision with
-  `RangeError`, and the extension can never be cleared or disabled
+  never enabled permessage-deflate gains it live through the same
+  setter (EB-561): `gw.setGatewayDeflate(true)` takes the
+  construction defaults, an object falls back per field to the
+  construction defaults, and only handshakes that start after the
+  enable negotiate — a connection that is already open stays
+  plaintext. The enable is one-way and live-only (a restart drops
+  it), and the extension can never be cleared or disabled
   through a revision (an explicitly `undefined` field keeps its live
   value — clearing it would make already-negotiated connections'
   inbound compressed frames fail with a 1002 protocol error). There

@@ -10,9 +10,11 @@
  * connection, existing ones included; the window bits bind only
  * connections established after the revision — a connection that is
  * already open keeps the window bits its handshake negotiated. A
- * gateway that never enabled permessage-deflate refuses the revision,
- * and the extension can never be cleared or disabled through a
- * revision (an explicitly `undefined` field keeps its live value).
+ * gateway that never enabled permessage-deflate gains it live through
+ * the same setter (EB-561: `true` takes the construction defaults,
+ * an object falls back per field), and the extension can never be
+ * cleared or disabled through a revision (an explicitly `undefined`
+ * field keeps its live value).
  * There is no audit event for this revision — the live tuning is
  * observable in `getStats().deflate` instead.
  */
@@ -253,21 +255,22 @@ const DEFAULT_DEFLATE = {
   maxInflatedBytes: 8 * 1024 * 1024,
 };
 
-test('setGatewayDeflate requires permessage-deflate to be enabled', () => {
+test('setGatewayDeflate on a never-enabled gateway enables it live (EB-561)', () => {
   const bus = new EventBus();
   const gw = new GatewayServer(bus, {});
   assert.equal(gw.getStats().deflate, undefined);
-  assert.throws(
-    () => gw.setGatewayDeflate({ compressThresholdBytes: 2048 }),
-    /permessage-deflate is not enabled/,
-  );
-  assert.throws(() => gw.setGatewayDeflate({ maxInflatedBytes: 100 }), RangeError);
   // An absent revision asks nothing to move, even on a disabled gateway.
   gw.setGatewayDeflate(null as never);
   gw.setGatewayDeflate(undefined as never);
   assert.equal(gw.getStats().deflate, undefined);
-  // A non-object revision still throws on a disabled gateway.
+  // A non-object revision still throws on a disabled gateway, and the
+  // gateway stays disabled.
   assert.throws(() => gw.setGatewayDeflate('nope' as never), RangeError);
+  assert.equal(gw.getStats().deflate, undefined);
+  // An object revision enables it live, with unprovided fields taking
+  // the construction defaults — the old must-restart gate is gone.
+  gw.setGatewayDeflate({ compressThresholdBytes: 2048 });
+  assert.deepEqual(gw.getStats().deflate, { ...DEFAULT_DEFLATE, compressThresholdBytes: 2048 });
 });
 
 test('setGatewayDeflate rejects illegal values and leaves the live tuning untouched', () => {

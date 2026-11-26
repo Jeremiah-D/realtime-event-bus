@@ -500,8 +500,8 @@ export interface GatewayOptions {
    * govern from the next message / frame on every connection, existing
    * ones included, while the window bits bind only connections
    * established after the revision; a gateway that never enabled the
-   * extension refuses the revision, and the extension can never be
-   * cleared or disabled through a revision.
+   * extension gains it live through the same setter (EB-561), and the
+   * extension can never be cleared or disabled through a revision.
    */
   permessageDeflate?: boolean | PerMessageDeflateOptions;
 }
@@ -583,9 +583,11 @@ export interface GatewaySubscriptionLimitRevision {
  * There is deliberately no way to clear or disable the extension
  * through a revision: clearing it would make already-negotiated
  * connections' inbound compressed frames fail with a 1002 protocol
- * error, so a gateway that never enabled permessage-deflate refuses
- * the revision with `RangeError` instead of switching the extension
- * on — unlike `setGatewayClientPressure` / `setGatewayMaxSubscriptionsPerConnection`, which have an explicit-`undefined` clear.
+ * error, so a gateway that never enabled permessage-deflate gains
+ * the extension live through the same setter instead (EB-561:
+ * `true` takes the construction defaults, an object falls back per
+ * field) — unlike `setGatewayClientPressure` /
+ * `setGatewayMaxSubscriptionsPerConnection`, which have an explicit-`undefined` clear.
  */
 export interface GatewayDeflateRevision {
   /** Payloads smaller than this are sent as-is (positive integer). */
@@ -659,11 +661,12 @@ export interface GatewayStats {
     maxHandshakeBytes: number;
   };
   /**
-   * Live permessage-deflate tuning (EB-330): the values
-   * `setGatewayDeflate` last revised, or the construction values —
-   * `undefined` when permessage-deflate is disabled. The window bits
-   * are the live values for *new* connections: a connection that is
-   * already open keeps the window bits its handshake negotiated.
+   * Live permessage-deflate tuning (EB-330, live enable EB-561): the
+   * values `setGatewayDeflate` last revised or live-enabled, or the
+   * construction values — `undefined` when permessage-deflate is
+   * disabled. The window bits are the live values for *new*
+   * connections: a connection that is already open keeps the window
+   * bits its handshake negotiated.
    */
   deflate: ResolvedPerMessageDeflate | undefined;
 }
@@ -1374,12 +1377,15 @@ export class GatewayServer {
   }
 
   /**
-   * Revises the permessage-deflate tuning live (EB-330) without
-   * restarting the server: `setGatewayDeflate({
+   * Revises the permessage-deflate tuning live (EB-330) — and enables
+   * the extension live on a gateway that never enabled it (EB-561) —
+   * without restarting the server: `setGatewayDeflate({
    * compressThresholdBytes?, serverMaxWindowBits?,
    * clientMaxWindowBits?, maxInflatedBytes? })` retunes the opt-in
    * extension (see `GatewayOptions.permessageDeflate` for the
-   * defaults: threshold 1024, both window bits 15, bomb cap 8 MiB).
+   * defaults: threshold 1024, both window bits 15, bomb cap 8 MiB),
+   * while `setGatewayDeflate(true)` enables it with exactly those
+   * defaults.
    *
    * Only the fields provided move — a partial revision keeps the
    * fields it leaves out. The propagation splits by field, following
@@ -1394,13 +1400,25 @@ export class GatewayServer {
    * handshake time, so an already-open connection keeps compressing
    * with the window it negotiated until it reconnects.
    *
+   * The enable half (EB-561) follows the same split: only handshakes
+   * that start after the enable negotiate — the handshake reads the
+   * live `deflateOpts` on every new connection — so a connection that
+   * is already open stays plaintext after the enable, and RFC 7692
+   * has no mid-connection renegotiation to offer it. An object
+   * enable falls back per field to the construction defaults (there
+   * is no live tuning to merge against yet); `true` takes every
+   * construction default. The enable is one-way and live-only: a
+   * restart drops it, and the extension can never be cleared or
+   * disabled through this setter.
+   *
    * There is deliberately no way to clear or disable the extension
    * through a revision (unlike `setGatewayClientPressure`'s clear
    * mode): an explicitly `undefined` field is not a value and keeps
    * its live value, and a gateway that never enabled
-   * permessage-deflate refuses the revision outright — clearing the
-   * extension would make already-negotiated connections' inbound
-   * compressed frames fail with a 1002 protocol error.
+   * permessage-deflate gains the extension through this setter
+   * instead of refusing the call — clearing the extension would make
+   * already-negotiated connections' inbound compressed frames fail
+   * with a 1002 protocol error.
    *
    * There is no audit event for this revision: like `setGatewayLimits`
    * / `setGatewayClientPressure` /
@@ -1416,28 +1434,47 @@ export class GatewayServer {
    * bits integers 8–15 — so a value that could not be set at
    * construction cannot be revised in later either. An empty
    * revision, and a revision identical to the current tuning, are
-   * both no-ops.
+   * both no-ops. On a never-enabled gateway an illegal value throws
+   * with the gateway still disabled, so a later valid call still
+   * enables it; `true` on an already-enabled gateway is a no-op
+   * (it does not reset the tuning — tuning moves only through an
+   * object revision, along EB-545's repeat-enable).
    *
-   * Throws `RangeError` when permessage-deflate is not enabled, for a
-   * non-object revision, or for an illegal `compressThresholdBytes`,
-   * `serverMaxWindowBits`, `clientMaxWindowBits`, or
-   * `maxInflatedBytes`.
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `compressThresholdBytes`, `serverMaxWindowBits`,
+   * `clientMaxWindowBits`, or `maxInflatedBytes`.
    */
-  setGatewayDeflate(opts: GatewayDeflateRevision): void {
+  setGatewayDeflate(opts: GatewayDeflateRevision | true): void {
     // An absent revision asks nothing to move.
     if (opts == null) {
       return;
     }
-    if (typeof opts !== 'object' || Array.isArray(opts)) {
+    if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
       throw new RangeError(
         'setGatewayDeflate: revision must be an object with compressThresholdBytes, serverMaxWindowBits, clientMaxWindowBits and/or maxInflatedBytes',
       );
     }
     const current = this.deflateOpts;
     if (current === undefined) {
-      throw new RangeError(
-        'setGatewayDeflate: permessage-deflate is not enabled (pass permessageDeflate at construction first)',
-      );
+      // EB-561: the enable half — a gateway that never enabled
+      // permessage-deflate gains it live on the first call, with the
+      // revision resolved through the same `resolvePerMessageDeflate`
+      // construction-time rule the configured path enforces (`true`
+      // takes every construction default, a partial object falls back
+      // per field to the construction defaults — there is no live
+      // tuning to merge against yet). Validate BEFORE installing
+      // anything: an illegal value throws here with the gateway still
+      // unconfigured, so a later valid call still enables it.
+      // `resolvePerMessageDeflate` returns undefined only for
+      // `false`/`undefined`, which cannot reach here.
+      this.deflateOpts = resolvePerMessageDeflate(opts === true ? true : opts)!;
+      return;
+    }
+    // An enabled gateway treats `true` as a no-op: re-affirming the
+    // extension does not reset its tuning — tuning moves only through
+    // an object revision (along EB-545 repeat-enable).
+    if (opts === true) {
+      return;
     }
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the field it leaves out — so resolution
