@@ -1,5 +1,5 @@
 /**
- * GraphQL gateway permessage-deflate tuning revision (EB-563).
+ * GraphQL gateway permessage-deflate tuning revision (EB-563/EB-564).
  *
  * `setGraphqlGatewayDeflate` retunes `compressThresholdBytes`,
  * `serverMaxWindowBits`, `clientMaxWindowBits` and `maxInflatedBytes`
@@ -9,12 +9,12 @@
  * and the bomb cap govern from the next message / frame on every
  * connection, existing ones included; the window bits bind only
  * connections established after the revision — a connection that is
- * already open keeps the window bits its handshake negotiated. Only a
- * gateway that already enabled permessage-deflate can be revised: a
- * never-enabled gateway refuses the revision with `RangeError` (live
- * enable is EB-564), and the extension can never be cleared or
- * disabled through a revision (an explicitly `undefined` field keeps
- * its live value).
+ * already open keeps the window bits its handshake negotiated. A
+ * gateway that never enabled permessage-deflate gains the extension
+ * live through the same setter (EB-564: `true` enables with the
+ * construction defaults, a partial object falls back per field to
+ * them), and the extension can never be cleared or disabled through
+ * a revision (an explicitly `undefined` field keeps its live value).
  * There is no audit event for this revision — the live tuning is
  * observable in `getStats().deflate` instead.
  */
@@ -288,7 +288,7 @@ const DEFAULT_DEFLATE = {
   maxInflatedBytes: 8 * 1024 * 1024,
 };
 
-test('setGraphqlGatewayDeflate on a never-enabled gateway refuses the revision (EB-563)', () => {
+test('setGraphqlGatewayDeflate on a never-enabled gateway enables it live (EB-564)', () => {
   const bus = new EventBus();
   const gw = new GraphqlGateway(bus, { port: 0 });
   assert.equal(gw.getStats().deflate, undefined);
@@ -300,13 +300,10 @@ test('setGraphqlGatewayDeflate on a never-enabled gateway refuses the revision (
   // gateway stays disabled.
   assert.throws(() => gw.setGraphqlGatewayDeflate('nope' as never), RangeError);
   assert.equal(gw.getStats().deflate, undefined);
-  // A well-formed revision on a never-enabled gateway throws — the
-  // setter revises only; live enable is EB-564.
-  assert.throws(() => gw.setGraphqlGatewayDeflate({ compressThresholdBytes: 2048 }), RangeError);
-  assert.equal(gw.getStats().deflate, undefined);
-  // Even an empty revision refuses: there is nothing live to revise.
-  assert.throws(() => gw.setGraphqlGatewayDeflate({}), RangeError);
-  assert.equal(gw.getStats().deflate, undefined);
+  // An object revision enables it live, with unprovided fields taking
+  // the construction defaults — the old must-restart gate is gone.
+  gw.setGraphqlGatewayDeflate({ compressThresholdBytes: 2048 });
+  assert.deepEqual(gw.getStats().deflate, { ...DEFAULT_DEFLATE, compressThresholdBytes: 2048 });
 });
 
 test('setGraphqlGatewayDeflate rejects illegal values and leaves the live tuning untouched', () => {

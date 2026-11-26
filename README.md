@@ -12784,16 +12784,31 @@ Semantics:
   from the next message / frame on every connection, existing ones
   included; the window bits bind only connections established after
   the revision — a connection that is already open keeps the window
-  bits its handshake negotiated until it reconnects. Only a gateway
-  that already enabled permessage-deflate can be revised: a
-  never-enabled gateway refuses the revision with `RangeError` (live
-  enable is EB-564), and the extension can never be cleared or
-  disabled through a revision (an explicitly `undefined` field keeps
-  its live value — clearing it would make already-negotiated
-  connections' inbound compressed frames fail with a 1002 protocol
-  error). There is no audit event for this revision;
+  bits its handshake negotiated until it reconnects. The extension can
+  never be cleared or disabled through a revision (an explicitly
+  `undefined` field keeps its live value — clearing it would make
+  already-negotiated connections' inbound compressed frames fail with
+  a 1002 protocol error). There is no audit event for this revision;
   `gw.getStats().deflate` reports the live tuning (`undefined` when
   disabled).
+- **Live permessage-deflate enable (EB-564).**
+  `gw.setGraphqlGatewayDeflate(true)` — or a partial object — gains
+  the extension live on a gateway that never enabled it, without
+  restarting the server: `true` takes every construction default
+  (threshold 1024, both window bits 15, bomb cap 8 MiB), a partial
+  object falls back per field to those defaults, and an illegal value
+  throws `RangeError` with the gateway still disabled, so a later
+  valid call still enables it. Only handshakes that start after the
+  enable negotiate — a connection that is already open stays
+  plaintext, and RFC 7692 has no mid-connection renegotiation. The
+  enable is one-way (there is no path to clear or disable the
+  extension through this setter) and live-only: a restart drops it.
+  `true` on an already-enabled gateway is a no-op — it does not reset
+  the tuning, which moves only through an object revision. `null` /
+  `undefined` are silent no-ops. There is no audit event for the
+  enable; `gw.getStats().deflate` flips from `undefined` to the live
+  four fields, and each `connectionsDetail` row reports whether that
+  connection negotiated the extension.
 - **Query mapping.** Only `subscription` operations with a single root
   field are accepted. The root field takes `topic: String!` (required
   topic pattern) and `filter: String` (optional `filterexpr`

@@ -90,10 +90,10 @@
  * (`undefined` when disabled) and each `connectionsDetail` row
  * carries `deflate: boolean` for whether that connection negotiated
  * the extension. The tuning is revisable live with
- * `setGraphqlGatewayDeflate` (EB-563) — only on a gateway that
- * already enabled the extension; a gateway that never enabled it
- * refuses the revision with `RangeError` (live enable is a
- * separate item, EB-564).
+ * `setGraphqlGatewayDeflate` (EB-563) — and a gateway that never
+ * enabled it gains the extension live through the same setter
+ * (EB-564: `true` enables with the construction defaults, a partial
+ * object falls back per field to them).
  */
 import {
   createServer as createTcpServer,
@@ -880,9 +880,9 @@ export interface GraphqlGatewayOptions {
    * `clientMaxWindowBits` (default 15, range 8–15) tune the LZ77
    * windows in each direction. Invalid values throw `RangeError` at
    * construction, like every other option. Revisable live with
-   * `setGraphqlGatewayDeflate` (EB-563) — only on a gateway that
-   * already enabled the extension; a gateway that never enabled it
-   * refuses the revision (live enable is EB-564). The shared helpers live in `src/gateway-deflate.ts`
+   * `setGraphqlGatewayDeflate` (EB-563) — and a gateway that never
+   * enabled the extension gains it live through the same setter
+   * (EB-564). The shared helpers live in `src/gateway-deflate.ts`
    * (EB-206); `maxFrameBytes` bounds the compressed wire frame, while
    * `maxInflatedBytes` caps the decompressed message (the EB-206
    * precedent).
@@ -957,7 +957,7 @@ export interface GraphqlGatewayStats {
    * `undefined` when permessage-deflate is disabled. The window bits
    * are the live values for *new* connections: a connection that is
    * already open keeps the window bits its handshake negotiated.
-   * Revisable live with `setGraphqlGatewayDeflate` (EB-563).
+   * Revisable live with `setGraphqlGatewayDeflate` (EB-563/EB-564).
    */
   deflate: ResolvedPerMessageDeflate | undefined;
 }
@@ -1010,16 +1010,17 @@ export interface GraphqlGatewaySubscriptionLimitRevision {
 }
 
 /**
- * A `setGraphqlGatewayDeflate` revision (EB-563): any subset of the
- * four permessage-deflate tuning fields. Only the fields provided
+ * A `setGraphqlGatewayDeflate` revision (EB-563/EB-564): any subset of
+ * the four permessage-deflate tuning fields. Only the fields provided
  * move — a field left out (or explicitly `undefined`) keeps its live
  * value. There is deliberately no way to clear or disable the
  * extension through a revision: clearing it would make
  * already-negotiated connections' inbound compressed frames fail
  * with a 1002 protocol error, so a gateway that never enabled
- * permessage-deflate refuses the revision outright (live enable is
- * EB-564) — unlike `setGraphqlGatewayMaxSubscriptionsPerConnection`,
- * which has an explicit-`undefined` clear.
+ * permessage-deflate gains the extension through this setter instead
+ * (live enable is EB-564) — unlike
+ * `setGraphqlGatewayMaxSubscriptionsPerConnection`, which has an
+ * explicit-`undefined` clear.
  */
 export interface GraphqlGatewayDeflateRevision {
   /** Payloads smaller than this are sent as-is (positive integer). */
@@ -1509,35 +1510,37 @@ export class GraphqlGateway {
   }
 
   /**
-   * Revises the permessage-deflate tuning live (EB-563) without
-   * restarting the server: `setGraphqlGatewayDeflate({
-   * compressThresholdBytes?, serverMaxWindowBits?,
-   * clientMaxWindowBits?, maxInflatedBytes? })` retunes the opt-in
-   * extension (see `GraphqlGatewayOptions.permessageDeflate` for the
-   * defaults: threshold 1024, both window bits 15, bomb cap 8 MiB).
-   * Only on a gateway that already enabled permessage-deflate — a
-   * gateway that never enabled it refuses the revision with
-   * `RangeError` (live enable is a separate item, EB-564), so the
-   * setter never extends the extension to a new gateway.
+   * Enables or revises the permessage-deflate tuning live (EB-563/EB-564)
+   * without restarting the server: `setGraphqlGatewayDeflate(true)`
+   * enables the opt-in extension with exactly the construction defaults
+   * (threshold 1024, both window bits 15, bomb cap 8 MiB), and
+   * `setGraphqlGatewayDeflate({ compressThresholdBytes?,
+   * serverMaxWindowBits?, clientMaxWindowBits?, maxInflatedBytes? })`
+   * enables it with a partial object falling back per field to those
+   * defaults — or, on a gateway that already enabled it, retunes only
+   * the fields provided (see `GraphqlGatewayOptions.permessageDeflate`
+   * for the defaults).
    *
-   * Only the fields provided move — a partial revision keeps the
-   * fields it leaves out. The propagation splits by field, following
-   * the WS gateway's `setGatewayDeflate` (EB-330): `threshold` and
-   * the bomb cap govern from the next message / frame on every
+   * Only handshakes that start after the enable negotiate — a
+   * connection that is already open stays plaintext, and RFC 7692 has
+   * no mid-connection renegotiation. The propagation splits by field,
+   * following the WS gateway's `setGatewayDeflate` (EB-330): `threshold`
+   * and the bomb cap govern from the next message / frame on every
    * connection, existing ones included — the send path reads
    * `compressThresholdBytes` live per message (`sendJson`) and the
    * inbound path reads `maxInflatedBytes` live per frame
    * (`processWsMessage`) — while the window bits bind only
-   * connections established after the revision: each connection's
+   * connections established after the call: each connection's
    * `deflate` captures the negotiated `serverWindowBits` once, at
    * handshake time, so an already-open connection keeps compressing
    * with the window it negotiated until it reconnects.
    *
    * There is deliberately no way to clear or disable the extension
-   * through a revision: an explicitly `undefined` field is not a
+   * through this setter: an explicitly `undefined` field is not a
    * value and keeps its live value — clearing the extension would
    * make already-negotiated connections' inbound compressed frames
-   * fail with a 1002 protocol error.
+   * fail with a 1002 protocol error. The enable is one-way and
+   * live-only: a restart drops it.
    *
    * There is no audit event for this revision: like
    * `setGraphqlGatewayLimits` / `setGraphqlGatewayHandshake` /
@@ -1545,38 +1548,56 @@ export class GraphqlGateway {
    * keeps no audit log — the live tuning is observable in
    * `getStats().deflate` instead.
    *
-   * Fail-closed: a gateway with permessage-deflate disabled, a
-   * non-object revision, and an illegal value all throw `RangeError`
-   * with the live tuning untouched. Validation reuses the
+   * Fail-closed: a non-object revision, and an illegal value all throw
+   * `RangeError` with the live tuning untouched. Validation reuses the
    * construction-time rule (`resolvePerMessageDeflate`): the
    * threshold and the bomb cap are positive integers, the window
    * bits integers 8–15 — so a value that could not be set at
-   * construction cannot be revised in later either. An empty
-   * revision, and a revision identical to the current tuning, are
-   * both no-ops.
+   * construction cannot be enabled or revised in later either. An
+   * empty revision on a never-enabled gateway enables with the
+   * construction defaults; an empty revision, and a revision identical
+   * to the current tuning, are both no-ops on an enabled gateway. On
+   * a never-enabled gateway an illegal value throws with the gateway
+   * still disabled, so a later valid call still enables it; `true` on
+   * an already-enabled gateway is a no-op (it does not reset the
+   * tuning — tuning moves only through an object revision, along
+   * EB-545's repeat-enable).
    *
-   * Throws `RangeError` for a revision on a gateway that never
-   * enabled permessage-deflate, for a non-object revision, or for an
-   * illegal `compressThresholdBytes`, `serverMaxWindowBits`,
+   * Throws `RangeError` for a non-object revision, or for an illegal
+   * `compressThresholdBytes`, `serverMaxWindowBits`,
    * `clientMaxWindowBits`, or `maxInflatedBytes`.
    */
-  setGraphqlGatewayDeflate(opts: GraphqlGatewayDeflateRevision): void {
+  setGraphqlGatewayDeflate(opts: GraphqlGatewayDeflateRevision | true): void {
     // An absent revision asks nothing to move.
     if (opts == null) {
       return;
     }
-    if (typeof opts !== 'object' || Array.isArray(opts)) {
+    if (opts !== true && (typeof opts !== 'object' || Array.isArray(opts))) {
       throw new RangeError(
         'setGraphqlGatewayDeflate: revision must be an object with compressThresholdBytes, serverMaxWindowBits, clientMaxWindowBits and/or maxInflatedBytes',
       );
     }
     const current = this.deflateOpts;
     if (current === undefined) {
-      // EB-563 revises only: a gateway that never enabled
-      // permessage-deflate gains nothing here — live enable is EB-564.
-      throw new RangeError(
-        'setGraphqlGatewayDeflate: permessage-deflate is not enabled on this gateway',
-      );
+      // EB-564: the enable half — a gateway that never enabled
+      // permessage-deflate gains it live on the first call, with the
+      // revision resolved through the same `resolvePerMessageDeflate`
+      // construction-time rule the configured path enforces (`true`
+      // takes every construction default, a partial object falls back
+      // per field to the construction defaults — there is no live
+      // tuning to merge against yet). Validate BEFORE installing
+      // anything: an illegal value throws here with the gateway still
+      // unconfigured, so a later valid call still enables it.
+      // `resolvePerMessageDeflate` returns undefined only for
+      // `false`/`undefined`, which cannot reach here.
+      this.deflateOpts = resolvePerMessageDeflate(opts === true ? true : opts)!;
+      return;
+    }
+    // An enabled gateway treats `true` as a no-op: re-affirming the
+    // extension does not reset its tuning — tuning moves only through
+    // an object revision (along EB-545 repeat-enable).
+    if (opts === true) {
+      return;
     }
     // Validate before touching anything: `undefined` is not a value — a
     // partial object keeps the field it leaves out — so resolution
