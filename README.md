@@ -12771,11 +12771,29 @@ Semantics:
   that offers nothing, or a gateway with the extension disabled,
   connects normally in plaintext. Invalid option values throw
   `RangeError` at construction; an invalid offer fails the handshake
-  with 400. Not revisable live yet — the GraphQL
-  `setGraphqlGatewayDeflate` setter is a separate item (EB-563).
-  `maxFrameBytes` bounds the compressed wire frame, while
+  with 400. `maxFrameBytes` bounds the compressed wire frame, while
   `maxInflatedBytes` caps the decompressed message (the EB-206
   precedent).
+- **Live permessage-deflate revision (EB-563).**
+  `gw.setGraphqlGatewayDeflate({ compressThresholdBytes?,
+  serverMaxWindowBits?, clientMaxWindowBits?, maxInflatedBytes? })`
+  retunes the opt-in permessage-deflate tuning without restarting the
+  server: only the fields provided move, an illegal value throws
+  `RangeError` with the live tuning untouched, and an empty or
+  identical revision is a no-op. The threshold and the bomb cap govern
+  from the next message / frame on every connection, existing ones
+  included; the window bits bind only connections established after
+  the revision — a connection that is already open keeps the window
+  bits its handshake negotiated until it reconnects. Only a gateway
+  that already enabled permessage-deflate can be revised: a
+  never-enabled gateway refuses the revision with `RangeError` (live
+  enable is EB-564), and the extension can never be cleared or
+  disabled through a revision (an explicitly `undefined` field keeps
+  its live value — clearing it would make already-negotiated
+  connections' inbound compressed frames fail with a 1002 protocol
+  error). There is no audit event for this revision;
+  `gw.getStats().deflate` reports the live tuning (`undefined` when
+  disabled).
 - **Query mapping.** Only `subscription` operations with a single root
   field are accepted. The root field takes `topic: String!` (required
   topic pattern) and `filter: String` (optional `filterexpr`
