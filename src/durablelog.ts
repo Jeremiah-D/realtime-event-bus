@@ -1983,9 +1983,11 @@ export class DurableTopicLog {
   private archiveScheduled = false;
   /**
    * At-rest encryptor (EB-80), `undefined` when the log stores plaintext
-   * (the default — fully backward compatible).
+   * (the default — fully backward compatible). Mutable at runtime via
+   * `installEncryptor` (EB-568) — the bus exposes it as
+   * `setDurableLogEncryptor`, which only ever installs a rotating ring.
    */
-  private readonly encryptor?: PayloadEncryptor;
+  private encryptor?: PayloadEncryptor;
   /**
    * Time-based retention bound in milliseconds (`maxAgeMs`), `undefined`
    * when no age bound is configured. Mutable at runtime via
@@ -2383,6 +2385,42 @@ export class DurableTopicLog {
     }
     this.segmentRotation = resolved;
     return this.currentSegmentRotation();
+  }
+
+  /**
+   * Installs an at-rest encryptor live on a log constructed without one
+   * (EB-568), the mirror of `installSegmentRotation` for the unconfigured
+   * case — where a log constructed with an encryptor seals from the first
+   * append, `installEncryptor` seals from the next append onward.
+   * Returns nothing. Throws `RangeError` for an encryptor that is not a
+   * usable `PayloadEncryptor` (reusing the construction-time validation
+   * from `open`), or when an encryptor is already configured — the
+   * encryptor is install-only, never replaced. A rejected call leaves
+   * the log exactly as it was, so a later valid call still installs.
+   *
+   * No history is rewritten: lines sealed before the install keep their
+   * envelope, and lines written before it in plaintext stay plaintext —
+   * the read path (`openLine`) passes plaintext v1 lines through
+   * untouched and decrypts sealed v2 envelopes with the installed
+   * encryptor, so a mixed file recovers fine. The publish-dedup journal
+   * seals the same way, through the same `sealLine` / `openLine` pair.
+   */
+  installEncryptor(encryptor: PayloadEncryptor): void {
+    if (
+      encryptor === undefined ||
+      typeof encryptor !== 'object' ||
+      encryptor === null ||
+      typeof (encryptor as PayloadEncryptor).encrypt !== 'function' ||
+      typeof (encryptor as PayloadEncryptor).decrypt !== 'function'
+    ) {
+      throw new RangeError(
+        'durableLogEncryptor must be a PayloadEncryptor with encrypt/decrypt methods',
+      );
+    }
+    if (this.encryptor !== undefined) {
+      throw new RangeError('DurableTopicLog.installEncryptor: encryptor is already configured');
+    }
+    this.encryptor = encryptor;
   }
 
   /**

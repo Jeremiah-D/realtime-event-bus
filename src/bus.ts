@@ -5815,6 +5815,9 @@ export interface EventBusOptions {
    * (same key) must open the directory again; opening a sealed
    * directory without it throws loudly at recovery. `NoopEncryptor`
    * (from `src/encrypt.ts`) is for tests only — it protects nothing.
+   * Install it live on a bus that has a log but no encryptor with
+   * `setDurableLogEncryptor` (EB-568) — only a rotating ring can be
+   * installed live.
    */
   durableLogEncryptor?: PayloadEncryptor;
   /**
@@ -19516,9 +19519,10 @@ export class EventBus {
   private durableLogSegmentRotation?: SegmentRotationOptions;
   /**
    * `durableLogEncryptor` as configured — namespace child logs (EB-52)
-   * seal with the same encryptor as the root log.
+   * seal with the same encryptor as the root log; kept in sync by
+   * `setDurableLogEncryptor` (EB-568).
    */
-  private readonly durableLogEncryptor?: PayloadEncryptor;
+  private durableLogEncryptor?: PayloadEncryptor;
   /**
    * The S3 client the durable log currently offloads through (EB-399) —
    * the construction-time client, then whatever
@@ -26417,10 +26421,135 @@ export class EventBus {
   }
 
   /**
+   * Installs the durable log's at-rest encryptor live (EB-568) on a bus
+   * constructed with a durable log but no encryptor:
+   * `setDurableLogEncryptor(encryptor, actor?)` installs the
+   * `RotatingDekEncryptor` ring, so a bus that started in plaintext can
+   * start sealing at rest without restarting (which would drop every
+   * live subscription, queue, and replay position).
+   *
+   * Only a rotating ring can be installed live: a plain
+   * `AesGcmEncryptor`, `NoopEncryptor`, or any other ringless
+   * `PayloadEncryptor` throws `RangeError` — the ring is what
+   * `rotateDurableLogEncryptionKey` (EB-398) rotates, so installing a
+   * ringless encryptor would strand the bus with a key it can never
+   * rotate. The install is the last piece of the durable-log enable
+   * family: install the log first (`setDurableLog`, EB-567), then the
+   * encryptor on it — a bus with no durable log refuses fail-closed
+   * with the same `requires EventBusOptions.durableLogDir to be set`
+   * gate the revision family uses.
+   *
+   * New appends seal from the next append onward: the log calls the
+   * same ring object on every line (`sealLine` / `openLine`), so newly
+   * appended lines — and later-sealed archived segments — carry the
+   * live key id. Nothing already persisted is rewritten or re-sealed:
+   * lines written before the install in plaintext stay plaintext and
+   * still read (the read path passes plaintext v1 lines through
+   * untouched), and the publish-dedup journal seals the same way, so
+   * a mixed old/new file recovers fine — verified against the read
+   * path before this shipped, not assumed. Namespace child logs share
+   * the same ring reference as the root log, so the install fans out
+   * to every child log already registered, and a namespace registered
+   * after the install opens its child log with the live ring, like
+   * construction.
+   *
+   * The install opens the rotate gate: `rotateDurableLogEncryptionKey`
+   * (EB-398) and `getDurableLogEncryptionKeyId()` work from the
+   * install onward, reading the same live ring. The grace window still
+   * goes through the operator's ring reference directly (`setGraceMs`,
+   * EB-354).
+   *
+   * Fail-closed: a bus with no durable log, a bus that already has an
+   * encryptor (constructed with one or installed live — the encryptor
+   * is install-only, never replaced), and a closed bus all throw
+   * `RangeError`. An illegal encryptor throws `RangeError` with the
+   * live tuning and the audit log untouched — validation reuses the
+   * construction-time rule (`DurableTopicLog.open`), so a value that
+   * could not be set at construction cannot be installed later either
+   * — and a failed call changes nothing at all: the bus stays
+   * unconfigured, so a later valid call still enables it. `null` is a
+   * silent no-op with no audit (along EB-540 / EB-559), and the null
+   * branch sits before the already-enabled gate. Audited as
+   * `durable_log_encryptor_enabled` (`{ liveKeyId, oldLiveKeyId: null
+   * }` — key ids are labels, never key material; the key itself is
+   * never written to the audit log). The enable is live-only: a
+   * restart restores the unconfigured state.
+   *
+   * Orthogonal to EB-80 (that is the at-rest encryption mechanism
+   * itself — this its live install), to EB-398 (that rotates the DEK
+   * in the installed ring — this installs the ring), to EB-567 (that
+   * installs the log itself — this installs the encryptor on a log
+   * that already exists), and to EB-566 / EB-361 (those install
+   * rotation / offload on a log that already exists — this the
+   * encryptor). There is no disable: an installed encryptor stays
+   * installed (along EB-544 / EB-559, install-only).
+   *
+   * Throws `RangeError` for a bad actor, when the bus is closed, when
+   * the bus has no durable log, when an encryptor is already enabled,
+   * or for an encryptor that is not a rotating ring.
+   */
+  setDurableLogEncryptor(encryptor: RotatingDekEncryptor | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogEncryptor');
+    // Fail-fast on a closed bus (EB-154, along `setDurableLog`): close()
+    // already flushed once — there is no live log left to seal.
+    if (this.closed) {
+      throw new RangeError('setDurableLogEncryptor: bus is closed');
+    }
+    // `null` on a never-enabled bus is a silent no-op (along EB-540 /
+    // EB-559): the null branch sits before the already-enabled gate,
+    // so it asks nothing to install on any bus.
+    if (encryptor == null) {
+      return;
+    }
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogEncryptor requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    if (this.durableLogEncryptor !== undefined) {
+      throw new RangeError(
+        'setDurableLogEncryptor: durableLogEncryptor is already enabled on this bus',
+      );
+    }
+    // Validate before installing anything: a rejected encryptor leaves
+    // the bus unconfigured, so a later valid call still enables it.
+    // The shape check reuses the construction-time rule
+    // (`DurableTopicLog.open`); the ring check mirrors the rotate gate
+    // (`rotateDurableLogEncryptionKey`, EB-398) — only a rotating ring
+    // can be installed live, since only a ring can be rotated later.
+    if (
+      typeof encryptor !== 'object' ||
+      typeof (encryptor as PayloadEncryptor).encrypt !== 'function' ||
+      typeof (encryptor as PayloadEncryptor).decrypt !== 'function'
+    ) {
+      throw new RangeError(
+        'setDurableLogEncryptor: encryptor must be a PayloadEncryptor with encrypt/decrypt methods',
+      );
+    }
+    if (!(encryptor instanceof RotatingDekEncryptor)) {
+      throw new RangeError(
+        'setDurableLogEncryptor: durableLogEncryptor must be a RotatingDekEncryptor — only a rotating key ring can be installed live',
+      );
+    }
+    log.installEncryptor(encryptor);
+    for (const child of this.namespaceLogs.values()) {
+      child.installEncryptor(encryptor);
+    }
+    this.durableLogEncryptor = encryptor;
+    this.auditSubscription({
+      action: 'durable_log_encryptor_enabled',
+      actor,
+      detail: { liveKeyId: encryptor.liveKeyId, oldLiveKeyId: null },
+    });
+  }
+
+  /**
    * Rotates the durable log's at-rest encryption DEK live (EB-398)
    * without restarting the bus: `rotateDurableLogEncryptionKey(newKeyId?, actor?)`
    * mints a fresh random 32-byte DEK in the `RotatingDekEncryptor` ring the bus
-   * was constructed with (`EventBusOptions.durableLogEncryptor`, EB-80) and
+   * was constructed with (`EventBusOptions.durableLogEncryptor`, EB-80) or
+   * installed live (`setDurableLogEncryptor`, EB-568) and
    * makes it the live key, so a leaked or aging key can be replaced
    * mid-incident without rebuilding the bus (which would drop every live
    * subscription, queue, and replay position).
@@ -26452,8 +26581,9 @@ export class EventBus {
    * ring's smallest free `k<N>` id. The live key id is visible via
    * `getDurableLogEncryptionKeyId()`.
    *
-   * Fail-closed: a bus constructed without `durableLogEncryptor` throws
-   * `RangeError` — encryption cannot be enabled after the fact. A bus
+   * Fail-closed: a bus with no `durableLogEncryptor` — neither
+   * constructed with one nor installed live via `setDurableLogEncryptor`
+   * (EB-568) — throws `RangeError`. A bus
    * whose encryptor is not a rotating ring (a plain `AesGcmEncryptor`,
    * `NoopEncryptor`, or any other `PayloadEncryptor` with no key ring)
    * also throws `RangeError`: a ringless encryptor has nothing to

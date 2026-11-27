@@ -1318,7 +1318,8 @@ library.
   `getStats().durableLog` additionally reports `archived` (total archived
   entries), `corruptArchives`, and per-topic `segments`
   (`{ live, segments, archived }`). Opt-in at-rest encryption
-  (`new EventBus({ durableLogDir, durableLogEncryptor })`, `src/encrypt.ts`):
+  (`new EventBus({ durableLogDir, durableLogEncryptor })` or
+  `setDurableLogEncryptor(ring)` live (EB-568), `src/encrypt.ts`):
   every per-topic JSONL data line, every archived segment's record payload,
   and the publish-dedup journal (`__publish_dedup.jsonl`) are sealed with a
   `PayloadEncryptor` before they touch disk — AES-256-GCM via `node:crypto`
@@ -1340,11 +1341,15 @@ library.
   live, without restarting the bus — the new key seals from the next append
   onward, old sealed lines keep their envelope key id and are never
   re-sealed, and namespace child logs share the same ring reference so they
-  follow automatically. Only a bus constructed with a
-  `RotatingDekEncryptor` can rotate: a plain `AesGcmEncryptor`,
-  `NoopEncryptor`, or any other ringless `PayloadEncryptor` refuses, as
-  does a bus with no encryptor (encryption cannot be enabled after the
-  fact). Omitting `newKeyId` takes the ring's smallest free `k<N>`; an
+  follow automatically. Install the encryptor live on a bus that has a
+  log but no encryptor with `setDurableLogEncryptor(ring, actor?)`
+  (EB-568): only a `RotatingDekEncryptor` ring can be installed — new
+  appends seal from the next append onward, lines written before the
+  install in plaintext stay plaintext and still read, and the install
+  fans out to namespace child logs. Only a bus with a rotating ring can
+  rotate: a plain `AesGcmEncryptor`, `NoopEncryptor`, or any other
+  ringless `PayloadEncryptor` refuses, as does a bus with no encryptor
+  (install one live first with `setDurableLogEncryptor`). Omitting `newKeyId` takes the ring's smallest free `k<N>`; an
   illegal or already-held id refuses with the live key untouched. The
   retired key keeps decrypting inside the ring's live grace window — with
   the default grace of 0 an old line fails loudly at recovery once the
