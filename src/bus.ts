@@ -5507,7 +5507,9 @@ export interface EventBusOptions {
    * directory — recovers per-topic sequence counters and can replay missed
    * messages to resubscribing consumers via
    * `SubscribeOptions.resumeFromSeq`. Disabled by default; when enabled,
-   * every `publish` pays one synchronous file append.
+   * every `publish` pays one synchronous file append. A bus constructed
+   * without a log can install one live with `setDurableLog(dir, opts?)`
+   * (EB-567) — the durable-log revision gates open with it.
    */
   durableLogDir?: string;
   /**
@@ -16188,6 +16190,31 @@ interface WatermarkIdleState {
   lastAdvanceAt: number | undefined;
 }
 
+/**
+ * Options for `EventBus.setDurableLog` (EB-567): the durable-log knobs
+ * a live install accepts. Every field mirrors the construction-time
+ * `EventBusOptions` knob of the same name; an omitted field takes the
+ * construction default. Segment rotation, segment offload, and the
+ * encryptor are NOT installable here — each has its own live enable
+ * (`setDurableLogSegmentRotation` EB-566,
+ * `setDurableLogSegmentOffloadClient` EB-361, `setDurableLogEncryptor`
+ * EB-568): install the log first, then enable those on it.
+ */
+export interface DurableLogInstallOptions {
+  /** Per-topic entry budget (`durableLogMaxEntriesPerTopic`, default 10000). */
+  maxEntriesPerTopic?: number;
+  /** Time-based retention bound in ms (`durableLogMaxAgeMs`, unset by default). */
+  maxAgeMs?: number;
+  /** Per-topic live-byte budget (`durableLogMaxBytesPerTopic`, unset by default). */
+  maxBytesPerTopic?: number;
+  /** Keyed compaction (`durableLogKeyCompaction`, default false). */
+  keyCompaction?: boolean;
+  /** Pluggable storage backend (`durableLogStorageBackend`, filesystem by default). */
+  storageBackend?: DurableStorageBackend;
+  /** Publish-dedup journal bound (`publishDedupMaxEntries`, default the live `idempotencyMaxEntries`). */
+  publishDedupMaxEntries?: number;
+}
+
 export class EventBus {
   /**
    * Stable identity of this bus instance (see `EventBusOptions.busId`):
@@ -19290,12 +19317,16 @@ export class EventBus {
    */
   private readonly chaosLatencyBypass = new Set<string>();
   /**
-   * Durable topic log, present only when `EventBusOptions.durableLogDir`
-   * was given. Every `fanOut` appends the stamped message here; the
-   * per-topic sequence counters are seeded from it at construction so a
-   * restart never reuses a sequence number.
+   * Durable topic log, present when `EventBusOptions.durableLogDir`
+   * was given — or when the log was installed live via `setDurableLog`
+   * (EB-567). Every `fanOut` appends the stamped message here; the
+   * per-topic sequence counters are seeded from it at construction (or
+   * at the live install) so a restart never reuses a sequence number.
+   * Not `readonly`: `setDurableLog` installs the first log on a
+   * never-configured bus; the publish path always reads the live
+   * reference.
    */
-  private readonly durableLog?: DurableTopicLog;
+  private durableLog?: DurableTopicLog;
   /**
    * Pull-mode consumption state (EB-111): per-topic ring of the most
    * recent admitted messages (bounded by `pullBufferSize`), feeding
@@ -20192,66 +20223,7 @@ export class EventBus {
       // same-client revision is a no-op (the client itself is never
       // exposed — it may hold credentials).
       this.durableLogOffloadClient = options.durableLogSegmentOffload?.s3;
-      // Reseed the publish-side idempotent-dedup window from the journal
-      // (EB-66): a restarted bus keeps suppressing within-window retries.
-      // Claims that aged out of the window are "unknown" — dropped here,
-      // never rehydrated. Bounded to `idempotencyMaxEntries`: the journal
-      // yields claims in claim order, so taking the tail keeps the most
-      // recently claimed identities — the exact analog of the live
-      // table's insertion-ordered eviction. EB-146: content-hash claims
-      // (journaled with the reserved `content:` messageId prefix) are
-      // routed back to the content-dedup table with the bus-level window —
-      // a per-call custom window is an in-process refinement. EB-151:
-      // explicit idempotency-key claims (journaled with the reserved
-      // `key:` prefix) are routed back to the key slots of the same
-      // table, restoring the first claim's payload hash (for conflict
-      // detection) and first result (returned to retries); a `key:` line
-      // without a hash is not a valid key claim and is skipped.
-      {
-        const nowMs = this.now();
-        const live: Array<{ key: string; at: number }> = [];
-        // Content-hash (EB-146) and explicit-key (EB-151) claims share the
-        // one in-memory table, so they share one tail slice here too: the
-        // journal yields claims in claim order, and taking the tail keeps
-        // the most recently claimed identities — the exact analog of the
-        // live table's insertion-ordered eviction.
-        const liveTable: Array<{ key: string; at: number; hash?: string; accepted?: number }> = [];
-        for (const entry of log.recoveredPublishDedup()) {
-          if (nowMs - entry.at < this.idempotencyWindowMs) {
-            if (entry.messageId.startsWith(CONTENT_DEDUP_JOURNAL_PREFIX)) {
-              liveTable.push({
-                key: `${entry.topic}\0${entry.messageId.slice(CONTENT_DEDUP_JOURNAL_PREFIX.length)}`,
-                at: entry.at,
-              });
-            } else if (entry.messageId.startsWith(KEY_DEDUP_JOURNAL_PREFIX)) {
-              if (typeof entry.hash !== 'string') continue;
-              // The in-memory key slot keeps the `key:` prefix (it is
-              // what distinguishes key slots from content-hash slots in
-              // the shared table), so the journal messageId is used
-              // verbatim — unlike the `content:` prefix, it is not
-              // stripped.
-              liveTable.push({
-                key: `${entry.topic}\0${entry.messageId}`,
-                at: entry.at,
-                hash: entry.hash,
-                accepted: entry.accepted ?? 0,
-              });
-            } else {
-              live.push({ key: `${entry.topic}\0${entry.messageId}`, at: entry.at });
-            }
-          }
-        }
-        for (const { key, at } of live.slice(-this.idempotencyMaxEntries)) {
-          this.dedup.set(key, at);
-        }
-        // Bloom pre-filter (EB-214): rebuilt from the recovered table
-        // (EB-66) — a restarted bus keeps the pre-filter without
-        // replaying the claim stream one by one.
-        this.dedupBloom?.rebuild(this.dedup.keys());
-        for (const { key, at, hash, accepted } of liveTable.slice(-this.idempotencyMaxEntries)) {
-          this.contentDedup.set(key, { at, windowMs: this.idempotencyWindowMs, hash, accepted });
-        }
-      }
+      this.reseedPublishDedupFromLog(log);
       // Recover numbering continuity and per-key cursors from the log —
       // shared with namespace child logs (see `recoverLogState`).
       this.recoverLogState(log);
@@ -21446,7 +21418,7 @@ export class EventBus {
    * first log access; it is runtime-only (a restart forgets it — the
    * operator re-sets it, like the partition rules).
    *
-   * Requires a durable log (`durableLogDir`) with keyed compaction
+   * Requires a durable log (`durableLogDir`, or enabled live via `setDurableLog`, EB-567) with keyed compaction
    * (`durableLogKeyCompaction`): without latest-per-key semantics a
    * per-key TTL has nothing to evict. Throws `RangeError` when either
    * is missing, when `topicPattern` is empty, or when `ttlMs` is not a
@@ -25584,6 +25556,180 @@ export class EventBus {
   }
 
   /**
+   * Installs the durable log live (EB-567) on a bus constructed without
+   * `durableLogDir`: `setDurableLog(dir, opts?)` gives a running bus the
+   * append-only per-topic JSONL log it was built without — no restart, no
+   * loss of the live subscriptions, replay positions, consumer-group
+   * assignments, or rate-limit and dedup state a restart would drop.
+   *
+   * The whole log installs at once: the root log opens over `dir` with
+   * the retention and budget knobs in `opts` — `maxEntriesPerTopic`
+   * (default 10000), `maxAgeMs` (unset by default), `maxBytesPerTopic`
+   * (unset by default), `keyCompaction` (default false),
+   * `storageBackend` (the filesystem rooted at `dir` by default), and
+   * `publishDedupMaxEntries` (default the live `idempotencyMaxEntries`).
+   * An omitted `opts` — or `{}` — takes every construction default
+   * (along WR-459). Segment rotation, segment offload, and the encryptor
+   * are NOT installed here: each has its own live enable
+   * (`setDurableLogSegmentRotation` EB-566,
+   * `setDurableLogSegmentOffloadClient` EB-361, `setDurableLogEncryptor`
+   * EB-568) — install the log first, then enable those on it.
+   *
+   * Installing replicates the construction-time wiring exactly: the root
+   * log opens through `DurableTopicLog.open` with the same options
+   * construction passes (the bus clock, the checksum-failure fan-out),
+   * the remembered per-topic bounds are recorded so a namespace
+   * registered later opens its child log with the same budget and
+   * compaction as the root (EB-52), the publish-side idempotent-dedup
+   * window is reseeded from the journal (a retry of a claim the log
+   * already holds is suppressed at once), and per-topic sequence
+   * counters and stats are reseeded from the recovered history
+   * (`recoverLogState`), so numbering continues instead of restarting
+   * at 1 and already-sealed segments replay through `resumeFromSeq` /
+   * `resumeFromTime` from the first subscribe after the install. New
+   * publishes append to the log from the install onward — history from
+   * before the install is read-only recovery, never rewritten.
+   *
+   * The enable opens the gates the constructed bus already has:
+   * `setDurableLogMaxAgeMs` (EB-85), `setTopicDurableLogMaxAgeMs`
+   * (EB-388), `setDurableLogMaxEntriesPerTopic` (EB-322),
+   * `setDurableLogMaxBytesPerTopic` (EB-323),
+   * `setDurableLogPublishDedupMaxEntries` (EB-328),
+   * `setDurableLogSegmentRotation` (EB-355/EB-566),
+   * `setDurableLogKeyCompaction` (EB-364), and the rest of the
+   * durable-log revision family — each reads the live `durableLog`.
+   * Namespaces registered before the install keep using the root log
+   * (their topics were already publishing there); namespaces registered
+   * after get their own child log, like construction.
+   *
+   * The install does NOT rebuild live delivery state from disk:
+   * delayed-delivery timers, recurring jobs, pause buffers, retained
+   * messages, and committed offsets are restart-time recoveries — a
+   * live install leaves the in-memory state the bus built from live
+   * publishes exactly as it is, and only new publishes after the
+   * install are persisted. Likewise the trace archive and the publish
+   * audit journal keep their own enables (`setTraceArchive`,
+   * `setPublishAudit` EB-554) and are untouched by this call.
+   *
+   * Fail-closed: a bus that already has a durable log, a closed bus,
+   * and an illegal dir or option value all throw `RangeError` with the
+   * live tuning and the audit log untouched — the gate is `durableLog`
+   * being present, so a bus constructed with `durableLogDir` refuses
+   * here; validation reuses the construction-time rule
+   * (`DurableTopicLog.open`), so a value that could not be set at
+   * construction cannot be installed later either — and a failed call
+   * changes nothing at all: the bus stays unconfigured, so a later
+   * valid call still enables it. `null` on a never-enabled bus is a
+   * silent no-op with no audit (along EB-540/EB-559), and the null
+   * branch sits before the already-enabled gate. Audited as
+   * `durable_log_enabled` (`{ dir, maxEntriesPerTopic,
+   * oldMaxEntriesPerTopic: null, maxAgeMs, oldMaxAgeMs: null,
+   * maxBytesPerTopic, oldMaxBytesPerTopic: null, keyCompaction,
+   * oldKeyCompaction: null, publishDedupMaxEntries,
+   * oldPublishDedupMaxEntries: null }` — every old value is `null`,
+   * since there was no log to replace; the log contents are never
+   * written to the audit log, only the directory and the bounds). The
+   * enable is live-only: a restart restores the unconfigured state.
+   *
+   * Orthogonal to EB-566 (that installs segment rotation on a log that
+   * already exists — this installs the log itself), to EB-568 (that
+   * installs the encryptor on a log that already exists), to EB-361
+   * (that installs the offload client), and to EB-554 (that installs
+   * the publish audit journal, which itself requires a log). There is
+   * no disable: an installed log stays installed (along EB-544/EB-559,
+   * install-only).
+   *
+   * Throws `RangeError` for a bad actor, when the bus is closed, when
+   * a durable log is already enabled, or for an illegal dir or option
+   * value.
+   */
+  setDurableLog(dir: string | null, opts?: DurableLogInstallOptions, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLog');
+    // Fail-fast on a closed bus (EB-154, along `setGroupLag`): close()
+    // already flushed once — there is no live log left to install.
+    if (this.closed) {
+      throw new RangeError('setDurableLog: bus is closed');
+    }
+    // `null` on a never-enabled bus is a silent no-op (along EB-540 /
+    // EB-559): the null branch sits before the already-enabled gate,
+    // so it asks nothing to install on any bus.
+    if (dir == null) {
+      return;
+    }
+    if (this.durableLog !== undefined) {
+      throw new RangeError('setDurableLog: durable log is already enabled on this bus');
+    }
+    if (typeof dir !== 'string' || dir.length === 0) {
+      throw new RangeError('setDurableLog: dir must be a non-empty string');
+    }
+    if (opts !== undefined && (typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new RangeError('setDurableLog: opts must be an options object');
+    }
+    // Resolve BEFORE opening anything: a value that could not be set at
+    // construction cannot be installed later either — `DurableTopicLog.open`
+    // re-validates every bound the same way, so an illegal value throws
+    // here with the bus still unconfigured and a later valid call still
+    // enables it.
+    const maxEntriesPerTopic = opts?.maxEntriesPerTopic ?? 10000;
+    const maxAgeMs = opts?.maxAgeMs;
+    const maxBytesPerTopic = opts?.maxBytesPerTopic;
+    const keyCompaction = opts?.keyCompaction ?? false;
+    const publishDedupMaxEntries =
+      opts?.publishDedupMaxEntries ?? this.durableLogPublishDedupMaxEntries;
+    // Replicate the construction-time wiring (bus.ts:20146-20191): open
+    // the root log with the same options construction passes — the bus
+    // clock and the checksum-failure fan-out — and no rotation, offload,
+    // or encryptor (EB-566/EB-361/EB-568 each enable their own).
+    const log = DurableTopicLog.open({
+      dir,
+      backend: opts?.storageBackend,
+      maxEntriesPerTopic,
+      maxAgeMs,
+      maxBytesPerTopic,
+      now: this.now,
+      keyCompaction,
+      publishDedupMaxEntries,
+      // EB-94: a checksum-failed archived segment is isolated by the
+      // log and reported here — one audit event per segment (EB-436:
+      // the shared fan-out, read from the bus cell on every failure).
+      onSegmentChecksumFailed: (info) => this.reportSegmentChecksumFailed(info),
+    });
+    this.durableLog = log;
+    // Remembered for namespace child logs (EB-52): children open with
+    // the same per-topic budget, retention bound, byte budget, compaction
+    // mode, and publish-dedup journal bound as the root log.
+    this.durableLogMaxEntriesPerTopic = opts?.maxEntriesPerTopic;
+    this.durableLogMaxAgeMs = maxAgeMs;
+    this.durableLogMaxBytesPerTopic = maxBytesPerTopic;
+    this.durableLogKeyCompaction = keyCompaction;
+    this.durableLogPublishDedupMaxEntries = publishDedupMaxEntries;
+    // Reseed the publish-side idempotent-dedup window from the journal,
+    // like construction: a retry of a claim the log already holds is
+    // suppressed at once.
+    this.reseedPublishDedupFromLog(log);
+    // Recover numbering continuity and per-key cursors from the log, like
+    // construction: numbering continues instead of restarting at 1.
+    this.recoverLogState(log);
+    this.auditSubscription({
+      action: 'durable_log_enabled',
+      actor,
+      detail: {
+        dir,
+        maxEntriesPerTopic,
+        oldMaxEntriesPerTopic: null,
+        maxAgeMs: maxAgeMs ?? null,
+        oldMaxAgeMs: null,
+        maxBytesPerTopic: maxBytesPerTopic ?? null,
+        oldMaxBytesPerTopic: null,
+        keyCompaction,
+        oldKeyCompaction: null,
+        publishDedupMaxEntries,
+        oldPublishDedupMaxEntries: null,
+      },
+    });
+  }
+
+  /**
    * Changes the durable log's time-based retention bound at runtime
    * (EB-85): records older than `now - maxAgeMs` (bus clock) are evicted
    * at the next compact of each topic. Pass `undefined` to clear the age
@@ -25592,7 +25738,7 @@ export class EventBus {
    * subscription audit log as `retention_updated` (with the previous and
    * new bound in `detail`), so retention policy changes stay attributable.
    * Throws `RangeError` for a bad actor, for a non-positive-finite
-   * `maxAgeMs`, or when the bus has no `durableLogDir`.
+   * `maxAgeMs`, or when the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567).
    */
   setDurableLogMaxAgeMs(maxAgeMs: number | undefined, actor = 'system'): void {
     assertValidActor(actor, 'setDurableLogMaxAgeMs');
@@ -25647,7 +25793,7 @@ export class EventBus {
    * counter — per-topic state is observed through
    * `getTopicDurableLogMaxAgeMs` / `listTopicDurableLogMaxAgeMs`.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A bad topic or a non-positive-finite bound also
@@ -25761,7 +25907,7 @@ export class EventBus {
    * A namespace registered after the revision opens its child log with
    * the live bus bound, like every other durable-log option.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A non-positive-integer bound also throws
@@ -25776,7 +25922,7 @@ export class EventBus {
    * (that retunes tail sampling — this the durable-log retention).
    *
    * Throws `RangeError` for a bad actor, for a non-positive-integer
-   * `maxEntriesPerTopic`, or when the bus has no `durableLogDir`.
+   * `maxEntriesPerTopic`, or when the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567).
    */
   setDurableLogMaxEntriesPerTopic(maxEntriesPerTopic: number, actor = 'system'): void {
     assertValidActor(actor, 'setDurableLogMaxEntriesPerTopic');
@@ -25832,7 +25978,7 @@ export class EventBus {
    * child log with the live bus bound, like every other durable-log
    * option.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A non-positive-finite bound also throws
@@ -25851,7 +25997,7 @@ export class EventBus {
    * `undefined`).
    *
    * Throws `RangeError` for a bad actor, for a non-positive-finite
-   * `maxBytesPerTopic`, or when the bus has no `durableLogDir`.
+   * `maxBytesPerTopic`, or when the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567).
    */
   setDurableLogMaxBytesPerTopic(maxBytesPerTopic: number | undefined, actor = 'system'): void {
     assertValidActor(actor, 'setDurableLogMaxBytesPerTopic');
@@ -25906,7 +26052,7 @@ export class EventBus {
    * its child log with the live bus bound, like every other
    * durable-log option.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A non-positive-integer bound also throws
@@ -25925,7 +26071,7 @@ export class EventBus {
    * entry/byte retention bounds — this the dedup journal bound).
    *
    * Throws `RangeError` for a bad actor, for a non-positive-integer
-   * `maxEntries`, or when the bus has no `durableLogDir`.
+   * `maxEntries`, or when the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567).
    */
   setDurableLogPublishDedupMaxEntries(maxEntries: number, actor = 'system'): void {
     assertValidActor(actor, 'setDurableLogPublishDedupMaxEntries');
@@ -25986,7 +26132,7 @@ export class EventBus {
    * revision opens its child log with the live bus triggers, like
    * every other durable-log option.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. An illegal value throws `RangeError`
@@ -26004,7 +26150,7 @@ export class EventBus {
    * retention — this the segment age that closes a segment).
    *
    * Throws `RangeError` for a bad actor, for an illegal trigger, or
-   * when the bus has no `durableLogDir`. Like the EB-355 revision,
+   * when the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567). Like the EB-355 revision,
    * enabling carries no closed-bus gate: a closed bus installs the
    * triggers and audits exactly as an open one does.
    */
@@ -26103,7 +26249,7 @@ export class EventBus {
    * `getStats().durableLog.readbackCacheMaxSegments` /
    * `readbackCacheMaxBytes`.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A bus constructed without
@@ -26124,7 +26270,7 @@ export class EventBus {
    * offload itself — this its local cache bounds).
    *
    * Throws `RangeError` for a bad actor, for an illegal bound, when
-   * the bus has no `durableLogDir`, or when the bus was constructed
+   * the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567), or when the bus was constructed
    * without `durableLogSegmentOffload`.
    */
   setDurableLogReadbackCache(patch: Partial<ReadbackCacheLimits>, actor = 'system'): void {
@@ -26205,7 +26351,7 @@ export class EventBus {
    * JSON has no `Infinity`). The live count is visible in
    * `getStats().durableLog.retainLocalSegments`.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A bus constructed without
@@ -26230,7 +26376,7 @@ export class EventBus {
    * archived segments' local retention).
    *
    * Throws `RangeError` for a bad actor, for an illegal count, when
-   * the bus has no `durableLogDir`, or when the bus was constructed
+   * the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567), or when the bus was constructed
    * without `durableLogSegmentOffload`.
    */
   setDurableLogRetainLocalSegments(retainLocalSegments: number, actor = 'system'): void {
@@ -26412,7 +26558,7 @@ export class EventBus {
    * time — never logged" rule — and there is no getter that returns the
    * client itself, since a real client holds credentials.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A bus constructed without
@@ -26435,7 +26581,7 @@ export class EventBus {
    * transport layer).
    *
    * Throws `RangeError` for a bad actor, for an unusable client, when
-   * the bus has no `durableLogDir`, or when the bus was constructed
+   * the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567), or when the bus was constructed
    * without `durableLogSegmentOffload`.
    */
   setDurableLogSegmentOffloadClient(s3: RemoteSegmentS3Client, actor = 'system'): void {
@@ -26518,7 +26664,7 @@ export class EventBus {
    * with the live bus flag, like every other durable-log option. The
    * live flag is visible in `getStats().durableLog.keyCompaction`.
    *
-   * Fail-closed: a bus with no `durableLogDir` has no durable log to
+   * Fail-closed: a bus with no durable log — neither constructed with `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has none to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. There is no "only if already set" gate: a bus
@@ -26540,7 +26686,7 @@ export class EventBus {
    * condition's switch).
    *
    * Throws `RangeError` for a bad actor, for a non-boolean `enabled`,
-   * or when the bus has no `durableLogDir`.
+   * or when the bus has no durable log (neither constructed with `durableLogDir` nor enabled live via `setDurableLog`, EB-567).
    */
   setDurableLogKeyCompaction(enabled: boolean, actor = 'system'): void {
     assertValidActor(actor, 'setDurableLogKeyCompaction');
@@ -35860,12 +36006,81 @@ export class EventBus {
   }
 
   /**
+   * Reseeds the publish-side idempotent-dedup window from a log's
+   * publish-dedup journal (EB-66): a restarted bus — or a bus that
+   * installs its log live (EB-567) — keeps suppressing within-window
+   * retries. Claims that aged out of the window are "unknown" —
+   * dropped here, never rehydrated. Bounded to
+   * `idempotencyMaxEntries`: the journal yields claims in claim order,
+   * so taking the tail keeps the most recently claimed identities —
+   * the exact analog of the live table's insertion-ordered eviction.
+   * EB-146: content-hash claims (journaled with the reserved
+   * `content:` messageId prefix) are routed back to the content-dedup
+   * table with the bus-level window — a per-call custom window is an
+   * in-process refinement. EB-151: explicit idempotency-key claims
+   * (journaled with the reserved `key:` prefix) are routed back to
+   * the key slots of the same table, restoring the first claim's
+   * payload hash (for conflict detection) and first result (returned
+   * to retries); a `key:` line without a hash is not a valid key claim
+   * and is skipped. Shared by the constructor and `setDurableLog`
+   * (EB-567): on a live install the journal entries merge into the
+   * live tables — live claims are kept, never cleared — and the
+   * pre-filter rebuilds from the merged table.
+   */
+  private reseedPublishDedupFromLog(log: DurableTopicLog): void {
+    const nowMs = this.now();
+    const live: Array<{ key: string; at: number }> = [];
+    // Content-hash (EB-146) and explicit-key (EB-151) claims share the
+    // one in-memory table, so they share one tail slice here too: the
+    // journal yields claims in claim order, and taking the tail keeps
+    // the most recently claimed identities — the exact analog of the
+    // live table's insertion-ordered eviction.
+    const liveTable: Array<{ key: string; at: number; hash?: string; accepted?: number }> = [];
+    for (const entry of log.recoveredPublishDedup()) {
+      if (nowMs - entry.at < this.idempotencyWindowMs) {
+        if (entry.messageId.startsWith(CONTENT_DEDUP_JOURNAL_PREFIX)) {
+          liveTable.push({
+            key: `${entry.topic}\0${entry.messageId.slice(CONTENT_DEDUP_JOURNAL_PREFIX.length)}`,
+            at: entry.at,
+          });
+        } else if (entry.messageId.startsWith(KEY_DEDUP_JOURNAL_PREFIX)) {
+          if (typeof entry.hash !== 'string') continue;
+          // The in-memory key slot keeps the `key:` prefix (it is
+          // what distinguishes key slots from content-hash slots in
+          // the shared table), so the journal messageId is used
+          // verbatim — unlike the `content:` prefix, it is not
+          // stripped.
+          liveTable.push({
+            key: `${entry.topic}\0${entry.messageId}`,
+            at: entry.at,
+            hash: entry.hash,
+            accepted: entry.accepted ?? 0,
+          });
+        } else {
+          live.push({ key: `${entry.topic}\0${entry.messageId}`, at: entry.at });
+        }
+      }
+    }
+    for (const { key, at } of live.slice(-this.idempotencyMaxEntries)) {
+      this.dedup.set(key, at);
+    }
+    // Bloom pre-filter (EB-214): rebuilt from the recovered table
+    // (EB-66) — a restarted bus keeps the pre-filter without
+    // replaying the claim stream one by one.
+    this.dedupBloom?.rebuild(this.dedup.keys());
+    for (const { key, at, hash, accepted } of liveTable.slice(-this.idempotencyMaxEntries)) {
+      this.contentDedup.set(key, { at, windowMs: this.idempotencyWindowMs, hash, accepted });
+    }
+  }
+
+  /**
    * Reseeds bus-side cursors from a durable log: per-topic sequence
    * numbers and stats entries (so the next publish continues the
    * on-disk numbering and stats reflect recovered history), plus the
    * per-key sequence cursors (so keyed publishes never restart at 1 and
-   * corrupt per-key ordering). The root log gets this at construction;
-   * a namespace child log gets it at `createNamespace`.
+   * corrupt per-key ordering). The root log gets this at construction
+   * (or at the live install, EB-567); a namespace child log gets it
+   * at `createNamespace`.
    */
   private recoverLogState(log: DurableTopicLog): void {
     for (const topic of log.topics()) {

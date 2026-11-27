@@ -869,7 +869,7 @@ library.
   mirroring pauses (local delivery unaffected) until a probe succeeds
   again, with `bridge_unhealthy` / `bridge_recovered` audit events.
 - **`src/durablelog.ts` — `DurableTopicLog`**: opt-in append-only per-topic
-  JSONL log (`new EventBus({ durableLogDir })`). Every published message is
+  JSONL log (`new EventBus({ durableLogDir })`). A bus constructed without a log can install one live with `setDurableLog(dir, opts?, actor?)` (EB-567): the root log opens over `dir`, the publish-side idempotent-dedup window reseeds from the journal, and already-sealed segments replay from the first subscribe after the install — audited as `durable_log_enabled`, live-only (a restart restores the unconfigured state); segment rotation, offload, and the encryptor each have their own live enable. Every published message is
   appended as one line (`{v, seq, topic, at, expiresAt?, payload}`, one file
   per URL-encoded topic) before fan-out, so a restarted process pointed at
   the same directory recovers per-topic sequence counters — numbering
@@ -964,8 +964,7 @@ library.
   new bound governs from the next append-triggered compact — tightening
   does not force an immediate compact, loosening simply allows more
   capacity. It fans out to the root log and every namespace child log
-  (a namespace registered later opens with the live bound), requires a
-  `durableLogDir` (a bus without one throws `RangeError`), and is
+  (a namespace registered later opens with the live bound), requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567; a bus without one throws `RangeError`), and is
   audited as `durable_log_max_entries_revised` (old and new bound); an
   identical revision is a no-op with no audit. Retune the per-topic byte
   budget live with `setDurableLogMaxBytesPerTopic(maxBytesPerTopic,
@@ -976,7 +975,7 @@ library.
   to the newest records that fit; rotation on: crossing the bound
   archives the live segment instead). It fans out to the root log and
   every namespace child log (a namespace registered later opens with the
-  live bound), requires a `durableLogDir`, and is audited as
+  live bound), requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567), and is audited as
   `durable_log_max_bytes_revised` (`{ from, to }`, `null` when unset);
   an identical revision is a no-op with no audit. Retune the
   publish-dedup journal bound live with
@@ -989,7 +988,7 @@ library.
   (tightening does not force an immediate journal rewrite, loosening
   simply allows more capacity). It fans out to the root log and every
   namespace child log (a namespace registered later opens with the
-  live bound), requires a `durableLogDir`, and is audited as
+  live bound), requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567), and is audited as
   `durable_log_publish_dedup_max_entries_revised` (old and new bound);
   an identical revision is a no-op with no audit. Retune the
   segment-rotation triggers live with
@@ -1001,7 +1000,7 @@ library.
   append (a tightened entry budget rotates on that next append, the age
   budget is judged on record timestamps). It fans out to the root log
   and every namespace child log (a namespace registered later opens
-  with the live triggers), requires a `durableLogDir`, and is audited
+  with the live triggers), requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567), and is audited
   as `durable_log_segment_rotation_revised`
   (`{ from, to }`, `null` when a trigger is unset); an identical
   revision, or a patch with neither field, is a no-op with no audit.
@@ -1264,8 +1263,7 @@ library.
   cached, and `purgeTopic` evicts the topic from the cache. Retune the cache bounds live
   with `setDurableLogReadbackCache(patch, actor?)` (EB-361): a partial revision — only the
   fields provided move; tightening prunes the cache to the new bounds at once
-  (least-recently-used first), loosening governs from the next insert; it requires a
-  `durableLogDir` and a bus constructed with `durableLogSegmentOffload` (offload cannot be
+  (least-recently-used first), loosening governs from the next insert; it requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567) and a bus constructed with `durableLogSegmentOffload` (offload cannot be
   enabled after the fact), skips namespace child logs (they do not offload), and is audited
   as `durable_log_readback_cache_revised` (old and new bounds); an identical revision is a
   no-op with no audit, and the live bounds are visible in
@@ -1273,7 +1271,7 @@ library.
   retain count live with `setDurableLogRetainLocalSegments(n, actor?)` (EB-362): tightening
   deletes local copies beyond the new bound at once (least-recently-used first, only segments
   the manifest confirms as remote), loosening governs from the next offload pass; `0` keeps
-  nothing local and `Infinity` restores full retention; same gates (requires a `durableLogDir`
+  nothing local and `Infinity` restores full retention; same gates (requires a durable log — constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567 —
   and a bus constructed with `durableLogSegmentOffload`, skips namespace child logs) and the
   same no-op rule, audited as `durable_log_retain_local_segments_revised` (`Infinity` recorded
   as `null`), live value in `getStats().durableLog.retainLocalSegments`. Replace the offload client
@@ -1288,8 +1286,7 @@ library.
   serve the same bucket and key space (the operator's precondition). A
   dry-run client (`DryRunS3Client`) records intended keys and never
   uploads, writes a manifest, or trims local segments — swapping back to
-  a real client resumes real uploads. Same gates (requires a
-  `durableLogDir` and a bus constructed with
+  a real client resumes real uploads. Same gates (requires a durable log — constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567 — and a bus constructed with
   `durableLogSegmentOffload`, skips namespace child logs) and the same
   no-op rule for re-installing the live client, audited as
   `durable_log_segment_offload_client_revised` (`{ isDryRun, oldIsDryRun }`,
@@ -1304,8 +1301,7 @@ library.
   to full history at once, appends stop maintaining the key index, and the superseded counts freeze.
   The per-key TTL gate (`setTopicKeyTtl`) follows the live flag, stored TTL rules only sleep while
   disabled. A bus constructed without keyed compaction can still enable it; it fans out to the root
-  log and every namespace child log (a namespace registered later opens with the live flag), requires
-  a `durableLogDir`, and is audited as `durable_log_key_compaction_revised` (`{ enabled, oldEnabled }`);
+  log and every namespace child log (a namespace registered later opens with the live flag), requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567), and is audited as `durable_log_key_compaction_revised` (`{ enabled, oldEnabled }`);
   an identical revision is a no-op with no audit, and the live flag is visible in
   `getStats().durableLog.keyCompaction`. Readback volume is observable
   in `getStats().durableLog` (`s3Readbacks` pulls, `s3ReadbackBytes` downloaded bytes,
