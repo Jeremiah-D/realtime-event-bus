@@ -1001,11 +1001,16 @@ library.
   append (a tightened entry budget rotates on that next append, the age
   budget is judged on record timestamps). It fans out to the root log
   and every namespace child log (a namespace registered later opens
-  with the live triggers), requires a `durableLogDir` and a bus
-  constructed with rotation (rotation cannot be enabled after the
-  fact), and is audited as `durable_log_segment_rotation_revised`
+  with the live triggers), requires a `durableLogDir`, and is audited
+  as `durable_log_segment_rotation_revised`
   (`{ from, to }`, `null` when a trigger is unset); an identical
   revision, or a patch with neither field, is a no-op with no audit.
+  A bus constructed without rotation can enable it live with the same
+  setter (EB-566): the stored history seeds the first segment — the
+  pre-existing live file becomes the new segment's first segment, so
+  the next append is judged against the real stored entry count and
+  first record, and a first enable audits `from` with both triggers
+  `null`.
   Corrupt log lines are skipped and counted
   (`getStats().durableLog.corruptLines`), never fatal; payloads
   `JSON.stringify` cannot represent are delivered live but skipped by the
@@ -1131,7 +1136,12 @@ library.
   skipped and counted (`getStats().durableLog.corruptArchives`), never
   fatal; restart recovery rebuilds the archive view from the index, adopts
   orphan archives, and folds archived seq/keySeq bounds into the cursors —
-  numbering never reuses an archived number. Segment checksums (EB-94):
+  numbering never reuses an archived number. A bus constructed without
+  rotation can enable it live with `setDurableLogSegmentRotation`
+  (EB-566): the pre-existing live file becomes the new segment's first
+  segment — its entry count and first record's seq / timestamp seed the
+  segment identity, so the next append is judged against the real stored
+  history. Segment checksums (EB-94):
   every archived segment gets a `<name>.sha256` sidecar (SHA-256 of the
   gzipped bytes, `node:crypto`, zero new dependencies) written after the
   `.gz` and before the index line; recovery verifies every indexed segment

@@ -5764,9 +5764,9 @@ export interface EventBusOptions {
    * `{ includeArchived: true }`. Only meaningful with `durableLogDir`.
    * Default: absent (no rotation — one live file per topic, as before).
    * Invalid triggers throw `RangeError` at construction. Retune live
-   * with `setDurableLogSegmentRotation(patch, actor?)` (EB-355); only
-   * a bus constructed with rotation can be revised — rotation cannot
-   * be enabled after the fact.
+   * with `setDurableLogSegmentRotation(patch, actor?)` (EB-355); a bus
+   * constructed without rotation can enable it live with the same
+   * setter (EB-566) — the stored history seeds the first segment.
    */
   durableLogSegmentRotation?: SegmentRotationOptions;
   /**
@@ -25954,9 +25954,13 @@ export class EventBus {
 
   /**
    * Changes the durable log's segment-rotation triggers at runtime
-   * (EB-355): `setDurableLogSegmentRotation(patch, actor?)` retunes
-   * when a topic's live segment closes and archives (see
-   * `EventBusOptions.durableLogSegmentRotation`).
+   * (EB-355, enabled live EB-566): `setDurableLogSegmentRotation(patch, actor?)`
+   * retunes when a topic's live segment closes and archives (see
+   * `EventBusOptions.durableLogSegmentRotation`), and on a bus
+   * constructed without rotation it enables rotation — installing the
+   * triggers and seeding each topic's live-segment identity from the
+   * records already on disk, so the pre-existing live file becomes
+   * the new segment's first segment instead of counting from 0.
    *
    * A partial revision: only the fields `patch` provides move, the
    * rest keep their live values. Passing a field as `undefined` clears
@@ -25968,12 +25972,16 @@ export class EventBus {
    * next append of each topic: tightening `maxEntriesPerSegment`
    * below the current segment's entry count rotates on that next
    * append, and `maxSegmentAgeMs` is judged on record timestamps
-   * (the bus clock).
+   * (the bus clock). Enabling is the same shape: the stored entry
+   * count and the first stored record's seq / timestamp seed the
+   * segment, so a stored segment already past a tightened budget
+   * rotates on the next append, exactly like a tightened revision.
    *
    * The change applies to the root log and every namespace child log,
    * and is recorded in the subscription audit log as
    * `durable_log_segment_rotation_revised` (with the previous and new
-   * triggers in `detail`, `null` when unset), so rotation-policy
+   * triggers in `detail`, `null` when unset — a first enable audits
+   * `from` with both triggers `null`), so rotation-policy
    * changes stay attributable. A namespace registered after the
    * revision opens its child log with the live bus triggers, like
    * every other durable-log option.
@@ -25981,13 +25989,7 @@ export class EventBus {
    * Fail-closed: a bus with no `durableLogDir` has no durable log to
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
-   * explicitly refuses. A bus constructed without
-   * `durableLogSegmentRotation` also throws `RangeError`: rotation
-   * cannot be enabled after the fact, because the live segment's
-   * identity (its entry count and first record's seq / timestamp) is
-   * only tracked while rotation is on — a late-enabled rotation
-   * would count the segment from 0 and misalign it with the live
-   * file's actual first record. An illegal value throws `RangeError`
+   * explicitly refuses. An illegal value throws `RangeError`
    * with the live triggers and the audit log untouched: validation
    * reuses the construction-time rule
    * (`resolveSegmentRotationOptions`: at least one trigger, a
@@ -26001,9 +26003,10 @@ export class EventBus {
    * triggers), and to `setDurableLogMaxAgeMs` (that retunes time-based
    * retention — this the segment age that closes a segment).
    *
-   * Throws `RangeError` for a bad actor, for an illegal trigger, when
-   * the bus has no `durableLogDir`, or when the bus was constructed
-   * without `durableLogSegmentRotation`.
+   * Throws `RangeError` for a bad actor, for an illegal trigger, or
+   * when the bus has no `durableLogDir`. Like the EB-355 revision,
+   * enabling carries no closed-bus gate: a closed bus installs the
+   * triggers and audits exactly as an open one does.
    */
   setDurableLogSegmentRotation(patch: SegmentRotationOptions, actor = 'system'): void {
     assertValidActor(actor, 'setDurableLogSegmentRotation');
@@ -26013,15 +26016,37 @@ export class EventBus {
         'setDurableLogSegmentRotation requires EventBusOptions.durableLogDir to be set',
       );
     }
-    const current = this.durableLogSegmentRotation;
-    if (current === undefined) {
-      throw new RangeError(
-        'setDurableLogSegmentRotation requires EventBusOptions.durableLogSegmentRotation to be set: rotation cannot be enabled after the fact',
-      );
-    }
     // Nothing to revise: no-op, no audit. An explicitly `undefined`
     // field is a clear, not an absence (hence the `in` checks).
     if (!('maxEntriesPerSegment' in patch) && !('maxSegmentAgeMs' in patch)) {
+      return;
+    }
+    const triggers = (t: SegmentRotationOptions) => ({
+      maxEntriesPerSegment: t.maxEntriesPerSegment ?? null,
+      maxSegmentAgeMs: t.maxSegmentAgeMs ?? null,
+    });
+    const current = this.durableLogSegmentRotation;
+    if (current === undefined) {
+      // EB-566: enable rotation on a bus constructed without it. The
+      // install validates first, then seeds each topic's live-segment
+      // identity from the records already on disk — an illegal patch
+      // leaves the bus unconfigured with the audit log untouched.
+      const installed = log.installSegmentRotation(patch);
+      if (installed === undefined) {
+        return;
+      }
+      for (const child of this.namespaceLogs.values()) {
+        child.installSegmentRotation(patch);
+      }
+      this.durableLogSegmentRotation = installed;
+      this.auditSubscription({
+        action: 'durable_log_segment_rotation_revised',
+        actor,
+        detail: {
+          from: { maxEntriesPerSegment: null, maxSegmentAgeMs: null },
+          to: triggers(installed),
+        },
+      });
       return;
     }
     const merged: SegmentRotationOptions = { ...current, ...patch };
@@ -26042,10 +26067,6 @@ export class EventBus {
       child.setSegmentRotation(patch);
     }
     this.durableLogSegmentRotation = merged;
-    const triggers = (t: SegmentRotationOptions) => ({
-      maxEntriesPerSegment: t.maxEntriesPerSegment ?? null,
-      maxSegmentAgeMs: t.maxSegmentAgeMs ?? null,
-    });
     this.auditSubscription({
       action: 'durable_log_segment_rotation_revised',
       actor,
@@ -26504,7 +26525,7 @@ export class EventBus {
    * constructed without keyed compaction can still enable it — the
    * flip only changes the read view and rebuilds the in-memory index
    * from disk, and needs no construction-time structure (unlike
-   * offload or rotation, which cannot be enabled after the fact). A
+   * offload, which cannot be enabled after the fact). A
    * non-boolean flag also throws `RangeError` with the live flag and
    * the audit log untouched. A revision identical to the current flag
    * is a no-op with no audit.

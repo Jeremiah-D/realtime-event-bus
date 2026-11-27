@@ -1,5 +1,6 @@
 /**
- * Bus-level durable-log segment-rotation revision (EB-355).
+ * Bus-level durable-log segment-rotation revision (EB-355) and live
+ * enable (EB-566).
  *
  * `setDurableLogSegmentRotation(patch, actor?)` retunes when a topic's
  * live segment closes and archives — without restarting the bus. A
@@ -12,8 +13,10 @@
  * is judged on record timestamps (the bus clock). The revision fans
  * out to the root log and every namespace child log, and a namespace
  * registered later opens with the live bus triggers. A bus without
- * `durableLogDir`, or constructed without rotation, refuses
- * fail-closed (rotation cannot be enabled after the fact); illegal
+ * `durableLogDir` refuses fail-closed; a bus constructed without
+ * rotation enables it live instead (EB-566) — the stored entry count
+ * and first record seed the first segment, so a stored segment already
+ * past a tightened budget rotates on the next append; illegal
  * values fail closed with the live triggers untouched; an identical
  * revision, or a patch with neither field, is a no-op with no audit.
  */
@@ -133,13 +136,42 @@ test('DurableTopicLog.setSegmentRotation with neither field is a no-op', () => {
   assert.equal(unrotated.setSegmentRotation({}), undefined);
 });
 
-test('a log constructed without rotation refuses to enable it after the fact', () => {
+test('DurableTopicLog.installSegmentRotation enables rotation on an unconfigured log', () => {
   const log = DurableTopicLog.open({ dir: freshDir() });
-  assert.throws(() => log.setSegmentRotation({ maxEntriesPerSegment: 5 }), RangeError);
   assert.equal(log.currentSegmentRotation(), undefined);
+  assert.deepEqual(log.installSegmentRotation({ maxEntriesPerSegment: 5 }), {
+    maxEntriesPerSegment: 5,
+  });
+  assert.deepEqual(log.currentSegmentRotation(), { maxEntriesPerSegment: 5 });
+  // A second install refuses: the log is already configured.
+  assert.throws(
+    () => log.installSegmentRotation({ maxEntriesPerSegment: 3 }),
+    /already configured/,
+  );
+  assert.deepEqual(log.currentSegmentRotation(), { maxEntriesPerSegment: 5 });
 });
 
-test('setDurableLogSegmentRotation requires durableLogDir, rotation configured, and a valid actor', () => {
+test('DurableTopicLog.installSegmentRotation rejects illegal values and stays unconfigured', () => {
+  const log = DurableTopicLog.open({ dir: freshDir() });
+  for (const bad of [
+    { maxEntriesPerSegment: 0 },
+    { maxEntriesPerSegment: -1 },
+    { maxEntriesPerSegment: 1.5 },
+    { maxSegmentAgeMs: 0 },
+    { maxSegmentAgeMs: -1 },
+    { maxSegmentAgeMs: Number.NaN },
+    { maxSegmentAgeMs: Infinity },
+  ]) {
+    assert.throws(() => log.installSegmentRotation(bad as never), RangeError);
+  }
+  assert.equal(log.currentSegmentRotation(), undefined);
+  // A valid install still works afterwards.
+  assert.deepEqual(log.installSegmentRotation({ maxEntriesPerSegment: 5 }), {
+    maxEntriesPerSegment: 5,
+  });
+});
+
+test('setDurableLogSegmentRotation requires durableLogDir and a valid actor, and enables rotation on an unconfigured bus', () => {
   const noLog = new EventBus();
   assert.throws(() => noLog.setDurableLogSegmentRotation({ maxEntriesPerSegment: 5 }), RangeError);
   assert.throws(
@@ -149,12 +181,14 @@ test('setDurableLogSegmentRotation requires durableLogDir, rotation configured, 
   noLog.close();
 
   const noRotation = new EventBus({ durableLogDir: freshDir() });
-  assert.throws(
-    () => noRotation.setDurableLogSegmentRotation({ maxEntriesPerSegment: 5 }),
-    /cannot be enabled after the fact/,
-  );
-  assert.equal(audit(noRotation).length, 0);
-  assert.equal(liveRotation(noRotation), undefined);
+  noRotation.setDurableLogSegmentRotation({ maxEntriesPerSegment: 5 }, 'ops');
+  assert.deepEqual(liveRotation(noRotation), { maxEntriesPerSegment: 5 });
+  assert.equal(audit(noRotation).length, 1);
+  assert.deepEqual(audit(noRotation)[0].detail, {
+    from: { maxEntriesPerSegment: null, maxSegmentAgeMs: null },
+    to: { maxEntriesPerSegment: 5, maxSegmentAgeMs: null },
+  });
+  assert.equal(audit(noRotation)[0].actor, 'ops');
   noRotation.close();
 
   const bus = new EventBus({

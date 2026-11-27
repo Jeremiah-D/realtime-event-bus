@@ -1908,7 +1908,8 @@ export class DurableTopicLog {
   /**
    * Opt-in segment rotation triggers, `undefined` when rotation is
    * disabled (the default — one live file per topic, as before).
-   * Mutable at runtime via `setSegmentRotation` (EB-355).
+   * Mutable at runtime via `setSegmentRotation` (EB-355) and installable
+   * live via `installSegmentRotation` (EB-566).
    */
   private segmentRotation?: SegmentRotationOptions;
   /**
@@ -2331,6 +2332,83 @@ export class DurableTopicLog {
   }
 
   /**
+   * Installs segment rotation live on a log constructed without it
+   * (EB-566), the mirror of `setSegmentRotation` for the unconfigured
+   * case — where `setSegmentRotation` refuses an unconfigured log,
+   * `installSegmentRotation` refuses a configured one, and installs
+   * the fresh resolved triggers otherwise. Returns the installed
+   * triggers. Throws `RangeError` for an illegal value (reusing the
+   * construction-time validation `resolveSegmentRotationOptions`),
+   * leaving the log unconfigured. A patch with neither field is a
+   * no-op returning the current triggers (still `undefined`).
+   *
+   * Enabling seeds each topic's live-segment identity from the
+   * records already on disk — the same derivation recovery performs
+   * (`segmentEntries` from the live entry count, `segmentStartSeq` /
+   * `segmentStartAt` from the live file's first well-formed record),
+   * so the pre-existing live file becomes the new segment's first
+   * segment instead of counting from 0. Topics whose live file is
+   * empty — or holds no well-formed record — keep no start identity
+   * until the next append seeds it, exactly like an empty segment.
+   * The seed scan only parses the first well-formed line per topic:
+   * leading corrupt lines are skipped silently, `corruptLines` is
+   * never re-counted and `seqIndex` is never rebuilt (recovery
+   * already did both). Nothing already persisted is rewritten,
+   * renamed, or re-read in full, and the new triggers govern from
+   * the next append — there is no immediate rotation. Segment
+   * archiving / offload configuration is untouched: a log installed
+   * this way still has no offload, since offload is only ever
+   * resolved at construction from the rotation it was built with.
+   */
+  installSegmentRotation(patch: SegmentRotationOptions): SegmentRotationOptions | undefined {
+    // Neither field given at all is a no-op; an explicitly `undefined`
+    // field is a clear, not an absence (hence the `in` checks).
+    if (!('maxEntriesPerSegment' in patch) && !('maxSegmentAgeMs' in patch)) {
+      return this.currentSegmentRotation();
+    }
+    if (this.segmentRotation !== undefined) {
+      throw new RangeError(
+        'DurableTopicLog.installSegmentRotation: segmentRotation is already configured',
+      );
+    }
+    // Validate first: a rejected patch leaves the log unconfigured.
+    const resolved = resolveSegmentRotationOptions(patch) as SegmentRotationOptions;
+    for (const [topic, entries] of this.entryCounts) {
+      this.segmentEntries.set(topic, entries);
+      const first = this.firstLiveRecord(topic);
+      if (first !== undefined) {
+        this.segmentStartSeq.set(topic, first.seq);
+        this.segmentStartAt.set(topic, first.at);
+      }
+    }
+    this.segmentRotation = resolved;
+    return this.currentSegmentRotation();
+  }
+
+  /**
+   * The first well-formed record of a topic's live file, if any.
+   * Only the leading lines are read, stopping at the first record
+   * that parses — corrupt lines before it are skipped silently, so
+   * this never touches `corruptLines` or `seqIndex` (unlike
+   * `parseFileRecordsWithIndex`, which rebuilds both). Returns
+   * `undefined` when the file is absent, empty, or holds no
+   * well-formed record.
+   */
+  private firstLiveRecord(topic: string): DurableLogRecord | undefined {
+    const text = this.readText(this.fileFor(topic));
+    if (text === undefined) return undefined;
+    for (const line of text.split('\n')) {
+      if (line.length === 0) continue;
+      const inner = this.openLine(line);
+      if (inner == null) continue;
+      const rec = parseLogLine(inner, topic);
+      if (rec == null) continue;
+      return rec;
+    }
+    return undefined;
+  }
+
+  /**
    * Changes the segment-rotation triggers at runtime (EB-355), as a
    * partial revision: only the fields `patch` provides move, the rest
    * keep their live values. Passing a field as `undefined` clears that
@@ -2342,14 +2420,10 @@ export class DurableTopicLog {
    * returning the current triggers.
    *
    * Fail-closed: a log constructed without `segmentRotation` refuses
-   * outright — rotation cannot be enabled after the fact, because the
-   * live segment's identity (`segmentEntries` / `segmentStartSeq` /
-   * `segmentStartAt`) is only tracked while rotation is on, so a
-   * late-enabled rotation would count the segment from 0 and misalign
-   * it with the live file's actual first record. The bus enforces the
-   * same gate as `setDurableLogSegmentRotation` and records the change
-   * in the subscription audit log
-   * (`durable_log_segment_rotation_revised`).
+   * outright — use `installSegmentRotation` (EB-566) to enable
+   * rotation on such a log instead; the bus enforces the same split
+   * as `setDurableLogSegmentRotation` and records the change in the
+   * subscription audit log (`durable_log_segment_rotation_revised`).
    *
    * Only the triggers move: the in-flight live segment keeps its
    * original start time and counted entries (no recount, no immediate
@@ -2366,7 +2440,7 @@ export class DurableTopicLog {
     }
     if (this.segmentRotation === undefined) {
       throw new RangeError(
-        'DurableTopicLog.setSegmentRotation requires segmentRotation to be configured at construction: rotation cannot be enabled after the fact',
+        'DurableTopicLog.setSegmentRotation requires segmentRotation to be configured at construction: use installSegmentRotation to enable rotation on an unconfigured log',
       );
     }
     const merged = resolveSegmentRotationOptions({
