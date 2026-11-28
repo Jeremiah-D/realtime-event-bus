@@ -3613,9 +3613,11 @@ export class DurableTopicLog {
    * — empty, or unknown to this log — is silently skipped (it seals
    * nothing and writes no empty archive segment), and a topic whose
    * rename fails is left in the live file for the next append to
-   * retry, so it is not reported either. Only the root log rotates:
-   * namespace child logs keep their own live files and rotation
-   * identity (the bus trigger never reaches them).
+   * retry, so it is not reported either. Only the root log rotates
+   * under the root trigger: namespace child logs keep their own live
+   * files and rotation identity (the root bus trigger never reaches
+   * them — the namespace trigger, EB-575, seals a namespace's child
+   * log instead).
    *
    * Fail-closed: a log constructed without `segmentRotation` refuses
    * with `RangeError` — without rotation the segment identity

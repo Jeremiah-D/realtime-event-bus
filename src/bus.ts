@@ -26959,7 +26959,9 @@ export class EventBus {
    * uploads the sealed segment on that same background pass.
    *
    * Only the root log rotates; namespace child logs keep their own
-   * live files and rotation identity, so the trigger skips them. The
+   * live files and rotation identity, so the trigger skips them —
+   * seal a namespace's segments with
+   * `triggerNamespaceDurableLogSegmentRotation` (EB-575) instead. The
    * trigger is recorded in the subscription audit log as
    * `durable_log_segment_rotation_triggered` (with `{ topics }` in
    * `detail` — only the rotated topics, never segment names or seqs).
@@ -27006,6 +27008,97 @@ export class EventBus {
       action: 'durable_log_segment_rotation_triggered',
       actor,
       detail: { topics: [...rotated] },
+    });
+    return { rotated };
+  }
+
+  /**
+   * Triggers a durable-log segment rotation on demand for one
+   * namespace's child log (EB-575), the namespace twin of
+   * `triggerDurableLogSegmentRotation` (EB-572): it seals the live
+   * segment of one topic — or of every topic with live records in
+   * that namespace when no topic is given — at once, so an operator
+   * can close a namespaced topic's segments inside a maintenance
+   * window instead of waiting for the next append to cross an entry
+   * or age budget. It runs the child log's rotation directly: the
+   * same O(1) rename seals the segment and the same background
+   * archive pass gzips and indexes it, so the trigger itself never
+   * blocks publishing. The topic is the concrete topic name
+   * (`<namespace>/<topic>`, the key the child log stores it under);
+   * a relative name is an unknown topic and is silently skipped.
+   *
+   * Only that namespace's child log rotates: the root log and every
+   * other namespace's child log keep their live files, so the trigger
+   * touches nothing outside the named namespace. The trigger is
+   * recorded in the subscription audit log as
+   * `durable_log_namespace_segment_rotation_triggered` (with
+   * `{ namespace, topics }` in `detail` — only the namespace and the
+   * rotated topics, never segment names or seqs). An empty or unknown
+   * topic is silently skipped (it seals nothing and writes no empty
+   * archive segment), and a second trigger right after the first
+   * reports `{ rotated: [] }`.
+   *
+   * Fail-closed: a bus with no durable log — neither constructed with
+   * `durableLogDir` nor enabled live via `setDurableLog` (EB-567) —
+   * has nothing to rotate and throws `RangeError`. A namespace that
+   * was never registered throws likewise (`unknown namespace`, along
+   * `deleteNamespace`), and a namespace registered before the durable
+   * log was enabled has no child log — its topics fell back to the
+   * root log (`durableLogForTopic` `?? root`), which the root trigger
+   * already covers — so it refuses rather than rotating the root log
+   * twice. A child log without segment rotation configured refuses
+   * likewise: enable rotation live with `setDurableLogSegmentRotation`
+   * (EB-566) first — the enable fans out to the child logs, so a
+   * namespace registered before the enable gains rotation with it.
+   *
+   * Orthogonal to EB-572 (that seals the root log — this seals one
+   * namespace's child log), to EB-566 (that enables rotation live —
+   * this requires it), and to EB-569 (that verifies the chain — the
+   * sealed namespace segment is verified by its own child log's
+   * chain, each namespace keeping its own).
+   *
+   * Throws `RangeError` for a bad actor, for an invalid namespace
+   * prefix, for an empty topic, when the bus has no durable log
+   * (neither constructed with `durableLogDir` nor enabled live via
+   * `setDurableLog`, EB-567), when the namespace is unknown, when
+   * the namespace has no child log, or when the child log has no
+   * segment rotation configured.
+   */
+  triggerNamespaceDurableLogSegmentRotation(
+    namespace: string,
+    topic?: string,
+    actor = 'system',
+  ): { rotated: string[] } {
+    assertValidActor(actor, 'triggerNamespaceDurableLogSegmentRotation');
+    validateNamespacePrefix(namespace);
+    if (topic !== undefined && (typeof topic !== 'string' || topic.length === 0)) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'triggerNamespaceDurableLogSegmentRotation requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    if (!this.namespaces.has(namespace)) {
+      throw new RangeError(`unknown namespace "${namespace}"`);
+    }
+    const child = this.namespaceLogs.get(namespace);
+    if (child === undefined) {
+      throw new RangeError(
+        `triggerNamespaceDurableLogSegmentRotation: namespace "${namespace}" was registered before the durable log was enabled and has no child log`,
+      );
+    }
+    if (child.currentSegmentRotation() === undefined) {
+      throw new RangeError(
+        'triggerNamespaceDurableLogSegmentRotation requires EventBusOptions.durableLogSegmentRotation to be set: enable rotation live with setDurableLogSegmentRotation',
+      );
+    }
+    const rotated = child.rotateSegmentsNow(topic);
+    this.auditSubscription({
+      action: 'durable_log_namespace_segment_rotation_triggered',
+      actor,
+      detail: { namespace, topics: [...rotated] },
     });
     return { rotated };
   }

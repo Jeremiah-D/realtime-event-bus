@@ -1163,7 +1163,12 @@ library.
   `{ archived }` — only the count, never segment names or seqs); an empty or
   unknown topic is silently skipped, a bus without rotation refuses with
   `RangeError` (enable it live with `setDurableLogSegmentRotation`,
-  EB-566), and namespace child logs are not rotated; audited as
+  EB-566), and namespace child logs are not rotated by this trigger —
+  seal them with `triggerNamespaceDurableLogSegmentRotation(namespace,
+  topic?, actor?)` (EB-575), audited as
+  `durable_log_namespace_segment_rotation_triggered` (`{ namespace,
+  topics }` — only the namespace and the rotated topics, never segment
+  names or seqs); audited as
   `durable_log_segment_rotation_triggered` (`{ topics }` — only the
   rotated topics, never segment names or seqs). Segment checksums (EB-94):
   every archived segment gets a `<name>.sha256` sidecar (SHA-256 of the
