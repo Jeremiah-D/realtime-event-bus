@@ -27073,6 +27073,83 @@ export class EventBus {
   }
 
   /**
+   * Triggers a durable-log archive pass on demand (EB-574):
+   * `triggerDurableLogArchive(topic?, actor?)` gzips and indexes every
+   * pending segment (`*.jsonl.tmp`) — or only one topic's — at once, so
+   * an operator can confirm a sealed segment is archived (gzip +
+   * sidecar + index + chain manifest) inside a maintenance window
+   * instead of waiting for the next background archive tick. It runs
+   * the root log's archive loop directly: the same `archiveOne` per
+   * segment, the same crash-safe ordering — and it never offloads, so
+   * the remote push stays with `triggerDurableLogOffload` (EB-570).
+   * This closes the middle step of the rotate → archive → offload
+   * chain: after `triggerDurableLogSegmentRotation` (EB-572) seals a
+   * segment, this trigger archives it, and the EB-570 trigger then
+   * uploads it — the whole chain runs synchronously with no timer
+   * wait, and each step is audited once.
+   *
+   * Only the root log archives; namespace child logs keep their own
+   * pending segments and their own background pass, so the trigger
+   * skips them. The trigger is recorded in the subscription audit log
+   * as `durable_log_archive_triggered` (with `{ archived }` in
+   * `detail` — only the count, never segment names or seqs). The
+   * returned `{ archived }` lists the segment paths actually archived.
+   * An empty or unknown topic is silently skipped (it archives nothing
+   * and writes no empty archive segment), and a second trigger right
+   * after the first reports `{ archived: [] }`.
+   *
+   * Fail-closed: a bus with no durable log — neither constructed with
+   * `durableLogDir` nor enabled live via `setDurableLog` (EB-567) —
+   * has nothing to archive and throws `RangeError`. A bus constructed
+   * without `durableLogSegmentRotation` refuses likewise: without
+   * rotation no segment is ever sealed, so there is never a pending
+   * segment to archive — enable rotation live with
+   * `setDurableLogSegmentRotation` (EB-566) first. The trigger never
+   * throws for a failed archive — the segment stays pending and the
+   * next trigger or background pass retries it — but the caller pays
+   * the gzip cost synchronously: on a large segment that is
+   * observable, and only the triggering call waits, never the publish
+   * path.
+   *
+   * Orthogonal to EB-61 (that is the archive mechanism itself — this
+   * its manual trigger), to EB-572 (that seals the segment — this
+   * archives the sealed segment), to EB-570 (that triggers the offload
+   * pass — this archives what the pass then uploads), to EB-569 (that
+   * verifies the chain — this writes the chain link the check then
+   * reads), and to EB-94 (that verifies the sidecar — this writes the
+   * sidecar the check then reads).
+   *
+   * Throws `RangeError` for a bad actor, for a non-string topic, when
+   * the bus has no durable log (neither constructed with
+   * `durableLogDir` nor enabled live via `setDurableLog`, EB-567), or
+   * when the bus has no segment rotation configured.
+   */
+  triggerDurableLogArchive(topic?: string, actor = 'system'): { archived: string[] } {
+    assertValidActor(actor, 'triggerDurableLogArchive');
+    if (topic !== undefined && typeof topic !== 'string') {
+      throw new RangeError('topic must be a string');
+    }
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'triggerDurableLogArchive requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    if (log.currentSegmentRotation() === undefined) {
+      throw new RangeError(
+        'triggerDurableLogArchive requires EventBusOptions.durableLogSegmentRotation to be set: enable rotation live with setDurableLogSegmentRotation',
+      );
+    }
+    const archived = log.archivePendingSegmentsNow(topic);
+    this.auditSubscription({
+      action: 'durable_log_archive_triggered',
+      actor,
+      detail: { archived: archived.length },
+    });
+    return { archived };
+  }
+
+  /**
    * Flips the durable log's keyed compaction live (EB-364):
    * `setDurableLogKeyCompaction(enabled, actor?)` switches the log
    * between Kafka-style latest-per-key retention and full-history

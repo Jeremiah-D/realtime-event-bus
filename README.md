@@ -1155,7 +1155,12 @@ library.
   the live segment of one topic — or of every topic with live records
   when no topic is given — at once, so a maintenance window can close
   segments instead of waiting for the next append to cross a budget; the
-  gzip + index still run on the background archive pass, an empty or
+  gzip + index still run on the background archive pass, or on demand
+  with `triggerDurableLogArchive(topic?, actor?)` (EB-574), which archives
+  every pending segment — or only one topic's — synchronously and returns
+  their paths, so rotate → archive → offload runs as one manual chain
+  with no timer wait (audited as `durable_log_archive_triggered`,
+  `{ archived }` — only the count, never segment names or seqs); an empty or
   unknown topic is silently skipped, a bus without rotation refuses with
   `RangeError` (enable it live with `setDurableLogSegmentRotation`,
   EB-566), and namespace child logs are not rotated; audited as

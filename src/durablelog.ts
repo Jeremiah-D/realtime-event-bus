@@ -3665,19 +3665,78 @@ export class DurableTopicLog {
     timer.unref();
   }
 
-  /** Archives every pending segment (`*.jsonl.tmp`) in the log's key space. */
-  private drainArchiveQueue(): void {
+  /**
+   * Archives every pending segment (`*.jsonl.tmp`) on demand (EB-574),
+   * the manual counterpart of the background archive pass in
+   * `drainArchiveQueue`: the same loop — the same `archiveOne` per
+   * segment, the same crash-safe ordering — run synchronously, so an
+   * operator can confirm a sealed segment is gzipped, sidecarred,
+   * indexed, and chained inside a maintenance window instead of waiting
+   * for the next background tick. This closes the middle step of the
+   * rotate → archive → offload chain: after
+   * `triggerDurableLogSegmentRotation` seals a segment, this archives
+   * it, and `offloadNow` (via `triggerDurableLogOffload`, EB-570) then
+   * uploads it — the whole chain runs with no timer wait. It never
+   * offloads: the remote push stays with the EB-570 trigger, so each
+   * step is audited once.
+   *
+   * Returns the paths actually archived — only segments that completed
+   * the gzip, sidecar, index line, and chain link. A segment whose
+   * archive step fails stays pending for the next trigger or background
+   * pass and is not reported; the trigger never throws for an archive
+   * failure (along EB-570 remote failures never throwing, and EB-572
+   * rename failures never throwing). With a topic, only that topic's
+   * pending segments are archived; an empty or unknown topic archives
+   * nothing and reports an empty list. Only the root log archives:
+   * namespace child logs keep their own pending segments and their own
+   * background pass (their names carry the `namespaces/` prefix and
+   * are skipped here).
+   *
+   * A failure to list the backend archives nothing and reports an
+   * empty list, like the background pass. The trigger itself pays the
+   * gzip cost synchronously — on a large segment that is observable —
+   * but it never blocks the publish path: only the triggering call
+   * waits.
+   */
+  archivePendingSegmentsNow(topic?: string): string[] {
     let names: string[];
     try {
       names = this.backend.list();
     } catch {
-      return;
+      return [];
     }
+    const archived: string[] = [];
     for (const name of names) {
       // EB-96: a child log drains its own pending segments.
       if (name.startsWith(NAMESPACE_LOG_KEY_PREFIX)) continue;
-      if (name.endsWith('.jsonl.tmp')) this.archiveOne(name);
+      if (!name.endsWith('.jsonl.tmp')) continue;
+      if (topic !== undefined) {
+        // The topic rides the file name (see `pendingSegmentName`);
+        // decode it and compare exactly — a prefix match would
+        // collide when one topic's encoded name extends another's
+        // (e.g. `a` vs `a.seg-x`).
+        const marker = name.lastIndexOf('.seg-');
+        if (marker < 0) continue;
+        let fileTopic: string;
+        try {
+          fileTopic = decodeURIComponent(name.slice(0, marker));
+        } catch {
+          continue;
+        }
+        if (fileTopic !== topic) continue;
+      }
+      const archivedPath = this.archiveOne(name);
+      if (archivedPath !== undefined) archived.push(archivedPath);
     }
+    return archived;
+  }
+
+  /** Archives every pending segment (`*.jsonl.tmp`) in the log's key space. */
+  private drainArchiveQueue(): void {
+    // EB-574: the archive loop lives in `archivePendingSegmentsNow` so
+    // the manual trigger runs the same pass; the background pass keeps
+    // its offload tail.
+    this.archivePendingSegmentsNow();
     // EB-163: newly archived segments go remote on the same background
     // pass. Never throws into the timer: a remote outage only counts
     // failures, the next pass retries.
@@ -3993,20 +4052,25 @@ export class DurableTopicLog {
    * open) or a leftover pending file (re-archived idempotently: the same
    * content addresses the same archive name, and an already-indexed
    * segment just drops its pending file). Never throws: a failure leaves
-   * the pending file for the next pass.
+   * the pending file for the next pass. Returns the archived segment's
+   * path once the gzip, sidecar, index line, and chain link are all
+   * complete — or the already-indexed path when a crash leftover only
+   * needed its pending file dropped — and `undefined` when nothing was
+   * archived (EB-574, so the manual trigger can report exactly what it
+   * archived).
    */
-  private archiveOne(pendingName: string): void {
+  private archiveOne(pendingName: string): string | undefined {
     const text = this.readText(pendingName);
-    if (text === undefined) return;
+    if (text === undefined) return undefined;
     // The topic rides the file name (see `pendingSegmentName`); records
     // are validated against it, so a renamed file can never corrupt reads.
     const marker = pendingName.lastIndexOf('.seg-');
-    if (marker < 0) return;
+    if (marker < 0) return undefined;
     let topic: string;
     try {
       topic = decodeURIComponent(pendingName.slice(0, marker));
     } catch {
-      return;
+      return undefined;
     }
     const records: DurableLogRecord[] = [];
     for (const line of text.split('\n')) {
@@ -4031,7 +4095,7 @@ export class DurableTopicLog {
       } catch {
         // Left for the next pass.
       }
-      return;
+      return undefined;
     }
     const first = records[0];
     const last = records[records.length - 1];
@@ -4048,7 +4112,7 @@ export class DurableTopicLog {
       } catch {
         // Left for the next pass.
       }
-      return;
+      return entry.path;
     }
     const canonical = records.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
     let gzBytes: Buffer;
@@ -4056,7 +4120,7 @@ export class DurableTopicLog {
       gzBytes = gzipSync(canonical);
     } catch {
       // Compression failed: leave the pending file for the next pass.
-      return;
+      return undefined;
     }
     try {
       // EB-80: the archived record bytes are sealed per line before
@@ -4068,7 +4132,7 @@ export class DurableTopicLog {
       // Either the write failed or the archive already exists (a
       // concurrent pass won the race): leave the pending file for the
       // next pass, which dedupes against the index.
-      return;
+      return undefined;
     }
     // EB-94: checksum sidecar — after the `.gz`, before the index line,
     // extending the crash-safe ordering (.gz -> sidecar -> index ->
@@ -4090,7 +4154,7 @@ export class DurableTopicLog {
     } catch {
       // The `.gz` is safely on disk; the index append is retried via
       // orphan adoption on the next open.
-      return;
+      return undefined;
     }
     // EB-118: chain manifest line — after the index line, before the
     // pending delete, extending the crash-safe ordering (.gz -> sidecar
@@ -4098,7 +4162,7 @@ export class DurableTopicLog {
     // segment without a chain line; the next open heals it in index
     // order, and the leftover pending file is dropped idempotently by the
     // next pass (the archive itself is already complete).
-    if (!this.appendChainLink(topic, entry, segmentHash, gzBytes.length)) return;
+    if (!this.appendChainLink(topic, entry, segmentHash, gzBytes.length)) return undefined;
     try {
       this.backend.delete(pendingName);
     } catch {
@@ -4106,6 +4170,7 @@ export class DurableTopicLog {
       // dropped idempotently by the next pass.
     }
     this.addArchiveEntry(entry);
+    return entry.path;
   }
 
   /**
