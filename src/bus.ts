@@ -26947,6 +26947,70 @@ export class EventBus {
   }
 
   /**
+   * Triggers a durable-log segment rotation on demand (EB-572):
+   * `triggerDurableLogSegmentRotation(topic?, actor?)` seals the live
+   * segment of one topic — or of every topic with live records when no
+   * topic is given — at once, so an operator can close segments inside
+   * a maintenance window instead of waiting for the next append to
+   * cross an entry or age budget. It runs the root log's rotation
+   * directly: the same O(1) rename seals the segment and the same
+   * background archive pass gzips and indexes it, so the trigger
+   * itself never blocks publishing, and a bus with offload configured
+   * uploads the sealed segment on that same background pass.
+   *
+   * Only the root log rotates; namespace child logs keep their own
+   * live files and rotation identity, so the trigger skips them. The
+   * trigger is recorded in the subscription audit log as
+   * `durable_log_segment_rotation_triggered` (with `{ topics }` in
+   * `detail` — only the rotated topics, never segment names or seqs).
+   * An empty or unknown topic is silently skipped (it seals nothing
+   * and writes no empty archive segment), and a second trigger right
+   * after the first reports `{ rotated: [] }`.
+   *
+   * Fail-closed: a bus with no durable log — neither constructed with
+   * `durableLogDir` nor enabled live via `setDurableLog` (EB-567) —
+   * has nothing to rotate and throws `RangeError`. A bus constructed
+   * without `durableLogSegmentRotation` refuses likewise: without
+   * rotation the segment identity is never maintained, so a manual
+   * seal would stamp a bogus range — enable rotation live with
+   * `setDurableLogSegmentRotation` (EB-566) first.
+   *
+   * Orthogonal to EB-355 (that retunes the automatic triggers — this
+   * seals on demand without moving them), to EB-566 (that enables
+   * rotation live — this requires it), and to EB-570 (that triggers
+   * the offload pass — this seals the segment the pass then uploads).
+   *
+   * Throws `RangeError` for a bad actor, for an empty topic, when the
+   * bus has no durable log (neither constructed with `durableLogDir`
+   * nor enabled live via `setDurableLog`, EB-567), or when the bus
+   * has no segment rotation configured.
+   */
+  triggerDurableLogSegmentRotation(topic?: string, actor = 'system'): { rotated: string[] } {
+    assertValidActor(actor, 'triggerDurableLogSegmentRotation');
+    if (topic !== undefined && (typeof topic !== 'string' || topic.length === 0)) {
+      throw new RangeError('topic must be a non-empty string');
+    }
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'triggerDurableLogSegmentRotation requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    if (log.currentSegmentRotation() === undefined) {
+      throw new RangeError(
+        'triggerDurableLogSegmentRotation requires EventBusOptions.durableLogSegmentRotation to be set: enable rotation live with setDurableLogSegmentRotation',
+      );
+    }
+    const rotated = log.rotateSegmentsNow(topic);
+    this.auditSubscription({
+      action: 'durable_log_segment_rotation_triggered',
+      actor,
+      detail: { topics: [...rotated] },
+    });
+    return { rotated };
+  }
+
+  /**
    * Flips the durable log's keyed compaction live (EB-364):
    * `setDurableLogKeyCompaction(enabled, actor?)` switches the log
    * between Kafka-style latest-per-key retention and full-history

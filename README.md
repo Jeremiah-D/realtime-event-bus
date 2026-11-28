@@ -1140,7 +1140,17 @@ library.
   (EB-566): the pre-existing live file becomes the new segment's first
   segment — its entry count and first record's seq / timestamp seed the
   segment identity, so the next append is judged against the real stored
-  history. Segment checksums (EB-94):
+  history. Trigger a rotation on demand with
+  `triggerDurableLogSegmentRotation(topic?, actor?)` (EB-572): it seals
+  the live segment of one topic — or of every topic with live records
+  when no topic is given — at once, so a maintenance window can close
+  segments instead of waiting for the next append to cross a budget; the
+  gzip + index still run on the background archive pass, an empty or
+  unknown topic is silently skipped, a bus without rotation refuses with
+  `RangeError` (enable it live with `setDurableLogSegmentRotation`,
+  EB-566), and namespace child logs are not rotated; audited as
+  `durable_log_segment_rotation_triggered` (`{ topics }` — only the
+  rotated topics, never segment names or seqs). Segment checksums (EB-94):
   every archived segment gets a `<name>.sha256` sidecar (SHA-256 of the
   gzipped bytes, `node:crypto`, zero new dependencies) written after the
   `.gz` and before the index line; recovery verifies every indexed segment

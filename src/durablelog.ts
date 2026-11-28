@@ -3601,6 +3601,55 @@ export class DurableTopicLog {
   }
 
   /**
+   * Seals the live segment of one topic — or of every topic with live
+   * records when no topic is given — on demand (EB-572), the manual
+   * counterpart of the automatic triggers in `noteSegmentAppend` /
+   * the byte-budget rotation in `append`: it calls `rotateSegment`
+   * directly, so the same O(1) rename seals the segment and the same
+   * background archive pass gzips and indexes it — the trigger itself
+   * never blocks on gzip, the index, or an offload upload.
+   *
+   * Returns the topics actually sealed. A topic with no live records
+   * — empty, or unknown to this log — is silently skipped (it seals
+   * nothing and writes no empty archive segment), and a topic whose
+   * rename fails is left in the live file for the next append to
+   * retry, so it is not reported either. Only the root log rotates:
+   * namespace child logs keep their own live files and rotation
+   * identity (the bus trigger never reaches them).
+   *
+   * Fail-closed: a log constructed without `segmentRotation` refuses
+   * with `RangeError` — without rotation the segment identity
+   * (`segmentStartSeq` / `segmentStartAt`) is never maintained, so a
+   * manual seal would stamp a bogus range; enable rotation first
+   * (at construction, or live via `installSegmentRotation`, EB-566).
+   */
+  rotateSegmentsNow(topic?: string): string[] {
+    if (this.segmentRotation === undefined) {
+      throw new RangeError(
+        'DurableTopicLog.rotateSegmentsNow requires segmentRotation to be configured: enable rotation with installSegmentRotation',
+      );
+    }
+    const targets =
+      topic !== undefined
+        ? [topic]
+        : [...this.entryCounts.entries()]
+            .filter(([, count]) => count > 0)
+            .map(([t]) => t);
+    const rotated: string[] = [];
+    for (const t of targets) {
+      // Empty or unknown topics seal nothing: rotateSegment would
+      // rename an empty live file into a bogus zero-record segment.
+      if ((this.entryCounts.get(t) ?? 0) === 0) continue;
+      this.rotateSegment(t);
+      // rotateSegment resets the live counts only on a successful
+      // rename; a failed rename leaves the records in the live file
+      // (and the count above zero), so it is not reported.
+      if ((this.entryCounts.get(t) ?? 0) === 0) rotated.push(t);
+    }
+    return rotated;
+  }
+
+  /**
    * Arms the background archive pass on an unref'd timer: pending
    * segments are gzipped and indexed without ever blocking the publish
    * path, and a pending archive never keeps the process alive on its
