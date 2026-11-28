@@ -4118,18 +4118,7 @@ export class DurableTopicLog {
    */
   private compact(topic: string): void {
     const records = this.readFileRecords(topic);
-    // EB-221: key-TTL eviction runs before age retention — a key older
-    // than its TTL leaves a tombstone (seq baseline preserved), while a
-    // key older than `maxAgeMs` but younger than its TTL is
-    // retention-dropped without one (the pre-EB-221 `maxAgeMs` behavior;
-    // set the key TTL <= `maxAgeMs` to keep the baseline guarantee for
-    // every key).
-    const retained = this.applyRetention(topic, this.applyKeyTtl(topic, records));
-    const kept = this.applyBytesBound(
-      this.keyCompaction
-        ? compactKeyed(retained, this.maxEntriesPerTopic)
-        : retained.slice(-this.maxEntriesPerTopic),
-    );
+    const kept = this.keptAfterCompact(topic, records);
     const text = kept.map((rec) => this.sealLine(`${JSON.stringify(logLineOf(rec))}\n`)).join('');
     try {
       // EB-96: atomic replace through the backend — readers never see a
@@ -4145,6 +4134,74 @@ export class DurableTopicLog {
     if (this.keyCompaction) this.rebuildKeyIndex(topic, kept);
     // EB-205: the file was rewritten — rebuild the seq→offset index.
     this.parseFileRecordsWithIndex(topic, text);
+  }
+
+  /**
+   * The retention pipeline `compact` applies, shared with `compactNow`
+   * (EB-573) so the manual trigger's drop decision and the rewrite
+   * itself can never disagree: key-TTL eviction, then age retention,
+   * then the byte bound, then keyed compaction (or the count slice).
+   * Pure — it reads nothing and writes nothing.
+   */
+  private keptAfterCompact(topic: string, records: DurableLogRecord[]): DurableLogRecord[] {
+    // EB-221: key-TTL eviction runs before age retention — a key older
+    // than its TTL leaves a tombstone (seq baseline preserved), while a
+    // key older than `maxAgeMs` but younger than its TTL is
+    // retention-dropped without one (the pre-EB-221 `maxAgeMs` behavior;
+    // set the key TTL <= `maxAgeMs` to keep the baseline guarantee for
+    // every key).
+    const retained = this.applyRetention(topic, this.applyKeyTtl(topic, records));
+    return this.applyBytesBound(
+      this.keyCompaction
+        ? compactKeyed(retained, this.maxEntriesPerTopic)
+        : retained.slice(-this.maxEntriesPerTopic),
+    );
+  }
+
+  /**
+   * Compacts one topic's live file — or every topic with live records
+   * when no topic is given — on demand (EB-573), the manual
+   * counterpart of the amortized compact trigger in `append`: it runs
+   * the same `compact` pipeline, so a tightened bound (EB-322/EB-323)
+   * or a batch of superseded keys takes effect at once instead of
+   * waiting for the next append past twice the bound. Only the live
+   * file is rewritten; archived segments are untouched, and seq-0
+   * delayed-delivery schedule records never age out (see `compact`).
+   *
+   * Returns the topics that actually dropped at least one record
+   * (`kept.length < records.length`). A topic already inside every
+   * bound is silently skipped — it is not listed and its file is not
+   * rewritten — and so is an empty or unknown topic. Only the root
+   * log compacts: namespace child logs keep their own live files
+   * (the bus trigger never reaches them). The keyCompaction switch
+   * is not a gate: without it the same count/age/byte bounds still
+   * rewrite the file (`compactKeyed` just does not run). A failed
+   * backend write leaves the topic unreported, so the next trigger
+   * retries it.
+   */
+  compactNow(topic?: string): string[] {
+    const targets =
+      topic !== undefined
+        ? [topic]
+        : [...this.entryCounts.entries()]
+            .filter(([, count]) => count > 0)
+            .map(([t]) => t);
+    const compacted: string[] = [];
+    for (const t of targets) {
+      // Empty or unknown topics compact nothing: there is no live
+      // file to rewrite, and minting one would be pure churn.
+      if ((this.entryCounts.get(t) ?? 0) === 0) continue;
+      const records = this.readFileRecords(t);
+      // Already inside every bound: skip without rewriting — the
+      // trigger must not churn an in-bounds file.
+      if (this.keptAfterCompact(t, records).length === records.length) continue;
+      this.compact(t);
+      // `compact` updates the live count only after a successful
+      // rewrite, so a failed write leaves the count at the
+      // pre-compact value and the topic stays unreported.
+      if ((this.entryCounts.get(t) ?? 0) < records.length) compacted.push(t);
+    }
+    return compacted;
   }
 
   /**

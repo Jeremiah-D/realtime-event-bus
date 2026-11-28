@@ -27011,6 +27011,68 @@ export class EventBus {
   }
 
   /**
+   * Triggers a durable-log compaction on demand (EB-573):
+   * `triggerDurableLogCompaction(topic?, actor?)` rewrites the live
+   * file of one topic — or of every topic with live records when no
+   * topic is given — at once, so an operator can reclaim dead weight
+   * (expired records, superseded keys) inside a maintenance window
+   * instead of waiting for the next append to cross twice the bound.
+   * It runs the root log's compaction directly: the same pipeline
+   * (key TTL, age retention, byte bound, keyed compaction / count
+   * slice, atomic rewrite, index rebuilds) reclaims the space
+   * synchronously, and only the live file is rewritten — archived
+   * segments are untouched, and seq-0 delayed-delivery schedule
+   * records never age out.
+   *
+   * Only the root log compacts; namespace child logs keep their own
+   * live files, so the trigger skips them. The trigger is recorded
+   * in the subscription audit log as
+   * `durable_log_compaction_triggered` (with `{ topics }` in
+   * `detail` — only the compacted topics, never record counts or
+   * byte totals; the reclaimed volume is read off
+   * `getStats().durableLog` before and after). A topic already
+   * inside every bound is silently skipped (not listed, not
+   * rewritten), as are an empty or unknown topic, and a second
+   * trigger right after the first reports `{ compacted: [] }`.
+   *
+   * Fail-closed: a bus with no durable log — neither constructed
+   * with `durableLogDir` nor enabled live via `setDurableLog`
+   * (EB-567) — has nothing to compact and throws `RangeError`.
+   * The keyCompaction switch is not a gate: a bus without it still
+   * compacts under the count/age/byte bounds.
+   *
+   * Orthogonal to EB-322/EB-323 (those move the bounds — this
+   * applies them at once), to EB-355 (that retunes the automatic
+   * triggers — this compacts on demand without moving them), to
+   * EB-570 (that triggers the offload pass — this reclaims the live
+   * file the pass then leaves alone), and to EB-572 (that seals the
+   * live segment — this rewrites it in place).
+   *
+   * Throws `RangeError` for a bad actor, for a non-string topic, or
+   * when the bus has no durable log (neither constructed with
+   * `durableLogDir` nor enabled live via `setDurableLog`, EB-567).
+   */
+  triggerDurableLogCompaction(topic?: string, actor = 'system'): { compacted: string[] } {
+    assertValidActor(actor, 'triggerDurableLogCompaction');
+    if (topic !== undefined && typeof topic !== 'string') {
+      throw new RangeError('topic must be a string');
+    }
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'triggerDurableLogCompaction requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const compacted = log.compactNow(topic);
+    this.auditSubscription({
+      action: 'durable_log_compaction_triggered',
+      actor,
+      detail: { topics: [...compacted] },
+    });
+    return { compacted };
+  }
+
+  /**
    * Flips the durable log's keyed compaction live (EB-364):
    * `setDurableLogKeyCompaction(enabled, actor?)` switches the log
    * between Kafka-style latest-per-key retention and full-history

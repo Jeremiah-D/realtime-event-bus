@@ -937,7 +937,13 @@ library.
   be followed by a fresh enable. An enable is audited as
   `replay_throttle_revised` with `oldThrottle: null`. Hot topics
   compact automatically (`durableLogMaxEntriesPerTopic`, default 10000,
-  amortized rewrite at 2x). Opt-in time-based retention
+  amortized rewrite at 2x). Or compact on demand with
+  `triggerDurableLogCompaction(topic?, actor?)` (EB-573): the same
+  pipeline runs at once, so dead weight is reclaimed immediately; only
+  topics that drop at least one record are reported, in-bounds topics
+  are left untouched, and the trigger is audited as
+  `durable_log_compaction_triggered` (`{ topics }`). Opt-in time-based
+  retention
   (`durableLogMaxAgeMs`, EB-85): records older than `now - maxAgeMs` (bus
   clock) are evicted when their topic compacts, dual-bounded with the
   count limit — a compact keeps records satisfying both. Delayed-delivery
@@ -963,7 +969,9 @@ library.
   only the bound moves, already-persisted records are untouched, and the
   new bound governs from the next append-triggered compact — tightening
   does not force an immediate compact, loosening simply allows more
-  capacity. It fans out to the root log and every namespace child log
+  capacity; to reclaim the space at once after tightening, call
+  `triggerDurableLogCompaction(topic?, actor?)` (EB-573). It fans out
+  to the root log and every namespace child log
   (a namespace registered later opens with the live bound), requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567; a bus without one throws `RangeError`), and is
   audited as `durable_log_max_entries_revised` (old and new bound); an
   identical revision is a no-op with no audit. Retune the per-topic byte
@@ -973,7 +981,9 @@ library.
   records are untouched, and the new bound governs from the next append
   (rotation off: the next append past twice the new bound compacts down
   to the newest records that fit; rotation on: crossing the bound
-  archives the live segment instead). It fans out to the root log and
+  archives the live segment instead); call
+  `triggerDurableLogCompaction(topic?, actor?)` (EB-573) to apply the new
+  bound at once. It fans out to the root log and
   every namespace child log (a namespace registered later opens with the
   live bound), requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567), and is audited as
   `durable_log_max_bytes_revised` (`{ from, to }`, `null` when unset);
