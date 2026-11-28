@@ -12,8 +12,9 @@
  * (`{ uploaded, failed }` — the keys are never recorded, since a key
  * names a remote object). A bus with no durable log refuses
  * fail-closed; a bus constructed without `durableLogSegmentOffload`
- * returns the zero result (offload cannot be enabled after the fact,
- * but a trigger there is a harmless no-op, not an error). Segments the
+ * returns the zero result (enable offload live with
+ * `setDurableLogSegmentOffload`, EB-571 — a trigger on such a bus is a
+ * harmless no-op, not an error). Segments the
  * remote manifest already knows are not re-pushed; a dry-run client
  * only rehearses; per-segment failures are counted in `failed` and
  * retried on the next trigger — the trigger never throws for a remote

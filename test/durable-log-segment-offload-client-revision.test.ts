@@ -232,7 +232,7 @@ test('bus without offload refuses; the getter is undefined', () => {
   const bus = new EventBus({ durableLogDir: freshDir() });
   assert.throws(
     () => bus.setDurableLogSegmentOffloadClient(new SharedStoreS3(store)),
-    /offload cannot be enabled after the fact/,
+    /use setDurableLogSegmentOffload to enable offload live/,
   );
   assert.equal(bus.getDurableLogSegmentOffloadClientIsDryRun(), undefined);
   assert.equal(audit(bus).length, 0);

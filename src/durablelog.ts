@@ -2026,9 +2026,12 @@ export class DurableTopicLog {
   /**
    * EB-163: resolved remote-offload configuration, `undefined` when
    * offload is disabled (the default — the log never touches the
-   * network and keeps every archived segment locally).
+   * network and keeps every archived segment locally). Installable
+   * live via `installSegmentOffload` (EB-571) on a log that already
+   * has segment rotation — hence not `readonly`, along
+   * `segmentRotation` (EB-566).
    */
-  private readonly offload?: ResolvedSegmentOffload;
+  private offload?: ResolvedSegmentOffload;
   /** EB-163: archived segments successfully uploaded to the remote. */
   private offloadUploaded = 0;
   /** EB-163: offload attempts that failed (upload or manifest write). */
@@ -2359,8 +2362,8 @@ export class DurableTopicLog {
    * renamed, or re-read in full, and the new triggers govern from
    * the next append — there is no immediate rotation. Segment
    * archiving / offload configuration is untouched: a log installed
-   * this way still has no offload, since offload is only ever
-   * resolved at construction from the rotation it was built with.
+   * this way still has no offload — install it with
+   * `installSegmentOffload` (EB-571) once rotation is in place.
    */
   installSegmentRotation(patch: SegmentRotationOptions): SegmentRotationOptions | undefined {
     // Neither field given at all is a no-op; an explicitly `undefined`
@@ -2421,6 +2424,81 @@ export class DurableTopicLog {
       throw new RangeError('DurableTopicLog.installEncryptor: encryptor is already configured');
     }
     this.encryptor = encryptor;
+  }
+
+  /**
+   * The current S3 offload configuration — the resolved values
+   * `installSegmentOffload` installed (EB-571), `undefined` when
+   * offload is not enabled on this log. The S3 client itself is never
+   * returned: a real client holds credentials
+   * (`SigV4S3Client` carries `accessKeyId` / `secretAccessKey` /
+   * `sessionToken`), so only its dry-run brand escapes the log, along
+   * `currentOffloadClientIsDryRun`.
+   */
+  currentSegmentOffload():
+    | {
+        keyPrefix: string;
+        namespace: string;
+        retainLocalSegments: number;
+        readbackCacheMaxSegments: number;
+        readbackCacheMaxBytes: number;
+        isDryRun: boolean | undefined;
+      }
+    | undefined {
+    return this.offload === undefined
+      ? undefined
+      : {
+          keyPrefix: this.offload.keyPrefix,
+          namespace: this.offload.namespace,
+          retainLocalSegments: this.offload.retainLocalSegments,
+          readbackCacheMaxSegments: this.offload.readbackCacheMaxSegments,
+          readbackCacheMaxBytes: this.offload.readbackCacheMaxBytes,
+          isDryRun: this.offload.s3.isDryRun,
+        };
+  }
+
+  /**
+   * Installs S3 segment offload live on a log constructed without it
+   * (EB-571), the mirror of `installSegmentRotation` for the
+   * unconfigured case — where a log constructed with offload uploads
+   * from the first sealed segment, `installSegmentOffload` uploads
+   * from the next background pass onward. Returns nothing. Throws
+   * `RangeError` when offload is already configured (install-only,
+   * never replaced — swapping the client stays
+   * `retuneOffloadClient`, EB-399), when the log has no segment
+   * rotation (only sealed segments are offloaded, so rotation must
+   * be configured first — at construction or live via
+   * `installSegmentRotation`, EB-566), or for an illegal option
+   * (reusing the construction-time validation
+   * `resolveSegmentOffloadOptions`: a usable S3 client, a non-empty
+   * key prefix, a valid retain count, valid readback-cache bounds).
+   * A rejected call leaves the log exactly as it was, so a later
+   * valid call still installs.
+   *
+   * Installing arms the background pass at once (`scheduleOffload`,
+   * along `open`): segments sealed before the install upload on the
+   * next pass without waiting for the next rotation or archive sweep.
+   * Nothing already persisted is rewritten: the archive index and
+   * chain manifest keep their lines, and the install only adds the
+   * remote upload — local retention still follows
+   * `retainLocalSegments` from the next pass. A dry-run client only
+   * rehearses (along EB-570): the pass records intended keys and
+   * never uploads, writes a manifest, or trims local segments.
+   */
+  installSegmentOffload(opts: SegmentOffloadOptions): void {
+    if (this.offload !== undefined) {
+      throw new RangeError(
+        'DurableTopicLog.installSegmentOffload: segmentOffload is already configured',
+      );
+    }
+    // Validate first: a rejected option leaves the log unconfigured.
+    // `resolveSegmentOffloadOptions` refuses a log without rotation
+    // (`segmentOffload requires segmentRotation`).
+    const resolved = resolveSegmentOffloadOptions(opts, this.segmentRotation);
+    this.offload = resolved as ResolvedSegmentOffload;
+    // Arm the background pass at once, along `open`: segments sealed
+    // before the install upload without waiting for the next sweep.
+    this.scheduleOffload();
   }
 
   /**
@@ -2520,8 +2598,8 @@ export class DurableTopicLog {
    * current bounds.
    *
    * Fail-closed: a log constructed without `segmentOffload` refuses
-   * outright — the cache bounds cannot be enabled after the fact,
-   * because there is no offload (no S3 client, no remote key space)
+   * outright — install offload first with `installSegmentOffload`
+   * (EB-571); there is no offload (no S3 client, no remote key space)
    * for the cache to serve. The bus enforces the same gate as
    * `setDurableLogReadbackCache` and records the change in the
    * subscription audit log (`durable_log_readback_cache_revised`).
@@ -2540,7 +2618,7 @@ export class DurableTopicLog {
   retuneReadbackCache(patch: Partial<ReadbackCacheLimits>): ReadbackCacheLimits | undefined {
     if (this.offload === undefined) {
       throw new RangeError(
-        'DurableTopicLog.retuneReadbackCache requires segmentOffload to be enabled at construction: the readback cache cannot be enabled after the fact',
+        'DurableTopicLog.retuneReadbackCache requires segmentOffload to be enabled: use installSegmentOffload to enable offload',
       );
     }
     const current = this.currentReadbackCacheLimits() as ReadbackCacheLimits;
@@ -2592,8 +2670,8 @@ export class DurableTopicLog {
    * as they were.
    *
    * Fail-closed: a log constructed without `segmentOffload` refuses
-   * outright — the retain count cannot be enabled after the fact,
-   * because there is no offload (no S3 client, no remote manifest)
+   * outright — install offload first with `installSegmentOffload`
+   * (EB-571); there is no offload (no S3 client, no remote manifest)
    * for the retention to serve. The bus enforces the same gate as
    * `setDurableLogRetainLocalSegments` and records the change in the
    * subscription audit log (`durable_log_retain_local_segments_revised`).
@@ -2622,7 +2700,7 @@ export class DurableTopicLog {
   retuneRetainLocalSegments(retain: number): number {
     if (this.offload === undefined) {
       throw new RangeError(
-        'DurableTopicLog.retuneRetainLocalSegments requires segmentOffload to be enabled at construction: the local retain count cannot be enabled after the fact',
+        'DurableTopicLog.retuneRetainLocalSegments requires segmentOffload to be enabled: use installSegmentOffload to enable offload',
       );
     }
     assertValidRetainLocalSegments(retain);
@@ -2664,8 +2742,9 @@ export class DurableTopicLog {
    * client exactly as it was.
    *
    * Fail-closed: a log constructed without `segmentOffload` refuses
-   * outright — the client cannot be enabled after the fact, because
-   * there is no remote key space for it to serve. The bus enforces the
+   * outright — install offload first with `installSegmentOffload`
+   * (EB-571); there is no remote key space for the client to serve.
+   * The bus enforces the
    * same gate as `setDurableLogSegmentOffloadClient` and records the
    * change in the subscription audit log
    * (`durable_log_segment_offload_client_revised`). Installing the very
@@ -2691,7 +2770,7 @@ export class DurableTopicLog {
   retuneOffloadClient(s3: RemoteSegmentS3Client): boolean | undefined {
     if (this.offload === undefined) {
       throw new RangeError(
-        'DurableTopicLog.retuneOffloadClient requires segmentOffload to be enabled at construction: the S3 client cannot be enabled after the fact',
+        'DurableTopicLog.retuneOffloadClient requires segmentOffload to be enabled: use installSegmentOffload to enable offload',
       );
     }
     const methods = ['putObject', 'getObject', 'headObject', 'listObjects', 'deleteObject'] as const;

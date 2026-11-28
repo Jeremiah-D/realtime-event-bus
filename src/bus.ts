@@ -5800,8 +5800,8 @@ export interface EventBusOptions {
    * `durableLogSegmentRotation` (only sealed segments are offloaded).
    * Retune the cache bounds live with
    * `setDurableLogReadbackCache(patch, actor?)` (EB-361); only a bus
-   * constructed with offload can be revised — offload cannot be enabled
-   * after the fact. Namespace child logs do not offload: their archived
+   * with offload can be revised — enable it live with
+   * `setDurableLogSegmentOffload(opts, actor?)` (EB-571). Namespace child logs do not offload: their archived
    * segments stay local, so the revision skips them.
    */
   durableLogSegmentOffload?: SegmentOffloadOptions;
@@ -19525,11 +19525,13 @@ export class EventBus {
   private durableLogEncryptor?: PayloadEncryptor;
   /**
    * The S3 client the durable log currently offloads through (EB-399) —
-   * the construction-time client, then whatever
+   * the construction-time client, the client
+   * `setDurableLogSegmentOffload` installed (EB-571), then whatever
    * `setDurableLogSegmentOffloadClient` last installed. Tracked here so
    * a same-client revision is a no-op without ever exposing the client
    * itself (a real client holds credentials). `undefined` when the bus
-   * was constructed without `durableLogSegmentOffload`.
+   * was constructed without `durableLogSegmentOffload` and never
+   * installed it live.
    */
   private durableLogOffloadClient?: RemoteSegmentS3Client;
   /**
@@ -25683,7 +25685,7 @@ export class EventBus {
     // Replicate the construction-time wiring (bus.ts:20146-20191): open
     // the root log with the same options construction passes — the bus
     // clock and the checksum-failure fan-out — and no rotation, offload,
-    // or encryptor (EB-566/EB-361/EB-568 each enable their own).
+    // or encryptor (EB-566/EB-571/EB-568 each enable their own).
     const log = DurableTopicLog.open({
       dir,
       backend: opts?.storageBackend,
@@ -26257,9 +26259,9 @@ export class EventBus {
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A bus constructed without
-   * `durableLogSegmentOffload` also throws `RangeError`: offload
-   * cannot be enabled after the fact, because there is no S3 client
-   * or remote key space for the cache to serve. An illegal value
+   * `durableLogSegmentOffload` also throws `RangeError`: install
+   * offload first with `setDurableLogSegmentOffload` (EB-571) — there
+   * is no S3 client or remote key space for the cache to serve. An illegal value
    * throws `RangeError` with the live bounds and the audit log
    * untouched: validation reuses the construction-time rule
    * (`assertValidReadbackCacheLimits`: both bounds non-negative
@@ -26288,7 +26290,7 @@ export class EventBus {
     const current = log.currentReadbackCacheLimits();
     if (current === undefined) {
       throw new RangeError(
-        'setDurableLogReadbackCache requires EventBusOptions.durableLogSegmentOffload to be set: offload cannot be enabled after the fact',
+        'setDurableLogReadbackCache requires EventBusOptions.durableLogSegmentOffload to be set: use setDurableLogSegmentOffload to enable offload live',
       );
     }
     // Nothing to revise: no-op, no audit.
@@ -26359,9 +26361,9 @@ export class EventBus {
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A bus constructed without
-   * `durableLogSegmentOffload` also throws `RangeError`: offload
-   * cannot be enabled after the fact, because there is no S3 client
-   * or remote manifest for the retention to serve. An illegal value
+   * `durableLogSegmentOffload` also throws `RangeError`: install
+   * offload first with `setDurableLogSegmentOffload` (EB-571) — there
+   * is no S3 client or remote manifest for the retention to serve. An illegal value
    * throws `RangeError` with the live count and the audit log
    * untouched: validation reuses the construction-time rule
    * (`assertValidRetainLocalSegments`: a non-negative integer or
@@ -26394,7 +26396,7 @@ export class EventBus {
     const current = log.currentRetainLocalSegments();
     if (current === undefined) {
       throw new RangeError(
-        'setDurableLogRetainLocalSegments requires EventBusOptions.durableLogSegmentOffload to be set: offload cannot be enabled after the fact',
+        'setDurableLogRetainLocalSegments requires EventBusOptions.durableLogSegmentOffload to be set: use setDurableLogSegmentOffload to enable offload live',
       );
     }
     // Re-affirming the current count is a no-op: no retune, no audit.
@@ -26692,9 +26694,9 @@ export class EventBus {
    * retune and throws `RangeError` — unlike the construction-time
    * option, which is silently ignored without a dir, a revision
    * explicitly refuses. A bus constructed without
-   * `durableLogSegmentOffload` also throws `RangeError`: offload
-   * cannot be enabled after the fact, because there is no S3 client or
-   * remote key space for the new client to serve. A client that is not
+   * `durableLogSegmentOffload` also throws `RangeError`: install
+   * offload first with `setDurableLogSegmentOffload` (EB-571) — there
+   * is no S3 client or remote key space for the new client to serve. A client that is not
    * a usable `RemoteSegmentS3Client` throws `RangeError` with the live
    * client untouched: validation reuses the construction-time rule
    * (all five methods `putObject` / `getObject` / `headObject` /
@@ -26726,7 +26728,7 @@ export class EventBus {
     // client's `isDryRun` may itself be `undefined`, so it cannot gate.
     if (log.currentRetainLocalSegments() === undefined) {
       throw new RangeError(
-        'setDurableLogSegmentOffloadClient requires EventBusOptions.durableLogSegmentOffload to be set: offload cannot be enabled after the fact',
+        'setDurableLogSegmentOffloadClient requires EventBusOptions.durableLogSegmentOffload to be set: use setDurableLogSegmentOffload to enable offload live',
       );
     }
     // Re-installing the live client is a no-op: no retune, no audit.
@@ -26743,6 +26745,135 @@ export class EventBus {
       detail: {
         isDryRun: s3.isDryRun ?? null,
         oldIsDryRun: oldIsDryRun ?? null,
+      },
+    });
+  }
+
+  /**
+   * Installs durable-log S3 segment offload live (EB-571) on a bus
+   * constructed with a durable log but no offload:
+   * `setDurableLogSegmentOffload(opts, actor?)` installs the upload
+   * channel, so a bus that started keeping every archived segment
+   * local can start pushing sealed segments to S3 without restarting
+   * (which would drop every live subscription, queue, and replay
+   * position).
+   *
+   * Segment rotation must already be configured — at construction or
+   * live via `setDurableLogSegmentRotation` (EB-566) — since only
+   * sealed segments are offloaded; a bus without rotation refuses
+   * with `RangeError`, and enabling rotation first (EB-566) then
+   * installing offload works. The install is the last piece of the
+   * durable-log enable family: install the log first
+   * (`setDurableLog`, EB-567), then rotation on it (EB-566), then
+   * offload — a bus with no durable log refuses fail-closed with the
+   * same `requires EventBusOptions.durableLogDir to be set` gate the
+   * revision family uses.
+   *
+   * Installing arms the background pass at once (along `open`):
+   * segments sealed before the install upload on the next pass
+   * without waiting for the next rotation or archive sweep, and the
+   * install opens the three offload gates at once —
+   * `setDurableLogReadbackCache` (EB-361),
+   * `setDurableLogRetainLocalSegments` (EB-362), and
+   * `setDurableLogSegmentOffloadClient` (EB-399) all work from the
+   * install onward. Only the root log offloads; namespace child logs
+   * do not offload, so the install skips them (a namespace registered
+   * later likewise opens without offload). A dry-run client
+   * (`DryRunS3Client`) only rehearses: the pass records intended keys
+   * and never uploads, writes a manifest, or trims local segments —
+   * swapping back to a real client resumes real uploads.
+   *
+   * Fail-closed: a bus with no durable log, a bus that already has
+   * offload (constructed with it or installed live — offload is
+   * install-only, never replaced; swapping the client stays
+   * `setDurableLogSegmentOffloadClient`, EB-399), and a closed bus
+   * all throw `RangeError`. An illegal option throws `RangeError`
+   * with the live tuning and the audit log untouched — validation
+   * reuses the construction-time rule
+   * (`resolveSegmentOffloadOptions`: a usable S3 client, a non-empty
+   * key prefix, a valid retain count, valid readback-cache bounds),
+   * so a value that could not be set at construction cannot be
+   * installed later either — and a failed call changes nothing at
+   * all: the bus stays unconfigured, so a later valid call still
+   * enables it. `null` is a silent no-op with no audit (along
+   * EB-540 / EB-559), and the null branch sits before the
+   * already-enabled gate. Audited as
+   * `durable_log_segment_offload_enabled` (`{ keyPrefix, namespace,
+   * retainLocalSegments, readbackCacheMaxSegments,
+   * readbackCacheMaxBytes, isDryRun, old*: null }` — `Infinity` is
+   * recorded as `null`, since JSON has no `Infinity`; the S3 client
+   * itself is never recorded, only its dry-run brand). The enable is
+   * live-only: a restart restores the unconfigured state.
+   *
+   * Orthogonal to EB-163 (that is S3 offload itself — this its live
+   * install), to EB-399 (that swaps the offload client — this
+   * installs offload itself, the client's precondition), to EB-361 /
+   * EB-362 (those retune the readback-cache bounds / the local retain
+   * count on an offloaded bus — this opens their gates), to EB-570
+   * (that triggers the pass — this arms the channel the pass walks),
+   * and to EB-566 / EB-567 / EB-568 (those install rotation / the log
+   * / the encryptor — this the offload channel, the last of the
+   * family). There is no disable: installed offload stays installed
+   * (along EB-544 / EB-559, install-only).
+   *
+   * Throws `RangeError` for a bad actor, when the bus is closed, when
+   * the bus has no durable log, when offload is already enabled, when
+   * segment rotation is not configured, or for an illegal option.
+   */
+  setDurableLogSegmentOffload(opts: SegmentOffloadOptions | null, actor = 'system'): void {
+    assertValidActor(actor, 'setDurableLogSegmentOffload');
+    // Fail-fast on a closed bus (EB-154, along `setDurableLog` /
+    // `setDurableLogEncryptor`): close() already flushed once — there
+    // is no live log left to arm a pass on.
+    if (this.closed) {
+      throw new RangeError('setDurableLogSegmentOffload: bus is closed');
+    }
+    // `null` on a never-enabled bus is a silent no-op (along EB-540 /
+    // EB-559): the null branch sits before the already-enabled gate,
+    // so it asks nothing to install on any bus.
+    if (opts == null) {
+      return;
+    }
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'setDurableLogSegmentOffload requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    if (log.currentSegmentOffload() !== undefined) {
+      throw new RangeError(
+        'setDurableLogSegmentOffload: durableLogSegmentOffload is already enabled on this bus',
+      );
+    }
+    // Validate before installing anything: a rejected option leaves
+    // the bus unconfigured, so a later valid call still enables it.
+    // The log reuses the construction-time rule
+    // (`resolveSegmentOffloadOptions`) — rotation included, so a bus
+    // without rotation refuses here until EB-566 installs it.
+    log.installSegmentOffload(opts);
+    // Remember the installed client so a same-client revision is a
+    // no-op (along the construction-time wiring, bus.ts:20229).
+    this.durableLogOffloadClient = opts.s3;
+    const installed = log.currentSegmentOffload() as NonNullable<
+      ReturnType<DurableTopicLog['currentSegmentOffload']>
+    >;
+    this.auditSubscription({
+      action: 'durable_log_segment_offload_enabled',
+      actor,
+      detail: {
+        keyPrefix: installed.keyPrefix,
+        namespace: installed.namespace,
+        retainLocalSegments:
+          installed.retainLocalSegments === Infinity ? null : installed.retainLocalSegments,
+        readbackCacheMaxSegments: installed.readbackCacheMaxSegments,
+        readbackCacheMaxBytes: installed.readbackCacheMaxBytes,
+        isDryRun: installed.isDryRun ?? null,
+        oldKeyPrefix: null,
+        oldNamespace: null,
+        oldRetainLocalSegments: null,
+        oldReadbackCacheMaxSegments: null,
+        oldReadbackCacheMaxBytes: null,
+        oldIsDryRun: null,
       },
     });
   }
@@ -26784,9 +26915,9 @@ export class EventBus {
    * none to offload and throws `RangeError`. A bus constructed without
    * `durableLogSegmentOffload` does not throw: there is no remote to
    * push to, so the pass is a zero result (`{ uploaded: 0, failed: 0,
-   * keys: [] }`, the `offloadNow` empty form) — offload cannot be
-   * enabled after the fact, but a trigger on such a bus is a harmless
-   * no-op, not an error.
+   * keys: [] }`, the `offloadNow` empty form) — enable offload live
+   * with `setDurableLogSegmentOffload` (EB-571) first; a trigger on
+   * such a bus is a harmless no-op, not an error.
    *
    * Orthogonal to EB-163 (that is the automatic offload pass itself —
    * this its manual trigger), to EB-399 (that swaps the offload client
@@ -26858,7 +26989,8 @@ export class EventBus {
    * constructed without keyed compaction can still enable it — the
    * flip only changes the read view and rebuilds the in-memory index
    * from disk, and needs no construction-time structure (unlike
-   * offload, which cannot be enabled after the fact). A
+   * offload, which still needs segment rotation configured first —
+   * see `setDurableLogSegmentOffload`, EB-571). A
    * non-boolean flag also throws `RangeError` with the live flag and
    * the audit log untouched. A revision identical to the current flag
    * is a no-op with no audit.

@@ -869,7 +869,7 @@ library.
   mirroring pauses (local delivery unaffected) until a probe succeeds
   again, with `bridge_unhealthy` / `bridge_recovered` audit events.
 - **`src/durablelog.ts` — `DurableTopicLog`**: opt-in append-only per-topic
-  JSONL log (`new EventBus({ durableLogDir })`). A bus constructed without a log can install one live with `setDurableLog(dir, opts?, actor?)` (EB-567): the root log opens over `dir`, the publish-side idempotent-dedup window reseeds from the journal, and already-sealed segments replay from the first subscribe after the install — audited as `durable_log_enabled`, live-only (a restart restores the unconfigured state); segment rotation, offload, and the encryptor each have their own live enable. Every published message is
+  JSONL log (`new EventBus({ durableLogDir })`). A bus constructed without a log can install one live with `setDurableLog(dir, opts?, actor?)` (EB-567): the root log opens over `dir`, the publish-side idempotent-dedup window reseeds from the journal, and already-sealed segments replay from the first subscribe after the install — audited as `durable_log_enabled`, live-only (a restart restores the unconfigured state); segment rotation, offload (`setDurableLogSegmentOffload`, EB-571), and the encryptor each have their own live enable. Every published message is
   appended as one line (`{v, seq, topic, at, expiresAt?, payload}`, one file
   per URL-encoded topic) before fan-out, so a restarted process pointed at
   the same directory recovers per-topic sequence counters — numbering
@@ -1270,8 +1270,7 @@ library.
   cached, and `purgeTopic` evicts the topic from the cache. Retune the cache bounds live
   with `setDurableLogReadbackCache(patch, actor?)` (EB-361): a partial revision — only the
   fields provided move; tightening prunes the cache to the new bounds at once
-  (least-recently-used first), loosening governs from the next insert; it requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567) and a bus constructed with `durableLogSegmentOffload` (offload cannot be
-  enabled after the fact), skips namespace child logs (they do not offload), and is audited
+  (least-recently-used first), loosening governs from the next insert; it requires a durable log (constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567) and a bus with `durableLogSegmentOffload` (constructed with it or enabled live via `setDurableLogSegmentOffload`, EB-571), skips namespace child logs (they do not offload), and is audited
   as `durable_log_readback_cache_revised` (old and new bounds); an identical revision is a
   no-op with no audit, and the live bounds are visible in
   `getStats().durableLog.readbackCacheMaxSegments` / `readbackCacheMaxBytes`. Retune the local
@@ -1279,7 +1278,7 @@ library.
   deletes local copies beyond the new bound at once (least-recently-used first, only segments
   the manifest confirms as remote), loosening governs from the next offload pass; `0` keeps
   nothing local and `Infinity` restores full retention; same gates (requires a durable log — constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567 —
-  and a bus constructed with `durableLogSegmentOffload`, skips namespace child logs) and the
+  and a bus with `durableLogSegmentOffload`, constructed with it or enabled live via `setDurableLogSegmentOffload`, EB-571, skips namespace child logs) and the
   same no-op rule, audited as `durable_log_retain_local_segments_revised` (`Infinity` recorded
   as `null`), live value in `getStats().durableLog.retainLocalSegments`. Replace the offload client
   live with `setDurableLogSegmentOffloadClient(s3, actor?)` (EB-399):
@@ -1293,14 +1292,33 @@ library.
   serve the same bucket and key space (the operator's precondition). A
   dry-run client (`DryRunS3Client`) records intended keys and never
   uploads, writes a manifest, or trims local segments — swapping back to
-  a real client resumes real uploads. Same gates (requires a durable log — constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567 — and a bus constructed with
-  `durableLogSegmentOffload`, skips namespace child logs) and the same
+  a real client resumes real uploads. Same gates (requires a durable log — constructed with `durableLogDir` or enabled live via `setDurableLog`, EB-567 — and a bus with `durableLogSegmentOffload`, constructed with it or enabled live via `setDurableLogSegmentOffload`, EB-571, skips namespace child logs) and the same
   no-op rule for re-installing the live client, audited as
   `durable_log_segment_offload_client_revised` (`{ isDryRun, oldIsDryRun }`,
   `null` when a client carries no brand — never an endpoint or a
   credential), live brand in
   `getDurableLogSegmentOffloadClientIsDryRun()` (the client itself is
-  never returned: it may hold credentials). Trigger an offload pass on
+  never returned: it may hold credentials). Enable offload live with
+  `setDurableLogSegmentOffload(opts, actor?)` (EB-571): it installs the
+  S3 upload channel on a bus with a durable log but no offload, so a
+  running bus gains the cold-storage export without restarting; segment
+  rotation must already be configured (at construction or live via
+  `setDurableLogSegmentRotation`, EB-566), since only sealed segments
+  are offloaded. The install validates the options first (a usable S3
+  client, a non-empty key prefix, a valid retain count, valid
+  readback-cache bounds), so an illegal option refuses with the bus
+  still unconfigured and a later valid call still enables it; installing
+  arms the background pass at once, so segments sealed before the
+  install upload on the next pass, and it opens the three offload gates
+  at once (`setDurableLogReadbackCache`, `setDurableLogRetainLocalSegments`,
+  `setDurableLogSegmentOffloadClient`). A bus with no durable log, a bus
+  that already has offload (install-only, never replaced), and a closed
+  bus all refuse with `RangeError`; `null` is a silent no-op with no
+  audit; audited as `durable_log_segment_offload_enabled` (the resolved
+  key prefix, namespace, retain count, readback-cache bounds, and
+  dry-run brand — `Infinity` recorded as `null`, the S3 client itself
+  never recorded), live-only (a restart restores the unconfigured
+  state). Trigger an offload pass on
   demand with `triggerDurableLogOffload(actor?)` (EB-570): it runs the
   root log's offload pass synchronously and returns `{ uploaded, failed,
   keys }`, so sealed segments can be pushed inside a maintenance window
