@@ -1300,7 +1300,15 @@ library.
   `null` when a client carries no brand — never an endpoint or a
   credential), live brand in
   `getDurableLogSegmentOffloadClientIsDryRun()` (the client itself is
-  never returned: it may hold credentials). Flip keyed compaction live
+  never returned: it may hold credentials). Trigger an offload pass on
+  demand with `triggerDurableLogOffload(actor?)` (EB-570): it runs the
+  root log's offload pass synchronously and returns `{ uploaded, failed,
+  keys }`, so sealed segments can be pushed inside a maintenance window
+  instead of waiting for the next rotation or archive sweep, and a client
+  swapped in live is walked at once; audited as
+  `durable_log_offload_triggered` (`{ uploaded, failed }` — the keys are
+  never recorded), a bus with no durable log refuses with `RangeError`,
+  and a bus constructed without offload returns the zero result. Flip keyed compaction live
   with `setDurableLogKeyCompaction(enabled, actor?)` (EB-364): enabling switches the read view to
   latest-per-key at once (superseded records stop replaying even before the file is rewritten) and
   rebuilds each log's key index and superseded counts from disk, so the next append counts the dead

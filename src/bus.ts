@@ -26759,6 +26759,63 @@ export class EventBus {
   }
 
   /**
+   * Triggers one durable-log S3 offload pass on demand (EB-570):
+   * `triggerDurableLogOffload(actor?)` runs the root log's `offloadNow()`
+   * synchronously and returns what the pass did — `{ uploaded, failed,
+   * keys }` — so an operator can push sealed segments to S3 inside a
+   * maintenance window instead of waiting for the next rotation or
+   * archive sweep, and a client swapped in by
+   * `setDurableLogSegmentOffloadClient` (EB-399) is walked at once
+   * instead of from the next automatic pass.
+   *
+   * Only the root log offloads; namespace child logs do not offload, so
+   * the trigger skips them. The pass is recorded in the subscription
+   * audit log as `durable_log_offload_triggered` (with `{ uploaded,
+   * failed }` in `detail` — the keys are never recorded, since a key
+   * names a remote object). The pass itself is unchanged: segments the
+   * remote manifest already knows are not re-pushed, a dry-run client
+   * only rehearses (keys are returned, no upload, no manifest write, no
+   * local trim), and per-segment failures are counted in `failed` and
+   * retried on the next trigger — the trigger never throws for a remote
+   * failure.
+   *
+   * Fail-closed: a bus with no durable log — neither constructed with
+   * `durableLogDir` nor enabled live via `setDurableLog` (EB-567) — has
+   * none to offload and throws `RangeError`. A bus constructed without
+   * `durableLogSegmentOffload` does not throw: there is no remote to
+   * push to, so the pass is a zero result (`{ uploaded: 0, failed: 0,
+   * keys: [] }`, the `offloadNow` empty form) — offload cannot be
+   * enabled after the fact, but a trigger on such a bus is a harmless
+   * no-op, not an error.
+   *
+   * Orthogonal to EB-163 (that is the automatic offload pass itself —
+   * this its manual trigger), to EB-399 (that swaps the offload client
+   * — this walks whichever client is live), to EB-362 (that retunes
+   * the local retain count — this triggers the pass that trims), and
+   * to EB-361 (that retunes the readback cache — this the upload side).
+   *
+   * Throws `RangeError` for a bad actor or when the bus has no durable
+   * log (neither constructed with `durableLogDir` nor enabled live via
+   * `setDurableLog`, EB-567).
+   */
+  triggerDurableLogOffload(actor = 'system'): { uploaded: number; failed: number; keys: string[] } {
+    assertValidActor(actor, 'triggerDurableLogOffload');
+    const log = this.durableLog;
+    if (log == null) {
+      throw new RangeError(
+        'triggerDurableLogOffload requires EventBusOptions.durableLogDir to be set',
+      );
+    }
+    const result = log.offloadNow();
+    this.auditSubscription({
+      action: 'durable_log_offload_triggered',
+      actor,
+      detail: { uploaded: result.uploaded, failed: result.failed },
+    });
+    return result;
+  }
+
+  /**
    * Flips the durable log's keyed compaction live (EB-364):
    * `setDurableLogKeyCompaction(enabled, actor?)` switches the log
    * between Kafka-style latest-per-key retention and full-history
