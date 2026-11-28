@@ -1175,7 +1175,14 @@ library.
   and reports reordered lines, missing / replaced / unreadable segments,
   and rogue (unchained) segment files, each located by topic/segmentId/
   path — O(segments) plus one full byte read per segment, an operator
-  tool, not a hot-path check. A damaged segment is still isolated
+  tool, not a hot-path check. `EventBus.verifyDurableLogSegmentChain()`
+  (EB-569) reports the same five issue kinds over the running bus, read
+  from the log's own in-memory chain view instead of re-reading the
+  manifest — no stop, no race with the archive pass (and S3-backed logs
+  verify through their own backend, where append is read-modify-write);
+  the live unsealed segment is never counted, namespace child logs keep
+  their own chains and are not in the root report, and a bus without a
+  durable log reports an empty chain. A damaged segment is still isolated
   in-process per the EB-94 convention (skipped, counted, audited);
   offline, the chain keeps naming its original digest, so verify reports
   the tamper instead of silently dropping the link. Rotation and

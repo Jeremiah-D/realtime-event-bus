@@ -5905,6 +5905,136 @@ export class DurableTopicLog {
     }
     return { ok: issues.length === 0, segments: entries.length, issues };
   }
+
+  /**
+   * EB-569: live chain verification over this log instance — the same
+   * five issue kinds as the offline `verifySegmentChain`, but read from
+   * the log's own in-memory state instead of re-reading the manifest
+   * file, so a running bus can be checked without stopping it and
+   * without racing the archive pass:
+   * - linkage and digests come from `chainEntries`, the in-memory mirror
+   *   of `__segment_chain.jsonl` — pushed only after the manifest
+   *   append succeeds, so a torn or half-appended last line can never
+   *   be observed mid-archive (and the S3 backend's read-modify-write
+   *   append can never hand back a stale tail);
+   * - segment bytes are re-read through this log's own backend, so an
+   *   S3-backed log verifies exactly like a filesystem one;
+   * - the rogue scan enumerates `backend.list()`, skipping the reserved
+   *   `namespaces/` prefix — namespace child logs keep their own chains
+   *   and are verified through their own instances, never through the
+   *   root report.
+   * The live (unsealed) segment is not chained and is never counted; a
+   * purged topic drops its chain entries with it. A manifest line
+   * deleted on disk is invisible here by design — the in-memory chain
+   * is the authority while the log runs, and the next open heals the
+   * missing line (EB-118). Read-only: no manifest writes, no healing,
+   * no audit. Cost is the same as the offline entry — O(segments) plus
+   * one full byte read per archived segment.
+   */
+  verifySegmentChainLive(): SegmentChainReport {
+    const issues: SegmentChainIssue[] = [];
+    const expectedPrev = new Map<string, string>();
+    const lastByTopic = new Map<string, SegmentChainEntry>();
+    const knownPaths = new Set<string>();
+    for (const entry of this.chainEntries) {
+      const want = expectedPrev.get(entry.topic) ?? SEGMENT_CHAIN_GENESIS_PREV;
+      if (entry.prevHash !== want) {
+        issues.push({
+          topic: entry.topic,
+          segmentId: entry.segmentId,
+          path: entry.path,
+          kind: 'link',
+          detail:
+            `prevHash ${entry.prevHash} does not link to the previous segment's ` +
+            `digest ${want} — the in-memory chain was reordered or the line was forged`,
+        });
+      }
+      knownPaths.add(entry.path);
+      lastByTopic.set(entry.topic, entry);
+      let raw: Buffer | undefined;
+      let unreadable = false;
+      try {
+        const bytes = this.backend.read(entry.path);
+        raw = bytes === undefined ? undefined : Buffer.from(bytes);
+      } catch {
+        unreadable = true;
+      }
+      if (unreadable) {
+        issues.push({
+          topic: entry.topic,
+          segmentId: entry.segmentId,
+          path: entry.path,
+          kind: 'unreadable',
+          detail: 'the segment file exists but its bytes cannot be read',
+        });
+      } else if (raw === undefined) {
+        issues.push({
+          topic: entry.topic,
+          segmentId: entry.segmentId,
+          path: entry.path,
+          kind: 'missing',
+          detail: 'the chain names a segment file that is gone from the log',
+        });
+      } else {
+        const actual = createHash('sha256').update(raw).digest('hex');
+        if (actual !== entry.sha256) {
+          issues.push({
+            topic: entry.topic,
+            segmentId: entry.segmentId,
+            path: entry.path,
+            kind: 'hash',
+            detail:
+              `segment bytes hash ${actual} != chain digest ${entry.sha256} — ` +
+              `the segment was replaced or tampered with`,
+          });
+        }
+      }
+      expectedPrev.set(entry.topic, entry.sha256);
+    }
+    // Tail consistency: the last link per topic must be the tail the log
+    // itself advances on the next archive. Every writer path maintains
+    // both together (append, heal, purge, rename), so a disagreement
+    // means the in-memory chain view and the writer disagree — which no
+    // per-entry check can see.
+    for (const [topic, tail] of this.chainTails) {
+      const last = lastByTopic.get(topic);
+      if (last === undefined || last.sha256 !== tail) {
+        issues.push({
+          topic,
+          segmentId: last?.segmentId ?? '',
+          path: last?.path ?? CHAIN_MANIFEST_NAME,
+          kind: 'link',
+          detail:
+            `chain tail ${tail} does not match the last chained segment's digest ` +
+            `${last?.sha256 ?? 'none'} — the chain view and the writer disagree`,
+        });
+      }
+    }
+    // Rogue segments: archived on disk but never chained. Namespace child
+    // logs live under the reserved prefix — their segments belong to the
+    // child log's scoped view, never to this report.
+    let names: string[];
+    try {
+      names = this.backend.list();
+    } catch {
+      names = [];
+    }
+    for (const name of names) {
+      if (name.startsWith(NAMESPACE_LOG_KEY_PREFIX)) continue;
+      const parsed = parseSegmentFileName(name);
+      if (parsed == null) continue;
+      if (!knownPaths.has(name)) {
+        issues.push({
+          topic: parsed.topic,
+          segmentId: `${parsed.seqStart}-${parsed.seqEnd}`,
+          path: name,
+          kind: 'rogue',
+          detail: 'an archived segment on disk has no chain manifest line',
+        });
+      }
+    }
+    return { ok: issues.length === 0, segments: this.chainEntries.length, issues };
+  }
 }
 
 /**

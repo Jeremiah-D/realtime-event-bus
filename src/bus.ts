@@ -172,7 +172,7 @@ import {
   type RemediationActionResult,
   type RemediationReport,
 } from './remediate.ts';
-import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type ReadbackCacheLimits, type SegmentChecksumFailure, type SegmentOffloadOptions, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
+import { DurableTopicLog, NAMESPACE_LOG_KEY_PREFIX, type DurableLogRecord, type ForkTopicOptions, type ForkTopicResult, type MergeTopicsResult, type ReadbackCacheLimits, type SegmentChainReport, type SegmentChecksumFailure, type SegmentOffloadOptions, type SegmentRotationOptions, type SplitTopicPredicate, type SplitTopicsResult } from './durablelog.ts';
 import { exportTopicData as exportTopicDataFromLog, importTopicData as importTopicDataIntoLog, type ImportTopicDataResult } from './topic-data-export.ts';
 import {
   OutboxRelay,
@@ -69482,6 +69482,29 @@ export class EventBus {
    */
   verifySubscriptionAuditChain(): ChainVerification {
     return this.subAudit.verifyAuditChain();
+  }
+
+  /**
+   * Verifies the durable log's archived-segment hash chain (EB-569)
+   * over the live log instance: every archived segment's `prevHash`
+   * must link to the previous segment's digest (per topic, genesis
+   * first), every chained segment's bytes must still hash to its
+   * manifest digest, and no archived segment file may sit on disk
+   * unchained. Same five issue kinds as the offline
+   * `DurableTopicLog.verifySegmentChain(dir)` — `link` / `hash` /
+   * `missing` / `rogue` / `unreadable` — but read from the log's own
+   * in-memory chain view, so the bus keeps running: no stop, no
+   * manifest re-read, no race with the archive pass, and S3-backed
+   * logs verify through their own backend. The live (unsealed)
+   * segment is not chained and is never counted; namespace child logs
+   * keep their own chains and are not in this report. Read-only and
+   * unaudited, like `verifyPublishAuditChain`.
+   *
+   * Returns `{ ok: true, segments: 0, issues: [] }` when the bus has
+   * no durable log — there is nothing to verify.
+   */
+  verifyDurableLogSegmentChain(): SegmentChainReport {
+    return this.durableLog?.verifySegmentChainLive() ?? { ok: true, segments: 0, issues: [] };
   }
 
   /**
